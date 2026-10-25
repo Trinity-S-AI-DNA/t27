@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/queen_chats.t27 -- the right dock of T27 OS: a chat with the Queen.
+; Owner, 2026-10-23: "make a sidebar on the right with a chat in it, so you can talk with the Queen".
+; The Queen is a real agent cell (agents.t27 AGENT_QUEEN, bin "queen"); the one chat the window had for
+; her side of the glass was the CONTROL DASHBOARD, which only shows the swarm's files -- it never let the
+; user say anything to her. Her CLI chats live in panes owned by the PTY server, like every other agent,
+; so the dock is the SAME model placed differently:
+;   the dock  a column QP_W wide on the right edge (the panel regime of queen.t27: it opens at qp_left, and
+;             the content math never forks -- glass just adds the dock into the one panel flag it passes on);
+;   the chat  the pane grid of the Queen's session, resized to the dock and read through the same pty
+;             polling the content pane uses; the transcript IS her terminal;
+;   the input a one-line box at the foot. What is typed is collected in the dock's own buffer; Enter sends
+;             the buffer's bytes plus CR into her pane (pty_client client_keys) and clears it. While the
+;             dock is open the window's keystrokes go to the buffer, not straight to the pane.
+; Decisions that live here, all pure: geometry, the dock's grid dims, the buffer edit (typing, backspace,
+; paste with the printable cap), the send framing, the session pick, and who wins the one right dock.
+; The host calls (client_keys, client_resize) and the drawing belong to glass_window.t27.
+; The dock excludes the other right panels: opening one closes the other; exactly one thing docked right.
+
+module T27osQueenChats;
+
+use t27os::queen::QP_W;
+use t27os::queen::QP_PAD;
+use t27os::queen::qp_left;
+use t27os::agents::AGENT_QUEEN;
+use t27os::term_pane::TP_CELL_W;
+use t27os::term_pane::TP_LINE_H;
+use t27os::term_pane::TP_COLS_MIN;
+use t27os::term_pane::TP_COLS_MAX;
+use t27os::term_pane::TP_ROWS_MIN;
+use t27os::term_pane::TP_ROWS_MAX;
+
+// ---------------------------------------------------------------- geometry
+
+pub const RC_TITLE : str = "QUEEN CHAT";
+pub const RC_TITLE_Y : f64 = 20.0;
+pub const RC_TERM_PAD : f64 = 12.0;
+pub const RC_TERM_TOP : f64 = 44.0;
+pub const RC_IN_H : f64 = 40.0;
+pub const RC_IN_GAP : f64 = 12.0;
+pub const RC_TEXT_MAX : usize = 200;
+pub const RC_CR : u8 = 13;
+
+/// The dock's left edge: the panel regime (the same edge and width the other right panels use).
+pub fn rc_left(sw : f64) -> f64 { return qp_left(sw); }
+
+/// The transcript rectangle (`top` = the top of the workspace, `foot` = the height of the status bar):
+/// between the title and the input line, never under either.
+pub fn rc_term_rect(sw : f64, sh : f64, top : f64, foot : f64, out : []f64) -> bool {
+    out[0] = rc_left(sw) + RC_TERM_PAD;
+    out[1] = top + RC_TERM_TOP;
+    out[2] = QP_W - 2.0 * RC_TERM_PAD;
+    out[3] = sh - foot - out[1] - RC_IN_GAP - RC_IN_H;
+    return out[2] > 0.0 and out[3] >= 4.0 * TP_LINE_H;
+}
+
+/// The input line rectangle: full panel width minus the pad, at the foot above the status bar.
+pub fn rc_input_rect(sw : f64, sh : f64, top : f64, foot : f64, out : []f64) -> bool {
+    out[0] = rc_left(sw) + QP_PAD;
+    out[1] = sh - foot - RC_IN_GAP - RC_IN_H;
+    out[2] = QP_W - 2.0 * QP_PAD;
+    out[3] = RC_IN_H;
+    return out[2] > 0.0;
+}
+
+pub fn on_input(x : f64, y : f64, sw : f64, sh : f64, top : f64, foot : f64, ln : usize) -> bool {
+    var r : [4]f64 = undefined;
+    if (rc_input_rect(sw, sh, top, foot, r[0..4]) == false or y < r[1] or y >= r[1] + r[3] or x < r[0] or x >= r[0] + r[2]) { return false; }
+    return x >= r[0] + @as(f64, @floatFromInt(ln)) * 7.2 or y < r[1] + r[3] * 0.5;
+}
+
+// ---------------------------------------------------------------- the dock's grid dims
+
+/// The pane's cols at the dock: the transcript width divided by the cell width, clamped to the observed
+/// terminal bounds. The pane is resized to these while the dock is open, so her terminal wraps for it.
+pub fn rc_grid_cols(w : f64) -> u32 {
+    if (w < 0.0) { return TP_COLS_MIN; }
+    var c : u32 = (w / TP_CELL_W) as u32;
+    if (c < TP_COLS_MIN) { c = TP_COLS_MIN; }
+    if (c > TP_COLS_MAX) { c = TP_COLS_MAX; }
+    return c;
+}
+
+/// The pane's rows at the dock: the transcript height divided by the line height, clamped the same way.
+pub fn rc_grid_rows(h : f64) -> u32 {
+    if (h < 0.0) { return TP_ROWS_MIN; }
+    var r : u32 = (h / TP_LINE_H) as u32;
+    if (r < TP_ROWS_MIN) { r = TP_ROWS_MIN; }
+    if (r > TP_ROWS_MAX) { r = TP_ROWS_MAX; }
+    return r;
+}
+
+// ---------------------------------------------------------------- the input buffer
+
+/// A typed unit joins only when it prints: bytes 20h..7eh (the dock input, unlike the pane, holds no
+/// control sequences itself).
+pub fn rc_takes(unit : u8) -> bool { return unit >= 32 and unit < 127; }
+
+/// The buffer keeps the text at 0 and its length in one byte at RC_TEXT_MAX; returns the new length.
+pub fn rc_type(t : []u8, unit : u8) -> usize {
+    var n : usize = t[RC_TEXT_MAX] as usize;
+    if (rc_takes(unit) == false or n >= RC_TEXT_MAX) { return n; }
+    t[n] = unit;
+    n = n + 1;
+    t[RC_TEXT_MAX] = n as u8;
+    return n;
+}
+
+/// Backspace removes one printing unit (the bytes before the length), never the length byte itself.
+pub fn rc_back(t : []u8) -> usize {
+    var n : usize = t[RC_TEXT_MAX] as usize;
+    if (n == 0) { return 0; }
+    n = n - 1;
+    t[n] = 0;
+    t[RC_TEXT_MAX] = n as u8;
+    return n;
+}
+
+/// The send payload: the buffer, then CR. t must hold the whole payload when it returns.
+pub fn rc_payload(t : []u8) -> usize {
+    var n : usize = t[RC_TEXT_MAX] as usize;
+    t[n] = RC_CR;
+    return n + 1;
+}
+
+/// After a send (or a close) the line is empty again: the bytes and the CR byte the send left behind
+/// are zeroed, and the length returns to zero.
+pub fn rc_clear(t : []u8) -> void {
+    var i : usize = t[RC_TEXT_MAX] as usize + 1;
+    t[RC_TEXT_MAX] = 0;
+    while (i > 0) {
+        i = i - 1;
+        t[i] = 0;
+    }
+}
+
+// ---------------------------------------------------------------- the session and the one dock
+
+/// The chat follows the Queen's session: the index carries the Queen when it is open, else none -- glass
+/// opens one in the chosen space (windows.t27 add_session) before the dock shows anything.
+pub fn rc_session_good(cur : u32, agent : u32) -> bool {
+    return cur != 4294967295 and agent == AGENT_QUEEN;
+}
+
+/// Who wins the one right dock: the chat excludes every other right panel, and a panel open keeps it out.
+pub fn rc_wins(queenpanel : bool, doctor : bool, keys : bool, profile : bool) -> bool {
+    if (queenpanel or doctor or keys or profile) { return false; }
+    return true;
+}
+
+/// Opening the dock is one bit; pressing again closes it.
+pub fn rc_flip(open : bool) -> bool { return open == false; }
+
+/// The header switch: a QUEEN CHAT box left of the page switch (dash.t27 switch_x), same size, so the
+/// right cluster reads QUEEN CHAT beside the page cycle and the profile circle stays put.
+pub fn qc_left_of_switch(switch_l : f64) -> f64 { return switch_l - 8.0 - QC_W; }
+pub fn on_qc_switch(x : f64, y : f64, switch_l : f64, ws_top : f64) -> bool {
+    const l : f64 = qc_left_of_switch(switch_l);
+    return x >= l and x <= l + QC_W and y >= ws_top + 11.0 and y <= ws_top + 33.0;
+}
+pub const QC_W : f64 = 84.0;
+
+/// The dock is live only while the chat follows the Queen's session.
+pub fn rc_docked(dock_open : bool, cur : u32, agent : u32) -> bool {
+    if (dock_open == false) { return false; }
+    return rc_session_good(cur, agent);
+}
+
+/// A paste joins its printable bytes and stops at the cap; returns the length after.
+pub fn rc_paste(t : []u8, clip : []const u8, m : usize) -> usize {
+    var i : usize = 0;
+    var n : usize = t[RC_TEXT_MAX] as usize;
+    while (i < m) {
+        if (rc_takes(clip[i]) and n < RC_TEXT_MAX) {
+            t[n] = clip[i];
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    t[RC_TEXT_MAX] = n as u8;
+    return n;
+}
+
+invariant rc_dock_takes_the_panel_regime : QP_W >= 260.0 and QP_W <= 340.0 and RC_TEXT_MAX == 200;
+invariant rc_the_dock_never_swallows_a_control_byte : rc_takes(13) == false and rc_takes(27) == false and rc_takes(32) and rc_takes(126) and rc_takes(127) == false;
+invariant rc_input_sits_at_the_foot : RC_IN_H >= 32.0 and RC_IN_GAP >= 8.0;
+
+/// The dock reads the text store region that sits above the profile region (labelled in glass TBO_RC);
+/// these numbers fix its layout so the text and the length byte never overlap.
+invariant rc_buffer_layout : RC_TEXT_MAX < 512 and RC_TEXT_MAX + 1 <= 512;
+
+// ---------------------------------------------------------------- tests
+
+test the_dock_binds_to_the_panel_geometry {
+    const sw : f64 = 1400.0;
+    assert rc_left(sw) == qp_left(sw);
+    assert QP_W > 0.0;
+    var r : [4]f64 = undefined;
+    assert rc_term_rect(sw, 700.0, 34.0, 20.0, r[0..4]);
+    assert r[0] == sw - QP_W + RC_TERM_PAD and r[2] == QP_W - 2.0 * RC_TERM_PAD;
+    assert r[1] == 34.0 + RC_TERM_TOP;
+    assert r[3] == 700.0 - 20.0 - 34.0 - RC_TERM_TOP - RC_IN_GAP - RC_IN_H;
+    var i : [4]f64 = undefined;
+    assert rc_input_rect(sw, 700.0, 34.0, 20.0, i[0..4]);
+    assert i[0] == sw - QP_W + QP_PAD and i[2] == QP_W - 2.0 * QP_PAD;
+    assert i[1] == 700.0 - 20.0 - RC_IN_GAP - RC_IN_H;
+    // transcript and input never overlap, and neither slides under the status bar
+    assert r[1] + r[3] <= i[1];
+    assert i[1] + i[3] <= 700.0 - 20.0;
+}
+
+test the_grid_fits_the_dock_and_stays_in_the_observed_bounds {
+    const w : f64 = QP_W - 2.0 * RC_TERM_PAD;
+    var r : [4]f64 = undefined;
+    assert rc_term_rect(1400.0, 700.0, 34.0, 20.0, r[0..4]);
+    const c : u32 = rc_grid_cols(r[2]);
+    const rows : u32 = rc_grid_rows(r[3]);
+    assert c >= TP_COLS_MIN and c <= TP_COLS_MAX;
+    assert rows >= TP_ROWS_MIN and rows <= TP_ROWS_MAX;
+    assert (c as f64) * TP_CELL_W <= r[2] + TP_CELL_W;
+    assert rc_grid_cols(-1.0) == TP_COLS_MIN;
+    assert rc_grid_rows(-1.0) == TP_ROWS_MIN;
+}
+
+test typing_edits_the_line_and_the_send_frames_it {
+    var t : [512]u8 = undefined;
+    t[RC_TEXT_MAX] = 0;
+    var n : usize = 0;
+    n = rc_type(t[0..512], 'h');
+    n = rc_type(t[0..512], 'i');
+    n = rc_type(t[0..512], '!');
+    assert n == 3 and t[0] == 'h' and t[1] == 'i' and t[2] == '!';
+    assert rc_payload(t[0..512]) == 4 and t[3] == RC_CR;
+    rc_clear(t[0..512]);
+    assert t[RC_TEXT_MAX] == 0 and t[3] == 0;
+    // control units never join and the cap holds
+    assert rc_type(t[0..512], 27) == 0;
+    var i : usize = 0;
+    while (i < RC_TEXT_MAX) { assert rc_type(t[0..512], 'x') == i + 1; i = i + 1; }
+    assert rc_type(t[0..512], 'y') == RC_TEXT_MAX;
+    // backspace
+    rc_clear(t[0..512]);
+    n = rc_type(t[0..512], 'a');
+    n = rc_type(t[0..512], 'b');
+    n = rc_back(t[0..512]);
+    assert n == 1 and t[0] == 'a';
+    assert rc_back(t[0..512]) == 0;
+    assert rc_back(t[0..512]) == 0;
+}
+
+test one_dock_at_a_time_and_the_queen_session_carries_it {
+    assert rc_wins(false, false, false, false);
+    assert rc_wins(false, false, false, false) and rc_wins(true, false, false, false) == false;
+    assert rc_wins(false, true, true, true) == false;
+    assert rc_flip(false) and rc_flip(true) == false;
+    // the Queen's own number, the centre cell of the comb; index 0 is a real session, none is not
+    assert AGENT_QUEEN == 4;
+    assert rc_session_good(0, AGENT_QUEEN);
+    assert rc_session_good(3, AGENT_QUEEN);
+    assert rc_session_good(4294967295, AGENT_QUEEN) == false;
+    assert rc_session_good(0, AGENT_QUEEN + 1) == false;
+}
+
+test the_header_switch_sits_left_of_the_page_switch_and_the_paste_holds_the_cap {
+    // dash.t27 switch_x(1440.0) = 1440.0 - 42.0 - 8.0 - SWITCH_W; the QUEEN CHAT box is its left neighbour
+    const l : f64 = qc_left_of_switch(1306.0);
+    assert l == 1306.0 - 8.0 - QC_W;
+    assert on_qc_switch(l + 1.0, 42.0 + 11.0 + 1.0, 1306.0, 42.0);
+    assert on_qc_switch(l - 1.0, 64.0, 1306.0, 42.0) == false;
+    assert on_qc_switch(l + 10.0, 42.0 + 33.0 + 1.0, 1306.0, 42.0) == false;
+    var t : [512]u8 = undefined;
+    t[RC_TEXT_MAX] = 0;
+    var clip : [8]u8 = ['a', 13, 'b', 'c', 127, 200, 'd', 'e'];
+    assert rc_paste(t[0..512], clip[0..8], 8) == 5;
+    assert t[0] == 'a' and t[1] == 'b' and t[4] == 'e' and t[RC_TEXT_MAX] == 5;
+    var i : usize = rc_paste(t[0..512], clip[0..8], 0);
+    while (i < RC_TEXT_MAX) { i = rc_paste(t[0..512], clip[0..8], 8); }
+    assert t[RC_TEXT_MAX] == RC_TEXT_MAX;
+    rc_clear(t[0..512]);
+    // the dock is live only when the chat follows the Queen's session
+    assert rc_docked(false, 0, AGENT_QUEEN) == false;
+    assert rc_docked(true, 0, AGENT_QUEEN + 1) == false;
+    assert rc_docked(true, 0, AGENT_QUEEN);
+}

@@ -592,3 +592,63 @@ Result: nothing new dated after 2026-10-18 was found for any of the items below.
 - IHP-Open-PDK. Newest commit on the IHP-GmbH default branch list is 2026-09-01 ("Dev -> Main", changelog entries since v0.3.0) [V] (src:ihp-gh-commits). Our pinned commit 21133f21 resolves to a merge dated 2026-09-08 from a fork's upstream-sync branch [V] (src:ihp-pin-commit); whether its model files equal upstream's is not checked [U].
 
 Consequence for this file: none for the claims of sections 0 to 8. For the next refresh: re-read the VACASK release list, the ngspice news page and the cpphdl commit list; read the full text of the 2026 electromagnetic-transient paper if the publisher page opens.
+
+---
+
+## 12. Competitor delta 2026-10-24
+
+Written 2026-10-24 against origin/master at 3c7dec11ba (issue #12026). Method: WebSearch and WebFetch on 2026-10-24; no code was run and nobody was contacted. The window is the five days since section 11 (2026-10-19), plus items older than that which the baseline did not carry. Tags: [V] read on the primary page, [S] search result only, [U] not confirmed, [I] inference. Weakness labels W1 to W19 are those of section 7 and of "Found while building".
+
+Result: nothing changes the positioning of sections 0 and 7. No FPGA or hardware emulator of transistor-level circuits with compact models appeared, no GPU or FPGA SPICE work targets this chain, and nothing new was said about uberWAVE. Three items touch the reference chain and the speed bar; each has an action in the last list.
+
+Inside the window (2026-10-19 to 2026-10-24):
+
+- TreeSPICE, pull request 17. Opened 2026-10-18, merged 2026-10-19: an open-source (Apache-2.0, C++17) SPICE engine with a multifrontal direct solver; the GPU path is still being built and the CPU path runs today. The pull request says the IHP SG13G2 passive, diode and bipolar device classes it lists agree with ngspice 47, with DC differences of about 1e-5 to 1e-9; these are the author's figures and were not rerun here [V for the page, U for the numbers]. PSP103 is not listed as a covered device class, and the README and the pull request disagree on test counts [V]. W10 and W13 only: a second engine, but not a usable reference without PSP103 (src:treespice).
+- IHP-Open-PDK, dev branch, 2026-10-18 to 2026-10-23: a resistor variation restructure, a cmim formula fix, antenna diode convergence (pull request 1294), SG13CMOS5L antenna models and a PyCell merge (pull request 1289) [V]. None of it is a PSP103 change: the history of cornerMOSlv.lib ends on 2025-05-20, and the newest commit on main is still 2026-09-01 [V]. W8: the pin 21133f21 (a merge dated 2026-09-08) carries the same PSP103 and corner content as dev as far as the file history shows [I]; the file hashes are not compared yet (#12027) (src:ihp-dev).
+- VACASK, two commits on 2026-10-22; the newest skips the Newton-Raphson check maxima when nothing reads them, with a run-time gain of about 0 to 5 percent and identical output on four cases, both reported by the author [V for the commit, U for the numbers]. The newest release is still 0.3.4 (2026-09-13) [V]. W7 and W13: no change (src:vacask).
+- cpphdl analog, commits from 2026-10-21 to 2026-10-24 on analog models, a 1G receiver and IHP verification. The analog README still describes modified nodal analysis, damped Newton and backward Euler with ngspice compact models, and still states no FPGA and no hardware execution [V]. Same position as section 5.4; whether the word RTL in commit titles implies an FPGA path is [U] (src:cpphdl).
+- arXiv 2610.31024, submitted 2026-10-22: neural networks replace BSIM-CMG current and charge for a 3 nm nanosheet inside standard-cell characterisation; the abstract reports up to 8 times less time and a delay error below 0.11 percent [V, abstract]. No PSP, no named simulator, no hardware. W3 and W4: a different device family and a software flow; no PSP103 neural surrogate was found [S] (src:arxiv-2610-31024).
+- 2AMLogic, a public organisation of analog blocks made with AI help, two of them on IHP SG13G2 (an LDO and a PLL), activity on 2026-10-24, no FPGA or emulation mention [V]. An issue on its VCO repository reports a NaN DC operating point with an OSDI varactor under ngspice 47, cause unconfirmed [U]. W13 and W15: the ngspice reference itself can fail on an SG13G2 cell; the repositories are a possible source of netlists for the supported subset (src:2amlogic).
+- ngspice: the newest release is still 47 (2026-08-11) [V]; a third-party issue of 2026-10-11 mentions a development branch pre-master-48 [S]. No change (src:ngspice-news).
+
+Older than the window, absent from the baseline:
+
+- OpenVAF-Reloaded, tag _osdi_0.5_20260820: published 2026-10-14 06:50 UTC at commit 3e360c1; the notes name an absolute-delay enhancement (OSDI 0.5), and OSDI 0.4 stays the default on master [V]. The assets could not be loaded and later commits are unknown (the API answered 403) [U]. Section 11 cites only _20260610. W8 and W13: an .osdi file from a 0.4 and from a 0.5 compiler is a different binary contract. PSP103 has no delay element, so the values should not move [I], but a receipt must name the compiler commit and the OSDI version (#12027) (src:openvaf-osdi05).
+- IIC-OSIC-TOOLS issue 375 and pull request 378: opened 2026-10-06, fixed 2026-10-07. The 2026.09 container image shipped an OpenVAF built for OSDI 0.4, so VACASK models using absdelay ran with zero delay and no error; the fix pins OpenVAF to a branch at fbd1d4a1 [V]. The pull request says ngspice 47 accepts OSDI 0.4 and newer; that is the author's statement and was not tested here [V for the page]. W8 and W13: a documented silent difference of a reference by tool version, so a reproducible reference is a property of the whole container image. PSP103 itself is not affected [I] (src:iic-375).
+- Synopsys PrimeSim SPICE on GPU: a press release of 2026-07-26 reports up to 18 times on NVIDIA GPUs against CPU-only runs, the GPU model not named [V]. A 3.5 times customer figure on a B200 from a 2026-03 conference page is search only [S]. No ZeBu or FPGA statement for analog. W7: this is the number a speed claim would be read against (src:synopsys-2026-07).
+- Cadence Spectre X: a press release of 2026-03-17 announces GPU acceleration; a customer figure of up to 5 times comes from search snippets because the page answered 403 [S]. No 2026 Palladium or Protium announcement for analog or mixed-signal emulation was found [S]. W7, same as above (src:cadence-2026-03).
+- OPAL-RT, High-Speed Converter Solver, 2026-09-21: a capability inside eHS for fast switching networks (SiC, GaN); the release states no step size, number format or limits [V]. Power electronics, a different domain (src:opalrt-hscs).
+- Typhoon HIL 2026.1 and 2026.3: the UltraCore solver with a 3.5 ns step moved from announcement to release in 2026.1 (2026-02), and the 2026.3 highlights are dated 2026-08 [S]; the 2026.3 contents are [U] because the PDF could not be read. It confirms 3.5 ns as the fastest published step in that field; our step is a different regime (src:typhoon-highlights).
+- Siemens Veloce, a real-number-model PLL talk on an event listing, date not verified, details [U]; real-number models are behavioural, the contrast already drawn in section 4 (src:ams-signals).
+- Xyce: the repository feed dates release 7.10 as 2025-09-22, while section 11 gives 2025-07-21 from the GitHub release page; the two sources disagree and section 11 is left as written (src:xyce-feed).
+- uberWAVE: the NLnet page, read 2026-10-24, shows no milestones and no release [V]. W9: nothing to react to (src:nlnet-uberwave).
+
+Checked, nothing new: FPGA or hardware emulation of transistor-level circuits (the one hit of 2026-10-16, MDPI Electronics 15(20):4762, is about data converters embedded in FPGAs [V]); GPU or FPGA SPICE research beyond the items above; neural or tabulated PSP103 surrogates [S]. Not rechecked after 2026-10-19: msdsl, anasymod, and OpenVAF-Reloaded commits after 2026-10-14 [U].
+
+Pareto reading [I]:
+
+1. The reference chain is not pinned by tool version (OpenVAF OSDI 0.4 against 0.5; IIC-OSIC-TOOLS issue 375). Action: write the OpenVAF commit and the OSDI version of the compiled PSP103 model into every ngspice receipt and confirm once that the pinned ngspice-47 loads it (#12027).
+2. The IHP dev branch moves daily and our pin is a 2026-09-08 commit. The files that matter show no change, so the claim stands today, but nothing guards it. Action: compare the content hashes of the PSP103 model file and cornerMOSlv.lib at 21133f21 with current dev and main, and write the result into the receipt (#12027).
+3. The commercial speed bar is now concrete: up to 18 times for GPU PrimeSim against CPU, and about 5 times for a Spectre X customer [S]. Action: keep "no speed claim" (W7) in the release notes; in the benchmark plan name these two as the comparison and count the table-build and reference-run cost on our side.
+
+Nothing else changed, so sections 0 and 7 stand as written. The next refresh re-reads: the OpenVAF-Reloaded release list, the IHP-Open-PDK dev log for PSP103 files, the VACASK release list and the cpphdl analog README.
+
+Sources of section 12 (every URL used):
+
+- treespice - https://github.com/Seshak-code/TreeSPICE and https://github.com/Seshak-code/TreeSPICE/pull/17
+- ihp-dev - https://github.com/IHP-GmbH/IHP-Open-PDK (branch dev)
+- vacask - https://codeberg.org/arpadbuermen/VACASK
+- cpphdl - https://github.com/mirekez/cpphdl and https://raw.githubusercontent.com/mirekez/cpphdl/main/analog/README.md
+- arxiv-2610-31024 - https://arxiv.org/abs/2610.31024
+- 2amlogic - https://github.com/2AMLogic
+- ngspice-news - https://ngspice.sourceforge.io/news.html
+- openvaf-osdi05 - https://github.com/OpenVAF-Reloaded/OpenVAF/releases/tag/_osdi_0.5_20260820
+- iic-375 - https://github.com/iic-jku/IIC-OSIC-TOOLS/issues/375 and https://github.com/iic-jku/IIC-OSIC-TOOLS/pull/378
+- synopsys-2026-07 - https://news.synopsys.com/2026-07-26-Synopsys-Showcases-Comprehensive-Autonomous-Engineering-Workflows-from-Silicon-to-Systems,-Developed-with-NVIDIA-Technology
+- cadence-2026-03 - https://www.cadence.com/en_US/home/company/newsroom/press-releases/pr/2026/cadence-and-nvidia-unveil-accelerated-engineering-solutions.html (search result only, page answered 403)
+- opalrt-hscs - https://www.opal-rt.com/press-room/high-speed-converter-solver1/
+- typhoon-highlights - https://www.typhoon-hil.com/wp-content/uploads/2026/02/2026.1_Software_Highlights_EN.pdf and https://www.typhoon-hil.com/wp-content/uploads/2026/08/2026.3-Software-Highlights-EN.pdf
+- ams-signals - https://ams-signals.com/events/
+- xyce-feed - https://github.com/Xyce/Xyce/releases
+- nlnet-uberwave - https://nlnet.nl/project/uberWAVE/
+- mdpi-converters - https://www.mdpi.com/2079-9292/15/20/4762
