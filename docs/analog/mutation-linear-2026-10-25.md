@@ -1,8 +1,9 @@
 # Mutation test gaps of specs/analog/linear.t27, 2026-10-25
 
 Issue #12275, part of epic #10486 (weak spots of the analog v0.1 release). This lane wrote the missing asserts, the
-accepted file and this note. It did not run the mutation gate and did not save a seal: both are the orchestrator's.
-Where each number comes from:
+accepted file and this note. It did not run the mutation gate and did not save a seal: both are the orchestrator's. The
+orchestrator ran the gate on this tree afterwards; the result is in the section "Gate result". Where each number comes
+from:
 
 - **Census** (420 mutants, 316 killed, 61 survived, 38 hung, 5 unviable) is the analog-loop census of the unmodified
   spec on 2026-10-25, tree 1c783b0b31, a master-built compiler, run by `tri mutate spec`. The 61 survivors were
@@ -13,7 +14,9 @@ Where each number comes from:
   passes 0 of 26. The 14 existing tests are unchanged (145 counted asserts); the 12 new tests count 98 asserts, 243 in
   all.
 - **Which assert kills which mutant** is a by-hand reading of the mutated text against the assert, written next to each
-  new assert as a comment. It is not measured: the gate has not been run on this tree.
+  new assert as a comment. The gate measured the total, not this attribution: all 35 test-gap survivors are now killed,
+  each by a failing test and none by an invariant (section "Gate result"). Which assert fails on which mutant stays a
+  reading.
 
 Kinds among the 61 survivors: flip-cmp 20, swap-arith 33, swap-logic 3, drop-step 4, ret-default 1.
 
@@ -112,9 +115,25 @@ The 5 unviable entries differ from the other accepted files (`sar_comparator_qi`
 because the issue counts them in the 69. Reading `gate_counts` in `cli/tri/src/mutate.rs`: an entry is checked per line
 and kind, and it is stale (exit 2, "ACCEPTED BUT KILLED") only when mutants of that line and kind ran and all were
 killed; unviable mutants are left out of that test, and each of the five lines carries only its one `ret-default`
-mutant, so the five entries are inert today. That is a reading of the source: the gate has not been run with this
-file. If the orchestrator's gate run disagrees, delete the five entries and keep the five lines as comments, as the
-other files do; nothing else changes.
+mutant, so the five entries are inert today. The gate run confirmed this reading: it passed with the file unchanged, so
+the five entries stay (section "Gate result").
+
+## Gate result
+
+Run by the orchestrator on this tree on 2026-10-25, 13:14:15 to 13:27:00 (+07), with the master-built compiler, jobs 3,
+timeout 30: `tri mutate spec --file specs/analog/linear.t27 --accepted docs/analog/mutation-accepted-linear.txt`, exit
+0, "Gate passed".
+
+- **Mutants:** 420, of which 351 killed (all by a failing test, 0 by an invariant), 26 survived, 38 hung, 5 unviable.
+- **Against the census of the unmodified spec** (316 killed, 61 survived, 38 hung, 5 unviable) the added tests turned
+  35 survivors into kills: 316 + 35 = 351 and 61 - 35 = 26. The 26 survivors match the 18 equivalent, 7 dead line and 1
+  undecided mutants of the tables above (18 + 7 + 1 = 26).
+- **Survivor gate:** 64 mutants not killed (26 survived, 38 hung), 64 accepted by the accepted file, 0 accepted lines now
+  killed. No survivor is unaccepted and no entry is stale.
+- **Unviable entries:** the 5 entries (lines 277, 392, 397, 407, 654, kind `ret-default`) are kept. As predicted from
+  reading `gate_counts`, the gate ignores an entry whose mutants were all unviable, and it passed with the file
+  unchanged, so the five entries are inert. They become a signal if the emitter later lets one of those mutants run and
+  a test kills it: the entry is then stale and the gate fails.
 
 ## Caveats (what is by hand or not established)
 
@@ -132,18 +151,16 @@ other files do; nothing else changes.
 - **441 and 442**: whether any other spec calls `stamp` or `derive` on a table `table_ok` refuses is not established. A
   repo-wide search for callers of `AnalogLinear` was not completed. A caller would move these seven from dead line to
   test gap.
-- **The by-hand kill reading** of every group is not measured. The group D assert on `peak` (16649635 and 126610) and
-  the group A and B values passed on the unmodified spec at the first run, so the expected values are right; that each
-  assert fails on its mutant is the reading above.
+- **The by-hand kill reading** of every group is the per-assert attribution only. The gate measured that all 35
+  test-gap survivors are killed, each by a failing test; it did not name the assert. The group D assert on `peak`
+  (16649635 and 126610) and the group A and B values passed on the unmodified spec at the first run, so the expected
+  values are right; that a given assert is the one that fails on a given mutant is the reading above.
 
 ## Not done
 
-- The mutation gate has not been run: not on the unmodified spec (the first step of the issue, which compares the counts
-  with 420 / 316 / 61 / 38 / 5) and not on this tree. The orchestrator runs it with
-  `tri mutate spec --file specs/analog/linear.t27 --accepted docs/analog/mutation-accepted-linear.txt`.
-- The seal of `AnalogLinear` is not re-saved (`tri seals changed`, orchestrator); the appended tests change the spec, so
-  the seal is stale until then.
+- The seal of `AnalogLinear` was re-saved by `tri seals changed` (seal-save and seal-recheck exit 0, importer seals exit
+  0 with nothing else changed) and `t27c seal specs/analog/linear.t27 --verify` exits 0; `tri test` on the spec gives
+  26/26 with 0 vacuous.
 - 463 `>=` has no test (no expected value is derived).
-- `tri coverage --strict` and the CI docs check were not run in this lane.
-- The unviable-entry question above is open until the gate runs.
+- `tri coverage --strict` and the CI docs check were not run in this lane; the orchestrator runs coverage separately.
 - The dead lines 441 and 442 are not removed and not pinned.
