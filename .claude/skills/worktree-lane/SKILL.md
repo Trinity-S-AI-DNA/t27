@@ -76,7 +76,7 @@ behind a step lives in one place and is pointed at, not copied: landing is `own-
 ## Traps
 
 - The installed `tri` can be older than the specs: `tri trigit` exists, but `tri golden land|push` and
-  `tri git` may be missing or answer something else. Check `tri golden status` before relying on it; a fresh
+  the other git verbs may be missing or answer something else. Check `tri golden status` before relying on it; a fresh
   binary comes from the lab, not from a build on the Mac.
 - A pane that prints `API Error: 401` or `429` is handled by the key master's failover (key, then model, then
   profile); do not edit keys by hand and never print one. If every key rests, the pane waits.
