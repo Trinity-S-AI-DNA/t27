@@ -297,8 +297,6 @@ fn parameterized_beyond_the_cut_is_refused_by_name() {
 // t27f.build name (frames 1/2/3/65, latency 96/256, paints 0/1/1).
 #[test]
 fn live_closure_trio_module_node_verifies() {
-    use std::path::Path;
-    use std::process::Command;
     let spec = Path::new("../../../specs/t27f/live_scalar_closure.t27");
     if !spec.exists() {
         eprintln!("closure spec not found; skipping");
@@ -363,4 +361,42 @@ console.log(ok?'MC OK':'MC MISMATCH');";
     let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the M-C gate needs Node's WebAssembly");
     assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("MC OK"), "a comparison mismatched in a standard runtime");
+}
+
+// The floor-12 cut (memory + data, the struct path's first missing floor in
+// #5980's dependency order): `emit` without an image is byte-identical to
+// the scalar cut; `emit_with_image` mounts the image as linear memory sized
+// pages_for(len), min = max, one active data segment at offset 0 -- and a
+// standard runtime validates the module.
+#[test]
+fn data_image_mounts_as_memory_and_one_segment() {
+    let p = prog(vec![fn_const_ret("the_answer", Ty::I32, 42)]);
+    assert_eq!(wasm32_emitter::emit(&p).expect("emit").len(), 43); // no image: unchanged
+    let m = wasm32_emitter::emit_with_image(&p, &[42, 0, 0]).expect("emit");
+    let mut want = Vec::new();
+    want.extend_from_slice(b"\0asm\x01\x00\x00\x00"); // magic, version 1
+    want.extend_from_slice(&[0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]); // type
+    want.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // function
+    want.extend_from_slice(&[0x05, 0x04, 0x01, 0x01, 0x01, 0x01]); // memory: 1 page, min=max
+    want.extend_from_slice(&[0x07, 0x0e, 0x01]); // export
+    want.extend_from_slice(b"\x0athe_answer\x00\x00");
+    want.extend_from_slice(&[0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b]); // code
+    want.extend_from_slice(&[0x0b, 0x09, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x03, 0x2a, 0x00, 0x00]); // data: 1 segment
+    assert_eq!(m, want);
+    assert_eq!(m.len(), 60);
+    // pages_for covers the image's tail page: the gx_ contract's 143,692
+    // bytes want exactly 3 pages (memtype 01 03 03)
+    let big = wasm32_emitter::emit_with_image(&p, &vec![0u8; 143_692]).expect("emit");
+    assert!(big.windows(6).any(|w| w == [0x05, 0x04, 0x01, 0x01, 0x03, 0x03]), "3 pages missing");
+    // a standard runtime compiles (validates) the mounted module
+    let dir = std::env::temp_dir().join(format!("t27b-wasm-mem-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("memdata.wasm");
+    std::fs::write(&path, &m).expect("write module");
+    let script = "const fs=require('fs');\
+new WebAssembly.Module(fs.readFileSync(process.argv[1]));\
+console.log('MEMDATA VALID');";
+    let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the floor-12 gate needs Node's WebAssembly");
+    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("MEMDATA VALID"), "the runtime refused the memory+data module");
 }
