@@ -427,7 +427,7 @@ Follow-up: #12432 (open) and #12512, PR #12540 (merged). Gate, from the note
 the seven deferred mutants not yet accepted) is in that note and not repeated here. Run 2 (49 min 19 s, with the five
 lab-value tests of #12512 in the spec and the six deferred entries still in the accepted file): 868 mutants, 712
 killed, 42 survived, 79 hung, 35 unviable, **exit 2**, because exactly the six deferred keys were now killed; the two
-extra unviable (line 699, swap-arith twice) were zig cache errors, not emitter refusals. The six entries were removed
+extra unviable (line 699, swap-arith twice) were zig cache errors, not emitter refusals (#12539). The six entries were removed
 (124 -> 118 entry lines: 39 equivalent entries naming the 42 equivalent survivors, and 79 hung). Confirmation gate on
 exactly the final 118-entry file (2026-10-26 03:29:42 to 04:18:12 +07, 48 min 30 s): 868 mutants, 714 killed, 42
 survived, 79 hung, 33 unviable (the two line-699 mutants are killed in this run); 121 not killed, all 121 accepted, 0
