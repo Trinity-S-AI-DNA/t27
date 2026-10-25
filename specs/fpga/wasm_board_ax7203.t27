@@ -106,6 +106,20 @@ pub const OP_LOCAL_GET : u8 = 0x20;
 pub const OP_LOCAL_SET : u8 = 0x21;
 pub const OP_LOCAL_TEE : u8 = 0x22;
 pub const OP_I32_CONST : u8 = 0x41;
+; P3 (2026-10-24): i64.const joins as the LOW-32 floor. OP_I64_CONST decodes the
+; same five-byte SLEB128 submachine as OP_I32_CONST and pushes the same u32 word:
+; for every i64 whose low 32 bits are what the answer contract expresses, a
+; canonical SLEB of five bytes or fewer exists (the fleet's 987654321 and -5 both
+; fit); a longer continuation at imm_cnt == 4 refuses with ERR_LEB, the same honest
+; boundary as i32. The 64-bit datapath itself stays a separate increment.
+pub const OP_I64_CONST : u8 = 0x42;
+; P4 (2026-10-24): the float consts join as RAW-BIT words -- no LEB at all. A real
+; wasm f32.const carries its four IEEE-754 bytes little-endian right after the
+; opcode, f64.const its eight; the floor pushes those bits as the u32 stack word:
+; f32 wholesale, f64 as the low 32 (its first four bytes), the same honest floor
+; as i64.const. Float arithmetic and the f64 high half stay a separate increment.
+pub const OP_F32_CONST : u8 = 0x43;
+pub const OP_F64_CONST : u8 = 0x44;
 pub const OP_I32_EQZ : u8 = 0x45;
 pub const OP_I32_EQ : u8 = 0x46;
 pub const OP_I32_NE : u8 = 0x47;
@@ -824,7 +838,7 @@ fn step_all(rxd : u8) {
                                 fail_rsp(ERR_LOCAL);
                             }
                         } else {
-                            if (scrap_op == OP_I32_CONST) {
+                            if (scrap_op == OP_I32_CONST or scrap_op == OP_I64_CONST) {
                                 scrap_imm = code[run_base + pc + 1];
                                 if ((scrap_imm & 0x80) != 0) {
                                     if (sp < STACK_MAX) {
@@ -845,6 +859,22 @@ fn step_all(rxd : u8) {
                                     }
                                 }
                             } else {
+                                if (scrap_op == OP_F32_CONST or scrap_op == OP_F64_CONST) {
+                                    if (sp < STACK_MAX) {
+                                        st[sp] = (code[run_base + pc + 1] as u32);
+                                        st[sp] = st[sp] | shl32((code[run_base + pc + 2] as u32), 8);
+                                        st[sp] = st[sp] | shl32((code[run_base + pc + 3] as u32), 16);
+                                        st[sp] = st[sp] | shl32((code[run_base + pc + 4] as u32), 24);
+                                        sp = sp + 1;
+                                        if (scrap_op == OP_F32_CONST) {
+                                            pc = pc + 5;
+                                        } else {
+                                            pc = pc + 9;
+                                        }
+                                    } else {
+                                        fail_rsp(ERR_STACK);
+                                    }
+                                } else {
                                 if (scrap_op == OP_I32_EQZ) {
                                     if (sp > 0) {
                                         if (st[sp - 1] == 0) {
@@ -1244,6 +1274,7 @@ fn step_all(rxd : u8) {
                                             }
                                         }
                                     }
+                                }
                                 }
                             }
                         }
@@ -2073,4 +2104,115 @@ test p2_roundtrip_errors {
     assert cap[1] == 63;
     assert err == ERR_PROG;
     assert frames - f0 == 0;
+}
+
+
+; P3 behavioral (the fleet's two programs, over the wire like p2_roundtrip, with
+; save/restore of page 0 so every other test sees the default image):
+;   42 B1 D1 F9 D6 03 0B  = i64.const 987654321; end   (the t27b emitter's exact bytes)
+;   42 7B 0B              = i64.const -5; end
+; the alias law first, as runtime facts
+test p3_i64_wire_programs {
+    assert OP_I64_CONST == 0x42;
+    assert OP_I32_CONST == 0x41;
+    var save : [12]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 12) { save[i] = uprog[i]; i = i + 1; }
+    uprog[0] = OP_I64_CONST;
+    uprog[1] = 0xB1;
+    uprog[2] = 0xD1;
+    uprog[3] = 0xF9;
+    uprog[4] = 0xD6;
+    uprog[5] = 0x03;
+    uprog[6] = OP_END;
+    uprog[7] = OP_I64_CONST;
+    uprog[8] = 0x7B;
+    uprog[9] = OP_END;
+    var r : u32 = host_load(0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    r = host_run_user(7, 0, 64, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 64;
+    assert cap[2] == 0xB1;
+    assert cap[3] == 0x68;
+    assert cap[4] == 0xDE;
+    r = host_run_user(3, 7, 65, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 65;
+    assert cap[2] == 0xFB;
+    assert cap[3] == 0xFF;
+    assert cap[4] == 0xFF;
+    i = 0;
+    while (i < 12) { uprog[i] = save[i]; i = i + 1; }
+}
+
+; P4 behavioral (the fleet's last named refusal, over the wire like p3, with
+; save/restore of page 0 so every other test sees the default image):
+;   43 00 00 20 40 0B                      = f32.const 2.5; end  (word 0x40200000)
+;   44 00 00 00 00 00 00 04 40 0B          = f64.const 2.5; end  (low32 0x00000000)
+;   44 18 2D 44 54 FB 21 09 40 0B          = f64.const pi; end  (0x400921FB54442D18,
+;                                           low32 0x54442D18 -- a nonzero low half, so
+;                                           the low-32 law is witnessed, not just a zero)
+; the raw-bit law first, as runtime facts
+test p4_f32_wire_programs {
+    assert OP_F32_CONST == 0x43;
+    assert OP_F64_CONST == 0x44;
+    var save : [26]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 26) { save[i] = uprog[i]; i = i + 1; }
+    uprog[0] = OP_F32_CONST;
+    uprog[1] = 0x00;
+    uprog[2] = 0x00;
+    uprog[3] = 0x20;
+    uprog[4] = 0x40;
+    uprog[5] = OP_END;
+    uprog[6] = OP_F64_CONST;
+    uprog[7] = 0x00;
+    uprog[8] = 0x00;
+    uprog[9] = 0x00;
+    uprog[10] = 0x00;
+    uprog[11] = 0x00;
+    uprog[12] = 0x00;
+    uprog[13] = 0x04;
+    uprog[14] = 0x40;
+    uprog[15] = OP_END;
+    uprog[16] = OP_F64_CONST;
+    uprog[17] = 0x18;
+    uprog[18] = 0x2D;
+    uprog[19] = 0x44;
+    uprog[20] = 0x54;
+    uprog[21] = 0xFB;
+    uprog[22] = 0x21;
+    uprog[23] = 0x09;
+    uprog[24] = 0x40;
+    uprog[25] = OP_END;
+    var r : u32 = host_load(0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    r = host_run_user(6, 0, 66, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 66;
+    assert cap[2] == 0x00;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x20;
+    r = host_run_user(10, 6, 67, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 67;
+    assert cap[2] == 0x00;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x00;
+    r = host_run_user(10, 16, 68, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 68;
+    assert cap[2] == 0x18;
+    assert cap[3] == 0x2D;
+    assert cap[4] == 0x44;
+    i = 0;
+    while (i < 26) { uprog[i] = save[i]; i = i + 1; }
 }

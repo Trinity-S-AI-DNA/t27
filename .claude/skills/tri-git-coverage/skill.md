@@ -85,3 +85,12 @@ Parse/help work: `t27c run specs/git/tri_workflow.t27 release-plan` and <!-- not
 `status-report` (ignore the "please install release build" note — the stub
 prints it by design, so confirm by overriding, never by trusting a bare run).
 The git release rules live in `specs/git/release_rules.t27`.
+
+## Traps
+
+- 2026-10-24 target/release/t27c was rebuilt by an unseen process mid-measurement (8.1MB Oct23 to 10.6MB Oct24), flipping from rejecting test-report to accepting it; record the binary mtime+size beside every tri test number or two runs of the same command measure different programs (12001)
+- 2026-10-24 a 0-based index assert is wrong by one more often than not: bar_at over ' | ' at offset 7 not 8, and starts_at('xghp_',1,5,'ghp_') is TRUE not false; run the test before trusting the sign of your own negative case (12001)
+- 2026-10-24 coverage-to-100 is safe when the spec already compiles and passes (lesson/tick/e2e/experience: just add bare-name calls); it is NOT a fix for a BLOCKED spec -- operations.t27 (5%) and diff.t27 (37%) do not compile, so raise the compiling ones first and file the broken ones (12001)
+- 2026-10-25 2026-10-25 own-language is shrink-only: a PR must net <= 0 lines in counting foreign files (.rs .py .html count, .t27 .md do not); compile gen/c/policy/own_language.c and feed it git diff --numstat BEFORE pushing, then rewrite the change as one traversal so deletions beat additions (#12192)
+- 2026-10-25 2026-10-25 gh pr checks --required names the checks auto-merge waits for; when fpga-lint, fpga-conformance or test-ratchet are red, first prove they are red on master with gh run list --workflow NAME --branch master, or you chase a failure your diff cannot fix (#12250)
+- 2026-10-25 2026-10-25 a seal scan run by a binary built from other sources prints hundreds of false STALE entries (278 once): cargo build --release -p t27c first, then tools/check_seal_currency.py means something (#12192)
