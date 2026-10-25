@@ -9,9 +9,14 @@ the accepted file and this note. Where each number comes from:
   035df5ce60 and this lane's base 368ce03b6d (`git diff` of the file is empty). The census ran in a pre-audit tree; no
   mutant was re-run in this lane. The classes of the 108 survivors are from reading the spec (and the converter
   `spice_convert.t27` where a test depends on it); nothing was classified by a tool.
-- **After** is NOT measured. This lane did not run the survivor gate (the brief forbids it) and did not re-save the
-  seal. The forecast, to be checked by the gate run that follows, is 677 mutants, 606 killed, 28 survived (27
-  equivalent, 1 dead), 31 hung, 12 unviable, and the gate passing on the accepted file below.
+- **After** (677 mutants, 608 killed, 26 survived, 31 hung, 12 unviable) is the survivor gate, `tri mutate spec` with
+  the accepted file as batch 2 left it, run by the analog loop in a T27 OS pane on this lane's tree, 2026-10-25
+  13:27-13:47 +07 (jobs 3, timeout 30 s, 20 min 9 s; 1-minute load 8.2 at the start). The forecast written before the
+  run was 606 killed and 28 survived; the run found 2 more killed. It exited 2 for one reason: two accepted lines, 592
+  and 597 (`flip-cmp` in the loops of `sl_init`), which the census reading had classed equivalent, are killed by the new
+  tests ("ACCEPTED BUT KILLED"). Both lines were removed from the accepted file after the run. Every other mutant that
+  was not killed (26 survived, 31 hung) is on an accepted line, and none of the 19 survivors of batch 2 is alive. The
+  run was not repeated on the file as it now stands: only a probe of the one function `sl_init` was (see Not claimed).
 - **Tests**: `tri test specs/analog/sar_logic.t27` in a T27 OS pane, a master-built `tri` and t27c, 2026-10-25 13:08 +07
   (load 22.7), end state of both batches: 44 tests (18 before, 26 new), 44 pass, 0 fail, 0 vacuous passes of 44,
   exit 0. After batch 1 alone it was 31 tests, all passing, 0 vacuous (12:18 +07, load 14).
@@ -21,7 +26,8 @@ ret-default 52. Among the 108 survivors: drop-guard 13, drop-step 4, flip-cmp 53
 
 ## The 108 survivors, and what became of each
 
-By reading: 27 equivalent, 80 test gap, 1 dead line, 0 undecided. Of the 80 test gaps, the 13 tests of batch 1 (P1 to
+By reading: 27 equivalent, 80 test gap, 1 dead line, 0 undecided (the gate run later showed 2 of the 27, lines 592 and
+597, to be killed, so 25 equivalent stay). Of the 80 test gaps, the 13 tests of batch 1 (P1 to
 P13) kill 61 (a distinct count: survivor #8, the tgate pass row at line 359, is named by both P3 and P11) and the 13
 tests of batch 2 (P14 to P26) kill the other 19. "#N" is the Nth survivor in census order. The mutant column follows
 the census text.
@@ -49,7 +55,8 @@ the census text.
 | 561 | drop `if (d < 1) { return 1; }` (#33) | dead line | kept, accepted |
 | 561 | `d < 1` to `d <= 1` (#34) | equivalent: both return 1 | accepted |
 | 570 | `n < gt[GT_NNET]` to `<=` in sl_net (#35) | test gap | killed by P23 |
-| 587, 592, 597, 609, 630 | `<=` in the loops of sl_init (587, 592, 597), sl_links (609) and sl_loads (630) (#36, #37, #40, #43, #48) | equivalent: spare or ghost slots nothing reads | accepted |
+| 587, 609, 630 | `<=` in the loops of sl_init (587), sl_links (609) and sl_loads (630) (#36, #43, #48) | equivalent: spare or ghost slots nothing reads | accepted |
+| 592, 597 | `g < GT_NGATE` and `j < 7` to `<=` in sl_init (#37, #40) | read as equivalent (ghost row; the next gate's slot 0, rewritten with the same value) | killed in the gate run; the tool does not say by which test, so no test is named here |
 | 593, 594 | `ms[SL_DRV + g]` and `ms[SL_PT + g]` to `-` in sl_init (#38, #39) | test gap | 2 killed by P8 |
 | 598 (2) | `g * 7 + j` to `g / 7 + j` and to `g * 7 - j` in sl_init (#41, #42) | test gap | 2 killed by P8 |
 | 610, 611 | `ms[SL_CELL + g]` and `ms[SL_FED + g]` to `-` in sl_links (#44, #45) | test gap | 2 killed by P16 |
@@ -87,14 +94,15 @@ the census text.
 | 1047, 1052 | `SL_H_REST + SL_H_FALL0` to `-`, and `t + 654` to `t - 654` in sl_chain_stim (#105, #106) | test gap | 2 killed by P19 |
 | 1085, 1093 | `e < tr` to `<=` in sl_chain_err_f (1085) and `e < tf` to `<=` in sl_chain_err_r (1093) (#107, #108) | test gap | 2 killed by P18 |
 
-Totals: 27 equivalent (accepted) + 1 dead line (kept, accepted) + 61 test gaps killed by batch 1 + 19 test gaps
-killed by batch 2 = 108. The census cannot say which assert kills which mutant, so the by-hand reading below stands
-in; the gate run that follows is the check.
+Totals: 25 equivalent (accepted) + 1 dead line (kept, accepted) + 61 test gaps killed by batch 1 + 19 test gaps
+killed by batch 2 + 2 read as equivalent and killed (592, 597) = 108. The gate run agrees on the count: 526 + 82 = 608
+killed, 26 survived (25 + 1). It cannot say which assert kills which mutant, so the by-test attribution above is by
+reading, checked for batch 2 by the single-mutant runs below.
 
 ## The hung 31, the unviable 12, and the accepted file
 
-`docs/analog/mutation-accepted-sar_logic.txt` has 58 entry lines: 26 equivalent, 1 dead line, 31 hung. The issue
-counts mutants and not lines: 27 equivalent + 1 dead + 31 hung + 12 unviable = 71. The 71 mutants are not 71 lines for
+`docs/analog/mutation-accepted-sar_logic.txt` has 56 entry lines: 24 equivalent, 1 dead line, 31 hung. The issue
+counts mutants and not lines: 25 equivalent + 1 dead + 31 hung + 12 unviable = 69. The 69 mutants are not 69 lines for
 two reasons.
 
 - The 12 unviable mutants (all `ret-default`, a body emptied, which zig refuses with `not yet implemented`: lines 584,
@@ -109,11 +117,11 @@ The 31 hung mutants are all `x = x + 1` turned into `x = x` in a loop counter (l
 986); the loop never ends, so no test can go red and only the clock ends the mutant. They are accepted by
 construction, as in the other analog notes. The counter and function of each is read from the spec, not run.
 
-The 80 killed survivors (61 of batch 1, 19 of batch 2) are not in the file, because an accepted line whose mutants
-are all killed makes the gate exit 2 as a stale line. In batch 1 the 19 survivors that batch 2 targets were listed as
-pending, as they were still alive; batch 2 killed them and removed those lines, so the file now holds only what stays
-alive on purpose. If the gate run finds one of the 19 still alive, its line goes back into the file as an equivalent
-entry with the finding, as the brief requires. No (line, kind) key is shared between an accepted entry and a killed
+The 82 killed survivors (61 of batch 1, 19 of batch 2, and the 2 of lines 592 and 597) are not in the file, because an
+accepted line whose mutants are all killed makes the gate exit 2 as a stale line; that is exactly what the gate run
+showed for 592 and 597. In batch 1 the 19 survivors that batch 2 targets were listed as pending, as they were still
+alive; batch 2 killed them and removed those lines, and the gate run confirmed that none of the 19 is alive, so the
+file now holds only what stays alive on purpose. No (line, kind) key is shared between an accepted entry and a killed
 survivor; the keys of the hung drop-step lines do not meet the four drop-step survivors (548, 556, 616, 803).
 
 ## The dead line (561)
@@ -278,21 +286,29 @@ Found by reading; none of it is changed by this lane.
 
 ## Not claimed
 
-- The survivor gate was not run in this lane, so the forecast above (606 killed, 28 survived, 31 hung, 12 unviable)
-  is not a measurement: FR-001 (a census re-run on the unmodified tree) and SC-001 (the gate on the changed tree) are
-  open. The 30 s mutant timeout was not re-measured with the 26 added tests, which lengthen the suite; a slower suite
-  can turn a killed mutant into a hung one, which the gate would show.
-- The seal of the spec was not re-saved (FR-003): the spec text changed, so its seal in `.trinity/seals/` is stale until
-  a master-built t27c saves it. `tri coverage --strict` and the CI checks were not run locally.
-- Both batches are written (#12237 and #12240), but the 19 survivors of batch 2 are removed from the accepted file on
-  the strength of the by-hand reading and the 19 single-mutant runs above, not of a gate run. If the gate finds one
-  still alive, its line is added back as an equivalent entry with the finding.
-- The 27 equivalent survivors are classified by reading the arithmetic, not proved equivalent by a tool. Three carry a
-  condition: #18 (line 488) holds only for the call `sl_delay` makes on a converter deck, and #60 and #77 (lines 680,
-  768) hold while an input has no driver in the circuit (the contract at line 678). The loop-bound `<=` equivalents
-  (lines 587, 592, 597, 609, 630, 639, 641, 730, 739, 752, 754, 767, 774) assume a deck below 128 nets and 160 gates
-  and a zeroed `gt`; a deck at capacity was not traced. If one of them is not equivalent after all, a later test kills
-  it and the gate reports that accepted line as stale.
+- The gate was run once, on the tree with both batches and the accepted file as it stood before lines 592 and 597 were
+  removed; it exited 2 because of those two lines. After the removal the full gate was NOT run again. What was run is
+  a probe of the one function `sl_init` (`tri mutate spec --fn sl_init`, jobs 2, timeout 45 s, 2026-10-25 14:05-14:08
+  +07, load 12 at the start): 17 mutants, 12 killed, 1 survived (line 587, accepted), 3 hung (589, 599, 601, accepted),
+  1 unviable, "0 accepted line(s) now killed", "Gate passed". It re-checks only the accepted lines inside that
+  function. Lines outside `sl_init`
+  are unchanged between the gate run and this tree, but the claim "the gate passes" rests on that argument and on the
+  CI check, not on a second full run. FR-001 (a census re-run on the unmodified tree) is also open: the "Before" column
+  is the analog-loop census of the unmodified spec, not a re-run in this lane.
+- The 30 s mutant timeout held for the 26 added tests: no killed mutant of the census turned into a hung one (31 hung,
+  as before). Only the load at the start of the run (8.2) was recorded, the load during the 20 minutes was not sampled.
+  At a high load (above 40) the pre-check of the unmutated spec times out, which is a property of the machine, not of
+  the spec.
+- The seal of the spec was re-saved by `tri seals changed` with a master-built t27c before the gate run, and the
+  working tree holds that seal; `tri coverage --strict` and the other CI checks were not run locally.
+- Both batches are written (#12237 and #12240); the gate run above found none of the 19 survivors of batch 2 alive.
+- The 25 equivalent survivors are classified by reading the arithmetic, not proved equivalent by a tool, and the gate
+  run shows that such a reading can be wrong: 2 of the 27 read as equivalent were killed. Three carry a condition: #18
+  (line 488) holds only for the call `sl_delay` makes on a converter deck, and #60 and #77 (lines 680, 768) hold while
+  an input has no driver in the circuit (the contract at line 678). The loop-bound `<=` equivalents (lines 587, 609,
+  630, 639, 641, 730, 739, 752, 754, 767, 774) assume a deck below 128 nets and 160 gates and a zeroed `gt`; a deck at
+  capacity was not traced. If one of them is not equivalent after all, a later test kills it and the gate reports that
+  accepted line as stale.
 - The 31 hung mutants are classified by construction: the tool reports each as outliving the timeout, which is
   consistent with an endless loop but was not shown by a run that was let to finish. The 12 unviable mutants were never
   checked by any test; they share one emitter-side message (`not yet implemented`) that says nothing about the spec.
@@ -305,5 +321,4 @@ Found by reading; none of it is changed by this lane.
   and the claim that it is the assert whose comment names it is by reading.
 - The run-level effect of #106 (`t - 654`) was not re-derived, and #29 (P22) is claimed only as far as that test's own
   assert.
-- Only `specs/analog/sar_logic.t27` was touched among the specs. No PR was opened; this issue is a part of #12163 and
-  does not close it.
+- Only `specs/analog/sar_logic.t27` was touched among the specs. The work is a part of #12163 and does not close it.
