@@ -31,3 +31,4 @@ pub mod jit;
 pub mod macho;
 pub mod lower;
 pub mod timing;
+pub mod wasm32_emitter;
