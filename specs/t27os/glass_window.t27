@@ -1292,6 +1292,7 @@ use t27os::frame_gate::fg_wait_anim;
 use t27os::frame_gate::fg_ticks;
 use t27os::frame_gate::fg_whole;
 use t27os::frame_gate::fg_mouse;
+use t27os::frame_gate::fg_hidden_wait;
 use t27os::text_cache::tc_style;
 use t27os::text_cache::tc_flush;
 use t27os::text_cache::tc_room;
@@ -1902,6 +1903,20 @@ pub const STATE_ACTIVE : u64 = 1;
 pub const UTF8 : u32 = 134217984;
 /// kCGImageAlphaPremultipliedLast
 pub const ALPHA_PREMUL_LAST : u32 = 1;
+/// kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little: BGRA, the layout Core Animation composites in.
+/// The frame bitmaps use it, in the screen's own colour space, so a new frame is handed to the layer as is: with
+/// RGBA in DeviceRGB every frame was unpremultiplied, colour-matched and premultiplied again (profile 2026-10-25:
+/// 47 of 160 main-thread samples in CA::Render::copy_image -> vImageConvert_AnyToAny).
+pub const BGRA_PREMUL_FIRST : u32 = 8194;
+/// kCGImageAlphaPremultipliedFirst and kCGBitmapByteOrder32Little, the two halves of BGRA_PREMUL_FIRST.
+pub const CG_ALPHA_PREMUL_FIRST : u32 = 2;
+pub const CG_ORDER_32_LITTLE : u32 = 8192;
+/// The bitmap info every frame bitmap is made with: the alpha mode or-ed with the byte order.
+fn frame_bitmap_info(alpha: u32, order: u32) -> u32 {
+    return alpha | order;
+}
+/// NSWindowOcclusionStateVisible: some part of the window is on a screen.
+pub const OCC_VISIBLE : u64 = 2;
 /// kCGBlendModeNormal, kCGBlendModeClear
 pub const BLEND_NORMAL : u32 = 0;
 pub const BLEND_CLEAR : u32 = 16;
@@ -2191,6 +2206,16 @@ fn msg_cstr(o: u64, s: u64, buf: []u8, max: u64, enc: u64) -> bool { return @ext
 fn msg_char(o: u64, s: u64, i: u64) -> u64 { return @extern("objc_msgSend"); }
 
 fn cg_rgb() -> u64 { return @extern("CGColorSpaceCreateDeviceRGB"); }
+/// The colour space of the screen the window is on ([[win colorSpace] CGColorSpace]); DeviceRGB when it has none.
+fn screen_space(win: u64) -> u64 {
+    const ns : u64 = msg0(win, sel("colorSpace"));
+    if (ns == 0) { return cg_rgb(); }
+    const cs : u64 = msg0(ns, sel("CGColorSpace"));
+    if (cs == 0) { return cg_rgb(); }
+    return cs;
+}
+/// Is any part of the window on a screen? A covered, minimised or other-Space window draws nothing.
+fn on_screen(occlusion: u64) -> bool { return (occlusion & OCC_VISIBLE) != 0; }
 fn cg_bitmap(data: u64, w: usize, h: usize, bits: usize, row: usize, space: u64, info: u32) -> u64 { return @extern("CGBitmapContextCreate"); }
 fn cg_image(c: u64) -> u64 { return @extern("CGBitmapContextCreateImage"); }
 fn cg_image_release(i: u64) -> void { @extern("CGImageRelease"); }
@@ -8755,6 +8780,26 @@ fn orbit_pick(tg: []const u64, mx: f64, my: f64, sw: f64, sh: f64) -> i64 {
     return ov_hit(@as(i64, @intFromFloat(sw / 2.0)), @as(i64, @intFromFloat(orb_stage_h(sh) / 2.0)), ra[0..32], rb[0..32], rp[0..32], orb_n(tg[TPG_O_N]), theta, @as(i64, @intFromFloat(mx)), @as(i64, @intFromFloat(my - AREA_TOP)));
 }
 
+/// What the orbit puts on screen, as a frame key part: every label's whole-point position and the hovered one.
+/// The drift moves a label by a point a few times a second, so the window draws when one moves, not every sixtieth.
+fn orbit_key(tg: []const u64, mx: f64, my: f64, sw: f64, sh: f64) -> u64 {
+    var ra : [32]i64 = undefined;
+    var rb : [32]i64 = undefined;
+    var rp : [32]i64 = undefined;
+    orbit_load(tg, ra[0..32], rb[0..32], rp[0..32]);
+    const theta : i64 = ov_theta(orb_r(tg[TPG_O_CLOCK]), tg[TPG_O_RM] != 0);
+    const ccx : i64 = @as(i64, @intFromFloat(sw / 2.0));
+    const ccy : i64 = @as(i64, @intFromFloat(orb_stage_h(sh) / 2.0));
+    const n : usize = orb_n(tg[TPG_O_N]);
+    var k : u64 = orb_w(orbit_pick(tg, mx, my, sw, sh) + 1);
+    var i : usize = 0;
+    while (i < n) {
+        k = fg_mix(fg_mix(k, orb_w(ov_pos_x(ccx, ra[i], rp[i], theta))), orb_w(ov_pos_y(ccy, rb[i], rp[i], theta)));
+        i = i + 1;
+    }
+    return k;
+}
+
 /// The orbit: only the formulas, white text, no frame, each turning clockwise on its ellipse; the hovered one is brighter
 /// and underlined. A click opens the card with the name, value, error and sector.
 fn orbit_draw(c: u64, kit: [48]u64, tg: []const u64, mx: f64, my: f64, sw: f64, sh: f64, full: bool, a: f64) -> void {
@@ -11007,18 +11052,21 @@ pub fn main() -> void {
     ell_buf[0] = 8230;
     kit[K_ELL] = msg_chars(msg0(cls("NSString"), s_alloc), sel("initWithCharacters:length:"), ell_buf, 1);
 
-    const c : u64 = cg_bitmap(0, 3840, 2400, 8, 15360, cg_rgb(), ALPHA_PREMUL_LAST);
+    // the frames are drawn in the screen's colour space, BGRA, so the layer takes them without a conversion
+    const scr : u64 = screen_space(win);
+    const c : u64 = cg_bitmap(0, 3840, 2400, 8, 15360, scr, frame_bitmap_info(CG_ALPHA_PREMUL_FIRST, CG_ORDER_32_LITTLE));
     cg_translate(c, 0.0, SH_MAX * WIDE_RETINA);
     cg_scale(c, WIDE_RETINA, 0.0 - WIDE_RETINA);
     // F. the layer's background follows on_glass(sw), set again when the width (dock) or the full-screen
     // state turns it (owner, 2026-10-23: glass is the compact panel's; the full window is #000000).
     var was_glass : bool = on_glass(W_PT);
     // K. the narrow panel draws point for point into its own bitmap, cropped to the view each frame.
-    const cc : u64 = cg_bitmap(0, 1520, 2600, 8, 6080, cg_rgb(), ALPHA_PREMUL_LAST);
+    const cc : u64 = cg_bitmap(0, 1520, 2600, 8, 6080, scr, frame_bitmap_info(CG_ALPHA_PREMUL_FIRST, CG_ORDER_32_LITTLE));
     cg_translate(cc, 0.0, CH_MAX * RETINA);
     cg_scale(cc, RETINA, 0.0 - RETINA);
 
     const s_next : u64 = sel("nextEventMatchingMask:untilDate:inMode:dequeue:");
+    const s_occl : u64 = sel("occlusionState");
     const s_send : u64 = sel("sendEvent:");
     const s_type : u64 = sel("type");
     const s_key : u64 = sel("keyCode");
@@ -13254,15 +13302,25 @@ pub fn main() -> void {
                 fki = fki + 1;
             }
         }
-        // the home logo flies in for ANIM_FRAMES, the menu waves open and shut, the GOD MODE edge glows
-        const fanim : bool = frame < ANIM_FRAMES or (ma > 0.0 and ma < 1.0) or glow > 0.0 or ov_animates(ov_visible(@as(i64, @intFromFloat((1.0 - ma) * 1000.0))), tgv[TPG_O_RM] != 0, orb_n(tgv[TPG_O_N]));
+        // the home logo flies in for ANIM_FRAMES, the menu waves open and shut, the GOD MODE edge glow fades in and out
+        const fanim : bool = frame < ANIM_FRAMES or (ma > 0.0 and ma < 1.0) or (glow > 0.0 and glow < 1.0);
+        // ticking (frame_gate.t27): the steady flame flickers on the tick count and the orbit drifts to whole points;
+        // what they show goes into the key, so they draw when a pixel can change, at most once a tick
+        const fflame : bool = glow > 0.0;
+        const forbit : bool = ov_animates(ov_visible(@as(i64, @intFromFloat((1.0 - ma) * 1000.0))), tgv[TPG_O_RM] != 0, orb_n(tgv[TPG_O_N]));
+        if (fflame) { fk = fg_mix(fk, @as(u64, frame)); }
+        if (forbit) { fk = fg_mix(fk, orbit_key(tgv[0..256], mx, my, sw, sh)); }
+        // a window no part of which is on a screen draws nothing; coming back changes the key, so it draws at once
+        const fseen : bool = on_screen(msg0(win, s_occl));
+        fk = fg_mix(fk, fg_flag(fseen));
+        const flive : bool = tlink == PANE_LIVE and topen != PANE_NONE;
         // RC. the dock's open flag rides in its own region, synced here so the draw reads the same frame
         if (rc) { tbv[RC_FLAG] = 1; } else { tbv[RC_FLAG] = 0; }
-        const fdraw : bool = fg_draw_due(fk, fshown, fanim, fsince);
+        const fdraw : bool = fseen and fg_draw_due(fk, fshown, fanim, fsince);
         fquiet = fg_quiet(fquiet, fk != fshown or fanim or tbusy);
         fsince = fg_since(fsince, fdraw);
         fshown = fk;
-        fwait = fg_wait_anim(fquiet, tlink == PANE_LIVE and topen != PANE_NONE, fanim, FRAME_S);
+        fwait = fg_hidden_wait(fseen, flive, fg_wait_anim(fquiet, flive, fanim, fflame or forbit, a_acc, FRAME_S));
         msg_flag(tx_cls, s_quiet, true);
         if (fdraw and narrow) {
             draw(cc, kit, frame, state, hov, ma, shown, task, space, sp, ss, cur, collapsed, mx, my, z, sw, sh, ws, full, qp, ring, evn, now, sug, god, glow, dk, dp, darmed, doff, dgo, walking, dlabel, tst[0..32], tcells[0..960000], topen, tcur, kyp, kstored[0..9], kmask[0..544], kmlen[0..9], kst[0..72], kfail[0..9], kopen[0..9], kedit, kbuf[0..256], klen, karm, kbusy, kemask, kewhy, ktpick, hs, cons2, dcv[0..512], gal[0..49152], gt[0..2560], evd, @as(u64, evp) + @as(u64, evn2) * 1048576 + @as(u64, evpr) * 1099511627776, pbuf[0..4160], sst[0..560], tgv[0..256], tbv[0..TB_SIZE]);
@@ -15125,6 +15183,51 @@ test the_orbit_tick_survives_words_that_hold_garbage {
     tg[TPG_O_N] = 0xFFFFFFFFFFFFFFFF;
     orbit_tick(tg[0..256], 1.0, 1280.0, 800.0, 100.0, 100.0, 6.0, false);
     assert orbit_pick(tg[0..256], 100.0, 100.0, 1280.0, 800.0) >= -1;
+}
+
+// ---- idle CPU (2026-10-25, Refs #12368): the frame bitmaps, the occlusion test and the orbit's key part ----
+
+test the_frame_bitmaps_are_bgra_premultiplied_first_as_the_layer_composites {
+    // kCGImageAlphaPremultipliedFirst (2) | kCGBitmapByteOrder32Little (2 << 12)
+    assert frame_bitmap_info(CG_ALPHA_PREMUL_FIRST, CG_ORDER_32_LITTLE) == BGRA_PREMUL_FIRST;
+    assert frame_bitmap_info(CG_ALPHA_PREMUL_FIRST, CG_ORDER_32_LITTLE) != ALPHA_PREMUL_LAST;
+    assert frame_bitmap_info(ALPHA_PREMUL_LAST, 0) == ALPHA_PREMUL_LAST;
+}
+
+test a_window_is_seen_when_its_occlusion_state_has_the_visible_bit {
+    assert on_screen(OCC_VISIBLE);
+    assert on_screen(OCC_VISIBLE | 8192);
+    assert on_screen(0) == false;
+    assert on_screen(8192) == false;
+}
+
+test the_orbit_key_follows_the_label_positions_and_nothing_else {
+    var tg : [256]u64 = undefined;
+    var z : usize = 0;
+    while (z < 256) {
+        tg[z] = 0;
+        z = z + 1;
+    }
+    orbit_tick(tg[0..256], 1.0, 1280.0, 800.0, -50.0, -50.0, 5.0, false);
+    assert tg[TPG_O_N] > 0;
+    tg[TPG_O_CLOCK] = 1000;
+    const k1 : u64 = orbit_key(tg[0..256], -50.0, -50.0, 1280.0, 800.0);
+    // the same state gives the same key
+    assert orbit_key(tg[0..256], -50.0, -50.0, 1280.0, 800.0) == k1;
+    // a quarter turn later (60 s at 1.5 degrees a second) the labels stand elsewhere
+    tg[TPG_O_CLOCK] = 61000;
+    assert orbit_key(tg[0..256], -50.0, -50.0, 1280.0, 800.0) != k1;
+    // reduced motion holds the orbit still: the clock no longer moves the key
+    tg[TPG_O_RM] = 1;
+    const k2 : u64 = orbit_key(tg[0..256], -50.0, -50.0, 1280.0, 800.0);
+    tg[TPG_O_CLOCK] = 1000;
+    assert orbit_key(tg[0..256], -50.0, -50.0, 1280.0, 800.0) == k2;
+    // an empty orbit has one key whatever its clock says
+    tg[TPG_O_N] = 0;
+    tg[TPG_O_RM] = 0;
+    const k3 : u64 = orbit_key(tg[0..256], -50.0, -50.0, 1280.0, 800.0);
+    tg[TPG_O_CLOCK] = 61000;
+    assert orbit_key(tg[0..256], -50.0, -50.0, 1280.0, 800.0) == k3;
 }
 
 // ---- the heartbeat file (crash guard, issue 12368) ----
