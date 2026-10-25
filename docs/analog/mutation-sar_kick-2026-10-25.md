@@ -89,8 +89,13 @@ the file must be regenerated. New tests go at the end of the spec for that reaso
   only.
 - The 5 hung mutants are classified by construction (a loop step dropped), not by a run that was allowed to finish.
 - Which test killed which of the 4 killed mutants was not measured.
-- That a constant-bound assert is folded and not counted is the reading that fits the one change made (the report went
-  from 6 to 10 when the four were rewritten with a `var`); it was not checked in the compiler source.
+- Why the four asserts were not counted was checked with a negative control, not in the compiler source: a scratch spec
+  (never committed; 5 tests; `tri test`, master-built `t27c`, 08:19 +07, exit 1) holds `pub const TBL : [4]u32 = [10, 20, 30, 40]`
+  and five tests. A true `assert_eq(TBL[2], 30)` passes and is reported `VACUOUS` (0 runtime asserts counted); a false
+  `assert_eq(TBL[2], 31)` FAILS, like a false `assert_eq(v, 31)` on a `var` and a false `assert_eq(30, 31)`. So an assert on
+  a constant table element is evaluated, not dropped, and not counted; the rewrite with a `var` only makes the count honest.
+  Other asserts of that shape in the analog specs (a candidate is `assert_eq(DEC_IDX[7], LD_IDX[0])` in this file) may be
+  uncounted the same way; they were not listed or run, so any such count is understated, not wrong.
 - The tests pin the model's own tie rules and scan bounds; they do not compare the model with ngspice.
 - Only `sar_kick.t27` was gated here. The other analog specs have a census with survivors not yet pinned: #12098
   (`sar_cdac`), #12099 (`sar_comparator_psp`).
