@@ -22,7 +22,7 @@ Window: from the v0.1 release (tag `analog-v0.1.0`, 2026-10-24) to 2026-10-26 05
 - Method: a census first (measure how many mutants the tests kill), then a classification of every survivor, then a follow-up issue shaped to pass the issue-shape gate (four headings, numbered FR requirements with "must", countable success criteria).
 - Classes used: equivalent (no test can tell), test gap (a test can be written), dead line (no input reaches it), hung (an endless loop), not constructed (a witness input is still needed), undecided (needs a lab trace).
 - Fix: tests are appended after the last test of the spec; the model lines are not edited. The seal is re-saved with a master-built compiler, and an accepted-mutants file per spec records what stays alive and why.
-- Gate rule: exit 2 when a not-killed mutant is not accepted, or when an accepted line is now killed. An entry is stale when every viable mutant of its key was killed; unviable mutants are ignored in that lookup (row 115, found by a read-only subagent that read the gate source).
+- Gate rule: exit 2 when a not-killed mutant is not accepted, or when an accepted line is now killed. An entry is stale when every viable mutant of its key was killed; unviable mutants are ignored in that lookup (row 115, found by reading the gate source).
 - Census of 17 of 17 specs is on master in `docs/analog/mutation-census-rest-2026-10-25.md` (PR #12501 and the refresh PR #12552 for #12543). #12116 is checked against it: SC-001 met (17 specs, five counts each); SC-002 not met to the letter (row 135).
 - Per-spec results with the PR that landed each are in section 3.
 
@@ -73,8 +73,8 @@ Window: from the v0.1 release (tag `analog-v0.1.0`, 2026-10-24) to 2026-10-26 05
 | accept_sar, 281 mutants | census 218, 58, 4, 1; gate 241, 35, 4, 1; 39 accepted; exit 0 | rows 99, 114, #12431 |
 | mos_psp103, 359 mutants | census 264, 72, 18, 5; gate 306, 30, 18, 5; 48 accepted; exit 0 | rows 102, 111, #12434 |
 | mos_table, 632 mutants | gate 583, 25, 20, 4; 45 accepted; exit 0 (fifth run) | row 95, #12317 |
-| raw_writer, 526 mutants | gate 474, 21, 31, 0; 52 accepted | row 96, mutation-raw_writer-2026-10-25.md |
-| linear, 420 mutants | census 316, 61, 38, 5; gate 351, 26, 38, 5 | rows 71, 82 |
+| raw_writer, 526 mutants | census 412, 83, 31, 0 (exit 0); gate 474, 21, 31, 0; 52 accepted; gate passed | row 96, mutation-raw_writer-2026-10-25.md |
+| linear, 420 mutants | census 316, 61, 38, 5; gate 351, 26, 38, 5; 64 accepted; exit 0 | rows 71, 82 |
 | Delta gate, one function of linear_zoh | 3 mutants in 11 s, exit 0 | row 81 |
 | Delta gate, `--fn sl_init` of sar_logic | 17 mutants: 12 killed, 1 survived, 3 hung, 1 unviable; 14:05 to 14:08 | row 83 |
 | Gate time, sar_kick_net | 39 min 49 s first gate; 38 min 05 s confirmation gate | rows 126, 130 |
@@ -122,9 +122,9 @@ These are real alternatives. A changes how work lands, B adds an agent, C adds a
 
 ### C. The external team supplies a block and a criterion
 
-- Who does what: the external team names the next block and the check that enforces it, as it did for the 13 blocks of v0.1. The loop turns it into a spec with tests and a gate, and runs the acceptance evaluator on it. An answer from the team arrived on 2026-10-26 (row 136); its content is not recorded here. A reply is drafted and not sent.
-- Owner time: read the answer and say yes or no to sending the reply (estimate: 10 minutes).
-- Default if nobody answers: the reply is not sent, the reminder planned for 2026-10-27 is cancelled (row 136), and the loop continues with its own blocks and models nothing from memory.
+- Who does what: the external team names the next block and the check that enforces it, as it did for the 13 blocks of v0.1. The loop turns it into a spec with tests and a gate, and runs the acceptance evaluator on it. The state of the exchange is kept in the epic ledger (row 136 and later), not in this report.
+- Owner time: read the team's answer and say yes or no to sending a reply (estimate: 10 minutes).
+- Default if nobody answers: no reply is sent, and the loop continues with its own blocks and models nothing from memory.
 
 ## 6. Three Pareto speed-up variants
 
