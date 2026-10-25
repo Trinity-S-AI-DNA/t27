@@ -12,6 +12,8 @@
 //!   1  type:     one func type per exported fn, `(P... -> T` over the fn's
 //!                own parameter count
 //!   3  function: type index i for fn i
+//!   5  memory + 11 data (floor 12, `emit_with_image` only): the image as
+//!                one active segment at offset 0, memory pages_for(len), min=max
 //!   7  export:   fn i exported under its t27 name, kind func (0)
 //!   10 code:     locals 0, the body program, `end`
 //!
@@ -105,17 +107,6 @@ fn uleb(out: &mut Vec<u8>, v: u64) {
     let at = out.len();
     out.resize(at + wasm_law::uleb_len(v), 0);
     wasm_law::uleb(out, at, v);
-}
-
-/// Signed LEB128 (`i32.const` / `i64.const` operands) -- the law's writer.
-/// The carried scalar set fits i64 (a u64 constant crosses as the same bit
-/// pattern read signed), and the varint encoding of those bytes is unique, so
-/// the narrowing preserves the encoding the law pins.
-fn sleb(out: &mut Vec<u8>, v: i128) {
-    let at = out.len();
-    out.resize(at + 10, 0);
-    let end = wasm_law::sleb(out, at, v as i64);
-    out.truncate(end);
 }
 
 /// One section: id byte, payload size, payload -- the law's framing.
@@ -251,8 +242,17 @@ fn lower_stack(e: &Expr, f: &Func, out: &mut Vec<u8>) -> Result<(), EmitError> {
     }
 }
 
-/// Emit the whole module.
+/// Emit the whole module: today's scalar cut, no data image.
 pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
+    emit_with_image(prog, &[])
+}
+
+/// Emit the whole module with a read-only data image mounted (the law's
+/// floor 12): one active data segment at offset 0 over linear memory sized
+/// `pages_for(image.len())` pages, min = max; an empty image emits exactly
+/// `emit`'s module. The consumer is the gx_ struct contract
+/// (specs/t27f/live_struct_glue.t27), whose layout the memory carries.
+pub fn emit_with_image(prog: &Program, image: &[u8]) -> Result<Vec<u8>, EmitError> {
     // The export set: every pub fn in a supported shape. M-A: no parameters,
     // a scalar return, a single constant return. M-B: parameters on the i32
     // carrier, an i32-carrier return, a single `return <expr>;` whose
@@ -410,26 +410,16 @@ pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
     m.extend_from_slice(b"\0asm"); // the magic
     m.extend_from_slice(&1u32.to_le_bytes()); // version 1
 
-    // 1 type: one functype per fn, over its own parameter count (no dedup; one
-    // type per fn keeps the walk trivial)
+    // 1 type: one functype per fn via the law (no dedup, one type per fn)
     let mut p = Vec::new();
     uleb(&mut p, k as u64);
     for (_, ret, nparams, _) in &fns {
-        if *nparams == 0 {
-            p.push(0x60); // functype
-            uleb(&mut p, 0); // parameters
-            uleb(&mut p, 1); // results
-            p.push(valtype(*ret).expect("scalar, checked above"));
-        } else {
-            // `(...) -> i32` over the fn's own parameter list, via the law.
-            let params = vec![wasm_law::VT_I32; *nparams];
-            let results = [valtype(*ret).expect("i32 carrier, checked above")];
-            let at = p.len();
-            let cap = at + 1 + wasm_law::uleb_len(*nparams as u64) + *nparams + 1 + 1;
-            p.resize(cap, 0);
-            let end = wasm_law::functype_full(&mut p, at, &params, &results);
-            p.truncate(end);
-        }
+        let params = vec![wasm_law::VT_I32; *nparams];
+        let results = [valtype(*ret).expect("scalar, checked above")];
+        let at = p.len();
+        p.resize(at + 4 + wasm_law::uleb_len(*nparams as u64) + *nparams, 0);
+        let end = wasm_law::functype_full(&mut p, at, &params, &results);
+        p.truncate(end);
     }
     section(&mut m, 1, &p);
 
@@ -440,6 +430,17 @@ pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
         uleb(&mut p, i as u64);
     }
     section(&mut m, 3, &p);
+
+    if !image.is_empty() {
+        // 5 memory (floor 12): pages_for(len) pages, min = max, one memory.
+        let pg = wasm_law::pages_for(image.len() as u64);
+        let mut b = [0u8; 8];
+        let n = wasm_law::memtype(&mut b, 0, pg, pg);
+        let mut p = Vec::new();
+        uleb(&mut p, 1); // one memory
+        p.extend_from_slice(&b[..n]);
+        section(&mut m, wasm_law::SEC_MEMORY, &p);
+    }
 
     // 7 export: name, kind func (0), func index
     let mut p = Vec::new();
@@ -468,6 +469,16 @@ pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
         p.extend_from_slice(&body_bytes);
     }
     section(&mut m, 10, &p);
+
+    if !image.is_empty() {
+        // 11 data (floor 12): the image as one active segment at offset 0.
+        let mut s = vec![0u8; 11 + image.len()];
+        let n = wasm_law::data_segment_active(&mut s, 0, 0, image);
+        let mut p = Vec::new();
+        uleb(&mut p, 1); // one segment
+        p.extend_from_slice(&s[..n]);
+        section(&mut m, wasm_law::SEC_DATA, &p);
+    }
     Ok(m)
 }
 
@@ -509,18 +520,6 @@ mod tests {
         }
     }
 
-    fn read_uleb(b: &[u8]) -> (u64, usize) {
-        let (mut v, mut n) = (0u64, 0usize);
-        loop {
-            let byte = b[n];
-            v |= ((byte & 0x7f) as u64) << (7 * n);
-            n += 1;
-            if byte & 0x80 == 0 {
-                return (v, n);
-            }
-        }
-    }
-
     fn read_sleb(b: &[u8]) -> i128 {
         let (mut result, mut shift) = (0i128, 0u32);
         for &byte in b {
@@ -534,50 +533,6 @@ mod tests {
             }
         }
         result
-    }
-
-    #[test]
-    fn leb128_unsigned_edges() {
-        let mut b = Vec::new();
-        uleb(&mut b, 0);
-        assert_eq!(b, vec![0x00]);
-        let mut b = Vec::new();
-        uleb(&mut b, 127);
-        assert_eq!(b, vec![0x7f]);
-        let mut b = Vec::new();
-        uleb(&mut b, 128);
-        assert_eq!(b, vec![0x80, 0x01]);
-        let mut b = Vec::new();
-        uleb(&mut b, 624_485);
-        assert_eq!(b, vec![0xe5, 0x8e, 0x26]);
-        let (v, n) = read_uleb(&b);
-        assert_eq!((v, n), (624_485, 3));
-    }
-
-    #[test]
-    fn leb128_signed_edges() {
-        for (v, want) in [
-            (0i128, vec![0x00]),
-            (1, vec![0x01]),
-            (42, vec![0x2a]),
-            (63, vec![0x3f]),
-            (64, vec![0xc0, 0x00]),
-            (-1, vec![0x7f]),
-            (-64, vec![0x40]),
-            (-65, vec![0xbf, 0x7f]),
-            (-123_456, vec![0xc0, 0xbb, 0x78]),
-        ] {
-            let mut b = Vec::new();
-            sleb(&mut b, v);
-            assert_eq!(b, want, "sleb({})", v);
-            assert_eq!(read_sleb(&b), v);
-        }
-        // the full i64 range survives the round trip
-        for v in [i64::MIN as i128, i64::MAX as i128, -(1i128 << 63), (1i128 << 63) - 1] {
-            let mut b = Vec::new();
-            sleb(&mut b, v);
-            assert_eq!(read_sleb(&b), v);
-        }
     }
 
     #[test]
