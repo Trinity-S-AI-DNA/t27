@@ -1,17 +1,29 @@
-# Mutation census of the remaining analog specs, 2026-10-25 (partial: 11 of 17 specs written up here)
+# Mutation census of the remaining analog specs, 2026-10-25 (17 of 17 specs measured; gate numbers recorded here for 9)
 
 Issue #12116, part of epic #10486 (weak spots of the analog v0.1 release). The tool, `tri mutate spec`, never edits
-the spec, and the checkout stayed clean during the run. This note is written while the census is unfinished, so a
-reader sees what is measured and what is not: 11 of the 17 specs have a measured run and are written up below; 6 are
-not measured. linear and linear_zoh were first measured on a tree that the later audit #12191 changed, so sections 9
-and 10 give the re-run on master after the audit, and raw_writer (section 9) was measured on a tree that master has
-not changed. Where each number comes from:
+the spec, and the checkout stayed clean during the runs. All 17 specs now have a measured run and are written up
+below: sections 1 to 10 are the first 11 specs (written while the census was unfinished), and sections 11 to 16
+are the six that were run later on master: sar_switch, mos_table, accept_sar, sar_kick_net, sar_comparator and
+mos_psp103 (the order of the old "not measured" list; the run order was sar_switch, mos_table, accept_sar,
+sar_comparator, mos_psp103, sar_kick_net). linear and linear_zoh were first measured on a tree that the later audit
+#12191 changed, so section 10 gives their re-run on master after the audit, and raw_writer (section 9) was
+measured on a tree that master has not changed. Gate numbers (the survivor gate of the follow-up pull request) are
+recorded in this note for 9 of the 17 specs: vacask_compare, mos_psp103_gates, mos_psp103_inv20 and
+sar_comparator_qi (section 17), and sar_switch, mos_table, accept_sar, sar_kick_net and mos_psp103 (sections 11 to
+14 and 16; the sar_kick_net gate ended with exit 2, nine gaps deferred). The gate of sar_comparator is running and
+has no numbers yet. sar_trace_raw and bench have no test gap, so no gate. The other five (sar_logic,
+sar_comparator_q, raw_writer, linear, linear_zoh) have merged gate pull requests whose numbers this note does not
+record (section 17). Where each number comes from:
 
 - **Run:** `tri mutate spec --file specs/analog/sar_logic.t27 --t27c <master-built t27c> --jobs 3 --timeout 30`, in
   a T27 OS shell cell on this Mac, started 07:59:23 +07 and finished 08:24:07 +07 (24 min 44 s of wall time), exit 0.
   Lane base `035df5ce60`, binary `t27c 0.5.2` built from master. No `--accepted` file: this is a census, not a gate.
 - **Machine at the start:** load average 26.13 19.54 17.57, 7.4 GiB free on the data volume. At 08:25 the volume
-  was down to 0.4 GiB and the run on the second spec was stopped by hand (kill threshold 2.5 GiB); see section 13.
+  was down to 0.4 GiB and the run on the second spec was stopped by hand (kill threshold 2.5 GiB); see section 19.
+- **The six later runs (sections 11 to 16)** used the same command (`--jobs 3 --timeout 30`) and a master-built
+  `t27c` in a T27 OS pane, each on a tree that holds master's unedited spec file; the tree, the start time and the
+  load are stated per section.
+  The compiler version of those six runs is not recorded, except for sar_comparator (0.5.2, in the branch note only).
 
 ## 1. sar_logic.t27 (677 mutants)
 
@@ -274,38 +286,212 @@ Not established: every expected value in the file is hand arithmetic from the fu
 
 Follow-up: #12275 (linear, groups A to F) and #12276 (linear_zoh, groups A to E). The dead lines 441 and 442 of linear are unreachable for any table that `table_ok` accepts and need a decision, not an assert: delete them or lift the refusal; if the owner prefers to keep them, the hand-derived checks are in section 4 of the classification file.
 
-## 11. Where each written-up spec stands
+## 11. sar_switch.t27 (400 mutants)
 
-Counts are mutants: killed / survived / hung / unviable. "Census" is the first run (tree `035df5ce60`) for every spec except linear and linear_zoh, whose census cell is the re-run on master `1c783b0b31` after the audit (section 10); "gate" is the survivor gate of the pull request for the follow-up issue, run on the lane rebased on master `1c783b0b31`.
+Run: `--jobs 3 --timeout 30`, master-built `t27c` (version not recorded), tree `4d03070df6` (it holds the spec of master
+`f81a02f36a`), started 12:12 +07, finished 12:27 +07, exit 0. Load 3 at the 12:13 claim, 25 to 35 during part of the
+run. An earlier attempt on this spec was killed by the load rule (section 19) and claims no result. Source: #12241
+comments 6393789316 (start) and 6393949785 (result).
+
+| Outcome | Count | Read off the output |
+| --- | --- | --- |
+| killed | 306 | all 306 by a failing test, 0 by an invariant at compile time |
+| survived | 53 | classified below |
+| hung | 33 | all 33 are drop-step of a loop counter |
+| unviable | 8 | all 8 are ret-default of a void body (`zig: error: not yet implemented`) |
+
+Classification of the 53 survivors, by reading and nothing run (comment 6394100901): 14 equivalent (6 exact: lines 234,
+236, 238, 510, 511, 772; 1 "not constructed": 467; 7 "below one ulp": 400 twice and 406 five times), 39 test gap in six
+groups (A 3, B 3, C 4, D 16, E 5, F 8), 0 dead line settled (792 is a candidate); 14 + 39 + 0 = 53.
+
+Follow-up: #12287 (closed), PR #12349 (merged 2026-10-25T09:53:02Z; its title says 349 of 400 mutants killed). Gate,
+from `docs/analog/mutation-sar_switch-2026-10-25.md`: tree `07966d524e`, 14:49:42-15:07:09 +07 (17 min 27 s),
+`--timeout 45`, load 18.56 at the start, exit 0, "Gate passed": 400 mutants, 349 killed, 10 survived, 33 hung, 8
+unviable. Eight new tests (22 tests, 22 pass) killed 43 of the 53 survivors. The 10 left: 234, 236, 238, 510, 511, 772
+(equivalent), 327, 467, 500 (no witness found) and 792 (dead on the stimuli tried). The accepted file
+`docs/analog/mutation-accepted-sar_switch.txt` has 51 entries (10 + 33 + 8).
+
+## 12. mos_table.t27 (632 mutants)
+
+Run: `--jobs 3 --timeout 30`, master-built `t27c` (version not recorded), a tree byte-identical to master
+`36c8d6a54f`, started 12:27:55 +07, finished 12:55:18 +07 (27 min 23 s), exit 0. Load averages 7.63 15.30 16.53 at the
+start, 25 to 60 (1-minute) during the run. Source: #12241 comments 6394248086 (result) and 6394519605
+(classification), and `docs/analog/mutation-mos_table-2026-10-25.md`.
+
+Operator classes of the 632: drop-guard 22, flip-cmp 64, swap-logic 5, drop-step 64, swap-arith 406, ret-default 71.
+
+| Outcome | Count | Read off the output |
+| --- | --- | --- |
+| killed | 493 | all 493 by a failing test, 0 by an invariant at compile time |
+| survived | 115 | classified below |
+| hung | 20 | all 20 are `x = x + 1` -> `x = x` of a loop counter (lines 584, 601, 652, 654, 667, 669, 702, 704, 719, 721, 741, 743, 770, 786, 852, 855, 881, 884, 897, 902) |
+| unviable | 4 | all 4 are ret-default of a void function: `build_table` 645, `run_tabf_q` 841, `run_tabf` 860, `run_ana` 866 |
+
+Classification of the 115 survivors, by reading and nothing run (comment 6394519605): 25 equivalent (5 of the weaker
+kind: 624 and 894 below one ulp, 688, 875 and 877 inferred and not run), 89 test gap in eleven groups (A 3, B 2, C 5, D
+4, E 2, F 3, G 8, H 4, I 9, J 1, K 48), 1 dead line (835, `newton_iter_f`); 25 + 89 + 1 = 115.
+
+Follow-up: #12317 (closed), PR #12401 (merged; its title says 583/632 killed, 45 accepted). Gate, from the note:
+18:06-18:23 +07 (17.5 min), `--jobs 3 --timeout 45`, load 9.3 at the start, exit 0, "Gate passed": 632 mutants, 583
+killed (583 by a failing test, 0 by an invariant), 25 survived, 20 hung, 4 unviable; 45 not killed, 45 accepted, 0
+accepted lines now killed. 37 tests (21 old, 16 new: T1 to T16), 37 pass. The accepted file has 47 entries. Four
+earlier gate attempts the same day (16:17, 16:46, 17:35, 17:54) were killed by the load rule and gave no result.
+
+## 13. accept_sar.t27 (281 mutants)
+
+Run: `--jobs 3 --timeout 30`, master-built `t27c` (version not recorded), a detached checkout of master `89a747eefc`
+(spec of 1787 lines, no spec edited), started 18:39:36 +07, finished 18:57:31 +07 (about 18 min), exit 0. Load 10.74 at
+the start, 21.5 at 18:44, 12.85 at 19:05; more than 47 GiB free. The first attempt (reported in comment 6394248086)
+did not run: the check of the unmutated spec timed out while the load was above 40. Source: #12241 comments 6397417923
+(result) and 6397879773 (classification).
+
+Operator classes of the 281: drop-guard 6, flip-cmp 83, swap-logic 46, drop-step 13, swap-arith 90, ret-default 43.
+
+| Outcome | Count | Read off the output |
+| --- | --- | --- |
+| killed | 218 | all 218 by a failing test, 0 by an invariant at compile time |
+| survived | 58 | flip-cmp 38, swap-logic 12, swap-arith 7, drop-guard 1 |
+| hung | 4 | lines 441 (`as_inv_vth_of`), 542 (`as_thermo`), 595 (`as_sar_run`), 714 (`as_ramp`), all `x = x + 1` -> `x = x` |
+| unviable | 1 | line 631, swap-arith in `as_clk_golden`: the constant -319900 cannot be held by `usize`, zig refuses it at compile time |
+
+Classification of the 58 survivors, by reading and nothing run (comment 6397879773): 34 equivalent (27 of them "not
+constructed"), 23 test gap in nine groups (A to I), 1 dead line (651); 34 + 23 + 1 = 58.
+
+Follow-up: #12431 (closed), PR #12482 (merged 2026-10-25T16:19:34Z; its title says the gaps are closed and the gate
+passed). Gate, from `docs/analog/mutation-accept_sar-2026-10-25.md`: 22:21-22:42 +07 (20 min), `--jobs 2 --timeout 45`,
+load 25 to 44, exit 0, "Gate passed": 281 mutants, 241 killed, 35 survived, 4 hung, 1 unviable; 39 not killed, 39
+accepted, 0 accepted lines now killed. The first gate run (21:56-22:19) exited 2 on a stale accepted entry for line
+631, which was removed. 26 tests, 26 pass. The accepted file has 39 entries.
+
+## 14. sar_kick_net.t27 (727 mutants)
+
+Run: `--jobs 3 --timeout 30`, master-built `t27c` (version not recorded), master `89a747eefc` (spec of 2183 lines),
+started 19:50:45 +07, finished 20:27:02 +07 (about 36 min), exit 0. Load 13.96 at the claim and 13.33 at the start
+(both read by hand), 17.5 at the end; more than 30 GiB free. Two earlier runs of this spec were aborted: the first at
+08:25 on disk space (its output file is a stub), the second started 12:55:59 and stopped at about 13:06 with the
+1-minute load at 63 to 78 (section 19). Source: #12241 comments 6397860038 (claim), 6398234410 (result) and 6398686819
+(classification).
+
+Operator classes of the 727: drop-guard 33, flip-cmp 123, swap-logic 19, drop-step 54, swap-arith 432, ret-default 66.
+
+| Outcome | Count | Read off the output |
+| --- | --- | --- |
+| killed | 591 | all 591 by a failing test, 0 by an invariant at compile time |
+| survived | 82 | classified below |
+| hung | 39 | all 39 are drop-step of a loop counter |
+| unviable | 15 | all 15 are ret-default of a void function |
+
+Classification of the 82 survivors, by reading and nothing run (comment 6398686819): 35 equivalent, 43 test gap in
+three groups (A 33, B 9, C 1), 4 dead line (709 twice, 710 twice), 0 not decided; 35 + 43 + 4 = 82. The comment records
+two judgement calls: if the swap block is read as dead, the split is 18 dead line and 19 in group A; if 709, 710 and
+689 are group C, it is 0 dead line, 31 equivalent and 6 in group C.
+
+Follow-up: #12460 (open) and #12494 (open, the nine deferred gaps that need lab values), PR #12496 (open; its title
+says the gate measured 624 of 727 killed, nine deferred). Gate, from the branch note `docs/analog/mutation-sar_kick_net-2026-10-25.md`
+on `origin/lane/analog-mut-sar_kick_net-12460` (not on master yet): 22:48:31-23:36:06 +07 (47 min 35 s), `--jobs 2
+--timeout 45`, load 26 at the start, head `0022752f05`, clean tree, **exit 2**: 727 mutants, 624 killed (624 by a
+failing test, 0 at compile time), 48 survived, 40 hung, 15 unviable; 88 not killed, 79 accepted and matched, 0 accepted
+lines now killed, 9 not accepted. Against the census: killed +33, survived -34, hung +1 (line 770 `k = k`, predicted).
+30 tests pass; the accepted file has 77 entry lines. The nine deferred: 618, 1047, 1054 (`+`), 1055 (`+`), 1062, 1203,
+1343, 1469 (twice). Line 1343 is not written; the other eight need a lab value first. The gate **with the nine
+deferred entries added was not re-run**: that it would exit 0 is inferred, not measured.
+
+## 15. sar_comparator.t27 (868 mutants)
+
+Run: `--jobs 3 --timeout 30`, master-built `t27c`, master `89a747eefc`, started 18:57:31 +07, finished 19:27:03 +07
+(29 min 32 s), exit 0. Load averages 14.25 15.99 15.42 at the start, 49.5 (1-minute) at the end; more than 42 GiB
+free. The version 0.5.2 of `t27c` is stated only in the branch note, not in the census comment. Source: #12241
+comments 6397643043 (result) and 6398028597 (classification).
+
+Operator classes of the 868: drop-guard 32, flip-cmp 171, swap-logic 7, drop-step 100, swap-arith 472, ret-default 86.
+
+| Outcome | Count | Read off the output |
+| --- | --- | --- |
+| killed | 659 | all 659 by a failing test, 0 by an invariant at compile time |
+| survived | 98 | classified below |
+| hung | 78 | all 78 are drop-step of a loop counter |
+| unviable | 33 | all 33 are ret-default |
+
+Classification of the 98 survivors, by reading and nothing run (comment 6398028597): 42 equivalent, 55 test gap in
+fifteen groups (A to O), 0 dead line, 1 not decided (522); 42 + 55 + 0 + 1 = 98.
+
+Follow-up: #12432 (open). No pull request is open for it yet (a `gh pr list` on the branch answers empty). Gate:
+**gate running**, no numbers. The branch note `docs/analog/mutation-sar_comparator-2026-10-25.md` on
+`origin/lane/analog-mut-sar_comparator-12432` (not on master yet) says the gate was not run on its tree: 33 tests (20
+old, 13 new) pass with 0 vacuous (21:39-21:40 +07, load 27.4), groups A to M are written and their "killed" is a
+reading, and groups N (1396, 1397, 1404), O (1291, 1322 twice) and line 522 need lab figures. Its accepted file lists
+79 hung entries, one more than the census's 78: line 914 (drop-step) is predicted to turn hung once the group A test
+runs the swap branch, which is a prediction and not a measurement.
+
+## 16. mos_psp103.t27 (359 mutants)
+
+Run: `--jobs 3 --timeout 30`, master-built `t27c` (version not recorded), master `89a747eefc` (spec of 2664 lines),
+started 19:27:03 +07, finished 19:42:20 +07 (about 15 min), exit 0. Load 49.46 at the start (the start precondition,
+load under 15, was not checked by hand), about 26 at the end; more than 36 GiB free. Source: #12241 comments 6397804039
+(result) and 6398054158 (classification).
+
+Operator classes of the 359: drop-guard 28, flip-cmp 69, swap-logic 6, drop-step 36, swap-arith 195, ret-default 25.
+
+| Outcome | Count | Read off the output |
+| --- | --- | --- |
+| killed | 264 | all 264 by a failing test, 0 by an invariant at compile time |
+| survived | 72 | classified below |
+| hung | 18 | 14 loop counters, 2 in the `dc_out` bisection (line 388), 2 in `gate_step` (707 `while (go or it < 40)` and 715 `it = it`) |
+| unviable | 5 | 4 ret-default (`lift_u32` 396, `shift_run` 405, `scale_q` 566, `gate_run` 721) and 1 swap-arith in `op_gap` (755, `12 * CELL` -> `12 / CELL`, a u32 underflow zig refuses) |
+
+That at least one `gate_step` run ends on the 40-iteration cap is an inference from the two hung mutants there.
+Classification of the 72 survivors at census time, by reading and nothing run (comment 6398054158): 22 equivalent (16
+of them in `gate_step`, the equivalence inferred), 50 test gap in three groups (A 32, B 12, C 6), 0 dead line, 0 not
+decided; 22 + 50 = 72. Group C is a judgement call: called equivalent, the split is 44 test gap and 28 equivalent.
+
+Follow-up: #12434 (closed), PR #12468 (merged 2026-10-25T15:35:41Z; its title says the gate passes 306/359). Gate, from
+`docs/analog/mutation-mos_psp103-2026-10-25.md`: 21:34:02-21:53:59 +07 (20 min), `--jobs 2 --timeout 45`, load averages
+21.19 26.22 22.95 at the start, exit 0, "Gate passed": 359 mutants, 306 killed, 30 survived, 18 hung, 5 unviable; 48 not
+killed, 48 accepted, 0 accepted lines now killed. The lane killed 42 test gaps (group A 32, group B 10: two of the 12
+group B mutants, lines 348 and 349, were found equivalent while the tests were written); the 30 survivors left are 22 +
+2 + 6 equivalent (the 6 are group C). 51 tests (40 old, 11 new blocks with 199 runtime asserts), 51 pass. The accepted
+file has 35 entry lines.
+
+## 17. Where each spec stands
+
+Counts are mutants: killed / survived / hung / unviable. "Census" is the first run: tree `035df5ce60` for the first eleven specs except linear and linear_zoh, whose census cell is the re-run on master `1c783b0b31` after the audit (section 10), and the master tree named in sections 11 to 16 for the six later specs. "Gate" is the survivor gate of the pull request for the follow-up issue: for vacask_compare, mos_psp103_gates, mos_psp103_inv20 and sar_comparator_qi it ran on the lane rebased on master `1c783b0b31`; for the five gate rows of sections 11 to 16 it ran on the lane tree named there.
+
+A "later:" clause was added to the rows whose original text said "nothing run" or "no test added", because the pull request of that follow-up has merged since. It gives pull request numbers and title words, not gate numbers: this note does not carry them.
 
 | Spec | Census | Follow-up | State |
 | --- | --- | --- | --- |
-| sar_logic | 526 / 108 / 31 / 12 of 677 | #12163 | classified by reading (27 / 80 / 1); no test added |
+| sar_logic | 526 / 108 / 31 / 12 of 677 | #12163 | classified by reading (27 / 80 / 1); no test added when the row was written; later: PR #12331 merged (title: 608 of 677 mutants killed; Closes #12237, #12240) |
 | sar_trace_raw | 38 / 1 / 3 / 0 of 42 | none | nothing to fix: 1 equivalent, 3 endless loops |
 | vacask_compare | 34 / 8 / 6 / 0 of 48 (pre-audit tree) | #12182 (PR #12204) | gate on master: 40 / 2 / 6 / 0; the 6 test gaps are killed, 2 equivalent and 6 hung are accepted |
 | bench | 55 / 3 / 0 / 0 of 58 | none | 3 equivalent, no test gap |
 | mos_psp103_gates | 75 / 10 / 9 / 0 of 94 (pre-audit tree) | #12187 (PR #12206) | gate on master: 76 / 9 / 9 / 0 |
 | mos_psp103_inv20 | 72 / 23 / 5 / 1 of 101 | #12185 (PR #12207) | gate on master: 81 / 14 / 5 / 1; see the line below the table |
 | sar_comparator_qi | 256 / 20 / 18 / 14 of 308 | #12186 (PR #12205) | gate on master: 262 / 14 / 18 / 14 |
-| sar_comparator_q | 266 / 40 / 17 / 13 of 336 | to be filed | 17 equivalent, 19 test gap in five groups, 4 dead line; nothing run |
-| raw_writer | 412 / 83 / 31 / 0 of 526 | #12273, #12274 | 19 equivalent, 62 test gap in ten groups (J inferred, H and I need a lab value), 2 dead line; nothing run |
-| linear | 316 / 61 / 38 / 5 of 420 (post-audit tree, same as pre-audit) | #12275 | 18 equivalent, 35 test gap in six groups, 7 dead line, 1 not decided; nothing run |
-| linear_zoh | 195 / 30 / 27 / 0 of 252 (post-audit tree; pre-audit 193 / 30 / 29 / 0) | #12276 | 2 equivalent, 28 test gap in five groups, 0 dead line; 452 and 468 moved from hung to killed, cause not established; nothing run |
+| sar_comparator_q | 266 / 40 / 17 / 13 of 336 | #12229 (groups A and B), #12230 (groups C, D, E); the row said "to be filed" | 17 equivalent, 19 test gap in five groups, 4 dead line; nothing run when the row was written; later: PR #12281 (groups A and B, title: gate passed) and PR #12459 (groups C, D, E, title: gate passes) merged |
+| raw_writer | 412 / 83 / 31 / 0 of 526 | #12273, #12274 | 19 equivalent, 62 test gap in ten groups (J inferred, H and I need a lab value), 2 dead line; nothing run when the row was written; later: PR #12288 (groups A to D) and PR #12363 (groups E to J) merged, both titled gate passed |
+| linear | 316 / 61 / 38 / 5 of 420 (post-audit tree, same as pre-audit) | #12275 | 18 equivalent, 35 test gap in six groups, 7 dead line, 1 not decided; nothing run when the row was written; later: PR #12307 merged (title: gate passed) |
+| linear_zoh | 195 / 30 / 27 / 0 of 252 (post-audit tree; pre-audit 193 / 30 / 29 / 0) | #12276 | 2 equivalent, 28 test gap in five groups, 0 dead line; 452 and 468 moved from hung to killed, cause not established; nothing run when the row was written; later: PR #12342 merged (title: gate result recorded) |
+| sar_switch | 306 / 53 / 33 / 8 of 400 (section 11) | #12287 (PR #12349) | 14 equivalent, 39 test gap in six groups, 0 dead line; gate: 349 / 10 / 33 / 8, the 10 left are 6 equivalent, 3 with no witness found, 1 dead on the stimuli tried |
+| mos_table | 493 / 115 / 20 / 4 of 632 (section 12) | #12317 (PR #12401) | 25 equivalent, 89 test gap in eleven groups, 1 dead line; gate: 583 / 25 / 20 / 4, 45 accepted |
+| accept_sar | 218 / 58 / 4 / 1 of 281 (section 13) | #12431 (PR #12482) | 34 equivalent, 23 test gap in nine groups, 1 dead line; gate: 241 / 35 / 4 / 1, 39 accepted |
+| sar_kick_net | 591 / 82 / 39 / 15 of 727 (section 14) | #12460, #12494 (PR #12496, open) | 35 equivalent, 43 test gap in three groups, 4 dead line; gate: 624 / 48 / 40 / 15, exit 2, nine gaps deferred (#12494); gate with the deferred entries not re-run |
+| sar_comparator | 659 / 98 / 78 / 33 of 868 (section 15) | #12432 | 42 equivalent, 55 test gap in fifteen groups, 1 not decided; no pull request yet; gate running |
+| mos_psp103 | 264 / 72 / 18 / 5 of 359 (section 16) | #12434 (PR #12468) | 22 equivalent, 50 test gap in three groups at census time; gate: 306 / 30 / 18 / 5, 42 test gaps killed, 30 equivalent left |
 
 mos_psp103_inv20, in words: of the 23 survivors, 9 are killed by the five added tests and 14 are accepted (13 equivalent mutants in 12 entries, plus line 176). Line 173, which the first draft of the note had accepted as equivalent, is killed by the exact-mirror test, so its accepted entry was removed; the first gate run exited 2 on that stale entry and the second run (11:13-11:16 +07) passed. The forecast written before the run was 80 / 15 / 5 / 1.
 
-## 12. What is not claimed
+## 18. What is not claimed
 
-- **Six specs have no measured run:** sar_switch (a run started and was killed by the load rule, section 13), mos_table, accept_sar, sar_kick_net (727 mutants; an earlier run was stopped at 08:25 and its output file is a stub), sar_comparator and mos_psp103. Their numbers are "not measured".
-- **linear and linear_zoh were measured twice.** The first runs were on the census base `035df5ce60`; `bf66e458aa` (#12191, 151 asserts on constant table elements now count) changed both specs afterwards, so section 10 uses the re-runs on master `1c783b0b31`. The same commit changed vacask_compare, mos_psp103_gates, mos_table, sar_comparator, sar_kick_net, sar_switch and mos_psp103, and `7fefa30eaa` (#12153) changed sar_kick. Sections 3 and 5 are therefore the pre-audit counts of vacask_compare and mos_psp103_gates; the gate rows of section 11 are the current ones. The re-runs found the same survivors as the first runs (61 and 30), so the classes are the first runs' classes, read a second time; the only counts that moved are the killed and the hung of linear_zoh (193 to 195 and 29 to 27, section 10), and why they moved is not established.
+- **What is still not claimed after the six later runs.** The gate result of sar_comparator: the gate is running, and its branch note records no gate run (its "killed" for groups A to M is a reading; groups N, O and line 522 need lab figures). An exit 0 for the sar_kick_net gate: the measured gate exited 2, nine gaps are deferred in #12494, and the gate with their entries added was not re-run. The compiler version of five of the six later runs (not recorded). The gate numbers of the five specs whose merged gate pull requests section 17 names only by number (sar_logic, sar_comparator_q, raw_writer, linear, linear_zoh).
+- **linear and linear_zoh were measured twice.** The first runs were on the census base `035df5ce60`; `bf66e458aa` (#12191, 151 asserts on constant table elements now count) changed both specs afterwards, so section 10 uses the re-runs on master `1c783b0b31`. The same commit changed vacask_compare, mos_psp103_gates, mos_table, sar_comparator, sar_kick_net, sar_switch and mos_psp103, and `7fefa30eaa` (#12153) changed sar_kick. Sections 3 and 5 are therefore the pre-audit counts of vacask_compare and mos_psp103_gates; the gate rows of section 17 are the current ones. The six specs of sections 11 to 16 were run on master trees that already contain `bf66e458aa` (checked with `git merge-base --is-ancestor` for `f81a02f36a`, `36c8d6a54f` and `89a747eefc`), so their counts are post-audit. The re-runs found the same survivors as the first runs (61 and 30), so the classes are the first runs' classes, read a second time; the only counts that moved are the killed and the hung of linear_zoh (193 to 195 and 29 to 27, section 10), and why they moved is not established.
 - **raw_writer was measured on an unchanged tree** (a `git diff` of its path between the census base and master is empty) and is written up in section 9. Its test-gap groups H and I need a value from the lab, and group J is inferred: it rests on the premise that the tests run in a build that traps on an out-of-range index, an underflow and a divide by zero, which nothing here confirms.
-- The specs this note classifies on the census base (sar_logic, sar_trace_raw, bench, mos_psp103_inv20, sar_comparator_qi, sar_comparator_q, raw_writer) are byte-identical between the census base and master (checked with `git diff --quiet` on these paths) except two: master has since gained only added lines in mos_psp103_inv20 (150, #12207) and in sar_comparator_qi (99, #12205), the tests of the follow-up issues. The survivor lines in sections 6 and 7 are the census's, and the gate rows of section 11 are the current state.
-- **Classes come from reading, not from a run:** the 108 sar_logic survivors and the 40 sar_comparator_q survivors were read off the spec by subagents and spot-checked by the orchestrator; the 83 raw_writer survivors and the 91 survivors of linear and linear_zoh (61 and 30) were classified the same way, and their notes record no spot-check. The expected values of the proposed asserts are hand-derived and stay unverified until a T27 OS pane runs them. An "equivalent" is an argument, not a proof by a tool.
-- **Hung is not proven endless.** The tool reports only that the tests outlived `--timeout 30`. Each hung mutant listed is a dropped counter step or a bisection condition that never closes, which is endless by construction, and none was re-run with a longer limit. The one measured exception is in section 10: two linear_zoh mutants (452, 468) were hung in the first run and killed in the second, so a hang is a statement about one run, and a hung mutant that is not a dropped counter step is not shown to be endless.
-- **Compiler and load.** Every census run on the census base used one `t27c`, version 0.5.2; the compiler binary of the two re-runs on master (linear, linear_zoh) is not recorded in their notes. The 0.5.2 build is an older build than the tree's own (it predates the gen-zig and gen-rust commits now on master); no verdict was re-run with a current binary. A compiler build from another session ran beside the middle runs, and the 1-minute load was 24 to 46 during them, so a mutant that was only slow could have been counted as hung. Under a current binary exactly the spec seals of the follow-up lanes move, which is a separate check from the mutant verdicts.
+- The specs this note classifies on the census base (sar_logic, sar_trace_raw, bench, mos_psp103_inv20, sar_comparator_qi, sar_comparator_q, raw_writer) are byte-identical between the census base and master (checked with `git diff --quiet` on these paths) except two: master has since gained only added lines in mos_psp103_inv20 (150, #12207) and in sar_comparator_qi (99, #12205), the tests of the follow-up issues. The survivor lines in sections 6 and 7 are the census's, and the gate rows of section 17 are the current state.
+- **Classes come from reading, not from a run:** the 108 sar_logic survivors and the 40 sar_comparator_q survivors were read off the spec by subagents and spot-checked by the orchestrator; the 83 raw_writer survivors and the 91 survivors of linear and linear_zoh (61 and 30) were classified the same way, and their notes record no spot-check. The expected values of the proposed asserts are hand-derived and stay unverified until a T27 OS pane runs them. An "equivalent" is an argument, not a proof by a tool. The survivors of the six later specs (sections 11 to 16) were classified by reading in the same way, nothing run; the census comments record no spot-check, and the equivalence of the 16 `gate_step` mutants of mos_psp103 is an inference.
+- **Hung is not proven endless.** The tool reports only that the tests outlived `--timeout 30`. Each hung mutant listed is a dropped counter step or a bisection condition that never closes, which is endless by construction, and none was re-run with a longer limit. The one measured exception is in section 10: two linear_zoh mutants (452, 468) were hung in the first run and killed in the second, so a hang is a statement about one run, and a hung mutant that is not a dropped counter step is not shown to be endless. In the six later specs the hung mutants are loop counters (sar_switch, mos_table, accept_sar, sar_kick_net, sar_comparator), except two bisection mutants (`dc_out`, line 388) and two `gate_step` mutants (707, 715) of mos_psp103, which are not counters. The gates of sar_switch, mos_table, accept_sar and mos_psp103 used `--timeout 45` and counted the same number of hung mutants as their census runs (33, 20, 4, 18); 45 s is not a long enough limit to call a hang endless either.
+- **Compiler and load.** Every census run on the census base used one `t27c`, version 0.5.2; the compiler binary of the two re-runs on master (linear, linear_zoh) is not recorded in their notes, and neither is that of the six later runs (0.5.2 is stated for sar_comparator in its branch note only). The 0.5.2 build is an older build than the tree's own (it predates the gen-zig and gen-rust commits now on master); no verdict was re-run with a current binary. A compiler build from another session ran beside the middle runs, and the 1-minute load was 24 to 46 during them, so a mutant that was only slow could have been counted as hung. The six later runs were also made under load: 25 to 60 (1-minute) during mos_table, 49.5 at the end of sar_comparator, 49.46 at the start of mos_psp103 (its start precondition was not checked by hand). Under a current binary exactly the spec seals of the follow-up lanes move, which is a separate check from the mutant verdicts.
 - No speed claim: the wall times are single runs under load, not a rate.
 
-## 13. Why the runs stopped
+## 19. Why the runs stopped
 
 First stop, 08:25. Free space on the data volume fell from 7.4 GiB (07:59) to 0.4 GiB (08:25) while two other trees on this Mac held a large part of it: `/private/tmp/opencode` 9.08 GiB (87 entries) and the user temp directory `opencode` 8.81 GiB (131 entries), both read with `du -sk` at 08:31. Those belong to another tool's session and were not touched. The run on sar_kick_net was stopped by hand (kill threshold 2.5 GiB).
 
@@ -315,4 +501,17 @@ Third stop, 11:08. The 1-minute load, driven by compiler, synthesis and `claude 
 
 After the third stop, linear (11:23-11:36 +07) and linear_zoh (11:36-11:44 +07) were re-run on master `1c783b0b31`, one after the other (section 10). The 1-minute load at the start of the linear_zoh run was 7.43 (5-minute 8.60, 15-minute 12.03); the load at the start of the linear run is not recorded in its note. raw_writer was measured earlier, between the second and the third stop (10:39-10:55 +07, section 9).
 
-Resuming: when the 1-minute load is under 15 and the volume has more than 4 GiB free, the census is run on master for the six unmeasured specs, one pane at a time. Each result is posted on #12116 before the next run starts.
+Two more aborted runs, recorded in comment 6394248086 on #12241. The sar_kick_net run was started again at 12:55:59 +07 and stopped at about 13:06, after about 10 minutes, with the 1-minute load at 63 to 78. The first attempt on accept_sar did not run: the check of the unmutated spec timed out while the load was above 40. Neither left a result.
+
+Resumed and completed. The rule was: run only when the 1-minute load is under 15 and the volume has more than 4 GiB free, one pane at a time, each result posted before the next run starts. The census was then resumed on master and the six unmeasured specs are now all measured (6 of 6), each result posted as a comment on #12241 (the issue that completes this note), where the old text said #12116. All times are +07 on 2026-10-25, all six runs exit 0:
+
+| Order | Spec | Started | Finished | Section |
+| --- | --- | --- | --- | --- |
+| 1 | sar_switch | 12:12 | 12:27 | 11 |
+| 2 | mos_table | 12:27:55 | 12:55:18 | 12 |
+| 3 | accept_sar | 18:39:36 | 18:57:31 | 13 |
+| 4 | sar_comparator | 18:57:31 | 19:27:03 | 15 |
+| 5 | mos_psp103 | 19:27:03 | 19:42:20 | 16 |
+| 6 | sar_kick_net | 19:50:45 | 20:27:02 | 14 |
+
+The 1-minute load at the start was under 15 for sar_switch (3, at the claim), mos_table (7.63), accept_sar (10.74), sar_comparator (14.25) and sar_kick_net (13.33, read by hand). For mos_psp103 it was 49.46, and the start precondition was not checked by hand; sections 16 and 18 say so. The load rose during the runs of mos_table (to 60) and sar_comparator (49.5 at the end).
