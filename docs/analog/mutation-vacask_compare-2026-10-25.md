@@ -2,19 +2,21 @@
 
 Issue #12182, part of epic #10486 (weak spots of the analog v0.1 release). The numbers before come from the census of
 #12116 (section 3), measured 09:34-09:37 +07, exit 0, with `tri mutate spec --file specs/analog/vacask_compare.t27
---t27c <0.5.2 build> --jobs 3 --timeout 30`. This lane did not re-run the census and did not run the gate: the tests
-below are checked by `tri test` and by reading each mutant against its assert, nothing more.
+--t27c <0.5.2 build> --jobs 3 --timeout 30`. This lane did not re-run the census. The tests below are checked by `tri
+test` and by reading each mutant against its assert; the survivor gate was then run on this tree (section "Measured").
 
 ## Census (before)
 
 | Run | Mutants | Killed | Survived | Hung | Unviable |
 | --- | --- | --- | --- | --- | --- |
 | Census of #12116, unmodified spec | 48 | 34 | 8 | 6 | 0 |
-| Expected after this change (not measured) | 48 | 40 | 2 | 6 | 0 |
+| After this change (gate run on this tree, measured) | 48 | 40 | 2 | 6 | 0 |
 
-The tests appended to the spec add no mutants (the tool mutates the functions, not the tests), so the mutant count
-stays 48. The line numbers are those of the census text; they hold on this tree too (the lane base rewrites asserts of
-the test section only, which is below every mutated line).
+The measured row equals the 40/2/6/0 forecast made from reading the mutants; no number differs from it. The tests
+appended to the spec add no mutants (the tool mutates the functions, not the tests), so the mutant count stays 48. The
+line numbers are those of the census text; they hold on this tree too (the lane base rewrites asserts of the test
+section only, which is below every mutated line), and the gate run confirms it: the 8 mutants it left unkilled are
+the 8 accepted lines.
 
 ## The 8 survivors, by label
 
@@ -33,7 +35,8 @@ Eight survivors: 2 equivalent, 6 missing tests in 5 groups (181 and 184 share on
 
 The 6 hung mutants are drop-step mutants of loop counters (`i = i + 1` becomes `i = i`) at lines 174, 186, 208, 219,
 229 and 243: each loop never ends, so no test can go red and only the clock ends the mutant. They are listed in the
-accepted file with that reason, by construction, not by a run that was allowed to finish.
+accepted file with that reason, by construction, not by a run that was allowed to finish; the gate run saw all six
+outlive `--timeout 30`.
 
 ## The asserts that kill each group
 
@@ -63,21 +66,28 @@ local `var` or a function result; none is on a module constant element.
 
 ## What was run
 
-`tri test specs/analog/vacask_compare.t27 --t27c /Users/playra/t27-build/target/release/t27c` (a pane of the T27 OS, load
+`tri test specs/analog/vacask_compare.t27 --t27c <older build tree>/target/release/t27c` (a pane of the T27 OS, load
 6.94 at the start, 10:21 +07), exit 0:
 
 - before this change (the lane base `1941409a64`; the count is from the run of the #12166 audit, not repeated here): 7 tests, 7 pass, 0 fail, 0 vacuous;
 - after: 12 tests, 12 pass, 0 fail, `vacuous passes 0 of 12`. The five new tests count 5, 5, 5, 4 and 4 runtime asserts.
 
+## Measured
+
+The survivor gate ran on this tree on 2026-10-25, 10:26:31 to 10:29:16 +07, in a T27 OS pane with a master-built
+`t27c` (master base `1c783b0b31`), `--jobs 3 --timeout 30`: 48 mutants, 40 killed (all 40 by a failing test, none by an
+invariant), 2 survived, 6 hung, 0 unviable; "8 not killed (2 survived, 6 hung), 8 accepted by
+docs/analog/mutation-accepted-vacask_compare.txt; 0 accepted line(s) now killed. Gate passed." So SC-001 and SC-003 are
+measured and met. The seal `.trinity/seals/analog_AnalogVacaskCompare.json` was re-saved by `tri seals changed` with the
+master-built `t27c` (11:13-11:14 +07); a second run left it unchanged, and no importer's seal moved.
+
 ## Not done
 
-- The mutation gate was not run on this tree. SC-001 (`tri mutate spec ... --accepted
-  docs/analog/mutation-accepted-vacask_compare.txt` exits 0) and SC-003 are therefore not measured; the 40/2/6 row above is
-  an expectation from reading the mutants, not a count. In particular the gate also fails an accepted line whose mutant is
-  now killed; the 8 accepted lines are the 2 equivalent survivors and the 6 hung mutants only.
-- The seal `.trinity/seals/analog_AnalogVacaskCompare.json` is not re-saved (the tests change the spec's hash), and
-  strict coverage of `specs/analog/*.t27` was not re-run (SC-004).
-- `tri test` here used the older `t27c` of the build tree, not the master-built one that saves seals.
+- The tool does not name which test kills a mutant (it reports "40 by a failing test"), so the "killed by the Nth new
+  test" column above is from reading each mutant against its assert, not from the gate output.
+- Strict coverage of `specs/analog/*.t27` (`tri coverage --strict`, SC-004) was not run locally; CI runs it.
+- `tri test` for the counts in "What was run" used the older `t27c` of the build tree; the gate and the seal used the
+  master-built one.
 - The two equivalent survivors are classified by reading the function (the write at equality repeats the value held), not
   proved equivalent by a tool.
 - No PR is opened by this lane.
