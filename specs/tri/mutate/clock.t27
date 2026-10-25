@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/mutate/clock.t27 -- how long `tri mutate spec` waits for one mutant, first pass (#12345)
+; `tri mutate spec` (cli/tri/src/mutate.rs) gives every mutant one clock, `--timeout`. A mutant that
+; never ends waits the whole of it. Logged 2026-10-25, gate run 12276c of the analog loop:
+; `tri mutate spec --file specs/analog/linear_zoh.t27 --jobs 3 --timeout 45` took 13 min 35 s (load 17.98
+; at start) for 252 mutants: 223 killed, 2 survived, 27 hung, 0 unviable. Every one of the 27 hung
+; mutants is a drop-step mutant that never ends, so each waits the full 45 s: 27 x 45 = 1215 job-seconds
+; of about 2445 (3 jobs x 815 s), about half of the run. Derived from the logged figures, not timed
+; per mutant.
+; This spec is slice 1 of #12345: the rule first, in t27, the way survivors.t27 was slice 1 of #7303.
+; The rule has two parts, both on whole seconds and whole counts (u32; no realistic input comes near 2^32):
+;   the first-pass clock -- min(cap, max(FLOOR, baseline x 1.5 + 5)), where the cap is the user's
+;     `--timeout` and the baseline is the net time of the unmutated spec's own test run, 0 when no
+;     baseline is known yet. The factor 150 percent and the 5 s are the Stryker rule (timeout = net test
+;     time x 1.5 + 5 s; literature survey of 2026-10-25, 25 works opened; PIT and Stryker both drop tests
+;     and rerun only what is needed; Stryker issue 3023 on hit counters). The division rounds down.
+;     The floor bounds a tiny baseline from below and the cap bounds a large one from above; a cap
+;     below the floor wins, because the user's `--timeout` is the last word.
+;   the rerun -- a mutant that hung at the first pass and that the accepted file does NOT name is run
+;     once more at the cap before it fails the gate; a hung mutant the accepted file names is not rerun
+;     (survivors.t27: it is accepted already). `accepted_hits` here counts only the accepted hits that
+;     fall on hung mutants, not those on survivors.
+; Every number in this spec is proposed, not measured on t27: FACTOR_PCT and PLUS_S are another tool's
+; defaults, FLOOR_S is a guess. Slice 2 has to measure them against the baseline times of real specs.
+; Cost model, in job-seconds (one job running one second):
+;   old gate -- every hung mutant waits the cap:            hung x cap
+;   new gate -- every hung mutant waits the first pass, and each rerun waits the cap again:
+;                                                           hung x first + rerun x cap
+;   saved    = old - new, or 0 when the new gate would cost as much or more. It equals
+;              accepted_hits x (cap - first) - rerun x first when accepted_hits <= hung.
+; The saving is ARITHMETIC on counts a caller supplies, not a measurement: no gate has run with this
+; rule, and no speed claim stands until slice 2 shows one. The model is also not always a gain: it pays
+; only when accepted_hits x cap > hung x first, so a run whose hung mutants are mostly unaccepted costs
+; more than the old gate, and `job_s_saved` then reads 0 instead of a negative number.
+; Trade-off, recorded on purpose: a first-pass clock shorter than `--timeout` is for SCREENING runs
+; while iterating. The LANDING gate keeps ONE `--timeout`, with the accepted file written against it.
+; The reason is a slow kill: line 177 of specs/analog/linear_zoh.t27 (`nrm / 2.0` to `nrm * 2.0`) was
+; listed as hung at `--timeout 30` under high load and killed at `--timeout 45` at load 18. An accepted
+; hung entry that is really a slow kill is only found at the cap, so a short first pass would never
+; reach it. A first pass that hangs on an unaccepted line is rerun at the cap and may yet be killed.
+; Slice 2 (wiring `first_pass_s`, `rerun_at_cap` into the driver) is hand-written Rust in
+; cli/tri/src/mutate.rs. Under the only-t27 rule it is parked and needs the owner's decision: label the
+; wiring PR `owner-approved-foreign`, or name who writes the glue. Until then the driver keeps its single
+; `--timeout`, and the protocol stays "screen at a short `--timeout` while iterating, land at one
+; `--timeout` with the accepted file written against it".
+; Mutation gate on this file (`tri mutate spec`, 2026-10-25, 24 mutants): 20 killed, 4 survived, and all
+; four are equivalent mutants: the comparison of `min_s` (<), `max_s` (>), `rerun_at_cap` (>) and
+; `job_s_saved` (>=) flipped to its tie-including form changes nothing, because on a tie the same value
+; comes out (a or b; hung - hung = 0; old - new = 0).
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriMutateClock;
+
+// The Stryker rule, timeout = net test time x 1.5 + 5 s, as integers: 150 percent and 5 seconds.
+// Proposed, not measured on t27.
+pub const FACTOR_PCT : u32 = 150;
+// Proposed, not measured on t27.
+pub const PLUS_S : u32 = 5;
+// The shortest first-pass clock, in seconds, for a spec with no baseline or a tiny one. Proposed, not
+// measured on t27: a guess.
+pub const FLOOR_S : u32 = 10;
+
+/// The smaller of two clocks in seconds.
+pub fn min_s(a_s: u32, b_s: u32) -> u32 {
+    if (a_s < b_s) { return a_s; }
+    return b_s;
+}
+
+/// The larger of two clocks in seconds.
+pub fn max_s(a_s: u32, b_s: u32) -> u32 {
+    if (a_s > b_s) { return a_s; }
+    return b_s;
+}
+
+/// The first-pass clock: the baseline x 1.5 + 5 s (rounded down), at least FLOOR_S, at most the cap.
+/// A cap below FLOOR_S wins: the user's `--timeout` is the last word.
+pub fn first_pass_s(baseline_s: u32, cap_s: u32) -> u32 {
+    return min_s(cap_s, max_s(FLOOR_S, baseline_s * FACTOR_PCT / 100 + PLUS_S));
+}
+
+/// Hung mutants of the first pass that the accepted file does not name: each is rerun once at the cap.
+/// More hits than hung mutants cannot come from a correct count; none is rerun then, and nothing
+/// underflows (the type is unsigned: compare before subtracting).
+pub fn rerun_at_cap(hung: u32, accepted_hits: u32) -> u32 {
+    if (accepted_hits > hung) { return 0; }
+    return hung - accepted_hits;
+}
+
+/// Job-seconds the old gate spends on hung mutants: every one waits the cap.
+pub fn wait_old_s(hung: u32, cap_s: u32) -> u32 {
+    return hung * cap_s;
+}
+
+/// Job-seconds the new gate spends on hung mutants: every one waits the first pass, and each rerun
+/// waits the cap again.
+pub fn wait_new_s(hung: u32, accepted_hits: u32, cap_s: u32, first_s: u32) -> u32 {
+    return hung * first_s + rerun_at_cap(hung, accepted_hits) * cap_s;
+}
+
+/// Job-seconds saved against waiting the cap on every hung mutant, never negative. Arithmetic on the
+/// counts given, not a measurement. 0 when the new gate would cost as much or more (a first pass at or
+/// above the cap, or hung mutants mostly unaccepted); compared before subtracting, so nothing underflows.
+pub fn job_s_saved(hung: u32, accepted_hits: u32, cap_s: u32, first_s: u32) -> u32 {
+    if (wait_new_s(hung, accepted_hits, cap_s, first_s) >= wait_old_s(hung, cap_s)) { return 0; }
+    return wait_old_s(hung, cap_s) - wait_new_s(hung, accepted_hits, cap_s, first_s);
+}
+
+/// The Stryker numbers and the floor. A change of any of them is a change of the rule.
+invariant the_proposed_constants_are_150_5_10 { assert FACTOR_PCT == 150 and PLUS_S == 5 and FLOOR_S == 10; }
+
+/// The first-pass clock is never above the cap, and never below the floor unless the cap itself is
+/// below it. Fixed inputs, no loop: a heavy loop in an invariant blows the comptime branch budget.
+invariant the_first_pass_stays_between_the_floor_and_the_cap {
+    assert first_pass_s(0, 45) <= 45 and first_pass_s(0, 45) >= FLOOR_S;
+    assert first_pass_s(8, 45) <= 45 and first_pass_s(8, 45) >= FLOOR_S;
+    assert first_pass_s(1000, 45) <= 45 and first_pass_s(1000, 45) >= FLOOR_S;
+    assert first_pass_s(8, 17) <= 17 and first_pass_s(8, 17) >= FLOOR_S;
+    assert first_pass_s(8, 16) <= 16 and first_pass_s(8, 16) >= FLOOR_S;
+    assert first_pass_s(0, 10) <= 10 and first_pass_s(0, 10) >= FLOOR_S;
+    assert first_pass_s(0, 9) <= 9;
+    assert first_pass_s(1000, 9) <= 9;
+    assert first_pass_s(8, 0) <= 0;
+    assert first_pass_s(0, 100000) >= FLOOR_S and first_pass_s(100000, 100000) <= 100000;
+}
+
+// Scenario: the helper behind the floor and the cap, both orders and the tie.
+test min_s_is_the_smaller_clock {
+    assert min_s(3, 5) == 3;
+    assert min_s(5, 3) == 3;
+    assert min_s(4, 4) == 4;
+    assert min_s(0, 7) == 0;
+    assert min_s(7, 0) == 0;
+}
+
+// Scenario: same for the larger.
+test max_s_is_the_larger_clock {
+    assert max_s(3, 5) == 5;
+    assert max_s(5, 3) == 5;
+    assert max_s(4, 4) == 4;
+    assert max_s(0, 7) == 7;
+    assert max_s(7, 0) == 7;
+}
+
+// Scenario: gate run 12276c, linear_zoh at --timeout 45 with a baseline of 8 s: 8 x 150 / 100 = 12,
+// plus 5 = 17 s, between the floor (10) and the cap (45).
+test the_logged_baseline_gives_17_s {
+    assert first_pass_s(8, 45) == 17;
+    assert first_pass_s(8, 100) == 17;
+    assert first_pass_s(8, 18) == 17;
+}
+
+// Scenario: a new spec with no baseline yet. 0 x 1.5 + 5 = 5 s is below the floor, so the floor
+// gives the clock. A tiny baseline never gives a clock shorter than the floor.
+test no_baseline_or_a_tiny_one_gets_the_floor {
+    assert first_pass_s(0, 45) == FLOOR_S;
+    assert first_pass_s(0, 45) == 10;
+    assert first_pass_s(1, 45) == 10;
+    assert first_pass_s(2, 45) == 10;
+    assert first_pass_s(3, 45) == 10;
+}
+
+// Scenario: the floor stops winning between baselines 3 s (3 x 150 / 100 = 4, plus 5 = 9, floor wins)
+// and 4 s (6 + 5 = 11, the baseline wins). Integer steps never land on the floor exactly.
+test the_baseline_overtakes_the_floor_at_4_s {
+    assert first_pass_s(3, 45) == 10;
+    assert first_pass_s(4, 45) == 11;
+    assert first_pass_s(5, 45) == 12;
+    assert first_pass_s(6, 45) == 14;
+}
+
+// Scenario: rounding. 11 x 150 / 100 = 16 (16.5 rounded down), plus 5 = 21, not 22. And a baseline of
+// 100 s gives 155 under a cap of 1000: it pins the factor, the divisor and the 5 s apart.
+test the_factor_rounds_down_and_each_operator_counts {
+    assert first_pass_s(11, 100) == 21;
+    assert first_pass_s(100, 1000) == 155;
+    assert first_pass_s(7, 100) == 15;
+    assert first_pass_s(9, 100) == 18;
+    assert first_pass_s(40, 1000) == 65;
+}
+
+// Scenario: the cap is the ceiling. The baseline gives 44 s at 26 s, exactly 45 at 27 s and 47 at 28 s,
+// against a cap of 45: below it the baseline rules, at it they tie, above it the cap rules.
+test the_cap_stops_a_long_baseline {
+    assert first_pass_s(26, 45) == 44;
+    assert first_pass_s(27, 45) == 45;
+    assert first_pass_s(28, 45) == 45;
+    assert first_pass_s(29, 45) == 45;
+    assert first_pass_s(1000, 45) == 45;
+}
+
+// Scenario: the cap sits one second either side of the baseline's own clock (17 s).
+test the_cap_wins_exactly_when_it_is_below_the_clock {
+    assert first_pass_s(8, 18) == 17;
+    assert first_pass_s(8, 17) == 17;
+    assert first_pass_s(8, 16) == 16;
+    assert first_pass_s(8, 11) == 11;
+}
+
+// Scenario: a cap below the floor. The user's `--timeout 6` is the last word, whatever the baseline.
+test a_cap_below_the_floor_wins {
+    assert first_pass_s(0, 6) == 6;
+    assert first_pass_s(100, 6) == 6;
+    assert first_pass_s(0, 9) == 9;
+    assert first_pass_s(0, 10) == 10;
+    assert first_pass_s(0, 11) == 10;
+    assert first_pass_s(8, 0) == 0;
+}
+
+// Scenario: a huge baseline (an hour) against the cap of a long run: the baseline rules below the
+// cap and the cap rules above it.
+test a_huge_baseline_gets_the_cap {
+    assert first_pass_s(3600, 600) == 600;
+    assert first_pass_s(3600, 5405) == 5405;
+    assert first_pass_s(3600, 5406) == 5405;
+    assert first_pass_s(3600, 100000) == 5405;
+}
+
+// Scenario: gate run 12276c, all 27 hung mutants are in the accepted file: no rerun.
+test all_27_hung_accepted_means_no_rerun {
+    assert rerun_at_cap(27, 27) == 0;
+    assert rerun_at_cap(1, 1) == 0;
+    assert rerun_at_cap(0, 0) == 0;
+}
+
+// Scenario: line 177 of linear_zoh at the first pass: 28 mutants hang, 27 are accepted, so the 28th
+// (the slow kill) is rerun once at the cap and may be killed there.
+test line_177_is_rerun_at_the_cap {
+    assert rerun_at_cap(28, 27) == 1;
+    assert rerun_at_cap(1, 0) == 1;
+    assert rerun_at_cap(5, 4) == 1;
+}
+
+// Scenario: nothing accepted yet (a spec on its first gate run): every hung mutant is rerun.
+test nothing_accepted_reruns_every_hung_mutant {
+    assert rerun_at_cap(27, 0) == 27;
+    assert rerun_at_cap(10, 3) == 7;
+    assert rerun_at_cap(3, 2) == 1;
+}
+
+// Scenario: a count that cannot be right (more accepted hits than hung mutants) reruns nothing, and
+// the unsigned subtraction does not underflow.
+test more_hits_than_hung_mutants_reruns_none {
+    assert rerun_at_cap(5, 6) == 0;
+    assert rerun_at_cap(0, 1) == 0;
+    assert rerun_at_cap(3, 10) == 0;
+    assert rerun_at_cap(5, 5) == 0;
+}
+
+// Scenario: the old gate waits the whole cap on every hung mutant: 27 x 45 = 1215 job-seconds, the
+// figure of the logged run.
+test the_old_gate_waits_the_cap_on_every_hung_mutant {
+    assert wait_old_s(27, 45) == 1215;
+    assert wait_old_s(28, 45) == 1260;
+    assert wait_old_s(0, 45) == 0;
+    assert wait_old_s(1, 45) == 45;
+    assert wait_old_s(5, 0) == 0;
+}
+
+// Scenario: the new gate. All 27 accepted: 27 x 17 = 459, no rerun. Line 177 as the 28th hung
+// mutant: 28 x 17 + 1 x 45 = 521. Nothing accepted: 27 x 17 + 27 x 45 = 1674.
+test the_new_gate_waits_the_first_pass_and_then_the_cap_on_reruns {
+    assert wait_new_s(27, 27, 45, 17) == 459;
+    assert wait_new_s(28, 27, 45, 17) == 521;
+    assert wait_new_s(27, 0, 45, 17) == 1674;
+    assert wait_new_s(0, 0, 45, 17) == 0;
+    assert wait_new_s(7, 4, 50, 13) == 241;
+}
+
+// Scenario: gate run 12276c. 27 hung, all 27 accepted, cap 45, baseline 8 so first pass 17 s:
+// 1215 - 459 = 756 = 27 x (45 - 17) job-seconds. Arithmetic on the logged counts, not a timing.
+test the_logged_run_saves_756_job_s {
+    assert first_pass_s(8, 45) == 17;
+    assert job_s_saved(27, 27, 45, 17) == 756;
+    assert job_s_saved(27, 27, 45, 17) == 27 * (45 - 17);
+    assert job_s_saved(27, 27, 45, first_pass_s(8, 45)) == 756;
+}
+
+// Scenario: line 177. The same run with the slow kill hung at the first pass and unaccepted: 28 hung,
+// 27 accepted, rerun 1. 28 x 45 - (28 x 17 + 1 x 45) = 1260 - 521 = 739 = 27 x 28 - 1 x 17.
+test line_177_costs_one_rerun_and_saves_739_job_s {
+    assert rerun_at_cap(28, 27) == 1;
+    assert job_s_saved(28, 27, 45, 17) == 739;
+    assert job_s_saved(28, 27, 45, 17) == 27 * 28 - 17;
+    assert job_s_saved(28, 27, 45, 17) == job_s_saved(27, 27, 45, 17) - 17;
+}
+
+// Scenario: the closed form accepted_hits x (cap - first) - rerun x first agrees with the cost model
+// when accepted_hits <= hung, on inputs with no factor in common.
+test the_saving_agrees_with_its_closed_form {
+    assert job_s_saved(7, 4, 50, 13) == 4 * (50 - 13) - 3 * 13;
+    assert job_s_saved(7, 4, 50, 13) == 109;
+    assert job_s_saved(3, 2, 45, 17) == 39;
+    assert job_s_saved(3, 2, 45, 17) == 2 * (45 - 17) - 1 * 17;
+    assert job_s_saved(10, 8, 45, 17) == 190;
+    assert job_s_saved(10, 8, 45, 17) == 8 * (45 - 17) - 2 * 17;
+}
+
+// Scenario: no hung mutant, nothing to save, whatever else is given.
+test zero_hung_saves_nothing {
+    assert job_s_saved(0, 0, 45, 17) == 0;
+    assert job_s_saved(0, 5, 45, 17) == 0;
+    assert job_s_saved(0, 0, 0, 0) == 0;
+}
+
+// Scenario: more accepted hits than hung mutants: rerun is 0 and the saving is the whole
+// hung x (cap - first), with no underflow on the way.
+test more_hits_than_hung_mutants_saves_the_full_difference {
+    assert job_s_saved(3, 5, 45, 17) == 84;
+    assert job_s_saved(3, 3, 45, 17) == 84;
+    assert job_s_saved(1, 9, 45, 17) == 28;
+}
+
+// Scenario: a first pass at or above the cap saves nothing: the old gate waited the cap, the new one
+// would wait the first pass, and some mutants twice.
+test a_first_pass_at_or_above_the_cap_saves_nothing {
+    assert job_s_saved(27, 27, 45, 45) == 0;
+    assert job_s_saved(27, 27, 45, 46) == 0;
+    assert job_s_saved(27, 27, 45, 90) == 0;
+    assert job_s_saved(27, 27, 45, 44) == 27;
+    assert job_s_saved(27, 27, 45, 0) == 1215;
+}
+
+// Scenario: nothing accepted, the first run of a spec. The new gate costs 27 x 17 + 27 x 45 = 1674
+// against 1215: more than the old one, so the saving reads 0, not a negative number.
+test mostly_unaccepted_hung_mutants_save_nothing {
+    assert wait_new_s(27, 0, 45, 17) > wait_old_s(27, 45);
+    assert job_s_saved(27, 0, 45, 17) == 0;
+    assert job_s_saved(10, 3, 45, 17) == 0;
+    assert job_s_saved(10, 0, 45, 17) == 0;
+}
+
+// Scenario: the break-even edge. 2 hung, 1 accepted, cap 20: first 10 costs 2 x 10 + 1 x 20 = 40, the
+// same as the old 2 x 20 = 40, so 0 saved. One second less costs 38 (saves 2); one second more costs 42.
+test the_break_even_edge_saves_zero {
+    assert wait_new_s(2, 1, 20, 10) == wait_old_s(2, 20);
+    assert job_s_saved(2, 1, 20, 10) == 0;
+    assert job_s_saved(2, 1, 20, 9) == 2;
+    assert job_s_saved(2, 1, 20, 11) == 0;
+    assert job_s_saved(2, 2, 20, 10) == 20;
+}
