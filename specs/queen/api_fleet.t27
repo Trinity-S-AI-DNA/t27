@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/api_fleet.t27 -- the law of the free-model API fleet (Trinity-S-AI-DNA/t27#12170).
+; The owner's directive of 2026-10-25: scan every available AI API, use the free capacity to the
+; maximum, rotate keys so free-tier rate limits never slow the agents, and pay a user $TRI for the
+; useful work their contributed capacity carried.
+; --
+; What already exists, and is NOT rebuilt here:
+; - The reviewer bee (tools/bees/reviewer.py) scans ZAI_KEY_1../ZAI_API_KEY_.. from ~/.claude/.env,
+;   rotates in numeric order, and falls back glm-4.7-flash <-> glm-4.5-flash. Its per-key machinery
+;   (refusal kinds, cooldowns, bitmasks, the attempt bound) is queen/key_failover.t27. This file is
+;   the FLEET-level law above them: the route table, the model-pair fallback, the probe
+;   classification of the dated matrix, and the credit row the settle path consumes.
+; - The settle rail: receipts -> verdict -> OUT_CREDITED -> PAY_NORMAL, 1 mTRI per accepted job
+;   (verified/payout.t27, trinet/node-work-credit.t27; queen/key_credit.t27 holds the lease law).
+; --
+; The measured matrix (probed live 2026-10-25, skill free-fleet-routing; prices and plan access
+; drift -- highspeed was listed $0 and refused by the plan the same day it was listed):
+;   zai-coding-plan/glm-5.3-flash   $0 in/out   ALIVE (the subagent default)
+;   zai-coding-plan/glm-5.3-highspeed  $0 listed  REFUSED -- plan does not yet include access
+;   z.ai glm-4.5-flash              $0          ALIVE on all 5 pool keys (ZAI_KEY_1,2,3,5,6)
+;   z.ai glm-4.7-flash              $0          ALIVE on keys 1,3,6 (2,5 unprobed this date)
+;   nvidia z-ai/glm-5.3 (+ flash)   $0 listed   UNPROBED
+;   free-claude-code/* routes       free        UNPROBED
+;   OpenRouter z-ai/glm-5.2:free    free, 50-1000 req/day per docs  UNPROBED
+; The 2026-10-25 lesson, encoded in law below: all five pool keys answered 401 on glm-4.7-flash
+; and ALIVE on glm-4.5-flash the same hour. A 401 is a fact about the ROUTE (model x plan), never
+; about the key alone; fix incidents by re-probing the matrix, not by replacing the pool.
+; --
+; Not here: network I/O (the host probes; this file classifies what came back), the wiring into
+; trios and the bee (generated, never hand-written). ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenApiFleet;
+
+use queen::key_failover::NO_KEY;
+use queen::key_failover::KE_TRANSIENT;
+use queen::key_failover::KE_AUTH;
+use queen::key_failover::KE_QUOTA;
+use queen::key_failover::KE_REQUEST;
+use queen::key_failover::MAX_ATTEMPTS_PER_TURN;
+use queen::key_failover::bit;
+use queen::key_credit::NO_ACCOUNT;
+use queen::key_credit::KEY_CREDIT_MTRI;
+use verified::payout::PAY_NONE;
+use verified::payout::PAY_NORMAL;
+use trinet::node-work-credit::REWARD_PER_JOB_MTRI;
+
+; --- 1. The route table ---------------------------------------------------------------------------------
+
+/// The status a route carries in the dated matrix. The probe vocabulary is the same four words.
+pub const RS_ALIVE : u8 = 0;
+pub const RS_REFUSED : u8 = 1;
+pub const RS_DEAD : u8 = 2;
+pub const RS_UNPROBED : u8 = 3;
+
+/// The matrix prices routes in micro-USD per million tokens; every seeded route is free today.
+pub const PRICE_FREE : u32 = 0;
+
+/// Providers of the 2026-10-25 matrix.
+pub const PR_ZAI_CODING_PLAN : u8 = 0;
+pub const PR_ZAI_API : u8 = 1;
+pub const PR_NVIDIA : u8 = 2;
+pub const PR_FREE_CLAUDE_CODE : u8 = 3;
+pub const PR_OPENROUTER : u8 = 4;
+
+/// Models of the 2026-10-25 matrix.
+pub const MD_GLM_53_FLASH : u8 = 0;
+pub const MD_GLM_53_HIGHSPEED : u8 = 1;
+pub const MD_GLM_45_FLASH : u8 = 2;
+pub const MD_GLM_47_FLASH : u8 = 3;
+pub const MD_GLM_53 : u8 = 4;
+pub const MD_GLM_52_FREE : u8 = 5;
+
+/// One row of the dated matrix. `probe_date` is the probe's UTC date as YYYYMMDD, 0 when the route
+/// was never probed. `key_mask` names the pool keys the probe found ALIVE on this route: bit k is
+/// key k (ZAI_KEY_k), 0 when the route does not answer through the numbered pool.
+pub struct FleetRoute {
+    route_id: u8,
+    provider: u8,
+    model: u8,
+    price_in_mus: u32,
+    price_out_mus: u32,
+    status: u8,
+    probe_date: u32,
+    key_mask: u32,
+}
+
+pub const ROUTE_COUNT : u32 = 7;
+
+/// The 2026-10-25 matrix, verbatim from the probe. This table is the scanner's first OUTPUT; a
+/// later probe rewrites rows through probe_updates, never by hand-editing this seed.
+pub const ROUTES : [7]FleetRoute = [
+    FleetRoute{.route_id = 0, .provider = PR_ZAI_CODING_PLAN, .model = MD_GLM_53_FLASH,
+        .price_in_mus = PRICE_FREE, .price_out_mus = PRICE_FREE, .status = RS_ALIVE,
+        .probe_date = 20261025, .key_mask = 0},
+    FleetRoute{.route_id = 1, .provider = PR_ZAI_CODING_PLAN, .model = MD_GLM_53_HIGHSPEED,
+        .price_in_mus = PRICE_FREE, .price_out_mus = PRICE_FREE, .status = RS_REFUSED,
+        .probe_date = 20261025, .key_mask = 0},
+    FleetRoute{.route_id = 2, .provider = PR_ZAI_API, .model = MD_GLM_45_FLASH,
+        .price_in_mus = PRICE_FREE, .price_out_mus = PRICE_FREE, .status = RS_ALIVE,
+        .probe_date = 20261025, .key_mask = 110},
+    FleetRoute{.route_id = 3, .provider = PR_ZAI_API, .model = MD_GLM_47_FLASH,
+        .price_in_mus = PRICE_FREE, .price_out_mus = PRICE_FREE, .status = RS_ALIVE,
+        .probe_date = 20261025, .key_mask = 74},
+    FleetRoute{.route_id = 4, .provider = PR_NVIDIA, .model = MD_GLM_53,
+        .price_in_mus = PRICE_FREE, .price_out_mus = PRICE_FREE, .status = RS_UNPROBED,
+        .probe_date = 0, .key_mask = 0},
+    FleetRoute{.route_id = 5, .provider = PR_FREE_CLAUDE_CODE, .model = MD_GLM_53,
+        .price_in_mus = PRICE_FREE, .price_out_mus = PRICE_FREE, .status = RS_UNPROBED,
+        .probe_date = 0, .key_mask = 0},
+    FleetRoute{.route_id = 6, .provider = PR_OPENROUTER, .model = MD_GLM_52_FREE,
+        .price_in_mus = PRICE_FREE, .price_out_mus = PRICE_FREE, .status = RS_UNPROBED,
+        .probe_date = 0, .key_mask = 0},
+];
+
+/// Whether `id` names a row of the table.
+pub fn route_in_table(id: u8) -> bool {
+    return (id as u32) < ROUTE_COUNT;
+}
+
+/// How many pool keys the probe found ALIVE on this route.
+pub fn alive_keys(mask: u32) -> u32 {
+    var n : u32 = 0;
+    var k : u32 = 0;
+    while (k < 32) {
+        if ((mask & bit(k)) != 0) {
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+; --- 2. The rotation law --------------------------------------------------------------------------------
+
+/// A fleet pool holds at most FLEET_KEY_MAX numbered keys, sorted ascending (numeric order:
+/// ZAI_KEY_1, ZAI_KEY_2, ZAI_KEY_3, ZAI_KEY_5, ZAI_KEY_6 -- there is no key 4 in the 2026-10-25
+/// pool; the mask names the numbers, the array carries them in order).
+pub const FLEET_KEY_MAX : u32 = 8;
+/// No key left (an alias of key_failover's NO_KEY, in u8 for key numbers).
+pub const NO_FLEET_KEY : u8 = 255;
+/// The pair the reviewer bee alternates; nothing else has a model fallback.
+pub const NO_MODEL : u8 = 255;
+
+/// The free fallback pair: the bee's second opinion, and the step after a pool's last key.
+pub fn fallback_model(model: u8) -> u8 {
+    if (model == MD_GLM_45_FLASH) { return MD_GLM_47_FLASH; }
+    if (model == MD_GLM_47_FLASH) { return MD_GLM_45_FLASH; }
+    return NO_MODEL;
+}
+
+/// The next pool key after `last`, in numeric order, NO_FLEET_KEY after the last one. `last`
+/// out of the pool (NO_FLEET_KEY, or a number the pool does not hold) starts at the top. The
+/// caller falls back to the other model only when this returns NO_FLEET_KEY.
+pub fn next_key(keys: [FLEET_KEY_MAX]u8, count: u32, last: u8) -> u8 {
+    if (count == 0) { return NO_FLEET_KEY; }
+    if (count > FLEET_KEY_MAX) { return NO_FLEET_KEY; }
+    if (last == NO_FLEET_KEY) { return keys[0]; }
+    var i : u32 = 0;
+    while (i < count) {
+        if (keys[i] == last) {
+            if (i + 1 < count) { return keys[i + 1]; }
+            return NO_FLEET_KEY;
+        }
+        i = i + 1;
+    }
+    return keys[0];
+}
+
+/// The refusal kinds that rotate: the brief's trio. 429 and 529 arrive as KE_TRANSIENT (z.ai codes
+/// 1302/1305 ride the same HTTP statuses), a dead or excluded key as KE_AUTH (401). A quota
+/// refusal is the lease law's business (key_failover cooldowns, key_credit receipts), a bad
+/// request fails on every key: neither rotates the fleet.
+pub fn refusal_rotates(kind: u8) -> bool {
+    if (kind == KE_TRANSIENT) { return true; }
+    return kind == KE_AUTH;
+}
+
+/// The rotation step after a refusal.
+/// RT_NEXT_KEY: the next key of this model still answers -- take it.
+/// RT_FALLBACK_MODEL: this model's keys are out; the pair's other model has alive keys.
+/// RT_FAIL: nothing left. Fails closed.
+pub const RT_NEXT_KEY : u8 = 0;
+pub const RT_FALLBACK_MODEL : u8 = 1;
+pub const RT_FAIL : u8 = 2;
+
+/// `attempts` counts this turn's attempts so far, under key_failover's MAX_ATTEMPTS_PER_TURN: one
+/// bound stops both laws, so a turn can never spin through the pair forever.
+pub fn rotate_step(attempts: u32, has_next_key: bool, model: u8, fallback_alive: u32) -> u8 {
+    if (attempts >= MAX_ATTEMPTS_PER_TURN) { return RT_FAIL; }
+    if (has_next_key) { return RT_NEXT_KEY; }
+    if (fallback_alive > 0) {
+        if (fallback_model(model) != NO_MODEL) { return RT_FALLBACK_MODEL; }
+    }
+    return RT_FAIL;
+}
+
+/// The whole law in one call: find the next key, then decide.
+pub fn rotate(keys: [FLEET_KEY_MAX]u8, count: u32, last: u8, model: u8, fallback_alive: u32, attempts: u32) -> u8 {
+    let nxt : u8 = next_key(keys, count, last);
+    return rotate_step(attempts, nxt != NO_FLEET_KEY, model, fallback_alive);
+}
+
+; --- 3. The probe classification ------------------------------------------------------------------------
+
+/// Body markers a probe reads (z.ai's codes ride the body, not always the status).
+pub const BM_NONE : u8 = 0;
+pub const BM_PLAN_EXCLUDES : u8 = 1;
+pub const BM_QUOTA : u8 = 2;
+pub const BM_OVERLOAD : u8 = 3;
+
+/// Classify one probe answer for one route.
+/// - a plan-excluded marker refuses the route at any status (highspeed, 2026-10-25: listed $0,
+///   refused by the plan);
+/// - 200 is ALIVE;
+/// - 401/403 REFUSE THE ROUTE and never the key: the 2026-10-25 lesson (all five keys answered
+///   401 on glm-4.7-flash, ALIVE on glm-4.5-flash the same hour);
+/// - 402 or a quota marker is DEAD (spent, not transient);
+/// - 429, 529, 5xx, a dead connection, an overload marker leave the route UNPROBED: the probe
+///   learned nothing durable, re-probe;
+/// - other 4xx is DEAD; an unknown route id is DEAD;
+/// - anything else is UNPROBED.
+pub fn probe_result(route_id: u8, http_code: u32, marker: u8) -> u8 {
+    if (route_in_table(route_id) == false) { return RS_DEAD; }
+    if (marker == BM_PLAN_EXCLUDES) { return RS_REFUSED; }
+    if (marker == BM_QUOTA) { return RS_DEAD; }
+    if (marker == BM_OVERLOAD) { return RS_UNPROBED; }
+    if (http_code == 0) { return RS_UNPROBED; }
+    if (http_code == 200) { return RS_ALIVE; }
+    if (http_code == 401) { return RS_REFUSED; }
+    if (http_code == 403) { return RS_REFUSED; }
+    if (http_code == 402) { return RS_DEAD; }
+    if (http_code == 429) { return RS_UNPROBED; }
+    if (http_code == 529) { return RS_UNPROBED; }
+    if (http_code >= 500) { return RS_UNPROBED; }
+    if (http_code >= 400) { return RS_DEAD; }
+    return RS_UNPROBED;
+}
+
+/// Whether a probe of this answer may rewrite the dated matrix row. An inconclusive probe
+/// (UNPROBED) never touches a row that already carries a dated answer; a fresh row (probe_date 0)
+/// takes any answer. A durable answer (ALIVE, REFUSED, DEAD) always rewrites row and date.
+pub fn probe_updates(route_id: u8, http_code: u32, marker: u8) -> bool {
+    if (route_in_table(route_id) == false) { return false; }
+    let row : FleetRoute = ROUTES[route_id];
+    let cls : u8 = probe_result(route_id, http_code, marker);
+    if (cls == RS_UNPROBED) {
+        if (row.probe_date != 0) { return false; }
+    }
+    return true;
+}
+
+/// The lesson as law: a probe, whatever it answers, never retires a key from the pool. Keys
+/// leave only through the lease law (key_failover cooldowns, key_credit receipts). The matrix
+/// records what a route answered on a date; the pool is the host's, and survives the probe.
+pub fn probe_retires_key(route_id: u8, http_code: u32, marker: u8) -> bool {
+    if (route_in_table(route_id) == false) { return false; }
+    return false;
+}
+
+; --- 4. The meter ----------------------------------------------------------------------------------------
+
+/// One row per gate-passing call on a fleet route: what the settle path consumes. A row with
+/// pay == PAY_NORMAL settles at KEY_CREDIT_MTRI (1 mTRI per accepted job). Tokens are recorded
+/// and never priced; the unit is the accepted job (queen/key_credit.t27).
+pub struct CreditRow {
+    job_id: u64,
+    route_id: u8,
+    owner: u64,
+    tokens_est: u64,
+    mtri: u64,
+    pay: u8,
+}
+
+/// The meter. A call earns only when ALL THREE hold: the work passed its gate, the route is a row
+/// of the table, and the key has an owner (a pool key carries no account, and the company
+/// crediting itself is not a reward for anyone's work).
+pub fn credit(job_id: u64, route_id: u8, owner: u64, gate_passed: bool, tokens_est: u64) -> CreditRow {
+    var pay : u8 = PAY_NONE;
+    var mtri : u64 = 0;
+    if (gate_passed) {
+        if (route_in_table(route_id)) {
+            if (owner != NO_ACCOUNT) {
+                pay = PAY_NORMAL;
+                mtri = KEY_CREDIT_MTRI;
+            }
+        }
+    }
+    return CreditRow{.job_id = job_id, .route_id = route_id, .owner = owner,
+        .tokens_est = tokens_est, .mtri = mtri, .pay = pay};
+}
+
+; --- 5. Tests --------------------------------------------------------------------------------------------
+
+fn is_probe_status(s: u8) -> bool {
+    if (s == RS_ALIVE) { return true; }
+    if (s == RS_REFUSED) { return true; }
+    if (s == RS_DEAD) { return true; }
+    return s == RS_UNPROBED;
+}
+
+/// The 2026-10-25 pool: ZAI_KEY_1,2,3,5,6 in numeric order (there is no key 4).
+test the_pool_is_five_keys_in_numeric_order {
+    var keys : [FLEET_KEY_MAX]u8 = [1, 2, 3, 5, 6, 0, 0, 0];
+    assert next_key(keys, 5, NO_FLEET_KEY) == 1;
+    assert next_key(keys, 5, 1) == 2;
+    assert next_key(keys, 5, 2) == 3;
+    assert next_key(keys, 5, 3) == 5;
+    assert next_key(keys, 5, 5) == 6;
+    // after the last key: no key -- the caller falls back to the other model
+    assert next_key(keys, 5, 6) == NO_FLEET_KEY;
+    // a last the pool does not hold starts at the top
+    assert next_key(keys, 5, 4) == 1;
+    assert next_key(keys, 5, 7) == 1;
+    // fails closed on an empty or oversized pool
+    var none : [FLEET_KEY_MAX]u8 = [0, 0, 0, 0, 0, 0, 0, 0];
+    assert next_key(none, 0, NO_FLEET_KEY) == NO_FLEET_KEY;
+    assert next_key(keys, FLEET_KEY_MAX + 1, 1) == NO_FLEET_KEY;
+}
+
+/// The pair alternates and nothing else has a fallback; the bound fails closed.
+test rotation_wraps_through_the_pair_then_fails {
+    assert fallback_model(MD_GLM_45_FLASH) == MD_GLM_47_FLASH;
+    assert fallback_model(MD_GLM_47_FLASH) == MD_GLM_45_FLASH;
+    assert fallback_model(MD_GLM_53_FLASH) == NO_MODEL;
+    assert fallback_model(MD_GLM_53_HIGHSPEED) == NO_MODEL;
+    // the trio rotates: 429/529 (transient) and 401 (auth) move on; quota and a bad request do not
+    assert refusal_rotates(KE_TRANSIENT);
+    assert refusal_rotates(KE_AUTH);
+    assert refusal_rotates(KE_QUOTA) == false;
+    assert refusal_rotates(KE_REQUEST) == false;
+    // a key is still left: take it, whatever the fallback holds
+    assert rotate_step(1, true, MD_GLM_45_FLASH, 0) == RT_NEXT_KEY;
+    // the 2026-10-25 case: 4.5-flash's five keys are out (last was 6); 4.7-flash holds 3 alive
+    var keys45 : [FLEET_KEY_MAX]u8 = [1, 2, 3, 5, 6, 0, 0, 0];
+    assert rotate(keys45, 5, 6, MD_GLM_45_FLASH, 3, 5) == RT_FALLBACK_MODEL;
+    // a pool whose fallback model is refused or out: fail
+    assert rotate(keys45, 5, 6, MD_GLM_45_FLASH, 0, 5) == RT_FAIL;
+    assert rotate(keys45, 5, 6, MD_GLM_53_FLASH, 3, 5) == RT_FAIL;
+    // one bound stops the turn even with keys left
+    assert rotate(keys45, 5, 2, MD_GLM_45_FLASH, 3, MAX_ATTEMPTS_PER_TURN) == RT_FAIL;
+    assert rotate(keys45, 5, 2, MD_GLM_45_FLASH, 3, MAX_ATTEMPTS_PER_TURN - 1) == RT_NEXT_KEY;
+}
+
+/// The seeded table is the matrix exactly as probed on 2026-10-25.
+test the_table_is_the_2026_10_25_matrix {
+    assert ROUTE_COUNT == 7;
+    // zai-coding-plan/glm-5.3-flash: ALIVE, $0 in and out, the subagent default
+    assert ROUTES[0].provider == PR_ZAI_CODING_PLAN and ROUTES[0].model == MD_GLM_53_FLASH;
+    assert ROUTES[0].status == RS_ALIVE and ROUTES[0].probe_date == 20261025;
+    assert ROUTES[0].price_in_mus == PRICE_FREE and ROUTES[0].price_out_mus == PRICE_FREE;
+    // glm-5.3-highspeed: $0 listed, REFUSED by the plan the same day
+    assert ROUTES[1].model == MD_GLM_53_HIGHSPEED and ROUTES[1].status == RS_REFUSED;
+    assert ROUTES[1].probe_date == 20261025;
+    // z.ai glm-4.5-flash: ALL FIVE pool keys ALIVE (ZAI_KEY_1,2,3,5,6 -- no key 4)
+    assert ROUTES[2].model == MD_GLM_45_FLASH and ROUTES[2].status == RS_ALIVE;
+    assert ROUTES[2].key_mask == bit(1) + bit(2) + bit(3) + bit(5) + bit(6);
+    assert alive_keys(ROUTES[2].key_mask) == 5;
+    // z.ai glm-4.7-flash: keys 1,3,6 ALIVE; 2,5 unprobed this date
+    assert ROUTES[3].model == MD_GLM_47_FLASH and ROUTES[3].status == RS_ALIVE;
+    assert ROUTES[3].key_mask == bit(1) + bit(3) + bit(6);
+    assert alive_keys(ROUTES[3].key_mask) == 3;
+    // nvidia, free-claude-code, OpenRouter: listed free, never probed this date
+    assert ROUTES[4].provider == PR_NVIDIA and ROUTES[4].status == RS_UNPROBED;
+    assert ROUTES[4].probe_date == 0;
+    assert ROUTES[5].provider == PR_FREE_CLAUDE_CODE and ROUTES[5].status == RS_UNPROBED;
+    assert ROUTES[6].provider == PR_OPENROUTER and ROUTES[6].status == RS_UNPROBED;
+    assert ROUTES[6].model == MD_GLM_52_FREE;
+}
+
+/// The probe classifies the matrix's answers, including the 401 lesson.
+test probe_classifies_the_2026_10_25_answers {
+    // the two answers the matrix records for z.ai
+    assert probe_result(0, 200, BM_NONE) == RS_ALIVE;
+    assert probe_result(1, 403, BM_PLAN_EXCLUDES) == RS_REFUSED;
+    // a plan-excluded marker refuses at ANY status, even a 200
+    assert probe_result(0, 200, BM_PLAN_EXCLUDES) == RS_REFUSED;
+    // THE LESSON: the same five keys, 401 on 4.7-flash, ALIVE on 4.5-flash, one hour apart
+    assert probe_result(3, 401, BM_NONE) == RS_REFUSED;
+    assert probe_result(2, 200, BM_NONE) == RS_ALIVE;
+    assert probe_result(3, 401, BM_NONE) != RS_DEAD;
+    // a spent key (402, or z.ai's 1113 quota marker) is DEAD; transient answers teach nothing
+    assert probe_result(2, 402, BM_NONE) == RS_DEAD;
+    assert probe_result(2, 200, BM_QUOTA) == RS_DEAD;
+    assert probe_result(2, 429, BM_NONE) == RS_UNPROBED;
+    assert probe_result(2, 529, BM_NONE) == RS_UNPROBED;
+    assert probe_result(2, 0, BM_NONE) == RS_UNPROBED;
+    assert probe_result(2, 503, BM_NONE) == RS_UNPROBED;
+    assert probe_result(2, 200, BM_OVERLOAD) == RS_UNPROBED;
+    // other client errors are dead routes; an unknown route id is dead
+    assert probe_result(2, 404, BM_NONE) == RS_DEAD;
+    assert probe_result(9, 200, BM_NONE) == RS_DEAD;
+}
+
+/// Every classification is one of the four words, over the whole answer space; an inconclusive
+/// probe never rewrites a dated row; and no probe ever retires a key.
+test probe_laws_hold_over_the_whole_answer_space {
+    var code : u32 = 0;
+    while (code <= 600) {
+        var m : u32 = 0;
+        while (m <= 3) {
+            var r : u32 = 0;
+            while (r < ROUTE_COUNT) {
+                let cls : u8 = probe_result(r as u8, code, m as u8);
+                assert is_probe_status(cls);
+                assert probe_retires_key(r as u8, code, m as u8) == false;
+                r = r + 1;
+            }
+            // an UNPROBED answer never rewrites a dated row; a durable one always may
+            let upd : bool = probe_updates(0, code, m as u8);
+            let cls0 : u8 = probe_result(0, code, m as u8);
+            if (cls0 == RS_UNPROBED) {
+                assert upd == false;
+            } else {
+                assert upd;
+            }
+            m = m + 1;
+        }
+        code = code + 7;
+    }
+    // a fresh row takes any answer
+    assert probe_updates(4, 200, BM_NONE);
+    assert probe_updates(4, 429, BM_NONE);
+    // an unknown route updates nothing
+    assert probe_updates(9, 200, BM_NONE) == false;
+}
+
+/// The meter emits one row per gate pass, credits it at the one rate, and pays nothing
+/// for a failed gate, an unknown route, or an owned-by-nobody pool key.
+test the_meter_credits_one_row_per_gate_pass {
+    let row : CreditRow = credit(8001, 0, 42, true, 1500);
+    assert row.job_id == 8001 and row.route_id == 0 and row.owner == 42;
+    assert row.tokens_est == 1500;
+    assert row.pay == PAY_NORMAL and row.mtri == KEY_CREDIT_MTRI;
+    assert KEY_CREDIT_MTRI == REWARD_PER_JOB_MTRI;
+    // a second gate pass is its own row: one row per accepted job
+    let row2 : CreditRow = credit(8002, 2, 42, true, 900);
+    assert row2.job_id == 8002 and row2.pay == PAY_NORMAL;
+    // a gate fail earns nothing
+    let no_gate : CreditRow = credit(8003, 0, 42, false, 1500);
+    assert no_gate.pay == PAY_NONE and no_gate.mtri == 0;
+    // a pool key has no one to credit
+    let pool : CreditRow = credit(8004, 0, NO_ACCOUNT, true, 1500);
+    assert pool.pay == PAY_NONE and pool.mtri == 0;
+    // an unknown route earns nothing
+    let no_route : CreditRow = credit(8005, 9, 42, true, 1500);
+    assert no_route.pay == PAY_NONE and no_route.mtri == 0;
+}
+
+; --- 6. Invariants ---------------------------------------------------------------------------------------
+
+invariant the_status_vocabulary_is_the_matrixs_four_words {
+    assert RS_ALIVE == 0 and RS_REFUSED == 1 and RS_DEAD == 2 and RS_UNPROBED == 3;
+    assert RS_ALIVE != RS_REFUSED and RS_REFUSED != RS_DEAD and RS_DEAD != RS_UNPROBED;
+}
+
+invariant the_masks_name_only_pool_keys_that_exist {
+    assert ROUTES[2].key_mask <= bit(1) + bit(2) + bit(3) + bit(5) + bit(6);
+    assert ROUTES[3].key_mask <= ROUTES[2].key_mask;
+    assert FLEET_KEY_MAX < 32;
+}
+
+invariant no_fleet_key_is_no_key {
+    assert NO_FLEET_KEY == NO_KEY;
+    assert NO_FLEET_KEY >= FLEET_KEY_MAX;
+}
+
+invariant the_pair_is_an_involution {
+    assert fallback_model(fallback_model(MD_GLM_45_FLASH)) == MD_GLM_45_FLASH;
+    assert fallback_model(fallback_model(MD_GLM_47_FLASH)) == MD_GLM_47_FLASH;
+}
+
+invariant the_meter_rate_is_the_owners_one_rate {
+    assert KEY_CREDIT_MTRI == REWARD_PER_JOB_MTRI;
+    assert KEY_CREDIT_MTRI == 1;
+    assert PAY_NONE != PAY_NORMAL;
+}
