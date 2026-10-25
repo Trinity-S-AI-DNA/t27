@@ -229,12 +229,11 @@ hand-run kills (493 + 41 + 48 + 1 killed, 115 - 41 - 48 - 1 = 25 equivalent) and
 
 - The mutation gate has been run on this tree and passed (section "Gate result (measured)" above); nothing of it
   remains open. The figures in this note are measured, not predicted.
-- The seal was saved after the batch 3 tests (PR #12401, commit "re-save the AnalogMosTable seal after the batch 3
-  tests"). On master the seal `.trinity/seals/analog_AnalogMosTable.json` records 37 of 37 tests, 0 vacuous, and its
+- The seal was saved after the batch 3 tests, in PR #12401 (squash commit 96ce237ccd). On master the seal
+  `.trinity/seals/analog_AnalogMosTable.json` records 37 of 37 tests, 0 vacuous, and its
   `spec_hash` equals the sha256 of `specs/analog/mos_table.t27` (compared when this section was corrected). The lane
   itself saved none.
-- `tri coverage` and the CI docs check were not run in this lane. The CI `coverage` job of PR #12401 reported a
-  failure; its cause was not examined here and is not claimed to be this spec.
+- `tri coverage` and the CI docs check were not run in this lane; nothing here claims their result.
 - Nothing of group K or of line 835 is left to a later lane: the gate lists none of their lines among the
   not-killed mutants (see "Gate result (measured)").
 - The gate ran the 20 hung mutants again and reports 20 hung, the same count as the census; all 45 not-killed mutants
