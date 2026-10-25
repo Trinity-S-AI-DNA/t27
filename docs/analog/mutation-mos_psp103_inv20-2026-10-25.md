@@ -6,8 +6,10 @@ spec. Where each number comes from:
 - **Before** (101 mutants, 72 killed, 23 survived, 5 hung, 1 unviable) is the census of the unmodified spec, lane base
   master `de7c038e2d`, `tri mutate spec`, 3 mutants at a time, zig `-j2` each, t27c 0.5.2, 09:39-09:43 +07, exit 0.
   The 23 survivor lines are read off that output; the classes below come from reading the spec and the census text.
-- **After** (80 killed, 15 survived, 5 hung, 1 unviable) is the expected count, **not a measurement**: the gate has not
-  been run on the changed spec. The tests appended to the spec add no mutants (the tool mutates functions, not tests).
+- **After** (81 killed, 14 survived, 5 hung, 1 unviable) is measured: `tri mutate spec --accepted` on the changed spec,
+  3 mutants at a time, `--timeout 30`, the master-built t27c, 10:58-11:03 +07 (a census job ran beside it). The forecast
+  written before the run was 80 / 15 / 5 / 1; the run killed one more, line 173, which this note had accepted as equivalent
+  (see below). The tests appended to the spec add no mutants (the tool mutates functions, not tests).
 
 ## The 23 survivors, and what became of each
 
@@ -17,10 +19,11 @@ spec. Where each number comes from:
 | 223 | 1 | test gap, group B: `k < n` to `<=` in `iv_run` writes one sample too many | killed by test 3 |
 | 236 (drop-guard and `0.0 - 1.0` to `0.0 + 1.0`) | 2 | test gap, group C: the no-crossing return of `iv_delay_ps` was never taken | killed by test 3 |
 | 293 | 1 | test gap, group D: `k <= n` to `<` in `iv_kick` leaves out the last sample | killed by test 4 |
-| 126, 143, 146 (`>=`, `+`, xn), 154 (`>=`, xn2), 173, 199, 201, 236 (`<=`), 280, 295, 296 | 14 | equivalent | accepted |
+| 173 | 1 | was called equivalent (a 65th halving of `iv_rest` moves the root by about 1e-12 words, under the 17-word bar); test 5 compares `iv_rest` with an inline copy exactly, which sees that move | killed (measured; the tool does not name the test) |
+| 126, 143, 146 (`>=`, `+`, xn), 154 (`>=`, xn2), 199, 201, 236 (`<=`), 280, 295, 296 | 13 mutants in 12 entries | equivalent | accepted |
 | 176 | 1 | was undecided; equivalent, shown by test 5 | accepted |
 
-Totals: 8 killed (4 + 1 + 2 + 1), 15 accepted (14 + 1); 8 + 15 = 23. The 5 hung mutants (177, 202, 229, 281, 297) are
+Totals: 9 killed (4 + 1 + 2 + 1 + 1), 14 accepted (13 + 1); 9 + 14 = 23. The 5 hung mutants (177, 202, 229, 281, 297) are
 drop-step mutants of loop counters (`k = k + 1` or `j = j + 1` becomes the name unchanged), so each loop never ends and
 no test can go red; they are named in the accepted file with that reason. The 1 unviable mutant is the `[ret-default]`
 of `iv_run` (line 209): zig answers `zig: error: not yet implemented`. The same message stands for the same kind of
@@ -71,11 +74,11 @@ unaccepted: edit the spec above line 563 and the file must be regenerated.
 
 ## Not done, not claimed
 
-- The mutation gate has not been run on the changed spec, so the After counts (80 / 15 / 5 / 1) and "8 killed" are
-  expected from reading each mutated line against its assert, not measured. Which test kills which mutant was not
-  measured either.
+- The gate was run once on the changed spec (81 / 14 / 5 / 1, "Gate passed" only after the line 173 entry was removed;
+  the first run exited 2 on that entry and a second run is recorded in the pull request). Which test kills which mutant
+  was not measured: the tool names no test, so "killed by test N" in the table is read from the asserts.
 - The seal is not saved (`.trinity/seals/` was not touched); a `tri seals changed` is still owed before landing.
-- The 14 equivalent survivors are classified by reading the arithmetic (each entry carries it), not proved equivalent by
+- The 13 equivalent survivors are classified by reading the arithmetic (each entry carries it), not proved equivalent by
   a tool; the rail ties (126, 143) and line 176 are backed by asserts on this spec's own inputs only.
 - The 5 hung mutants are classified by construction (a loop step dropped), not by a run that was allowed to finish.
 - The unviable mutant at 209 is classified by the shared message with three other specs, not by reading the emitter.
