@@ -2,8 +2,9 @@
 //! the public surface: the bytes `emit` writes, the exports they describe, and
 //! the refusals for everything a pub fn does beyond the supported shape.
 //!
-//! The private LEB128 helpers have their unit tests in the emitter itself
-//! (`cargo test -p t27b --lib`); this file holds what the canonical gate runs.
+//! The private LEB128 helpers' edges are pinned in the law itself
+//! (specs/tri/t27b/wasm.t27, floors 1-4: the uleb/sleb textbook vectors, the
+//! carrier crossings); this file holds what the canonical gate runs.
 
 use std::path::Path;
 use std::process::Command;
@@ -265,12 +266,8 @@ fn parameterized_beyond_the_cut_is_refused_by_name() {
     f.body = vec![Stmt::Eval(konst(Ty::U32, 9)), Stmt::Return(Some(konst(Ty::U32, 1)))];
     let e = wasm32_emitter::emit(&prog(vec![f])).expect_err("refused");
     assert_eq!(e.construct, "fn body");
-    // `&` is not on the floor (comparisons are, M-C -- their own test below)
-    let src = "pub fn andy(a: u32) -> u32 { return a & 1; }\n";
-    let e = wasm32_emitter::emit(&lower_src(src)).expect_err("refused");
-    assert_eq!(e.construct, "arithmetic op");
-    assert_eq!(e.func, "andy");
-    // a param'd fn computing a remainder (`%` is not on the floor)
+    // `&` is on the floor now (M-D, floor 13 -- its own test below); `%` is
+    // the refusing example
     let src = "pub fn remf(a: u32) -> u32 { return a % 16; }\n";
     let e = wasm32_emitter::emit(&lower_src(src)).expect_err("refused");
     assert_eq!(e.construct, "arithmetic op");
@@ -363,4 +360,39 @@ console.log(ok?'MC OK':'MC MISMATCH');";
     let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the M-C gate needs Node's WebAssembly");
     assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("MC OK"), "a comparison mismatched in a standard runtime");
+}
+
+// The M-D cut (logic/shift, t27os#3's lane; the law's floor 13): six opcodes
+// byte-pinned, shr SIGNED on i32 / UNSIGNED on u32, Node proving all answers.
+#[test]
+fn logic_shifts_lower_to_floor_thirteen_and_run() {
+    let src = concat!(
+        "pub fn band(a: i32, b: i32) -> i32 { return a & b; }\n",
+        "pub fn bor(a: i32, b: i32) -> i32 { return a | b; }\n",
+        "pub fn bxor(a: i32, b: i32) -> i32 { return a ^ b; }\n",
+        "pub fn shl(a: i32, n: i32) -> i32 { return a << n; }\n",
+        "pub fn shr(a: i32, n: i32) -> i32 { return a >> n; }\n",
+        "pub fn shru(a: u32, n: u32) -> u32 { return a >> n; }\n",
+    );
+    let m = wasm32_emitter::emit(&lower_src(src)).expect("emit");
+    for opcode in [0x71u8, 0x72, 0x73, 0x74, 0x75, 0x76] {
+        assert!(m.windows(5).any(|w| w == [0x20, 0x00, 0x20, 0x01, opcode]), "opcode {:#04x} missing", opcode);
+    }
+    let dir = std::env::temp_dir().join(format!("t27b-wasm-md-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("md.wasm");
+    std::fs::write(&path, &m).expect("write module");
+    // wasm truth: the amount masks & 31 (`3 << 32` is 3; t27 native traps --
+    // the divergence floor 13 names, as floor 5 named div_u's).
+    let script = "const fs=require('fs');\
+const e=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),{}).exports;\
+const ok=e.band(-1,0x0F0F)===0x0F0F&&e.band(0xF0F0F0F0,-1)===(0xF0F0F0F0|0)\
+&&e.bor(0x0F0F,-1)===-1&&e.bxor(0xAAAAAAAA,0x55555555)===-1&&e.bxor(-1,-1)===0\
+&&e.shl(1,31)===-2147483648&&e.shl(3,32)===3&&e.shl(0x40000001,1)===-2147483646\
+&&e.shr(-16,2)===-4&&e.shr(-1,31)===-1&&e.shr(3,32)===3&&e.shr(-2147483648,31)===-1\
+&&e.shru(0xFFFFFFC0,2)===1073741808&&e.shru(0x80000000,31)===1;\
+console.log(ok?'MD OK':'MD MISMATCH');";
+    let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the M-D gate needs Node's WebAssembly");
+    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("MD OK"), "a logic/shift answer mismatched in a standard runtime");
 }

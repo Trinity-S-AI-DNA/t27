@@ -19,7 +19,8 @@
 //! f32/f64, and the odd widths uN/iN):
 //!   M-A: `pub fn name() -> T { return <const>; }` -- any carried T.
 //!   M-B: `pub fn name(p0: P, ...) -> T { return <expr>; }` where the
-//!     expression is a tree of `+ - * /` over parameters and i32-range
+//!     expression is a tree of `+ - * / & | ^ << >>` over parameters and
+//!     i32-range
 //!     constants, P and T on the i32 carrier (bool and the <=32-bit ints).
 //!     `/` and integer `@divTrunc` lower to i32.div_u (truncated unsigned
 //!     quotient). The value semantics cross; the native overflow trap of
@@ -33,6 +34,12 @@
 //!     (wasm_board_ax7203.t27) numbers the same bytes signed -- `/` chose
 //!     div_u to match the die where die and source disagreed; here they
 //!     agree. `x == 0` folds to one eqz (0x45), `x != 0` to two.
+//!   M-D: the logic/shift family joins the tree (the law's floor 13,
+//!     t27os#3's logic/shift lane): `& | ^` to 0x71/0x72/0x73;
+//!     `<<` to 0x74, `>>` to 0x75 shr_s SIGNED (t27's `>>` on i32 is
+//!     Zig's arithmetic shift, W-27) or 0x76 shr_u unsigned -- correct
+//!     wasm32; both die-confirmed. The amount is the
+//!     carrier's `& 31`, the die's law; t27's traps diverge, as `/` did.
 
 use crate::ir::{CmpOp, ArithOp, Expr, ExprKind, Func, Program, Stmt, Ty};
 
@@ -176,7 +183,11 @@ enum Body {
 /// opcodes (`Div` -- the IR of both `/` and integer `@divTrunc` -- via
 /// i32.div_u), comparisons `== != < <= > >=` via floor 11 (0x46/0x47 and the
 /// signed 0x48/0x4A/0x4C/0x4E; `x == 0` folds to one eqz, `x != 0` to two,
-/// the law's eqz_fold rule). Anything else is refused by name.
+/// the law's eqz_fold rule), `& | ^` via floor 13's 0x71/0x72/0x73 and
+/// `<< >>` via 0x74/0x75-or-0x76 (the law's bitwise_opcode/shift_opcode; the
+/// right shift reads the left operand's sign, and the amount is the
+/// carrier's `& 31`, the die's law, not t27's trap). Anything else is
+/// refused by name.
 fn lower_stack(e: &Expr, f: &Func, out: &mut Vec<u8>) -> Result<(), EmitError> {
     match &e.kind {
         ExprKind::Const(v) => {
@@ -203,20 +214,29 @@ fn lower_stack(e: &Expr, f: &Func, out: &mut Vec<u8>) -> Result<(), EmitError> {
             Ok(())
         }
         ExprKind::Arith { op, lhs, rhs, .. } => {
+            // Floor 5's four, then floor 13's seven. The right shift reads
+            // the LEFT operand's sign (t27's `>>` on i32 is Zig's arithmetic
+            // shift, W-27): signed takes shr_s 0x75, unsigned shr_u 0x76 --
+            // correct wasm32; the fleet's fill-crossing pair confirmed both
+            // opcodes on silicon). Both spellings of each shift lower to
+            // one byte: the carrier masks the amount `& 31` (the die's
+            // shl32/sar32 law), so t27's out-of-range trap is not modeled,
+            // as Div's was not.
             let opcode: u8 = match op {
-                ArithOp::Add => wasm_law::OP_I32_ADD,
-                ArithOp::Sub => wasm_law::OP_I32_SUB,
-                ArithOp::Mul => wasm_law::OP_I32_MUL,
-                ArithOp::Div => wasm_law::OP_I32_DIV_U,
-                other => {
-                    return Err(EmitError::new(
-                        &f.name,
-                        f.line,
-                        "arithmetic op",
-                        format!("the wasm32 emitter lowers + - * / on the i32 carrier, `{:?}` here", other),
-                    ));
+                ArithOp::And | ArithOp::Or | ArithOp::Xor => wasm_law::bitwise_opcode(*op as u8),
+                ArithOp::Shl | ArithOp::ShlW | ArithOp::Shr | ArithOp::ShrW => {
+                    wasm_law::shift_opcode(*op as u8, lhs.ty.signed())
                 }
+                _ => wasm_law::arith_opcode(*op as u8),
             };
+            if opcode == 0 {
+                return Err(EmitError::new(
+                    &f.name,
+                    f.line,
+                    "arithmetic op",
+                    format!("the wasm32 emitter lowers + - * / & | ^ << >> on the i32 carrier, `{:?}` here", op),
+                ));
+            }
             lower_stack(lhs, f, out)?;
             lower_stack(rhs, f, out)?;
             out.push(opcode);
@@ -246,7 +266,7 @@ fn lower_stack(e: &Expr, f: &Func, out: &mut Vec<u8>) -> Result<(), EmitError> {
             &f.name,
             f.line,
             "expression kind",
-            "the wasm32 emitter lowers parameters, i32 constants, + - * / and == != < <= > >= only".into(),
+            "the wasm32 emitter lowers parameters, i32 constants, + - * / & | ^ << >> and == != < <= > >= only".into(),
         )),
     }
 }
@@ -256,7 +276,7 @@ pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
     // The export set: every pub fn in a supported shape. M-A: no parameters,
     // a scalar return, a single constant return. M-B: parameters on the i32
     // carrier, an i32-carrier return, a single `return <expr>;` whose
-    // expression is a tree of + - * / over parameters and i32 constants.
+    // expression is a tree of + - * / & | ^ << >> over parameters and i32 constants.
     // Tests and private fns are not exports; a pub fn outside the supported
     // shape is refused by name.
     let mut fns: Vec<(usize, Ty, usize, Body)> = Vec::new();
@@ -471,141 +491,8 @@ pub fn emit(prog: &Program) -> Result<Vec<u8>, EmitError> {
     Ok(m)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::{Expr, Func, OverflowMode, Program};
-
-    fn konst(ty: Ty, v: i128) -> Expr {
-        Expr { ty, kind: ExprKind::Const(v) }
-    }
-
-    fn fn_const_ret(name: &str, ret: Ty, v: i128) -> Func {
-        Func {
-            name: name.into(),
-            nparams: 0,
-            ret: Some(ret),
-            vars: vec![],
-            body: vec![Stmt::Return(Some(konst(ret, v)))],
-            line: 1,
-            is_pub: true,
-            is_test: false,
-            is_invariant: false,
-            noreturn_site: 0,
-            slots: vec![],
-        }
-    }
-
-    fn prog(funcs: Vec<Func>) -> Program {
-        Program {
-            module: String::new(),
-            funcs,
-            sites: vec![],
-            mode: OverflowMode::Trap,
-            unchecked: vec![],
-            data: vec![],
-            globals: vec![],
-            internal_abi: vec![],
-        }
-    }
-
-    fn read_uleb(b: &[u8]) -> (u64, usize) {
-        let (mut v, mut n) = (0u64, 0usize);
-        loop {
-            let byte = b[n];
-            v |= ((byte & 0x7f) as u64) << (7 * n);
-            n += 1;
-            if byte & 0x80 == 0 {
-                return (v, n);
-            }
-        }
-    }
-
-    fn read_sleb(b: &[u8]) -> i128 {
-        let (mut result, mut shift) = (0i128, 0u32);
-        for &byte in b {
-            result |= ((byte & 0x7f) as i128) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 128 && byte & 0x40 != 0 {
-                    result |= -1i128 << shift;
-                }
-                return result;
-            }
-        }
-        result
-    }
-
-    #[test]
-    fn leb128_unsigned_edges() {
-        let mut b = Vec::new();
-        uleb(&mut b, 0);
-        assert_eq!(b, vec![0x00]);
-        let mut b = Vec::new();
-        uleb(&mut b, 127);
-        assert_eq!(b, vec![0x7f]);
-        let mut b = Vec::new();
-        uleb(&mut b, 128);
-        assert_eq!(b, vec![0x80, 0x01]);
-        let mut b = Vec::new();
-        uleb(&mut b, 624_485);
-        assert_eq!(b, vec![0xe5, 0x8e, 0x26]);
-        let (v, n) = read_uleb(&b);
-        assert_eq!((v, n), (624_485, 3));
-    }
-
-    #[test]
-    fn leb128_signed_edges() {
-        for (v, want) in [
-            (0i128, vec![0x00]),
-            (1, vec![0x01]),
-            (42, vec![0x2a]),
-            (63, vec![0x3f]),
-            (64, vec![0xc0, 0x00]),
-            (-1, vec![0x7f]),
-            (-64, vec![0x40]),
-            (-65, vec![0xbf, 0x7f]),
-            (-123_456, vec![0xc0, 0xbb, 0x78]),
-        ] {
-            let mut b = Vec::new();
-            sleb(&mut b, v);
-            assert_eq!(b, want, "sleb({})", v);
-            assert_eq!(read_sleb(&b), v);
-        }
-        // the full i64 range survives the round trip
-        for v in [i64::MIN as i128, i64::MAX as i128, -(1i128 << 63), (1i128 << 63) - 1] {
-            let mut b = Vec::new();
-            sleb(&mut b, v);
-            assert_eq!(read_sleb(&b), v);
-        }
-    }
-
-    #[test]
-    fn i64_uses_the_i64_const_opcode_and_signed_leb() {
-        let m = emit(&prog(vec![fn_const_ret("big", Ty::I64, -7)])).expect("emit");
-        // code section body: locals 0, i64.const -7 (0x42 0x79), end
-        assert!(m.ends_with(&[0x00, 0x42, 0x79, 0x0b]));
-        // the type section says i64 (0x7e), not i32
-        assert!(m.windows(4).any(|w| w == [0x60, 0x00, 0x01, 0x7e]));
-    }
-
-    #[test]
-    fn unsigned_above_the_signed_carrier_wraps_to_the_same_bits() {
-        // u32 4,000,000,000 is the 32-bit pattern wasm carries as -294,967,296:
-        // the varint must be that signed image, or the runtime refuses the
-        // module ("extra bits in varint").
-        let insn = const_insn(Ty::U32, 4_000_000_000);
-        assert_eq!(insn[0], 0x41);
-        assert_eq!(read_sleb(&insn[1..]), -294_967_296);
-        // u64 2^63 + 5 is the same 64 bits as the signed -2^63 + 5.
-        let insn = const_insn(Ty::U64, (1i128 << 63) + 5);
-        assert_eq!(insn[0], 0x42);
-        assert_eq!(read_sleb(&insn[1..]), -(1i128 << 63) + 5);
-        // everything below the boundary passes through unchanged
-        let insn = const_insn(Ty::U32, 2_147_483_647);
-        assert_eq!(read_sleb(&insn[1..]), 2_147_483_647);
-        let insn = const_insn(Ty::I32, -2_147_483_648);
-        assert_eq!(read_sleb(&insn[1..]), -2_147_483_648);
-    }
-}
-
+// The inline unit tests this file carried duplicated the LAW's own pins
+// one-for-one (specs/tri/t27b/wasm.t27: uleb 624485 -> E5 8E 26, sleb
+// -123456 -> C0 BB 78, i64.const -7 -> 42 79, const_insn's carrier
+// crossings) and the gate's byte-pinned modules; removed by M-D under the
+// shrink-only rule. The law is the home of those bytes.
