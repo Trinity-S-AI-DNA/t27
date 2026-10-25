@@ -1460,14 +1460,14 @@ pub fn type_body(out: []u8, names: []const u8, descs: []const u8, bodies: []cons
     var n : usize = vec_prefix(out, 0, k as u32);
     var i : usize = 0;
     while (i < k) {
-        var ps : [MAX_DESC_PARAMS]u8 = undefined;
+        var ps : [MAX_DESC_PARAMS]u8 = [VT_I32] ** MAX_DESC_PARAMS;
         var np : usize = desc_nparams(descs, i) as usize;
         var j : usize = 0;
         while (j < np) {
             ps[j] = VT_I32;
             j = j + 1;
         }
-        var rs : [1]u8 = undefined;
+        var rs : [1]u8 = [VT_I32];
         rs[0] = desc_result(descs, i);
         n = functype_full(out, n, ps[0..np], rs[0..1]);
         i = i + 1;
@@ -1933,6 +1933,10 @@ pub const WOP_ADD : u8 = 0;
 pub const WOP_SUB : u8 = 1;
 pub const WOP_MUL : u8 = 2;
 pub const WOP_DIV : u8 = 6;
+/// Rem's row in arith_debug_name (the first refused op: `+ - * /` are the
+/// admitted four). The adapter passes ArithOp's own discriminant, so every
+/// refused op keeps the name its Debug spelling prints.
+pub const WOP_REM : u8 = 8;
 
 /// The module-level refusal's fn name: the whole module.
 pub fn module_func() -> str {
@@ -2869,7 +2873,21 @@ pub fn fn_body_bytes(out: []u8, at: usize, shape: u8, ret_name: []const u8, payl
         var j : usize = 0;
         while (j < payload_len as usize) {
             var r : usize = payload_off as usize + j;
-            n = lower_expr_node(out, n, node_kind(nodes, r), node_v(nodes, r), node_var(nodes, r), node_op(nodes, r));
+            // Floor 13: the zero a comparison folds drops here, and the
+            // folded cmp lowers to its eqz count, not the opcode.
+            if (!fold_row_dropped(nodes, payload_off, payload_len, j as u32)) {
+                if (node_kind(nodes, r) == EK_CMP) {
+                    var d : [1]u32 = [0] ** 1;
+                    var uses : u8 = fold_cmp(nodes, payload_off, payload_len, j as u32, d[0..1]);
+                    if (uses > 0) {
+                        n = eqz_uses(out, n, uses);
+                    } else {
+                        n = lower_expr_node(out, n, node_kind(nodes, r), node_v(nodes, r), node_var(nodes, r), node_op(nodes, r));
+                    }
+                } else {
+                    n = lower_expr_node(out, n, node_kind(nodes, r), node_v(nodes, r), node_var(nodes, r), node_op(nodes, r));
+                }
+            }
             j = j + 1;
         }
     } else if (shape == BS_SELECT) {
@@ -2991,6 +3009,103 @@ pub fn walk_bodies_len(descs: []const u8) -> usize {
     if (k == 0) { return 0; }
     var a : usize = desc_body_off(descs, k - 1) as usize;
     return a + desc_body_len(descs, k - 1) as usize;
+}
+
+/// The largest postfix node stream postfix_refusal folds. An honest bound:
+/// the bodies the emitter lowers are far smaller; a longer stream fails
+/// closed rather than silently truncating the fold.
+pub const MAX_POSTFIX : usize = 512;
+
+/// Floor 8's verdict of a floor-9 postfix payload, folded with an explicit
+/// verdict stack instead of a tree walk: a Const pushes REF_OK, a Var pushes
+/// its local-variable verdict, an Arith pops rhs then lhs and pushes
+/// expr_refusal's own decision -- the same verdict, one node at a time.
+/// op_out[0] receives the op byte the detail names when the verdict is
+/// REF_ARITHMETIC_OP (the refusing node's own op, or the one carried up from
+/// its refusing operand), 0 when none refuses. A stream that is too long,
+/// runs past nodes, underpops, or carries a kind the lowering does not admit
+/// (the adapter marks those 255) fails closed as REF_EXPRESSION_KIND.
+pub fn postfix_refusal(nodes: []const u8, off: u32, len: u32, nparams: u32, op_out: []u8) -> u8 {
+    op_out[0] = 0;
+    if (len > MAX_POSTFIX as u32) { return REF_EXPRESSION_KIND; }
+    if ((off as usize + len as usize) * NODE_ROW > nodes.len) { return REF_EXPRESSION_KIND; }
+    var vs : [MAX_POSTFIX]u8 = [0] ** MAX_POSTFIX;
+    var os : [MAX_POSTFIX]u8 = [0] ** MAX_POSTFIX;
+    var top : usize = 0;
+    var j : usize = 0;
+    while (j < len as usize) {
+        var r : usize = off as usize + j;
+        var k : u8 = node_kind(nodes, r);
+        if (k == EK_CONST) {
+            vs[top] = expr_refusal(EK_CONST, 0, 0, nparams, 0, 0);
+            os[top] = 0;
+            top = top + 1;
+        } else if (k == EK_VAR) {
+            vs[top] = expr_refusal(EK_VAR, node_var(nodes, r), 0, nparams, 0, 0);
+            os[top] = 0;
+            top = top + 1;
+        } else if (k == EK_ARITH) {
+            if (top < 2) { return REF_EXPRESSION_KIND; }
+            var o : u8 = node_op(nodes, r);
+            var v : u8 = expr_refusal(EK_ARITH, 0, o, nparams, vs[top - 2], vs[top - 1]);
+            var carried : u8 = o;
+            if (vs[top - 2] != REF_OK) { carried = os[top - 2]; }
+            if (vs[top - 2] == REF_OK and vs[top - 1] != REF_OK) { carried = os[top - 1]; }
+            top = top - 2;
+            vs[top] = v;
+            os[top] = carried;
+            top = top + 1;
+        } else if (k == EK_CMP) {
+            if (top < 2) { return REF_EXPRESSION_KIND; }
+            var cv : u8 = expr_refusal(EK_CMP, 0, node_op(nodes, r), nparams, vs[top - 2], vs[top - 1]);
+            top = top - 2;
+            vs[top] = cv;
+            os[top] = 0;
+            top = top + 1;
+        } else {
+            return REF_EXPRESSION_KIND;
+        }
+        j = j + 1;
+    }
+    if (top != 1) { return REF_EXPRESSION_KIND; }
+    if (vs[0] == REF_ARITHMETIC_OP) { op_out[0] = os[0]; }
+    return vs[0];
+}
+
+/// The detail line of a refusal code, composed by the code's own builder:
+/// the typed ones carry the type name (or the op's debug name) the caller
+/// reads from its own tables; every fixed one is refusal_detail's bytes.
+pub fn refusal_detail_for(out: []u8, at: usize, code: u8, ty: []const u8, op: u8) -> usize {
+    if (code == REF_PTR_RETURN) { return uncarried_return_detail(out, at, ty); }
+    if (code == REF_I128_RETURN) { return uncarried_return_detail(out, at, ty); }
+    if (code == REF_FN_PARAMETERS) { return i32_params_detail(out, at, ty); }
+    if (code == REF_FN_RETURN_TYPE) { return i32_results_detail(out, at, ty); }
+    if (code == REF_ARITHMETIC_OP) { return arith_op_detail(out, at, op); }
+    return put_bytes(out, at, refusal_detail(code));
+}
+
+/// A bodies_out capacity walk_prog cannot outgrow: for every row it admits,
+/// at least the worst reserve its own write loop checks (12 per carried
+/// const, 6 per node, 21 for a select -- 11*plen+3 covers every shape).
+pub fn bodies_cap(facts: []const u8, strings: []const u8, nodes: []const u8) -> usize {
+    if (!facts_ok(facts, strings, nodes)) { return 0; }
+    var cap : usize = 0;
+    var i : usize = 0;
+    while (i < fact_rows(facts)) {
+        var fl : u32 = fact_flags(facts, i);
+        if ((fl & FF_TEST == 0) and (fl & FF_PUB != 0)) {
+            cap = cap + (fact_payload_len(facts, i) as usize) * 11 + 3;
+        }
+        i = i + 1;
+    }
+    return cap;
+}
+
+/// A scratch capacity compose_module cannot outgrow: every section body it
+/// renders into scratch is bounded by the names blob, the lowered bodies and
+/// a per-fn framing allowance (functype, entry, export, code framing).
+pub fn scratch_cap(names_len: usize, bodies_len: usize, k: usize) -> usize {
+    return names_len + bodies_len + 64 * k + 64;
 }
 
 test fact_and_node_rows_round_trip {
@@ -4594,4 +4709,488 @@ test walk_prog_locals_lowers_the_while_prog {
     var jn : usize = code_entries_locals(joined[0..24], names[0..3], descs[0..24], bodies[0..17], locals[0..4]);
     assert jn == 19 and joined[0] == 0x12 and joined[1] == 0x00 and joined[2] == 0x03;
     assert joined[18] == 0x0B;
+}
+
+// -- Floor 13: the EMITTER-DELETION floor (this PR, port epic #6198; the
+// owner rule of 2026-10-24, PR thread #11983 comment 6385614462: the file
+// cli/t27b/src/wasm32_emitter.rs DELETES, it does not shrink). Two things
+// the deleted file owned move here, plus the adapter-support fns above
+// (postfix_refusal, refusal_detail_for, bodies_cap, scratch_cap, WOP_REM):
+//
+// 1. The eqz fold as the ROW WALK's own decision. Floor 11's eqz_fold doc
+//    said "the emitter applies this rule at the Cmp node" -- with the
+//    emitter deleted there is no tree walk above the rows, so the walk
+//    itself must drop the folded zero and emit the eqz count. The zero
+//    sides are found by the backward arity walk (subtree_start): in a
+//    postfix stream an operand settles one need and an operator adds one,
+//    so the subtree a comparison pops closes where the running need
+//    reaches zero read downward. A multi-node subtree's last row is an
+//    operator, so "the row beside the cmp is CONST 0" can never mistake an
+//    inner operand of a bigger tree for a whole zero operand.
+// 2. Comparisons through postfix_refusal: the six all carry (floor 11's
+//    expr_refusal row), operands lhs before rhs, exactly as Arith.
+
+/// Where the subtree ending at row k starts: reading rows downward, an
+/// operand settles one need, an operator adds one; the subtree starts where
+/// the need reaches zero. Returns len when the walk runs past off (a
+/// malformed stream; the refusal walk has already refused it).
+pub fn subtree_start(nodes: []const u8, off: u32, len: u32, k: u32) -> u32 {
+    var need : usize = 1;
+    var i : i32 = k as i32;
+    while (i >= off as i32) {
+        var kk : u8 = node_kind(nodes, off as usize + i as usize);
+        if (kk == EK_CONST or kk == EK_VAR) {
+            need = need - 1;
+        } else {
+            need = need + 1;
+        }
+        if (need == 0) { return i as u32; }
+        i = i - 1;
+    }
+    return len;
+}
+
+/// The comparison at row c as the fold sees it: drops_out[0] receives the
+/// row the comparison folds away (its zero operand; len when it does not
+/// fold) and the fn returns eqz_fold's count of eqz bytes it lowers to
+/// instead of the two-operand opcode. The rhs is the subtree ending at
+/// c - 1; the lhs the subtree ending one row before that. 0 == 0 keeps one
+/// zero (the rhs one drops; the lhs rule refuses when the rhs is itself
+/// the constant 0), exactly the emitter's arm.
+pub fn fold_cmp(nodes: []const u8, off: u32, len: u32, c: u32, drops_out: []u32) -> u8 {
+    drops_out[0] = len;
+    if (c == 0 or c >= len) { return 0; }
+    if (node_kind(nodes, off as usize + c as usize) != EK_CMP) { return 0; }
+    var s : u32 = subtree_start(nodes, off, len, c - 1);
+    if (s == len) { return 0; }
+    var rz : bool = s == c - 1
+        and node_kind(nodes, off as usize + s as usize) == EK_CONST
+        and node_v(nodes, off as usize + s as usize) == 0;
+    var lz : bool = false;
+    var t : u32 = len;
+    if (s > 0) {
+        t = subtree_start(nodes, off, len, s - 1);
+        if (t == len) { return 0; }
+        lz = t == s - 1
+            and node_kind(nodes, off as usize + t as usize) == EK_CONST
+            and node_v(nodes, off as usize + t as usize) == 0;
+    }
+    var uses : u8 = eqz_fold(node_op(nodes, off as usize + c as usize), lz, rz);
+    if (uses == 0) { return 0; }
+    if (rz) {
+        drops_out[0] = c - 1;
+    } else {
+        drops_out[0] = t;
+    }
+    return uses;
+}
+
+/// True when some comparison in the stream folds row j away. The emission
+/// walk asks this per row; the streams are small and the answer is exact.
+pub fn fold_row_dropped(nodes: []const u8, off: u32, len: u32, j: u32) -> bool {
+    var c : u32 = 0;
+    while (c < len) {
+        var d : [1]u32 = [0] ** 1;
+        var uses : u8 = fold_cmp(nodes, off, len, c, d[0..1]);
+        if (uses > 0 and d[0] == j) { return true; }
+        c = c + 1;
+    }
+    return false;
+}
+
+/// The data section of one image-mounted segment, framed in place (floor
+/// 12's body through the composer): the count 1, one active segment at
+/// offset 0, the image as payload. The image is never staged in scratch --
+/// the segment is written at its final address in out, the export/code
+/// in-place pattern.
+pub fn data_image_section(out: []u8, at: usize, image: []const u8) -> usize {
+    var il : u64 = image.len as u64;
+    var body_len : u64 = (5 + uleb_len(il) + image.len) as u64;
+    var hl : usize = uleb_len(body_len);
+    out[at] = SEC_DATA;
+    var k : usize = uleb(out, at + 1, body_len);
+    var n : usize = vec_prefix(out, at + 1 + hl, 1);
+    return data_segment_active(out, n, 0, image);
+}
+
+/// compose_module's twin over a data image (floor 12's cut through the
+/// walk's composer, the emit_with_image contract): the image becomes one
+/// linear memory -- min = max = pages_for(len) -- mounted between the
+/// function and export sections in id order (1, 3, 5, 7, 10, 11) and one
+/// active segment at offset 0 after the code section. An EMPTY image is
+/// exactly compose_module's bytes: the scalar cut does not move.
+pub fn compose_module_with_image(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8, image: []const u8, scratch: []u8) -> usize {
+    if (image.len == 0) { return compose_module(out, names, descs, bodies, scratch); }
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    if (k == 0) { return 0; }
+    var n : usize = module_preamble(out, 0);
+    var sn : usize = type_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_TYPE, scratch[0..sn]);
+    sn = func_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_FUNC, scratch[0..sn]);
+    var pg : u64 = pages_for(image.len as u64);
+    sn = memtype(scratch, 0, pg, pg);
+    n = memory_section(out, n, 1, scratch[0..sn]);
+    sn = export_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_EXPORT, scratch[0..sn]);
+    sn = code_entries(scratch, names, descs, bodies);
+    n = code_section(out, n, k as u32, scratch[0..sn]);
+    return data_image_section(out, n, image);
+}
+
+test subtree_start_finds_whole_operands_only {
+    // a < b: rows [Var 0, Var 1, Cmp] -- each operand is one row
+    var nd : [48]u8 = undefined;
+    var m : usize = node_put(nd[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(nd[0..48], m, EK_VAR, 0, 1, 0);
+    m = node_put(nd[0..48], m, EK_CMP, 2, 0, 0);
+    assert m == 48;
+    assert subtree_start(nd[0..48], 0, 3, 1) == 1 and subtree_start(nd[0..48], 0, 3, 0) == 0;
+    // 0 == (x + 1): rows [Const 0, Var 1, Const 1, Arith Add, Cmp] -- the
+    // rhs subtree is three rows; its last row is an operator, so the zero
+    // beside the cmp can only be the lhs
+    var n2 : [80]u8 = undefined;
+    m = node_put(n2[0..80], 0, EK_CONST, 0, 0, 0);
+    m = node_put(n2[0..80], m, EK_VAR, 0, 1, 0);
+    m = node_put(n2[0..80], m, EK_CONST, 0, 0, 1);
+    m = node_put(n2[0..80], m, EK_ARITH, WOP_ADD, 0, 0);
+    m = node_put(n2[0..80], m, EK_CMP, 0, 0, 0);
+    assert m == 80;
+    assert subtree_start(n2[0..80], 0, 5, 3) == 1 and subtree_start(n2[0..80], 0, 5, 0) == 0;
+    // an inner operand of a bigger tree is not a whole operand: in
+    // [Var 0, Const 0, Arith Add, Const 5, Cmp] the Const 0 at row 1 is an
+    // operand of the ADD at row 2, not a whole lhs of the Cmp
+    var n3 : [80]u8 = undefined;
+    m = node_put(n3[0..80], 0, EK_VAR, 0, 0, 0);
+    m = node_put(n3[0..80], m, EK_CONST, 0, 0, 0);
+    m = node_put(n3[0..80], m, EK_ARITH, WOP_ADD, 0, 0);
+    m = node_put(n3[0..80], m, EK_CONST, 0, 0, 5);
+    m = node_put(n3[0..80], m, EK_CMP, 0, 0, 0);
+    assert m == 80;
+    assert subtree_start(n3[0..80], 0, 5, 3) == 3 and subtree_start(n3[0..80], 0, 5, 2) == 0;
+}
+
+test fold_cmp_drops_the_zero_side {
+    var d : [1]u32 = [0] ** 1;
+    // x == 0: the rhs zero drops, one eqz
+    var z : [48]u8 = undefined;
+    var m : usize = node_put(z[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(z[0..48], m, EK_CONST, 0, 0, 0);
+    m = node_put(z[0..48], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    assert fold_cmp(z[0..48], 0, 3, 2, d[0..1]) == 1 and d[0] == 1;
+    assert fold_row_dropped(z[0..48], 0, 3, 1) and !fold_row_dropped(z[0..48], 0, 3, 0);
+    // x != 0: two eqz over the one operand
+    var nz : [48]u8 = undefined;
+    m = node_put(nz[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(nz[0..48], m, EK_CONST, 0, 0, 0);
+    m = node_put(nz[0..48], m, EK_CMP, 1, 0, 0);
+    assert m == 48;
+    d[0] = 9;
+    assert fold_cmp(nz[0..48], 0, 3, 2, d[0..1]) == 2 and d[0] == 1;
+    // 0 == x: the lhs zero drops (the rhs is a whole Var row)
+    var l : [48]u8 = undefined;
+    m = node_put(l[0..48], 0, EK_CONST, 0, 0, 0);
+    m = node_put(l[0..48], m, EK_VAR, 0, 0, 0);
+    m = node_put(l[0..48], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    d[0] = 9;
+    assert fold_cmp(l[0..48], 0, 3, 2, d[0..1]) == 1 and d[0] == 0;
+    // 0 == (x + 1): the lhs zero drops beside a three-row rhs
+    var t5 : [80]u8 = undefined;
+    m = node_put(t5[0..80], 0, EK_CONST, 0, 0, 0);
+    m = node_put(t5[0..80], m, EK_VAR, 0, 1, 0);
+    m = node_put(t5[0..80], m, EK_CONST, 0, 0, 1);
+    m = node_put(t5[0..80], m, EK_ARITH, WOP_ADD, 0, 0);
+    m = node_put(t5[0..80], m, EK_CMP, 0, 0, 0);
+    assert m == 80;
+    d[0] = 9;
+    assert fold_cmp(t5[0..80], 0, 5, 4, d[0..1]) == 1 and d[0] == 0;
+    // x < 0 does not fold; x == 1 does not; 0 == 0 keeps one zero (the rhs)
+    var lt : [48]u8 = undefined;
+    m = node_put(lt[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(lt[0..48], m, EK_CONST, 0, 0, 0);
+    m = node_put(lt[0..48], m, EK_CMP, 2, 0, 0);
+    assert m == 48;
+    d[0] = 9;
+    assert fold_cmp(lt[0..48], 0, 3, 2, d[0..1]) == 0 and d[0] == 3;
+    var e1 : [48]u8 = undefined;
+    m = node_put(e1[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(e1[0..48], m, EK_CONST, 0, 0, 1);
+    m = node_put(e1[0..48], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    d[0] = 9;
+    assert fold_cmp(e1[0..48], 0, 3, 2, d[0..1]) == 0 and d[0] == 3;
+    var zz : [48]u8 = undefined;
+    m = node_put(zz[0..48], 0, EK_CONST, 0, 0, 0);
+    m = node_put(zz[0..48], m, EK_CONST, 0, 0, 0);
+    m = node_put(zz[0..48], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    d[0] = 9;
+    assert fold_cmp(zz[0..48], 0, 3, 2, d[0..1]) == 1 and d[0] == 1;
+}
+
+test fn_body_bytes_folds_the_zero_comparison {
+    // pub fn z(a) { return a == 0; } -- local.get 0, eqz, end
+    var nd : [48]u8 = undefined;
+    var nodes : [48]u8 = undefined;
+    var m : usize = node_put(nodes[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(nodes[0..48], m, EK_CONST, 0, 0, 0);
+    m = node_put(nodes[0..48], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    var n : usize = fn_body_bytes(nd[0..48], 0, BS_RETURN_EXPR, "bool", 0, 3, nodes[0..48]);
+    assert n == 4 and nd[0] == 0x20 and nd[1] == 0x00 and nd[2] == 0x45 and nd[3] == 0x0B;
+    // pub fn nz(a) { return a != 0; } -- local.get 0, eqz, eqz, end
+    var nn : [48]u8 = undefined;
+    m = node_put(nn[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(nn[0..48], m, EK_CONST, 0, 0, 0);
+    m = node_put(nn[0..48], m, EK_CMP, 1, 0, 0);
+    assert m == 48;
+    n = fn_body_bytes(nd[0..48], 0, BS_RETURN_EXPR, "bool", 0, 3, nn[0..48]);
+    assert n == 5 and nd[2] == 0x45 and nd[3] == 0x45 and nd[4] == 0x0B;
+    // pub fn lz(a) { return 0 == a; } -- the lhs zero drops, same bytes
+    var lnodes : [48]u8 = undefined;
+    m = node_put(lnodes[0..48], 0, EK_CONST, 0, 0, 0);
+    m = node_put(lnodes[0..48], m, EK_VAR, 0, 0, 0);
+    m = node_put(lnodes[0..48], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    n = fn_body_bytes(nd[0..48], 0, BS_RETURN_EXPR, "bool", 0, 3, lnodes[0..48]);
+    assert n == 4 and nd[0] == 0x20 and nd[1] == 0x00 and nd[2] == 0x45;
+    // pub fn lt(a) { return a < 0; } -- ordered against zero does NOT fold
+    var ltn : [48]u8 = undefined;
+    m = node_put(ltn[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(ltn[0..48], m, EK_CONST, 0, 0, 0);
+    m = node_put(ltn[0..48], m, EK_CMP, 2, 0, 0);
+    assert m == 48;
+    n = fn_body_bytes(nd[0..48], 0, BS_RETURN_EXPR, "bool", 0, 3, ltn[0..48]);
+    assert n == 6 and nd[0] == 0x20 and nd[1] == 0x00 and nd[2] == 0x41 and nd[3] == 0x00 and nd[4] == 0x48 and nd[5] == 0x0B;
+    // pub fn e(a) { return a == 1; } -- a nonzero constant keeps both sides
+    var en : [48]u8 = undefined;
+    m = node_put(en[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(en[0..48], m, EK_CONST, 0, 0, 1);
+    m = node_put(en[0..48], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    n = fn_body_bytes(nd[0..48], 0, BS_RETURN_EXPR, "bool", 0, 3, en[0..48]);
+    assert n == 6 and nd[2] == 0x41 and nd[3] == 0x01 and nd[4] == 0x46;
+}
+
+test compose_module_with_image_pins_the_mounted_module {
+    // the answer leaf's walk fixture (walk_prog_lowers_the_answer_leaf's)
+    var strings : [16]u8 = undefined;
+    var sn : usize = put_bytes(strings[0..16], 0, "the_answer");
+    var i32_off : u32 = @intCast(sn);
+    sn = put_bytes(strings[0..16], sn, "i32");
+    var nodes : [16]u8 = undefined;
+    var m : usize = node_put(nodes[0..16], 0, EK_CONST, 0, 0, 42);
+    assert m == 16;
+    var facts : [48]u8 = undefined;
+    var n : usize = fact_put(facts[0..48], 0, FF_PUB | FF_RET, 0, 10, 0, i32_off, 3, BS_CONST_RETURN, REF_OK, 0, 1, 1);
+    assert n == 48;
+    var names : [10]u8 = undefined;
+    var descs : [24]u8 = undefined;
+    var bodies : [12]u8 = undefined;
+    var dn : usize = walk_prog(names[0..10], descs[0..24], bodies[0..12], facts[0..48], strings[0..16], nodes[0..16]);
+    assert dn == 24;
+    var scratch : [64]u8 = undefined;
+    // the empty image is the scalar cut's 43 bytes, byte for byte
+    var plain : [64]u8 = undefined;
+    var pn : usize = compose_module(plain[0..64], names[0..10], descs[0..24], bodies[0..12], scratch[0..64]);
+    var buf : [128]u8 = undefined;
+    var empty : [1]u8 = undefined;
+    var cn : usize = compose_module_with_image(buf[0..128], names[0..10], descs[0..24], bodies[0..12], empty[0..0], scratch[0..64]);
+    assert cn == pn and cn == 43;
+    var i : usize = 0;
+    while (i < 43) {
+        assert buf[i] == plain[i];
+        i = i + 1;
+    }
+    // the gx_ contract's 143692-byte image wants exactly 3 pages (01 03 03)
+    assert pages_for(143692) == 3;
+}
+
+test compose_module_with_image_mounts_the_image {
+    var strings : [16]u8 = undefined;
+    var sn : usize = put_bytes(strings[0..16], 0, "the_answer");
+    var i32_off : u32 = @intCast(sn);
+    sn = put_bytes(strings[0..16], sn, "i32");
+    var nodes : [16]u8 = undefined;
+    var m : usize = node_put(nodes[0..16], 0, EK_CONST, 0, 0, 42);
+    assert m == 16;
+    var facts : [48]u8 = undefined;
+    var n : usize = fact_put(facts[0..48], 0, FF_PUB | FF_RET, 0, 10, 0, i32_off, 3, BS_CONST_RETURN, REF_OK, 0, 1, 1);
+    assert n == 48;
+    var names : [10]u8 = undefined;
+    var descs : [24]u8 = undefined;
+    var bodies : [12]u8 = undefined;
+    var dn : usize = walk_prog(names[0..10], descs[0..24], bodies[0..12], facts[0..48], strings[0..16], nodes[0..16]);
+    assert dn == 24;
+    var scratch : [64]u8 = undefined;
+    // the 3-byte image mounts 60 bytes: memory 05 (1 page, min=max) between
+    // function and export, data 0B (one active segment at 0) after code
+    var img : [3]u8 = undefined;
+    img[0] = 42;
+    img[1] = 0;
+    img[2] = 0;
+    var big : [128]u8 = undefined;
+    var bn : usize = compose_module_with_image(big[0..128], names[0..10], descs[0..24], bodies[0..12], img[0..3], scratch[0..64]);
+    assert bn == 60;
+    assert big[0] == 0x00 and big[1] == 0x61 and big[2] == 0x73 and big[3] == 0x6D;
+    assert big[4] == 0x01 and big[8] == 0x01 and big[15] == 0x03;
+    assert big[19] == 0x05 and big[20] == 0x04 and big[21] == 0x01;
+    assert big[22] == 0x01 and big[23] == 0x01 and big[24] == 0x01;
+    assert big[25] == 0x07 and big[41] == 0x0A;
+    assert big[49] == 0x0B and big[50] == 0x09 and big[51] == 0x01;
+    assert big[52] == 0x00 and big[53] == 0x41 and big[54] == 0x00;
+    assert big[55] == 0x0B and big[56] == 0x03 and big[57] == 0x2A;
+    assert big[58] == 0x00 and big[59] == 0x00;
+    // the gx_ contract's 143692-byte image wants exactly 3 pages (01 03 03)
+    assert pages_for(143692) == 3;
+}
+
+test postfix_refusal_carries_the_six_comparisons {
+    var op : [1]u8 = undefined;
+    var nd : [80]u8 = undefined;
+    var c : u8 = 0;
+    while (c < 6) {
+        var m : usize = node_put(nd[0..80], 0, EK_VAR, 0, 0, 0);
+        m = node_put(nd[0..80], m, EK_VAR, 0, 1, 0);
+        m = node_put(nd[0..80], m, EK_CMP, c, 0, 0);
+        assert m == 48;
+        assert postfix_refusal(nd[0..80], 0, 3, 2, op[0..1]) == REF_OK;
+        c = c + 1;
+    }
+    // the fold's operands carry too: x == 0 is admitted
+    var m : usize = node_put(nd[0..80], 0, EK_VAR, 0, 0, 0);
+    m = node_put(nd[0..80], m, EK_CONST, 0, 0, 0);
+    m = node_put(nd[0..80], m, EK_CMP, 0, 0, 0);
+    assert m == 48;
+    assert postfix_refusal(nd[0..80], 0, 3, 1, op[0..1]) == REF_OK;
+    // a cmp with nothing to pop fails closed
+    var nc : [16]u8 = undefined;
+    node_put(nc[0..16], 0, EK_CMP, 0, 0, 0);
+    assert postfix_refusal(nc[0..16], 0, 1, 0, op[0..1]) == REF_EXPRESSION_KIND;
+}
+
+test postfix_refusal_folds_each_admitted_stream {
+    var op : [1]u8 = undefined;
+    // (a + 16): Var 0, Const 16, Add -- admitted
+    var nd : [48]u8 = undefined;
+    var m : usize = node_put(nd[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(nd[0..48], m, EK_CONST, 0, 0, 16);
+    m = node_put(nd[0..48], m, EK_ARITH, WOP_ADD, 0, 0);
+    assert m == 48;
+    assert postfix_refusal(nd[0..48], 0, 3, 1, op[0..1]) == REF_OK;
+    assert op[0] == 0;
+    // the trio's arrival_frame (t / 16 + 1): Var 0, Const 16, Div, Const 1, Add
+    var af : [80]u8 = undefined;
+    m = node_put(af[0..80], 0, EK_VAR, 0, 0, 0);
+    m = node_put(af[0..80], m, EK_CONST, 0, 0, 16);
+    m = node_put(af[0..80], m, EK_ARITH, WOP_DIV, 0, 0);
+    m = node_put(af[0..80], m, EK_CONST, 0, 0, 1);
+    m = node_put(af[0..80], m, EK_ARITH, WOP_ADD, 0, 0);
+    assert m == 80;
+    assert postfix_refusal(af[0..80], 0, 5, 1, op[0..1]) == REF_OK;
+    // a folded verdict equals the tree walk's: expr_refusal over the same tree
+    assert postfix_refusal(af[0..80], 0, 5, 1, op[0..1])
+        == expr_refusal(EK_ARITH, 0, WOP_ADD, 1,
+               expr_refusal(EK_ARITH, 0, WOP_DIV, 1, expr_refusal(EK_VAR, 0, 0, 1, 0, 0), expr_refusal(EK_CONST, 0, 0, 1, 0, 0)),
+               expr_refusal(EK_CONST, 0, 0, 1, 0, 0));
+}
+
+test postfix_refusal_names_the_refusing_op {
+    var op : [1]u8 = undefined;
+    op[0] = 99;
+    // a % 16: the refusing node's own op
+    var nd : [48]u8 = undefined;
+    var m : usize = node_put(nd[0..48], 0, EK_VAR, 0, 0, 0);
+    m = node_put(nd[0..48], m, EK_CONST, 0, 0, 16);
+    m = node_put(nd[0..48], m, EK_ARITH, WOP_REM, 0, 0);
+    assert postfix_refusal(nd[0..48], 0, 3, 1, op[0..1]) == REF_ARITHMETIC_OP;
+    assert op[0] == WOP_REM;
+    // (a % 2) + 1: the deepest refusing operand's op carries up past the Add
+    var n2 : [80]u8 = undefined;
+    m = node_put(n2[0..80], 0, EK_VAR, 0, 0, 0);
+    m = node_put(n2[0..80], m, EK_CONST, 0, 0, 2);
+    m = node_put(n2[0..80], m, EK_ARITH, WOP_REM, 0, 0);
+    m = node_put(n2[0..80], m, EK_CONST, 0, 0, 1);
+    m = node_put(n2[0..80], m, EK_ARITH, WOP_ADD, 0, 0);
+    assert postfix_refusal(n2[0..80], 0, 5, 1, op[0..1]) == REF_ARITHMETIC_OP;
+    assert op[0] == WOP_REM;
+    // (1 + 2) * (a % 4): the rhs refuses; the lhs's admitted op stays out
+    var n3 : [112]u8 = undefined;
+    m = node_put(n3[0..112], 0, EK_CONST, 0, 0, 1);
+    m = node_put(n3[0..112], m, EK_CONST, 0, 0, 2);
+    m = node_put(n3[0..112], m, EK_ARITH, WOP_ADD, 0, 0);
+    m = node_put(n3[0..112], m, EK_VAR, 0, 0, 0);
+    m = node_put(n3[0..112], m, EK_CONST, 0, 0, 4);
+    m = node_put(n3[0..112], m, EK_ARITH, WOP_REM, 0, 0);
+    m = node_put(n3[0..112], m, EK_ARITH, WOP_MUL, 0, 0);
+    assert postfix_refusal(n3[0..112], 0, 7, 1, op[0..1]) == REF_ARITHMETIC_OP;
+    assert op[0] == WOP_REM;
+}
+
+test postfix_refusal_fails_closed {
+    var op : [1]u8 = undefined;
+    // a local read past the parameters
+    var nd : [16]u8 = undefined;
+    node_put(nd[0..16], 0, EK_VAR, 0, 3, 0);
+    assert postfix_refusal(nd[0..16], 0, 1, 2, op[0..1]) == REF_LOCAL_VARIABLE;
+    // a kind the lowering does not admit (the adapter marks those 255)
+    var nk : [16]u8 = undefined;
+    node_put(nk[0..16], 0, 255, 0, 0, 0);
+    assert postfix_refusal(nk[0..16], 0, 1, 0, op[0..1]) == REF_EXPRESSION_KIND;
+    // an Arith with nothing to pop
+    var na : [16]u8 = undefined;
+    node_put(na[0..16], 0, EK_ARITH, WOP_ADD, 0, 0);
+    assert postfix_refusal(na[0..16], 0, 1, 0, op[0..1]) == REF_EXPRESSION_KIND;
+    // a stream that runs past the nodes area
+    assert postfix_refusal(nd[0..16], 8, 4, 0, op[0..1]) == REF_EXPRESSION_KIND;
+    // two operands and no operator: not one verdict on the stack
+    var n2 : [32]u8 = undefined;
+    var m : usize = node_put(n2[0..32], 0, EK_CONST, 0, 0, 1);
+    node_put(n2[0..32], m, EK_CONST, 0, 0, 2);
+    assert postfix_refusal(n2[0..32], 0, 2, 0, op[0..1]) == REF_EXPRESSION_KIND;
+}
+
+test refusal_detail_for_routes_every_code {
+    var d : [160]u8 = undefined;
+    var n : usize = refusal_detail_for(d[0..160], 0, REF_PTR_RETURN, "ptr", 0);
+    assert std.mem.eql(u8, d[0..n], "the wasm32 emitter exports scalar returns, `ptr` here");
+    n = refusal_detail_for(d[0..160], 0, REF_I128_RETURN, "i128", 0);
+    assert std.mem.eql(u8, d[0..n], "the wasm32 emitter exports scalar returns, `i128` here");
+    n = refusal_detail_for(d[0..160], 0, REF_FN_PARAMETERS, "u64", 0);
+    assert std.mem.eql(u8, d[0..n], "the wasm32 emitter carries i32 parameters, `u64` here");
+    n = refusal_detail_for(d[0..160], 0, REF_FN_RETURN_TYPE, "i64", 0);
+    assert std.mem.eql(u8, d[0..n], "the wasm32 emitter carries i32 results here, `i64` instead");
+    n = refusal_detail_for(d[0..160], 0, REF_ARITHMETIC_OP, "", 8);
+    assert std.mem.eql(u8, d[0..n], "the wasm32 emitter lowers + - * / on the i32 carrier, `Rem` here");
+    n = refusal_detail_for(d[0..160], 0, REF_MODULE, "", 0);
+    assert std.mem.eql(u8, d[0..n], "no pub fn whose body the wasm32 emitter lowers (a constant leaf, or an expression over i32 parameters and constants)");
+    n = refusal_detail_for(d[0..160], 0, REF_VOID_PUB_FN, "", 0);
+    assert std.mem.eql(u8, d[0..n], "the wasm32 emitter exports fns that return a scalar");
+}
+
+test bodies_cap_and_scratch_cap_bound_the_walk {
+    // strings: "the_answer" + "i32"; nodes: one const
+    var strings : [16]u8 = undefined;
+    var sn : usize = put_bytes(strings[0..16], 0, "the_answer");
+    var i32_off : u32 = @intCast(sn);
+    sn = put_bytes(strings[0..16], sn, "i32");
+    var nodes : [16]u8 = undefined;
+    node_put(nodes[0..16], 0, EK_CONST, 0, 0, 42);
+    // one admitted const row (payload 1) and one test row the walk skips
+    // (its payload borrows the same 1-node area, so facts_ok holds)
+    var facts : [96]u8 = undefined;
+    var n : usize = fact_put(facts[0..96], 0, FF_PUB | FF_RET, 0, 10, 0, i32_off, 3, BS_CONST_RETURN, REF_OK, 0, 1, 1);
+    n = fact_put(facts[0..96], n, FF_TEST, 0, 0, 0, 0, 0, BS_OTHER, 0, 0, 1, 2);
+    assert n == 96;
+    // the admitted row reserves 11*1+3 = 14 bytes; the skipped row adds none
+    assert bodies_cap(facts[0..96], strings[0..16], nodes[0..16]) == 14;
+    // a partial facts area fails closed
+    assert bodies_cap(facts[0..30], strings[0..16], nodes[0..16]) == 0;
+    // the trio needs 117 bytes of module: the scratch bound over it holds
+    assert scratch_cap(64, 128, 3) >= 64 + 128;
+    // a select's 21-byte reserve is inside the same per-row bound
+    assert 11 * 3 + 3 >= 21;
 }
