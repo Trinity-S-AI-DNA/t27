@@ -575,7 +575,7 @@ void test_coverage_report_carries_every_class(void) {
     assert((buf_has(&out, w, "n=3", 3) == true));
     assert((buf_has(&out, w, "n=2", 3) == true));
     assert((buf_has(&out, w, "n=0", 3) == true));
-    assert((buf_has(&out, w, "n=62", 4) == false));
+    assert((buf_has(&out, w, "n=64", 4) == false));
     assert((buf_has(&out, w, "G_UNKNOWN", 9) == true));
 }
 
@@ -622,7 +622,7 @@ void test_a_hole_in_either_column_fails_the_filled_check(void) {
     for (size_t i = 0; i < 68; i++) {
         n[i] = NAME_LENS[i];
     }
-    n[66] = 0;
+    n[67] = 0;
     assert((rows_filled(n, EVENT_LENS) == false));
     size_t e[68] = {0};
     for (size_t i = 0; i < 68; i++) {
@@ -654,8 +654,8 @@ void test_a_repeated_name_is_caught_wherever_it_sits(void) {
     for (size_t i = 0; i < 68; i++) {
         k[i] = NAME_LENS[i];
     }
-    m[66] = m[0];
-    k[66] = k[0];
+    m[67] = m[0];
+    k[67] = k[0];
     assert((names_unique_in(m, k) == false));
 }
 
@@ -665,13 +665,13 @@ void test_a_class_outside_the_three_is_unknown(void) {
     for (size_t i = 0; i < 68; i++) {
         c[i] = CLASSES[i];
     }
-    c[66] = G_UNKNOWN;
+    c[67] = G_UNKNOWN;
     assert((classes_known(c) == false));
-    c[66] = G_BLOCKING;
+    c[67] = G_BLOCKING;
     assert((classes_known(c) == true));
-    c[66] = G_SOFT;
+    c[67] = G_SOFT;
     assert((classes_known(c) == true));
-    c[66] = G_REPORTING;
+    c[67] = G_REPORTING;
     assert((classes_known(c) == true));
 }
 
