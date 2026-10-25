@@ -69,6 +69,8 @@ mod hot; // t27c gen-rust of specs/tri/hot/hot.t27 (#8870): every rule of `tri h
 #[path = "../../../gen/rust/tools/t27o/ledger.rs"] #[allow(dead_code, unused_parens, clippy::all)] mod t27o_ledger; // t27c gen-rust of specs/tools/t27o/ledger.t27: which runner's exit code is a verdict for `tri t27o --check` (#10525), which front end reads a file, what a .zig file is judged by (#10823)
 #[path = "../../../gen/rust/tri/lanes/lanes.rs"] #[allow(dead_code, unused_parens)]
 mod lanes; // t27c gen-rust of specs/tri/lanes/lanes.t27: every rule of `tri lanes`
+#[path = "../../../gen/rust/tri/preflight/preflight.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod pf; // t27c gen-rust of specs/tri/preflight/preflight.t27: the push preflight's decision table over labs.t27's gate commands (#11783)
 #[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
 #[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
 #[path = "../../../gen/rust/tools/t27o/zig_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod zig; // t27c gen-rust of specs/tools/t27o/zig_convert.t27: the Zig front end of `tri t27o` (#10765)
@@ -459,6 +461,8 @@ enum Commands {
     T27oSweep { paths: Vec<String>, #[arg(long, default_value = t27o_ledger::SWEEP_HERE)] repo: String, #[arg(long, default_value_t = t27o_ledger::SWEEP_MAX_BYTES)] max_bytes: usize, #[arg(long)] cache: Option<String>, #[arg(long, default_value_t = t27o_ledger::SWEEP_TOP)] top: usize },
     /// Land a lane branch (default: the current one): merge master, then tests with no vacuous pass, seals, types ratchet, dupe subset, push, pull request, auto-merge; the first failing gate stops it with a named code (CONFLICT, TESTS_NOT_CLEAN, SEAL_NOT_CLEAN, TYPES_NOT_CLEAN, DUPE_NOT_SUBSET, PUSH_NOT_CONFIRMED) and a second run prints ALREADY_LANDED; --plan prints the steps and runs none, --check stops before the commit; T27C names the t27c program (default t27c on PATH) (rules: specs/tri/land/land.t27, #11068).
     Land { branch: Option<String>, #[arg(long, default_value_t = 0)] issue: u64, #[arg(long)] plan: bool, #[arg(long)] check: bool },
+    /// Run the nine local gates of specs/t27os/labs.t27 (commands imported there, rules specs/tri/preflight/preflight.t27) in gate order before a push, one line per gate; exit 0 every gate ok, 1 a gate is RED, 2 a gate gave no verdict (timeout, missing tool); every refusal names the gate and the command to inspect (#11783).
+    Preflight,
     /// The golden chain's front door: `land` verifies each queued claude/evolve-* branch locally and lands the ready ones on refs/golden/head by compare-and-swap (--plan writes nothing), `push` sends the unpushed links to GitHub as one `tri land` pull request when the window is due (--queued N overrides the Actions queue count, --issue N is the Closes #N), `status` prints head, queue and the next push time (rules: specs/queen/golden_chain.t27 section 6, hosted by specs/tri/land/golden_land.t27, #11275).
     Golden { action: String, #[arg(long)] plan: bool, #[arg(long)] queued: Option<u64>, #[arg(long, default_value_t = 0)] issue: u64 },
     /// `trigit <verb>`: our own git's one command per act -- claim <issue> <sha>, beat <host> <build>, status, verdict <key>, land; hold, release, send, recv, join and board print why they wait (rules: specs/tri/trigit/verbs.t27, #11601).
@@ -1393,6 +1397,7 @@ fn main() -> Result<()> {
         Commands::Trigit { argv } => std::process::exit(cmd_trigit(&argv)? as i32),
         Commands::T27os { action, plan, yes, build, sums } => std::process::exit(cmd_t27os(action, *plan, *yes, *build, sums)),
         Commands::Land { branch, issue, plan, check } => std::process::exit(cmd_land(branch.as_deref(), *issue, *plan, *check, false)? as i32),
+        Commands::Preflight => std::process::exit(cmd_preflight() as i32),
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
         Commands::Learn { action } => loopclaim::learn_run(action)?,
     }
@@ -1519,6 +1524,20 @@ fn cmd_serve(addr: &str) -> Result<()> {
 }
 
 /// `tri land` (#11068): every rule is specs/tri/land/land.t27; this runs the slot it names next as an argument vector (no shell), appends the run as evidence, has the spec judge it and stops at the first refusal. The scratch worktree is removed on every path.
+/// `tri preflight` (#11783): the nine local gates of specs/t27os/labs.t27 as one command before a push. Every rule -- which gate, which command, the timeout ceiling, the verdict, the exit -- is specs/tri/preflight/preflight.t27; this glue spawns `sh -c` per gate, kills it at the spec's ceiling (a kill is no-verdict, never ok), prints the spec's one line per gate, and refuses on anything but ok (exit 1 red, exit 2 no verdict).
+fn cmd_preflight() -> u8 {
+    let (mut worst, mut line) = (pf::PF_OK, vec![0u8; 64]);
+    for i in 0..pf::GATE_COUNT {
+        let x = match Command::new("sh").arg("-c").arg(pf::pf_command(i)).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() { Ok(mut c) => { let dl = std::time::Instant::now() + std::time::Duration::from_secs(pf::pf_timeout(i) as u64); loop { match c.try_wait() { Ok(Some(s)) => break s.code().unwrap_or(255) as u8, Ok(None) if std::time::Instant::now() >= dl => { let _ = c.kill(); let _ = c.wait(); break 255; } Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)), Err(_) => break 255 } } } Err(_) => 255 };
+        let n = pf::pf_line(&mut line, 64, i, x);
+        println!("{}", String::from_utf8_lossy(&line[..n]));
+        if pf::pf_refuses(pf::pf_classify(x)) { eprintln!("  red gate: {} | inspect: {}", pf::pf_name(i), pf::pf_command(i)); }
+        worst = pf::pf_worse(worst, pf::pf_classify(x));
+    }
+    if worst == pf::PF_OK { println!("tri preflight: {}/{} gates ok, push may go", pf::GATE_COUNT, pf::GATE_COUNT); } else { eprintln!("tri preflight: REFUSED ({}) -- fix the red gate above, re-run `tri preflight`, then push", if worst == pf::PF_RED { "a gate is RED" } else { "a gate gave no verdict" }); }
+    pf::pf_exit_code(worst)
+}
+
 fn cmd_land(branch: Option<&str>, issue: u64, plan: bool, check: bool, seals: bool) -> Result<u8> {
     let leak = |s: String| -> &'static str { s.leak() };
     let head = || Command::new("git").args(["symbolic-ref", "--short", "HEAD"]).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
@@ -1582,7 +1601,7 @@ fn cmd_golden(action: &str, plan: bool, queued: Option<u64>, issue: u64) -> Resu
     Ok(g::exit_code(code))
 }
 
-/// `trigit <verb>`: our own git's one command per act (specs/tri/trigit/verbs.t27, #11601): the spec decides the class; this glue runs one argv vector with no shell, reads the feed, or prints the spec's words. Same shape as cmd_golden.
+/// `trigit <verb>`: our own git's one command per act (specs/tri/trigit/verbs.t27, #11601): the spec decides the class; this glue runs one argv vector with no shell, reads the feed or the handoff ledger, or prints the spec's words. Same shape as cmd_golden.
 fn cmd_trigit(args: &[String]) -> Result<u8> {
     use tv as v;
     let leak = |s: String| -> &'static str { s.leak() };
@@ -1603,13 +1622,13 @@ fn cmd_trigit(args: &[String]) -> Result<u8> {
             let n = v::beat_push_argv(&mut buf, 4096, sha.as_bytes(), host.as_bytes()); if n == 0 { eprintln!("trigit beat: commit {sha} is not a hex id"); return Ok(1); }
             let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit beat: push exit {x}: {o}"); return Ok(x); }
             let r = leak(format!("{}{}", v::ALIVE_PREF, host)); say(v::TV_BEAT, r.as_bytes(), sha.as_bytes(), &mut buf); }
-        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096);
-            let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096);
-            println!("{}", String::from_utf8_lossy(&buf[..n])); }
+        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096); let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); }
         v::A_VERDICT => { let key = args.get(1).map(String::as_str).unwrap_or(""); let n = v::verdict_argv(&mut buf, 4096, key.as_bytes());
             if n == 0 { eprintln!("trigit verdict: need a key"); return Ok(1); }
             let (x, o) = run(&buf[..n], false); if o.is_empty() && x == 0 { println!("no verdict for {key}"); } else { println!("{}", o.trim()); } println!("{}", v::verdict_where()); }
         v::A_GOLDEN => return cmd_golden("land", false, None, 0),
+        v::A_HANDOFF => { let p = find_trinity_root()?.join(v::handoff_where()); let text = std::fs::read_to_string(&p).unwrap_or_default(); let head = args.get(1).cloned().unwrap_or_default(); if head.is_empty() { let n = v::handoff_text(text.as_bytes(), &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(0); }
+            let (ag, ta, st, is) = (leak(head), leak(args.get(2).cloned().unwrap_or_default()), leak(args.get(3).cloned().unwrap_or_default()), leak(args.get(4).cloned().unwrap_or_default())); let nt = leak(args.get(5..).map(|r| r.join(" ")).unwrap_or_default()); let n = v::create_record(&mut buf, 4096, ag, ta, st, is, nt); if n == 0 { println!("{}", v::handoff_refusal()); return Ok(1); } let last = v::find_last_state(text.as_bytes(), ta); let code = v::state_code(st.as_bytes(), 0, st.len()); if !v::may_write(last, code) { println!("{}", v::move_refusal()); return Ok(1); } let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&p).map_err(|e| anyhow::anyhow!("trigit handoff: {e}"))?; if !text.is_empty() && !text.ends_with('\n') { std::io::Write::write_all(&mut f, b"\n").map_err(|e| anyhow::anyhow!("trigit handoff: {e}"))?; } std::io::Write::write_all(&mut f, &buf[..n]).map_err(|e| anyhow::anyhow!("trigit handoff: {e}"))?; let rec = leak(String::from_utf8_lossy(&buf[..n - 1]).into_owned()); say(v::TV_HANDOFF, rec.as_bytes(), v::handoff_where().as_bytes(), &mut buf); }
         _ => { let n = v::usage_text(&mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
     }
     Ok(0)

@@ -3669,18 +3669,17 @@ async fn coverage_handler(Json(req): Json<CompileRequest>) -> impl IntoResponse 
         Ok(ast) => {
             let mut fn_names = Vec::new();
             let mut tested_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
-            fn collect_calls(node: &compiler::Node, calls: &mut std::collections::HashSet<String>) {
-                if node.kind == compiler::NodeKind::ExprCall && !node.name.is_empty() {
-                    calls.insert(node.name.clone());
+            // one walk: every FnDecl anywhere, and the bare name of every call inside a
+            // test block at any depth (#11808: qualified calls and nested blocks were unread).
+            fn walk(n: &compiler::Node, fns: &mut Vec<String>, calls: &mut std::collections::HashSet<String>, in_test: bool) {
+                if n.kind == compiler::NodeKind::FnDecl { fns.push(n.name.clone()); }
+                if in_test && n.kind == compiler::NodeKind::ExprCall && !n.name.is_empty() {
+                    calls.insert(n.name.rsplit('.').next().unwrap_or(&n.name).to_string());
                 }
-                for child in &node.children { collect_calls(child, calls); }
+                let t = in_test || matches!(n.kind, compiler::NodeKind::TestBlock | compiler::NodeKind::InvariantBlock | compiler::NodeKind::BenchBlock);
+                for child in &n.children { walk(child, fns, calls, t); }
             }
-            for child in &ast.children {
-                if child.kind == compiler::NodeKind::FnDecl { fn_names.push(child.name.clone()); }
-                if matches!(child.kind, compiler::NodeKind::TestBlock | compiler::NodeKind::InvariantBlock | compiler::NodeKind::BenchBlock) {
-                    collect_calls(child, &mut tested_fns);
-                }
-            }
+            walk(&ast, &mut fn_names, &mut tested_fns, false);
             let covered: Vec<&String> = fn_names.iter().filter(|f| tested_fns.contains(*f)).collect();
             let uncovered: Vec<&String> = fn_names.iter().filter(|f| !tested_fns.contains(*f)).collect();
             let pct = if !fn_names.is_empty() { 100.0 * covered.len() as f64 / fn_names.len() as f64 } else { 0.0 };
