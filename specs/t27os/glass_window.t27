@@ -5755,6 +5755,9 @@ pub fn on_keys_foot(x: f64, y: f64, sw: f64, sh: f64) -> bool {
 // waitpid(WNOHANG) from the frame loop, so a draw never waits for it.
 // ======================================================================================================
 pub const TPG_N : usize = 256;
+/// H. the heartbeat (crash guard, issue 12368): the unix second of the last beat written to ~/.t27os/live/app.beat.
+/// Word 2 was a spare word; the_word_map_has_no_overlap holds it.
+pub const TPG_BEAT_AT : u32 = 2;
 /// T. the terminal pane's right-click menu (open flag, left edge, top edge) and whether a mouse press in the pane
 /// is still held (a selection is being dragged); above TPG_O_HP + 32 and above the footer and dashboard words (TPG_QD_FLAGS).
 pub const TPG_T_MENU : u32 = 251;
@@ -10775,6 +10778,68 @@ fn set_prefill(dc: []u64, pb: []u8, line: []const u8) -> void {
     dc[D_PREN] = @as(u64, n);
 }
 
+// ---- the heartbeat (crash guard, issue 12368) ----
+// Once a second the frame loop writes "<pid> <unix seconds>\n" to ~/.t27os/live/app.beat and a clean quit removes
+// the file. The pty server (pty_server.t27 beat_parse / sup_decide) reads it every 5 s: a pid that is gone with the
+// file still there is a crash, a pid that is alive with a beat older than 20 s is a hang; either way it relaunches.
+// The loop wakes at least every 0.5 s (frame_gate FG_IDLE_S), so a 1 Hz beat is never 20 s late unless the main
+// thread is stuck. The file is written to app.beat.tmp and renamed over, so the reader never sees half a line.
+
+/// The beat file ~/.t27os/live/app.beat (tmp: its .tmp twin), NUL-ended in out; the length without the NUL, or 0
+/// when home is too long for out.
+fn beat_path(home: []const u8, out: []u8, tmp: bool) -> usize {
+    if (home.len > 200 or out.len < 260) { return 0; }
+    var n : usize = put_bytes(out, 0, home);
+    n = put_bytes(out, n, "/.t27os/live/app.beat");
+    if (tmp) { n = put_bytes(out, n, ".tmp"); }
+    out[n] = 0;
+    return n;
+}
+
+/// "<pid> <unix seconds>\n", the bytes pty_server.t27 beat_parse reads; the length.
+fn beat_text(out: []u8, pid: u64, now: u64) -> usize {
+    var n : usize = put_dec(out, 0, pid);
+    out[n] = 32;
+    n = put_dec(out, n + 1, now);
+    out[n] = 10;
+    return n + 1;
+}
+
+fn app_pid() -> i32 { return @extern("getpid"); }
+
+/// Write the beat for `now`: the tmp file, then rename over app.beat. The live folder is made on the first failure.
+fn beat_write(home: []const u8, now: u64) -> void {
+    var fb : [320]u8 = undefined;
+    var pb : [320]u8 = undefined;
+    if (beat_path(home, fb[0..320], false) == 0) { return; }
+    if (beat_path(home, pb[0..320], true) == 0) { return; }
+    var pid : u64 = 0;
+    const raw : i32 = app_pid();
+    if (raw > 0) { pid = @as(u64, @intCast(raw)); }
+    var tb : [48]u8 = undefined;
+    const tn : usize = beat_text(tb[0..48], pid, now);
+    var fd : i32 = sys_creat(pb[0..320], 420);
+    if (fd < 0) {
+        var dp : [320]u8 = undefined;
+        const k : usize = put_bytes(dp[0..320], 0, home);
+        put_bytes(dp[0..320], k, "/.t27os/live");
+        dp[k + 12] = 0;
+        sys_mkdir(dp[0..320], 493);
+        fd = sys_creat(pb[0..320], 420);
+        if (fd < 0) { return; }
+    }
+    sys_write(fd, tb[0..tn], @as(u64, tn));
+    sys_close(fd);
+    sys_rename(pb[0..320], fb[0..320]);
+}
+
+/// A clean quit removes the beat, so the supervisor reads "no file" as "the owner closed the app".
+fn beat_clear(home: []const u8) -> void {
+    var fb : [320]u8 = undefined;
+    if (beat_path(home, fb[0..320], false) == 0) { return; }
+    sys_unlink(fb[0..320]);
+}
+
 // ---- the app ----
 
 pub fn main() -> void {
@@ -12679,6 +12744,11 @@ pub fn main() -> void {
             tgv[TPG_O_RMSYS] = 0;
             if (msg0(msg0(cls("NSWorkspace"), sel("sharedWorkspace")), sel("accessibilityDisplayShouldReduceMotion")) % 256 != 0) { tgv[TPG_O_RMSYS] = 1; }
         }
+        // H. the heartbeat: once a second, the pty server's supervisor reads it (see beat_write)
+        if (tgv[TPG_BEAT_AT] != now) {
+            tgv[TPG_BEAT_AT] = now;
+            beat_write(dhb[0..dhn], now);
+        }
         orbit_tick(tgv[0..256], z, sw, sh, mx, my, abs_time(), tgv[TPG_O_RMSYS] != 0);
         if (menu_open(state) and (shown != PETAL_CHAT or cons2)) {
             dash_tick(dcv[0..512], gal[0..49152], gt[0..2560], dhb[0..dhn], jpid[0..6], jwi[0..6], now);
@@ -13229,6 +13299,8 @@ pub fn main() -> void {
         frame = frame + a_frames;
         pool_pop(pool);
     }
+    // the window closed: a clean quit, so the supervisor must not relaunch
+    beat_clear(dhb[0..dhn]);
 }
 
 // ---- tests ----
@@ -14781,7 +14853,7 @@ test a_bad_pid_word_is_gone_and_is_never_reaped_or_killed {
 // NEXT AUTHOR: a new TPG_ word or span MUST get its line in the_word_map_has_no_overlap below, in the same
 // commit, as (name, base, length). Length 1 is a plain word; a base + offset use (TPG_Q_RING + i) needs the
 // full length. The test fails on the first overlap and on any word past TPG_N. Free words (2026-10-25):
-// 2, 33, 75, 89, 109, 135 (33, 75, 89, 109, 135 are reserved for the GNN page).
+// 33, 75, 89, 109, 135 (all five are reserved for the GNN page; word 2 is now TPG_BEAT_AT, the heartbeat).
 //
 // wm_claim marks base .. base + len in seen and says whether all of them were free and inside TPG_N.
 fn wm_claim(seen: []u8, base: u32, len: u32) -> bool {
@@ -14908,6 +14980,7 @@ test the_word_map_has_no_overlap {
     assert wm_claim(seen[0..256], TPG_O_RM, 1);
     assert wm_claim(seen[0..256], TPG_O_RMAT, 1);
     assert wm_claim(seen[0..256], TPG_O_RMSYS, 1);
+    assert wm_claim(seen[0..256], TPG_BEAT_AT, 1);
     assert wm_claim(seen[0..256], TPG_LG_LAST, 1);
     assert wm_claim(seen[0..256], TPG_LG_PID, 1);
     assert wm_claim(seen[0..256], TPG_LG_START, 1);
@@ -14999,4 +15072,45 @@ test the_orbit_tick_survives_words_that_hold_garbage {
     tg[TPG_O_N] = 0xFFFFFFFFFFFFFFFF;
     orbit_tick(tg[0..256], 1.0, 1280.0, 800.0, 100.0, 100.0, 6.0, false);
     assert orbit_pick(tg[0..256], 100.0, 100.0, 1280.0, 800.0) >= -1;
+}
+
+// ---- the heartbeat file (crash guard, issue 12368) ----
+
+test the_beat_text_is_the_pid_a_space_the_unix_second_and_a_newline {
+    var out : [48]u8 = undefined;
+    const n : usize = beat_text(out[0..48], 123, 1700000000);
+    assert n == 15;
+    assert out[0] == 49 and out[1] == 50 and out[2] == 51;
+    assert out[3] == 32;
+    assert out[4] == 49 and out[5] == 55 and out[6] == 48 and out[13] == 48;
+    assert out[14] == 10;
+    const m : usize = beat_text(out[0..48], 1, 9);
+    assert m == 4;
+    assert out[0] == 49 and out[1] == 32 and out[2] == 57 and out[3] == 10;
+}
+
+test the_beat_path_lives_under_the_live_folder_and_ends_in_a_nul {
+    var out : [320]u8 = undefined;
+    const n : usize = beat_path("/Users/tester", out[0..320], false);
+    assert n == 34;
+    assert out[n] == 0;
+    assert out[13] == 47 and out[14] == 46;
+    assert out[n - 1] == 116 and out[n - 2] == 97;
+    const t : usize = beat_path("/Users/tester", out[0..320], true);
+    assert t == 38;
+    assert out[34] == 46 and out[35] == 116 and out[36] == 109 and out[37] == 112;
+    assert out[t] == 0;
+}
+
+test the_beat_path_refuses_a_home_that_does_not_fit {
+    var out : [320]u8 = undefined;
+    var long : [256]u8 = undefined;
+    var i : usize = 0;
+    while (i < 256) {
+        long[i] = 97;
+        i = i + 1;
+    }
+    assert beat_path(long[0..201], out[0..320], false) == 0;
+    assert beat_path(long[0..200], out[0..320], false) == 221;
+    assert beat_path("/Users/tester", out[0..100], false) == 0;
 }
