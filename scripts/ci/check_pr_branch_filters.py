@@ -98,6 +98,7 @@ NOT_MERGE_CRITICAL = {
     "t27o-golden.yml": "a reusable golden-spec job other workflows call; the caller's own checks gate the merge, not this file",
     "queen-refile.yml": "it re-files issues no bee can take again; filing work gates no merge",
     "queen-watchdog.yml": "it asks whether the swarm answers and restarts it; nothing it does gates a merge",
+    "t27os.yml": "it runs the T27OS lab executor on a schedule; the lab publishes receipts, its own failure gates no merge",
     "pusher.yml": "it reads the system and writes one issue; it gates nothing and must never block a merge",
     "queen-doctor.yml": "it turns oracle failures into issues on a schedule; filing work gates no merge",
     "build-paper.yml": "not a required check for master branch protection",
