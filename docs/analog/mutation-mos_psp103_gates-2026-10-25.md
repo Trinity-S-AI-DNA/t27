@@ -1,15 +1,19 @@
 # Mutation census of specs/analog/mos_psp103_gates.t27, 2026-10-25
 
 Issue #12187, part of epic #10486 (weak spots of the analog v0.1 release). The tool, `tri mutate spec`, never edits
-the spec. This note covers the census as it was measured, the two survivors that were classed as test gaps, and what
-has not been run. Where each number comes from:
+the spec. This note covers the census, the two survivors that were classed as test gaps, the survivor gate that was
+run on the tree with the new tests, and what is still not measured. Where each number comes from:
 
 - **Census** (94 mutants, 75 killed, 10 survived, 9 hung, 0 unviable) is the run of the issue #12116 census on the
   unmodified spec: lane base master `035df5ce60`, the shared release build of `tri` and `t27c` (`t27c` 0.5.2),
   `--jobs 3 --timeout 30`, 09:43-09:48 +07 (4 min 14 s of wall time), exit 0, load averages 17.00 21.15 30.65 at the
   start. No `--accepted` file: it was a census, not a gate. The 10 survivor lines and the 9 hung lines are read off
   that output.
-- **After** is `tri test` on the tree of this change (section 4). The mutation gate was not run on this tree.
+- **Gate** (94 mutants, 76 killed, 9 survived, 9 hung, 0 unviable) is `tri mutate spec` with `--accepted
+  docs/analog/mutation-accepted-mos_psp103_gates.txt` on the tree of this change (the two tests of section 4 and the
+  accepted file, commit `3f51b1cbbc`), run in a T27 OS pane with the master-built `t27c`, lane master base
+  `1c783b0b31`, `--jobs 3 --timeout 30`, 10:50:30-10:55:27 +07 (4 min 57 s of wall time). Its last lines read: 18 not
+  killed (9 survived, 9 hung), 18 accepted by the file, 0 accepted lines now killed, "Gate passed."
 
 ## 1. Census
 
@@ -19,12 +23,20 @@ tri mutate spec --file specs/analog/mos_psp103_gates.t27 --t27c <master-built t2
 
 | Run | Mutants | Killed | Survived | Hung | Unviable |
 | --- | --- | --- | --- | --- | --- |
-| Census (unmodified spec) | 94 | 75 | 10 | 9 | 0 |
+| Census (unmodified spec, no accepted file) | 94 | 75 | 10 | 9 | 0 |
+| Gate (this tree, with the accepted file) | 94 | 76 | 9 | 9 | 0 |
 
-By kind: flip-cmp 20, drop-step 7, swap-arith 55, ret-default 12. All 75 kills are by a failing test, none by an
-invariant at compile time.
+By kind, in both runs: flip-cmp 20, drop-step 7, swap-arith 55, ret-default 12. All 75 census kills and all 76 gate
+kills are by a failing test, none by an invariant at compile time.
 
-## 2. The 10 survivors
+The gate differs from the census by one mutant: 76 killed instead of 75, 9 survived instead of 10, hung and unviable
+unchanged. That is the outcome section 4 aimed at (line 233 killed, the other 9 survivors accepted), so no gate
+count differs from what this note expected. The gate passed because all 18 mutants it did not kill are lines of the
+accepted file; line 233 is not in that file and the gate did not fail on it, so it is no longer among the survivors.
+
+## 2. The 10 census survivors
+
+Nine of them survive in the gate too (all but line 233) and are accepted; the table is the census classification.
 
 | Line | Mutant | Class | Why |
 | --- | --- | --- | --- |
@@ -72,28 +84,30 @@ function line number are unchanged):
    It does not kill the mutant (no input exists that could); it makes the acceptance checkable, because a future
    word of exactly 1000 pA in the data makes this test fail. 10 runtime asserts counted.
 
-Result of `tri test specs/analog/mos_psp103_gates.t27` on this tree: 11 tests, 11 passed, 0 failed, 0 vacuous.
+Result of `tri test specs/analog/mos_psp103_gates.t27` on this tree: 11 tests, 11 passed, 0 failed, 0 vacuous. The
+re-saved seal records the same (section 6).
 
 ## 5. Decisions
 
 - **Line 233: a test, not an acceptance.** The mutant reads one more point of a sweep whose size the doc comment
   states; an input that decides it exists (a cell whose resistance rises to the end), so a test is the right answer.
+  The gate agrees: line 233 is not in the accepted file and the gate passed.
 - **Line 294: accepted.** No input exists in the pinned data on which the two comparisons differ. Changing the
   function (for example by making the data injectable) would move the lines the other accepted entries key on.
   The acceptance sits on a stated fact about the data, and the second test fails if that fact stops holding.
 - **Eight running-extremum lines and nine loop hangs: accepted** with the reasons above.
 
-## 6. Not done
+## 6. Seal and what is not measured
 
-- **The mutation gate was not run** on this tree (`tri mutate spec --file specs/analog/mos_psp103_gates.t27
-  --accepted docs/analog/mutation-accepted-mos_psp103_gates.txt`). The accepted file lists 18 lines: 8 equivalent,
-  1 equivalent on the pinned data, 9 hung. Line 233 is deliberately not listed; if the new test does not kill it,
-  the gate fails on it, and if it listed 233 the gate would fail on an accepted line that is now killed.
-- **The kill of line 233 is read by hand**, not measured: the mutated line was checked against the asserts, the
-  mutant was not run.
-- **The seal was not re-saved** (`.trinity/seals/` untouched); the orchestrator re-saves it with a master-built
-  `t27c`.
-- **Strict coverage was not re-run** after the tests were added.
-- **The equivalences and the hang reasons are classified by reading the code**, not by a tool; the census output
-  itself only says that 9 mutants outlived `--timeout 30`.
-- **Per-mutant attribution is not measured**: which test kills which of the 75 killed mutants is not recorded.
+- **The seal was re-saved** by `tri seals changed` with the master-built `t27c` (`t27c-bootstrap@0.5.2`) at
+  11:13-11:14 +07 on 2026-10-25 (`sealed_at` 04:13:44Z). `.trinity/seals/analog_AnalogMosPsp103Gates.json` now holds
+  the hash of this spec and 11 tests, 11 passed, 0 failed, 0 vacuous (it held 9 before). No other seal moved.
+- **The accepted file lists 18 lines** (8 equivalent, 1 equivalent on the pinned data, 9 hung), and the gate matched
+  all 18 and none of them is killed. Line 233 is deliberately not listed.
+- **Strict coverage was not run locally** (`tri coverage --strict`); CI runs it.
+- **The kill of line 233 is attributed by design and by count, not by tool**: the gate output names no killing test.
+  The survivors fell by exactly one and line 233 left them, but the census and the gate ran on different master bases
+  (`035df5ce60` and `1c783b0b31`).
+- **The equivalences and the hang reasons are classified by reading the code**, not by a tool; the gate output
+  itself only says of each of the 9 hung that its tests outlived `--timeout 30`, so "hung" is by construction.
+- **Per-mutant attribution is not measured**: which test kills which of the 76 killed mutants is not recorded.
