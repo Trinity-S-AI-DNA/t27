@@ -74,10 +74,13 @@ unaccepted: edit the spec above line 563 and the file must be regenerated.
 
 ## Not done, not claimed
 
-- The gate was run once on the changed spec (81 / 14 / 5 / 1, "Gate passed" only after the line 173 entry was removed;
-  the first run exited 2 on that entry and a second run is recorded in the pull request). Which test kills which mutant
-  was not measured: the tool names no test, so "killed by test N" in the table is read from the asserts.
-- The seal is not saved (`.trinity/seals/` was not touched); a `tri seals changed` is still owed before landing.
+- The gate was run twice on the changed spec. The first run (10:58-11:03 +07) exited 2 because the line 173 entry was
+  stale; with the entry removed, the second run (11:13:25-11:16:14 +07, jobs 3, timeout 30, master-built t27c, tree
+  rebased on master `1c783b0b31`) gives 81 / 14 / 5 / 1, 19 not killed and 19 accepted, 0 accepted lines now killed:
+  "Gate passed". Which test kills which mutant was not measured: the tool names no test, so "killed by test N" in the
+  table is read from the asserts.
+- The seal was re-saved by `tri seals changed` with the master-built t27c (see the pull request for the run);
+  `tri coverage --strict` was not run locally, CI runs it.
 - The 13 equivalent survivors are classified by reading the arithmetic (each entry carries it), not proved equivalent by
   a tool; the rail ties (126, 143) and line 176 are backed by asserts on this spec's own inputs only.
 - The 5 hung mutants are classified by construction (a loop step dropped), not by a run that was allowed to finish.
