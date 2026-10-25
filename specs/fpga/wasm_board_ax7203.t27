@@ -25,6 +25,52 @@
 ; shr_u, rotl/rotr, and div/rem signed and unsigned (a 32-clock restoring divider), plus the
 ; program store loaded over the wire. The MVP spec keeps proving what this cell does not run.
 ; -
+; P6 DESIGN FLOOR (2026-10-25), the architectural increment after P5 (the label stack,
+; in flight as #12010/#12011): the 64-bit datapath, law before silicon. Today st[] and
+; the answer register res are 32-bit, so i64.const and f64.const land wholesale only as
+; far as their low half -- the honest boundary the P3/P4 comments above record. This
+; floor is the design that removes it, stated where it will be executed and tested where
+; it can be tested today, in simulation, without silicon and without touching one
+; executable line.
+; STACK_2x32. Every logical stack slot becomes TWO u32 words: slot k's low word at
+; st[2k] (st_lo) and its high word at st[2k+1] (st_hi), little-endian word order to
+; match the wire's little-endian byte order. sp counts words: a push adds 2, a pop
+; removes 2, so sp is even forever (the parity invariant); underflow is sp < 2,
+; overflow is sp + 2 > STACK_WORDS. Slots are UNIFORM: an i32 or f32 value occupies
+; the lo word with hi zero, an i64 or f64 value occupies both -- one slot shape for
+; every type, so sp arithmetic never depends on the type sitting on the stack. The
+; physical array doubles, 16 words to STACK_WORDS = 32, keeping STACK_MAX = 16 as the
+; LOGICAL depth it already names; the live dispatch below still runs the one-word
+; model until the silicon increment migrates it.
+; I64.ADD = TWO ADDS + ONE CARRY. The opcode byte is 0x7C (pinned by the t27b
+; emitter's law, specs/tri/t27b/wasm.t27, the i64 stack floor). The compute law:
+; lo = add64_lo(a_lo, b_lo) -- verbatim today's i32.add; c = add64_c(a_lo, b_lo) --
+; a single bit, the u64-widened low sum crossing 0xFFFFFFFF; hi = add64_hi(a_hi,
+; b_hi, c) -- the second add absorbs the carry, and a carry OUT of the high add is
+; dropped, wraparound, the same law i32.add already follows at 32 bits. Silicon
+; shape: two shallow conditional 32-bit adds, the second with carry-in, the same
+; cone i32.add already closes inside the phase-gated 34.3 MHz engine bar -- no
+; microsequence, unlike mul and div. With two-word slots, i64.const's SLEB128
+; submachine assembles into both words (the ERR_LEB continuation boundary moves
+; outward to i64's ten bytes) and f64.const lands wholesale: eight bytes, one slot.
+; THE TWO-WORD ANSWER: OP_RUN_USER64. Chosen over a high-word register + one read,
+; because WORD_BITS = 24 is a property of the FIVE-BYTE frame, not of the silicon:
+; a hi-register read through that frame could never express more than 24 of the
+; high word's 32 bits -- 48 of 64 answer bits observable -- while claiming
+; bit-exactness. OP_RUN_USER64 = 0xFC instead: a request byte for byte identical to
+; OP_RUN_USER, answered RESP_OK SEQ w0..w7 -- 10 bytes, BOTH answer words in full,
+; low word first, little-endian. The answer register becomes the pair (res, res_hi);
+; an i32 answer keeps res_hi = 0 by the uniform-slot law, so every 5-byte response
+; stays byte-identical and old hosts and vectors see no change. WITNESS
+; CONSEQUENCE: the die witness inside the t27os receipt (runs/<sha>.json, the
+; receipt that follows a merged die witness, specs/t27os/receipt_result.t27) records
+; response bytes, so with the 10-byte frame it can carry i64 answers bit-exactly --
+; all eight bytes -- where today's answer carries only the low 24 bits.
+; The p6 tests below are SIMULATION LAW: they prove the carry arithmetic, the slot
+; addressing and the frame layout in test-report today, the sweep against an
+; independent no-overflow reference model; they claim nothing about silicon until
+; the datapath increment lands and the fleet crossing runs it on the die.
+; -
 ; THE WIRE. The TRI-NET node link, the one that carried 1035886/1035886 TNF16 requests and
 ; 251616/251616 mxdot4 requests at 1144744 baud with none lost: CFGMCLK between 65.6 and
 ; 68.7 MHz, divider 60, one start bit, 8 data bits LSB first, one stop bit.
@@ -81,6 +127,10 @@ pub const REQ_BYTES : u32 = 38;
 pub const BODY_BYTES : u32 = 36;
 pub const RESP_BYTES : u8 = 5;
 pub const WORD_BITS : u8 = 24;
+; P6 design floor: OP_RUN_USER64's response is 10 bytes -- RESP_OK, SEQ, then BOTH
+; answer words little-endian (8 bytes). WORD_BITS = 24 stays the width of the FIVE-byte
+; frame; the 64-bit frame answers in full. Every other response keeps RESP_BYTES = 5.
+pub const RESP64_BYTES : u8 = 10;
 pub const X_OFF : u32 = 4;
 pub const Y_OFF : u32 = 20;
 
@@ -89,6 +139,12 @@ pub const OP_LOAD_PAGE : u8 = 0xFE;
 pub const OP_RUN_USER : u8 = 0xFD;
 pub const CODE_PAGES : u32 = 4;
 pub const PAGE_BYTES : u32 = 32;
+; P6 design floor (2026-10-25): OP_RUN_USER64 runs the loaded program like OP_RUN_USER
+; -- a request byte for byte identical -- but answers BOTH answer words: RESP_OK SEQ
+; w0..w7, 10 bytes, low word first. Not yet in the executed set; the dispatch arm and
+; the widened txq land with the datapath increment. 0xFC is the next special below
+; OP_RUN_USER (0xFD) and OP_LOAD_PAGE (0xFE); program ids stay 0..PROGS-1.
+pub const OP_RUN_USER64 : u8 = 0xFC;
 
 ; --- Machine ----------------------------------------------------------------------------
 pub const STACK_MAX : u32 = 16;
@@ -96,6 +152,15 @@ pub const LOCALS : u32 = 4;
 pub const CODE_BYTES : u32 = 101;
 pub const CODE_PAD : u32 = 128;
 pub const I32_MASK : u64 = 0xFFFFFFFF;
+; P6 design floor (2026-10-25): the STACK_2x32 constants, law before silicon. SLOT_WORDS
+; is the words per logical slot; STACK_WORDS is the physical word count the silicon
+; increment grows st[] to -- 2 x STACK_MAX by hand, written flat like every other const
+; here (STACK_MAX stays the LOGICAL depth it already names, 16 slots, so test
+; machine_consts keeps its meaning). The live st stays [STACK_MAX]u32 until that
+; increment; the addressing law itself (slot k at 2k, 2k+1) is testable today and is,
+; as p6_stack_2x32_addressing.
+pub const SLOT_WORDS : u32 = 2;
+pub const STACK_WORDS : u32 = 32;
 
 ; --- opcodes, WebAssembly MVP final bytes (pinned by test opcode_bytes_are_real_wasm) ----
 pub const OP_END : u8 = 0x0B;
@@ -149,6 +214,12 @@ pub const OP_I32_SHR_S : u8 = 0x75;
 pub const OP_I32_SHR_U : u8 = 0x76;
 pub const OP_I32_ROTL : u8 = 0x77;
 pub const OP_I32_ROTR : u8 = 0x78;
+; P6 design floor (2026-10-25): the byte i64.add will dispatch on when the datapath
+; lands -- 0x7C, pinned by the t27b emitter's law (specs/tri/t27b/wasm.t27, the i64
+; stack floor), NOT yet in the executed set. The compute law is the three helpers
+; add64_lo / add64_c / add64_hi below: two adds and one carry, tested in simulation by
+; p6_i64_add_carry_law and p6_i64_add_carry_negative_control.
+pub const OP_I64_ADD : u8 = 0x7C;
 
 ; --- error codes (the MVP numbers; 4 was free and P2 gives it to divide-by-zero)
 pub const ERR_NONE : u8 = 0;
@@ -437,6 +508,45 @@ fn popcnt32(x : u32) -> u32 {
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
     v = (v + (v >> 4)) & 0x0F0F0F0F;
     return (v + (v >> 8) + (v >> 16) + (v >> 24)) & 0x3F;
+}
+
+; --- P6 design-floor helpers (2026-10-25): the i64.add compute law, SIMULATION LAW
+; --- ONLY. Nothing here is called from the tick body; like uprog they exist for the
+; --- tests and Yosys prunes them. The silicon increment that executes OP_I64_ADD
+; --- lowers exactly this arithmetic: two 32-bit adds and one carry bit.
+; The low add is verbatim today's i32.add (wrap32 of the u64-widened sum); the name
+; exists so the two-word chain reads as one law.
+fn add64_lo(a_lo : u32, b_lo : u32) -> u32 {
+    return wrap32((a_lo as u64) + (b_lo as u64));
+}
+
+; The carry out of the low add: strictly a single bit, 0 or 1 -- the contract the high
+; add depends on. The compare happens in u64, so no word overflows before the decision.
+fn add64_c(a_lo : u32, b_lo : u32) -> u32 {
+    if ((a_lo as u64) + (b_lo as u64) > I32_MASK) {
+        return 1;
+    }
+    return 0;
+}
+
+; The high add absorbs the carry; a carry OUT of the high add is dropped -- wraparound,
+; the same law i32.add already follows at 32 bits. c is defined only for 0 and 1.
+fn add64_hi(a_hi : u32, b_hi : u32, c : u32) -> u32 {
+    return wrap32((a_hi as u64) + (b_hi as u64) + (c as u64));
+}
+
+; The reference model: an independent derivation of the same two words that CANNOT
+; overflow u64 anywhere (the obvious packed model, one full-width u64 add of the two
+; packed operands, panics in the Zig test backend on wraparound pairs -- both halves
+; set -- where the mathematical sum leaves u64). The high word comes from the low
+; sum's shift, not from the carry bit the chain compares against: two mechanisms
+; that must agree. Both intermediates stay under 2^34.
+fn ref64_lo(a_lo : u32, b_lo : u32) -> u32 {
+    return wrap32((a_lo as u64) + (b_lo as u64));
+}
+
+fn ref64_hi(a_lo : u32, b_lo : u32, a_hi : u32, b_hi : u32) -> u32 {
+    return wrap32((a_hi as u64) + (b_hi as u64) + (((a_lo as u64) + (b_lo as u64)) >> 32));
 }
 
 ; --- responses
@@ -2215,4 +2325,235 @@ test p4_f32_wire_programs {
     assert cap[4] == 0x44;
     i = 0;
     while (i < 26) { uprog[i] = save[i]; i = i + 1; }
+}
+
+; --- P6 design-floor blocks (2026-10-25): the 64-bit datapath as law, in simulation,
+; --- before silicon. Pure insertion like p3/p4: no executable line above moved.
+
+; P6 carry law, part 1: the four corner pairs the chain must survive, hand-computed
+; as two-word answers, each word asserted through its own add. All values are i64
+; two's-complement words (lo first):
+;   0xFFFFFFFF + 1        overflows the low word only: carry 1, answer (0, 1)
+;   -1 + 1                both adds carry: answer (0, 0), the high carry out drops
+;   0x7FFFFFFF + 1        flips bit 31 with NO carry: answer (0x80000000, hi + 0)
+;   i64 min + i64 min     the low words are quiet, the high words wrap to 0: (0, 0)
+; plus -1 + -1 = -2, the double-carry ripple: (0xFFFFFFFE, 0xFFFFFFFF).
+test p6_i64_add_carry_law {
+    assert add64_c(0xFFFFFFFF, 1) == 1;
+    assert add64_lo(0xFFFFFFFF, 1) == 0;
+    assert add64_hi(0, 0, 1) == 1;
+    assert add64_hi(0xFFFFFFFF, 0, 1) == 0;
+    assert add64_c(0x7FFFFFFF, 1) == 0;
+    assert add64_lo(0x7FFFFFFF, 1) == 0x80000000;
+    assert add64_hi(0, 0, 0) == 0;
+    assert add64_c(0, 0) == 0;
+    assert add64_lo(0, 0) == 0;
+    assert add64_hi(0x80000000, 0x80000000, 0) == 0;
+    assert add64_lo(0xFFFFFFFF, 0xFFFFFFFF) == 0xFFFFFFFE;
+    assert add64_c(0xFFFFFFFF, 0xFFFFFFFF) == 1;
+    assert add64_hi(0xFFFFFFFF, 0xFFFFFFFF, 1) == 0xFFFFFFFF;
+}
+
+; P6 carry law, part 2: the boundary sweep. Every boundary pairing of low words,
+; crossed with quiet and overflowing high words, must equal the reference model
+; ref64 -- bit for bit, in both words -- and the carry bit must stay a bit. The
+; reference derives the high word from the low sum's shift (>> 32), a different
+; mechanism than the carry comparison the chain uses; the obvious packed model
+; (one full-width u64 add of the two packed operands) panics in the Zig test
+; backend on wraparound pairs, where the mathematical sum leaves u64, so it is
+; not used. 6 x 6 low pairs x 4 x 4 high pairs = 576 sums. The four named
+; corners close the sweep end to end through the chain against the reference.
+test p6_i64_add_carry_sweep {
+    var lo_edge : [6]u32 = [0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF];
+    var hi_edge : [4]u32 = [0, 1, 0x7FFFFFFF, 0xFFFFFFFF];
+    var i : u32 = 0;
+    var j : u32 = 0;
+    var k : u32 = 0;
+    var l : u32 = 0;
+    var a_lo : u32 = 0;
+    var a_hi : u32 = 0;
+    var b_lo : u32 = 0;
+    var b_hi : u32 = 0;
+    var c : u32 = 0;
+    var lo : u32 = 0;
+    var hi : u32 = 0;
+    var rl : u32 = 0;
+    var rh : u32 = 0;
+    while (i < 6) {
+        j = 0;
+        while (j < 6) {
+            a_lo = lo_edge[i];
+            b_lo = lo_edge[j];
+            c = add64_c(a_lo, b_lo);
+            lo = add64_lo(a_lo, b_lo);
+            assert c <= 1;
+            k = 0;
+            while (k < 4) {
+                a_hi = hi_edge[k];
+                l = 0;
+                while (l < 4) {
+                    b_hi = hi_edge[l];
+                    hi = add64_hi(a_hi, b_hi, c);
+                    rl = ref64_lo(a_lo, b_lo);
+                    rh = ref64_hi(a_lo, b_lo, a_hi, b_hi);
+                    assert lo == rl;
+                    assert hi == rh;
+                    l = l + 1;
+                }
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    a_lo = add64_lo(0xFFFFFFFF, 1);
+    rl = ref64_lo(0xFFFFFFFF, 1);
+    assert a_lo == rl;
+    c = add64_c(0xFFFFFFFF, 1);
+    hi = add64_hi(0, 0, c);
+    rh = ref64_hi(0xFFFFFFFF, 1, 0, 0);
+    assert hi == rh;
+    hi = add64_hi(0xFFFFFFFF, 0, c);
+    rh = ref64_hi(0xFFFFFFFF, 1, 0xFFFFFFFF, 0);
+    assert hi == rh;
+    c = add64_c(0, 0);
+    hi = add64_hi(0x80000000, 0x80000000, c);
+    rh = ref64_hi(0, 0, 0x80000000, 0x80000000);
+    assert hi == rh;
+}
+
+; P6 negative control: the failure modes of the chain, named. A suite that cannot
+; fail proves nothing, so every mutation of the chain is fed a discriminating input
+; on which it MUST disagree with the law, and a quiet input on which it must agree.
+;   mutation 1 -- the dropped carry: the high add ignores c. On 0xFFFFFFFF + 1 it
+;     reads hi 0 where the law says 1; on quiet 0x7FFFFFFF + 1 it is invisible.
+;   mutation 2 -- the carry read from the WRONG add (the high pair instead of the
+;     low pair): on high words 0xFFFFFFFF + 0xFFFFFFFF with quiet low words it
+;     injects 1 and reads 0xFFFFFFFF where the law says 0xFFFFFFFE; with quiet high
+;     words the mutation is invisible.
+;   mutation 3 -- the ill-formed carry input: the add64_c contract is a single bit.
+;     c = 2 double-counts on the very input that produces the real carry
+;     (0xFFFFFFFF + 1 must answer hi 1, not 2). The sweep proves the producer never
+;     leaves {0, 1}; this proves the consumer would be wrong if it did.
+test p6_i64_add_carry_negative_control {
+    var cw : u32 = add64_c(0xFFFFFFFF, 1);
+    var cq : u32 = add64_c(0x7FFFFFFF, 1);
+    var ch : u32 = add64_c(0xFFFFFFFF, 0xFFFFFFFF);
+    var c0 : u32 = add64_c(0, 0);
+    var h_drop : u32 = add64_hi(0, 0, cw);
+    var h_quiet : u32 = add64_hi(0, 0, cq);
+    var h_zero : u32 = add64_hi(0, 0, 0);
+    var h_ff_law : u32 = add64_hi(0xFFFFFFFF, 0xFFFFFFFF, c0);
+    var h_ff_wrong : u32 = add64_hi(0xFFFFFFFF, 0xFFFFFFFF, ch);
+    var h_c2 : u32 = add64_hi(0, 0, 2);
+    assert h_zero != h_drop;
+    assert h_zero == h_quiet;
+    assert h_ff_wrong != h_ff_law;
+    assert h_quiet == h_zero;
+    assert h_c2 != h_drop;
+}
+
+; P6 stack addressing: the STACK_2x32 slot law on the real st array, save/restore of
+; sp and st like p3/p4 save page 0. sp counts WORDS: push +2, pop -2, even forever;
+; slot k lives at words 2k (st_lo) and 2k+1 (st_hi); an add pops the top two slots
+; and pushes one, and the slot UNDER the operands keeps its words. The live array
+; holds 16 words = 8 logical slots today; the silicon increment doubles it to
+; STACK_WORDS = 32 and the addressing law does not move -- that is why it is law now.
+; The worked pair: slots 1 and 2 hold 0x00000000FFFFFFFF and 0x8000000000000001,
+; whose u64 sum is 0x8000000100000000: a low carry and a high wraparound at once.
+test p6_stack_2x32_addressing {
+    var ssp : u32 = sp;
+    var sst : [STACK_MAX]u32 = undefined;
+    var i : u32 = 0;
+    while (i < STACK_MAX) { sst[i] = st[i]; i = i + 1; }
+    sp = 0;
+    st[sp] = 0xDEADBEEF;
+    st[sp + 1] = 0x01234567;
+    sp = sp + 2;
+    st[sp] = 0xFFFFFFFF;
+    st[sp + 1] = 0x00000000;
+    sp = sp + 2;
+    st[sp] = 0x00000001;
+    st[sp + 1] = 0x80000000;
+    sp = sp + 2;
+    assert sp == 6;
+    assert (sp & 1) == 0;
+    assert st[0] == 0xDEADBEEF;
+    assert st[1] == 0x01234567;
+    assert st[2] == 0xFFFFFFFF;
+    assert st[3] == 0x00000000;
+    assert st[4] == 0x00000001;
+    assert st[5] == 0x80000000;
+    var c : u32 = add64_c(st[4], st[2]);
+    var lo : u32 = add64_lo(st[4], st[2]);
+    var hi : u32 = add64_hi(st[5], st[3], c);
+    sp = sp - 4;
+    st[sp] = lo;
+    st[sp + 1] = hi;
+    sp = sp + 2;
+    assert sp == 4;
+    assert (sp & 1) == 0;
+    assert st[0] == 0xDEADBEEF;
+    assert st[1] == 0x01234567;
+    var s_lo : u32 = ref64_lo(0x00000001, 0xFFFFFFFF);
+    var s_hi : u32 = ref64_hi(0x00000001, 0xFFFFFFFF, 0x80000000, 0x00000000);
+    assert st[2] == s_lo;
+    assert st[3] == s_hi;
+    sp = ssp;
+    i = 0;
+    while (i < STACK_MAX) { st[i] = sst[i]; i = i + 1; }
+    assert sp == ssp;
+}
+
+; P6 answer protocol: the OP_RUN_USER64 frame layout as law, and the choice it
+; records. The 10-byte response carries BOTH answer words in full, little-endian,
+; low word first; an i32 answer keeps hi = 0 (uniform slots), so its high bytes are
+; zero and every 5-byte frame stays byte-identical. The die witness in the t27os
+; receipt then records all eight answer bytes -- an i64 result bit-exactly, which
+; the low-24 answer of today cannot carry.
+test p6_run_user64_answer_protocol {
+    assert OP_RUN_USER64 == 0xFC;
+    assert OP_RUN_USER == 0xFD;
+    assert OP_LOAD_PAGE == 0xFE;
+    assert RESP_BYTES == 5;
+    assert RESP64_BYTES == 10;
+    assert RESP64_BYTES == 2 + 4 + 4;
+    assert SLOT_WORDS == 2;
+    assert STACK_WORDS == 32;
+    assert STACK_WORDS == STACK_MAX + STACK_MAX;
+    assert OP_I64_ADD == 0x7C;
+    assert OP_I64_CONST == 0x42;
+    var w_lo : u32 = 0x89ABCDEF;
+    var w_hi : u32 = 0x01234567;
+    var f : [10]u8 = undefined;
+    f[0] = RESP_OK;
+    f[1] = 0x5A;
+    f[2] = (w_lo & 255) as u8;
+    f[3] = ((w_lo >> 8) & 255) as u8;
+    f[4] = ((w_lo >> 16) & 255) as u8;
+    f[5] = ((w_lo >> 24) & 255) as u8;
+    f[6] = (w_hi & 255) as u8;
+    f[7] = ((w_hi >> 8) & 255) as u8;
+    f[8] = ((w_hi >> 16) & 255) as u8;
+    f[9] = ((w_hi >> 24) & 255) as u8;
+    assert f[0] == 165;
+    assert f[1] == 0x5A;
+    assert f[2] == 0xEF;
+    assert f[3] == 0xCD;
+    assert f[4] == 0xAB;
+    assert f[5] == 0x89;
+    assert f[6] == 0x67;
+    assert f[7] == 0x45;
+    assert f[8] == 0x23;
+    assert f[9] == 0x01;
+    w_hi = 0;
+    f[6] = (w_hi & 255) as u8;
+    f[7] = ((w_hi >> 8) & 255) as u8;
+    f[8] = ((w_hi >> 16) & 255) as u8;
+    f[9] = ((w_hi >> 24) & 255) as u8;
+    assert f[2] == 0xEF;
+    assert f[6] == 0;
+    assert f[7] == 0;
+    assert f[8] == 0;
+    assert f[9] == 0;
 }
