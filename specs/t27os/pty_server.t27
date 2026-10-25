@@ -22,6 +22,10 @@
 //   T27OS_INSTALL=1    write ~/Library/LaunchAgents/ai.t27.os-server.plist for this binary: it starts
 //                      the server at login, so panes come back (by session id, model kept) after a reboot.
 //
+// While serving, the server also watches the window (issue 12368): the window beats once a second into
+// ~/.t27os/live/app.beat, and a window that crashed or hung is opened again, at most 3 times in 10 minutes
+// (the supervisor section above serve_loop). T27OS_NO_SUPERVISOR=1 in the server's environment turns it off.
+//
 // Keys (gHashTag/t27#11241): the server holds up to MAX_KEYS numbered keys for each provider, in memory only,
 // sent by the window with OP_SETKEY (the key number rides in the high nibble of the pane byte). Every agent
 // pane picks its key by rotation at each start; the pane record keeps the key NUMBER, never the key. The
@@ -161,6 +165,7 @@ use t27os::pty_sys::sys_random;
 use t27os::pty_sys::sys_exe_path;
 use t27os::pty_sys::sys_environ;
 use t27os::pty_sys::sys_unsetenv;
+use t27os::pty_sys::sys_spawn;
 use t27os::pty_logic::O_KEYS;
 use t27os::pty_logic::KEY_CAP;
 use t27os::pty_proto::OP_SETKEY;
@@ -1166,9 +1171,328 @@ fn open_socket(st: []u64, mem: []u8) -> u32 {
     return OPEN_BOUND;
 }
 
+// ---- the hang and crash supervisor (t27os crash guard, issue 12368) ----
+//
+// The window writes ~/.t27os/live/app.beat once a second ("<pid> <unix seconds>\n", glass_window beat_text) and
+// removes it on a clean quit. Every SUP_EVERY_MS the server reads it. A pid that is gone while the file stays is
+// a crash; a pid that is the window and yet beats older than SUP_STALE_S is a hang (kill -9 first). Either way
+// the window is opened again with /usr/bin/open, at most SUP_MAX times in SUP_WINDOW_S; then one line is logged
+// and the server waits. Every decision below is a pure fn with a test; sup_tick only moves bytes.
+//
+// Guards, each one a reason a wrong process could die or a loop could run away:
+//   - the pid must be 2 .. 2^31-1 and not the server's own, so a bad file never reaches kill(0) or kill(-1);
+//   - the pid must be the window (proc_pidpath ends in T27OS.app/Contents/MacOS/T27OS), so a pid that the system
+//     gave to another program after a crash is never killed;
+//   - a beat older than SUP_ANCIENT_S is a leftover from a time the server was not watching: no action;
+//   - a check that comes more than SUP_GAP_S after the last one means the machine slept: skip it, so a window that
+//     has not yet beaten after the wake is not called hung;
+//   - SUP_GRACE_S after a relaunch the old beat is ignored, so the window has time to start;
+//   - T27OS_NO_SUPERVISOR set in the server's environment turns all of it off.
+
+const SUP_EVERY_MS : u64 = 5000;
+const SUP_STALE_S : u64 = 20;
+const SUP_ANCIENT_S : u64 = 120;
+const SUP_GAP_S : u64 = 15;
+const SUP_GRACE_S : u64 = 30;
+const SUP_WINDOW_S : u64 = 600;
+const SUP_MAX : u32 = 3;
+
+const SUP_NONE : u32 = 0;
+const SUP_RELAUNCH : u32 = 1;
+const SUP_KILL_RELAUNCH : u32 = 2;
+const SUP_GIVE_UP : u32 = 3;
+
+/// Slots of the supervisor's own array (a local of serve_loop, so the pty_logic G_* map stays untouched).
+const SX_OFF : usize = 0;
+const SX_NEXT : usize = 1;
+const SX_LAST : usize = 2;
+const SX_RELAUNCH : usize = 3;
+const SX_GAVE : usize = 4;
+const SX_OPEN : usize = 5;
+const SX_TIMES : usize = 6;
+const SX_SIZE : usize = 16;
+
+fn sup_getpid() -> i32 { return @extern("getpid"); }
+fn sup_pidpath(pid: i32, buf: []u8, size: u32) -> i32 { return @extern("proc_pidpath"); }
+
+/// "<pid> <unix seconds>\n" into out[0] and out[1]. False for anything else: no digits, a pid of 0 or above
+/// 2^31-1, a time of 0, a sign, more words, text after the newline. The newline itself may be missing.
+fn beat_parse(b: []const u8, out: []u64) -> bool {
+    var i : usize = 0;
+    var pid : u64 = 0;
+    var pd : usize = 0;
+    while (i < b.len and b[i] >= 48 and b[i] <= 57 and pd < 10) {
+        pid = pid * 10 + @as(u64, b[i]) - 48;
+        i = i + 1;
+        pd = pd + 1;
+    }
+    if (pd == 0 or i >= b.len or b[i] != 32) { return false; }
+    i = i + 1;
+    var secs : u64 = 0;
+    var sd : usize = 0;
+    while (i < b.len and b[i] >= 48 and b[i] <= 57 and sd < 12) {
+        secs = secs * 10 + @as(u64, b[i]) - 48;
+        i = i + 1;
+        sd = sd + 1;
+    }
+    if (sd == 0) { return false; }
+    if (i < b.len) {
+        if (b[i] != 10 or i + 1 != b.len) { return false; }
+    }
+    if (pid == 0 or pid > 2147483647 or secs == 0) { return false; }
+    out[0] = pid;
+    out[1] = secs;
+    return true;
+}
+
+/// The beat file ~/.t27os/live/app.beat, NUL-ended in out; the length without the NUL, 0 when home is too long.
+/// Same bytes as glass_window beat_path.
+fn beat_file(home: []const u8, out: []u8) -> usize {
+    if (home.len > 200 or out.len < 260) { return 0; }
+    var n : usize = put_bytes(out, 0, home);
+    n = put_bytes(out, n, "/.t27os/live/app.beat");
+    out[n] = 0;
+    return n;
+}
+
+/// Read the beat file into out; the byte count, 0 when there is no file (the owner closed the window) or it is empty.
+fn beat_read(home: []const u8, out: []u8) -> usize {
+    var fp : [320]u8 = undefined;
+    if (beat_file(home, fp[0..320]) == 0) { return 0; }
+    const fd : i32 = sys_open_ro(fp[0..320], 0);
+    if (fd < 0) { return 0; }
+    const n : i64 = sys_read(fd, out, @as(u64, out.len));
+    sys_close(fd);
+    if (n <= 0) { return 0; }
+    return @as(usize, @intCast(n));
+}
+
+fn path_ends_with(s: []const u8, tail: []const u8) -> bool {
+    if (tail.len > s.len) { return false; }
+    var i : usize = 0;
+    while (i < tail.len) {
+        if (s[s.len - tail.len + i] != tail[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The executable of a running process is the window, not some program that was given the same pid later.
+fn path_is_app(p: []const u8) -> bool {
+    return path_ends_with(p, "/T27OS.app/Contents/MacOS/T27OS");
+}
+
+/// A pid the supervisor may signal: 2 .. 2^31-1 and not the server itself. Never 0, 1 or a value that becomes -1.
+fn kill_target_ok(pid: u64, own: i32) -> bool {
+    if (pid < 2 or pid > 2147483647) { return false; }
+    if (own > 0 and pid == @as(u64, @intCast(own))) { return false; }
+    return true;
+}
+
+/// True when the last check is so far back that the machine, or this server, was not running in between.
+fn sup_gap(last: u64, now: u64) -> bool {
+    return last != 0 and now > last + SUP_GAP_S;
+}
+
+/// The one decision. `beat` is the unix second of the last beat, `alive` is "the pid exists and is the window",
+/// `recent` counts relaunches in the last SUP_WINDOW_S, `last_relaunch` is the second of the last one (0: none).
+fn sup_decide(now: u64, beat: u64, alive: bool, recent: u32, last_relaunch: u64) -> u32 {
+    var age : u64 = 0;
+    if (now > beat) { age = now - beat; }
+    if (age > SUP_ANCIENT_S) { return SUP_NONE; }
+    if (last_relaunch != 0 and now < last_relaunch + SUP_GRACE_S and beat <= last_relaunch) { return SUP_NONE; }
+    if (alive and age <= SUP_STALE_S) { return SUP_NONE; }
+    if (recent >= SUP_MAX) { return SUP_GIVE_UP; }
+    if (alive) { return SUP_KILL_RELAUNCH; }
+    return SUP_RELAUNCH;
+}
+
+/// How many of the relaunch seconds in `times` (0 = an empty slot) fall inside the window that ends at `now`.
+fn sup_used(times: []const u64, now: u64) -> u32 {
+    var n : u32 = 0;
+    var i : usize = 0;
+    while (i < times.len) {
+        if (times[i] != 0 and times[i] <= now and now - times[i] < SUP_WINDOW_S) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Note a relaunch at `now`: it takes an empty slot, else the oldest one.
+fn sup_record(times: []u64, now: u64) -> void {
+    var at : usize = 0;
+    var i : usize = 1;
+    while (i < times.len) {
+        if (times[i] < times[at]) { at = i; }
+        i = i + 1;
+    }
+    times[at] = now;
+}
+
+/// The window bundle that sits beside the server binary: <folder of bin>/T27OS.app, NUL-ended in out; the length
+/// without the NUL, 0 when bin has no folder or the result does not fit.
+fn bundle_beside(bin: []const u8, out: []u8) -> usize {
+    var cut : usize = 0;
+    var found : bool = false;
+    var i : usize = 0;
+    while (i < bin.len) {
+        if (bin[i] == 47) { cut = i; found = true; }
+        i = i + 1;
+    }
+    if (found == false or cut + 11 > out.len) { return 0; }
+    var n : usize = put_bytes(out, 0, bin[0..cut]);
+    n = put_bytes(out, n, "/T27OS.app");
+    out[n] = 0;
+    return n;
+}
+
+/// The command that opens the window as NUL-ended words in out, the start of each word in offs. With a bundle
+/// path: open <bundle>. Without one: open -a T27OS. The count of words, 0 when it does not fit.
+fn relaunch_words(bundle: []const u8, out: []u8, offs: []u64) -> u32 {
+    if (bundle.len + 40 > out.len or offs.len < 3) { return 0; }
+    var n : usize = put_bytes(out, 0, "/usr/bin/open");
+    out[n] = 0;
+    n = n + 1;
+    offs[0] = 0;
+    offs[1] = @as(u64, n);
+    if (bundle.len > 0) {
+        n = put_bytes(out, n, bundle);
+        out[n] = 0;
+        return 2;
+    }
+    n = put_bytes(out, n, "-a");
+    out[n] = 0;
+    n = n + 1;
+    offs[2] = @as(u64, n);
+    n = put_bytes(out, n, "T27OS");
+    out[n] = 0;
+    return 3;
+}
+
+/// Wait up to a second for pid to be gone after kill -9; true when it is.
+fn sup_wait_gone(pid: u64) -> bool {
+    var none : [8]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 10) {
+        if (sys_kill(@as(i32, @intCast(pid)), 0) != 0) { return true; }
+        sys_poll(none[0..8], 0, 100);
+        i = i + 1;
+    }
+    return sys_kill(@as(i32, @intCast(pid)), 0) != 0;
+}
+
+/// Start /usr/bin/open for the window; the pid of that short-lived child (reaped on a later tick), 0 when it
+/// could not be started.
+fn sup_launch(st: []const u64, mem: []const u8) -> u64 {
+    var bn : usize = @as(usize, @intCast(st[G_BINLEN]));
+    if (bn > 256) { bn = 256; }
+    var bp : [300]u8 = undefined;
+    var bl : usize = bundle_beside(mem[O_BIN .. O_BIN + bn], bp[0..300]);
+    if (bl > 0) {
+        const bfd : i32 = sys_open_ro(bp[0 .. bl + 1], 0);
+        if (bfd < 0) { bl = 0; } else { sys_close(bfd); }
+    }
+    var tb : [400]u8 = undefined;
+    var offs : [4]u64 = undefined;
+    offs[2] = 0;
+    offs[3] = 0;
+    const words : u32 = relaunch_words(bp[0..bl], tb[0..400], offs[0..4]);
+    if (words == 0) { return 0; }
+    var argv : [8]u64 = undefined;
+    var a : usize = 0;
+    while (a < 8) {
+        argv[a] = 0;
+        a = a + 1;
+    }
+    var w : usize = 0;
+    while (w < @as(usize, words)) {
+        const off : usize = @as(usize, @intCast(offs[w]));
+        argv[w] = sys_addr(tb[off .. 400], tb[0..1], 0);
+        w = w + 1;
+    }
+    var pid : [2]u32 = undefined;
+    pid[0] = 0;
+    pid[1] = 0;
+    var env : [8]u8 = undefined;
+    sys_peek(env[0..8], sys_environ(), 8);
+    const rc : i32 = sys_spawn(pid, tb[0..14], 0, 0, argv, get_u64(env[0..8], 0));
+    if (rc != 0 or pid[0] == 0) {
+        say("t27os-server: could not start /usr/bin/open\n");
+        return 0;
+    }
+    say("t27os-server: window relaunched\n");
+    return @as(u64, pid[0]);
+}
+
+/// Reap the `open` child of the last relaunch once it has exited (the panes' waitpid calls name their own pids).
+fn sup_reap(sup: []u64) -> void {
+    if (sup[SX_OPEN] == 0) { return; }
+    var ws : [2]u32 = undefined;
+    ws[0] = 0;
+    ws[1] = 0;
+    const r : i32 = sys_waitpid(@as(i32, @intCast(sup[SX_OPEN])), ws, 1);
+    if (r != 0) { sup[SX_OPEN] = 0; }
+}
+
+/// Once per SUP_EVERY_MS: read the beat, decide, act.
+fn sup_tick(st: []u64, mem: []u8, sup: []u64) -> void {
+    if (sup[SX_OFF] != 0) { return; }
+    const ms : u64 = now_ms(mem);
+    if (ms < sup[SX_NEXT]) { return; }
+    sup[SX_NEXT] = ms + SUP_EVERY_MS;
+    const now : u64 = ms / 1000;
+    sup_reap(sup);
+    const slept : bool = sup_gap(sup[SX_LAST], now);
+    sup[SX_LAST] = now;
+    if (slept) { return; }
+    var buf : [64]u8 = undefined;
+    var beat : [2]u64 = undefined;
+    const bn : usize = beat_read(home_slice(st, mem), buf[0..64]);
+    if (bn == 0) { return; }
+    if (beat_parse(buf[0..bn], beat[0..2]) == false) { return; }
+    const pid : u64 = beat[0];
+    var alive : bool = false;
+    if (kill_target_ok(pid, sup_getpid())) {
+        if (sys_kill(@as(i32, @intCast(pid)), 0) == 0) {
+            var pp : [260]u8 = undefined;
+            const pn : i32 = sup_pidpath(@as(i32, @intCast(pid)), pp[0..260], 256);
+            if (pn > 0 and path_is_app(pp[0 .. @as(usize, @intCast(pn))])) { alive = true; }
+        }
+    }
+    const used : u32 = sup_used(sup[SX_TIMES .. SX_TIMES + 3], now);
+    const act : u32 = sup_decide(now, beat[1], alive, used, sup[SX_RELAUNCH]);
+    if (act == SUP_NONE) {
+        sup[SX_GAVE] = 0;
+        return;
+    }
+    if (act == SUP_GIVE_UP) {
+        if (sup[SX_GAVE] == 0) {
+            sup[SX_GAVE] = 1;
+            say("t27os-server: window relaunch budget spent (3 in 10 min), supervisor paused\n");
+        }
+        return;
+    }
+    sup[SX_GAVE] = 0;
+    if (act == SUP_KILL_RELAUNCH) {
+        say("t27os-server: window hung, killing it\n");
+        sys_kill(@as(i32, @intCast(pid)), 9);
+        if (sup_wait_gone(pid) == false) { return; }
+    }
+    sup_record(sup[SX_TIMES .. SX_TIMES + 3], now);
+    sup[SX_RELAUNCH] = now;
+    sup[SX_OPEN] = sup_launch(st, mem);
+}
+
 fn serve_loop(st: []u64, mem: []u8) -> void {
     var kind : [64]u8 = undefined;
     var idx : [64]u8 = undefined;
+    var sup : [16]u64 = undefined;
+    var sz : usize = 0;
+    while (sz < SX_SIZE) {
+        sup[sz] = 0;
+        sz = sz + 1;
+    }
+    if (sys_getenv("T27OS_NO_SUPERVISOR") != 0) { sup[SX_OFF] = 1; }
     while (true) {
         var k : usize = 0;
         put_pollfd(mem[O_POLL .. O_POLL + 512], k, @as(u32, @intCast(st[G_LISTEN])));
@@ -1232,6 +1556,7 @@ fn serve_loop(st: []u64, mem: []u8) -> void {
         }
         quiet_tick(st, mem);
         wait_tick(st, mem);
+        sup_tick(st, mem, sup[0..16]);
     }
 }
 
@@ -1473,4 +1798,231 @@ test the_open_socket_verdicts_tell_a_bind_from_a_live_server {
     assert OPEN_LIVE != OPEN_BOUND;
     assert OPEN_FAILED != OPEN_BOUND;
     assert OPEN_LIVE != OPEN_FAILED;
+}
+
+// ---- the hang and crash supervisor (t27os crash guard, issue 12368) ----
+
+test the_beat_the_window_writes_parses_back_to_its_pid_and_second {
+    // the exact bytes glass_window beat_text(123, 1700000000) writes
+    var out : [2]u64 = undefined;
+    assert beat_parse("123 1700000000\n", out[0..2]);
+    assert out[0] == 123;
+    assert out[1] == 1700000000;
+    // the newline may be missing; the largest pid is accepted
+    assert beat_parse("7 42", out[0..2]);
+    assert out[0] == 7 and out[1] == 42;
+    assert beat_parse("2147483647 5\n", out[0..2]);
+    assert out[0] == 2147483647;
+}
+
+test a_beat_that_is_not_a_pid_a_space_and_a_second_is_refused {
+    var out : [2]u64 = undefined;
+    assert beat_parse("", out[0..2]) == false;
+    assert beat_parse("abc", out[0..2]) == false;
+    assert beat_parse("123", out[0..2]) == false;
+    assert beat_parse("123 ", out[0..2]) == false;
+    assert beat_parse("123 \n", out[0..2]) == false;
+    assert beat_parse(" 123 5\n", out[0..2]) == false;
+    assert beat_parse("12x 5\n", out[0..2]) == false;
+    assert beat_parse("123 5x\n", out[0..2]) == false;
+    assert beat_parse("123 5 6\n", out[0..2]) == false;
+    assert beat_parse("123 5\nx", out[0..2]) == false;
+    assert beat_parse("123 5\n\n", out[0..2]) == false;
+    assert beat_parse("-1 5\n", out[0..2]) == false;
+}
+
+test a_pid_of_zero_or_above_the_pid_range_is_refused_so_kill_never_sees_it {
+    var out : [2]u64 = undefined;
+    assert beat_parse("0 100\n", out[0..2]) == false;
+    assert beat_parse("2147483648 5\n", out[0..2]) == false;
+    assert beat_parse("99999999999 5\n", out[0..2]) == false;
+    assert beat_parse("123 0\n", out[0..2]) == false;
+    assert beat_parse("4294967295 5\n", out[0..2]) == false;
+}
+
+test only_a_pid_from_two_up_that_is_not_the_server_may_be_signalled {
+    assert kill_target_ok(0, 500) == false;
+    assert kill_target_ok(1, 500) == false;
+    assert kill_target_ok(2, 500);
+    assert kill_target_ok(500, 500) == false;
+    assert kill_target_ok(501, 500);
+    assert kill_target_ok(2147483647, 500);
+    assert kill_target_ok(2147483648, 500) == false;
+    assert kill_target_ok(4294967295, 500) == false;
+}
+
+test the_beat_file_path_matches_the_one_the_window_writes {
+    var out : [320]u8 = undefined;
+    const n : usize = beat_file("/Users/tester", out[0..320]);
+    assert n == 34;
+    assert out[n] == 0;
+    assert out[13] == 47 and out[14] == 46;
+    assert out[n - 1] == 116 and out[n - 2] == 97;
+    var long : [256]u8 = undefined;
+    var i : usize = 0;
+    while (i < 256) {
+        long[i] = 97;
+        i = i + 1;
+    }
+    assert beat_file(long[0..201], out[0..320]) == 0;
+    assert beat_file(long[0..200], out[0..320]) == 221;
+    assert beat_file("/Users/tester", out[0..100]) == 0;
+}
+
+test only_the_window_executable_counts_as_the_window {
+    assert path_is_app("/Users/a/t27/target/t27os/T27OS.app/Contents/MacOS/T27OS");
+    assert path_is_app("/Applications/T27OS.app/Contents/MacOS/T27OS");
+    assert path_is_app("/usr/bin/open") == false;
+    assert path_is_app("") == false;
+    assert path_is_app("T27OS.app/Contents/MacOS/T27OS") == false;
+    assert path_is_app("/Applications/Safari.app/Contents/MacOS/Safari") == false;
+    assert path_is_app("/x/T27OS.app/Contents/MacOS/T27OS2") == false;
+    assert path_is_app("/x/T27OS.app/Contents/MacOS/t27os-pty") == false;
+}
+
+test a_fresh_beat_of_a_live_window_asks_for_nothing {
+    assert sup_decide(1000, 999, true, 0, 0) == SUP_NONE;
+    assert sup_decide(1000, 1000, true, 0, 0) == SUP_NONE;
+    // the limit itself is still fresh
+    assert sup_decide(1000, 980, true, 0, 0) == SUP_NONE;
+    // a beat from the future (the clock stepped back) counts as fresh
+    assert sup_decide(1000, 1005, true, 0, 0) == SUP_NONE;
+}
+
+test a_live_window_that_stopped_beating_is_killed_then_relaunched {
+    assert sup_decide(1000, 979, true, 0, 0) == SUP_KILL_RELAUNCH;
+    assert sup_decide(1000, 900, true, 2, 0) == SUP_KILL_RELAUNCH;
+    // at the edge of the ancient limit it is still acted on, one second past it is not
+    assert sup_decide(1000, 880, true, 0, 0) == SUP_KILL_RELAUNCH;
+    assert sup_decide(1000, 879, true, 0, 0) == SUP_NONE;
+}
+
+test a_window_that_is_gone_while_its_beat_file_stays_is_relaunched {
+    assert sup_decide(1000, 997, false, 0, 0) == SUP_RELAUNCH;
+    assert sup_decide(1000, 1000, false, 2, 0) == SUP_RELAUNCH;
+    assert sup_decide(1000, 1005, false, 0, 0) == SUP_RELAUNCH;
+    assert sup_decide(1000, 880, false, 0, 0) == SUP_RELAUNCH;
+}
+
+test a_beat_older_than_the_ancient_limit_is_a_leftover_and_never_acted_on {
+    // the server was not watching when it was written: the pid may be a different program by now
+    assert sup_decide(1000, 879, false, 0, 0) == SUP_NONE;
+    assert sup_decide(1000, 1, true, 0, 0) == SUP_NONE;
+    assert sup_decide(1000, 1, false, 0, 0) == SUP_NONE;
+}
+
+test three_relaunches_in_the_window_stop_the_fourth {
+    assert sup_decide(1000, 997, false, 2, 0) == SUP_RELAUNCH;
+    assert sup_decide(1000, 997, false, 3, 0) == SUP_GIVE_UP;
+    assert sup_decide(1000, 979, true, 3, 0) == SUP_GIVE_UP;
+    assert sup_decide(1000, 997, false, 9, 0) == SUP_GIVE_UP;
+    // a fresh live window is left alone even when the budget is spent
+    assert sup_decide(1000, 999, true, 3, 0) == SUP_NONE;
+}
+
+test the_beat_from_before_a_relaunch_is_ignored_while_the_window_starts {
+    // relaunched at 990, the file still holds the dead window's beat from 985
+    assert sup_decide(1000, 985, false, 1, 990) == SUP_NONE;
+    assert sup_decide(1019, 985, false, 1, 990) == SUP_NONE;
+    // 30 s on, still no new beat: the relaunch did not take, so it is a crash again
+    assert sup_decide(1020, 985, false, 1, 990) == SUP_RELAUNCH;
+    // a beat the new window wrote after the relaunch counts at once
+    assert sup_decide(1000, 995, false, 1, 990) == SUP_RELAUNCH;
+    assert sup_decide(1000, 999, true, 1, 990) == SUP_NONE;
+}
+
+test a_check_long_after_the_last_one_is_skipped_as_a_sleep {
+    assert sup_gap(0, 5000) == false;
+    assert sup_gap(1000, 1005) == false;
+    assert sup_gap(1000, 1015) == false;
+    assert sup_gap(1000, 1016) == true;
+    assert sup_gap(1000, 40000) == true;
+    // a clock that stepped back is not a gap
+    assert sup_gap(1000, 900) == false;
+}
+
+test the_relaunch_budget_counts_inside_the_window_and_replaces_the_oldest {
+    var t : [3]u64 = undefined;
+    t[0] = 0;
+    t[1] = 0;
+    t[2] = 0;
+    assert sup_used(t[0..3], 1000) == 0;
+    sup_record(t[0..3], 100);
+    assert sup_used(t[0..3], 1000) == 1;
+    sup_record(t[0..3], 200);
+    sup_record(t[0..3], 300);
+    assert t[0] == 100 and t[1] == 200 and t[2] == 300;
+    assert sup_used(t[0..3], 400) == 3;
+    // 600 s after a relaunch it no longer counts
+    assert sup_used(t[0..3], 699) == 3;
+    assert sup_used(t[0..3], 700) == 2;
+    assert sup_used(t[0..3], 900) == 0;
+    // the next relaunch takes the oldest slot
+    sup_record(t[0..3], 700);
+    assert t[0] == 700 and t[1] == 200 and t[2] == 300;
+    assert sup_used(t[0..3], 701) == 3;
+}
+
+test the_window_bundle_is_looked_for_beside_the_server_binary {
+    var out : [300]u8 = undefined;
+    const n : usize = bundle_beside("/Users/t/t27/target/t27os/t27os-pty", out[0..300]);
+    assert n == 35;
+    assert out[n] == 0;
+    assert out[25] == 47 and out[26] == 84 and out[27] == 50 and out[28] == 55;
+    assert out[n - 1] == 112 and out[n - 4] == 46;
+    assert bundle_beside("/t27os-pty", out[0..300]) == 10;
+    assert bundle_beside("t27os-pty", out[0..300]) == 0;
+    assert bundle_beside("", out[0..300]) == 0;
+    assert bundle_beside("/Users/t/t27/target/t27os/t27os-pty", out[0..30]) == 0;
+}
+
+test the_relaunch_command_is_open_with_a_bundle_or_open_dash_a_name {
+    var out : [400]u8 = undefined;
+    var offs : [4]u64 = undefined;
+    offs[0] = 9;
+    offs[1] = 9;
+    offs[2] = 9;
+    offs[3] = 9;
+    const w : u32 = relaunch_words("/x/T27OS.app", out[0..400], offs[0..4]);
+    assert w == 2;
+    assert offs[0] == 0 and offs[1] == 14;
+    assert out[0] == 47 and out[12] == 110 and out[13] == 0;
+    assert out[14] == 47 and out[15] == 120;
+    assert out[14 + 12] == 0;
+    const v : u32 = relaunch_words("", out[0..400], offs[0..4]);
+    assert v == 3;
+    assert offs[1] == 14 and offs[2] == 17;
+    assert out[14] == 45 and out[15] == 97 and out[16] == 0;
+    assert out[17] == 84 and out[18] == 50 and out[19] == 55 and out[20] == 79 and out[21] == 83 and out[22] == 0;
+}
+
+test a_bundle_path_that_does_not_fit_makes_no_command {
+    var out : [400]u8 = undefined;
+    var offs : [4]u64 = undefined;
+    var long : [380]u8 = undefined;
+    var i : usize = 0;
+    while (i < 380) {
+        long[i] = 97;
+        i = i + 1;
+    }
+    assert relaunch_words(long[0..380], out[0..400], offs[0..4]) == 0;
+    assert relaunch_words("/x", out[0..400], offs[0..2]) == 0;
+}
+
+test the_supervisor_numbers_agree_with_each_other {
+    // a check every 5 s, a hang at 20 s, a leftover at 120 s, a sleep gap at 15 s, a start-up grace of 30 s
+    assert SUP_EVERY_MS == 5000;
+    assert SUP_STALE_S == 20;
+    assert SUP_EVERY_MS / 1000 < SUP_GAP_S;
+    assert SUP_GAP_S < SUP_STALE_S;
+    assert SUP_STALE_S < SUP_GRACE_S;
+    assert SUP_GRACE_S < SUP_ANCIENT_S;
+    assert SUP_ANCIENT_S < SUP_WINDOW_S;
+    assert SUP_MAX == 3;
+    assert SUP_WINDOW_S == 600;
+    assert SUP_NONE != SUP_RELAUNCH and SUP_RELAUNCH != SUP_KILL_RELAUNCH and SUP_KILL_RELAUNCH != SUP_GIVE_UP;
+    assert SUP_NONE != SUP_GIVE_UP and SUP_NONE != SUP_KILL_RELAUNCH and SUP_RELAUNCH != SUP_GIVE_UP;
+    // the supervisor's slots fit its array and do not overlap
+    assert SX_TIMES + 3 <= SX_SIZE;
+    assert SX_OPEN < SX_TIMES;
 }
