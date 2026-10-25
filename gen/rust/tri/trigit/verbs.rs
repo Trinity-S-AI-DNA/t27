@@ -146,14 +146,8 @@ pub fn is_hex(t: &[u8]) -> bool {
     return true;
 }
 
-pub fn put_s(out: &mut [u8], mut w: usize, cap: usize, s: &[u8]) -> usize {
-    let mut i: usize = 0;
-    while ((i < s.len()) && (w < cap)) {
-        out[(w) as usize] = s[(i) as usize];
-        w = (w + 1);
-        i = (i + 1);
-    }
-    return w;
+pub fn put_s(out: &mut [u8], w: usize, cap: usize, s: &[u8]) -> usize {
+    return put_lit(out, w, cap, s);
 }
 
 pub fn claim_argv(out: &mut [u8], cap: usize, issue: u64, sha: &[u8]) -> usize {
@@ -553,11 +547,11 @@ pub fn hov_row(f: &[u8], a: usize, b: usize, out: &mut [u8], mut w: usize, cap: 
     let e0: usize = nth_sep(f, a, b, 0);
     let e1: usize = nth_sep(f, a, b, 1);
     w = put_span(out, w, cap, f, a, e0);
-    w = put_lit(out, w, cap, " ");
+    w = put_lit(out, w, cap, b" ");
     w = put_span(out, w, cap, f, (e0 + 1), e1);
-    w = put_lit(out, w, cap, " -> session ");
-    w = put_lit(out, w, cap, hov_name(hov_session(state_field_code(f, a, b))));
-    w = put_lit(out, w, cap, "\n");
+    w = put_lit(out, w, cap, b" -> session ");
+    w = put_lit(out, w, cap, hov_name(hov_session(state_field_code(f, a, b))).as_bytes());
+    w = put_lit(out, w, cap, b"\n");
     return w;
 }
 
@@ -693,16 +687,16 @@ pub fn create_record(out: &mut [u8], cap: usize, agent: &'static str, task: &'st
         return 0;
     }
     let mut w: usize = 0;
-    w = put_lit(out, w, cap, agent);
-    w = put_lit(out, w, cap, "|");
-    w = put_lit(out, w, cap, task);
-    w = put_lit(out, w, cap, "|");
-    w = put_lit(out, w, cap, state);
-    w = put_lit(out, w, cap, "|");
-    w = put_lit(out, w, cap, issue);
-    w = put_lit(out, w, cap, "|");
-    w = put_lit(out, w, cap, note);
-    w = put_lit(out, w, cap, "\n");
+    w = put_lit(out, w, cap, agent.as_bytes());
+    w = put_lit(out, w, cap, b"|");
+    w = put_lit(out, w, cap, task.as_bytes());
+    w = put_lit(out, w, cap, b"|");
+    w = put_lit(out, w, cap, state.as_bytes());
+    w = put_lit(out, w, cap, b"|");
+    w = put_lit(out, w, cap, issue.as_bytes());
+    w = put_lit(out, w, cap, b"|");
+    w = put_lit(out, w, cap, note.as_bytes());
+    w = put_lit(out, w, cap, b"\n");
     return w;
 }
 
@@ -756,10 +750,10 @@ pub fn nth_sep(s: &[u8], from: usize, to: usize, n: u32) -> usize {
     return to;
 }
 
-pub fn put_lit(out: &mut [u8], mut w: usize, cap: usize, s: &'static str) -> usize {
+pub fn put_lit(out: &mut [u8], mut w: usize, cap: usize, s: &[u8]) -> usize {
     let mut i: usize = 0;
     while ((i < s.len()) && (w < cap)) {
-        out[(w) as usize] = s.as_bytes()[(i) as usize];
+        out[(w) as usize] = s[(i) as usize];
         w = (w + 1);
         i = (i + 1);
     }
