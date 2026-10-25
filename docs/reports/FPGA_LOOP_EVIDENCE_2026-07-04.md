@@ -211,7 +211,7 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 
 ## Legacy helper scripts
 
-The ad-hoc helpers `fpga/tools/load_sram.sh` and `fpga/tools/synth_gf16_matrix.sh` remain in the tree for reference, but the canonical path is now the `tri` CLI (`L7 UNITY`).
+The ad-hoc helpers `fpga/tools/load_sram.sh` and `fpga/tools/synth_gf16_matrix.sh` remain in the tree for reference, but the canonical path is now the `tri` CLI (`L7 UNITY`). Update 2026-10-25: both helper scripts were removed under #12411, because the canonical path is the `tri` CLI and they targeted the Wukong's 676-ball part, not the AX7203.
 
 ## Remaining blockers after W394 tool work
 
