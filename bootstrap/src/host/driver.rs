@@ -84,11 +84,6 @@ impl<M: Mmio> BitnetDriver<M> {
         &mut self.mmio
     }
 
-    /// Consume the driver and return the backend.
-    pub fn into_mmio(self) -> M {
-        self.mmio
-    }
-
     /// Program the inference parameters.  The caller is responsible for
     /// ensuring values fit the underlying CSR widths; this routine only
     /// rejects zero counts via `DriverError::InvalidConfig`.
@@ -127,11 +122,6 @@ impl<M: Mmio> BitnetDriver<M> {
     /// Read the STATUS register and test the `done` bit.
     pub fn is_done(&mut self) -> bool {
         self.mmio.read32(csr_map::STATUS) & csr_map::STATUS_DONE_MASK != 0
-    }
-
-    /// Read the STATUS register and test the `error` bit.
-    pub fn has_error(&mut self) -> bool {
-        self.mmio.read32(csr_map::STATUS) & csr_map::STATUS_ERROR_MASK != 0
     }
 
     /// Poll STATUS up to `max_polls` times waiting for `done`.
