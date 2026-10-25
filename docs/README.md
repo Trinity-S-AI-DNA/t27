@@ -24,6 +24,7 @@ First-party docs follow the **27-agent trinity alphabet** grouping: **three nona
 | [`coordination/TASK_PROTOCOL.md`](coordination/TASK_PROTOCOL.md) | Inter-agent TASK protocol. |
 | [`coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md`](coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md) | Phased plan: seed → tests → Queen brain (`tri`/`t27c`, conformance, codegen gap). |
 | [`coordination/inter-agent-handoff/`](coordination/inter-agent-handoff/) | Portable handoff bundle. |
+| [`coordination/HANDOFF.md`](coordination/HANDOFF.md) | The ledger `tri trigit handoff` reads and appends (#12286). |
 
 ## [`system/`](system/) — system documentation bodies (rendered at `t27.ai/#/docs`)
 
