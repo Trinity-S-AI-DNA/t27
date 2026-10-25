@@ -144,8 +144,10 @@ measurement: no run isolates them.** They are listed so a later lane can decide.
   other 138 are shown live by the rise of the counted number, not by a failing run of their own.
 - The audit did not run the OLD folded form against a wrong value, so it says nothing about whether the old form
   refused it at compile time or let it through.
-- The seals of the 13 specs are not re-saved in this lane, strict coverage of `specs/analog/*.t27` was not re-run, and
-  the mutation census of the specs that have an accepted file was not re-run. The edits sit below every accepted line
+- The seals of the 13 specs were re-saved afterwards (10:23 +07, with a `t27c` built from master; an earlier save with
+  a `t27c` older than master's gen-zig and gen-rust commits moved 20 seals and was discarded), and strict coverage of
+  `specs/analog/*.t27` then read `gaps 0`, `coverage 130/130`. The mutation census of the specs that have an accepted
+  file was not re-run. The edits sit below every accepted line
   of `sar_cdac` (last accepted line 669, first edit 698) and of `sar_comparator_psp` (last accepted line 217, first
   edit 414), so those `path:line` keys still name the same code; the other 11 specs have no accepted file.
 - Speed is not claimed: the windows above are wall-clock times of runs on a loaded machine.
