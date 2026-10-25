@@ -149,6 +149,22 @@ pub const OP_I32_SHR_S : u8 = 0x75;
 pub const OP_I32_SHR_U : u8 = 0x76;
 pub const OP_I32_ROTL : u8 = 0x77;
 pub const OP_I32_ROTR : u8 = 0x78;
+; P5 (2026-10-25): float arithmetic joins as bit-exact integer work on the raw
+; IEEE-754 words P4 made pushable -- no FPU, only shifts, compares and adds.
+; f32.add and f32.sub decompose both words, order the magnitudes, align the
+; smaller mantissa, add or subtract, renormalize through clz32; f32.mul runs a
+; 24-clock shift-add on the 24-bit significands, in the shape of i32.mul. THE
+; ROUNDING LAW OF THIS FLOOR IS TRUNCATION (round toward zero): every bit
+; shifted out -- by alignment, by the carry fold, by the product fold -- is
+; dropped, no guard, no sticky, no round-up. Overflow goes to infinity,
+; underflow to zero or a denormal by the same truncation, x + (-x) is +0, NaN
+; answers the canonical quiet word, and subtraction is literally addition of
+; the sign-flipped second operand. Denormals are honored as inputs (effective
+; exponent 1, no implicit bit) and as outputs. Division, fused ops, f64
+; arithmetic and the f64 high half stay separate increments.
+pub const OP_F32_ADD : u8 = 0x92;
+pub const OP_F32_SUB : u8 = 0x93;
+pub const OP_F32_MUL : u8 = 0x94;
 
 ; --- error codes (the MVP numbers; 4 was free and P2 gives it to divide-by-zero)
 pub const ERR_NONE : u8 = 0;
@@ -193,6 +209,17 @@ var mul_run : u8 = 0
 var mul_a : u32 = 0
 var mul_b : u32 = 0
 var mul_acc : u32 = 0
+; P5: the f32.mul shift-add state, the same microsequence shape as i32.mul --
+; 24 clocks for the 24 significand bits, the u64 pair holding the 48-bit
+; product, fa_e the biased exponent sum, fa_s the xor sign, fa_res the
+; special-case answer (NaN, inf, signed zero) the setup already knows.
+var fa_run : u8 = 0
+var fa_a : u64 = 0
+var fa_b : u32 = 0
+var fa_acc : u64 = 0
+var fa_e : u32 = 0
+var fa_s : u32 = 0
+var fa_res : u32 = 0
 var res : u32 = 0
 var scrap_op : u8 = 0
 var scrap_imm : u8 = 0
@@ -439,6 +466,191 @@ fn popcnt32(x : u32) -> u32 {
     return (v + (v >> 8) + (v >> 16) + (v >> 24)) & 0x3F;
 }
 
+; --- P5 helpers: binary32 arithmetic as pure word work (no FPU, no `*`)
+; f32_neg flips the sign bit -- the whole of subtraction, since IEEE defines
+; a - b as a + (-b) even for the specials.
+fn f32_neg(x : u32) -> u32 {
+    return x ^ 0x80000000;
+}
+
+; f32_add: decompose both words, answer the specials first (canonical quiet
+; NaN; inf wins unless the signs clash, which is NaN; zeros follow the IEEE
+; sign laws), then order the magnitudes -- (effective exponent, mantissa) is
+; lexicographic because a denormal's effective exponent 1 keeps its mantissa
+; below every normal's implicit bit -- align the smaller mantissa right (a
+; distance of 25 or more shifts it to nothing: truncation), add or subtract,
+; renormalize through clz32. Same signs: the carry fold drops the low bit,
+; exponent 255 overflows to inf, a mantissa still below bit 23 is an honest
+; denormal result. Opposite signs: bigger minus smaller with the bigger's
+; sign, equal magnitudes are +0, and an exponent that reaches 1 before bit 23
+; packs the denormal (shift left by e-1). Every dropped bit is TRUNCATED.
+fn f32_add(a : u32, b : u32) -> u32 {
+    var sa : u32 = a >> 31;
+    var ea : u32 = (a >> 23) & 0xFF;
+    var ma : u32 = a & 0x7FFFFF;
+    var sb : u32 = b >> 31;
+    var eb : u32 = (b >> 23) & 0xFF;
+    var mb : u32 = b & 0x7FFFFF;
+    if ((ea == 255 && ma != 0) or (eb == 255 && mb != 0)) {
+        return 0x7FC00000;
+    }
+    if (ea == 255 or eb == 255) {
+        if (ea == 255 && eb == 255 && sa != sb) {
+            return 0x7FC00000;
+        }
+        if (ea == 255) {
+            return a;
+        }
+        return b;
+    }
+    if (ea == 0 && ma == 0 && eb == 0 && mb == 0) {
+        return (sa & sb) << 31;
+    }
+    if (ea == 0 && ma == 0) {
+        return b;
+    }
+    if (eb == 0 && mb == 0) {
+        return a;
+    }
+    var ea2 : u32 = ea;
+    var ma2 : u32 = ma | 0x800000;
+    if (ea == 0) {
+        ea2 = 1;
+        ma2 = ma;
+    }
+    var eb2 : u32 = eb;
+    var mb2 : u32 = mb | 0x800000;
+    if (eb == 0) {
+        eb2 = 1;
+        mb2 = mb;
+    }
+    var big_e : u32 = ea2;
+    var big_m : u32 = ma2;
+    var sml_m : u32 = mb2;
+    var rsign : u32 = sa;
+    if (ea2 < eb2 or (ea2 == eb2 && ma2 < mb2)) {
+        big_e = eb2;
+        big_m = mb2;
+        sml_m = ma2;
+        rsign = sb;
+    }
+    var d : u32 = 0;
+    if (ea2 >= eb2) {
+        d = ea2 - eb2;
+    } else {
+        d = eb2 - ea2;
+    }
+    var sml_sh : u32 = 0;
+    if (d < 25) {
+        sml_sh = shr_u32(sml_m, d);
+    }
+    if (sa == sb) {
+        var sum : u32 = big_m + sml_sh;
+        var e : u32 = big_e;
+        if ((sum & 0x1000000) != 0) {
+            sum = sum >> 1;
+            e = e + 1;
+        }
+        if (e >= 255) {
+            return (sa << 31) | 0x7F800000;
+        }
+        if ((sum & 0x800000) != 0) {
+            return (sa << 31) | (e << 23) | (sum & 0x7FFFFF);
+        }
+        return (sa << 31) | sum;
+    }
+    if (ea2 == eb2 && ma2 == mb2) {
+        return 0;
+    }
+    var m : u32 = big_m - sml_sh;
+    var n : u32 = clz32(m) - 8;
+    if (big_e <= n) {
+        return (rsign << 31) | shl32(m, big_e - 1);
+    }
+    m = shl32(m, n);
+    return (rsign << 31) | ((big_e - n) << 23) | (m & 0x7FFFFF);
+}
+
+; f32_mul_setup: decode the specials that need no product (NaN, inf -- with
+; inf times zero as NaN -- and signed zero) into fa_res and answer 0, or load
+; the 24-clock shift-add machine with the effective significands and answer 1.
+; Denormals enter as exponent 1 without the implicit bit, as in f32_add.
+fn f32_mul_setup(x : u32, y : u32) -> u8 {
+    var ex : u32 = (x >> 23) & 0xFF;
+    var mx : u32 = x & 0x7FFFFF;
+    var ey : u32 = (y >> 23) & 0xFF;
+    var my : u32 = y & 0x7FFFFF;
+    fa_s = (x >> 31) ^ (y >> 31);
+    if ((ex == 255 && mx != 0) or (ey == 255 && my != 0)) {
+        fa_res = 0x7FC00000;
+        return 0;
+    }
+    if (ex == 255 or ey == 255) {
+        if ((ex == 255 && ey == 0 && my == 0) or (ey == 255 && ex == 0 && mx == 0)) {
+            fa_res = 0x7FC00000;
+            return 0;
+        }
+        fa_res = (fa_s << 31) | 0x7F800000;
+        return 0;
+    }
+    if ((ex == 0 && mx == 0) or (ey == 0 && my == 0)) {
+        fa_res = fa_s << 31;
+        return 0;
+    }
+    var ex2 : u32 = ex;
+    var mx2 : u32 = mx | 0x800000;
+    if (ex == 0) {
+        ex2 = 1;
+        mx2 = mx;
+    }
+    var ey2 : u32 = ey;
+    var my2 : u32 = my | 0x800000;
+    if (ey == 0) {
+        ey2 = 1;
+        my2 = my;
+    }
+    fa_a = mx2 as u64;
+    fa_b = my2;
+    fa_acc = 0;
+    fa_e = ex2 + ey2;
+    fa_run = 24;
+    return 1;
+}
+
+; f32_mul_pack: the machine's last clock. The product P = mx2 * my2 sits in
+; fa_acc (< 2^48) with fa_e = ex2 + ey2, so the value is P * 2^(fa_e - 300).
+; The MSB position b comes from clz32 of the top or bottom half; the exponent
+; is E = fa_e + b - 173, infinity at E >= 255; the mantissa fold P >> (b - 23)
+; TRUNCATES the low bits. E below 1 packs the denormal P >> (151 - fa_e),
+; which is a signed zero once the shift leaves the 48-bit product.
+fn f32_mul_pack() -> u32 {
+    var p : u64 = fa_acc;
+    var hi : u32 = ((p >> 16) & 0xFFFFFFFF) as u32;
+    var b : u32 = 0;
+    if (hi != 0) {
+        b = 47 - clz32(hi);
+    } else {
+        b = 31 - clz32((p & 0xFFFFFFFF) as u32);
+    }
+    var esum : u32 = fa_e + b;
+    if (esum >= 428) {
+        return (fa_s << 31) | 0x7F800000;
+    }
+    if (esum >= 174) {
+        var m : u32 = ((p >> (b - 23)) & 0xFFFFFFFF) as u32;
+        return (fa_s << 31) | ((esum - 173) << 23) | (m & 0x7FFFFF);
+    }
+    var sh : u32 = 151 - fa_e;
+    if (sh >= 48) {
+        return fa_s << 31;
+    }
+    if (sh >= 32) {
+        var m48 : u32 = ((p >> 24) & 0xFFFFFF) as u32;
+        return (fa_s << 31) | shr_u32(m48, sh - 24);
+    }
+    return (fa_s << 31) | (((p >> sh) & 0x7FFFFF) as u32);
+}
+
 ; --- responses
 fn fail_rsp(e : u8) {
     err = e;
@@ -453,6 +665,7 @@ fn fail_rsp(e : u8) {
     mul_run = 0;
     imm_run = 0;
     dv_run = 0;
+    fa_run = 0;
 }
 
 fn ok_rsp() {
@@ -683,6 +896,7 @@ fn step_all(rxd : u8) {
                 mul_run = 0;
                 imm_run = 0;
                 dv_run = 0;
+                fa_run = 0;
                 loc[0] = (body[X_OFF] as u32) | ((body[X_OFF + 1] as u32) << 8) | ((body[X_OFF + 2] as u32) << 16) | ((body[X_OFF + 3] as u32) << 24);
                 loc[1] = (body[Y_OFF] as u32) | ((body[Y_OFF + 1] as u32) << 8) | ((body[Y_OFF + 2] as u32) << 16) | ((body[Y_OFF + 3] as u32) << 24);
                 frames = frames + 1;
@@ -700,6 +914,7 @@ fn step_all(rxd : u8) {
             mul_run = 0;
             imm_run = 0;
             dv_run = 0;
+            fa_run = 0;
             loc[0] = (body[X_OFF] as u32) | ((body[X_OFF + 1] as u32) << 8) | ((body[X_OFF + 2] as u32) << 16) | ((body[X_OFF + 3] as u32) << 24);
             loc[1] = (body[Y_OFF] as u32) | ((body[Y_OFF + 1] as u32) << 8) | ((body[Y_OFF + 2] as u32) << 16) | ((body[Y_OFF + 3] as u32) << 24);
             frames = frames + 1;
@@ -722,6 +937,18 @@ fn step_all(rxd : u8) {
                 mul_run = mul_run - 1;
                 if (mul_run == 0) {
                     st[sp - 1] = mul_acc;
+                    pc = pc + 1;
+                }
+            } else {
+            if (fa_run > 0) {
+                if ((fa_b & 1) == 1) {
+                    fa_acc = fa_acc + fa_a;
+                }
+                fa_a = fa_a + fa_a;
+                fa_b = fa_b >> 1;
+                fa_run = fa_run - 1;
+                if (fa_run == 0) {
+                    st[sp - 1] = f32_mul_pack();
                     pc = pc + 1;
                 }
             } else {
@@ -870,6 +1097,32 @@ fn step_all(rxd : u8) {
                                             pc = pc + 5;
                                         } else {
                                             pc = pc + 9;
+                                        }
+                                    } else {
+                                        fail_rsp(ERR_STACK);
+                                    }
+                                } else {
+                                if (scrap_op == OP_F32_ADD or scrap_op == OP_F32_SUB) {
+                                    if (sp >= 2) {
+                                        if (scrap_op == OP_F32_ADD) {
+                                            st[sp - 2] = f32_add(st[sp - 2], st[sp - 1]);
+                                        } else {
+                                            st[sp - 2] = f32_add(st[sp - 2], f32_neg(st[sp - 1]));
+                                        }
+                                        sp = sp - 1;
+                                        pc = pc + 1;
+                                    } else {
+                                        fail_rsp(ERR_STACK);
+                                    }
+                                } else {
+                                if (scrap_op == OP_F32_MUL) {
+                                    if (sp >= 2) {
+                                        if (f32_mul_setup(st[sp - 2], st[sp - 1]) == 1) {
+                                            sp = sp - 1;
+                                        } else {
+                                            st[sp - 2] = fa_res;
+                                            sp = sp - 1;
+                                            pc = pc + 1;
                                         }
                                     } else {
                                         fail_rsp(ERR_STACK);
@@ -1277,9 +1530,12 @@ fn step_all(rxd : u8) {
                                 }
                                 }
                             }
+                                }
+                                }
                         }
                     }
                 }
+            }
             }
             }
             }
@@ -2215,4 +2471,207 @@ test p4_f32_wire_programs {
     assert cap[4] == 0x44;
     i = 0;
     while (i < 26) { uprog[i] = save[i]; i = i + 1; }
+}
+
+; P5 behavioral (the float floor, over the wire like p3/p4, with save/restore
+; of the first three pages so every other test sees the default image):
+;   43 00 00 20 40 43 00 00 C0 3F 92 0B  = f32.const 2.5; f32.const 1.5; f32.add; end
+;                                         (4.0 = 0x40800000, low24 00 00 80)
+;   43 00 00 20 40 43 00 00 C0 3F 93 0B  = 2.5 - 1.5 = 1.0 (low24 00 00 80)
+;   43 00 00 80 3F 43 00 00 20 40 93 0B  = 1.0 - 2.5 = -1.5 (low24 00 00 C0)
+;   43 00 00 00 40 43 00 00 00 40 94 0B  = 2.0 * 2.0 = 4.0 (the 24-clock
+;                                         significand machine, low24 00 00 80)
+;   43 00 00 C0 3F 43 00 00 00 40 94 0B  = 1.5 * 2.0 = 3.0 (low24 00 00 40)
+;   43 01 00 00 00 43 00 00 00 40 94 0B  = denorm 2^-149 * 2.0 = 2^-148
+;                                         (denormal input and output, 02 00 00)
+;   43 01 00 00 00 43 01 00 00 00 92 0B  = 2^-149 + 2^-149 = 2^-148 (02 00 00)
+;   92 0B                                 = f32.add on an empty stack: RESP_BADOP
+; the exact-word laws first, as runtime facts (the wire carries only 24 bits,
+; so full 32-bit exactness is pinned here). The 48-bit products are built with
+; shifts, not wide hex literals: the toolchain truncates a hex literal wider
+; than 32 bits, a fact measured by this test's first draft (0x90000000000
+; assigned and re-compared equal at 0, while the shifted build carried the bits)
+test p5_f32_arith_programs {
+    assert OP_F32_ADD == 0x92;
+    assert OP_F32_SUB == 0x93;
+    assert OP_F32_MUL == 0x94;
+    assert f32_add(0x40200000, 0x3FC00000) == 0x40800000;
+    assert f32_add(0x3F800000, 0x3F800000) == 0x40000000;
+    assert f32_add(0x3F800000, 0xBF800000) == 0x00000000;
+    assert f32_add(0x40200000, 0xBFC00000) == 0x3F800000;
+    assert f32_add(0x3FC00000, 0xBF800000) == 0x3F000000;
+    assert f32_add(0x00000001, 0x00000001) == 0x00000002;
+    assert f32_add(0x00800000, 0x00000001) == 0x00800001;
+    assert f32_add(0x00800000, 0x80000001) == 0x007FFFFF;
+    assert f32_add(0x7F7FFFFF, 0x7F7FFFFF) == 0x7F800000;
+    assert f32_add(0x7F800000, 0xFF800000) == 0x7FC00000;
+    assert f32_add(0x3F800001, 0x33800000) == 0x3F800001;
+    assert f32_add(0x40200000, f32_neg(0x3FC00000)) == 0x3F800000;
+    fa_acc = (0x90000 as u64) << 28;
+    fa_e = 254;
+    fa_s = 0;
+    assert f32_mul_pack() == 0x40100000;
+    fa_acc = 0x800000;
+    fa_e = 129;
+    fa_s = 0;
+    assert f32_mul_pack() == 0x00000002;
+    fa_acc = ((0xFFFFFC as u64) << 24) + 1;
+    fa_e = 508;
+    fa_s = 1;
+    assert f32_mul_pack() == 0xFF800000;
+    fa_run = 0;
+    var save : [96]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 96) { save[i] = uprog[i]; i = i + 1; }
+    uprog[0] = OP_F32_CONST;
+    uprog[1] = 0x00;
+    uprog[2] = 0x00;
+    uprog[3] = 0x20;
+    uprog[4] = 0x40;
+    uprog[5] = OP_F32_CONST;
+    uprog[6] = 0x00;
+    uprog[7] = 0x00;
+    uprog[8] = 0xC0;
+    uprog[9] = 0x3F;
+    uprog[10] = OP_F32_ADD;
+    uprog[11] = OP_END;
+    uprog[12] = OP_F32_CONST;
+    uprog[13] = 0x00;
+    uprog[14] = 0x00;
+    uprog[15] = 0x20;
+    uprog[16] = 0x40;
+    uprog[17] = OP_F32_CONST;
+    uprog[18] = 0x00;
+    uprog[19] = 0x00;
+    uprog[20] = 0xC0;
+    uprog[21] = 0x3F;
+    uprog[22] = OP_F32_SUB;
+    uprog[23] = OP_END;
+    uprog[24] = OP_F32_CONST;
+    uprog[25] = 0x00;
+    uprog[26] = 0x00;
+    uprog[27] = 0x80;
+    uprog[28] = 0x3F;
+    uprog[29] = OP_F32_CONST;
+    uprog[30] = 0x00;
+    uprog[31] = 0x00;
+    uprog[32] = 0x20;
+    uprog[33] = 0x40;
+    uprog[34] = OP_F32_SUB;
+    uprog[35] = OP_END;
+    uprog[36] = OP_F32_CONST;
+    uprog[37] = 0x00;
+    uprog[38] = 0x00;
+    uprog[39] = 0x00;
+    uprog[40] = 0x40;
+    uprog[41] = OP_F32_CONST;
+    uprog[42] = 0x00;
+    uprog[43] = 0x00;
+    uprog[44] = 0x00;
+    uprog[45] = 0x40;
+    uprog[46] = OP_F32_MUL;
+    uprog[47] = OP_END;
+    uprog[48] = OP_F32_CONST;
+    uprog[49] = 0x00;
+    uprog[50] = 0x00;
+    uprog[51] = 0xC0;
+    uprog[52] = 0x3F;
+    uprog[53] = OP_F32_CONST;
+    uprog[54] = 0x00;
+    uprog[55] = 0x00;
+    uprog[56] = 0x00;
+    uprog[57] = 0x40;
+    uprog[58] = OP_F32_MUL;
+    uprog[59] = OP_END;
+    uprog[60] = OP_F32_CONST;
+    uprog[61] = 0x01;
+    uprog[62] = 0x00;
+    uprog[63] = 0x00;
+    uprog[64] = 0x00;
+    uprog[65] = OP_F32_CONST;
+    uprog[66] = 0x00;
+    uprog[67] = 0x00;
+    uprog[68] = 0x00;
+    uprog[69] = 0x40;
+    uprog[70] = OP_F32_MUL;
+    uprog[71] = OP_END;
+    uprog[72] = OP_F32_CONST;
+    uprog[73] = 0x01;
+    uprog[74] = 0x00;
+    uprog[75] = 0x00;
+    uprog[76] = 0x00;
+    uprog[77] = OP_F32_CONST;
+    uprog[78] = 0x01;
+    uprog[79] = 0x00;
+    uprog[80] = 0x00;
+    uprog[81] = 0x00;
+    uprog[82] = OP_F32_ADD;
+    uprog[83] = OP_END;
+    uprog[84] = OP_F32_ADD;
+    uprog[85] = OP_END;
+    var r : u32 = host_load(0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    r = host_load(1);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    r = host_load(2);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    r = host_run_user(12, 0, 71, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 71;
+    assert cap[2] == 0x00;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x80;
+    r = host_run_user(12, 12, 72, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 72;
+    assert cap[2] == 0x00;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x80;
+    r = host_run_user(12, 24, 73, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 73;
+    assert cap[2] == 0x00;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0xC0;
+    r = host_run_user(12, 36, 74, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 74;
+    assert cap[2] == 0x00;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x80;
+    r = host_run_user(12, 48, 75, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 75;
+    assert cap[2] == 0x00;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x40;
+    r = host_run_user(12, 60, 76, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 76;
+    assert cap[2] == 0x02;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x00;
+    r = host_run_user(12, 72, 77, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_OK;
+    assert cap[1] == 77;
+    assert cap[2] == 0x02;
+    assert cap[3] == 0x00;
+    assert cap[4] == 0x00;
+    r = host_run_user(2, 84, 78, 0, 0);
+    assert r == 0;
+    assert cap[0] == RESP_BADOP;
+    assert cap[1] == 78;
+    assert err == ERR_STACK;
+    i = 0;
+    while (i < 96) { uprog[i] = save[i]; i = i + 1; }
 }
