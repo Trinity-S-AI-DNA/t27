@@ -1,8 +1,8 @@
 # Mutation test gaps of specs/analog/sar_switch.t27, 2026-10-25
 
 Issue #12287, part of epic #10486 (weak spots of the analog v0.1 release). This lane wrote the missing asserts, the
-accepted file and this note. It did not run the mutation gate and did not save a seal: both are the orchestrator's.
-Where each number comes from:
+accepted file and this note. The mutation gate and the seal were run afterwards by the analog loop (section "The gate
+run"). Where each number comes from:
 
 - **Census** (400 mutants, 306 killed, 53 survived, 33 hung, 8 unviable) is the analog-loop census of the unmodified
   spec on 2026-10-25, tree 4d03070df6 (it holds the spec of master f81a02f36a), run by `tri mutate spec`.
@@ -144,8 +144,23 @@ of the 43 mutants the tests kill. Reading the gate's rule (an entry is checked p
 when mutants of that line and kind ran and all were killed; unviable mutants are left out of that test), the 8
 unviable entries are inert today, as in the other accepted files that carry them.
 
-Predicted gate figures, not measured: 400 mutants, 349 killed (306 + 43), 10 survived (53 - 43), 33 hung, 8 unviable;
-43 mutants not killed (10 survived, 33 hung), 43 accepted, 0 accepted lines now killed.
+## The gate run
+
+Measured on 2026-10-25, tree 07966d524e (this lane before the final rebase), run by
+`tri mutate spec --file specs/analog/sar_switch.t27 --accepted docs/analog/mutation-accepted-sar_switch.txt --jobs 3
+--timeout 45`: 14:49:42 to 15:07:09 (17 min 27 s), exit 0, "Gate passed." The machine load was 18.56 at the start and
+rose above 60 for a few minutes in the middle (other sessions and the desktop app); no verdict was changed by hand.
+
+| | mutants | killed | survived | hung | unviable |
+|---|---|---|---|---|---|
+| census, before this lane | 400 | 306 | 53 | 33 | 8 |
+| gate, with the 8 new tests | 400 | 349 (349 by a failing test, 0 by an invariant) | 10 | 33 | 8 |
+
+43 mutants are not killed (10 survived, 33 hung); all 43 are accepted by the file above, and 0 accepted lines are now
+killed. The figures I predicted from the by-hand run (349 killed, 10 survived, 33 hung, 8 unviable) are exactly the
+measured ones. The hung count is the census's 33, so the load spike turned no kill into a hang. The 10 survivors are
+exactly lines 234, 236, 238, 510, 511, 772 (equivalent), 327, 467, 500 (no witness) and 792 (dead on the stimuli
+tried); lines 400 and 406 are absent from the not-killed list, so their 15 mutants are killed.
 
 ## Caveats (what is by hand or not established)
 
@@ -164,10 +179,9 @@ Predicted gate figures, not measured: 400 mutants, 349 killed (306 + 43), 10 sur
 
 ## Not done
 
-- The mutation gate was not run on this tree (`tri mutate spec --file specs/analog/sar_switch.t27 --accepted
-  docs/analog/mutation-accepted-sar_switch.txt`); the figures above are predicted.
-- No seal was saved and `.trinity/seals/` is untouched. Whether the appended tests change the sealed hash was not
-  checked here.
+- The seal of `analog_AnalogSarSwitch` was saved (tests 22 of 22) and `tri seals changed` passes after the rebase;
+  see the PR for the final run.
 - `tri coverage --strict` and the CI docs check were not run in this lane.
 - 327 and 500 have no test (no witness); 792 is not pinned.
-- The 33 hung lines were not re-run; they are the census's.
+- The 33 hung lines were not re-run one by one: the gate ran them at the one `--timeout` 45 and each stayed hung, so
+  they are clock results at that timeout, as in the other accepted files.
