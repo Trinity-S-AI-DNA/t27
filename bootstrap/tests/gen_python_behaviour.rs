@@ -101,7 +101,7 @@ fn python_says(module: &str, names: &[&str], tag: &str) -> Option<String> {
 }
 
 /// The spec the corpus opens on. Its artifact must parse and import, and the
-/// four declarations it holds must be the four the module binds -- its three
+/// four declarations it holds must be the four the module binds -- its four
 /// fns, two tests and two invariants announced, not stubbed.
 #[test]
 fn gen_python_hello_world_parses_and_imports() {
@@ -115,7 +115,7 @@ fn gen_python_hello_world_parses_and_imports() {
         "{module}"
     );
     assert!(module.contains("__NOT_EMITTED__ = []\n"), "{module}");
-    assert_eq!(module.matches("was not emitted -- this backend lowers declarations").count(), 3, "{module}");
+    assert_eq!(module.matches("was not emitted -- this backend lowers declarations").count(), 4, "{module}");
     assert!(!module.contains("def "), "a fn must be announced, never stubbed:\n{module}");
     assert!(!module.contains("export "), "{module}");
 
