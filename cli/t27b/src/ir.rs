@@ -718,13 +718,9 @@ impl Program {
     }
 }
 
-// The wasm32 fact table (epic #11840, port epic #6198): the IR-side half of
-// `t27b build --target wasm32`. The byte law (floors 9-10, the module mounted
-// above) walks flat tables, so this projects a Program into them: the names
-// blob, one 48-byte fact row per fn (flags, name span, parameter count,
-// return-type span, body shape, the row's floor-8 body verdict, its node
-// payload span, the line) and the 16-byte postfix node rows. Every decision
-// is the law's; this only reads the IR and writes the rows.
+/// The wasm32 fact table (epic #11840): the IR-side half of the wasm32
+/// build. The byte law walks flat tables; this projects a Program into them
+/// and writes the rows. Every decision is the law's; this only reads the IR.
 
 /// One 16-byte node row through the law's node_put.
 fn wasm_node(ns: &mut Vec<u8>, kind: u8, op: u8, var: u32, v: u64) {
@@ -733,11 +729,8 @@ fn wasm_node(ns: &mut Vec<u8>, kind: u8, op: u8, var: u32, v: u64) {
     ns.extend_from_slice(&r);
 }
 
-/// The postfix node rows of one expression (`+ - * /` and the six
-/// comparisons over parameters and constants; any other kind marks the row
-/// 255, which the law refuses). The op byte is ArithOp's / CmpOp's own
-/// discriminant, the order the law's debug-name table and cmp_opcode spell
-/// every variant.
+/// The postfix node rows of one expression; any other kind marks the row
+/// 255, which the law refuses. The op byte is ArithOp's / CmpOp's discriminant.
 fn wasm_post(e: &Expr, ns: &mut Vec<u8>) {
     match &e.kind {
         ExprKind::Const(v) => wasm_node(ns, w::EK_CONST, 0, 0, *v as u64),
@@ -845,16 +838,37 @@ pub fn wasm_facts(p: &Program) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
                     plen = 3;
                 }
             }
+            // Straight-line statement bodies: assignments then the trailing
+            // return -- floor 14's window; only i32-carried locals are
+            // claimed, any other statement keeps BS_OTHER's refusal.
+            stmts @ [.., Stmt::Return(Some(e))]
+                if stmts.len() > 1
+                    && stmts[..stmts.len() - 1].iter().all(|s| matches!(s, Stmt::Assign { .. }))
+                    && f.vars[f.nparams..].iter().all(|v| w::carrier(v.ty.name().as_bytes()) == w::VT_I32) =>
+            {
+                shape = w::BS_STMTS_RETURN;
+                for st in &stmts[..stmts.len() - 1] {
+                    if let Stmt::Assign { var, value } = st {
+                        wasm_post(value, &mut ns);
+                        wasm_node(&mut ns, w::EK_LOCAL_SET, 0, *var, 0);
+                    }
+                }
+                wasm_post(e, &mut ns);
+                plen = (ns.len() / w::NODE_ROW) as u32 - poff;
+            }
             _ => {}
         }
         let mut op = [0u8; 1];
         if shape == w::BS_RETURN_EXPR {
             body_r = w::postfix_refusal(&ns, poff, plen, f.nparams as u32, &mut op);
+        } else if shape == w::BS_STMTS_RETURN {
+            body_r = w::stmts_refusal_w(&ns, poff, plen, f.nparams as u32, (f.vars.len() - f.nparams) as u32, &mut op);
         }
         let mut row = [0u8; w::FACT_ROW];
-        w::fact_put(
+        let locals_n = if shape == w::BS_STMTS_RETURN { (f.vars.len() - f.nparams) as u32 } else { 0 };
+        w::fact_put_locals(
             &mut row, 0, flags, noff, f.name.len() as u32, f.nparams as u32, roff,
-            (s.len() - roff as usize) as u32, shape, body_r, poff, plen, f.line,
+            (s.len() - roff as usize) as u32, shape, body_r, poff, plen, f.line, locals_n,
         );
         facts.extend_from_slice(&row);
     }
