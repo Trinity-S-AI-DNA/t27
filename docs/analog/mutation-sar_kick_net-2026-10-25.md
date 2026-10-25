@@ -40,11 +40,13 @@ mutant by mutant.
   survived (-43), 39 -> 40 hung (+1, the 770 hang). The seal re-save on the same spec after the run (01:54 +07, the
   minute is from the seal output file) printed tests 36/36 pass in the seal run (30 tests before, six new, 0 failed), and a
   verify with all five hashes MATCH; the seal file `.trinity/seals/analog_AnalogSarKickNet.json` is re-saved in this PR.
-- **The nine deferred entries are deleted, and the file on disk was not gated again.** The second run had them in the
+- **The nine deferred entries are deleted, and the 68-entry file was gated afterwards.** The second run had them in the
   file and reported them as accepted-but-killed, which is the signal to delete them; they are deleted, so the accepted
-  file now has 68 entry lines. The gate was not run on the 68-entry file (about 40 minutes on a loaded machine). That it
-  exits 0 follows from the rule that an accepted entry only filters its own (line, kind) key, and from every one of the
-  79 not-killed mutants of the second run being matched by an entry that stays. It is **inferred, not measured**.
+  file now has 68 entry lines. A confirmation gate on exactly that file (tree of head e0ea55536a, 2026-10-26 02:46:41 to
+  03:24:46 +07, 38 min 05 s, `--jobs 2 --timeout 45`, load averages 6.58 5.77 6.45 at the start) printed 727 mutants,
+  633 killed (633 by a failing test, 0 at compile time), 39 survived, 40 hung, 15 unviable; 79 not killed, 79 accepted,
+  0 accepted lines now killed, "Gate passed", exit 0. The 15 unviable answers are all "not yet implemented"; no cache
+  error (FileNotFound, NotLibStub) appeared in this run. The exit 0 is **measured**.
 
 ## The 82 survivors by label
 
@@ -128,5 +130,5 @@ killed, `i != 0` and `i != 2` live) and 822 `flip-cmp` (`scale >= 0.0` is killed
 - **The 1343 teeth check** (do the two table expressions differ for at least one i) is covered by the issue-12494 test:
   the issue comment states that `dc_insitu(i, 9)` and `dc_insitu(i, 10)` differ for all 8 conversions (smallest gap
   2.84e-6 V), and the 1343 key is killed in the second run.
-- **The confirmation gate on the 68-entry file is still to come.** Until a gate run on the file as it stands now exits
-  0, "exit 0" for that file is inferred from the gate rule, not measured (see "Where the numbers come from").
+- **The confirmation gate on the 68-entry file is done: exit 0, measured** (figures in the bullet "The nine deferred
+  entries are deleted" above). It ran on the tree of head e0ea55536a; the commits after it change only this note.
