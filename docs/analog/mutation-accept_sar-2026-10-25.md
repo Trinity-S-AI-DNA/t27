@@ -139,10 +139,14 @@ at compile time), 35 survived, 4 hung, 1 unviable; 39 not killed, 39 accepted, 0
 passed", exit 0. The census had 218 killed, so the 23 new kills are exactly the 23 test gaps.
 
 **The first gate run** (21:56-22:19, same options and tree, with a 40th entry for line 631) ended with exit 2: the
-gate reported "1 accepted line(s) now killed" for `accept_sar.t27:631 [swap-arith]`. An entry for an unviable mutant
-counts as killed, not as ignored, so unviable mutants must not be listed in the accepted file; the entry was removed
-and the second run passed. An earlier reading of the gate's rule in this note (unviable entries are inert) was wrong
-for this mutant.
+gate reported "1 accepted line(s) now killed" for `accept_sar.t27:631 [swap-arith]`. The cause, read in
+`cli/tri/src/mutate.rs` (`gate_counts`): an entry is matched by line and kind, unviable mutants are left out of that
+lookup, and the entry is stale when every remaining mutant of the key was killed. Line 631 has three spaced operators,
+so three swap-arith mutants share the key; only one is unviable and the other two are killed by the tests, so the
+entry written for the unviable one was stale. The entry was removed and the second run passed. Two earlier readings in
+this note were wrong: that an unviable entry is inert, and (in the first correction) that an unviable mutant counts
+as killed. The rule is: never write an entry whose key has no survivor or hang. That the two siblings are killed is
+inferred from the gate's report and from no survivor entry for the line; the per-mutant output was not kept.
 
 ## Caveats (what is by hand or not established)
 
