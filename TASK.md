@@ -149,3 +149,4 @@
 ---
 
 *English only in this file.*- 2026-10-23T07:10Z | buffy-agent | tri-git release coverage (git.t27 0->100%, typecheck 0/0) + loop_guard safe-loop spec + issues #11730-#11733 reopened via issue-shape | landed in this PR | tooling bugs stay open in #11730-#11733; skill .claude/skills/tri-git-coverage/; no lock held
+- 2026-10-25T09:10Z | queen-live-lane | CYCLE PROVEN: the reviewer bee reviewed PR #12177 end to end on the free fleet (glm-4.7-flash, 88 s, $0.00), posted REQUEST_CHANGES with line-level evidence, caught the operator's OWN mistakes (a re-trigger commit missing its issue reference; stale seals), and the operator fixed them -- the system polices itself | #12177 (bee branch, Auto Merge gate armed) | re-review pending after the history fix; pool capacity flapped 8->2 keys same morning, re-probe per api_fleet.t27 before routing
