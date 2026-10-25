@@ -1,0 +1,553 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/tools/dupes_key.t27 -- the alpha-normal form of a function body: the key the duplicate-bodies
+// ratchet should compare. Epic gHashTag/t27#12444, row E (issue #12449).
+// Why. tools/dupe_scan.py keys a body by its text, so `is_digit(b)` and `is_digit(c)` (a renamed
+// parameter), or `b >= 48` and `b >= '0'` (a literal spelled another way), are two different bodies and
+// the clones form no group: `is_digit` stood 36 times in 12 text variants and the ratchet reported none
+// of them (measured 2026-10-25, #12449). `normalise` writes a form in which those differences are gone,
+// so equal forms mean "the same function to a human".
+// What is NOT done here: the wiring into tools/dupe_scan.py. That scan is Python, the owner forbids new
+// hand-written code in any language but t27, and the foreign-line budget is net zero, so the change that
+// makes the ratchet read this key is a t27-native gate in the style of specs/policy/own_language.t27, with
+// the one-time re-bless of tools/duplicate_bodies_baseline.txt that the new key forces (it surfaces the
+// hidden clones). That is a later row of #12444. This file is the pure, tested function that row calls.
+// --
+// The normal form. normalise(params, body, out, cap) writes the form of `body`; the text of `params` is
+// only read, for the names. The six rules, each pinned by a test:
+// 1. Every parameter name becomes p0, p1, ... in the order the parameter list names them. The name of a
+//    parameter is the last identifier before the first ':' of its segment (a segment ends at a comma that
+//    is not inside (), [] or {}), or the last identifier of a segment that has no ':'.
+// 2. Every local introduced by `var NAME` or `const NAME` becomes l0, l1, ... in order of declaration. A
+//    later declaration of the same name (a sibling block) gets a new index, and a use is bound to the
+//    latest declaration before it. `const` right after ']' or '*' is a type qualifier ([]const u8,
+//    *const T), not a declaration. A for-loop capture |x| is not a declaration here: its name is kept as
+//    it is (renamed only if a parameter or an earlier local has the same name).
+// 3. A character literal becomes its decimal value: 'X' for a printable ASCII byte X (32..126, but not
+//    a single quote or a backslash) and the escapes \n \t \r \\ \' \" \0 (10 9 13 92 39 34 0). Any other quote
+//    (a malformed or unsupported literal such as 'ab' or '\x41') is copied as it stands.
+// 4. Text inside a "..." string (a backslash escapes the next byte) and inside a // comment (up to, not
+//    including, the line end) is copied verbatim: a name inside a string is not a variable.
+// 5. A run of whitespace (space, tab, LF, CR) becomes one space, and whitespace at the start and at the
+//    end of the body is dropped. After a // comment the run becomes one newline instead, so a comment
+//    can never swallow the code that follows it (`a // c` newline `b` and `a // c b` stay different).
+//    Whitespace is collapsed, never inserted or removed: `a>=b` and `a >= b` are different forms.
+// 6. Every other identifier is kept: function names, types, keywords, a number such as 0x1F (a number is
+//    read whole, never as a name), a member name after a single dot (`.len`, `.{ .x = 1 }`), and a
+//    builtin name after '@' (`@as`). A run of two or more dots is a range (`s[a..b]`), not a member.
+// --
+// Limits and the answer. At most 16 parameters and 32 locals; one more of either makes normalise return 0.
+// It also returns 0 when the form does not fit cap, and for a body with nothing in it (so 0 is "no key",
+// never a key). The form can be longer than the body (a one-letter name becomes two or three bytes) but
+// never longer than twice the body plus 4 bytes, so a buffer of that size always holds it. Bytes written
+// before a 0 is returned may be clipped garbage: do not read them.
+// No nested functions (a `fn` inside a body keeps its own parameter names), no scopes beyond the rule 2
+// above, no type information: it is a text normaliser, the same road as specs/tri/fmt_source.t27.
+// --
+// Imports, so a byte class and the bounded writer have one home each (a local copy of `put` would join a
+// duplicate group of its own): std::text (is_space, is_word, is_digit; epic row A) and
+// policy::own_language (put, put_range). Not for hardware specs until gHashTag/t27#8769 is closed.
+// Every private helper carries the dk_ prefix on purpose: the `use` splice keys declarations by bare name
+// and refuses two different bodies under one (R4), and word_end, str_end, span_eq, char_lit and the rest
+// already exist in this tree with other bodies. A spec that imports `normalise` must not collide.
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module tools::dupes_key;
+
+use std::text::is_space;
+use std::text::is_word;
+use std::text::is_digit;
+use policy::own_language::put;
+use policy::own_language::put_range;
+
+/// The first byte of an identifier: a letter or '_' (a digit starts a number, not a name).
+fn dk_is_ident_start(c: u8) -> bool {
+    return is_word(c) and is_digit(c) == false;
+}
+
+/// One past the last word byte of the run that starts at s[i]; i itself when s[i] is not a word byte.
+fn dk_word_end(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i;
+    while (k < n and is_word(s[k])) { k += 1; }
+    return k;
+}
+
+/// One past the closing quote of the string that opens at s[i]; n when it never closes. A backslash
+/// escapes the byte after it.
+fn dk_str_end(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i + 1;
+    while (k < n) {
+        if (s[k] == '\\') {
+            k += 2;
+        } else {
+            if (s[k] == '"') { return k + 1; }
+            k += 1;
+        }
+    }
+    return n;
+}
+
+/// The index of the line end (LF or CR) at or after s[i], or n: the comment that starts at i stops there.
+fn dk_comment_end(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i;
+    while (k < n and s[k] != '\n' and s[k] != '\r') { k += 1; }
+    return k;
+}
+
+/// Are a[af..at] and b[bf..bt] the same bytes (and so the same length)?
+fn dk_span_eq(a: []const u8, af: usize, at: usize, b: []const u8, bf: usize, bt: usize) -> bool {
+    if (at - af != bt - bf) { return false; }
+    var k : usize = 0;
+    while (k < at - af) {
+        if (a[af + k] != b[bf + k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Is s[f..t] exactly the text `lit`?
+fn dk_span_is(s: []const u8, f: usize, t: usize, lit: []const u8) -> bool {
+    return dk_span_eq(s, f, t, lit, 0, lit.len);
+}
+
+/// Is s[f..t] the whole word `var` or `const`?
+fn dk_is_decl_word(s: []const u8, f: usize, t: usize) -> bool {
+    if (dk_span_is(s, f, t, "var")) { return true; }
+    return dk_span_is(s, f, t, "const");
+}
+
+/// The byte an escape letter stands for, or -1 when it is not one of n t r 0 \ ' ".
+fn dk_esc_value(e: u8) -> i32 {
+    if (e == 'n') { return 10; }
+    if (e == 't') { return 9; }
+    if (e == 'r') { return 13; }
+    if (e == '0') { return 0; }
+    if (e == '\\') { return 92; }
+    if (e == '\'') { return 39; }
+    if (e == '"') { return 34; }
+    return -1;
+}
+
+/// The number the character literal that opens at s[i] stands for, or -1 when what follows is not one
+/// of the supported kinds: 'X' (X printable, not a quote or a backslash) or '\E' (E as in esc_value).
+fn dk_char_lit(s: []const u8, i: usize, n: usize) -> i32 {
+    if (i + 2 < n and s[i + 1] >= 32 and s[i + 1] <= 126 and s[i + 1] != '\\' and s[i + 1] != '\'' and s[i + 2] == '\'') {
+        return @as(i32, s[i + 1]);
+    }
+    if (i + 3 < n and s[i + 1] == '\\' and s[i + 3] == '\'') { return dk_esc_value(s[i + 2]); }
+    return -1;
+}
+
+/// Write the decimal digits of v (0 .. 255) at w; the position keeps counting past cap (see put).
+fn dk_put_dec(out: []u8, w: usize, cap: usize, v: u8) -> usize {
+    var p : usize = w;
+    if (v >= 100) { p = put(out, p, cap, 48 + v / 100); }
+    if (v >= 10) { p = put(out, p, cap, 48 + (v / 10) % 10); }
+    return put(out, p, cap, 48 + v % 10);
+}
+
+/// Write the normal form of `body` (rules in the header) into out[0..cap); `params` is the parameter
+/// list text, for the names only. Returns the number of bytes written, or 0 when there is no key: the body
+/// is empty, the form does not fit cap, or there are more than 16 parameters or 32 locals.
+pub fn normalise(params: []const u8, body: []const u8, out: []u8, cap: usize) -> usize {
+    var pfrom : [16]usize = undefined;
+    var pto : [16]usize = undefined;
+    var lfrom : [32]usize = undefined;
+    var lto : [32]usize = undefined;
+    var np : usize = 0;
+    var nl : usize = 0;
+    const pm : usize = params.len;
+    const n : usize = body.len;
+    var i : usize = 0;
+
+    // The parameter names. One scan; at i == pm a comma is read, so the last segment is closed too.
+    var depth : usize = 0;
+    var cf : usize = 0;
+    var ct : usize = 0;
+    var past_colon : bool = false;
+    while (i <= pm) {
+        var c : u8 = ',';
+        if (i < pm) { c = params[i]; }
+        if (dk_is_ident_start(c) and depth == 0) {
+            const e : usize = dk_word_end(params, i, pm);
+            if (past_colon == false) {
+                cf = i;
+                ct = e;
+            }
+            i = e;
+        } else if (c == ':' and depth == 0) {
+            past_colon = true;
+            i += 1;
+        } else if (c == '(' or c == '[' or c == '{') {
+            depth += 1;
+            i += 1;
+        } else if (c == ')' or c == ']' or c == '}') {
+            if (depth > 0) { depth -= 1; }
+            i += 1;
+        } else if ((c == ',' and depth == 0) or i == pm) {
+            if (ct > cf) {
+                if (np >= 16) { return 0; }
+                pfrom[np] = cf;
+                pto[np] = ct;
+                np += 1;
+            }
+            cf = 0;
+            ct = 0;
+            past_colon = false;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // The body, left to right. sep is the separator owed before the next token (0 none, ' ' or '\n').
+    var w : usize = 0;
+    var sep : u8 = 0;
+    var prev : u8 = 0;
+    var after_dot : bool = false;
+    var after_kw : bool = false;
+    i = 0;
+    while (i < n) {
+        const c : u8 = body[i];
+        if (is_space(c)) {
+            if (sep == 0) { sep = ' '; }
+            i += 1;
+        } else {
+            if (sep != 0 and w > 0) { w = put(out, w, cap, sep); }
+            sep = 0;
+            if (c == '/' and i + 1 < n and body[i + 1] == '/') {
+                const e : usize = dk_comment_end(body, i, n);
+                w = put_range(out, w, cap, body, i, e);
+                i = e;
+                sep = '\n';
+            } else if (c == '"') {
+                const e : usize = dk_str_end(body, i, n);
+                w = put_range(out, w, cap, body, i, e);
+                i = e;
+                after_dot = false;
+                after_kw = false;
+                prev = '"';
+            } else if (c == '\'') {
+                const v : i32 = dk_char_lit(body, i, n);
+                if (v >= 0) {
+                    w = dk_put_dec(out, w, cap, @as(u8, @intCast(v)));
+                    if (body[i + 1] == '\\') { i += 4; } else { i += 3; }
+                } else {
+                    w = put(out, w, cap, c);
+                    i += 1;
+                }
+                after_dot = false;
+                after_kw = false;
+                prev = '\'';
+            } else if (is_digit(c)) {
+                const e : usize = dk_word_end(body, i, n);
+                w = put_range(out, w, cap, body, i, e);
+                i = e;
+                after_dot = false;
+                after_kw = false;
+                prev = '0';
+            } else if (dk_is_ident_start(c)) {
+                const e : usize = dk_word_end(body, i, n);
+                const is_member : bool = after_dot;
+                const is_decl : bool = after_kw;
+                after_dot = false;
+                after_kw = false;
+                if (is_member) {
+                    w = put_range(out, w, cap, body, i, e);
+                } else if (is_decl) {
+                    if (nl >= 32) { return 0; }
+                    lfrom[nl] = i;
+                    lto[nl] = e;
+                    w = put(out, w, cap, 'l');
+                    w = dk_put_dec(out, w, cap, @as(u8, @intCast(nl)));
+                    nl += 1;
+                } else if (dk_is_decl_word(body, i, e) and prev != ']' and prev != '*') {
+                    w = put_range(out, w, cap, body, i, e);
+                    after_kw = true;
+                } else {
+                    var kind : u8 = 0;
+                    var idx : usize = 0;
+                    var k : usize = nl;
+                    while (k > 0 and kind == 0) {
+                        k -= 1;
+                        if (dk_span_eq(body, i, e, body, lfrom[k], lto[k])) {
+                            kind = 'l';
+                            idx = k;
+                        }
+                    }
+                    k = 0;
+                    while (k < np and kind == 0) {
+                        if (dk_span_eq(body, i, e, params, pfrom[k], pto[k])) {
+                            kind = 'p';
+                            idx = k;
+                        }
+                        k += 1;
+                    }
+                    if (kind == 0) {
+                        w = put_range(out, w, cap, body, i, e);
+                    } else {
+                        w = put(out, w, cap, kind);
+                        w = dk_put_dec(out, w, cap, @as(u8, @intCast(idx)));
+                    }
+                }
+                i = e;
+                prev = 'a';
+            } else {
+                w = put(out, w, cap, c);
+                i += 1;
+                after_dot = false;
+                after_kw = false;
+                if (c == '@') { after_dot = true; }
+                if (c == '.') {
+                    var dots : usize = 1;
+                    while (i < n and body[i] == '.') {
+                        w = put(out, w, cap, '.');
+                        i += 1;
+                        dots += 1;
+                    }
+                    if (dots == 1) { after_dot = true; }
+                }
+                prev = c;
+            }
+        }
+    }
+    if (w > cap) { return 0; }
+    return w;
+}
+
+/// Test helper: do both (params, body) pairs have a key, and the same one?
+fn same_key(pa: []const u8, ba: []const u8, pb: []const u8, bb: []const u8) -> bool {
+    var oa : [512]u8 = undefined;
+    var ob : [512]u8 = undefined;
+    const na : usize = normalise(pa, ba, &oa, 512);
+    const nb : usize = normalise(pb, bb, &ob, 512);
+    if (na == 0 or na != nb) { return false; }
+    var k : usize = 0;
+    while (k < na) {
+        if (oa[k] != ob[k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Test helper: is the normal form of (params, body) exactly `want`?
+fn norm_is(params: []const u8, body: []const u8, want: []const u8) -> bool {
+    var o : [512]u8 = undefined;
+    const m : usize = normalise(params, body, &o, 512);
+    if (m != want.len) { return false; }
+    var k : usize = 0;
+    while (k < m) {
+        if (o[k] != want[k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+test is_ident_start_takes_letters_and_underscore_only {
+    assert dk_is_ident_start('a');
+    assert dk_is_ident_start('Z');
+    assert dk_is_ident_start('_');
+    assert dk_is_ident_start('7') == false;
+    assert dk_is_ident_start('.') == false;
+    assert dk_is_ident_start(' ') == false;
+}
+
+test put_dec_u8_writes_the_decimal {
+    var out : [8]u8 = undefined;
+    assert dk_put_dec(&out, 0, 8, 0) == 1;
+    assert out[0] == '0';
+    assert dk_put_dec(&out, 0, 8, 48) == 2;
+    assert out[0] == '4';
+    assert out[1] == '8';
+    assert dk_put_dec(&out, 0, 8, 126) == 3;
+    assert out[0] == '1';
+    assert out[1] == '2';
+    assert out[2] == '6';
+    assert dk_put_dec(&out, 7, 8, 100) == 10;
+    assert out[7] == '1';
+}
+
+test char_lit_reads_one_byte_and_the_supported_escapes {
+    assert dk_char_lit("'0'", 0, 3) == 48;
+    assert dk_char_lit("' '", 0, 3) == 32;
+    assert dk_char_lit("'\"'", 0, 3) == 34;
+    assert dk_char_lit("'\\n'", 0, 4) == 10;
+    assert dk_char_lit("'\\t'", 0, 4) == 9;
+    assert dk_char_lit("'\\r'", 0, 4) == 13;
+    assert dk_char_lit("'\\0'", 0, 4) == 0;
+    assert dk_char_lit("'\\\\'", 0, 4) == 92;
+    assert dk_char_lit("'\\''", 0, 4) == 39;
+    assert dk_char_lit("'\\\"'", 0, 4) == 34;
+}
+
+test char_lit_refuses_what_it_cannot_read {
+    assert dk_char_lit("'ab'", 0, 4) == -1;
+    assert dk_char_lit("'\\x'", 0, 4) == -1;
+    assert dk_char_lit("''", 0, 2) == -1;
+    assert dk_char_lit("'0", 0, 2) == -1;
+    assert dk_char_lit("'''", 0, 3) == -1;
+    assert dk_char_lit("'\\n", 0, 3) == -1;
+}
+
+test word_end_stops_at_the_first_byte_that_is_not_a_word_byte {
+    assert dk_word_end("abc_1.len", 0, 9) == 5;
+    assert dk_word_end("a", 0, 1) == 1;
+    assert dk_word_end("ab c", 1, 4) == 2;
+    assert dk_word_end(" x", 0, 2) == 0;
+}
+
+test str_end_skips_escapes_and_clamps_to_the_end {
+    assert dk_str_end("\"ab\" x", 0, 6) == 4;
+    assert dk_str_end("\"a\\\"b\" x", 0, 8) == 6;
+    assert dk_str_end("\"ab", 0, 3) == 3;
+    assert dk_str_end("\"a\\", 0, 3) == 3;
+}
+
+test comment_end_stops_at_the_line_end {
+    assert dk_comment_end("// x\nrest", 0, 9) == 4;
+    assert dk_comment_end("// x", 0, 4) == 4;
+}
+
+test comment_end_stops_at_a_carriage_return {
+    var cr : [9]u8 = [47, 47, 32, 120, 13, 10, 114, 101, 115];
+    assert dk_comment_end(cr[0..9], 0, 9) == 4;
+}
+
+test span_eq_compares_length_and_bytes {
+    assert dk_span_eq("abcd", 1, 3, "xbcz", 1, 3);
+    assert dk_span_eq("abc", 1, 1, "xyz", 2, 2);
+    assert dk_span_eq("abc", 0, 2, "abc", 0, 3) == false;
+    assert dk_span_eq("abc", 0, 3, "abd", 0, 3) == false;
+}
+
+test is_decl_word_takes_var_and_const_as_whole_words {
+    assert dk_is_decl_word("var", 0, 3);
+    assert dk_is_decl_word("const", 0, 5);
+    assert dk_is_decl_word("x var y", 2, 5);
+    assert dk_is_decl_word("variable", 0, 8) == false;
+    assert dk_is_decl_word("cons", 0, 4) == false;
+    assert dk_is_decl_word("constant", 0, 8) == false;
+}
+
+test clones_that_differ_only_in_parameter_names_normalise_alike {
+    assert same_key("b: u8", "return b >= 48 and b <= 57;", "c: u8", "return c >= 48 and c <= 57;");
+    assert same_key("x: []const u8, y: []const u8", "return x.len == y.len;", "a: []const u8, b: []const u8", "return a.len == b.len;");
+    assert norm_is("b: u8", "return b >= 48 and b <= 57;", "return p0 >= 48 and p0 <= 57;");
+    assert norm_is("x: []const u8, y: []const u8", "return x.len == y.len;", "return p0.len == p1.len;");
+}
+
+test a_character_literal_and_its_number_normalise_alike {
+    assert same_key("b: u8", "return b >= '0' and b <= '9';", "b: u8", "return b >= 48 and b <= 57;");
+    assert same_key("b: u8", "return b >= 48 and b <= 57;", "c: u8", "return c >= '0' and c <= '9';");
+    assert norm_is("c: u8", "return c == '\\n' or c == '\\'' or c == '\"';", "return p0 == 10 or p0 == 39 or p0 == 34;");
+    assert norm_is("c: u8", "return c == ' ' or c == '\\\\' or c == '\\0';", "return p0 == 32 or p0 == 92 or p0 == 0;");
+    assert norm_is("c: u8", "c == '0'", "p0 == 48");
+}
+
+test bodies_that_differ_in_logic_do_not_normalise_alike {
+    assert same_key("b: u8", "return b < 10;", "c: u8", "return c < 10;");
+    assert same_key("b: u8", "return b < 10;", "b: u8", "return b <= 10;") == false;
+    assert same_key("b: u8", "return b >= 48;", "b: u8", "return b >= 49;") == false;
+    assert same_key("a: u8, b: u8", "return a - b;", "a: u8, b: u8", "return b - a;") == false;
+    assert same_key("a: u8, b: u8", "return a;", "a: u8, b: u8", "return b;") == false;
+    assert same_key("b: u8", "return b >= '0';", "b: u8", "return b >= '1';") == false;
+}
+
+test an_identifier_inside_a_string_or_a_comment_is_not_renamed {
+    assert norm_is("b: u8", "return \"b\" == b;", "return \"b\" == p0;");
+    assert norm_is("b: u8", "write(\"b \\\" b\", b);", "write(\"b \\\" b\", p0);");
+    assert norm_is("b: u8", "x = \"a//b\"; return b;", "x = \"a//b\"; return p0;");
+    assert norm_is("b: u8", "return b; // b is b", "return p0; // b is b");
+}
+
+test a_local_is_renamed_and_a_function_name_is_not {
+    assert norm_is("s: []const u8", "var k : usize = 0; while (k < s.len) { k = k + 1; } return helper(k);", "var l0 : usize = 0; while (l0 < p0.len) { l0 = l0 + 1; } return helper(l0);");
+    assert same_key("s: []const u8", "var k : usize = 0; return helper(k);", "t: []const u8", "var j : usize = 0; return helper(j);");
+    assert same_key("s: []const u8", "var k : usize = 0; return helper(k);", "s: []const u8", "var k : usize = 0; return other(k);") == false;
+}
+
+test locals_are_numbered_in_order_of_declaration {
+    assert norm_is("x: u8", "const a = x; var b = a + x; return b;", "const l0 = p0; var l1 = l0 + p0; return l1;");
+    assert norm_is("", "var k : u8 = 0; var k : u8 = 1; return k;", "var l0 : u8 = 0; var l1 : u8 = 1; return l1;");
+    assert same_key("", "var k : u8 = 0; var k : u8 = 1; return k;", "", "var a : u8 = 0; var b : u8 = 1; return b;");
+}
+
+test const_after_a_bracket_or_star_is_a_type_qualifier {
+    assert norm_is("s: []const u8", "var t : []const u8 = s; return t.len;", "var l0 : []const u8 = p0; return l0.len;");
+    assert norm_is("p: *const u8", "const q = p; return q;", "const l0 = p0; return l0;");
+    assert norm_is("p: *const u8", "var r : *const u8 = p; return r;", "var l0 : *const u8 = p0; return l0;");
+}
+
+test a_member_name_is_kept_even_when_a_parameter_has_the_same_name {
+    assert norm_is("len: usize, s: []const u8", "return s.len + len;", "return p1.len + p0;");
+    assert norm_is("as: usize", "return @as(u8, as);", "return @as(u8, p0);");
+    assert norm_is("x: usize", "return .{ .x = x };", "return .{ .x = p0 };");
+}
+
+test a_range_is_not_a_member_access {
+    assert norm_is("s: []const u8, a: usize, b: usize", "return s[a..b];", "return p0[p1..p2];");
+    assert norm_is("a: usize, b: usize", "return a...b;", "return p0...p1;");
+}
+
+test whitespace_collapses_to_one_space_and_the_ends_are_trimmed {
+    assert norm_is("b: u8", "  return   b  ;\n\n", "return p0 ;");
+    assert norm_is("b: u8", "if (b == 1) {\n    return 1;\n}", "if (p0 == 1) { return 1; }");
+    assert same_key("b: u8", "if (b == 1) {\n    return 1;\n}", "b: u8", "if (b == 1) {\treturn 1;   }");
+}
+
+test whitespace_is_collapsed_not_inserted {
+    assert same_key("b: u8", "return b>=1;", "b: u8", "return b >= 1;") == false;
+}
+
+test a_comment_cannot_swallow_the_code_after_it {
+    assert norm_is("b: u8", "return b; // x\nreturn 1;", "return p0; // x\nreturn 1;");
+    assert same_key("b: u8", "return b; // x\nreturn 1;", "b: u8", "return b; // x return 1;") == false;
+    var out : [8]u8 = undefined;
+    assert normalise("", "// c", &out, 8) == 4;
+}
+
+test a_number_is_never_read_as_an_identifier {
+    assert norm_is("x1F: u8", "return 0x1F + x1F;", "return 0x1F + p0;");
+    assert norm_is("e5: u8", "return 1e5 + e5;", "return 1e5 + p0;");
+    assert norm_is("x: u8", "return 1.5 + x;", "return 1.5 + p0;");
+}
+
+test parameter_lists_may_nest_and_end_with_a_comma {
+    assert norm_is("f: fn(u8, u8) -> u8, b: u8", "return f(b, b);", "return p0(p1, p1);");
+    assert norm_is("a: u8,", "return a;", "return p0;");
+    assert norm_is("self", "return self;", "return p0;");
+    assert norm_is("comptime T: type, x: T", "return x;", "return p1;");
+}
+
+test empty_input_writes_nothing {
+    var out : [8]u8 = undefined;
+    assert normalise("", "", &out, 8) == 0;
+    assert normalise("b: u8", "", &out, 8) == 0;
+    assert normalise("", "   \n\t ", &out, 8) == 0;
+    assert normalise("b: u8", "return b;", &out, 0) == 0;
+}
+
+test a_buffer_that_is_too_small_returns_zero {
+    var out : [16]u8 = undefined;
+    assert normalise("b: u8", "return b;", &out, 10) == 10;
+    assert normalise("b: u8", "return b;", &out, 9) == 0;
+    assert normalise("b: u8", "return b;", &out, 1) == 0;
+    assert normalise("b: u8", "return b;", &out, 16) == 10;
+}
+
+test more_than_sixteen_parameters_return_zero {
+    var out : [64]u8 = undefined;
+    assert normalise("a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8, j: u8, k: u8, l: u8, m: u8, n: u8, o: u8, p: u8", "return a;", &out, 64) == 10;
+    assert normalise("a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8, j: u8, k: u8, l: u8, m: u8, n: u8, o: u8, p: u8, q: u8", "return a;", &out, 64) == 0;
+    assert norm_is("a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8, j: u8, k: u8, l: u8, m: u8, n: u8, o: u8, p: u8", "return p;", "return p15;");
+}
+
+test more_than_thirty_two_locals_return_zero {
+    var out : [512]u8 = undefined;
+    assert normalise("", "var a = 0; var b = 0; var c = 0; var d = 0; var e = 0; var f = 0; var g = 0; var h = 0; var i = 0; var j = 0; var k = 0; var l = 0; var m = 0; var n = 0; var o = 0; var p = 0; var q = 0; var r = 0; var s = 0; var t = 0; var u = 0; var v = 0; var w = 0; var x = 0; var y = 0; var z = 0; var A = 0; var B = 0; var C = 0; var D = 0; var E = 0; var F = 0;", &out, 512) == 405;
+    assert normalise("", "var a = 0; var b = 0; var c = 0; var d = 0; var e = 0; var f = 0; var g = 0; var h = 0; var i = 0; var j = 0; var k = 0; var l = 0; var m = 0; var n = 0; var o = 0; var p = 0; var q = 0; var r = 0; var s = 0; var t = 0; var u = 0; var v = 0; var w = 0; var x = 0; var y = 0; var z = 0; var A = 0; var B = 0; var C = 0; var D = 0; var E = 0; var F = 0; var G = 0;", &out, 512) == 0;
+}
+
+test a_malformed_character_literal_is_copied_as_it_is {
+    assert norm_is("", "x = 'ab';", "x = 'ab';");
+    assert norm_is("", "x = '\\x41';", "x = '\\x41';");
+}
