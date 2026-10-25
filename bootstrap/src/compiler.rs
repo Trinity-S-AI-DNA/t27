@@ -19189,14 +19189,11 @@ impl VerilogCodegen {
                 // (possibly with a trailing `[N]` array suffix). We derive the
                 // target bit width and signedness and emit a Verilog form that is
                 // valid regardless of the operand's source width:
-                //   * signed target -> `$signed(op)` so the value sign-extends
-                //     when it feeds a wider expression context;
+                //   * integer target wider than a known-width operand -> explicit
+                //     extension `{{(W-N){sign-or-0}}, op}` sizing the expression (#12296);
+                //   * signed target -> `$signed(op)`;
                 //   * unsigned scalar target of width W < 64 -> `(op & {W{1'b1}})`
-                //     which truncates a wider operand to exactly W bits.  When the
-                //     operand is signed and narrower than W, emit an explicit
-                //     W-bit concatenation `({(W-N){($signed(op) < 0)}}, op)` that
-                //     sign-extends without relying on Icarus' mixed signed/unsigned
-                //     expression-context semantics;
+                //     which truncates a wider operand to exactly W bits;
                 //   * 64-bit / array / unknown -> emit the operand verbatim.
                 if node.children.is_empty() {
                     return;
@@ -19219,30 +19216,24 @@ impl VerilogCodegen {
                 let operand_width = operand_ws.map(|(w, _)| w as usize);
                 let is_widening_unsigned =
                     operand_width.map(|ow| ow <= width).unwrap_or(false) && !operand_signed;
-                let needs_sign_ext =
-                    operand_signed && operand_width.map(|ow| ow < width).unwrap_or(false);
-                if signed {
+                // A literal, or a 32-bit+ signed composite (`x + 1`), has no sure sign.
+                let unsure = operand.kind == NodeKind::ExprLiteral || (operand_signed
+                    && operand_width >= Some(32) && matches!(operand.kind, NodeKind::ExprBinary | NodeKind::ExprUnary));
+                if !is_array && !unsure && !Self::type_is_float(&base_ty) && operand_width.map_or(false, |w| w < width) {
+                    let at = self.output.len();
+                    self.gen_verilog_expr(operand);
+                    let op = self.output.split_off(at);
+                    let fill = if operand_signed { format!("($signed({}) < 0)", op) } else { "1'b0".into() };
+                    let cat = format!("{{{{{}{{{}}}}}, {}}}", width - operand_width.unwrap(), fill, op);
+                    self.write(&if signed { format!("$signed({})", cat) } else { cat });
+                } else if signed {
                     self.write("$signed(");
                     self.gen_verilog_expr(operand);
                     self.write(")");
                 } else if !is_array && width >= 1 && width < 64 && !is_widening_unsigned {
-                    if needs_sign_ext {
-                        let ext = width - operand_width.unwrap();
-                        // Explicit sign-extension: replicate the sign bit (computed
-                        // via comparison so it works for any operand expression)
-                        // and concatenate with the original operand.
-                        self.write("({{");
-                        self.write(&ext.to_string());
-                        self.write("{($signed(");
-                        self.gen_verilog_expr(operand);
-                        self.write(") < 0)}}, ");
-                        self.gen_verilog_expr(operand);
-                        self.write("})");
-                    } else {
-                        self.write("(");
-                        self.gen_verilog_expr(operand);
-                        self.write(&format!(" & {{{}{{1'b1}}}})", width));
-                    }
+                    self.write("(");
+                    self.gen_verilog_expr(operand);
+                    self.write(&format!(" & {{{}{{1'b1}}}})", width));
                 } else {
                     self.gen_verilog_expr(operand);
                 }
@@ -40791,19 +40782,19 @@ mod tests_hir_pipeline_parity {
         assert!(!v.contains(" as "), "cast should not emit 'as' keyword in Verilog");
         // Regression #1087: `as` was lexed as a bare identifier, so the cast
         // target leaked out as stray statements `as;` and `u32;`. The parser now
-        // folds `x as u32` into an ExprCast that lowers to just the operand.
+        // folds `x as u32` into an ExprCast that lowers to the zero-extended operand.
         assert!(!v.contains("u32;"), "cast should not emit bare type name");
         assert!(!v.contains("as;"), "cast should not emit a stray `as` statement");
         // Positive check: the function adopts its declared return width (u32 -> 32
-        // bits) and assigns the inner operand directly.
+        // bits) and assigns the operand zero-extended to that width.
         assert!(
             v.contains("function [31:0] cast_it;"),
             "cast target u32 should drive a 32-bit function result, got:\n{}",
             v
         );
         assert!(
-            v.contains("cast_it = x;"),
-            "cast should assign the inner operand verbatim, got:\n{}",
+            v.contains("cast_it = {{24{1'b0}}, x};"),
+            "cast should zero-extend the inner operand to the target width, got:\n{}",
             v
         );
     }
@@ -40812,9 +40803,10 @@ mod tests_hir_pipeline_parity {
     fn test_verilog_cast_width_correct() {
         // Variant E: width-correct cast lowering.
         //  * narrowing unsigned (u32 -> u8) truncates with a mask;
-        //  * widening unsigned of a known-width parameter (u8 -> u32) emits the
-        //    operand verbatim (no redundant mask);
-        //  * signed target (u8 -> i16) sign-extends via $signed.
+        //  * widening unsigned of a known-width parameter (u8 -> u32) zero-extends
+        //    explicitly (no redundant mask), so the enclosing expression is sized
+        //    to the target (#12296): `(a as u64) + (b as u64)` must not wrap at 32;
+        //  * signed target (u8 -> i16) zero-extends, then reads as signed.
         let src = r#"module CastWidth {
     pub fn narrow(x: u32) -> u8 {
         return x as u8
@@ -40824,6 +40816,12 @@ mod tests_hir_pipeline_parity {
     }
     pub fn signedcast(x: u8) -> i16 {
         return x as i16
+    }
+    pub fn wrap_gt(a: u32, b: u32, lim: u32) -> bool {
+        return (a as u64) + (b as u64) > (lim as u64)
+    }
+    pub fn sx(a: i32) -> i64 {
+        return a as i64
     }
 }"#;
         let v = Compiler::compile_verilog(src).unwrap();
@@ -40835,16 +40833,18 @@ mod tests_hir_pipeline_parity {
         );
         // widening a u8 parameter to u32 needs no mask
         assert!(
-            v.contains("widen = x;"),
-            "widening u8->u32 should emit operand verbatim, got:\n{}",
+            v.contains("widen = {{24{1'b0}}, x};"),
+            "widening u8->u32 should zero-extend explicitly, got:\n{}",
             v
         );
-        // signed target sign-extends
+        // signed target reads the zero-extended operand as signed
         assert!(
-            v.contains("signedcast = $signed(x);"),
+            v.contains("signedcast = $signed({{8{1'b0}}, x});"),
             "signed cast u8->i16 should use $signed, got:\n{}",
             v
         );
+        assert!(v.contains("{{32{1'b0}}, a} + {{32{1'b0}}, b}"), "{}", v);
+        assert!(v.contains("{{32{($signed(a) < 0)}}, a}"), "{}", v);
         assert!(
             v.contains("function signed [15:0] signedcast;"),
             "i16 return should declare a signed 16-bit function, got:\n{}",
@@ -41076,8 +41076,8 @@ mod tests_compiler_rejects {
 }"#,
         );
         assert!(
-            v.contains("ok = x;"),
-            "valid widening cast must still lower to the operand, got:\n{}",
+            v.contains("ok = {{24{1'b0}}, x};"),
+            "valid widening cast must still lower to the zero-extended operand, got:\n{}",
             v
         );
         assert!(
