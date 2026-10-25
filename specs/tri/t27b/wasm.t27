@@ -3611,3 +3611,413 @@ test whole_module_with_memory_and_data_pins_every_byte {
     assert m[52] == 0x00 and m[53] == 0x41 and m[54] == 0x00;
     assert m[55] == 0x0B and m[56] == 0x01 and m[57] == 0x2A;
 }
+
+// -- Floors 12-16 (the STATEFUL floor, #12148): the plan, the questions, and --
+// -- the landed law. One floor per commit, tests first, each green.           --
+
+// THE GAP (#12148's finding): floors 1-11 lower only stateless pure fns -- a
+// body that is one constant, one postfix expression, or one select. The gx_
+// exports of specs/t27f/live_graph_export.t27 need what those floors refuse:
+// a module MEMORY with DATA segments carrying the constant tables, mutable
+// module STATE (the staged graph rows), LOCALS in lowered bodies, LOOPS for
+// gx_replay's walk, and internal CALLS for the law's own helpers.
+//
+// RECONCILED 2026-10-25 (branch lane/wasm-stateful, rebased): master's #12152
+// landed this lane's floor-12 SECTION law under its own names -- pages_for,
+// memtype (limits min+max, flags 0x01), data_segment_active, memory_section,
+// data_section. This branch first wrote parallel bodies (pages_for_bytes,
+// mem_limits_min with the min-only form, data_entry); they are DROPPED here,
+// and what this branch keeps is what master lacks: the memory EXPORT entry
+// (kind 0x02), the stateful export body, the stateful composer
+// compose_module_mem, and floor 13 in full. The composer carries the min+max
+// limits form through master's memtype; the min-only form this branch first
+// pinned is gone with its law.
+//
+// THE FLOOR PLAN (each floor its own commit, tests first):
+//   Floor 12: MEMORY + DATA SEGMENTS -- master's #12152 law plus this
+//             branch's memory export and compose_module_mem.
+//   Floor 13: GLOBALS/STATE -- the global section (id 6): global_type
+//             (valtype + mutability), global_entry (init expr), wide state
+//             as MEMORY-BACKED SLOTS (i32.load/i32.store memargs), narrow
+//             live scalars as globals (global.get/set).
+//   Floor 14: LOCALS -- the existing REF_LOCAL_VARIABLE refusal path becomes
+//             lowering: local groups in code entries (code_entry already
+//             carries locals_n), local.get/set/tee beyond the parameter
+//             window.
+//   Floor 15: LOOPS -- loop/br/br_if lowering for gx_replay's walk (floor 6
+//             has the opcodes as byte emitters; this floor lowers IR shapes
+//             to them).
+//   Floor 16: CALLS -- internal call lowering for the law's own helpers
+//             (floor 6 has call's opcode; this floor maps fn refs to
+//             function indices in the walk).
+//
+// THE INVARIANT (the A/B/A acceptance): the 117-byte trio composes
+// byte-identical through every one of these floors -- a stateless module
+// carries no memory, no data, no globals, so the trio's bytes cannot move.
+// The gx_ smoke test rides ON TOP of the floors, never under them.
+//
+// QUESTION 1 (ANSWERED, floor 12): the active single-memory form 0x00 0x41
+// offset 0x0B is the ONLY form claimed; passive segments are not.
+// QUESTION 2 (ANSWERED, floor 13): wasm globals are single-valued; the
+// staged graph rows are wide. State lives in MEMORY-BACKED SLOTS (fixed
+// offsets reached by i32.load/i32.store); globals carry only the narrow
+// live scalars (the staged event count, the replay cursor).
+// QUESTION 3 (open, floor 14): the fact table's payload nodes carry var_idx
+// for parameters only (0..nparams-1); locals need indices above that window.
+// The plan: the adapter assigns local indices nparams.. and the walk stays
+// index-agnostic (var_idx passes through). If the adapter cannot, the fix is
+// a new node field, not a walk change.
+//
+// QUESTION 4 (open, floors 14-16): the remaining floors live in the WALK,
+// not in the byte law -- floor 14 must relax floor 8's REF_LOCAL_VARIABLE
+// refusal (refused_local_variable reads var_idx against nparams) and carry
+// each fn's local count on FACT_ROW's reserved word 11; floor 15 lowers
+// While to loop/br_if through the payload nodes; floor 16 maps call sites
+// to function indices the fact table does not carry today. All three are
+// spec-side and lawful. The EMITTER MOUNT is the part that needed the
+// owner's owner-approved-foreign label (granted 2026-10-25 for this lane):
+// t27b's adapter must flatten the new IR shapes into the fact table.
+
+// -- Floor 12, the stateful remainder (master's #12152 carries the section --
+// -- law): the memory EXPORT entry and the stateful composer. The page must --
+// -- READ the memory, so the memory is exported beside the fns; and a       --
+// -- module with memory composes through compose_module_mem, which inserts  --
+// -- the memory section after the function section and the data section    --
+// -- after the code section (wasm requires section ids ascending: 1 type,  --
+// -- 3 func, 5 memory, 6 global, 7 export, 10 code, 11 data). The          --
+// -- stateless compose_module is NOT TOUCHED: the 117-byte trio keeps its  --
+// -- bytes by construction, and floor 7's capstone keeps proving it.       --
+
+/// Export kinds: a function entry (floor 4's export_entry writes this) and a
+/// memory entry (the stateful module's one exported window).
+pub const EXPORT_KIND_FUNC : u8 = 0x00;
+pub const EXPORT_KIND_MEM : u8 = 0x02;
+
+/// One export entry of any kind: the uleb name length, the name bytes, the
+/// kind byte, the uleb index -- export_entry's shape with the kind general
+/// (floor 4's fn entry writes kind 0x00; the memory export writes 0x02).
+pub fn export_entry_kind(out: []u8, at: usize, name: []const u8, kind: u8, index: u32) -> usize {
+    var n : usize = uleb(out, at, name.len as u64);
+    var i : usize = 0;
+    while (i < name.len) {
+        out[n] = name[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    out[n] = kind;
+    return uleb(out, n + 1, index as u64);
+}
+
+/// The stateful export body: every fn under its name at its index, then the
+/// ONE memory at index 0 under mem_name -- k + 1 entries, the memory last.
+pub fn export_body_mem(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8, mem_name: []const u8) -> usize {
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    var n : usize = vec_prefix(out, 0, (k + 1) as u32);
+    var i : usize = 0;
+    while (i < k) {
+        var a : usize = desc_name_off(descs, i) as usize;
+        var b : usize = a + desc_name_len(descs, i) as usize;
+        n = export_entry_kind(out, n, names[a..b], EXPORT_KIND_FUNC, i as u32);
+        i = i + 1;
+    }
+    return export_entry_kind(out, n, mem_name, EXPORT_KIND_MEM, 0);
+}
+
+/// The stateful composer: compose_module's five sections with the memory
+/// section (min+max limits, ONE memory) inserted after the function section,
+/// the memory exported beside the fns, the global section between memory and
+/// export, and the data section framed after the code section -- section ids
+/// stay ascending (1, 3, 5, 6, 7, 10, 11). Fails closed (writes nothing,
+/// returns 0) on: no fns, min_pages 0 (the stateless path owns that module),
+/// min > max or max past the 65536-page ceiling (no legal memory type
+/// carries it), or joined bytes whose count says zero. data_joined and
+/// globals_joined live in the CALLER'S area, never the scratch, which the
+/// composer reuses per section.
+pub fn compose_module_mem(out: []u8, names: []const u8, descs: []const u8, bodies: []const u8, min_pages: u32, max_pages: u32, mem_name: []const u8, globals_count: u32, globals_joined: []const u8, data_count: u32, data_joined: []const u8, scratch: []u8) -> usize {
+    if (!descs_ok(names, descs, bodies)) { return 0; }
+    var k : usize = desc_count(descs);
+    if (k == 0) { return 0; }
+    if (min_pages == 0) { return 0; }
+    if (min_pages > max_pages) { return 0; }
+    if (max_pages as u64 > MEM_PAGES_MAX) { return 0; }
+    if (data_count == 0 and data_joined.len != 0) { return 0; }
+    if (globals_count == 0 and globals_joined.len != 0) { return 0; }
+    var n : usize = module_preamble(out, 0);
+    var sn : usize = type_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_TYPE, scratch[0..sn]);
+    sn = func_body(scratch, names, descs, bodies);
+    n = section(out, n, SEC_FUNC, scratch[0..sn]);
+    sn = memtype(scratch, 0, min_pages as u64, max_pages as u64);
+    n = memory_section(out, n, 1, scratch[0..sn]);
+    if (globals_count != 0) {
+        sn = global_body(scratch, 0, globals_count, globals_joined);
+        n = section(out, n, SEC_GLOBAL, scratch[0..sn]);
+    }
+    sn = export_body_mem(scratch, names, descs, bodies, mem_name);
+    n = section(out, n, SEC_EXPORT, scratch[0..sn]);
+    sn = code_entries(scratch, names, descs, bodies);
+    n = code_section(out, n, k as u32, scratch[0..sn]);
+    if (data_count != 0) {
+        n = data_section(out, n, data_count, data_joined);
+    }
+    return n;
+}
+
+test export_entry_kind_pins_the_memory_export {
+    var b : [16]u8 = undefined;
+    // "mem", kind memory 0x02, index 0: 03 6D 65 6D 02 00
+    var n : usize = export_entry_kind(b[0..16], 0, "mem", EXPORT_KIND_MEM, 0);
+    assert n == 6;
+    assert b[0] == 0x03 and b[1] == 'm' and b[2] == 'e' and b[3] == 'm';
+    assert b[4] == 0x02 and b[5] == 0x00;
+    // kind func 0x00 writes exactly floor 4's export_entry bytes: same shape
+    // in a separate buffer, compared byte against byte
+    var c : [8]u8 = undefined;
+    var e : [8]u8 = undefined;
+    var m : usize = export_entry_kind(c[0..8], 0, "mem", EXPORT_KIND_FUNC, 0);
+    assert m == 6 and c[4] == 0x00 and c[5] == 0x00;
+    m = export_entry(e[0..8], 0, "mem", 0);
+    assert m == 6;
+    var j : usize = 0;
+    while (j < 6) {
+        assert c[j] == e[j];
+        j = j + 1;
+    }
+}
+
+test compose_module_mem_pins_the_stateful_leaf {
+    // `pub fn answer() -> u32 { return 42; }` beside one page of memory
+    // (min 1, max 1) carrying "abc" at offset 4, the memory exported as
+    // "mem" -- 62 bytes, every section boundary pinned. Section ids stay
+    // ascending: 1 type, 3 func, 5 memory, 7 export, 10 code, 11 data.
+    // The memory section is master's #12152 shape: 05 04 01 01 01 01 --
+    // vector 1, limits flags 0x01, min 1, max 1.
+    var names : [6]u8 = undefined;
+    var nn : usize = put_bytes(names[0..6], 0, "answer");
+    assert nn == 6;
+    var bodies : [3]u8 = undefined;
+    bodies[0] = 0x41; bodies[1] = 0x2A; bodies[2] = 0x0B;
+    var d : [24]u8 = undefined;
+    var w : usize = desc_put(d[0..24], 0, 0, 6, 0, VT_I32, 0, 3);
+    assert w == 24;
+    // the data segment lives in its OWN area, never the compose scratch
+    var dj : [16]u8 = undefined;
+    var djl : usize = data_segment_active(dj[0..16], 0, 4, "abc");
+    assert djl == 8;
+    var out : [80]u8 = undefined;
+    var scratch : [64]u8 = undefined;
+    const n : usize = compose_module_mem(out[0..80], names[0..6], d[0..24], bodies[0..3], 1, 1, "mem", 0, dj[0..0], 1, dj[0..djl], scratch[0..64]);
+    assert n == 62;
+    // the six section ids at their boundaries
+    assert out[8] == SEC_TYPE and out[15] == SEC_FUNC and out[19] == SEC_MEMORY;
+    assert out[25] == SEC_EXPORT and out[43] == SEC_CODE and out[51] == SEC_DATA;
+    // the memory section: 05 04 01 01 01 01 -- vec 1, flags 0x01, min 1, max 1
+    assert out[20] == 0x04 and out[21] == 0x01 and out[22] == 0x01;
+    assert out[23] == 0x01 and out[24] == 0x01;
+    // the export body: TWO entries -- answer (kind func, index 0) then mem
+    assert out[26] == 0x10 and out[27] == 0x02;
+    assert out[28] == 0x06 and out[29] == 'a' and out[35] == EXPORT_KIND_FUNC and out[36] == 0x00;
+    assert out[37] == 0x03 and out[38] == 'm' and out[39] == 'e' and out[40] == 'm';
+    assert out[41] == EXPORT_KIND_MEM and out[42] == 0x00;
+    // the code entry: body 6, vec 1, size 4, locals 0, i32.const 42, end
+    assert out[44] == 0x06 and out[45] == 0x01 and out[46] == 0x04 and out[47] == 0x00;
+    assert out[48] == 0x41 and out[49] == 0x2A and out[50] == 0x0B;
+    // the data section: body 9, vec 1, segment 00 41 04 0B 03 "abc"
+    assert out[52] == 0x09 and out[53] == 0x01 and out[54] == 0x00 and out[55] == 0x41;
+    assert out[56] == 0x04 and out[57] == 0x0B and out[58] == 0x03 and out[59] == 'a';
+    assert out[60] == 'b' and out[61] == 'c';
+    // THE A/B/A, IN THE SAME TEST: the stateless composer over the SAME
+    // descriptor set is the 39-byte answer module -- the stateful floor did
+    // not move one byte of the stateless path. The stateless export
+    // section lands at 19 (no memory section between func and export);
+    // the stateful one at 25, six bytes later, exactly the memory
+    // section's width.
+    var out2 : [48]u8 = undefined;
+    const n2 : usize = compose_module(out2[0..48], names[0..6], d[0..24], bodies[0..3], scratch[0..64]);
+    assert n2 == 39 and out2[8] == SEC_TYPE and out2[15] == SEC_FUNC;
+    assert out2[19] == SEC_EXPORT;
+}
+
+test compose_module_mem_fails_closed {
+    var names : [6]u8 = undefined;
+    put_bytes(names[0..6], 0, "answer");
+    var bodies : [3]u8 = undefined;
+    bodies[0] = 0x41; bodies[1] = 0x2A; bodies[2] = 0x0B;
+    var d : [24]u8 = undefined;
+    desc_put(d[0..24], 0, 0, 6, 0, VT_I32, 0, 3);
+    var dj : [16]u8 = undefined;
+    var djl : usize = data_segment_active(dj[0..16], 0, 4, "abc");
+    var out : [80]u8 = undefined;
+    var scratch : [64]u8 = undefined;
+    // zero pages: the stateless module owns that path
+    assert compose_module_mem(out[0..80], names[0..6], d[0..24], bodies[0..3], 0, 1, "mem", 0, dj[0..0], 1, dj[0..djl], scratch[0..64]) == 0;
+    // min past max, and max past the 65536-page ceiling: no legal memory type
+    assert compose_module_mem(out[0..80], names[0..6], d[0..24], bodies[0..3], 2, 1, "mem", 0, dj[0..0], 1, dj[0..djl], scratch[0..64]) == 0;
+    assert compose_module_mem(out[0..80], names[0..6], d[0..24], bodies[0..3], 1, 65537, "mem", 0, dj[0..0], 1, dj[0..djl], scratch[0..64]) == 0;
+    // off-law descriptors: a name run past the names blob
+    var bad : [24]u8 = undefined;
+    desc_put(bad[0..24], 0, 0, 7, 0, VT_I32, 0, 3);
+    assert compose_module_mem(out[0..80], names[0..6], bad[0..24], bodies[0..3], 1, 1, "mem", 0, dj[0..0], 1, dj[0..djl], scratch[0..64]) == 0;
+    // data bytes with no data count
+    assert compose_module_mem(out[0..80], names[0..6], d[0..24], bodies[0..3], 1, 1, "mem", 0, dj[0..0], 0, dj[0..djl], scratch[0..64]) == 0;
+    // data_count 0 with NO bytes is the legal memory-only module: 51 bytes,
+    // six sections become five, the last is the code section
+    const n : usize = compose_module_mem(out[0..80], names[0..6], d[0..24], bodies[0..3], 1, 1, "mem", 0, dj[0..0], 0, dj[0..0], scratch[0..64]);
+    assert n == 51 and out[43] == SEC_CODE and out[50] == 0x0B;
+}
+
+// -- Floor 13: GLOBALS + MEMORY-BACKED STATE (#12148 stateful floor 2 of 5). --
+// -- The staged module state crosses in two shapes: NARROW live scalars as  --
+// -- wasm globals (the global section, id 6, between memory and export),   --
+// -- and WIDE state (the staged graph rows, the name table's rows) as      --
+// -- MEMORY-BACKED SLOTS -- fixed offsets in the floor-12 memory reached   --
+// -- by i32.load 0x28 / i32.store 0x36 with a memarg. QUESTION 2's answer  --
+// -- measured against live_graph_export.t27: the card's regions (NAME_OFF, --
+// -- LOG_OFF) are ROWS, not scalars, so they are slots; the live triple    --
+// -- (the staged event count, the replay cursor) is the narrow global set. --
+// -- Mutable globals are NOT EXPORTED by this law (the memory is the one   --
+// -- exported window; the MVP's mutable-global export needs a feature this --
+// -- law does not claim).                                                  --
+
+/// The global section id.
+pub const SEC_GLOBAL : u8 = 6;
+
+/// One global's type: the valtype byte through the floor-1 map, then the
+/// mutability byte (0x00 const, 0x01 mutable -- module state is mutable;
+/// a const global is a named constant and this law writes the byte but no
+/// helper reads it). An unknown type name writes nothing.
+pub fn global_type(out: []u8, at: usize, ty: []const u8, mutable: bool) -> usize {
+    var vt : u8 = valtype_byte(ty);
+    if (vt == 0) { return at; }
+    out[at] = vt;
+    if (mutable) {
+        out[at + 1] = 0x01;
+    } else {
+        out[at + 1] = 0x00;
+    }
+    return at + 2;
+}
+
+/// One global entry: its type, then its init expression, end. This floor
+/// initializes an i32 global from an i32 constant only (i64/f32/f64 pass
+/// through const_insn's map -- the same crossing the M-A leaf uses).
+pub fn global_entry_i32(out: []u8, at: usize, init: i32, mutable: bool) -> usize {
+    var n : usize = global_type(out, at, "i32", mutable);
+    if (n == at) { return at; }
+    n = i32_const(out, n, init);
+    return end(out, n);
+}
+
+/// The global-section body over PRE-JOINED entries (the caller's area, like
+/// the data entries): vec_prefix(count), then the bytes verbatim.
+pub fn global_body(out: []u8, at: usize, count: u32, entries_joined: []const u8) -> usize {
+    if (count == 0) { return at; }
+    var n : usize = vec_prefix(out, at, count);
+    var i : usize = 0;
+    while (i < entries_joined.len) {
+        out[n] = entries_joined[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// i32.load: the opcode 0x28, then the memarg -- the uleb alignment
+/// (the log2 of the byte width; 2 for a four-byte slot) and the uleb static
+/// offset (the slot's fixed address in the floor-12 memory).
+pub fn i32_load(out: []u8, at: usize, align: u32, offset: u32) -> usize {
+    out[at] = 0x28;
+    var n : usize = uleb(out, at + 1, align as u64);
+    return uleb(out, n, offset as u64);
+}
+
+/// i32.store: the opcode 0x36, then the memarg. The value is on the stack
+/// under the address -- the emitter's business, not this fn's.
+pub fn i32_store(out: []u8, at: usize, align: u32, offset: u32) -> usize {
+    out[at] = 0x36;
+    var n : usize = uleb(out, at + 1, align as u64);
+    return uleb(out, n, offset as u64);
+}
+
+/// global.get: the opcode 0x23, then the uleb global index.
+pub fn global_get(out: []u8, at: usize, idx: u32) -> usize {
+    out[at] = 0x23;
+    return uleb(out, at + 1, idx as u64);
+}
+
+/// global.set: the opcode 0x24, then the uleb global index.
+pub fn global_set(out: []u8, at: usize, idx: u32) -> usize {
+    out[at] = 0x24;
+    return uleb(out, at + 1, idx as u64);
+}
+
+test global_section_pins_type_entry_and_body {
+    var b : [8]u8 = undefined;
+    // the type: i32 mutable 7F 01, i32 const 7F 00, unknown name refuses
+    assert global_type(b[0..8], 0, "i32", true) == 2 and b[0] == 0x7F and b[1] == 0x01;
+    assert global_type(b[0..8], 0, "i32", false) == 2 and b[1] == 0x00;
+    assert global_type(b[0..8], 0, "nope", true) == 0;
+    // one entry: type 7F 01, i32.const 7, end -- five bytes
+    var n : usize = global_entry_i32(b[0..8], 0, 7, true);
+    assert n == 5 and b[2] == 0x41 and b[3] == 0x07 and b[4] == 0x0B;
+    // a negative init crosses signed: sleb(-64) is one byte 0x40
+    n = global_entry_i32(b[0..8], 0, -64, true);
+    assert n == 5 and b[3] == 0x40;
+    // the body over two pre-joined entries: vec 2, then the bytes verbatim
+    var j : [10]u8 = undefined;
+    var jl : usize = global_entry_i32(j[0..10], 0, 7, true);
+    jl = global_entry_i32(j[0..10], jl, 0, true);
+    assert jl == 10;
+    var bb : [16]u8 = undefined;
+    var bn : usize = global_body(bb[0..16], 0, 2, j[0..jl]);
+    assert bn == 11 and bb[0] == 0x02 and bb[1] == 0x7F and bb[10] == 0x0B;
+    assert global_body(bb[0..16], 0, 0, j[0..jl]) == 0;
+}
+
+test memory_and_global_instructions_pin_the_opcodes {
+    var b : [8]u8 = undefined;
+    // i32.load, natural alignment 2, slot at 0x1C (28, the kind column's
+    // byte in the layout plane's row): 28 02 1C
+    assert i32_load(b[0..8], 0, 2, 28) == 3 and b[0] == 0x28 and b[1] == 0x02 and b[2] == 0x1C;
+    // a wide offset crosses as a three-byte uleb: 143692 -> CC E2 08
+    var n : usize = i32_load(b[0..8], 0, 2, 143692);
+    assert n == 5 and b[1] == 0x02 and b[2] == 0xCC and b[3] == 0xE2 and b[4] == 0x08;
+    // i32.store, alignment 2, offset 0: 36 02 00
+    assert i32_store(b[0..8], 0, 2, 0) == 3 and b[0] == 0x36 and b[1] == 0x02 and b[2] == 0x00;
+    // global.get 0: 23 00; global.set 1: 24 01
+    assert global_get(b[0..8], 0, 0) == 2 and b[0] == 0x23 and b[1] == 0x00;
+    assert global_set(b[0..8], 0, 1) == 2 and b[0] == 0x24 and b[1] == 0x01;
+}
+
+test compose_module_mem_carries_the_global_section {
+    // The 62-byte stateful leaf with ONE mutable i32 global initialized to
+    // 7 spliced in: the global section (id 6) sits between memory (5) and
+    // export (7), six body bytes framed to eight -- 70 bytes in all.
+    var names : [6]u8 = undefined;
+    put_bytes(names[0..6], 0, "answer");
+    var bodies : [3]u8 = undefined;
+    bodies[0] = 0x41; bodies[1] = 0x2A; bodies[2] = 0x0B;
+    var d : [24]u8 = undefined;
+    desc_put(d[0..24], 0, 0, 6, 0, VT_I32, 0, 3);
+    var gj : [8]u8 = undefined;
+    var gl : usize = global_entry_i32(gj[0..8], 0, 7, true);
+    assert gl == 5;
+    var dj : [16]u8 = undefined;
+    var djl : usize = data_segment_active(dj[0..16], 0, 4, "abc");
+    var out : [96]u8 = undefined;
+    var scratch : [64]u8 = undefined;
+    const n : usize = compose_module_mem(out[0..96], names[0..6], d[0..24], bodies[0..3], 1, 1, "mem", 1, gj[0..gl], 1, dj[0..djl], scratch[0..64]);
+    assert n == 70;
+    // the section order is ascending: type 8, func 15, memory 19, GLOBAL 25,
+    // export 33, code 51, data 59
+    assert out[8] == SEC_TYPE and out[15] == SEC_FUNC and out[19] == SEC_MEMORY;
+    assert out[25] == SEC_GLOBAL and out[33] == SEC_EXPORT and out[51] == SEC_CODE and out[59] == SEC_DATA;
+    // the global body: vec 1, type 7F 01 (i32 mutable), i32.const 7, end
+    assert out[26] == 0x06 and out[27] == 0x01 and out[28] == 0x7F and out[29] == 0x01;
+    assert out[30] == 0x41 and out[31] == 0x07 and out[32] == 0x0B;
+    // the memory export entry: kind 0x02 at 49, index 0 at 50
+    assert out[49] == EXPORT_KIND_MEM and out[50] == 0x00;
+    // globals bytes with no count refuse: the count is the truth, not the len
+    assert compose_module_mem(out[0..96], names[0..6], d[0..24], bodies[0..3], 1, 1, "mem", 0, gj[0..gl], 0, dj[0..0], scratch[0..64]) == 0;
+}
