@@ -4,8 +4,8 @@ Issue #12229, part of epic #10486 (weak spots of the analog v0.1 release). The f
 groups A and B and the accepted file; groups C, D, E and the dead lines were left to the second issue #12230, whose
 lane (branch `lane/analog-mut-sqq-cde-12230`) added three tests, decided the dead lines, and extended this note and
 the accepted file; its parts are marked "12230" below. The analog loop ran the mutation gate on the tree of the first
-lane (it passed, see "After" below) and re-saved the seal; the tree of 12230 has had neither (see "Not done"). Where
-each number comes from:
+lane (it passed, see "After" below) and re-saved the seal; the tree of 12230 has had both since (the gate passed on
+it, see "After, tree of 12230" below, and the seal was re-saved). Where each number comes from:
 
 - **Before** (336 mutants, 266 killed, 40 survived, 17 hung, 13 unviable) is the analog-loop census of the unmodified
   spec, 10:25-10:39 +07, exit 0, 14 min 13 s, `tri mutate spec` 3 mutants at a time with zig `-j2` each, t27c 0.5.2
@@ -21,6 +21,14 @@ each number comes from:
   accepted by the file; 0 accepted line(s) now killed" and "Gate passed", exit 0. The 28 survivors are exactly the
   lines the table below marks equivalent (17), test gap of groups C, D, E (7, pending then, killed by 12230) or dead line (4); none of the lines of groups A and
   B (530, 533, 549, 555, 561, 562, 564) is among them. The forecast written before the run was the same four numbers.
+- **After, tree of 12230** (measured): the same 336 mutants, gate on the lane tree at 9129e6e5ce (the spec and the
+  accepted file are byte-identical to the merged tree; master was merged afterwards and changes neither). Run: `tri
+  mutate spec --file specs/analog/sar_comparator_q.t27 --accepted docs/analog/mutation-accepted-sar_comparator_q.txt
+  --jobs 2 --timeout 45` with the master-built compiler, in a T27 OS pane, 20:42:30-21:02:23 +07 (19 min 53 s), 1-min
+  load 14.3 at the start. The gate printed "38 not killed (21 survived, 17 hung), 38 accepted by
+  docs/analog/mutation-accepted-sar_comparator_q.txt; 0 accepted line(s) now killed" and "Gate passed", exit 0: the
+  forecast of 38 / 21 / 17 held exactly. A first run of this gate (`--jobs 3`, started 20:28) was stopped at about
+  mutant 190 by the kill rule when another session's seal sweep took the 1-min load to 71.7, so it gave no result.
 - **Tests, tree of 12229**: `tri test specs/analog/sar_comparator_q.t27` with the old 0.5.2 binary in a T27 OS
   pane, last run 11:46 +07 (after the final comment edit; the 11:41 run before it read the same): 12 tests (8 before), 12 pass, 0 fail, **0 vacuous passes of 12**, exit 0.
   The same t27c prints the same version text as the census's ("t27c 0.5.2", "build 0 commit unknown"); whether the build
@@ -160,7 +168,7 @@ relation and bit asserts) were followed by the final run at 19:44:48-19:44:59.
 
 ### The 7 mutants, run by hand
 
-Not the mutation gate (`tri mutate spec` was not run on this tree): one edit of the mutated line in the lane's spec,
+Not the mutation gate (these hand runs came before the gate run of "After, tree of 12230"): one edit of the mutated line in the lane's spec,
 `tri test` as above in a T27 OS pane, then the spec restored from the final copy (checked byte-equal afterwards). Each
 run takes 7 to 9 s.
 
@@ -183,8 +191,8 @@ the 38 mutants that the gate should see as not killed on the tree of 12230 (17 e
 The file of 12229 had 41 entries (15 equivalent, 9 pending, 17 hung; 45 mutants); 12230 removed the 7 pending entries
 of the test gaps (307, 311, 314, 315, 348, 351, 369), which the new tests kill (a killed mutant behind an entry would
 make the gate exit 2 as a stale line), and turned the 2 entries of the dead lines (164, 388) from pending into "dead but
-kept" with their reasons. No "pending" remains in the file. The forecast for the gate on the tree of 12230 is "38 not
-killed (21 survived, 17 hung), 38 accepted by the file; 0 accepted line(s) now killed", which is a forecast and not a run.
+kept" with their reasons. No "pending" remains in the file. The gate on the tree of 12230 printed "38 not killed (21
+survived, 17 hung), 38 accepted by the file; 0 accepted line(s) now killed" (measured, see "After, tree of 12230").
 The file differs from the issue's "58 entries (17 equivalent, 11 pending, 17 hung, 13 unviable)" in two ways, both
 because of how `tri mutate spec --accepted` reads the file (`cli/tri/src/mutate.rs`, `gate_counts`;
 `specs/tri/mutate/survivors.t27`):
@@ -196,7 +204,7 @@ because of how `tri mutate spec --accepted` reads the file (`cli/tri/src/mutate.
   nowhere by the gate, so they are comment lines with a one-line reason, as in the accepted file of
   `sar_comparator_qi` (whose gate run passed with the same arrangement). The gate run on the tree of 12229 passed with
   the file of 12229 (41 entries), which has the same arrangement, so it holds for this spec too; the file of 12230
-  has not been through the gate.
+  has been through the gate and passed.
 
 ## Not done, not claimed
 
@@ -204,11 +212,11 @@ because of how `tri mutate spec --accepted` reads the file (`cli/tri/src/mutate.
   against the assert; what the gate shows is that the 12 mutants of groups A and B are no longer among the survivors
   (40 survivors before, 28 after, and none of the 12 lines is listed).
 - The seal of `AnalogSarComparatorQ` was re-saved by the loop with the master-built compiler after the branch of 12229
-  was brought up to master. 12230 appended 114 lines to the spec and did **not** save the seal, so the seal is stale on
-  this tree until the loop re-saves it; `tri coverage --strict` was not run locally, CI runs it.
-- The mutation gate was not run on the tree of 12230. What is shown for its 7 test-gap mutants is the `tri test` run of
-  the tree (15 of 15 pass, 0 vacuous) and four hand runs that each turned the mutated line(s) red; the gate's figure
-  (forecast above: 38 not killed, 38 accepted) is for the loop to measure.
+  was brought up to master, and again on the tree of 12230 after master was merged into the lane (`t27c seal --save`,
+  then `--verify` exit 0, and `tri seals changed` CHECKED); `tri coverage --strict` was not run locally, CI runs it.
+- The mutation gate on the tree of 12230 passed (above). For its 7 test-gap mutants the evidence is the gate (they are
+  no longer among the survivors), the `tri test` run of the tree (15 of 15 pass, 0 vacuous) and four hand runs that
+  each turned the mutated line(s) red.
 - The census was not repeated with the master-built compiler on the unmodified spec (FR-001); the before-counts are the
   census's, the after-counts are the gate's.
 - The 17 equivalent survivors are classified by reading the arithmetic and the helpers (`sc_pack(0, .)` is 0,
