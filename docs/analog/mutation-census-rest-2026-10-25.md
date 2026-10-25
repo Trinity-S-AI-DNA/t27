@@ -1,4 +1,4 @@
-# Mutation census of the remaining analog specs, 2026-10-25 (17 of 17 specs measured; gate numbers recorded here for 9)
+# Mutation census of the remaining analog specs, 2026-10-25 (17 of 17 specs measured; gate numbers recorded here for 10)
 
 Issue #12116, part of epic #10486 (weak spots of the analog v0.1 release). The tool, `tri mutate spec`, never edits
 the spec, and the checkout stayed clean during the runs. All 17 specs now have a measured run and are written up
@@ -8,10 +8,10 @@ mos_psp103 (the order of the old "not measured" list; the run order was sar_swit
 sar_comparator, mos_psp103, sar_kick_net). linear and linear_zoh were first measured on a tree that the later audit
 #12191 changed, so section 10 gives their re-run on master after the audit, and raw_writer (section 9) was
 measured on a tree that master has not changed. Gate numbers (the survivor gate of the follow-up pull request) are
-recorded in this note for 9 of the 17 specs: vacask_compare, mos_psp103_gates, mos_psp103_inv20 and
-sar_comparator_qi (section 17), and sar_switch, mos_table, accept_sar, sar_kick_net and mos_psp103 (sections 11 to
-14 and 16; the sar_kick_net gate ended with exit 2, nine gaps deferred). The gate of sar_comparator is running and
-has no numbers yet. sar_trace_raw and bench have no test gap, so no gate. The other five (sar_logic,
+recorded in this note for 10 of the 17 specs: vacask_compare, mos_psp103_gates, mos_psp103_inv20 and
+sar_comparator_qi (section 17), and sar_switch, mos_table, accept_sar, sar_kick_net, sar_comparator and mos_psp103
+(sections 11 to 16; the sar_kick_net gate exited 0 on the final 68-entry accepted file, the nine deferred gaps killed).
+The sar_comparator gate exited 0 on the final 118-entry accepted file (714 killed of 868, section 15). sar_trace_raw and bench have no test gap, so no gate. The other five (sar_logic,
 sar_comparator_q, raw_writer, linear, linear_zoh) have merged gate pull requests whose numbers this note does not
 record (section 17). Where each number comes from:
 
@@ -386,15 +386,21 @@ three groups (A 33, B 9, C 1), 4 dead line (709 twice, 710 twice), 0 not decided
 two judgement calls: if the swap block is read as dead, the split is 18 dead line and 19 in group A; if 709, 710 and
 689 are group C, it is 0 dead line, 31 equivalent and 6 in group C.
 
-Follow-up: #12460 (open) and #12494 (open, the nine deferred gaps that need lab values), PR #12496 (open; its title
-says the gate measured 624 of 727 killed, nine deferred). Gate, from the branch note `docs/analog/mutation-sar_kick_net-2026-10-25.md`
-on `origin/lane/analog-mut-sar_kick_net-12460` (not on master yet): 22:48:31-23:36:06 +07 (47 min 35 s), `--jobs 2
+Follow-up: #12460 and #12494 (the nine gaps that needed lab values), PR #12531 (merged, squash `6f5a75d036`). Gate, from the note `docs/analog/mutation-sar_kick_net-2026-10-25.md` on master, three runs. First run: 22:48:31-23:36:06 +07 (47 min 35 s), `--jobs 2
 --timeout 45`, load 26 at the start, head `0022752f05`, clean tree, **exit 2**: 727 mutants, 624 killed (624 by a
 failing test, 0 at compile time), 48 survived, 40 hung, 15 unviable; 88 not killed, 79 accepted and matched, 0 accepted
 lines now killed, 9 not accepted. Against the census: killed +33, survived -34, hung +1 (line 770 `k = k`, predicted).
-30 tests pass; the accepted file has 77 entry lines. The nine deferred: 618, 1047, 1054 (`+`), 1055 (`+`), 1062, 1203,
-1343, 1469 (twice). Line 1343 is not written; the other eight need a lab value first. The gate **with the nine
-deferred entries added was not re-run**: that it would exit 0 is inferred, not measured.
+30 tests pass before that run. The nine not accepted are the nine deferred gaps: 618, 1047, 1054 (`+`), 1055 (`+`), 1062,
+1203, 1343, 1469 (twice). Second run (2026-10-26 01:11:22-01:51:11 +07, head `0a308eb7fc`, which holds the six
+lab-value tests of #12494; the accepted file with its 77 entry lines, the 68 plus the nine; load averages 8.91 10.03
+11.34 at the start): 727 mutants, 633 killed (633 by a failing test, 0 at compile time), 39 survived, 40 hung, 15
+unviable; 79 not killed, all 79 accepted, 9 accepted lines now killed, exactly the nine deferred keys, so **exit 2**
+again, which is the gate's signal to delete those lines. The nine entries were deleted, so the accepted file has 68
+entry lines. Confirmation gate on exactly that file (head `e0ea55536a`, 2026-10-26 02:46:41-03:24:46 +07, 38 min 05 s,
+`--jobs 2 --timeout 45`, load averages 6.58 5.77 6.45 at the start): 727 mutants, 633 killed (633 by a failing test, 0 at
+compile time), 39 survived, 40 hung, 15 unviable; 79 not killed, 79 accepted, 0 accepted lines now killed, "Gate
+passed", **exit 0, measured**. Against the census the final state is killed +42, survived -43, hung +1; the 39 survivors
+are the 35 equivalent and the 4 dead-line mutants. The seal run after the second run printed 36 of 36 tests pass.
 
 ## 15. sar_comparator.t27 (868 mutants)
 
@@ -415,13 +421,18 @@ Operator classes of the 868: drop-guard 32, flip-cmp 171, swap-logic 7, drop-ste
 Classification of the 98 survivors, by reading and nothing run (comment 6398028597): 42 equivalent, 55 test gap in
 fifteen groups (A to O), 0 dead line, 1 not decided (522); 42 + 55 + 0 + 1 = 98.
 
-Follow-up: #12432 (open). No pull request is open for it yet (a `gh pr list` on the branch answers empty). Gate:
-**gate running**, no numbers. The branch note `docs/analog/mutation-sar_comparator-2026-10-25.md` on
-`origin/lane/analog-mut-sar_comparator-12432` (not on master yet) says the gate was not run on its tree: 33 tests (20
-old, 13 new) pass with 0 vacuous (21:39-21:40 +07, load 27.4), groups A to M are written and their "killed" is a
-reading, and groups N (1396, 1397, 1404), O (1291, 1322 twice) and line 522 need lab figures. Its accepted file lists
-79 hung entries, one more than the census's 78: line 914 (drop-step) is predicted to turn hung once the group A test
-runs the swap branch, which is a prediction and not a measurement.
+Follow-up: #12432 (open) and #12512, PR #12540 (merged). Gate, from the note
+`docs/analog/mutation-sar_comparator-2026-10-25.md` on master and the header of
+`docs/analog/mutation-accepted-sar_comparator.txt`: the gate was run three times, `--jobs 2 --timeout 45`; run 1 (exit 2,
+the seven deferred mutants not yet accepted) is in that note and not repeated here. Run 2 (49 min 19 s, with the five
+lab-value tests of #12512 in the spec and the six deferred entries still in the accepted file): 868 mutants, 712
+killed, 42 survived, 79 hung, 35 unviable, **exit 2**, because exactly the six deferred keys were now killed; the two
+extra unviable (line 699, swap-arith twice) were zig cache errors, not emitter refusals (#12539). The six entries were removed
+(124 -> 118 entry lines: 39 equivalent entries naming the 42 equivalent survivors, and 79 hung). Confirmation gate on
+exactly the final 118-entry file (2026-10-26 03:29:42 to 04:18:12 +07, 48 min 30 s): 868 mutants, 714 killed, 42
+survived, 79 hung, 33 unviable (the two line-699 mutants are killed in this run); 121 not killed, all 121 accepted, 0
+accepted lines now killed, "Gate passed", **exit 0, measured on the final file**. Against the census the final state is
+killed +55, survived -56, hung +1, unviable unchanged (33).
 
 ## 16. mos_psp103.t27 (359 mutants)
 
@@ -454,7 +465,7 @@ file has 35 entry lines.
 
 ## 17. Where each spec stands
 
-Counts are mutants: killed / survived / hung / unviable. "Census" is the first run: tree `035df5ce60` for the first eleven specs except linear and linear_zoh, whose census cell is the re-run on master `1c783b0b31` after the audit (section 10), and the master tree named in sections 11 to 16 for the six later specs. "Gate" is the survivor gate of the pull request for the follow-up issue: for vacask_compare, mos_psp103_gates, mos_psp103_inv20 and sar_comparator_qi it ran on the lane rebased on master `1c783b0b31`; for the five gate rows of sections 11 to 16 it ran on the lane tree named there.
+Counts are mutants: killed / survived / hung / unviable. "Census" is the first run: tree `035df5ce60` for the first eleven specs except linear and linear_zoh, whose census cell is the re-run on master `1c783b0b31` after the audit (section 10), and the master tree named in sections 11 to 16 for the six later specs. "Gate" is the survivor gate of the pull request for the follow-up issue: for vacask_compare, mos_psp103_gates, mos_psp103_inv20 and sar_comparator_qi it ran on the lane rebased on master `1c783b0b31`; for the six gate rows of sections 11 to 16 it ran on the lane tree named there.
 
 A "later:" clause was added to the rows whose original text said "nothing run" or "no test added", because the pull request of that follow-up has merged since. It gives pull request numbers and title words, not gate numbers: this note does not carry them.
 
@@ -474,15 +485,15 @@ A "later:" clause was added to the rows whose original text said "nothing run" o
 | sar_switch | 306 / 53 / 33 / 8 of 400 (section 11) | #12287 (PR #12349) | 14 equivalent, 39 test gap in six groups, 0 dead line; gate: 349 / 10 / 33 / 8, the 10 left are 6 equivalent, 3 with no witness found, 1 dead on the stimuli tried |
 | mos_table | 493 / 115 / 20 / 4 of 632 (section 12) | #12317 (PR #12401) | 25 equivalent, 89 test gap in eleven groups, 1 dead line; gate: 583 / 25 / 20 / 4, 45 accepted |
 | accept_sar | 218 / 58 / 4 / 1 of 281 (section 13) | #12431 (PR #12482) | 34 equivalent, 23 test gap in nine groups, 1 dead line; gate: 241 / 35 / 4 / 1, 39 accepted |
-| sar_kick_net | 591 / 82 / 39 / 15 of 727 (section 14) | #12460, #12494 (PR #12496, open) | 35 equivalent, 43 test gap in three groups, 4 dead line; gate: 624 / 48 / 40 / 15, exit 2, nine gaps deferred (#12494); gate with the deferred entries not re-run |
-| sar_comparator | 659 / 98 / 78 / 33 of 868 (section 15) | #12432 | 42 equivalent, 55 test gap in fifteen groups, 1 not decided; no pull request yet; gate running |
+| sar_kick_net | 591 / 82 / 39 / 15 of 727 (section 14) | #12460, #12494 (PR #12531) | 35 equivalent, 43 test gap in three groups, 4 dead line; gate: 633 / 39 / 40 / 15, exit 0, 79 accepted mutants in 68 entry lines; the 43 test gaps are addressed (42 killed, 1 turned into a hang, line 770), the nine lab-value ones in the second run (#12494) |
+| sar_comparator | 659 / 98 / 78 / 33 of 868 (section 15) | #12432, #12512 (PR #12540) | 42 equivalent, 55 test gap in fifteen groups, 1 not decided; gate: 714 / 42 / 79 / 33, exit 0, 121 accepted mutants in 118 entry lines |
 | mos_psp103 | 264 / 72 / 18 / 5 of 359 (section 16) | #12434 (PR #12468) | 22 equivalent, 50 test gap in three groups at census time; gate: 306 / 30 / 18 / 5, 42 test gaps killed, 30 equivalent left |
 
 mos_psp103_inv20, in words: of the 23 survivors, 9 are killed by the five added tests and 14 are accepted (13 equivalent mutants in 12 entries, plus line 176). Line 173, which the first draft of the note had accepted as equivalent, is killed by the exact-mirror test, so its accepted entry was removed; the first gate run exited 2 on that stale entry and the second run (11:13-11:16 +07) passed. The forecast written before the run was 80 / 15 / 5 / 1.
 
 ## 18. What is not claimed
 
-- **What is still not claimed after the six later runs.** The gate result of sar_comparator: the gate is running, and its branch note records no gate run (its "killed" for groups A to M is a reading; groups N, O and line 522 need lab figures). An exit 0 for the sar_kick_net gate: the measured gate exited 2, nine gaps are deferred in #12494, and the gate with their entries added was not re-run. The compiler version of five of the six later runs (not recorded). The gate numbers of the five specs whose merged gate pull requests section 17 names only by number (sar_logic, sar_comparator_q, raw_writer, linear, linear_zoh).
+- **What is still not claimed after the six later runs.** Which new test killed which mutant of sar_kick_net: the 33 + 1 kills of its first run are totals, and the nine of the second run are measured per key, but their mapping to the six lab-value tests is the commit's own, backed by a hand check on scratch copies, not a gate output. The compiler version of five of the six later runs (not recorded). The gate numbers of the five specs whose merged gate pull requests section 17 names only by number (sar_logic, sar_comparator_q, raw_writer, linear, linear_zoh).
 - **linear and linear_zoh were measured twice.** The first runs were on the census base `035df5ce60`; `bf66e458aa` (#12191, 151 asserts on constant table elements now count) changed both specs afterwards, so section 10 uses the re-runs on master `1c783b0b31`. The same commit changed vacask_compare, mos_psp103_gates, mos_table, sar_comparator, sar_kick_net, sar_switch and mos_psp103, and `7fefa30eaa` (#12153) changed sar_kick. Sections 3 and 5 are therefore the pre-audit counts of vacask_compare and mos_psp103_gates; the gate rows of section 17 are the current ones. The six specs of sections 11 to 16 were run on master trees that already contain `bf66e458aa` (checked with `git merge-base --is-ancestor` for `f81a02f36a`, `36c8d6a54f` and `89a747eefc`), so their counts are post-audit. The re-runs found the same survivors as the first runs (61 and 30), so the classes are the first runs' classes, read a second time; the only counts that moved are the killed and the hung of linear_zoh (193 to 195 and 29 to 27, section 10), and why they moved is not established.
 - **raw_writer was measured on an unchanged tree** (a `git diff` of its path between the census base and master is empty) and is written up in section 9. Its test-gap groups H and I need a value from the lab, and group J is inferred: it rests on the premise that the tests run in a build that traps on an out-of-range index, an underflow and a divide by zero, which nothing here confirms.
 - The specs this note classifies on the census base (sar_logic, sar_trace_raw, bench, mos_psp103_inv20, sar_comparator_qi, sar_comparator_q, raw_writer) are byte-identical between the census base and master (checked with `git diff --quiet` on these paths) except two: master has since gained only added lines in mos_psp103_inv20 (150, #12207) and in sar_comparator_qi (99, #12205), the tests of the follow-up issues. The survivor lines in sections 6 and 7 are the census's, and the gate rows of section 17 are the current state.
