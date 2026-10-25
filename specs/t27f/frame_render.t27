@@ -1,0 +1,1564 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/frame_render.t27 -- the M6 render harness: the display list, rastered. The pure
+// rasterizer between export_video.t27's hash record and the MP4 the Railway lab encodes; issue
+// gHashTag/t27#10265, epic gHashTag/t27#10266. Design: docs/nona-02-organism/t27f/genui-research.md,
+// section 5.5.
+//
+// WHY A RASTERIZER AT ALL. M6's gate is per-frame hash equality between the export record and a
+// browser replay, and those hashes are of op streams, not pixels -- so the MP4 pipeline has needed,
+// until now, a renderer that turns the very same stream into the frames ffmpeg encodes. This card is
+// that renderer, and it renders THE display list: frame_bytes takes its op bytes from
+// export_video::frame_stream, the one function the browser loader executes, so no second flattener
+// exists (FR-001 of export_video carries over unchanged).
+//
+// WHAT IS RENDERED, EXACTLY. fill_rect, alpha, and the container scope the stream can express:
+// DL_RECT (the four consecutive records x, y, w, h), DL_FILL and DL_OPACITY (style state), DL_GROUP
+// / DL_GROUP_END (save/restore of a translate origin; the group record carries exactly one integer,
+// its x, and children compose it additively), DL_END (terminal). Everything else on the stream is
+// REFUSED with a named code before the first pixel moves -- DL_TEXT (see THE TEXT below: the
+// encoding carries no string, so the stream path cannot render it honestly), DL_PATH, DL_IMAGE,
+// DL_FACE, DL_CLIP_PUSH and DL_CLIP_POP (clip_frame), DL_STROKE (a stroked outline is not claimed),
+// and any opcode outside display_list's vocabulary. The refusal is decided by a dry pass over the
+// whole stream first, so a refused frame writes NOTHING: refused, never half-painted, the
+// discipline display_list applies to its own budget. The law names what is not yet rendered -- that
+// is honesty, not a gap to hide.
+//
+// THE TEXT (VERSION 2). Text renders OFF the stream, through draw_text: display_list emits a text
+// node as four DL_TEXT records carrying only the node's x, y, w, h (payload_len(DL_TEXT) == 4, and
+// scene.t27 gives a node no text-valued field), so NO string rides the op stream and there is
+// nothing there to raster -- the stream path keeps refusing DL_TEXT with E_UNSUPPORTED, and the
+// caller who holds the string calls draw_text directly. The font is a built-in 5x7 bitmap for the
+// printable ASCII subset 32..126: 95 glyphs in FONT, one byte per row, bit 4 the leftmost pixel,
+// 7 rows a glyph. The glyph shapes are the classic public-domain 5x7 GLCD font set, transposed from
+// its column-per-byte form to these rows; the transposition is pinned by test against that column
+// table, kept beside FONT, and six glyphs a consumer will check first -- A, B, 0, 1, space, period
+// -- are pinned bit-exactly in row form as well. draw_text paints 1:1 (one font pixel is one frame
+// pixel), monospace at a 6-pixel advance (5 glyph columns plus 1 blank), composes with translate by
+// the caller passing the already-translated origin, and blends through the same blend_q8 rule the
+// rects use. bg < 0 paints no background (only set pixels move); bg >= 0 paints the 5x7 cell behind
+// the glyph too. A char outside 32..126 renders as the space glyph -- named, tested, never a
+// refusal.
+//
+// WHY TRANSLATE AND NO SCALE. A display-list group record carries exactly one integer payload (the
+// group node's x; display_list.t27 emits nothing else for a container). That integer is the
+// translate this harness applies. A scale has no carrier in the op stream, so there is nothing to
+// implement exactly -- inventing a payload meaning would fork the sha-pinned encoding that HUD_SHA256
+// pins. Scale is the next increment and it begins in display_list.t27, not here.
+//
+// WHY PPM. ffmpeg consumes P6 byte sequences directly, so the mp4 pipeline needs no PNG and this
+// card writes none: ppm_write_into lays down the P6 header ("P6\n", "<w> <h>\n", "255\n") followed by
+// the RGB rows, 3*w*h bytes, nothing else. The lab loops frame_bytes over the schedule -- one PPM
+// per frame -- and hands the sequence to ffmpeg; the invocation itself stays lab plumbing
+// (ENCODER_HOST's side of the wall, FR-003 of export_video).
+//
+// THE FIXTURE THIS RENDERS. export_video's fixture_scene pins the OP-STREAM record: its card is
+// zero pixels tall by construction (only F_X and F_W are ever set on it) and it carries text and
+// face nodes this harness refuses. So frame_bytes renders the PIXEL projection of the same
+// schedule: the same 900-frame length, the same three animated quantities under the same motion law
+// -- card x (3k+7) mod 240, card width 60 + (k div 30) mod 40, opacity pulse 128 + k mod 128 --
+// mapped onto the caller's raster. A test holds the honesty of that split: export_video's own
+// fixture stream is refused here, by code, with the buffer untouched.
+//
+// DETERMINISM. The same (preset, raster, frame) gives byte-identical PPM bytes every run: tests
+// render frames twice and compare the full byte arrays and their sha256 (the work_graph digest
+// discipline -- equality across independent runs, not a golden file to drift), and frame 0 vs
+// frame 450 differ, because the scene animates.
+//
+// NOT CLAIMED: stroked outlines, path, image and clip rendering (refused, by code, named); TEXT on
+// the op-stream path (refused: the encoding carries no string; the integration is limited to what
+// display_list's encoding carries, and this card does not fork the HUD_SHA256-pinned encoding to
+// change that); text scale (1:1 only), rotation, proportional widths, anti-aliasing, the other 5x7
+// font variants, glyphs beyond the printable ASCII subset (they render as the space glyph), UTF-8
+// and its multibyte sequences; scale in the op stream (no carrier in the encoding; a
+// display_list.t27 change); PNG; the ffmpeg invocation and the MP4 itself; a rendered frame at the
+// full preset raster inside this repo's tests (the tests render small rasters -- the buffer belongs
+// to the caller, and 6220800 bytes belongs to the lab; the preset-size arithmetic is pinned by
+// ppm_len instead); antialiasing (edges are hard); alpha on the background clear (the clear is
+// opaque R_BG); a raster over the export pixel count (refused, not scaled); any claim that a lab
+// run has happened -- LAB_RUN_DONE of export_video is still false and this card does not flip it.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module frame_render;
+
+use t27f::scene::Scene;
+use t27f::scene::Op;
+use t27f::scene::scene_empty;
+use t27f::scene::apply_op;
+use t27f::scene::validate_scene;
+use t27f::scene::SCENE_OK;
+use t27f::scene::Q8;
+use t27f::scene::STYLE_KINDS;
+use t27f::scene::NO_PARENT;
+use t27f::scene::F_X;
+use t27f::scene::F_Y;
+use t27f::scene::F_W;
+use t27f::scene::F_H;
+use t27f::scene::F_FILL;
+use t27f::scene::F_OPACITY;
+use t27f::scene::PRIM_GROUP;
+use t27f::scene::PRIM_RECT;
+use t27f::scene::OP_ADD;
+use t27f::scene::OP_SET;
+use t27f::display_list::Stream;
+use t27f::display_list::stream_empty;
+use t27f::display_list::payload_len;
+use t27f::display_list::DL_END;
+use t27f::display_list::DL_GROUP;
+use t27f::display_list::DL_GROUP_END;
+use t27f::display_list::DL_RECT;
+use t27f::display_list::DL_TEXT;
+use t27f::display_list::DL_PATH;
+use t27f::display_list::DL_IMAGE;
+use t27f::display_list::DL_FACE;
+use t27f::display_list::DL_CLIP_PUSH;
+use t27f::display_list::DL_CLIP_POP;
+use t27f::display_list::DL_FILL;
+use t27f::display_list::DL_STROKE;
+use t27f::display_list::DL_OPACITY;
+use t27f::display_list::DL_KINDS;
+use t27f::export_video::MAX_EXPORT_FRAMES;
+use t27f::export_video::PRESET_LANDSCAPE;
+use t27f::export_video::PRESET_PORTRAIT;
+use t27f::export_video::PRESET_KINDS;
+use t27f::export_video::preset_ok;
+use t27f::export_video::preset_width;
+use t27f::export_video::preset_height;
+use t27f::export_video::frame_stream;
+use t27f::export_video::fixture_scene;
+use t27f::scene_raster::fmod;
+use t27f::scene_raster::imax;
+use t27f::scene_raster::red;
+use t27f::scene_raster::green;
+use t27f::scene_raster::blue;
+use t27os::editors::same_bytes;
+use tri::crypto::sha256;
+
+pub const ID : str = "frame-render";
+/// 1 was the rect/alpha/group raster that merged as #11816; 2 adds the off-stream text draw.
+pub const VERSION : u8 = 2;
+
+// ---- the raster --------------------------------------------------------------------------------------
+
+/// Both presets paint this many pixels (1920 x 1080 == 1080 x 1920); the buffer belongs to the
+/// caller, so nothing here allocates one.
+pub const FRAME_PIXELS : u32 = 2073600;
+pub const FRAME_RGB_LEN : u32 = 3 * FRAME_PIXELS;
+
+/// display_list flattens containers with an open[32] stack; the raster side mirrors that bound.
+pub const GROUP_STACK_MAX : u32 = 32;
+
+/// The clear colour every frame_bytes starts from, and the colour of a rect before any DL_FILL
+/// record arrives. Colours are 0xRRGGBB in an i32, as scene_raster.t27 states.
+pub const R_BG : i32 = 0x101418;
+pub const R_DEFAULT_FILL : i32 = 0xC8C8C8;
+
+/// Token id -> RGB, indexed by the style token the display list carries (0..STYLE_KINDS). The
+/// display list names a token, not a colour; this table is the harness's one mapping, pinned by
+/// test so a change moves loudly.
+pub const PALETTE : [5]i32 = [0x3A6EA5, 0xC8C8C8, 0x50FA7B, 0xC8A032, 0x903838];
+
+// ---- what the functions answer -----------------------------------------------------------------------
+
+pub const FRAME_OK : u8 = 0;
+pub const E_PRESET : u8 = 1;               // the preset is not one of the two export sizes
+pub const E_RANGE : u8 = 2;                // a frame outside the schedule, or a buffer too small
+pub const E_BUDGET : u8 = 3;               // display_list refused the flatten (its frame budget)
+pub const E_UNSUPPORTED : u8 = 4;          // the stream carries an op this harness does not render
+pub const E_TRUNC : u8 = 5;                // the stream ends mid-record or mid-rect
+pub const E_DEPTH : u8 = 6;                // group stack overflow, an unbalanced open or close
+pub const E_VALUE : u8 = 7;                // a payload outside its legal range
+pub const RESULT_NAMES : [8]str = ["ok", "preset", "range", "budget", "unsupported", "trunc", "depth", "value"];
+
+fn raster_ok(w: u32, h: u32) -> bool {
+    if (w == 0 or h == 0) { return false; }
+    if (w > 4096 or h > 4096) { return false; }
+    return w * h <= FRAME_PIXELS;
+}
+
+// ---- bytes --------------------------------------------------------------------------------------------
+
+/// The little-endian payload decode: the exact inverse of display_list's division-and-remainder
+/// emit, walking the four bytes back to front so no factor overflows.
+fn decode4(b: []const u8, at: usize) -> u32 {
+    var v : u32 = 0;
+    var k : usize = 4;
+    while (k > 0) {
+        k = k - 1;
+        v = v * 256 + (b[at + k] as u32);
+    }
+    return v;
+}
+
+// ---- the PPM writer -----------------------------------------------------------------------------------
+
+pub fn digits10(v: u32) -> u32 {
+    if (v < 10) { return 1; }
+    var n : u32 = 0;
+    var x = v;
+    while (x > 0) {
+        n = n + 1;
+        x = @divTrunc(x, 10);
+    }
+    return n;
+}
+
+/// "P6\n<w> <h>\n255\n": 3 bytes, the width, a space, the height, a newline, and "255\n".
+pub fn ppm_header_len(w: u32, h: u32) -> u32 {
+    return 3 + digits10(w) + 1 + digits10(h) + 1 + 4;
+}
+
+/// The whole file's size: header plus 3*w*h RGB bytes. Both presets: 17 + 6220800. A raster this
+/// card refuses answers 0 -- no bytes, not a wrong number.
+pub fn ppm_len(w: u32, h: u32) -> u32 {
+    if (!raster_ok(w, h)) { return 0; }
+    return ppm_header_len(w, h) + 3 * w * h;
+}
+
+fn write_dec(dst: []u8, at: usize, v: u32) -> usize {
+    const n = digits10(v);
+    var x = v;
+    var i : usize = n as usize;
+    while (i > 0) {
+        dst[at + i - 1] = ((x - @divTrunc(x, 10) * 10) as u8) + 48;
+        x = @divTrunc(x, 10);
+        i = i - 1;
+    }
+    return at + (n as usize);
+}
+
+/// Lay the P6 header down at dst[0..]. FRAME_OK, or E_RANGE for a refused raster or a short dst.
+pub fn ppm_header_into(dst: []u8, w: u32, h: u32) -> u8 {
+    if (!raster_ok(w, h)) { return E_RANGE; }
+    const need = ppm_header_len(w, h);
+    if ((dst.len as u32) < need) { return E_RANGE; }
+    dst[0] = 80;                           // 'P'
+    dst[1] = 54;                           // '6'
+    dst[2] = 10;                           // '\n'
+    var at : usize = write_dec(dst, 3, w);
+    dst[at] = 32;                          // ' '
+    at = at + 1;
+    at = write_dec(dst, at, h);
+    dst[at] = 10;                          // '\n'
+    at = at + 1;
+    dst[at] = 50;                          // '2'
+    dst[at + 1] = 53;                      // '5'
+    dst[at + 2] = 53;                      // '5'
+    dst[at + 3] = 10;                      // '\n'
+    return FRAME_OK;
+}
+
+/// The whole PPM: header, then the RGB rows verbatim. ffmpeg consumes the result directly.
+pub fn ppm_write_into(dst: []u8, rgb: []const u8, w: u32, h: u32) -> u8 {
+    if (!raster_ok(w, h)) { return E_RANGE; }
+    const need = 3 * w * h;
+    const total = ppm_len(w, h);
+    if (rgb.len < (need as usize)) { return E_RANGE; }
+    if ((dst.len as u32) < total) { return E_RANGE; }
+    const hr = ppm_header_into(dst, w, h);
+    if (hr != FRAME_OK) { return hr; }
+    const hl = ppm_header_len(w, h) as usize;
+    var j : u32 = 0;
+    while (j < need) {
+        dst[hl + (j as usize)] = rgb[j as usize];
+        j = j + 1;
+    }
+    return FRAME_OK;
+}
+
+// ---- the rasterizer -----------------------------------------------------------------------------------
+
+/// The dry pass: walk every record and refuse the first thing this harness does not render, before
+/// any byte of the buffer can move. st.ops is display_list's budget counter and means nothing here;
+/// the rasterizer reads st.n and st.bytes only. Since VERSION 2 this pass still refuses DL_TEXT:
+/// its four records carry only the node's x, y, w, h -- display_list's encoding has no string
+/// carrier, and scene.t27 gives a node no text-valued field -- so text reaches pixels through
+/// draw_text, with the string the caller holds, never through this walk.
+pub fn validate_stream(st: *Stream) -> u8 {
+    var i : u32 = 0;
+    var rect_phase : u32 = 0;
+    var depth : u32 = 0;
+    while (i < st.n) {
+        const op = st.bytes[i as usize];
+        if (op >= DL_KINDS) { return E_UNSUPPORTED; }
+        const pl = payload_len(op) as u32;
+        if (i + 1 + pl > st.n) { return E_TRUNC; }
+        // DL_TEXT stays refused here (see THE TEXT in the header): no string rides the stream.
+        if (op == DL_TEXT or op == DL_PATH or op == DL_IMAGE or op == DL_FACE or op == DL_CLIP_PUSH or op == DL_CLIP_POP or op == DL_STROKE) {
+            return E_UNSUPPORTED;
+        }
+        if (op == DL_OPACITY) {
+            if (decode4(st.bytes[0..st.n], (i + 1) as usize) > (Q8 as u32)) { return E_VALUE; }
+        }
+        if (op == DL_FILL) {
+            if ((st.bytes[(i + 1) as usize] as u32) >= (STYLE_KINDS as u32)) { return E_VALUE; }
+        }
+        if (op == DL_GROUP) {
+            if (decode4(st.bytes[0..st.n], (i + 1) as usize) >= 2147483648) { return E_VALUE; }
+            depth = depth + 1;
+            if (depth > GROUP_STACK_MAX) { return E_DEPTH; }
+        }
+        if (op == DL_GROUP_END) {
+            if (depth == 0) { return E_DEPTH; }
+            depth = depth - 1;
+        }
+        if (op == DL_RECT) {
+            if (decode4(st.bytes[0..st.n], (i + 1) as usize) >= 2147483648) { return E_VALUE; }
+            rect_phase = rect_phase + 1;
+            if (rect_phase == 4) { rect_phase = 0; }
+        }
+        if (op == DL_END) {
+            if (rect_phase != 0) { return E_TRUNC; }
+            if (depth != 0) { return E_DEPTH; }
+            return FRAME_OK;
+        }
+        i = i + 1 + pl;
+    }
+    if (rect_phase != 0) { return E_TRUNC; }
+    if (depth != 0) { return E_DEPTH; }
+    return FRAME_OK;
+}
+
+/// One channel of the Q8 alpha rule, pinned by test: (fg*a + dst*(Q8-a)) div Q8, floored.
+fn blend_q8(dst: i32, fg: i32, a: i32) -> i32 {
+    return @divTrunc(fg * a + dst * (Q8 - a), Q8);
+}
+
+/// fill_rect with alpha, clipped to the raster: rows ys..ye, columns xs..xe, one blend per channel.
+/// A rect reaching past the raster is clipped, not refused -- that is what fill_rect means.
+fn fill_rect(rgb: []u8, w: u32, h: u32, x0: i32, y0: i32, rw: u32, rh: u32, color: i32, alpha: i32) -> void {
+    if (rw == 0 or rh == 0) { return; }
+    if (alpha == 0) { return; }
+    if (x0 < 0 or y0 < 0) { return; }
+    if ((x0 as i64) >= (w as i64) or (y0 as i64) >= (h as i64)) { return; }
+    var xs : i64 = x0 as i64;
+    var ys : i64 = y0 as i64;
+    var xe : i64 = xs + (rw as i64);
+    var ye : i64 = ys + (rh as i64);
+    if (xe > (w as i64)) { xe = w as i64; }
+    if (ye > (h as i64)) { ye = h as i64; }
+    const fr = red(color);
+    const fgc = green(color);
+    const fb = blue(color);
+    var yy : u32 = ys as u32;
+    while ((yy as i64) < ye) {
+        var xx : u32 = xs as u32;
+        while ((xx as i64) < xe) {
+            const p : usize = ((yy * w + xx) * 3) as usize;
+            rgb[p] = blend_q8(rgb[p] as i32, fr, alpha) as u8;
+            rgb[p + 1] = blend_q8(rgb[p + 1] as i32, fgc, alpha) as u8;
+            rgb[p + 2] = blend_q8(rgb[p + 2] as i32, fb, alpha) as u8;
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+}
+
+/// The paint pass. Runs only after validate_stream answered FRAME_OK, so every record here is one
+/// this harness renders: rect, fill, opacity, group, end -- nothing else can reach this walk.
+fn paint_stream(rgb: []u8, w: u32, h: u32, st: *Stream) -> u8 {
+    var fill = R_DEFAULT_FILL;
+    var alpha = Q8;
+    var ox : [33]i32 = undefined;
+    var oy : [33]i32 = undefined;
+    ox[0] = 0;
+    oy[0] = 0;
+    var depth : u32 = 0;
+    var rx : u32 = 0;
+    var ry : u32 = 0;
+    var rw : u32 = 0;
+    var rh : u32 = 0;
+    var rect_phase : u32 = 0;
+    var i : u32 = 0;
+    while (i < st.n) {
+        const op = st.bytes[i as usize];
+        const pl = payload_len(op) as u32;
+        if (op == DL_END) { return FRAME_OK; }
+        if (op == DL_OPACITY) { alpha = (decode4(st.bytes[0..st.n], (i + 1) as usize)) as i32; }
+        if (op == DL_FILL) { fill = PALETTE[st.bytes[(i + 1) as usize] as usize]; }
+        if (op == DL_GROUP) {
+            depth = depth + 1;
+            ox[depth as usize] = ox[(depth - 1) as usize] + (decode4(st.bytes[0..st.n], (i + 1) as usize) as i32);
+            oy[depth as usize] = oy[(depth - 1) as usize];
+        }
+        if (op == DL_GROUP_END) { depth = depth - 1; }
+        if (op == DL_RECT) {
+            const v = decode4(st.bytes[0..st.n], (i + 1) as usize);
+            if (rect_phase == 0) { rx = v; }
+            if (rect_phase == 1) { ry = v; }
+            if (rect_phase == 2) { rw = v; }
+            if (rect_phase == 3) {
+                rh = v;
+                fill_rect(rgb, w, h, ox[depth as usize] + (rx as i32), oy[depth as usize] + (ry as i32), rw, rh, fill, alpha);
+            }
+            rect_phase = rect_phase + 1;
+            if (rect_phase == 4) { rect_phase = 0; }
+        }
+        i = i + 1 + pl;
+    }
+    return FRAME_OK;
+}
+
+/// Clear the raster to R_BG. The clear is opaque by definition: alpha belongs to the ops.
+pub fn clear_rgb(rgb: []u8, w: u32, h: u32) -> u8 {
+    if (!raster_ok(w, h)) { return E_RANGE; }
+    const need = 3 * w * h;
+    if (rgb.len < (need as usize)) { return E_RANGE; }
+    const r = red(R_BG) as u8;
+    const g = green(R_BG) as u8;
+    const b = blue(R_BG) as u8;
+    var p : u32 = 0;
+    while (p < w * h) {
+        rgb[(p * 3) as usize] = r;
+        rgb[(p * 3 + 1) as usize] = g;
+        rgb[(p * 3 + 2) as usize] = b;
+        p = p + 1;
+    }
+    return FRAME_OK;
+}
+
+/// Render one display list into an RGB buffer the caller owns. The whole stream is validated
+/// first, so a refused frame leaves the buffer byte-identical to what the caller passed in.
+pub fn render_stream_into(rgb: []u8, w: u32, h: u32, st: *Stream) -> u8 {
+    if (!raster_ok(w, h)) { return E_RANGE; }
+    const need = 3 * w * h;
+    if (rgb.len < (need as usize)) { return E_RANGE; }
+    const v = validate_stream(st);
+    if (v != FRAME_OK) { return v; }
+    return paint_stream(rgb, w, h, st);
+}
+
+// ---- the 5x7 font and its draw ------------------------------------------------------------------------
+
+/// The built-in font: the printable ASCII subset 32..126, one glyph per code. 95 glyphs, 7 rows a
+/// glyph, 5 pixels a row; the bytes run top to bottom, bit 4 is the leftmost pixel of a row, bits
+/// 3..0 walk right. The shapes are the classic public-domain 5x7 GLCD font set, transposed from its
+/// column-per-byte source table to these rows; the source table is kept beside this one (CLASSIC_
+/// COLS, below) and a test re-derives every row from it, so a transposition slip cannot ship. A, B,
+/// 0, 1, space and period are pinned bit-exactly in row form too, and every row byte is < 32 for
+/// the whole table, so an error cannot hide in a high bit.
+pub const FONT : [95][7]u8 = [
+    [0, 0, 0, 0, 0, 0, 0],          // 32 space
+    [4, 4, 4, 4, 4, 0, 4],          // 33 !
+    [10, 10, 10, 0, 0, 0, 0],       // 34 "
+    [10, 10, 31, 10, 31, 10, 10],   // 35 #
+    [4, 15, 20, 14, 5, 30, 4],      // 36 $
+    [24, 25, 2, 4, 8, 19, 3],       // 37 %
+    [12, 18, 20, 8, 21, 18, 13],    // 38 &
+    [12, 4, 8, 0, 0, 0, 0],         // 39 '
+    [2, 4, 8, 8, 8, 4, 2],          // 40 (
+    [8, 4, 2, 2, 2, 4, 8],          // 41 )
+    [0, 10, 4, 31, 4, 10, 0],       // 42 *
+    [0, 4, 4, 31, 4, 4, 0],         // 43 +
+    [0, 0, 0, 0, 12, 4, 8],         // 44 ,
+    [0, 0, 0, 31, 0, 0, 0],         // 45 -
+    [0, 0, 0, 0, 0, 12, 12],        // 46 .
+    [0, 1, 2, 4, 8, 16, 0],         // 47 /
+    [14, 17, 19, 21, 25, 17, 14],   // 48 0
+    [4, 12, 4, 4, 4, 4, 14],        // 49 1
+    [14, 17, 1, 2, 4, 8, 31],       // 50 2
+    [31, 2, 4, 2, 1, 17, 14],       // 51 3
+    [2, 6, 10, 18, 31, 2, 2],       // 52 4
+    [31, 16, 30, 1, 1, 17, 14],     // 53 5
+    [6, 8, 16, 30, 17, 17, 14],     // 54 6
+    [31, 1, 2, 4, 8, 8, 8],         // 55 7
+    [14, 17, 17, 14, 17, 17, 14],   // 56 8
+    [14, 17, 17, 15, 1, 2, 12],     // 57 9
+    [0, 12, 12, 0, 12, 12, 0],      // 58 :
+    [0, 12, 12, 0, 12, 4, 8],       // 59 ;
+    [1, 2, 4, 8, 4, 2, 1],          // 60 <
+    [0, 0, 31, 0, 31, 0, 0],        // 61 =
+    [16, 8, 4, 2, 4, 8, 16],        // 62 >
+    [14, 17, 1, 2, 4, 0, 4],        // 63 ?
+    [14, 17, 1, 13, 21, 21, 14],    // 64 @
+    [14, 17, 17, 17, 31, 17, 17],   // 65 A
+    [30, 17, 17, 30, 17, 17, 30],   // 66 B
+    [14, 17, 16, 16, 16, 17, 14],   // 67 C
+    [28, 18, 17, 17, 17, 18, 28],   // 68 D
+    [31, 16, 16, 30, 16, 16, 31],   // 69 E
+    [31, 16, 16, 30, 16, 16, 16],   // 70 F
+    [14, 17, 16, 16, 19, 17, 14],   // 71 G
+    [17, 17, 17, 31, 17, 17, 17],   // 72 H
+    [14, 4, 4, 4, 4, 4, 14],        // 73 I
+    [7, 2, 2, 2, 2, 18, 12],        // 74 J
+    [17, 18, 20, 24, 20, 18, 17],   // 75 K
+    [16, 16, 16, 16, 16, 16, 31],   // 76 L
+    [17, 27, 21, 17, 17, 17, 17],   // 77 M
+    [17, 17, 25, 21, 19, 17, 17],   // 78 N
+    [14, 17, 17, 17, 17, 17, 14],   // 79 O
+    [30, 17, 17, 30, 16, 16, 16],   // 80 P
+    [14, 17, 17, 17, 21, 18, 13],   // 81 Q
+    [30, 17, 17, 30, 20, 18, 17],   // 82 R
+    [15, 16, 16, 14, 1, 1, 30],     // 83 S
+    [31, 4, 4, 4, 4, 4, 4],         // 84 T
+    [17, 17, 17, 17, 17, 17, 14],   // 85 U
+    [17, 17, 17, 17, 17, 10, 4],    // 86 V
+    [17, 17, 17, 21, 21, 27, 17],   // 87 W
+    [17, 17, 10, 4, 10, 17, 17],    // 88 X
+    [17, 17, 10, 4, 4, 4, 4],       // 89 Y
+    [31, 1, 2, 4, 8, 16, 31],       // 90 Z
+    [7, 4, 4, 4, 4, 4, 7],          // 91 [
+    [0, 16, 8, 4, 2, 1, 0],         // 92 backslash
+    [28, 4, 4, 4, 4, 4, 28],        // 93 ]
+    [4, 10, 17, 0, 0, 0, 0],        // 94 ^
+    [0, 0, 0, 0, 0, 0, 31],         // 95 _
+    [8, 4, 2, 0, 0, 0, 0],          // 96 `
+    [0, 0, 14, 1, 15, 17, 15],      // 97 a
+    [16, 16, 22, 25, 17, 17, 30],   // 98 b
+    [0, 0, 14, 16, 16, 17, 14],     // 99 c
+    [1, 1, 13, 19, 17, 17, 15],     // 100 d
+    [0, 0, 14, 17, 31, 16, 14],     // 101 e
+    [6, 9, 8, 28, 8, 8, 8],         // 102 f
+    [0, 15, 17, 17, 15, 1, 14],     // 103 g
+    [16, 16, 22, 25, 17, 17, 17],   // 104 h
+    [4, 0, 12, 4, 4, 4, 14],        // 105 i
+    [2, 0, 6, 2, 2, 18, 12],        // 106 j
+    [16, 16, 18, 20, 24, 20, 18],   // 107 k
+    [12, 4, 4, 4, 4, 4, 14],        // 108 l
+    [0, 0, 26, 21, 21, 17, 17],     // 109 m
+    [0, 0, 22, 25, 17, 17, 17],     // 110 n
+    [0, 0, 14, 17, 17, 17, 14],     // 111 o
+    [0, 0, 30, 17, 30, 16, 16],     // 112 p
+    [0, 0, 13, 19, 15, 1, 1],       // 113 q
+    [0, 0, 22, 25, 16, 16, 16],     // 114 r
+    [0, 0, 14, 16, 14, 1, 30],      // 115 s
+    [8, 8, 28, 8, 8, 9, 6],         // 116 t
+    [0, 0, 17, 17, 17, 19, 13],     // 117 u
+    [0, 0, 17, 17, 17, 10, 4],      // 118 v
+    [0, 0, 17, 17, 21, 21, 10],     // 119 w
+    [0, 0, 17, 10, 4, 10, 17],      // 120 x
+    [0, 0, 17, 17, 15, 1, 14],      // 121 y
+    [0, 0, 31, 2, 4, 8, 31],        // 122 z
+    [2, 4, 4, 8, 4, 4, 2],          // 123 {
+    [4, 4, 4, 4, 4, 4, 4],          // 124 |
+    [8, 4, 4, 2, 4, 4, 8],          // 125 }
+    [0, 4, 2, 31, 2, 4, 0],         // 126 ~
+];
+
+pub const FONT_FIRST : u8 = 32;            // the first code with a glyph: space
+pub const FONT_LAST : u8 = 126;            // the last: tilde; outside the pair -> the space glyph
+pub const FONT_W : u32 = 5;                // glyph columns
+pub const FONT_H : u32 = 7;                // glyph rows
+/// The monospace step: the 5 glyph columns plus 1 blank, so adjacent glyphs never share an edge.
+pub const FONT_ADVANCE : u32 = 6;
+/// bg sentinel for draw_text: no background is painted, the destination shows through the gaps.
+pub const TEXT_TRANSPARENT : i32 = 0 - 1;
+
+/// The glyph row-table index of a character code. A code outside 32..126 maps to 0, the space
+/// glyph: unknown text renders as blanks at the right positions -- documented, tested, never a
+/// refusal.
+pub fn glyph_index(c: u8) -> u32 {
+    if (c < FONT_FIRST or c > FONT_LAST) { return 0; }
+    return (c - FONT_FIRST) as u32;
+}
+
+/// The pixel width of a string of n chars drawn by draw_text: the first glyph is FONT_W wide, each
+/// further one adds the FONT_ADVANCE step. The empty string is 0 wide and paints nothing.
+pub fn text_width(chars: u32) -> u32 {
+    if (chars == 0) { return 0; }
+    return FONT_W + (chars - 1) * FONT_ADVANCE;
+}
+
+/// One font pixel onto the raster, clipped: out-of-range pixels drop, in-range ones take one
+/// blend_q8 step per channel -- the same rule fill_rect applies, one pixel at a time.
+fn paint_glyph_pixel(rgb: []u8, w: u32, h: u32, px: i64, py: i64, color: i32, alpha: i32) -> void {
+    if (px < 0 or py < 0) { return; }
+    if (px >= (w as i64) or py >= (h as i64)) { return; }
+    const p : usize = ((py * (w as i64) + px) * 3) as usize;
+    rgb[p] = blend_q8(rgb[p] as i32, red(color), alpha) as u8;
+    rgb[p + 1] = blend_q8(rgb[p + 1] as i32, green(color), alpha) as u8;
+    rgb[p + 2] = blend_q8(rgb[p + 2] as i32, blue(color), alpha) as u8;
+}
+
+/// Draw the string s at (x, y) -- the top-left of the first glyph cell -- 1:1, one font pixel to
+/// one frame pixel. Set pixels paint fg, clear ones paint bg; bg < 0 (TEXT_TRANSPARENT) leaves the
+/// destination showing through the gaps. alpha is the stream's Q8 rule (0..Q8); it blends both
+/// colours through blend_q8, exactly as a rect at the same opacity would take them. Pixels past the
+/// raster clip, they do not refuse. The caller composes translate by passing the already-translated
+/// origin: this draw is off-stream, and no op record carries an origin here. FRAME_OK, E_RANGE for
+/// a refused raster or a short buffer, E_VALUE for an alpha outside 0..Q8. A char outside 32..126
+/// draws as the space glyph; an empty string paints nothing at all.
+pub fn draw_text(rgb: []u8, w: u32, h: u32, x: i32, y: i32, s: []const u8, fg: i32, bg: i32, alpha: i32) -> u8 {
+    if (!raster_ok(w, h)) { return E_RANGE; }
+    if (rgb.len < ((3 * w * h) as usize)) { return E_RANGE; }
+    if (alpha < 0 or alpha > Q8) { return E_VALUE; }
+    if (alpha == 0) { return FRAME_OK; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const g = glyph_index(s[i]);
+        const gx : i64 = (x as i64) + (i as i64) * (FONT_ADVANCE as i64);
+        var r : u32 = 0;
+        while (r < FONT_H) {
+            const bits = FONT[g as usize][r as usize];
+            var c : u32 = 0;
+            while (c < FONT_W) {
+                const on = ((bits as u32) >> (FONT_W - 1 - c)) & 1;
+                if (on == 1) {
+                    paint_glyph_pixel(rgb, w, h, gx + (c as i64), (y as i64) + (r as i64), fg, alpha);
+                } else {
+                    if (bg >= 0) {
+                        paint_glyph_pixel(rgb, w, h, gx + (c as i64), (y as i64) + (r as i64), bg, alpha);
+                    }
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return FRAME_OK;
+}
+
+// ---- the fixture: export_video's schedule, rastered ----------------------------------------------------
+
+/// The pixel projection of export_video's fixture schedule at the caller's raster, frame k: a group
+/// scope, the card (fill token 0, x (3k+7) mod 240 scaled to the raster, width 60 + (k div 30)
+/// mod 40 likewise, y h/8, height h/4) and the pulse band (fill token 2, full width, y h/2, opacity
+/// 128 + k mod 128). Built through scene::apply_op like every scene; flattened through
+/// export_video::frame_stream like every frame.
+pub fn renderable_fixture(w: u32, h: u32, frame: u32) -> Scene {
+    var s = scene_empty();
+    const kk = frame as i32;
+    const cw = w as i32;
+    const ch = h as i32;
+    const add_group = Op{ .op = OP_ADD, .seq = 1, .prim = PRIM_GROUP, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const add_card = Op{ .op = OP_ADD, .seq = 2, .prim = PRIM_RECT, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    const add_pulse = Op{ .op = OP_ADD, .seq = 3, .prim = PRIM_RECT, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    const y_card = Op{ .op = OP_SET, .seq = 4, .prim = 0, .parent = 0, .node = 1, .field = F_Y, .value = @divTrunc(ch, 8) };
+    const h_card = Op{ .op = OP_SET, .seq = 5, .prim = 0, .parent = 0, .node = 1, .field = F_H, .value = imax(@divTrunc(ch, 4), 1) };
+    const x_card = Op{ .op = OP_SET, .seq = 6, .prim = 0, .parent = 0, .node = 1, .field = F_X, .value = @divTrunc(fmod(kk * 3 + 7, 240) * cw, 240) };
+    const w_card = Op{ .op = OP_SET, .seq = 7, .prim = 0, .parent = 0, .node = 1, .field = F_W, .value = imax(@divTrunc((60 + fmod(@divTrunc(kk, 30), 40)) * cw, 240), 1) };
+    const y_pulse = Op{ .op = OP_SET, .seq = 8, .prim = 0, .parent = 0, .node = 2, .field = F_Y, .value = @divTrunc(ch, 2) };
+    const h_pulse = Op{ .op = OP_SET, .seq = 9, .prim = 0, .parent = 0, .node = 2, .field = F_H, .value = imax(@divTrunc(ch, 4), 1) };
+    const x_pulse = Op{ .op = OP_SET, .seq = 10, .prim = 0, .parent = 0, .node = 2, .field = F_X, .value = 0 };
+    const w_pulse = Op{ .op = OP_SET, .seq = 11, .prim = 0, .parent = 0, .node = 2, .field = F_W, .value = cw };
+    const o_pulse = Op{ .op = OP_SET, .seq = 12, .prim = 0, .parent = 0, .node = 2, .field = F_OPACITY, .value = 128 + fmod(kk, 128) };
+    const fill_card = Op{ .op = OP_SET, .seq = 13, .prim = 0, .parent = 0, .node = 1, .field = F_FILL, .value = 0 };
+    const fill_pulse = Op{ .op = OP_SET, .seq = 14, .prim = 0, .parent = 0, .node = 2, .field = F_FILL, .value = 2 };
+    assert(apply_op(&s, add_group) == SCENE_OK);
+    assert(apply_op(&s, add_card) == SCENE_OK);
+    assert(apply_op(&s, add_pulse) == SCENE_OK);
+    assert(apply_op(&s, y_card) == SCENE_OK);
+    assert(apply_op(&s, h_card) == SCENE_OK);
+    assert(apply_op(&s, x_card) == SCENE_OK);
+    assert(apply_op(&s, w_card) == SCENE_OK);
+    assert(apply_op(&s, y_pulse) == SCENE_OK);
+    assert(apply_op(&s, h_pulse) == SCENE_OK);
+    assert(apply_op(&s, x_pulse) == SCENE_OK);
+    assert(apply_op(&s, w_pulse) == SCENE_OK);
+    assert(apply_op(&s, o_pulse) == SCENE_OK);
+    assert(apply_op(&s, fill_card) == SCENE_OK);
+    assert(apply_op(&s, fill_pulse) == SCENE_OK);
+    return s;
+}
+
+/// One frame of the export as PPM bytes in dst: clear, flatten the fixture schedule through the
+/// browser's own frame_stream, raster, write the P6 header. dst needs ppm_len(w, h) bytes. The lab
+/// loops this at (preset_width(p), preset_height(p)) for k in 0..MAX_EXPORT_FRAMES and hands the
+/// files to ffmpeg; t27 has no allocator, so the buffer is always the caller's.
+pub fn frame_bytes(dst: []u8, preset: u8, w: u32, h: u32, frame: u32) -> u8 {
+    if (!preset_ok(preset)) { return E_PRESET; }
+    if (frame >= MAX_EXPORT_FRAMES) { return E_RANGE; }
+    if (!raster_ok(w, h)) { return E_RANGE; }
+    const total = ppm_len(w, h);
+    if ((dst.len as u32) < total) { return E_RANGE; }
+    var sc = renderable_fixture(w, h, frame);
+    if (validate_scene(&sc) != SCENE_OK) { return E_VALUE; }
+    var st = stream_empty();
+    const fr = frame_stream(&sc, &st);
+    if (fr != SCENE_OK) { return E_BUDGET; }
+    const hl = ppm_header_len(w, h);
+    const cleared = clear_rgb(dst[hl..total], w, h);
+    if (cleared != FRAME_OK) { return cleared; }
+    const rr = render_stream_into(dst[hl..total], w, h, &st);
+    if (rr != FRAME_OK) { return rr; }
+    return ppm_header_into(dst, w, h);
+}
+
+// ---- test helpers --------------------------------------------------------------------------------------
+// Hand-built streams for the refusal and alpha tests: display_list::emit is private to its own
+// module, and these write raw records at explicit offsets -- the same encoding, a different writer.
+
+fn put4(st: *Stream, at: u32, v: u32) -> void {
+    var x = v;
+    var k : u32 = 0;
+    while (k < 4) {
+        st.bytes[(at + k) as usize] = (x - @divTrunc(x, 256) * 256) as u8;
+        x = @divTrunc(x, 256);
+        k = k + 1;
+    }
+}
+
+/// Write one opcode plus its payload at at; returns the next offset.
+fn put_op1(st: *Stream, at: u32, op: u8, a: u32) -> u32 {
+    st.bytes[at as usize] = op;
+    const pl = payload_len(op) as u32;
+    if (pl == 4) { put4(st, at + 1, a); }
+    if (pl == 1) { st.bytes[(at + 1) as usize] = a as u8; }
+    return at + 1 + pl;
+}
+
+fn fill_bytes(buf: []u8, v: u8) -> void {
+    var i : usize = 0;
+    while (i < buf.len) {
+        buf[i] = v;
+        i = i + 1;
+    }
+}
+
+fn all_bytes(buf: []u8, v: u8) -> bool {
+    var i : usize = 0;
+    while (i < buf.len) {
+        if (buf[i] != v) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn hex_eq(h: [64]u8, want: []const u8) -> bool {
+    var i : u32 = 0;
+    while (i < 64) {
+        if (h[i as usize] != want[i as usize]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- tests ---------------------------------------------------------------------------------------------
+
+test the_palette_and_the_code_table_are_pinned {
+    assert(ID == "frame-render");
+    assert(VERSION == 2);
+    assert(FRAME_OK == 0);
+    assert(E_PRESET == 1);
+    assert(E_RANGE == 2);
+    assert(E_BUDGET == 3);
+    assert(E_UNSUPPORTED == 4);
+    assert(E_TRUNC == 5);
+    assert(E_DEPTH == 6);
+    assert(E_VALUE == 7);
+    assert(RESULT_NAMES.len == 8);
+    assert(PALETTE.len == 5);
+    assert(STYLE_KINDS == 5);
+    assert(PALETTE[0] == 0x3A6EA5);
+    assert(PALETTE[1] == 0xC8C8C8);
+    assert(PALETTE[2] == 0x50FA7B);
+    assert(PALETTE[3] == 0xC8A032);
+    assert(PALETTE[4] == 0x903838);
+    assert(R_BG != R_DEFAULT_FILL);
+    // the five token colours are pairwise distinct: no two tokens paint alike
+    var distinct : u32 = 0;
+    var a : u32 = 0;
+    while (a < 5) {
+        var b : u32 = a + 1;
+        while (b < 5) {
+            if (PALETTE[a as usize] != PALETTE[b as usize]) { distinct = distinct + 1; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    assert(distinct == 10);
+    // token 2 at full strength lands on every channel of a real render
+    var buf : [48]u8 = undefined;
+    var st = stream_empty();
+    var at : u32 = put_op1(&st, 0, DL_OPACITY, 256);
+    st.bytes[at as usize] = DL_FILL;
+    st.bytes[(at + 1) as usize] = 2;
+    at = at + 2;
+    at = put_op1(&st, at, DL_RECT, 0);
+    at = put_op1(&st, at, DL_RECT, 0);
+    at = put_op1(&st, at, DL_RECT, 4);
+    at = put_op1(&st, at, DL_RECT, 4);
+    st.n = at;
+    assert(render_stream_into(&buf, 4, 4, &st) == FRAME_OK);
+    assert(buf[0] == (red(PALETTE[2]) as u8));
+    assert(buf[1] == (green(PALETTE[2]) as u8));
+    assert(buf[2] == (blue(PALETTE[2]) as u8));
+    assert(buf[47] == (blue(PALETTE[2]) as u8));
+}
+
+test a_2x2_fill_rect_produces_the_exact_ppm {
+    var s = scene_empty();
+    const add = Op{ .op = OP_ADD, .seq = 1, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const sx = Op{ .op = OP_SET, .seq = 2, .prim = 0, .parent = 0, .node = 0, .field = F_X, .value = 1 };
+    const sy = Op{ .op = OP_SET, .seq = 3, .prim = 0, .parent = 0, .node = 0, .field = F_Y, .value = 1 };
+    const sw = Op{ .op = OP_SET, .seq = 4, .prim = 0, .parent = 0, .node = 0, .field = F_W, .value = 2 };
+    const sh = Op{ .op = OP_SET, .seq = 5, .prim = 0, .parent = 0, .node = 0, .field = F_H, .value = 2 };
+    const sf = Op{ .op = OP_SET, .seq = 6, .prim = 0, .parent = 0, .node = 0, .field = F_FILL, .value = 0 };
+    assert(apply_op(&s, add) == SCENE_OK);
+    assert(apply_op(&s, sx) == SCENE_OK);
+    assert(apply_op(&s, sy) == SCENE_OK);
+    assert(apply_op(&s, sw) == SCENE_OK);
+    assert(apply_op(&s, sh) == SCENE_OK);
+    assert(apply_op(&s, sf) == SCENE_OK);
+    var st = stream_empty();
+    assert(frame_stream(&s, &st) == SCENE_OK);
+    var rgb : [48]u8 = undefined;
+    assert(clear_rgb(&rgb, 4, 4) == FRAME_OK);
+    assert(render_stream_into(&rgb, 4, 4, &st) == FRAME_OK);
+    // bisect A: the RGB buffer alone
+    assert(rgb[0] == (red(R_BG) as u8));
+    assert(rgb[(5 * 3) as usize] == (red(PALETTE[0]) as u8));
+    assert(rgb[47] == (blue(R_BG) as u8));
+    // bisect B: the PPM write and header
+    var ppm : [59]u8 = undefined;
+    assert(ppm_len(4, 4) == 59);
+    assert(ppm_header_len(4, 4) == 11);
+    assert(ppm_write_into(&ppm, rgb[0..48], 4, 4) == FRAME_OK);
+    assert(ppm[0] == 80);
+    assert(ppm[1] == 54);
+    assert(ppm[2] == 10);
+    assert(ppm[3] == 52);
+    assert(ppm[4] == 32);
+    assert(ppm[5] == 52);
+    assert(ppm[6] == 10);
+    assert(ppm[7] == 50);
+    assert(ppm[8] == 53);
+    assert(ppm[9] == 53);
+    assert(ppm[10] == 10);
+    // pixel (0,0), bytes 11..13: background, the rect starts at (1,1)
+    assert(ppm[11] == (red(R_BG) as u8));
+    assert(ppm[12] == (green(R_BG) as u8));
+    assert(ppm[13] == (blue(R_BG) as u8));
+    // the corners outside the rect stay background: (1,0)=14, (0,1)=23, (3,0)=20, (3,3)=56 --
+    // byte 56 is the red channel of pixel 15: background red, not a painted one
+    assert(ppm[14] == (red(R_BG) as u8));
+    assert(ppm[23] == (red(R_BG) as u8));
+    assert(ppm[20] == (red(R_BG) as u8));
+    assert(ppm[56] == (red(R_BG) as u8));
+}
+
+test the_rects_painted_pixels_land_on_the_painted_offsets {
+    var s = scene_empty();
+    const add = Op{ .op = OP_ADD, .seq = 1, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const sx = Op{ .op = OP_SET, .seq = 2, .prim = 0, .parent = 0, .node = 0, .field = F_X, .value = 1 };
+    const sy = Op{ .op = OP_SET, .seq = 3, .prim = 0, .parent = 0, .node = 0, .field = F_Y, .value = 1 };
+    const sw = Op{ .op = OP_SET, .seq = 4, .prim = 0, .parent = 0, .node = 0, .field = F_W, .value = 2 };
+    const sh = Op{ .op = OP_SET, .seq = 5, .prim = 0, .parent = 0, .node = 0, .field = F_H, .value = 2 };
+    const sf = Op{ .op = OP_SET, .seq = 6, .prim = 0, .parent = 0, .node = 0, .field = F_FILL, .value = 0 };
+    assert(apply_op(&s, add) == SCENE_OK);
+    assert(apply_op(&s, sx) == SCENE_OK);
+    assert(apply_op(&s, sy) == SCENE_OK);
+    assert(apply_op(&s, sw) == SCENE_OK);
+    assert(apply_op(&s, sh) == SCENE_OK);
+    assert(apply_op(&s, sf) == SCENE_OK);
+    var st = stream_empty();
+    assert(frame_stream(&s, &st) == SCENE_OK);
+    var rgb : [48]u8 = undefined;
+    assert(clear_rgb(&rgb, 4, 4) == FRAME_OK);
+    assert(render_stream_into(&rgb, 4, 4, &st) == FRAME_OK);
+    var ppm : [59]u8 = undefined;
+    assert(ppm_write_into(&ppm, rgb[0..48], 4, 4) == FRAME_OK);
+    // pixel (1,1) begins at byte 26: token 0 at full strength (default opacity is Q8)
+    assert(ppm[26] == (red(PALETTE[0]) as u8));
+    assert(ppm[27] == (green(PALETTE[0]) as u8));
+    assert(ppm[28] == (blue(PALETTE[0]) as u8));
+    // pixel (2,2), bytes 41..43: still token 0
+    assert(ppm[41] == (red(PALETTE[0]) as u8));
+    assert(ppm[42] == (green(PALETTE[0]) as u8));
+    assert(ppm[43] == (blue(PALETTE[0]) as u8));
+}
+
+test alpha_blends_by_the_recorded_q8_rule {
+    // base: a full-canvas token-1 rect at full strength, then a 2x2 token-2 rect at opacity 128
+    var st = stream_empty();
+    var at : u32 = put_op1(&st, 0, DL_OPACITY, 256);
+    at = put_op1(&st, at, DL_FILL, 1);
+    at = put_op1(&st, at, DL_RECT, 0);
+    at = put_op1(&st, at, DL_RECT, 0);
+    at = put_op1(&st, at, DL_RECT, 4);
+    at = put_op1(&st, at, DL_RECT, 4);
+    at = put_op1(&st, at, DL_OPACITY, 128);
+    at = put_op1(&st, at, DL_FILL, 2);
+    at = put_op1(&st, at, DL_RECT, 1);
+    at = put_op1(&st, at, DL_RECT, 1);
+    at = put_op1(&st, at, DL_RECT, 2);
+    at = put_op1(&st, at, DL_RECT, 2);
+    st.n = at;
+    var rgb : [48]u8 = undefined;
+    assert(render_stream_into(&rgb, 4, 4, &st) == FRAME_OK);
+    // outside the overlay: pure token 1
+    assert(rgb[0] == (red(PALETTE[1]) as u8));
+    // inside, pixel (1,1): per channel (fg*128 + dst*128) div 256. red (80+200)/2 = 140 exact,
+    // green (250+200)/2 = 225 exact, blue (123+200)/2 = 161 -- 161.5 floored, the truncation pinned
+    const want_r = @divTrunc(red(PALETTE[2]) + red(PALETTE[1]), 2);
+    const want_g = @divTrunc(green(PALETTE[2]) + green(PALETTE[1]), 2);
+    const want_b = @divTrunc(blue(PALETTE[2]) + blue(PALETTE[1]), 2);
+    assert((rgb[(5 * 3) as usize] as i32) == want_r);
+    assert((rgb[(5 * 3 + 1) as usize] as i32) == want_g);
+    assert((rgb[(5 * 3 + 2) as usize] as i32) == want_b);
+    // the same rule at alpha 1: dst moves one floored step toward fg, no more
+    var st2 = stream_empty();
+    var at2 : u32 = put_op1(&st2, 0, DL_OPACITY, 256);
+    at2 = put_op1(&st2, at2, DL_FILL, 1);
+    at2 = put_op1(&st2, at2, DL_RECT, 0);
+    at2 = put_op1(&st2, at2, DL_RECT, 0);
+    at2 = put_op1(&st2, at2, DL_RECT, 4);
+    at2 = put_op1(&st2, at2, DL_RECT, 4);
+    at2 = put_op1(&st2, at2, DL_OPACITY, 1);
+    at2 = put_op1(&st2, at2, DL_FILL, 2);
+    at2 = put_op1(&st2, at2, DL_RECT, 0);
+    at2 = put_op1(&st2, at2, DL_RECT, 0);
+    at2 = put_op1(&st2, at2, DL_RECT, 4);
+    at2 = put_op1(&st2, at2, DL_RECT, 4);
+    st2.n = at2;
+    var rgb2 : [48]u8 = undefined;
+    assert(render_stream_into(&rgb2, 4, 4, &st2) == FRAME_OK);
+    const step_r = @divTrunc(red(PALETTE[2]) * 1 + red(PALETTE[1]) * (Q8 - 1), Q8);
+    const step_g = @divTrunc(green(PALETTE[2]) * 1 + green(PALETTE[1]) * (Q8 - 1), Q8);
+    assert((rgb2[0] as i32) == step_r);
+    assert((rgb2[1] as i32) == step_g);
+    // opacity 0 paints nothing: the base shows through untouched
+    var st3 = stream_empty();
+    var at3 : u32 = put_op1(&st3, 0, DL_OPACITY, 256);
+    at3 = put_op1(&st3, at3, DL_FILL, 1);
+    at3 = put_op1(&st3, at3, DL_RECT, 0);
+    at3 = put_op1(&st3, at3, DL_RECT, 0);
+    at3 = put_op1(&st3, at3, DL_RECT, 4);
+    at3 = put_op1(&st3, at3, DL_RECT, 4);
+    at3 = put_op1(&st3, at3, DL_OPACITY, 0);
+    at3 = put_op1(&st3, at3, DL_FILL, 2);
+    at3 = put_op1(&st3, at3, DL_RECT, 0);
+    at3 = put_op1(&st3, at3, DL_RECT, 0);
+    at3 = put_op1(&st3, at3, DL_RECT, 4);
+    at3 = put_op1(&st3, at3, DL_RECT, 4);
+    st3.n = at3;
+    var rgb3 : [48]u8 = undefined;
+    assert(render_stream_into(&rgb3, 4, 4, &st3) == FRAME_OK);
+    assert(rgb3[0] == (red(PALETTE[1]) as u8));
+    assert(rgb3[47] == (blue(PALETTE[1]) as u8));
+}
+
+test a_refused_op_yields_its_code_and_touches_no_byte {
+    var rgb : [48]u8 = undefined;
+    // a text node standing where a rect would paint
+    fill_bytes(rgb[0..48], 170);
+    var st = stream_empty();
+    var at : u32 = put_op1(&st, 0, DL_OPACITY, 256);
+    at = put_op1(&st, at, DL_FILL, 0);
+    at = put_op1(&st, at, DL_RECT, 0);
+    at = put_op1(&st, at, DL_RECT, 0);
+    at = put_op1(&st, at, DL_RECT, 4);
+    at = put_op1(&st, at, DL_RECT, 4);
+    at = put_op1(&st, at, DL_TEXT, 3);
+    at = put_op1(&st, at, DL_TEXT, 4);
+    at = put_op1(&st, at, DL_TEXT, 5);
+    at = put_op1(&st, at, DL_TEXT, 6);
+    st.n = at;
+    assert(validate_stream(&st) == E_UNSUPPORTED);
+    assert(render_stream_into(&rgb, 4, 4, &st) == E_UNSUPPORTED);
+    assert(all_bytes(rgb[0..48], 170));
+    // every other refused primitive, each alone in its stream: path, image, face, clip, stroke,
+    // and an opcode outside display_list's vocabulary
+    var stp = stream_empty();
+    var atp : u32 = put_op1(&stp, 0, DL_PATH, 1);
+    atp = put_op1(&stp, atp, DL_PATH, 2);
+    atp = put_op1(&stp, atp, DL_PATH, 3);
+    atp = put_op1(&stp, atp, DL_PATH, 4);
+    stp.n = atp;
+    assert(validate_stream(&stp) == E_UNSUPPORTED);
+    var sti = stream_empty();
+    sti.bytes[0] = DL_IMAGE;
+    put4(&sti, 1, 0);
+    sti.n = 5;
+    assert(validate_stream(&sti) == E_UNSUPPORTED);
+    var stf = stream_empty();
+    var atf : u32 = put_op1(&stf, 0, DL_FACE, 0);
+    atf = put_op1(&stf, atf, DL_FACE, 0);
+    atf = put_op1(&stf, atf, DL_FACE, 1);
+    atf = put_op1(&stf, atf, DL_FACE, 1);
+    stf.n = atf;
+    assert(render_stream_into(&rgb, 4, 4, &stf) == E_UNSUPPORTED);
+    var stc = stream_empty();
+    stc.bytes[0] = DL_CLIP_PUSH;
+    put4(&stc, 1, 0);
+    stc.n = 5;
+    assert(validate_stream(&stc) == E_UNSUPPORTED);
+    var sts = stream_empty();
+    sts.bytes[0] = DL_STROKE;
+    sts.bytes[1] = 0;
+    sts.n = 2;
+    assert(validate_stream(&sts) == E_UNSUPPORTED);
+    var stu = stream_empty();
+    stu.bytes[0] = 99;
+    put4(&stu, 1, 0);
+    stu.n = 5;
+    assert(validate_stream(&stu) == E_UNSUPPORTED);
+    assert(all_bytes(rgb[0..48], 170));
+    // the honesty test: export_video's own fixture stream -- the exact bytes M6 records -- carries
+    // text and face, and this harness refuses it, named, with the buffer untouched
+    var fs = fixture_scene(0);
+    var fst = stream_empty();
+    assert(frame_stream(&fs, &fst) == SCENE_OK);
+    assert(fst.n > 0);
+    fill_bytes(rgb[0..48], 170);
+    assert(render_stream_into(&rgb, 4, 4, &fst) == E_UNSUPPORTED);
+    assert(all_bytes(rgb[0..48], 170));
+}
+
+test malformed_streams_are_refused_by_name {
+    var rgb : [48]u8 = undefined;
+    // a rect cut short after two of its four records
+    fill_bytes(rgb[0..48], 170);
+    var st = stream_empty();
+    var at : u32 = put_op1(&st, 0, DL_OPACITY, 256);
+    at = put_op1(&st, at, DL_RECT, 1);
+    at = put_op1(&st, at, DL_RECT, 2);
+    st.n = at;
+    assert(validate_stream(&st) == E_TRUNC);
+    assert(render_stream_into(&rgb, 4, 4, &st) == E_TRUNC);
+    assert(all_bytes(rgb[0..48], 170));
+    // a close with no open
+    var st2 = stream_empty();
+    st2.bytes[0] = DL_GROUP_END;
+    st2.n = 1;
+    assert(validate_stream(&st2) == E_DEPTH);
+    // groups left open at the end of the stream
+    var st3 = stream_empty();
+    var at3 : u32 = put_op1(&st3, 0, DL_GROUP, 0);
+    at3 = put_op1(&st3, at3, DL_RECT, 0);
+    at3 = put_op1(&st3, at3, DL_RECT, 0);
+    at3 = put_op1(&st3, at3, DL_RECT, 1);
+    at3 = put_op1(&st3, at3, DL_RECT, 1);
+    st3.n = at3;
+    assert(validate_stream(&st3) == E_DEPTH);
+    // an opacity over Q8
+    var st4 = stream_empty();
+    var at4 : u32 = put_op1(&st4, 0, DL_OPACITY, 300);
+    st4.n = at4;
+    assert(validate_stream(&st4) == E_VALUE);
+    // a fill token at STYLE_KINDS -- the boundary -- and one far outside
+    var st5 = stream_empty();
+    st5.bytes[0] = DL_FILL;
+    st5.bytes[1] = STYLE_KINDS;
+    st5.n = 2;
+    assert(validate_stream(&st5) == E_VALUE);
+    var st6 = stream_empty();
+    st6.bytes[0] = DL_FILL;
+    st6.bytes[1] = 200;
+    st6.n = 2;
+    assert(validate_stream(&st6) == E_VALUE);
+    // 33 open groups: one past display_list's own open[32] stack
+    var st7 = stream_empty();
+    var at7 : u32 = 0;
+    var k : u32 = 0;
+    while (k <= GROUP_STACK_MAX) {
+        at7 = put_op1(&st7, at7, DL_GROUP, 0);
+        k = k + 1;
+    }
+    st7.n = at7;
+    assert(validate_stream(&st7) == E_DEPTH);
+    // a rect record at or past 2^31: geometry outside the scene's non-negative i32 contract
+    var st8 = stream_empty();
+    var at8 : u32 = put_op1(&st8, 0, DL_RECT, 2147483648);
+    st8.n = at8;
+    assert(validate_stream(&st8) == E_VALUE);
+    // and none of the six refusals above moved a byte
+    assert(all_bytes(rgb[0..48], 170));
+}
+
+test translate_composes_through_nested_groups_and_restores {
+    var s = scene_empty();
+    const g1 = Op{ .op = OP_ADD, .seq = 1, .prim = PRIM_GROUP, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const g2 = Op{ .op = OP_ADD, .seq = 2, .prim = PRIM_GROUP, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    const r1 = Op{ .op = OP_ADD, .seq = 3, .prim = PRIM_RECT, .parent = 1, .node = 0, .field = 0, .value = 0 };
+    const r2 = Op{ .op = OP_ADD, .seq = 4, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const gx1 = Op{ .op = OP_SET, .seq = 5, .prim = 0, .parent = 0, .node = 0, .field = F_X, .value = 5 };
+    const gx2 = Op{ .op = OP_SET, .seq = 6, .prim = 0, .parent = 0, .node = 1, .field = F_X, .value = 3 };
+    const rx1 = Op{ .op = OP_SET, .seq = 7, .prim = 0, .parent = 0, .node = 2, .field = F_X, .value = 2 };
+    const ry1 = Op{ .op = OP_SET, .seq = 8, .prim = 0, .parent = 0, .node = 2, .field = F_Y, .value = 0 };
+    const rw1 = Op{ .op = OP_SET, .seq = 9, .prim = 0, .parent = 0, .node = 2, .field = F_W, .value = 1 };
+    const rh1 = Op{ .op = OP_SET, .seq = 10, .prim = 0, .parent = 0, .node = 2, .field = F_H, .value = 1 };
+    const rx2 = Op{ .op = OP_SET, .seq = 11, .prim = 0, .parent = 0, .node = 3, .field = F_X, .value = 0 };
+    const ry2 = Op{ .op = OP_SET, .seq = 12, .prim = 0, .parent = 0, .node = 3, .field = F_Y, .value = 0 };
+    const rw2 = Op{ .op = OP_SET, .seq = 13, .prim = 0, .parent = 0, .node = 3, .field = F_W, .value = 1 };
+    const rh2 = Op{ .op = OP_SET, .seq = 14, .prim = 0, .parent = 0, .node = 3, .field = F_H, .value = 1 };
+    assert(apply_op(&s, g1) == SCENE_OK);
+    assert(apply_op(&s, g2) == SCENE_OK);
+    assert(apply_op(&s, r1) == SCENE_OK);
+    assert(apply_op(&s, r2) == SCENE_OK);
+    assert(apply_op(&s, gx1) == SCENE_OK);
+    assert(apply_op(&s, gx2) == SCENE_OK);
+    assert(apply_op(&s, rx1) == SCENE_OK);
+    assert(apply_op(&s, ry1) == SCENE_OK);
+    assert(apply_op(&s, rw1) == SCENE_OK);
+    assert(apply_op(&s, rh1) == SCENE_OK);
+    assert(apply_op(&s, rx2) == SCENE_OK);
+    assert(apply_op(&s, ry2) == SCENE_OK);
+    assert(apply_op(&s, rw2) == SCENE_OK);
+    assert(apply_op(&s, rh2) == SCENE_OK);
+    var st = stream_empty();
+    assert(frame_stream(&s, &st) == SCENE_OK);
+    var rgb : [768]u8 = undefined;
+    assert(clear_rgb(&rgb, 16, 16) == FRAME_OK);
+    assert(render_stream_into(&rgb, 16, 16, &st) == FRAME_OK);
+    // rect 1 paints at 5 + 3 + 2 = 10: the group translates compose additively
+    assert(rgb[30] == (red(R_DEFAULT_FILL) as u8));
+    assert(rgb[31] == (green(R_DEFAULT_FILL) as u8));
+    assert(rgb[32] == (blue(R_DEFAULT_FILL) as u8));
+    // one pixel short and one past: background
+    assert(rgb[27] == (red(R_BG) as u8));
+    assert(rgb[33] == (red(R_BG) as u8));
+    // rect 2 sits outside both groups, and the restores are real: it paints at (0,0)
+    assert(rgb[0] == (red(R_DEFAULT_FILL) as u8));
+    assert(rgb[3] == (red(R_BG) as u8));
+}
+
+test ppm_sizes_are_exact_at_both_presets {
+    assert(ppm_header_len(1920, 1080) == 17);
+    assert(ppm_header_len(1080, 1920) == 17);
+    assert(ppm_len(1920, 1080) == 17 + 6220800);
+    assert(ppm_len(1080, 1920) == 17 + 6220800);
+    assert(17 + 6220800 == FRAME_RGB_LEN + 17);
+    assert(FRAME_RGB_LEN == 3 * 1920 * 1080);
+    assert(ppm_len(96, 54) == 13 + 96 * 54 * 3);
+    assert(ppm_header_len(96, 54) == 13);
+    // the header for two-digit dimensions, written for real: P6\n96 54\n255\n
+    var hdr : [24]u8 = undefined;
+    var w : u32 = 0;
+    var i : u32 = 0;
+    while (i < 96) {
+        w = w + 1;
+        i = i + 1;
+    }
+    assert(ppm_header_into(&hdr, w, 54) == FRAME_OK);
+    assert(hdr[0] == 80);
+    assert(hdr[1] == 54);
+    assert(hdr[2] == 10);
+    assert(hdr[3] == 57);
+    assert(hdr[4] == 54);
+    assert(hdr[5] == 32);
+    assert(hdr[6] == 53);
+    assert(hdr[7] == 52);
+    assert(hdr[8] == 10);
+    assert(hdr[9] == 50);
+    assert(hdr[10] == 53);
+    assert(hdr[11] == 53);
+    assert(hdr[12] == 10);
+    assert(ppm_header_len(w, 54) == 13);
+    // a raster this harness refuses answers 0 bytes, and a degenerate one is E_RANGE
+    assert(ppm_len(2048, 2048) == 0);
+    assert(ppm_len(0, 1080) == 0);
+    assert(ppm_header_into(&hdr, 0, 0) == E_RANGE);
+    assert(digits10(0) == 1);
+    assert(digits10(9) == 1);
+    assert(digits10(10) == 2);
+    assert(digits10(1920) == 4);
+}
+
+test the_export_schedule_renders_deterministically_and_animates {
+    const W : u32 = 64;
+    const H : u32 = 36;
+    const n : u32 = ppm_len(W, H);
+    assert(n == 6925);
+    var a : [6925]u8 = undefined;
+    var b : [6925]u8 = undefined;
+    // frame 450 renders, and renders again byte-identical: the determinism gate
+    assert(frame_bytes(&a, PRESET_LANDSCAPE, W, H, 450) == FRAME_OK);
+    assert(frame_bytes(&b, PRESET_LANDSCAPE, W, H, 450) == FRAME_OK);
+    assert(same_bytes(a[0..6925], b[0..6925]));
+    var ha = sha256::hash_hex(a[0..6925]);
+    var hb = sha256::hash_hex(b[0..6925]);
+    assert(hex_eq(ha, hb[0..64]));
+    // frame 0 differs from frame 450: the scene animates
+    assert(frame_bytes(&b, PRESET_LANDSCAPE, W, H, 0) == FRAME_OK);
+    assert(!same_bytes(a[0..6925], b[0..6925]));
+    var h0 = sha256::hash_hex(b[0..6925]);
+    assert(!hex_eq(ha, h0[0..64]));
+    // the pixel law is preset-independent: the op stream is, and so is its raster
+    assert(frame_bytes(&b, PRESET_PORTRAIT, W, H, 450) == FRAME_OK);
+    assert(same_bytes(a[0..6925], b[0..6925]));
+    // more schedule points render: start, one step in, the frame before 450, the last frame
+    assert(frame_bytes(&b, PRESET_LANDSCAPE, W, H, 1) == FRAME_OK);
+    assert(frame_bytes(&b, PRESET_LANDSCAPE, W, H, 449) == FRAME_OK);
+    assert(frame_bytes(&b, PRESET_LANDSCAPE, W, H, 899) == FRAME_OK);
+    // and the refusals are named: a preset that is not one of the two, a frame past the 900-frame
+    // schedule, a buffer too small for the raster
+    assert(frame_bytes(&b, PRESET_KINDS, W, H, 0) == E_PRESET);
+    assert(frame_bytes(&b, 200, W, H, 0) == E_PRESET);
+    assert(frame_bytes(&b, PRESET_LANDSCAPE, W, H, MAX_EXPORT_FRAMES) == E_RANGE);
+    assert(frame_bytes(&b, PRESET_LANDSCAPE, W, H, 900) == E_RANGE);
+    var small : [8]u8 = undefined;
+    assert(frame_bytes(&small, PRESET_LANDSCAPE, W, H, 0) == E_RANGE);
+}
+
+// ---- the text tests ------------------------------------------------------------------------------------
+// The classic public-domain 5x7 GLCD font in its original column-per-byte form: 5 bytes a glyph,
+// bit r of a byte is row r, 7 rows used. FONT above is this table transposed to rows, and the test
+// after it re-derives every FONT row from these columns, so the two encodings cannot drift apart.
+
+const CLASSIC_COLS : [95][5]u8 = [
+    [0, 0, 0, 0, 0],        // 32 space
+    [0, 0, 95, 0, 0],       // 33 !
+    [0, 7, 0, 7, 0],        // 34 "
+    [20, 127, 20, 127, 20], // 35 #
+    [36, 42, 127, 42, 18],  // 36 $
+    [35, 19, 8, 100, 98],   // 37 %
+    [54, 73, 85, 34, 80],   // 38 &
+    [0, 5, 3, 0, 0],        // 39 '
+    [0, 28, 34, 65, 0],     // 40 (
+    [0, 65, 34, 28, 0],     // 41 )
+    [8, 42, 28, 42, 8],     // 42 *
+    [8, 8, 62, 8, 8],       // 43 +
+    [0, 80, 48, 0, 0],      // 44 ,
+    [8, 8, 8, 8, 8],        // 45 -
+    [0, 96, 96, 0, 0],      // 46 .
+    [32, 16, 8, 4, 2],      // 47 /
+    [62, 81, 73, 69, 62],   // 48 0
+    [0, 66, 127, 64, 0],    // 49 1
+    [66, 97, 81, 73, 70],   // 50 2
+    [33, 65, 69, 75, 49],   // 51 3
+    [24, 20, 18, 127, 16],  // 52 4
+    [39, 69, 69, 69, 57],   // 53 5
+    [60, 74, 73, 73, 48],   // 54 6
+    [1, 113, 9, 5, 3],      // 55 7
+    [54, 73, 73, 73, 54],   // 56 8
+    [6, 73, 73, 41, 30],    // 57 9
+    [0, 54, 54, 0, 0],      // 58 :
+    [0, 86, 54, 0, 0],      // 59 ;
+    [0, 8, 20, 34, 65],     // 60 <
+    [20, 20, 20, 20, 20],   // 61 =
+    [65, 34, 20, 8, 0],     // 62 >
+    [2, 1, 81, 9, 6],       // 63 ?
+    [50, 73, 121, 65, 62],  // 64 @
+    [126, 17, 17, 17, 126], // 65 A
+    [127, 73, 73, 73, 54],  // 66 B
+    [62, 65, 65, 65, 34],   // 67 C
+    [127, 65, 65, 34, 28],  // 68 D
+    [127, 73, 73, 73, 65],  // 69 E
+    [127, 9, 9, 9, 1],      // 70 F
+    [62, 65, 65, 81, 50],   // 71 G
+    [127, 8, 8, 8, 127],    // 72 H
+    [0, 65, 127, 65, 0],    // 73 I
+    [32, 64, 65, 63, 1],    // 74 J
+    [127, 8, 20, 34, 65],   // 75 K
+    [127, 64, 64, 64, 64],  // 76 L
+    [127, 2, 4, 2, 127],    // 77 M
+    [127, 4, 8, 16, 127],   // 78 N
+    [62, 65, 65, 65, 62],   // 79 O
+    [127, 9, 9, 9, 6],      // 80 P
+    [62, 65, 81, 33, 94],   // 81 Q
+    [127, 9, 25, 41, 70],   // 82 R
+    [70, 73, 73, 73, 49],   // 83 S
+    [1, 1, 127, 1, 1],      // 84 T
+    [63, 64, 64, 64, 63],   // 85 U
+    [31, 32, 64, 32, 31],   // 86 V
+    [127, 32, 24, 32, 127], // 87 W
+    [99, 20, 8, 20, 99],    // 88 X
+    [3, 4, 120, 4, 3],      // 89 Y
+    [97, 81, 73, 69, 67],   // 90 Z
+    [0, 0, 127, 65, 65],    // 91 [
+    [2, 4, 8, 16, 32],      // 92 backslash
+    [65, 65, 127, 0, 0],    // 93 ]
+    [4, 2, 1, 2, 4],        // 94 ^
+    [64, 64, 64, 64, 64],   // 95 _
+    [0, 1, 2, 4, 0],        // 96 `
+    [32, 84, 84, 84, 120],  // 97 a
+    [127, 72, 68, 68, 56],  // 98 b
+    [56, 68, 68, 68, 32],   // 99 c
+    [56, 68, 68, 72, 127],  // 100 d
+    [56, 84, 84, 84, 24],   // 101 e
+    [8, 126, 9, 1, 2],      // 102 f
+    [12, 82, 82, 82, 62],   // 103 g
+    [127, 8, 4, 4, 120],    // 104 h
+    [0, 68, 125, 64, 0],    // 105 i
+    [32, 64, 68, 61, 0],    // 106 j
+    [127, 16, 40, 68, 0],   // 107 k
+    [0, 65, 127, 64, 0],    // 108 l
+    [124, 4, 24, 4, 120],   // 109 m
+    [124, 8, 4, 4, 120],    // 110 n
+    [56, 68, 68, 68, 56],   // 111 o
+    [124, 20, 20, 20, 8],   // 112 p
+    [8, 20, 20, 24, 124],   // 113 q
+    [124, 8, 4, 4, 8],      // 114 r
+    [72, 84, 84, 84, 32],   // 115 s
+    [4, 63, 68, 64, 32],    // 116 t
+    [60, 64, 64, 32, 124],  // 117 u
+    [28, 32, 64, 32, 28],   // 118 v
+    [60, 64, 48, 64, 60],   // 119 w
+    [68, 40, 16, 40, 68],   // 120 x
+    [12, 80, 80, 80, 60],   // 121 y
+    [68, 100, 84, 76, 68],  // 122 z
+    [0, 8, 54, 65, 0],      // 123 {
+    [0, 0, 127, 0, 0],      // 124 |
+    [0, 65, 54, 8, 0],      // 125 }
+    [8, 8, 42, 28, 8],      // 126 ~
+];
+
+// column weight: bit 4 is the leftmost pixel, so column c of a row weighs 2^(4-c)
+const COL_WEIGHT : [5]u32 = [16, 8, 4, 2, 1];
+
+test the_font_pins_the_classic_glyph_bits {
+    assert(FONT.len == 95);
+    assert(FONT[0].len == 7);
+    assert(FONT_FIRST == 32);
+    assert(FONT_LAST == 126);
+    assert(((FONT_LAST - FONT_FIRST) as u32) + 1 == 95);
+    // the mapping: in range -> code - 32, outside -> the space glyph, at both ends
+    assert(glyph_index(32) == 0);
+    assert(glyph_index(65) == 33);
+    assert(glyph_index(66) == 34);
+    assert(glyph_index(48) == 16);
+    assert(glyph_index(49) == 17);
+    assert(glyph_index(46) == 14);
+    assert(glyph_index(126) == 94);
+    assert(glyph_index(31) == 0);
+    assert(glyph_index(127) == 0);
+    assert(glyph_index(255) == 0);
+    assert(glyph_index(0) == 0);
+    assert(glyph_index(200) == 0);
+    // the space glyph is seven clear rows
+    var r : u32 = 0;
+    while (r < 7) {
+        assert(FONT[0][r] == 0);
+        r = r + 1;
+    }
+    // A: .XXX. / X...X x3 / XXXXX / X...X x2
+    assert(FONT[33][0] == 14);
+    assert(FONT[33][1] == 17);
+    assert(FONT[33][2] == 17);
+    assert(FONT[33][3] == 17);
+    assert(FONT[33][4] == 31);
+    assert(FONT[33][5] == 17);
+    assert(FONT[33][6] == 17);
+    // B: three full-strength left edges, two four-wide bars, rounded right edge
+    assert(FONT[34][0] == 30);
+    assert(FONT[34][1] == 17);
+    assert(FONT[34][2] == 17);
+    assert(FONT[34][3] == 30);
+    assert(FONT[34][4] == 17);
+    assert(FONT[34][5] == 17);
+    assert(FONT[34][6] == 30);
+    // 0: the classic slashed zero
+    assert(FONT[16][0] == 14);
+    assert(FONT[16][1] == 17);
+    assert(FONT[16][2] == 19);
+    assert(FONT[16][3] == 21);
+    assert(FONT[16][4] == 25);
+    assert(FONT[16][5] == 17);
+    assert(FONT[16][6] == 14);
+    // 1: the flag, the stem, the base
+    assert(FONT[17][0] == 4);
+    assert(FONT[17][1] == 12);
+    assert(FONT[17][2] == 4);
+    assert(FONT[17][3] == 4);
+    assert(FONT[17][4] == 4);
+    assert(FONT[17][5] == 4);
+    assert(FONT[17][6] == 14);
+    // .: a 2x2 dot on the baseline, nothing above
+    assert(FONT[14][0] == 0);
+    assert(FONT[14][1] == 0);
+    assert(FONT[14][2] == 0);
+    assert(FONT[14][3] == 0);
+    assert(FONT[14][4] == 0);
+    assert(FONT[14][5] == 12);
+    assert(FONT[14][6] == 12);
+    // the encoding is 5 bits wide, table-wide: no row byte may reach a 6th bit
+    var g : u32 = 0;
+    while (g < 95) {
+        r = 0;
+        while (r < 7) {
+            assert(FONT[g][r] < 32);
+            r = r + 1;
+        }
+        g = g + 1;
+    }
+    // the monospace width law
+    assert(FONT_W == 5);
+    assert(FONT_H == 7);
+    assert(FONT_ADVANCE == 6);
+    assert(text_width(0) == 0);
+    assert(text_width(1) == 5);
+    assert(text_width(2) == 11);
+    assert(text_width(5) == 29);
+}
+
+test the_font_is_the_classic_column_table_transposed {
+    // every FONT row re-derived from the column table: row r sums, over the five columns, the
+    // weight of each column whose byte has bit r set -- the exact inverse of the transposition
+    var g : u32 = 0;
+    while (g < 95) {
+        var r : u32 = 0;
+        while (r < 7) {
+            var want : u32 = 0;
+            var c : u32 = 0;
+            while (c < 5) {
+                const bit = ((CLASSIC_COLS[g][c] as u32) >> r) & 1;
+                want = want + bit * COL_WEIGHT[c];
+                c = c + 1;
+            }
+            assert(FONT[g][r] == (want as u8));
+            r = r + 1;
+        }
+        g = g + 1;
+    }
+}
+
+test draw_text_paints_exact_bytes_at_the_chosen_offsets {
+    var rgb : [768]u8 = undefined;
+    assert(clear_rgb(&rgb, 16, 16) == FRAME_OK);
+    // "AB" at (2, 3): A's cell spans x 2..6, B's starts at 2 + 6 = 8
+    assert(draw_text(&rgb, 16, 16, 2, 3, "AB", PALETTE[2], TEXT_TRANSPARENT, Q8) == FRAME_OK);
+    // A row 0 = .XXX.: pixels (3,3) (4,3) (5,3) are fg; the cell edges stay background
+    assert(rgb[153] == (red(PALETTE[2]) as u8));
+    assert(rgb[154] == (green(PALETTE[2]) as u8));
+    assert(rgb[155] == (blue(PALETTE[2]) as u8));
+    assert(rgb[102] == (red(R_BG) as u8));
+    assert(rgb[162] == (red(R_BG) as u8));
+    // A row 4 = XXXXX: the crossbar at y=7, x 2..6, all five
+    assert(rgb[342] == (red(PALETTE[2]) as u8));
+    assert(rgb[346] == (green(PALETTE[2]) as u8));
+    assert(rgb[350] == (blue(PALETTE[2]) as u8));
+    assert(rgb[351] == (red(PALETTE[2]) as u8));
+    assert(rgb[356] == (blue(PALETTE[2]) as u8));
+    // A row 6 = X...X: legs at x=2 and x=6, the gap untouched
+    assert(rgb[438] == (red(PALETTE[2]) as u8));
+    assert(rgb[444] == (red(R_BG) as u8));
+    assert(rgb[450] == (red(PALETTE[2]) as u8));
+    // B row 0 = XXXX.: pixels (8,3)..(11,3) fg, the right edge (12,3) untouched
+    assert(rgb[169] == (green(PALETTE[2]) as u8));
+    assert(rgb[179] == (blue(PALETTE[2]) as u8));
+    assert(rgb[180] == (red(R_BG) as u8));
+    // far from both cells: background
+    assert(rgb[767] == (blue(R_BG) as u8));
+}
+
+test the_space_glyph_paints_nothing_transparent_and_fills_when_bg_is_set {
+    // transparent: a space moves no byte at all
+    var a : [768]u8 = undefined;
+    fill_bytes(a[0..768], 170);
+    assert(draw_text(&a, 16, 16, 1, 1, " ", PALETTE[2], TEXT_TRANSPARENT, Q8) == FRAME_OK);
+    assert(all_bytes(a[0..768], 170));
+    // an empty string moves no byte even with a background colour handed in
+    var c : [768]u8 = undefined;
+    fill_bytes(c[0..768], 170);
+    assert(draw_text(&c, 16, 16, 1, 1, "", PALETTE[2], PALETTE[0], Q8) == FRAME_OK);
+    assert(all_bytes(c[0..768], 170));
+    // with bg set: the 5x7 cell at (1,1)..(5,7) fills, everything around it stays
+    var b : [768]u8 = undefined;
+    fill_bytes(b[0..768], 170);
+    assert(draw_text(&b, 16, 16, 1, 1, " ", PALETTE[2], PALETTE[0], Q8) == FRAME_OK);
+    assert(b[51] == (red(PALETTE[0]) as u8));        // (1,1), the cell's top-left
+    assert(b[53] == (blue(PALETTE[0]) as u8));
+    assert(b[351] == (red(PALETTE[0]) as u8));       // (5,7), the cell's bottom-right
+    assert(b[353] == (blue(PALETTE[0]) as u8));
+    assert(b[48] == 170);                            // (0,1), one pixel left of the cell
+    assert(b[66] == 170);                            // (6,1), one pixel right
+    assert(b[9] == 170);                             // (3,0), one row above
+    assert(b[393] == 170);                           // (3,8), one row below
+}
+
+test a_char_outside_the_subset_renders_as_the_space_glyph {
+    // three codes with no glyph: 1, 127 and 255, built as bytes (no lexer escapes involved)
+    var odd : [3]u8 = undefined;
+    odd[0] = 1;
+    odd[1] = 127;
+    odd[2] = 255;
+    var a : [768]u8 = undefined;
+    var b : [768]u8 = undefined;
+    fill_bytes(a[0..768], 170);
+    fill_bytes(b[0..768], 170);
+    assert(draw_text(&a, 16, 16, 0, 0, odd[0..3], PALETTE[2], PALETTE[1], Q8) == FRAME_OK);
+    assert(draw_text(&b, 16, 16, 0, 0, "   ", PALETTE[2], PALETTE[1], Q8) == FRAME_OK);
+    // both renders moved bytes (the bg-filled cells prove the draws ran)...
+    assert(!all_bytes(a[0..768], 170));
+    assert(!all_bytes(b[0..768], 170));
+    // ...and they moved exactly the same ones: the odd codes drew spaces
+    assert(same_bytes(a[0..768], b[0..768]));
+}
+
+test text_paints_inside_the_rgb_and_never_resizes_the_ppm {
+    const W : u32 = 32;
+    const H : u32 = 16;
+    assert(ppm_len(W, H) == 13 + W * H * 3);
+    var rgb : [1536]u8 = undefined;
+    assert(clear_rgb(&rgb, W, H) == FRAME_OK);
+    // a five-char string at (1,4): the last glyph cell ends at x = 1 + 4*6 + 4 = 29, inside
+    assert(draw_text(&rgb, W, H, 1, 4, "HELLO", PALETTE[2], TEXT_TRANSPARENT, Q8) == FRAME_OK);
+    // H row 3 = XXXX.: pixel (2,7) is fg, the pixel left of the cell is not
+    assert(rgb[678] == (red(PALETTE[2]) as u8));
+    assert(rgb[384] == (red(R_BG) as u8));
+    // the last pixel of the raster is untouched background
+    assert(rgb[1533] == (red(R_BG) as u8));
+    assert(rgb[1535] == (blue(R_BG) as u8));
+    // the PPM is the same length it always was, header first, rows after
+    var ppm : [1549]u8 = undefined;
+    assert(ppm.len == 1549);
+    assert(ppm_write_into(&ppm, rgb[0..1536], W, H) == FRAME_OK);
+    assert(ppm[0] == 80);
+    assert(ppm[1] == 54);
+    assert(ppm[2] == 10);
+    assert(ppm[3] == 51);                            // '3'
+    assert(ppm[4] == 50);                            // '2'
+    assert(ppm[5] == 32);
+    assert(ppm[6] == 49);                            // '1'
+    assert(ppm[7] == 54);                            // '6'
+    assert(ppm[8] == 10);
+    assert(ppm[9] == 50);
+    assert(ppm[10] == 53);
+    assert(ppm[11] == 53);
+    assert(ppm[12] == 10);
+    // clipping: a glyph run off the right edge and one off the bottom clip, not refuse
+    assert(draw_text(&rgb, W, H, 30, 0, "W", PALETTE[3], TEXT_TRANSPARENT, Q8) == FRAME_OK);
+    assert(rgb[90] == (red(PALETTE[3]) as u8));      // (30,0) survives, (34,0) is gone
+    assert(draw_text(&rgb, W, H, 0, 13, "g", PALETTE[3], TEXT_TRANSPARENT, Q8) == FRAME_OK);
+    assert(rgb[1440] == (red(PALETTE[3]) as u8));    // (0,15) survives, row 16 is gone
+    // the alpha rule composes: one Q8 step of 128 over the cleared background
+    var rgb2 : [1536]u8 = undefined;
+    assert(clear_rgb(&rgb2, W, H) == FRAME_OK);
+    assert(draw_text(&rgb2, W, H, 0, 0, "A", PALETTE[2], TEXT_TRANSPARENT, 128) == FRAME_OK);
+    const want_r = @divTrunc(red(PALETTE[2]) * 128 + red(R_BG) * (Q8 - 128), Q8);
+    const want_g = @divTrunc(green(PALETTE[2]) * 128 + green(R_BG) * (Q8 - 128), Q8);
+    const want_b = @divTrunc(blue(PALETTE[2]) * 128 + blue(R_BG) * (Q8 - 128), Q8);
+    assert((rgb2[3] as i32) == want_r);
+    assert((rgb2[4] as i32) == want_g);
+    assert((rgb2[5] as i32) == want_b);
+    // the refusals are named: a short buffer, a refused raster, an alpha out of range
+    var tiny : [4]u8 = undefined;
+    assert(draw_text(&tiny, W, H, 0, 0, "A", PALETTE[2], TEXT_TRANSPARENT, Q8) == E_RANGE);
+    assert(draw_text(&rgb, 0, H, 0, 0, "A", PALETTE[2], TEXT_TRANSPARENT, Q8) == E_RANGE);
+    assert(draw_text(&rgb, W, H, 0, 0, "A", PALETTE[2], TEXT_TRANSPARENT, 257) == E_VALUE);
+    assert(draw_text(&rgb, W, H, 0, 0, "A", PALETTE[2], TEXT_TRANSPARENT, 0 - 1) == E_VALUE);
+    // alpha 0 paints nothing
+    var rgb3 : [1536]u8 = undefined;
+    fill_bytes(rgb3[0..1536], 170);
+    assert(draw_text(&rgb3, W, H, 0, 0, "AB", PALETTE[2], PALETTE[0], 0) == FRAME_OK);
+    assert(all_bytes(rgb3[0..1536], 170));
+}
+
+invariant the_render_code_table_is_closed {
+    assert(ID == "frame-render");
+    assert(FRAME_OK == 0);
+    assert(RESULT_NAMES.len == 8);
+    assert(E_UNSUPPORTED == 4);
+    assert(E_VALUE == 7);
+    assert(GROUP_STACK_MAX == 32);
+    assert(PALETTE.len == STYLE_KINDS);
+    assert(VERSION == 2);
+}
+
+invariant the_raster_is_the_export_presets_raster {
+    assert(FRAME_PIXELS == 1920 * 1080);
+    assert(FRAME_RGB_LEN == 3 * FRAME_PIXELS);
+    assert(FRAME_PIXELS == preset_width(PRESET_LANDSCAPE) * preset_height(PRESET_LANDSCAPE));
+    assert(FRAME_PIXELS == preset_width(PRESET_PORTRAIT) * preset_height(PRESET_PORTRAIT));
+    assert(ppm_len(preset_width(PRESET_LANDSCAPE), preset_height(PRESET_LANDSCAPE)) == 17 + FRAME_RGB_LEN);
+    assert(ppm_len(preset_width(PRESET_PORTRAIT), preset_height(PRESET_PORTRAIT)) == 17 + FRAME_RGB_LEN);
+    assert(MAX_EXPORT_FRAMES == 900);
+}
+
+invariant the_text_font_encoding_is_stated {
+    assert(FONT.len == 95);
+    assert(FONT[0].len == 7);
+    assert(FONT_FIRST == 32);
+    assert(FONT_LAST == 126);
+    assert(FONT_W == 5);
+    assert(FONT_H == 7);
+    assert(FONT_ADVANCE == FONT_W + 1);
+    assert(glyph_index(FONT_FIRST) == 0);
+    assert(glyph_index(FONT_LAST) == 94);
+    assert(text_width(0) == 0);
+    assert(text_width(1) == FONT_W);
+    assert(TEXT_TRANSPARENT < 0);
+    assert(E_VALUE == 7);
+    assert(VERSION == 2);
+}

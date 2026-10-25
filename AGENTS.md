@@ -315,6 +315,7 @@ Each gate is a spec. Read the spec, not a summary of it.
 - **Heavy runs do not go on a laptop.** Builds, corpus sweeps and mutation runs
   go to the Railway lab. A local Mac run has panicked the machine
   (2026-10-09).
+- **An edited import serves its sealed snapshot.** Cross-module consumers build against the import's seal, not the working tree: after editing an imported spec, `seal --save` it before rebuilding consumers -- and a consumer of a pub fn that calls a private helper needs that helper nameable, or the merged build fails on it (2026-10-23, #11777: identical error lines across different source texts were the tell).
 - **A merge is not a deploy.** A trinity merge is live on t27.ai only after the
   `gHashTag/ghashtag.github.io` publish workflow runs and its Pages build is
   `built`.
