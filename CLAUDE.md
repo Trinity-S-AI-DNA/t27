@@ -195,6 +195,18 @@ before touching anything under `fpga/`. Non-negotiables:
 - **Contributed keys** (added by users on app.t27.ai) are stored sealed by the Queen; work on them is managed by the owner and the Queen with the contributor's consent, and the contributor earns PROVIDER_FEE in TRI credit for verified work (`specs/network/mvp.t27`, `specs/verified/payout.t27`; minting is the founder's alone, `specs/trinet/mint_authority.t27`). Never read, print or move a key value.
 - **Numbers and the brand:** number formats (TNF, GoldenFloat, Golden Ruler, Z[phi]) and the brand visual (verified formulas orbiting the 27-petal logo) are sections of AGENTS.md; follow them, do not restate them.
 
+## Where t27 work lives (owner, 2026-10-25: agents litter the home folder and fill the disk)
+
+On 2026-10-25 the disk held 2.8 GiB free and the app refused to make a worktree (it needs 5.4 GiB). The cause was agent litter, not work: dozens of `~/t27-wt-*`, `~/t27-lane-*`, `~/t27-lanes/*` clones and worktrees, `/private/tmp/opencode` trees (19.5 GiB), and nested clones inside lane folders. Cleaning freed about 38 GiB. The rules, in one place:
+
+- **One home.** All t27 work lives in `~/t27` (the main clone) and its worktrees under `~/t27/.claude/worktrees/` (the app makes them). Sibling repos have one fixed home each (`~/t27os`, `~/trios`, `~/t27-mcp`, `~/trinity`); never a second clone of any of them.
+- **No litter outside it.** No clone, worktree or scratch tree in `~`, `~/t27-*`, `~/t27-lanes`, `/tmp` or `/private/tmp` (including `opencode` and other agent-tool temp trees). A lane needs a branch, not a folder: use the app's worktree, and when the work is merged or parked, remove it (skill `self-cleanup`). A worktree is yours to remove only when it is clean, pushed (or its branch parked as a local `rescue/<name>` ref), and no process uses it.
+- **Look before you make one.** More than 5.4 GiB must be free before a new worktree or a build (`df -g .`); under 8 GiB the status bar says low disk. Heavy builds and sweeps are not run on the Mac (see the lab rule above).
+- **Park, do not push, rescue work.** Unmerged work you cannot land is kept as `refs/heads/rescue/<name>` in the main clone and is never pushed.
+- **Foreign-language scratch is forbidden** here as everywhere (`only-t27`); a scratch file in `/tmp` is litter too.
+- **Short terminal commands.** A long `run_in_terminal` command hides the approval button; keep each under about 110 characters, one pipeline (skill `short-terminal-commands`).
+- **The DOCTOR watches this.** The T27 OS DOCTOR (`specs/t27os/doctor.t27`, host `glass_window.t27`) lists agent-litter roots (`/private/tmp/`, `/tmp/`, `~/t27-lanes/`, `~/t27-lane-*`, `~/t27-wt-*`, `.codex`, `.gemini`), offers only folders that are clean, pushed and not in use by a process (lsof check, fails closed), and says "low disk" under 6 GiB with the total it could free. Non-repo scratch trees and loose lane files are not watched yet (follow-up issue).
+
 ## Sandbox and shell traps
 
 - In a sandboxed agent, `gh` can fail with `x509: OSStatus -26276`, and `git worktree add`, branch deletion and `.git/config` writes can be refused; run those through a Terminal tab, or ask the orchestrator to fetch CI logs (`gh run view <id> --log-failed`) into a file for you.
