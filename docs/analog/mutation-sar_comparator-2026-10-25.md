@@ -1,9 +1,10 @@
 # Mutation census of specs/analog/sar_comparator.t27, 2026-10-25
 
 Issue #12432, census 4 of 6 on issue #12241, part of epic #10486 (weak spots of the analog v0.1 release). This lane
-wrote the missing asserts of groups A to M and the accepted file. Groups N and O and line 522 need a figure from the
-lab: they are deferred to issue #12512 and sit in the accepted file as "deferred test gap" entries. The analog loop ran
-the mutation gate on the committed tree and re-saved the seal (see "After"). Where each number comes from:
+wrote the missing asserts of groups A to M and the accepted file. Groups N and O and line 522 needed a figure from the
+lab: they were deferred to issue #12512 and sat in the accepted file as "deferred test gap" entries until the five
+lab-value tests of that issue killed all seven mutants (second gate run, see "After"); the six entries are removed. The
+analog loop ran the mutation gate three times and re-saved the seal (see "After"). Where each number comes from:
 
 - **Before** (868 mutants, 659 killed, 98 survived, 78 hung, 33 unviable) is the analog-loop census of the unmodified
   spec, 18:57-19:27 +07, exit 0, 29 min 32 s, load 14.25 15.99 15.42 at the start, t27c 0.5.2. Kinds: drop-guard,
@@ -12,15 +13,37 @@ the mutation gate on the committed tree and re-saved the seal (see "After"). Whe
 - **Tests**: `tri test specs/analog/sar_comparator.t27 --t27c <release t27c>` in a T27 OS pane, 21:39-21:40 +07 (about
   one minute), 1-min load 27.4 at the start: 33 tests (20 before, 13 new), 33 pass, 0 fail, **0 vacuous passes of 33**,
   exit 0. Every new test executed runtime asserts: A 8, B 7, C 2, D 5, E 5, F 8, G 8, H 8, I 2, J 5, K 1, L 3, M 16.
-- **After** (the gate on the committed tree, head bde919952c, before the deferred block was added): 868 mutants, 707
-  killed, 49 survived, 79 hung, 33 unviable; 128 not killed, 121 accepted by the entries of the file, 0 accepted lines
-  now killed, 7 not accepted (six keys, the seven deferred mutants below). `tri mutate spec ... --jobs 2 --timeout 45`
-  in a T27 OS pane, 2026-10-25 23:40 to 2026-10-26 00:36 +07 (about 56 min), 1-min load 9.07 at the start (10.83 and
-  11.70 for 5 and 15 min), exit 2 because of the 7 not accepted. The six deferred entries were added after that run, so
-  the run with them in place was not repeated; exit 0 follows from the run's own list (the 7 are exactly the 6 keys now
-  accepted as deferred) and is inferred, not measured. The census went 659 -> 707 killed and 98 -> 49 survivors.
+- **After, first gate run** (the gate on the committed tree, head bde919952c, before the deferred block was added): 868
+  mutants, 707 killed, 49 survived, 79 hung, 33 unviable; 128 not killed, 121 accepted by the entries of the file, 0
+  accepted lines now killed, 7 not accepted (six keys, the seven deferred mutants). `tri mutate spec ... --jobs 2
+  --timeout 45` in a T27 OS pane, 2026-10-25 23:40 to 2026-10-26 00:36 +07 (about 56 min), 1-min load 9.07 at the start
+  (10.83 and 11.70 for 5 and 15 min), exit 2 because of the 7 not accepted. The six deferred entries were added after
+  that run. The census went 659 -> 707 killed and 98 -> 49 survivors.
+- **After, second gate run** (`tri mutate spec --accepted ... --jobs 2 --timeout 45`, 2026-10-26 01:52 to 02:41 +07, 49
+  min 19 s, on the tree of head b86b1acbee: the spec plus the five lab-value tests added for issue #12512, 38 of 38 tests
+  pass; load 5.80 6.72 7.85 at the start; the accepted file still had the six deferred entries): 868 mutants, 712 killed
+  (712 by a failing test, 0 by an invariant), 42 survived, 79 hung, 35 unviable. Gate: 121 not killed (42 survived, 79
+  hung), 121 accepted, 6 accepted lines now killed, exit 2 as the gate is built to do. The six lines are 522
+  [flip-cmp], 1291 [swap-arith], 1322 [swap-arith], 1396 [swap-arith], 1397 [swap-arith] and 1404 [flip-cmp] = exactly the
+  six deferred keys = all seven deferred mutants (1322 carries two), so all seven are now killed. Against the first
+  run: killed 707 -> 712, survivors 49 -> 42, hung 79 -> 79, unviable 33 -> 35. The two extra unviable are line 699
+  [swap-arith] x2: zig cache errors ("failed to open ...libcompiler_rt.a: FileNotFound", "failed to parse TBD file:
+  NotLibStub"), not emitter refusals. The first run counted them killed, so the likely figures are 714 killed and 33
+  unviable; 712 and 35 are the measured ones of that run (the confirmation gate below measured 714 and 33). The six deferred entries were then removed from the accepted file (124 ->
+  118 entry lines). The census went 659 -> 707 -> 712 -> 714 killed and 98 -> 49 -> 42 -> 42 survivors; the last step is
+  measured by the confirmation gate run on the final file (next bullet).
+- **After, confirmation gate run** (the gate with `--jobs 2 --timeout 45` on exactly the final accepted file, 118 entry
+  lines, as committed at head 06e2262dbb, 2026-10-26 03:29:42 to 04:18:12 +07, 48 min 30 s; load 8.20 7.17 6.88 at the
+  start): 868 mutants, 714 killed (714 by a failing test, 0 by an invariant at compile time), 42 survived, 79 hung, 33
+  unviable; 121 not killed (42 survived, 79 hung), all 121 matched by accepted entries, 0 accepted lines now killed,
+  "Gate passed", exit 0: measured, not inferred. The 33 unviable answers are all `zig: error: not yet implemented` (the
+  ret-default mutants of functions with no return value); no cache error (FileNotFound, NotLibStub, libcompiler_rt)
+  appeared in this run. Against the second run: killed 712 -> 714, survivors 42 -> 42, hung 79 -> 79, unviable 35 -> 33;
+  the two former unviable at line 699 [swap-arith] x2 are killed here (35 - 2 = 33, 712 + 2 = 714). Against the census:
+  +55 killed, -56 survived, +1 hung, unviable unchanged at 33.
 - **Seal**: `AnalogSarComparator` re-saved with the master-built t27c (exit 0, verify 0); only
-  `.trinity/seals/analog_AnalogSarComparator.json` changed.
+  `.trinity/seals/analog_AnalogSarComparator.json` changed. The spec seal was re-saved again for the head b86b1acbee
+  that adds the five lab-value tests of issue #12512 (five hashes match).
 
 ## The 98 survivors, and what became of each
 
@@ -40,22 +63,24 @@ the mutation gate on the committed tree and re-saved the seal (see "After"). Whe
 | 422, 425 `jd = jp + jn` | `sc_resid_at` read directly | test gap, group K | killed by the residual with a non-zero J- (reading) |
 | 389, 391 x2 | `sc_stamp_cap` into a non-empty register | test gap, group L | killed by G+ 1000, J+ 5000 (reading) |
 | 544, 933 | back substitution on a dirty x | test gap, group M | killed by x pre-filled with 5 (reading) |
-| 1396, 1397, 1404 | `sc_headroom` with swap = true | test gap, group N | **deferred** (issue 12512): needs a lab figure; survived the gate |
-| 1291, 1322 x2 | loose windows of the transposed control and `sc_gap_g` | test gap, group O | **deferred** (issue 12512): needs lab windows; survived the gate |
-| 522 | `k < 9` to `k <= 9` in `sc_eliminate` | not decided | **deferred** (issue 12512): needs a lab trace; survived the gate |
+| 1396, 1397, 1404 | `sc_headroom` with swap = true | test gap, group N | killed by the lab-value tests of issue 12512 (second gate run) |
+| 1291, 1322 x2 | loose windows of the transposed control and `sc_gap_g` | test gap, group O | killed by the lab-value tests of issue 12512 (second gate run) |
+| 522 | `k < 9` to `k <= 9` in `sc_eliminate` | not decided | killed by the lab-value tests of issue 12512 (second gate run) |
 
-Totals: 42 equivalent + 49 test gaps of groups A to M + 6 test gaps of groups N and O (deferred) + 1 not decided
-(deferred) = 98. The gate run after the tests measured 49 survivors: 42 equivalent plus the 7 deferred mutants, so the 49
-test gaps of groups A to M are measured as killed (the survivor count dropped from 98 to 49 and the gate lists no other
-line). The tool still names no killing test, so the per-line "killed by" column is a reading of the mutated line against
-the assert; each expected word is hand arithmetic from the arrays the test builds, traced against the function bodies,
-and the unmutated tree passes all of them.
+Totals: the census read 98 survivors = 42 equivalent + 49 test gaps of groups A to M + 6 test gaps of groups N and O
+(deferred to issue 12512) + 1 not decided (line 522, deferred). The first gate run measured 49 survivors: 42 equivalent
+plus the 7 deferred mutants, so the 49 test gaps of groups A to M are measured as killed (the survivor count dropped
+from 98 to 49 and the gate lists no other line). The second gate run measured 42 survivors, the 42 equivalent only, so
+the 7 deferred mutants are killed as well. The tool still names no killing test, so the per-line "killed by" column for
+groups A to M is a reading of the mutated line against the assert; each expected word is hand arithmetic from the
+arrays the test builds, traced against the function bodies, and the unmutated tree passes all of them.
 
 The 78 hung are all drop-step mutants of loop counters, `x = x + 1` turned into `x = x`, so each loop never ends. They are
 accepted by construction. Line 914 (the swap loop counter k of `sc_solve_f`) was a survivor in the census because no
 test took the swap branch; the group A test now runs that branch, so the mutant hangs, and the accepted file lists it
 with the hung ones (79 hung entries). The 33 unviable are all ret-default (body emptied, `zig: error: not yet
-implemented`) and are named in comment lines at the end of the accepted file.
+implemented`) and are named in comment lines at the end of the accepted file. The second gate run counted 35 unviable;
+the two extra are line 699 [swap-arith] x2, zig cache errors (see "Not done, not claimed").
 
 ## What each new test asserts
 
@@ -88,10 +113,12 @@ nothing. The tests are appended after the last existing test, so no line above m
 
 ## The accepted file
 
-`docs/analog/mutation-accepted-sar_comparator.txt` has 124 entries: 39 equivalent (naming the 42 equivalent mutants), 79
-hung and 6 deferred test gaps (issue 12512, naming the 7 deferred mutants; they keep the gate green without claiming
-equivalence, as in `mutation-accepted-sar_kick_net.txt`). It is read per line and kind (`cli/tri/src/mutate.rs`, `gate_counts`; `specs/tri/mutate/survivors.t27`), which
-has three consequences, each written in the header of the file:
+`docs/analog/mutation-accepted-sar_comparator.txt` has 118 entries: 39 equivalent (naming the 42 equivalent mutants) and
+79 hung. It had 124 until the second gate run: 6 deferred test gaps (issue 12512, naming the 7 deferred mutants) kept the
+gate green without claiming equivalence, as in `mutation-accepted-sar_kick_net.txt`, and were removed once the lab-value
+tests killed them (the gate reported them "accepted but killed"). The file is read per line and kind
+(`cli/tri/src/mutate.rs`, `gate_counts`; `specs/tri/mutate/survivors.t27`), which has three consequences, each written
+in the header of the file:
 
 - One entry covers every mutant of its line and kind: 782 (2 mutants) and 1070 flip-cmp (3) are one entry each.
 - 425 [swap-arith] covers two census mutants, the equivalent `jp + jn > 1` and the group K mutant `jd = jp + jn`. The
@@ -100,22 +127,23 @@ has three consequences, each written in the header of the file:
   mutant of another kind; they have no entry, and an entry for them would make the gate exit 2 ("accepted but
   killed") once the new tests kill them.
 
-The 33 unviable mutants are counted nowhere by the gate, so they are comment lines at the end of the file.
+The 33 unviable mutants are counted nowhere by the gate, so they are comment lines at the end of the file; the two extra
+unviable of the second run (line 699, zig cache errors) are described in a comment line there too.
 
 ## Not done, not claimed
 
-- The gate was run once, on the committed tree before the deferred block was added (see "After"); the run with the
-  deferred block in place was not repeated, so exit 0 of the final tree is inferred from that run's list, not measured.
-  The census itself was not repeated; the gate run is the only measurement of the new kill counts.
-- All seven open mutants are tracked in issue #12512 and listed as "deferred test gap (12512)" entries; each needs a lab
-  figure, and none was guessed:
-- **Line 522** (`k < 9` to `k <= 9` in the row update of `sc_eliminate`) is not decided: it needs a lab trace of the words at
-  the extra pass and, if a matrix with a non-zero column-0 residue exists, an assert; otherwise an equivalent entry.
-- **Group N** (1396, 1397, 1404, `sc_headroom` with swap = true): the figure of `sc_headroom(&t, SC_H2, true, SC_K,
-  &SC_DV_M)` is a lab measurement and was not guessed. Line 1404 (the last step dropped) goes to the equivalent block if the
-  lab finds no stimulus that puts the maximum in step 140.
-- **Group O** (1291, 1322 x2): the two-sided windows for the `wrong` figure of the transposed control and the `wg` figure of
-  `sc_gap_g` come from lab values and were not guessed. These mutants stay survivors until then.
+- The gate was run three times (see "After"). The third run is the confirmation gate on exactly the final accepted file
+  (118 entry lines, head 06e2262dbb): its exit 0 is measured there, not inferred (the six removed keys are exactly the
+  six lines the second run reported "accepted but killed", and the confirmation run reported no accepted line as
+  killed). The census itself was not repeated; the three gate runs are the only measurements of the new kill counts.
+- The seven mutants that were open are closed by issue #12512 and are killed in the second run: line 522 (`k < 9` to `k
+  <= 9` in the row update of `sc_eliminate`), group N (1396, 1397, 1404, `sc_headroom` with swap = true) and group O
+  (1291, 1322 x2, the transposed control and `sc_gap_g`). Line 522 was "not decided" in the census; it is killed, so it is
+  not equivalent, and line 1404 needed no entry in the equivalent block.
+- Open, infrastructure noise: the unviable count is 35 in the second run against 33 in the first. The two extra are line
+  699 [swap-arith] x2, zig cache errors and not emitter refusals (the cache-clean launch agent logged removing the whole zig global cache, 61.5 GiB, at 02:06:45 in the middle of the run: read from its log, and the link to the two errors is inferred); the likely figures are 714 killed and 33 unviable, and the confirmation run measured them (714 killed, 33 unviable, no cache error). A
+  gate should list a zig answer that is not "not yet implemented" apart from the emitter refusals, so that such a
+  mutant is not counted as unviable (or as killed) without being seen. Filed as issue #12539.
 - The 42 equivalent survivors are classified by reading the arithmetic, not proved equivalent by a tool; the 349 and 825
   reason (symmetric conductance on the same four entries at vd = vs) is an inference from the stamp. The 79 hung are
   classified by construction (the tool reports each as outliving `--timeout`, which is consistent with an endless loop
