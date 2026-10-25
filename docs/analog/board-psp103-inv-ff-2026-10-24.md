@@ -66,7 +66,7 @@ Both counts are from the T27 OS lab (`Trinity-S-AI-DNA/t27os`, workflow `lab.yml
 
 ## 6. Build B
 
-Not run in this session. The pane server of the T27 OS app stopped answering at 21:50 on 2026-10-24 (`pty.sock` was re-created and nothing listens on it; `nc -zU` fails, the client prints `no server`), and the build, the load and the judge of Build B go through the pane. This corner therefore has the Build A receipt of section 3 and no Build B receipt.
+Run on 2026-10-24 in PR #12063 (task #12050); the receipt is `board-psp103-inv-buildb-2026-10-24.md`: 1218 of 1218 well-formed lines of the ff design read PASS, and the fold S at N = 18F equals the pin in three rounds. The first version of this section (PR #12031) said Build B had not been run, because the pane server of the T27 OS app had stopped answering at 21:50 on 2026-10-24; that was true when it was written. The Build A numbers of this note are unchanged.
 
 ## 7. Not claimed
 

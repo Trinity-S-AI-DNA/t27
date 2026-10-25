@@ -63,8 +63,9 @@ the clock ends the mutant. They are named in the accepted file with that reason.
 - a decision index without records has no errors and its threshold run is the whole scan grid (10 runtime asserts);
 - a decision exactly on the threshold follows the rule: a 0 above, or a 1 at or below, is an error. Two pinned records
   are used as the threshold, with neighbours at plus and minus 1 nV, so the delta is +1 or 0 by the rule and cannot be
-  met by accident (6 runtime asserts reported; the code has 10, the 4 that compare constant array elements are not in
-  the count, and why was not established);
+  met by accident (10 runtime asserts, all counted; the first version reported 6: the 4 asserts that compared a constant
+  array element with a literal were not counted, so each element is now read into a `var` first, #12117; see the last
+  list);
 - the scan grid end and the series resistor bracket leave no tie or extra point to decide anything: they back the
   accepted notes of lines 168, 170, 177, 275 and 302 with strict assertions (11 runtime asserts).
 
@@ -88,8 +89,13 @@ the file must be regenerated. New tests go at the end of the spec for that reaso
   only.
 - The 5 hung mutants are classified by construction (a loop step dropped), not by a run that was allowed to finish.
 - Which test killed which of the 4 killed mutants was not measured.
-- The count of 6 runtime asserts for the second test against 10 written is unexplained; the test passes and is not
-  vacuous either way.
+- Why the four asserts were not counted was checked with a negative control, not in the compiler source: a scratch spec
+  (never committed; 5 tests; `tri test`, master-built `t27c`, 08:19 +07, exit 1) holds `pub const TBL : [4]u32 = [10, 20, 30, 40]`
+  and five tests. A true `assert_eq(TBL[2], 30)` passes and is reported `VACUOUS` (0 runtime asserts counted); a false
+  `assert_eq(TBL[2], 31)` FAILS, like a false `assert_eq(v, 31)` on a `var` and a false `assert_eq(30, 31)`. So an assert on
+  a constant table element is evaluated, not dropped, and not counted; the rewrite with a `var` only makes the count honest.
+  Other asserts of that shape in the analog specs (a candidate is `assert_eq(DEC_IDX[7], LD_IDX[0])` in this file) may be
+  uncounted the same way; they were not listed or run, so any such count is understated, not wrong.
 - The tests pin the model's own tie rules and scan bounds; they do not compare the model with ngspice.
 - Only `sar_kick.t27` was gated here. The other analog specs have a census with survivors not yet pinned: #12098
   (`sar_cdac`), #12099 (`sar_comparator_psp`).
