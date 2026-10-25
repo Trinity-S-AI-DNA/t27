@@ -4,7 +4,7 @@ Issue #12432, census 4 of 6 on issue #12241, part of epic #10486 (weak spots of 
 wrote the missing asserts of groups A to M and the accepted file. Groups N and O and line 522 needed a figure from the
 lab: they were deferred to issue #12512 and sat in the accepted file as "deferred test gap" entries until the five
 lab-value tests of that issue killed all seven mutants (second gate run, see "After"); the six entries are removed. The
-analog loop ran the mutation gate twice and re-saved the seal (see "After"). Where each number comes from:
+analog loop ran the mutation gate three times and re-saved the seal (see "After"). Where each number comes from:
 
 - **Before** (868 mutants, 659 killed, 98 survived, 78 hung, 33 unviable) is the analog-loop census of the unmodified
   spec, 18:57-19:27 +07, exit 0, 29 min 32 s, load 14.25 15.99 15.42 at the start, t27c 0.5.2. Kinds: drop-guard,
@@ -29,9 +29,18 @@ analog loop ran the mutation gate twice and re-saved the seal (see "After"). Whe
   run: killed 707 -> 712, survivors 49 -> 42, hung 79 -> 79, unviable 33 -> 35. The two extra unviable are line 699
   [swap-arith] x2: zig cache errors ("failed to open ...libcompiler_rt.a: FileNotFound", "failed to parse TBD file:
   NotLibStub"), not emitter refusals. The first run counted them killed, so the likely figures are 714 killed and 33
-  unviable; 712 and 35 are the measured ones. The six deferred entries were then removed from the accepted file (124 ->
-  118 entry lines). The run on this final file was not repeated, so exit 0 of the final file is inferred from the second
-  run's list, not measured. The census went 659 -> 707 -> 712 killed and 98 -> 49 -> 42 survivors.
+  unviable; 712 and 35 are the measured ones of that run (the confirmation gate below measured 714 and 33). The six deferred entries were then removed from the accepted file (124 ->
+  118 entry lines). The census went 659 -> 707 -> 712 -> 714 killed and 98 -> 49 -> 42 -> 42 survivors; the last step is
+  measured by the confirmation gate run on the final file (next bullet).
+- **After, confirmation gate run** (the gate with `--jobs 2 --timeout 45` on exactly the final accepted file, 118 entry
+  lines, as committed at head 06e2262dbb, 2026-10-26 03:29:42 to 04:18:12 +07, 48 min 30 s; load 8.20 7.17 6.88 at the
+  start): 868 mutants, 714 killed (714 by a failing test, 0 by an invariant at compile time), 42 survived, 79 hung, 33
+  unviable; 121 not killed (42 survived, 79 hung), all 121 matched by accepted entries, 0 accepted lines now killed,
+  "Gate passed", exit 0: measured, not inferred. The 33 unviable answers are all `zig: error: not yet implemented` (the
+  ret-default mutants of functions with no return value); no cache error (FileNotFound, NotLibStub, libcompiler_rt)
+  appeared in this run. Against the second run: killed 712 -> 714, survivors 42 -> 42, hung 79 -> 79, unviable 35 -> 33;
+  the two former unviable at line 699 [swap-arith] x2 are killed here (35 - 2 = 33, 712 + 2 = 714). Against the census:
+  +55 killed, -56 survived, +1 hung, unviable unchanged at 33.
 - **Seal**: `AnalogSarComparator` re-saved with the master-built t27c (exit 0, verify 0); only
   `.trinity/seals/analog_AnalogSarComparator.json` changed. The spec seal was re-saved again for the head b86b1acbee
   that adds the five lab-value tests of issue #12512 (five hashes match).
@@ -123,17 +132,16 @@ unviable of the second run (line 699, zig cache errors) are described in a comme
 
 ## Not done, not claimed
 
-- The gate was run twice (see "After"). The final accepted file, with the six deferred entries removed, was not run
-  itself: its exit 0 is inferred from the second run's list (the six removed keys are exactly the six lines that run
-  reported "accepted but killed", and it reported no other accepted line as killed), not measured. A third confirmation
-  run on the final file may follow; it is open and not promised. The census itself was not repeated; the two gate runs
-  are the only measurements of the new kill counts.
+- The gate was run three times (see "After"). The third run is the confirmation gate on exactly the final accepted file
+  (118 entry lines, head 06e2262dbb): its exit 0 is measured there, not inferred (the six removed keys are exactly the
+  six lines the second run reported "accepted but killed", and the confirmation run reported no accepted line as
+  killed). The census itself was not repeated; the three gate runs are the only measurements of the new kill counts.
 - The seven mutants that were open are closed by issue #12512 and are killed in the second run: line 522 (`k < 9` to `k
   <= 9` in the row update of `sc_eliminate`), group N (1396, 1397, 1404, `sc_headroom` with swap = true) and group O
   (1291, 1322 x2, the transposed control and `sc_gap_g`). Line 522 was "not decided" in the census; it is killed, so it is
   not equivalent, and line 1404 needed no entry in the equivalent block.
 - Open, infrastructure noise: the unviable count is 35 in the second run against 33 in the first. The two extra are line
-  699 [swap-arith] x2, zig cache errors and not emitter refusals (the cache-clean launch agent logged removing the whole zig global cache, 61.5 GiB, at 02:06:45 in the middle of the run: read from its log, and the link to the two errors is inferred); the likely figures are 714 killed and 33 unviable. A
+  699 [swap-arith] x2, zig cache errors and not emitter refusals (the cache-clean launch agent logged removing the whole zig global cache, 61.5 GiB, at 02:06:45 in the middle of the run: read from its log, and the link to the two errors is inferred); the likely figures are 714 killed and 33 unviable, and the confirmation run measured them (714 killed, 33 unviable, no cache error). A
   gate should list a zig answer that is not "not yet implemented" apart from the emitter refusals, so that such a
   mutant is not counted as unviable (or as killed) without being seen. Filed as issue #12539.
 - The 42 equivalent survivors are classified by reading the arithmetic, not proved equivalent by a tool; the 349 and 825
