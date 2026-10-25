@@ -12,9 +12,13 @@ is still not measured. Where each number comes from:
 - **Tests** are `tri test specs/analog/mos_psp103.t27` in a T27 OS pane, started at 21:26 +07 with load averages
   27.10 23.04 18.44: 51 tests (40 before, 11 new), 51 pass, 0 fail, 0 vacuous of 51 (every test executed asserts).
   The 11 new blocks hold 199 runtime asserts.
-- **Gate** (the re-run of the census on the tree with the new tests, with the accepted file) has NOT been run. No
-  mutant below is shown killed by a gate result; each claim "kills" is a hand check of the mutated line against the
-  assert, nothing more.
+- **Gate** (the re-run of the census on the tree with the new tests, with the accepted file): `tri mutate spec --file
+  specs/analog/mos_psp103.t27 --accepted docs/analog/mutation-accepted-mos_psp103.txt --jobs 2 --timeout 45` with the
+  master-built t27c, in a T27 OS pane, 21:34:02 to 21:53:59 +07 (20 minutes, load averages 21.19 26.22 22.95 at the
+  start). Result: 359 mutants, 306 killed (306 by a failing test, 0 by an invariant at compile time), 30 survived, 18
+  hung, 5 unviable; 48 not killed (30 survived + 18 hung), 48 accepted, 0 accepted lines now killed; "Gate passed",
+  exit 0. Against the census, killed went from 264 to 306: exactly the 42 test gaps of section 1, and the 30 that
+  still survive are the 22 + 2 + 6 equivalent ones.
 
 ## 1. Survivors by label
 
@@ -86,11 +90,10 @@ lab value, so no survivor was left undecided.
 
 ## 5. Not done, and not proven
 
-- The mutation gate has not been run on this tree and the seal of the spec has not been re-saved; the orchestrator does
-  both. The accepted file lists 48 mutants (30 survivors, 18 hung) that the gate must find unchanged; if one of the
-  accepted lines is reported killed, the file needs that entry removed.
-- Each kill above is a hand check of the mutated line against the assert (the mutants were not applied). The tests
-  pass on the original spec; whether each fails on its mutant is for the gate to show.
+- The gate ran on this tree and passed (section above), and the seal of the spec was re-saved with the master-built
+  t27c (`seal --save`, `seal --verify` and `tri seals changed` all exit 0).
+- The 42 kills are now a gate measurement (264 to 306), but the gate does not say which test killed which mutant, so
+  the per-group claims in section 2 stay the hand checks they were. The 18 hung are the census's hung, unchanged.
 - Inferred, not computed: `mag_diff` at most 1 for 643 and 646, the rounding-noise bound for 689, and the "to within the
   last ulp" equivalence of the 16 `gate_step` mutants (the evidence is their survival under windows of 10 units and the
   hangs at 707 and 715).
