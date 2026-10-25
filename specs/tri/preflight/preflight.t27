@@ -1,0 +1,246 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/preflight/preflight.t27 -- the local gates as a push preflight (#11783).
+; Every t27 pull request this session passed CI first-run because the agent ran the nine
+; local gates of specs/t27os/labs.t27 by hand (~3 minutes) before pushing. This spec turns
+; that habit into one command: `tri preflight` runs the gates, prints one line per gate,
+; and refuses (exit 1) on any red, so the manual checklist disappears and a red gate is
+; seen on this machine instead of in CI.
+; --
+; WHAT IS DECIDED HERE (every rule has a test below):
+; - THE TABLE IS labs.t27's, not ours. The commands are imported from specs/t27os/labs.t27
+;   (gate_command), never restated: one table, one place a gate command changes. This file
+;   adds only what labs.t27 does not decide: the names the lines print, the per-gate
+;   timeout ceiling, the verdict classes, and the refuse rule.
+; - ALL NINE GATES BLOCK. The repair cycle's own rule carries over (labs.t27
+;   repair_needed): any red gate means the tree does not land new work, so any red gate
+;   refuses the push. There is no advisory gate today; when one arrives it flips a
+;   pf_blocking row, not the runner.
+; - THREE VERDICTS, not two. exit 0 is ok, exit 1 is RED, and ANYTHING ELSE -- a timeout,
+;   a signal, a missing tool (measured: without the t27c binary on PATH, six of the nine
+;   exit 2, "no verdict earned") -- is UNREAD. Fail closed, the same rule
+;   specs/tri/pr/preflight.t27 states for its own evidence: a gate that could not produce
+;   a verdict is never a pass. UNREAD refuses the push with exit 2, RED with exit 1; when
+;   both appear RED wins the exit because it is the actionable one.
+; - THE TIMEOUT IS A CEILING, NOT A PROMISE. Two gates regenerate the whole corpus
+;   (seal-coverage, emit-bitexact) and get 300 s; the rest get 120 s. A gate killed at its
+;   ceiling exits as UNREAD -- "took too long to say anything" -- never as ok.
+; --
+; WHAT IS NOT HERE: the spawn of sh, the kill at the deadline, and the reading of exit
+; codes; they are host calls (cli/tri/src/main.rs cmd_preflight). Every rule the host
+; applies -- which gate, which command, how long, what verdict, refuse or allow, which
+; exit -- is decided here and tested.
+; --
+; HONEST LIMITS. (1) The preflight runs the gates on THIS tree; it does not rebase, and a
+; tree that is green here can still go red on origin/master's newer tip -- rebase first,
+; which is the landing procedure's own step. (2) A red owned by another lane (the genfix
+; lane owns t27b's build at the time of writing) is still a red here: the preflight names
+; the gate and the command to inspect, and does not judge whose defect it is. (3) The
+; gate commands shell out to `tri` and `python3` as found on PATH; the preflight adds no
+; PATH of its own.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriPreflight;
+
+use t27os::labs::GATE_COUNT;
+use t27os::labs::GATE_WIDTHS;
+use t27os::labs::GATE_EMIT_BITEXACT;
+use t27os::labs::gate_command;
+use claw::text::put_str;
+use claw::text::has_prefix;
+
+; --- the gate table -------------------------------------------------------
+; The commands are labs.t27's (imported); the names are this command's one-line labels,
+; in gate order, one per GATE_* constant of labs.t27.
+
+pub const PF_NAMES : [9]str = ["widths", "types-ratchet", "types-classified", "seal-coverage", "seal-currency", "ring-drift", "assertionless", "documented-cmds", "emit-bitexact"];
+
+; Per-gate timeout ceiling, seconds, in gate order. A kill at the ceiling is UNREAD.
+
+pub const PF_TIMEOUTS : [9]u32 = [300, 120, 120, 300, 300, 120, 120, 120, 300];
+
+; --- verdicts -------------------------------------------------------------
+
+pub const PF_OK : u8 = 0;
+pub const PF_RED : u8 = 1;
+pub const PF_UNREAD : u8 = 2;
+
+pub fn pf_name(i : u8) -> str {
+    if (i >= GATE_COUNT) { return "?"; }
+    return PF_NAMES[i];
+}
+
+; pf_command is the identity on purpose: the table is labs.t27's, never a copy.
+
+pub fn pf_command(i : u8) -> str {
+    return gate_command(i);
+}
+
+pub fn pf_timeout(i : u8) -> u32 {
+    if (i >= GATE_COUNT) { return 0; }
+    return PF_TIMEOUTS[i];
+}
+
+; pf_blocking: every gate in the table blocks. Out of range blocks nothing (vacuous).
+
+pub fn pf_blocking(i : u8) -> bool {
+    return i < GATE_COUNT;
+}
+
+; pf_classify: exit 0 ok, exit 1 RED, anything else UNREAD (timeout, signal, missing tool).
+
+pub fn pf_classify(x : u8) -> u8 {
+    if (x == 0) { return PF_OK; }
+    if (x == 1) { return PF_RED; }
+    return PF_UNREAD;
+}
+
+; pf_refuses: the fail-closed rule. Only PF_OK allows the push.
+
+pub fn pf_refuses(v : u8) -> bool {
+    return v != PF_OK;
+}
+
+; pf_exit_code: RED refuses 1, UNREAD refuses 2, ok exits 0.
+
+pub fn pf_exit_code(v : u8) -> u8 {
+    if (v == PF_RED) { return 1; }
+    if (v == PF_UNREAD) { return 2; }
+    return 0;
+}
+
+; pf_worse: the fold for the whole run. RED outranks UNREAD: both refuse, but RED is
+; the verdict a reader can act on, so it wins the exit and the summary line.
+
+pub fn pf_worse(a : u8, b : u8) -> u8 {
+    if (a == PF_RED || b == PF_RED) { return PF_RED; }
+    if (a == PF_UNREAD || b == PF_UNREAD) { return PF_UNREAD; }
+    return PF_OK;
+}
+
+pub fn pf_verdict_word(x : u8) -> str {
+    if (x == 0) { return "ok"; }
+    if (x == 1) { return "RED"; }
+    return "no-verdict";
+}
+
+; pf_line: the one line the runner prints for gate i -- "preflight <name> <verdict>".
+
+pub fn pf_line(out : []u8, cap : usize, i : u8, x : u8) -> usize {
+    var w : usize = 0;
+    w = put_str(out, cap, w, "preflight ", 10);
+    w = put_str(out, cap, w, pf_name(i), pf_name(i).len());
+    w = put_str(out, cap, w, " ", 1);
+    w = put_str(out, cap, w, pf_verdict_word(x), pf_verdict_word(x).len());
+    return w;
+}
+
+; --- tests ----------------------------------------------------------------
+
+test commands_are_labs_commands_not_a_copy {
+    var i : u8 = 0;
+    while (i < GATE_COUNT) {
+        assert pf_command(i) == gate_command(i);
+        assert pf_command(i) != "";
+        i = i + 1;
+    }
+    assert gate_command(GATE_WIDTHS) != "";
+    assert gate_command(GATE_EMIT_BITEXACT) != "";
+}
+
+test anchor_len_is_47 {
+    assert pf_command(0).len() == 47;
+}
+
+test anchor_first_prefixes {
+    assert has_prefix(pf_command(0), pf_command(0).len(), "python3 tools/check_verilog_widths.py", 37);
+}
+
+test anchor_last_prefixes {
+    assert has_prefix(pf_command(GATE_COUNT - 1), pf_command(GATE_COUNT - 1).len(), "python3 tools/verify_emit_bitexact.py", 37);
+}
+
+test has_prefix_trivial {
+    assert has_prefix("abcdef", 6, "abc", 3);
+}
+
+test names_cover_every_gate {
+    var i : u8 = 0;
+    while (i < GATE_COUNT) {
+        assert pf_name(i) != "?";
+        assert pf_name(i) != "";
+        i = i + 1;
+    }
+    assert pf_name(9) == "?";
+    assert pf_name(99) == "?";
+    assert pf_name(GATE_WIDTHS) == "widths";
+    assert pf_name(GATE_EMIT_BITEXACT) == "emit-bitexact";
+}
+
+test every_gate_blocks_and_carries_a_ceiling {
+    var i : u8 = 0;
+    while (i < GATE_COUNT) {
+        assert pf_blocking(i) == true;
+        assert pf_timeout(i) > 0;
+        i = i + 1;
+    }
+    assert pf_blocking(9) == false;
+    assert pf_blocking(99) == false;
+    assert pf_timeout(99) == 0;
+}
+
+; seal-coverage (3), seal-currency (4), emit-bitexact (8) and widths (0) all regenerate
+; with the compiler and hold the 300 s ceiling; the five pure scanners hold 120 s. The
+; knobs are measured, not guessed: widths and seal-currency each crossed 120 s on the
+; owner's Mac as master's corpus grew, and the preflight caught both as no-verdict.
+test the_four_regenerating_gates_hold_the_larger_ceiling {
+    assert pf_timeout(0) == 300;
+    assert pf_timeout(3) == 300;
+    assert pf_timeout(4) == 300;
+    assert pf_timeout(8) == 300;
+    var i : u8 = 0;
+    var total : u32 = 0;
+    while (i < GATE_COUNT) {
+        total = total + pf_timeout(i);
+        i = i + 1;
+    }
+    assert total == 1800;
+}
+
+test classify_reads_only_exact_codes {
+    assert pf_classify(0) == PF_OK;
+    assert pf_classify(1) == PF_RED;
+    assert pf_classify(2) == PF_UNREAD;
+    assert pf_classify(127) == PF_UNREAD;
+    assert pf_classify(255) == PF_UNREAD;
+}
+
+test only_ok_allows_the_push {
+    assert pf_refuses(PF_OK) == false;
+    assert pf_refuses(PF_RED) == true;
+    assert pf_refuses(PF_UNREAD) == true;
+    assert pf_exit_code(PF_OK) == 0;
+    assert pf_exit_code(PF_RED) == 1;
+    assert pf_exit_code(PF_UNREAD) == 2;
+}
+
+test red_outranks_unread_in_the_fold {
+    assert pf_worse(PF_OK, PF_OK) == PF_OK;
+    assert pf_worse(PF_OK, PF_RED) == PF_RED;
+    assert pf_worse(PF_OK, PF_UNREAD) == PF_UNREAD;
+    assert pf_worse(PF_UNREAD, PF_OK) == PF_UNREAD;
+    assert pf_worse(PF_RED, PF_UNREAD) == PF_RED;
+    assert pf_worse(PF_UNREAD, PF_RED) == PF_RED;
+    assert pf_exit_code(pf_worse(PF_UNREAD, PF_RED)) == 1;
+}
+
+test the_line_names_the_gate_and_the_verdict {
+    var buf : [64]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var n : usize = 0;
+    n = pf_line(buf, 64, 0, 0);
+    assert n > 10;
+    assert has_prefix(buf, n, "preflight widths ok", 19);
+    n = pf_line(buf, 64, 0, 1);
+    assert has_prefix(buf, n, "preflight widths RED", 20);
+    n = pf_line(buf, 64, 8, 2);
+    assert has_prefix(buf, n, "preflight emit-bitexact no-verdict", 34);
+}
