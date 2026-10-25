@@ -103,7 +103,7 @@ checks. The categories, with the reference test to read for each:
 - **Loading, empty and error.** Drive `VIZ_EV_LOAD`, `VIZ_EV_LOADED` with no items
   (`VIZ_LC_EMPTY`), `VIZ_EV_FAILED` (`VIZ_LC_ERROR`) and `VIZ_EV_RETRY`; check that interaction is
   ignored until the view is ready, and that each lifecycle has something to draw. The reference
-  has no test of its own for EMPTY or ERROR (checked 2026-10-25): do not copy that gap.
+  has no test of its own for EMPTY or ERROR (as merged in #12193): do not copy that gap.
 - **Keyboard focus and reduced motion.** `VIZ_EV_FOCUS_NEXT` walks your entities in your focus
   order and wraps; `VIZ_EV_ACTIVATE` on the focused item equals a click
   (`focus_walks_nodes_then_edges_and_activate_selects_the_focused_item`); `VIZ_EV_BACK` clears the
@@ -117,7 +117,7 @@ checks. The categories, with the reference test to read for each:
 - **Host embedding.** `vh_validate` accepts the host; `vh_hit` returns each slot at a point inside
   it (`the_host_validates_and_places_each_view_in_its_slot` shows both); `vh_focus_next` follows
   slot order; the host still validates after `vh_embed` into another. The reference tests neither
-  of the last two (checked 2026-10-25): cover them.
+  of the last two (as merged in #12193): cover them.
 - **Invariants.** An `invariant` lowers to Zig comptime with a backward-branch quota of 1000, and
   one blown quota blocks the whole spec's report while `typecheck` stays quiet. No loops in
   invariants; put the iteration in a test.
@@ -149,7 +149,8 @@ checks. The categories, with the reference test to read for each:
 - **Every commit carries `Closes #<child>` or `Refs #12173`.** The L1 check
   (`.github/workflows/l1-traceability.yml`) reads each commit, and "see #N" or "Part of #N" fails.
   Never put `Closes` on the epic.
-- **Seals.** A new petal spec lands without a seal; the contract, the plan and the reference did.
+- **Seals.** A new petal spec lands without a seal, and so did the contract, the plan and the
+  reference: none of the three has a file under `.trinity/seals/`.
   Once a spec is sealed (with a master-built `t27c`, CLAUDE.md section 2, "Seals"), re-seal it after
   every edit: a seal that no longer matches its spec fails `seal-coverage`
   (`tools/check_seal_coverage.py`).
