@@ -43,6 +43,10 @@ mod hir_cost_models;
 #[path = "../gen/rust/compiler/verilog_bram_shape.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, clippy::all)]
 mod verilog_bram_shape;
+// specs/compiler/literal_text.t27 (#12298), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/literal_text.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, clippy::all)]
+mod literal_text;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -7800,22 +7804,7 @@ impl Codegen {
     /// `0i32` -> `0`, `1.5f64` -> `1.5`, `7usize` -> `7`; anything that is not
     /// a numeric literal with a Rust width suffix is returned unchanged.
     fn strip_rust_num_suffix(v: &str) -> String {
-        for suf in [
-            "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "f64",
-            "f32", "u8", "i8",
-        ] {
-            if let Some(num) = v.strip_suffix(suf) {
-                let num = num.strip_suffix('_').unwrap_or(num);
-                let body = num.strip_prefix('-').unwrap_or(num);
-                if !body.is_empty()
-                    && body.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                    && body.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
-                {
-                    return num.to_string();
-                }
-            }
-        }
-        v.to_string()
+        crate::use_resolve::sized(|b, c| literal_text::strip_num_suffix(v.as_bytes(), b, c))
     }
 
     /// Locals a block declares with one of the given explicit types.
@@ -13985,6 +13974,18 @@ impl VerilogCodegen {
         true
     }
 
+    /// #12298: `[v] ** N` fills a 1-D module array; the lines are specs/compiler/literal_text.t27.
+    fn emit_repeat_fill(&mut self, name: &str, dims: &[usize], init: &Node) {
+        if dims.len() != 1 || init.kind != NodeKind::ExprBinary || init.extra_op != "**" || init.children.len() != 2 || init.children[0].children.len() > 1 { return; }
+        let (lit, mut c) = (&init.children[0], String::new());
+        let mut v = Self::verilog_normalize_literal_text(&Codegen::strip_rust_num_suffix(&lit.extra_size));
+        if let Some(e) = lit.children.first() { v.clear(); self.collect_expr_text(e, &mut v); }
+        self.collect_expr_text(&init.children[1], &mut c);
+        let (n, d) = (name.as_bytes(), dims[0] as i64);
+        let text = crate::use_resolve::sized(|b, k| literal_text::start_values(n, n, d, c.as_bytes(), v.as_bytes(), self.emit_test_assertions as i64, self.indent as i64, b, k));
+        self.write(&text);
+    }
+
     /// W531: emit procedural assignments that initialize an unpacked primitive
     /// multi-dimensional array from a nested array literal.
     fn emit_unpacked_primitive_array_init(
@@ -15458,6 +15459,7 @@ impl VerilogCodegen {
                     }
                     _ => node.children[0].clone(),
                 };
+                self.emit_repeat_fill(&node.name, &dims, &init_node);
                 self.emit_unpacked_primitive_array_init(
                     &node.name,
                     &node.extra_type,
@@ -15482,9 +15484,6 @@ impl VerilogCodegen {
         };
         // W382: array type may come from the type annotation (e.g. "[4]u16") in
         // addition to the legacy extra_size path used by array literals.
-        let type_array = Self::parse_array_type(&node.extra_type);
-        // W382/W383: array type may come from the type annotation (e.g. "[4]u16")
-        // in addition to the legacy extra_size path. Restored from Wave Loop 455.
         let type_array = Self::parse_array_type(&node.extra_type);
         let is_array = !node.extra_size.is_empty() || type_array.is_some();
         let safe_name = Self::verilog_safe_identifier(&node.name);

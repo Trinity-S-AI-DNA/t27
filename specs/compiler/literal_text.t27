@@ -1,0 +1,329 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/compiler/literal_text.t27 -- the text a backend writes for a literal: the start values of a repeat
+; literal in Verilog (Closes #12298, Refs #9367), and the Rust width suffix that the Zig-style forms cut off.
+; --
+; The problem. `var mem : [65536]u8 = [0] ** 65536;` at module level reached the Verilog backend as an
+; `ExprBinary` whose operator is `**`, and `emit_unpacked_primitive_array_init` knows one initialiser: an
+; array literal that lists its elements. A repeat was neither, so the function returned without a line and
+; the declaration came out as `reg [7:0] mem[0:65535];` followed by an empty `initial begin end`. A
+; synthesizer reads that as "no start values" -- right for a block RAM, which powers up zero in the fabric --
+; but a simulator reads it as `x` in every byte, and a spec that says "a byte nobody wrote is 0" had no way
+; to be true under `vvp`. The same hole is open for every repeat literal the backend meets, 136 specs of the
+; corpus write one.
+; --
+; The fill. `repeat_fill` writes the lines that go inside that `initial` block, for a one-dimensional array
+; of DIM elements, `COUNT` repeats of the value VAL:
+; - from FILL_LOOP_MIN elements on, one named block with a loop (Verilog-2005 allows a declaration only in
+;   a named block, so `integer i;` cannot sit in the bare `initial begin`):
+;       begin : NAME__fill
+;           integer i;
+;           for (i = 0; i < N; i = i + 1) NAME[i] = VAL;
+;       end
+;   a 64 KiB array is three lines, not 65536, and iverilog (-g2005 and -g2012) and yosys read it;
+; - below it, one line `NAME[k] = VAL;` per element, which is what the literal `[a, b, c]` already gets.
+; The count is read from the text when it is digits (with `_`), else the array size stands for it: a repeat
+; count that names a constant (`** MEM_BYTES`) is the array's own size in any program that type-checks.
+; It never goes past DIM. `undefined` as the value means "any value will do", so no line is written.
+; `start_values` is what the backend calls: a synthesis run writes nothing for a value of zero (power-up zero is
+; what the hardware does, and the loop costs yosys 671 s on a 64 KiB array); a simulation run writes the fill,
+; because a simulator reads `x` otherwise.
+; Not covered, and as before: an array of more than one dimension, and a repeat whose pattern lists more
+; than one value (`[1, 2] ** n`): both still write no lines.
+; --
+; strip_num_suffix is compiler.rs `strip_rust_num_suffix`, moved here to pay for the mount (the hand Rust
+; kept only a one-line call): `0i32` is `0`, `1.5f64` is `1.5`, `7usize` is `7`, and a text that is not a
+; number with a width suffix comes back as it was.
+; --
+; `t27c gen-rust` lowers this spec to bootstrap/gen/rust/compiler/literal_text.rs, which
+; bootstrap/src/compiler.rs mounts by #[path]. Never hand-edit the generated copy.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module LiteralText;
+
+use tri::t27b::type_text;
+use compiler::verilog_bram_shape;
+
+pub const B_NL : u8 = 10;
+pub const B_SPACE : u8 = 32;
+pub const B_MINUS : u8 = 45;
+pub const B_DOT : u8 = 46;
+pub const B_ZERO : u8 = 48;
+pub const B_UNDER : u8 = 95;
+
+/// From this many elements on, a repeat is filled by one loop; below it, by one line per element.
+pub const FILL_LOOP_MIN : i64 = 16;
+
+/// The backend indents by four.
+pub const INDENT_STEP : i64 = 4;
+
+fn put_indent(out: []u8, cap: usize, at: usize, level: i64) -> usize {
+    var w : usize = at;
+    var k : i64 = 0;
+    while (k < level * INDENT_STEP) {
+        w = verilog_bram_shape::put(out, cap, w, B_SPACE);
+        k += 1;
+    }
+    return w;
+}
+
+/// The decimal digits of v >= 0.
+fn put_dec(out: []u8, cap: usize, at: usize, v: i64) -> usize {
+    var d : i64 = 1;
+    while (v / d >= 10) { d = d * 10; }
+    var w : usize = at;
+    var r : i64 = v;
+    while (d > 0) {
+        const dig : i64 = r / d;
+        const c : u8 = @intCast(dig + 48);
+        w = verilog_bram_shape::put(out, cap, w, c);
+        r = r - dig * d;
+        d = d / 10;
+    }
+    return w;
+}
+
+/// How many elements the repeat writes: COUNT when it is digits (`_` allowed), else DIM; never more than DIM.
+fn fill_count(count: []const u8, dim: i64) -> i64 {
+    const lo : usize = type_text::trim_lo(count, 0, count.len);
+    const hi : usize = type_text::trim_hi(count, lo, count.len);
+    if (lo >= hi) { return dim; }
+    var v : i64 = 0;
+    var i : usize = lo;
+    while (i < hi) {
+        const c : u8 = count[i];
+        if (type_text::digit(c)) {
+            if (v <= dim) {
+                const dv : i64 = @intCast(c - B_ZERO);
+                v = v * 10 + dv;
+            }
+        } else if (c != B_UNDER) {
+            return dim;
+        }
+        i += 1;
+    }
+    if (v > dim) { return dim; }
+    return v;
+}
+
+/// The lines (each ending in a newline) that fill NAME, an array of DIM elements, with COUNT repeats of VAL,
+/// at INDENT levels of four spaces; LABEL names the loop's block. 0 when there is nothing to write.
+pub fn repeat_fill(name: []const u8, label: []const u8, dim: i64, count: []const u8, val: []const u8, indent: i64, out: []u8, cap: usize) -> usize {
+    const n : i64 = fill_count(count, dim);
+    const vlo : usize = type_text::trim_lo(val, 0, val.len);
+    const vhi : usize = type_text::trim_hi(val, vlo, val.len);
+    if (n <= 0 or vlo >= vhi) { return 0; }
+    if (type_text::same(val[vlo .. vhi], "undefined")) { return 0; }
+    var w : usize = 0;
+    if (n >= FILL_LOOP_MIN) {
+        w = put_indent(out, cap, w, indent);
+        w = verilog_bram_shape::put_str(out, cap, w, "begin : ");
+        w = verilog_bram_shape::put_span(label, 0, label.len, out, cap, w);
+        w = verilog_bram_shape::put_str(out, cap, w, "__fill");
+        w = verilog_bram_shape::put(out, cap, w, B_NL);
+        w = put_indent(out, cap, w, indent + 1);
+        w = verilog_bram_shape::put_str(out, cap, w, "integer i;");
+        w = verilog_bram_shape::put(out, cap, w, B_NL);
+        w = put_indent(out, cap, w, indent + 1);
+        w = verilog_bram_shape::put_str(out, cap, w, "for (i = 0; i < ");
+        w = put_dec(out, cap, w, n);
+        w = verilog_bram_shape::put_str(out, cap, w, "; i = i + 1) ");
+        w = verilog_bram_shape::put_span(name, 0, name.len, out, cap, w);
+        w = verilog_bram_shape::put_str(out, cap, w, "[i] = ");
+        w = verilog_bram_shape::put_span(val, vlo, vhi, out, cap, w);
+        w = verilog_bram_shape::put(out, cap, w, 59);
+        w = verilog_bram_shape::put(out, cap, w, B_NL);
+        w = put_indent(out, cap, w, indent);
+        w = verilog_bram_shape::put_str(out, cap, w, "end");
+        w = verilog_bram_shape::put(out, cap, w, B_NL);
+    } else {
+        var k : i64 = 0;
+        while (k < n) {
+            w = put_indent(out, cap, w, indent);
+            w = verilog_bram_shape::put_span(name, 0, name.len, out, cap, w);
+            w = verilog_bram_shape::put(out, cap, w, 91);
+            w = put_dec(out, cap, w, k);
+            w = verilog_bram_shape::put_str(out, cap, w, "] = ");
+            w = verilog_bram_shape::put_span(val, vlo, vhi, out, cap, w);
+            w = verilog_bram_shape::put(out, cap, w, 59);
+            w = verilog_bram_shape::put(out, cap, w, B_NL);
+            k += 1;
+        }
+    }
+    return w;
+}
+
+/// Is the value only zeros (`0`, `00`, `0_0`)? A start value of zero is what a flip-flop or a block RAM
+/// powers up with, so a synthesizer needs no line to write it.
+fn is_zero(v: []const u8, lo: usize, hi: usize) -> bool {
+    if (lo >= hi) { return false; }
+    var i : usize = lo;
+    while (i < hi) {
+        if (v[i] != B_ZERO and v[i] != B_UNDER) { return false; }
+        i += 1;
+    }
+    return v[lo] == B_ZERO;
+}
+
+/// What the backend writes for a repeat: `repeat_fill`, except that a synthesis run (SIM = 0) writes nothing
+/// for a value of zero. Measured on the 64 KiB cell (specs/fpga/wasm_board_ax7203.t27): yosys `read_verilog`
+/// took 3.5 s with the empty `initial` and 671 s with the zero loop in it, for the same hardware.
+pub fn start_values(name: []const u8, label: []const u8, dim: i64, count: []const u8, val: []const u8, sim: i64, indent: i64, out: []u8, cap: usize) -> usize {
+    const vlo : usize = type_text::trim_lo(val, 0, val.len);
+    const vhi : usize = type_text::trim_hi(val, vlo, val.len);
+    if (sim == 0 and is_zero(val, vlo, vhi)) { return 0; }
+    return repeat_fill(name, label, dim, count, val, indent, out, cap);
+}
+
+/// Does v end in the word w?
+fn tail_is(v: []const u8, w: str) -> bool {
+    if (v.len < w.len) { return false; }
+    return type_text::same(v[v.len - w.len .. v.len], w);
+}
+
+/// The length of the Rust width suffix v ends in (`usize`, `u8`, `f64` ...), or 0.
+fn suffix_len(v: []const u8) -> usize {
+    if (tail_is(v, "usize") or tail_is(v, "isize")) { return 5; }
+    if (tail_is(v, "u128") or tail_is(v, "i128")) { return 4; }
+    if (tail_is(v, "u64") or tail_is(v, "i64") or tail_is(v, "u32") or tail_is(v, "i32")) { return 3; }
+    if (tail_is(v, "u16") or tail_is(v, "i16") or tail_is(v, "f64") or tail_is(v, "f32")) { return 3; }
+    if (tail_is(v, "u8") or tail_is(v, "i8")) { return 2; }
+    return 0;
+}
+
+/// `0i32` -> `0`, `1.5f64` -> `1.5`, `7usize` -> `7`; anything that is not a numeric literal with a Rust width
+/// suffix is written unchanged. One `_` before the suffix goes with it (`1_u8`); the number is an optional `-`,
+/// then a digit, then digits, `.` and `_`.
+pub fn strip_num_suffix(v: []const u8, out: []u8, cap: usize) -> usize {
+    const sl : usize = suffix_len(v);
+    if (sl > 0) {
+        var hi : usize = v.len - sl;
+        if (hi > 0 and v[hi - 1] == B_UNDER) { hi = hi - 1; }
+        var lo : usize = 0;
+        if (hi > 0 and v[0] == B_MINUS) { lo = 1; }
+        var ok : bool = false;
+        if (lo < hi) { ok = type_text::digit(v[lo]); }
+        var i : usize = lo;
+        while (ok and i < hi) {
+            const c : u8 = v[i];
+            ok = type_text::digit(c) or c == B_DOT or c == B_UNDER;
+            i += 1;
+        }
+        if (ok) { return verilog_bram_shape::put_span(v, 0, hi, out, cap, 0); }
+    }
+    return verilog_bram_shape::put_span(v, 0, v.len, out, cap, 0);
+}
+
+test a_big_repeat_is_one_named_loop {
+    var out : [256]u8 = undefined;
+    const want : str = "        begin : mem__fill\n            integer i;\n            for (i = 0; i < 65536; i = i + 1) mem[i] = 0;\n        end\n";
+    const n : usize = repeat_fill("mem", "mem", 65536, "65536", "0", 2, out[0 .. 256], 256);
+    assert n == want.len;
+    assert type_text::same(out[0 .. n], want);
+}
+
+test a_small_repeat_is_one_line_per_element {
+    var out : [256]u8 = undefined;
+    const want : str = "        mem[0] = 7;\n        mem[1] = 7;\n        mem[2] = 7;\n";
+    const n : usize = repeat_fill("mem", "mem", 3, "3", "7", 2, out[0 .. 256], 256);
+    assert type_text::same(out[0 .. n], want);
+}
+
+test the_threshold_is_where_the_loop_starts {
+    var out : [1024]u8 = undefined;
+    const below : usize = repeat_fill("m", "m", 15, "15", "0", 1, out[0 .. 1024], 1024);
+    assert type_text::starts(out[0 .. 1024], 0, below, "    m[0] = 0;\n    m[1] = 0;\n");
+    assert type_text::starts(out[0 .. 1024], below - 15, below, "    m[14] = 0;\n");
+    const at : usize = repeat_fill("m", "m", 16, "16", "0", 1, out[0 .. 1024], 1024);
+    assert type_text::starts(out[0 .. 1024], 0, at, "    begin : m__fill\n");
+    assert at < below;
+}
+
+test a_count_that_names_a_constant_is_the_array_size {
+    var out : [256]u8 = undefined;
+    const n : usize = repeat_fill("mem", "mem", 20, "MEM_BYTES", "0", 0, out[0 .. 256], 256);
+    assert type_text::same(out[0 .. n], "begin : mem__fill\n    integer i;\n    for (i = 0; i < 20; i = i + 1) mem[i] = 0;\nend\n");
+}
+
+test a_count_past_the_array_stops_at_its_end {
+    var out : [256]u8 = undefined;
+    const n : usize = repeat_fill("mem", "mem", 20, "100", "0", 0, out[0 .. 256], 256);
+    assert type_text::starts(out[0 .. 256], 0, n, "begin : mem__fill\n    integer i;\n    for (i = 0; i < 20;");
+}
+
+test a_count_with_separators_is_read {
+    var out : [256]u8 = undefined;
+    const n : usize = repeat_fill("mem", "mem", 4096, "1_024", "0", 0, out[0 .. 256], 256);
+    assert type_text::starts(out[0 .. 256], 0, n, "begin : mem__fill\n    integer i;\n    for (i = 0; i < 1024;");
+}
+
+test a_value_of_any_kind_writes_nothing {
+    var out : [256]u8 = undefined;
+    assert repeat_fill("mem", "mem", 64, "64", "undefined", 2, out[0 .. 256], 256) == 0;
+    assert repeat_fill("mem", "mem", 64, "64", "", 2, out[0 .. 256], 256) == 0;
+}
+
+test a_count_of_zero_writes_nothing {
+    var out : [256]u8 = undefined;
+    assert repeat_fill("mem", "mem", 64, "0", "5", 2, out[0 .. 256], 256) == 0;
+}
+
+test the_size_query_and_the_write_agree {
+    var out : [256]u8 = undefined;
+    const need : usize = repeat_fill("mem", "mem", 65536, "65536", "255", 2, out[0 .. 0], 0);
+    const got : usize = repeat_fill("mem", "mem", 65536, "65536", "255", 2, out[0 .. 256], 256);
+    assert need == got;
+    assert got > 0;
+}
+
+test a_synthesis_run_skips_a_zero_fill {
+    var out : [256]u8 = undefined;
+    assert start_values("mem", "mem", 65536, "65536", "0", 0, 2, out[0 .. 256], 256) == 0;
+    assert start_values("mem", "mem", 3, "3", "0", 0, 2, out[0 .. 256], 256) == 0;
+    assert start_values("mem", "mem", 64, "64", "0_0", 0, 2, out[0 .. 256], 256) == 0;
+}
+
+test a_synthesis_run_keeps_a_fill_that_is_not_zero {
+    var out : [256]u8 = undefined;
+    const big : usize = start_values("mem", "mem", 64, "64", "7", 0, 0, out[0 .. 256], 256);
+    assert type_text::same(out[0 .. big], "begin : mem__fill\n    integer i;\n    for (i = 0; i < 64; i = i + 1) mem[i] = 7;\nend\n");
+    const odd : usize = start_values("mem", "mem", 2, "2", "10", 0, 0, out[0 .. 256], 256);
+    assert type_text::same(out[0 .. odd], "mem[0] = 10;\nmem[1] = 10;\n");
+}
+
+test a_simulation_run_writes_the_zero_fill {
+    var out : [256]u8 = undefined;
+    const n : usize = start_values("mem", "mem", 65536, "65536", "0", 1, 2, out[0 .. 256], 256);
+    assert n == repeat_fill("mem", "mem", 65536, "65536", "0", 2, out[0 .. 256], 256);
+    assert n > 0;
+}
+
+test a_rust_width_suffix_is_cut_off {
+    var out : [64]u8 = undefined;
+    const a : usize = strip_num_suffix("0i32", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. a], "0");
+    const b : usize = strip_num_suffix("1.5f64", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. b], "1.5");
+    const c : usize = strip_num_suffix("7usize", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. c], "7");
+    const d : usize = strip_num_suffix("-5i8", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. d], "-5");
+    const e : usize = strip_num_suffix("1_000_u64", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. e], "1_000");
+}
+
+test a_text_that_is_not_a_suffixed_number_is_unchanged {
+    var out : [64]u8 = undefined;
+    const a : usize = strip_num_suffix("i32", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. a], "i32");
+    const b : usize = strip_num_suffix("0x1fu8", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. b], "0x1fu8");
+    const c : usize = strip_num_suffix("width", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. c], "width");
+    const d : usize = strip_num_suffix("-u8", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. d], "-u8");
+    const e : usize = strip_num_suffix("42", out[0 .. 64], 64);
+    assert type_text::same(out[0 .. e], "42");
+    const f : usize = strip_num_suffix("", out[0 .. 64], 64);
+    assert f == 0;
+}
