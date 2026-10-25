@@ -5,6 +5,8 @@
 //! carries a `site`, an index into `Program::sites`, so the interpreter and
 //! the generated code can be compared trap-for-trap, not only value-for-value.
 
+use crate::wasm_law as w; // the wasm32 byte law (specs/tri/t27b/wasm.t27), mounted in lib.rs
+
 /// Integer, boolean and float types of the supported subset. `usize` lowers
 /// to `U64`, `isize` to `I64`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -714,4 +716,147 @@ impl Program {
     pub fn tests(&self) -> impl Iterator<Item = (usize, &Func)> {
         self.funcs.iter().enumerate().filter(|(_, f)| f.is_test)
     }
+}
+
+// The wasm32 fact table (epic #11840, port epic #6198): the IR-side half of
+// `t27b build --target wasm32`. The byte law (floors 9-10, the module mounted
+// above) walks flat tables, so this projects a Program into them: the names
+// blob, one 48-byte fact row per fn (flags, name span, parameter count,
+// return-type span, body shape, the row's floor-8 body verdict, its node
+// payload span, the line) and the 16-byte postfix node rows. Every decision
+// is the law's; this only reads the IR and writes the rows.
+
+/// One 16-byte node row through the law's node_put.
+fn wasm_node(ns: &mut Vec<u8>, kind: u8, op: u8, var: u32, v: u64) {
+    let mut r = [0u8; w::NODE_ROW];
+    w::node_put(&mut r, 0, kind, op, var, v);
+    ns.extend_from_slice(&r);
+}
+
+/// The postfix node rows of one expression (`+ - * /` and the six
+/// comparisons over parameters and constants; any other kind marks the row
+/// 255, which the law refuses). The op byte is ArithOp's / CmpOp's own
+/// discriminant, the order the law's debug-name table and cmp_opcode spell
+/// every variant.
+fn wasm_post(e: &Expr, ns: &mut Vec<u8>) {
+    match &e.kind {
+        ExprKind::Const(v) => wasm_node(ns, w::EK_CONST, 0, 0, *v as u64),
+        ExprKind::Var(i) => wasm_node(ns, w::EK_VAR, 0, *i, 0),
+        ExprKind::Arith { op, lhs, rhs, .. } => {
+            wasm_post(lhs, ns);
+            wasm_post(rhs, ns);
+            wasm_node(ns, w::EK_ARITH, *op as u8, 0, 0);
+        }
+        ExprKind::Cmp { op, lhs, rhs, .. } => {
+            wasm_post(lhs, ns);
+            wasm_post(rhs, ns);
+            wasm_node(ns, w::EK_CMP, *op as u8, 0, 0);
+        }
+        _ => wasm_node(ns, 255, 0, 0, 0),
+    }
+}
+
+/// An IR constant as the law's u64 carrier: a float is its bit pattern, an
+/// integer its two's complement (the law's signed images read it back).
+fn wasm_v64(ty: Ty, v: i128) -> u64 {
+    if ty == Ty::F32 {
+        return f32_of(v).to_bits() as u64;
+    }
+    if ty == Ty::F64 {
+        return f64_of(v).to_bits();
+    }
+    return v as u64;
+}
+
+/// The fact table of a program: (facts, strings, nodes), one row per fn in
+/// declaration order, each with its floor-8 body verdict filled in.
+pub fn wasm_facts(p: &Program) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut facts, mut s, mut ns) = (Vec::new(), Vec::new(), Vec::new());
+    for f in &p.funcs {
+        let mut flags = (f.is_pub as u32) * w::FF_PUB | (f.is_test as u32) * w::FF_TEST;
+        let noff = s.len() as u32;
+        s.extend_from_slice(f.name.as_bytes());
+        let roff = s.len() as u32;
+        // A void fn keeps a zero-length return span; the law refuses it by
+        // the has-return flag before it ever reads the span.
+        let rname = match f.ret {
+            Some(t) => {
+                flags |= w::FF_RET;
+                s.extend_from_slice(t.name().as_bytes());
+                t
+            }
+            None => Ty::I32,
+        };
+        if f.vars[..f.nparams].iter().all(|v| w::carrier(v.ty.name().as_bytes()) == w::VT_I32) {
+            flags |= w::FF_PARAMS_I32;
+        }
+        let (mut shape, mut body_r, mut plen) = (w::BS_OTHER, w::REF_OK, 0u32);
+        // The payload span is in node ROWS (the law's node_v/expr readers
+        // index rows, not bytes).
+        let poff = (ns.len() / w::NODE_ROW) as u32;
+        match f.body.as_slice() {
+            // One return: a constant leaf (any carried type, no parameters),
+            // or the postfix program the M-B cut lowers.
+            [Stmt::Return(Some(e))] => {
+                if f.nparams == 0 && matches!(e.kind, ExprKind::Const(_)) {
+                    shape = w::BS_CONST_RETURN;
+                    plen = 1;
+                    if let ExprKind::Const(v) = e.kind {
+                        wasm_node(&mut ns, w::EK_CONST, 0, 0, wasm_v64(rname, v));
+                    }
+                } else {
+                    shape = w::BS_RETURN_EXPR;
+                    wasm_post(e, &mut ns);
+                    plen = (ns.len() / w::NODE_ROW) as u32 - poff;
+                }
+            }
+            // The select pattern: `if (<param> == 0) { return <x>; } return <y>;`
+            // -- eqz's branch-free join, both arms constants.
+            [Stmt::If { cond, then: tb, els }, Stmt::Return(Some(fall))] => {
+                shape = w::BS_SELECT;
+                let pv = if let ExprKind::Cmp { op: CmpOp::Eq, lhs, rhs } = &cond.kind {
+                    match (&lhs.kind, &rhs.kind) {
+                        (ExprKind::Var(i), ExprKind::Const(0)) => Some(*i),
+                        (ExprKind::Const(0), ExprKind::Var(i)) => Some(*i),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let x = if let [Stmt::Return(Some(te))] = tb.as_slice() {
+                    if let ExprKind::Const(v) = te.kind { Some(v) } else { None }
+                } else {
+                    None
+                };
+                let y = if let ExprKind::Const(v) = fall.kind { Some(v) } else { None };
+                body_r = w::select_refusal(
+                    els.len(),
+                    x.is_some(),
+                    x.is_some() && y.is_some(),
+                    matches!(&cond.kind, ExprKind::Cmp { op: CmpOp::Eq, .. }),
+                    pv.is_some(),
+                    pv.unwrap_or(0),
+                    f.nparams as u32,
+                );
+                if let (Some(a), Some(b), Some(i)) = (x, y, pv) {
+                    wasm_node(&mut ns, w::EK_CONST, 0, 0, a as u64); // select's true value
+                    wasm_node(&mut ns, w::EK_CONST, 0, 0, b as u64); // and its false value
+                    wasm_node(&mut ns, w::EK_VAR, 0, i, 0); // the condition
+                    plen = 3;
+                }
+            }
+            _ => {}
+        }
+        let mut op = [0u8; 1];
+        if shape == w::BS_RETURN_EXPR {
+            body_r = w::postfix_refusal(&ns, poff, plen, f.nparams as u32, &mut op);
+        }
+        let mut row = [0u8; w::FACT_ROW];
+        w::fact_put(
+            &mut row, 0, flags, noff, f.name.len() as u32, f.nparams as u32, roff,
+            (s.len() - roff as usize) as u32, shape, body_r, poff, plen, f.line,
+        );
+        facts.extend_from_slice(&row);
+    }
+    (facts, s, ns)
 }
