@@ -1,16 +1,17 @@
-# Mutation census of the remaining analog specs, 2026-10-25 (partial: 8 of 17 specs written up here)
+# Mutation census of the remaining analog specs, 2026-10-25 (partial: 11 of 17 specs written up here)
 
 Issue #12116, part of epic #10486 (weak spots of the analog v0.1 release). The tool, `tri mutate spec`, never edits
 the spec, and the checkout stayed clean during the run. This note is written while the census is unfinished, so a
-reader sees what is measured and what is not: 11 of the 17 specs have a measured run and 8 of them are written up
-below; linear and linear_zoh were measured on a tree that the later audit #12191 changed, so they wait for a re-run
-on master, and raw_writer is measured and not yet classified; 6 are not measured. Where each number comes from:
+reader sees what is measured and what is not: 11 of the 17 specs have a measured run and are written up below; 6 are
+not measured. linear and linear_zoh were first measured on a tree that the later audit #12191 changed, so sections 9
+and 10 give the re-run on master after the audit, and raw_writer (section 9) was measured on a tree that master has
+not changed. Where each number comes from:
 
 - **Run:** `tri mutate spec --file specs/analog/sar_logic.t27 --t27c <master-built t27c> --jobs 3 --timeout 30`, in
   a T27 OS shell cell on this Mac, started 07:59:23 +07 and finished 08:24:07 +07 (24 min 44 s of wall time), exit 0.
   Lane base `035df5ce60`, binary `t27c 0.5.2` built from master. No `--accepted` file: this is a census, not a gate.
 - **Machine at the start:** load average 26.13 19.54 17.57, 7.4 GiB free on the data volume. At 08:25 the volume
-  was down to 0.4 GiB and the run on the second spec was stopped by hand (kill threshold 2.5 GiB); see section 3.
+  was down to 0.4 GiB and the run on the second spec was stopped by hand (kill threshold 2.5 GiB); see section 13.
 
 ## 1. sar_logic.t27 (677 mutants)
 
@@ -218,9 +219,64 @@ Follow-up (one issue per test-gap group, highest value first; none filed here):
 
 The two dead-line decisions (164 x3: the falling ramp for SQ_R > 1; 388: the jac-false early return) need an owner's call, keep or delete, not an assert.
 
-## 9. Where each written-up spec stands
+## 9. raw_writer (measured 10:39-10:55 +07, exit 0, 15 min 50 s)
 
-Counts are mutants: killed / survived / hung / unviable. "Census" is this run (tree `035df5ce60`); "gate" is the survivor gate of the pull request for the follow-up issue, run on the lane rebased on master `1c783b0b31`.
+526 mutants, 412 killed (all by a failing test), 83 survived, 31 hung, 0 unviable. Kinds: drop-guard 44, flip-cmp 148, swap-logic 32, drop-step 80, swap-arith 187, ret-default 35. Run: `tri mutate spec` on `specs/analog/raw_writer.t27`, 3 at a time, zig -j2 each; the census ran with t27c 0.5.2, an older build than the tree's own, and the tree was at commit 035df5ce60. Raw output: kept outside the repo. The spec is unchanged between the census base and master (a `git diff` of the path is empty), so the line numbers are the census's. The classes are from reading the spec; nothing was re-run. The 83-row table (line, mutant, class, why), the proposed tests and the proposed issues are in `docs/analog/census-rest-2026-10-25/raw_writer-classification.md`.
+
+Facts the table leans on: `raw_sig` works in two scratch buffers, `a` (90 limbs) and `d` (810 digits), that every test and the writer reuse, so after a long number the cells d[16] and d[17] hold stale digits; the test buffers are oversized and zero-filled and no test fills a buffer exactly or overflows one, so an off-by-one at the end of the data is invisible unless it changes a result; the binary byte-for-byte test calls `raw_at_hex` only positively, where its ASCII twin changes one byte and asserts the compare turns false, so a `raw_at_hex` that returns true whenever the bytes fit passes every assert in it; the multi-line `if (...) { inf.err = ...; return inf; }` blocks of `raw_check` are not mutated by the census, so they cannot be listed and their absence is not a finding. The mutants that read or write one cell past the end are killed only if the build traps on it; that the tests run as Zig Debug tests, where an out-of-range index, an unsigned underflow or a divide by zero panics, is inferred from earlier censuses, not read (group J below rests on it).
+
+The 31 hung are 30 drop-step mutants of loop counters and cursors (`x = x + 1` becomes `x = x`, lines 136, 176, 235, 242, 280, 309, 364, 368, 380, 391, 477, 500, 546, 549, 562, 609, 629, 650, 658, 668, 690, 719, 722, 725, 804, 859, 877, 888, 919, 939) and 1 flip-cmp (line 139, `while (carry > 0)` to `>= 0`, which cannot end); each loop never ends, so they are the mutant's hang, not a test gap.
+
+Counts of the 83 survivors: 19 equivalent (79; 157, 163, 167; 228; 240; 297; 333, 338, 347; 645; 665; 683 flip; 690; 719; 720 flip; 722; 723 flip; 917), 62 test gap in ten groups (below), 2 dead line (683 drop, 954), 0 not decided (19 + 62 + 2 = 83).
+
+| Group | Mutants | What is missing | Basis of the expected values |
+| --- | --- | --- | --- |
+| A | 6 | `raw_at_hex` negative control and exact-size cases (867 x3, 873 x2, 876) | hand-derived; the lab confirms them first |
+| B | 14 | malformed variable lines for `raw_check_vars` (715 x2, 717 x2, 720 x2, 723 x7, 726); six hand-built lines | hand-derived; the lab confirms them first |
+| C | 2 | `raw_put_f64` of zero and `raw_from_bits` of the non-finite patterns (301, 355) | hand-derived; the lab confirms them first |
+| D | 8 | header counts and numbers at their limits (`raw_uint`, `raw_count_line`; 624 x2, 628, 629, 630, 636, 638 x2) | hand-derived; the lab confirms them first |
+| E | 7 | ASCII body shape, truncated and malformed point lines (`raw_check_ascii`; 685 x2, 688, 691 x2, 701 x2); four tiny hand-built bodies | hand-derived error codes; the lab confirms them first |
+| F | 11 | reader helpers on tight ranges (`raw_at`, `raw_eol`, `raw_has`, `raw_uint`, `raw_value_ok`); low value | hand-derived |
+| G | 2 | `raw_sig` must not read stale scratch digits (230, 233); two calls with pre-set d[16] and d[17] | hand-derived; the lab confirms them first |
+| H | 1 | the scale of the RLC current column (938) | needs a lab value: the peak current of 5.5 mA is an estimate from the circuit, not from the trace |
+| I | 2 | `raw_sig` carry-out of sixteen 9s (258 x2) | needs a lab value: a double whose 16 rounded digits are all 9; none is named, it is a lab search |
+| J | 9 | exact-size and short-input calls of the writers (140, 270, 387 drop, 543 x2, 560, 571, 715 flip, 873 drop); low value | inferred: rests on the trapping Debug build; if the build does not trap, these 9 rows become equivalent (28 equivalent, 53 test gap) |
+
+Not run, so inferred: every missing-assert value is hand arithmetic from the function bodies (digit counts, byte lengths such as 13 for a variable line and 21 for the zero text, the error code each mutant would return), labelled hand-derived and unverified; the lab must confirm each before an assert is written. The equivalent class rests on reading the helpers (`raw_pow(base, 0)` is 1, `raw_mul` by 1 changes nothing, `raw_eol` does not read when from >= n, the high bit of m at be = 1), not on running them. A lab finding that a group F or G assert cannot be made to differ would move that row to equivalent.
+
+Follow-up: one issue per group, highest value first; the groups are filed as #12273 (groups A to D) and #12274 (groups E to J and the two dead lines). The two dead-line decisions (683: the early `at >= n` return that line 685 already covers; 954: the fold guard in `raw_rlc_file`, which no call can reach) need an owner's call, keep or delete, not an assert; the default taken is to keep both lines and list them until the owner decides.
+
+## 10. linear and linear_zoh after the audit (re-run on master 1c783b0b31)
+
+Both specs were first measured on the census base 035df5ce60 (linear_zoh 10:15-10:25 +07), before the audit #12191 changed their tests. They were run again on master 1c783b0b31: linear at 11:23-11:36 +07, linear_zoh at 11:36-11:44 +07. The raw outputs and the pre-audit classifications are kept outside the repo; the reading of the second runs is in `docs/analog/census-rest-2026-10-25/linear-post-audit-classification.md`, and it is the text of that file, not a new run, that decides every class below. In that file "the old file" is the pre-audit classification.
+
+Counts are mutants: killed / survived / hung / unviable.
+
+| Spec | Post-audit run | Pre-audit run | Kinds |
+| --- | --- | --- | --- |
+| linear | 316 / 61 / 38 / 5 of 420 | the same | drop-guard 10, flip-cmp 88, swap-logic 14, drop-step 45, swap-arith 229, ret-default 34 |
+| linear_zoh | 195 / 30 / 27 / 0 of 252 | 193 / 30 / 29 / 0 | drop-guard 1, flip-cmp 33, drop-step 34, swap-arith 171, ret-default 13 |
+
+What the audit changed in the two specs: for linear, tests only (a `git diff` of the two trees for the path is 33 insertions and 13 deletions, all in the test blocks, lines 790-862 of the new file; the asserts on constant table elements now read `var` copies first, and the comment cites #12166); no line of the functions (lines 1-717) changed or moved, so every survivor keeps its line number, and the changed asserts read constants, not code the mutator edits, so killing none of the 61 is what the diff predicts. For linear_zoh, the diff touches lines 637-725 only. The two raw outputs of linear are byte-identical; the 30-survivor block of the two raw outputs of linear_zoh is byte-identical. Result: every survivor of the post-audit runs is a survivor of the pre-audit runs (61 and 30), so every old verdict stands and no class was reopened.
+
+| Spec | Equivalent | Test gap | Dead line | Not decided | Survivors |
+| --- | --- | --- | --- | --- | --- |
+| linear | 18 | 35 in six groups (A 10, B 6, C 6, D 5, E 4, F 4) | 7 (441 x3, 442 x4) | 1 (463 `>=`) | 61 |
+| linear_zoh | 2 (176, 433) | 28 in five groups (A 2, B 2, C 8, D 15, E 1) | 0 | 0 | 30 |
+
+Group letters are per file (the A of linear is the stamp shapes, the A of linear_zoh is the exact-grid twin). "Open" means the group still has survivors in the post-audit run: all six groups of linear and all five of linear_zoh are open, none closed. Later lanes are not in scope.
+
+The hung and the unviable. linear: 38 hung, all drop-step mutants of the form `x = x + 1` to `x = x`, each the counter of the `while` that encloses it, so the loop never closes (the same 38 lines as in the pre-audit run); 5 unviable, all `[ret-default]` of a function with no return value (`step` 277, `bump` 392, `stamp_pair` 397, `stamp_src` 407, `matmul` 654), each reading "zig: error: not yet implemented"; that the cause is on the emitter side and not in this spec is not established here. linear_zoh: 27 hung, all drop-step counters (the same 27 lines as before), 0 unviable.
+
+Two mutants of linear_zoh moved from hung to killed: 452 and 468 (`const m : u32 = 1 << j;` to `1 >> j` in `rlc_ex_err` and `rc_ex_err`). Before: 29 hung, namely the 27 counters plus these two; now 27 hung and 195 killed (193 + 2). They were never survivors, so no verdict is touched. Why they moved is not established. Facts: the code of both functions and of everything they call is identical in the two trees, and the test that reaches them (the grid test) is not in the diff; the machine load at the start differed (load averages 13.13, 20.07, 19.87 for the pre-audit run, 7.43, 8.60, 12.03 for the post-audit run). A candidate reading, not run and unverified: at j = 1 the mutant makes m = 0 and dt infinite, the loop `while (nrm > 0.5)` of `pade_expm` halves an infinite norm, and its u32 counter `s = s + 1` ends the loop by overflow after 2^32 passes if the build traps overflow, an end that arrives at a time which depends on the load against `--timeout`; that also rests on the inferred trapping build. Whether a third run puts them back among the hung: not established.
+
+Not established: every expected value in the file is hand arithmetic from the function bodies and none was run, so each should be confirmed on the lab before an assert is written; that the mutant build traps on `usize` underflow or out-of-range indexes (linear mutants 401 and 408, `- col`; linear_zoh group D, 15 mutants); the IEEE sign-symmetry argument for 393 and the width of the f64 boundary band for 574; whether a pivot tie (463 `>=`) can change any bit of a solved matrix; whether any other spec calls `stamp` or `derive` on a table that `table_ok` refuses (a repo-wide search for callers of `AnalogLinear` was not completed), which would move 441 and 442 from dead line to test gap; the linear_zoh group C expected values for the `ring_fixed` rows (541, 548, 550), which still come from a lab run and were not derived.
+
+Follow-up: #12275 (linear, groups A to F) and #12276 (linear_zoh, groups A to E). The dead lines 441 and 442 of linear are unreachable for any table that `table_ok` accepts and need a decision, not an assert: delete them or lift the refusal; if the owner prefers to keep them, the hand-derived checks are in section 4 of the classification file.
+
+## 11. Where each written-up spec stands
+
+Counts are mutants: killed / survived / hung / unviable. "Census" is the first run (tree `035df5ce60`) for every spec except linear and linear_zoh, whose census cell is the re-run on master `1c783b0b31` after the audit (section 10); "gate" is the survivor gate of the pull request for the follow-up issue, run on the lane rebased on master `1c783b0b31`.
 
 | Spec | Census | Follow-up | State |
 | --- | --- | --- | --- |
@@ -232,21 +288,24 @@ Counts are mutants: killed / survived / hung / unviable. "Census" is this run (t
 | mos_psp103_inv20 | 72 / 23 / 5 / 1 of 101 | #12185 (PR #12207) | gate on master: 81 / 14 / 5 / 1; see the line below the table |
 | sar_comparator_qi | 256 / 20 / 18 / 14 of 308 | #12186 (PR #12205) | gate on master: 262 / 14 / 18 / 14 |
 | sar_comparator_q | 266 / 40 / 17 / 13 of 336 | to be filed | 17 equivalent, 19 test gap in five groups, 4 dead line; nothing run |
+| raw_writer | 412 / 83 / 31 / 0 of 526 | #12273, #12274 | 19 equivalent, 62 test gap in ten groups (J inferred, H and I need a lab value), 2 dead line; nothing run |
+| linear | 316 / 61 / 38 / 5 of 420 (post-audit tree, same as pre-audit) | #12275 | 18 equivalent, 35 test gap in six groups, 7 dead line, 1 not decided; nothing run |
+| linear_zoh | 195 / 30 / 27 / 0 of 252 (post-audit tree; pre-audit 193 / 30 / 29 / 0) | #12276 | 2 equivalent, 28 test gap in five groups, 0 dead line; 452 and 468 moved from hung to killed, cause not established; nothing run |
 
 mos_psp103_inv20, in words: of the 23 survivors, 9 are killed by the five added tests and 14 are accepted (13 equivalent mutants in 12 entries, plus line 176). Line 173, which the first draft of the note had accepted as equivalent, is killed by the exact-mirror test, so its accepted entry was removed; the first gate run exited 2 on that stale entry and the second run (11:13-11:16 +07) passed. The forecast written before the run was 80 / 15 / 5 / 1.
 
-## 10. What is not claimed
+## 12. What is not claimed
 
-- **Six specs have no measured run:** sar_switch (a run started and was killed by the load rule, section 11), mos_table, accept_sar, sar_kick_net (727 mutants; an earlier run was stopped at 08:25 and its output file is a stub), sar_comparator and mos_psp103. Their numbers are "not measured".
-- **linear and linear_zoh were measured, and are not written up here.** They ran on the census base `035df5ce60`; `bf66e458aa` (#12191, 151 asserts on constant table elements now count) changed both specs afterwards, so their numbers describe a tree that no longer exists. The same commit changed vacask_compare, mos_psp103_gates, mos_table, sar_comparator, sar_kick_net, sar_switch and mos_psp103, and `7fefa30eaa` (#12153) changed sar_kick. Sections 3 and 5 are therefore the pre-audit counts of those two specs; the gate rows of section 9 are the current ones. linear and linear_zoh wait for a re-run on master.
-- **raw_writer was measured on an unchanged tree** and its classification is not written up yet.
-- The specs this note classifies (sar_logic, sar_trace_raw, bench, mos_psp103_inv20, sar_comparator_qi, sar_comparator_q) are byte-identical between the census base and master (checked with `git diff --quiet` on these six paths and on raw_writer).
-- **Classes come from reading, not from a run:** the 108 sar_logic survivors and the 40 sar_comparator_q survivors were read off the spec by subagents and spot-checked by the orchestrator; the expected values of the proposed asserts are hand-derived and stay unverified until a T27 OS pane runs them. An "equivalent" is an argument, not a proof by a tool.
-- **Hung is not proven endless.** The tool reports only that the tests outlived `--timeout 30`. Each hung mutant listed is a dropped counter step or a bisection condition that never closes, which is endless by construction, and none was re-run with a longer limit.
-- **Compiler and load.** Every census run used one `t27c`, version 0.5.2, an older build than the tree's own (it predates the gen-zig and gen-rust commits now on master); no verdict was re-run with a current binary. A compiler build from another session ran beside the middle runs, and the 1-minute load was 24 to 46 during them, so a mutant that was only slow could have been counted as hung. Under a current binary exactly the spec seals of the follow-up lanes move, which is a separate check from the mutant verdicts.
+- **Six specs have no measured run:** sar_switch (a run started and was killed by the load rule, section 13), mos_table, accept_sar, sar_kick_net (727 mutants; an earlier run was stopped at 08:25 and its output file is a stub), sar_comparator and mos_psp103. Their numbers are "not measured".
+- **linear and linear_zoh were measured twice.** The first runs were on the census base `035df5ce60`; `bf66e458aa` (#12191, 151 asserts on constant table elements now count) changed both specs afterwards, so section 10 uses the re-runs on master `1c783b0b31`. The same commit changed vacask_compare, mos_psp103_gates, mos_table, sar_comparator, sar_kick_net, sar_switch and mos_psp103, and `7fefa30eaa` (#12153) changed sar_kick. Sections 3 and 5 are therefore the pre-audit counts of vacask_compare and mos_psp103_gates; the gate rows of section 11 are the current ones. The re-runs found the same survivors as the first runs (61 and 30), so the classes are the first runs' classes, read a second time; the only counts that moved are the killed and the hung of linear_zoh (193 to 195 and 29 to 27, section 10), and why they moved is not established.
+- **raw_writer was measured on an unchanged tree** (a `git diff` of its path between the census base and master is empty) and is written up in section 9. Its test-gap groups H and I need a value from the lab, and group J is inferred: it rests on the premise that the tests run in a build that traps on an out-of-range index, an underflow and a divide by zero, which nothing here confirms.
+- The specs this note classifies on the census base (sar_logic, sar_trace_raw, bench, mos_psp103_inv20, sar_comparator_qi, sar_comparator_q, raw_writer) are byte-identical between the census base and master (checked with `git diff --quiet` on these paths) except two: master has since gained only added lines in mos_psp103_inv20 (150, #12207) and in sar_comparator_qi (99, #12205), the tests of the follow-up issues. The survivor lines in sections 6 and 7 are the census's, and the gate rows of section 11 are the current state.
+- **Classes come from reading, not from a run:** the 108 sar_logic survivors and the 40 sar_comparator_q survivors were read off the spec by subagents and spot-checked by the orchestrator; the 83 raw_writer survivors and the 91 survivors of linear and linear_zoh (61 and 30) were classified the same way, and their notes record no spot-check. The expected values of the proposed asserts are hand-derived and stay unverified until a T27 OS pane runs them. An "equivalent" is an argument, not a proof by a tool.
+- **Hung is not proven endless.** The tool reports only that the tests outlived `--timeout 30`. Each hung mutant listed is a dropped counter step or a bisection condition that never closes, which is endless by construction, and none was re-run with a longer limit. The one measured exception is in section 10: two linear_zoh mutants (452, 468) were hung in the first run and killed in the second, so a hang is a statement about one run, and a hung mutant that is not a dropped counter step is not shown to be endless.
+- **Compiler and load.** Every census run on the census base used one `t27c`, version 0.5.2; the compiler binary of the two re-runs on master (linear, linear_zoh) is not recorded in their notes. The 0.5.2 build is an older build than the tree's own (it predates the gen-zig and gen-rust commits now on master); no verdict was re-run with a current binary. A compiler build from another session ran beside the middle runs, and the 1-minute load was 24 to 46 during them, so a mutant that was only slow could have been counted as hung. Under a current binary exactly the spec seals of the follow-up lanes move, which is a separate check from the mutant verdicts.
 - No speed claim: the wall times are single runs under load, not a rate.
 
-## 11. Why the runs stopped
+## 13. Why the runs stopped
 
 First stop, 08:25. Free space on the data volume fell from 7.4 GiB (07:59) to 0.4 GiB (08:25) while two other trees on this Mac held a large part of it: `/private/tmp/opencode` 9.08 GiB (87 entries) and the user temp directory `opencode` 8.81 GiB (131 entries), both read with `du -sk` at 08:31. Those belong to another tool's session and were not touched. The run on sar_kick_net was stopped by hand (kill threshold 2.5 GiB).
 
@@ -254,4 +313,6 @@ Second stop, between 09:10 and 09:20. The third spec (vacask_compare) printed it
 
 Third stop, 11:08. The 1-minute load, driven by compiler, synthesis and `claude -p` jobs of other sessions, rose to 75 to 116 at 11:07 and 11:08. The kill rule (load above 60) ended the census pane while sar_switch was running; it left a start time, the load at the start and a partial output, and no result is claimed for it. By 11:13 the load was 4.5 and the follow-up gates and seals ran.
 
-Resuming: when the 1-minute load is under 15 and the volume has more than 4 GiB free, the census is re-run on master for linear and linear_zoh, then for the six unmeasured specs, one pane at a time. Each result is posted on #12116 before the next run starts.
+After the third stop, linear (11:23-11:36 +07) and linear_zoh (11:36-11:44 +07) were re-run on master `1c783b0b31`, one after the other (section 10). The 1-minute load at the start of the linear_zoh run was 7.43 (5-minute 8.60, 15-minute 12.03); the load at the start of the linear run is not recorded in its note. raw_writer was measured earlier, between the second and the third stop (10:39-10:55 +07, section 9).
+
+Resuming: when the 1-minute load is under 15 and the volume has more than 4 GiB free, the census is run on master for the six unmeasured specs, one pane at a time. Each result is posted on #12116 before the next run starts.
