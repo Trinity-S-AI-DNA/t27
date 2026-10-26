@@ -9211,10 +9211,24 @@ impl Codegen {
             // The CSE pass can leave its `_cse*` temp declarations AFTER their
             // first use in this backend's statement order (the Rust path hoists
             // them). They are pure expressions over consts/params, so emitting
-            // them first is always safe -- and required: Zig resolves locals
-            // lexically.
+            // them first is safe -- BUT only while they read no body local: a
+            // temp over a local (mem_poke's `_cse = k + 2` above `var k`,
+            // #12628/#5980) must stay in statement order, because Zig resolves
+            // locals lexically and the local may be declared later in the body.
+            let body_locals: std::collections::HashSet<String> = node
+                .children
+                .iter()
+                .filter(|s| s.kind == NodeKind::StmtLocal && !s.name.starts_with("_cse"))
+                .map(|s| s.name.clone())
+                .collect();
+            let hoists = |stmt: &Node| -> bool {
+                stmt.name.starts_with("_cse")
+                    && !body_locals
+                        .iter()
+                        .any(|name| param_referenced(&stmt.children, name))
+            };
             for stmt in node.children.iter() {
-                if stmt.kind == NodeKind::StmtLocal && stmt.name.starts_with("_cse") {
+                if hoists(stmt) {
                     self.gen_stmt(stmt);
                 }
             }
@@ -9225,7 +9239,7 @@ impl Codegen {
                 Self::zig_tail_returns(&mut body);
             }
             for stmt in body.iter() {
-                if !(stmt.kind == NodeKind::StmtLocal && stmt.name.starts_with("_cse")) {
+                if !hoists(stmt) {
                     self.gen_stmt(stmt);
                 }
             }
