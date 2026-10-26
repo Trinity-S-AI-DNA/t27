@@ -37,6 +37,8 @@ mod lab; // of specs/tri/mutate/lab.t27 (#7050): zig_j and the exit codes of a r
 #[path = "../../../gen/rust/tri/mutate/plant.rs"] #[allow(dead_code, unused_parens)]
 mod plant; // of specs/tri/mutate/plant.t27 (#7369): every decision of `mutate plant`
 #[path = "../../../gen/rust/tri/mutate/clock.rs"] #[allow(dead_code, unused_parens)] mod clock; // of specs/tri/mutate/clock.t27 (#12345): first-pass clock, reruns
+#[path = "../../../gen/rust/tri/mutate/answer.rs"] #[allow(dead_code, unused_parens)] mod answer; // of specs/tri/mutate/answer.t27 (#12539): how a failed compile is read, which answers are asked again
+use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
 #[derive(Subcommand)]
 pub enum MutateCmd {
@@ -1121,26 +1123,33 @@ fn first_error(stderr: &str) -> String {
         .unwrap_or_else(|| "exited non-zero with no `error:` line".to_string())
 }
 
-/// Read a failed zig compile. A mutant that breaks an invariant fails it, and
-/// zig marks that evaluation "called at comptime here": a check noticed.
-/// Running out of branch quota there is comptime's own timeout, a loop that
-/// never ends. Any other compile error means no check ran; measured on zig
-/// 0.16.0, a type error carries no comptime note.
-fn compile_fate(stderr: &str) -> Fate {
-    if stderr.contains("error: evaluation exceeded") {
-        Fate::Hang("zig's comptime branch quota, evaluating an invariant")
-    } else if stderr.contains("note: called at comptime here") {
-        Fate::Killed(KilledBy::Invariant)
-    } else {
-        Fate::Unviable(format!("zig: {}", first_error(stderr)))
+/// Read a failed zig compile by specs/tri/mutate/answer.t27: a branch-quota stop is a hang, a comptime-called invariant a check, any other error means no check ran.
+fn compile_fate(stderr: &'static str) -> Fate {
+    match answer::answer_of(stderr) {
+        answer::ANSWER_HANG => Fate::Hang("zig's comptime branch quota, evaluating an invariant"),
+        answer::ANSWER_INVARIANT => Fate::Killed(KilledBy::Invariant),
+        _ => Fate::Unviable(format!("zig: {}", first_error(stderr))),
     }
+}
+
+static RETRIED: AtomicU32 = AtomicU32::new(0); // mutants whose compile answer answer.t27 said to ask again (#12539)
+
+/// A compile answer that says nothing about the mutant (a damaged zig cache) is asked once more: the retry's fate stands and the first answer is printed; one that repeats stays unviable, tagged `answer::REPEATED`.
+fn zig_fate(zig: &Path, zig_j: u32, compile_secs: u64, run_secs: u64) -> Result<Fate> {
+    let said = |z: &Path| answer::retry_answer(answer::answer_of(std::fs::read_to_string(z.with_extension("err")).unwrap_or_default().leak()));
+    let first = zig_fate_once(zig, zig_j, compile_secs, run_secs)?;
+    if !matches!(first, Fate::Unviable(_)) || !said(zig) { return Ok(first); }
+    RETRIED.fetch_add(1, SeqCst);
+    let fate = zig_fate_once(zig, zig_j, compile_secs, run_secs)?;
+    if let Fate::Unviable(why) = &first { eprintln!("  retried after `{why}`: now {fate:?}"); }
+    Ok(match fate { Fate::Unviable(w) if said(zig) => Fate::Unviable(format!("{w}{}", answer::REPEATED)), f => f })
 }
 
 /// Compile a lowered spec's tests, then run them, each on its own clock. One
 /// clock over both made a cold compile on a loaded machine read as a hang, and
 /// `zig test` exits 1 on a compile error as on a failing test (#7148; the same
 /// defect is unclebob/mutator issue 1).
-fn zig_fate(zig: &Path, zig_j: u32, compile_secs: u64, run_secs: u64) -> Result<Fate> {
+fn zig_fate_once(zig: &Path, zig_j: u32, compile_secs: u64, run_secs: u64) -> Result<Fate> {
     let bin = zig.with_extension("bin");
     let err = zig.with_extension("err");
     let compiled = run_with_timeout(
@@ -1154,7 +1163,7 @@ fn zig_fate(zig: &Path, zig_j: u32, compile_secs: u64, run_secs: u64) -> Result<
             "the zig compile outlived {compile_secs} s: the machine's load, not the mutant \
              (comptime stops itself at its branch quota); lower --jobs or raise --timeout"
         ),
-        Some(false) => return Ok(compile_fate(&std::fs::read_to_string(&err).unwrap_or_default())),
+        Some(false) => return Ok(compile_fate(std::fs::read_to_string(&err).unwrap_or_default().leak())),
         Some(true) => {}
     }
     run_fate(zig, run_secs)
@@ -1629,6 +1638,11 @@ fn mutate_spec(
     print!("{}", spec_report(file, &ran));
     let (h, a) = hung.into_inner().map(|v| (v.len() as u32, v.iter().filter(|n| **n).count() as u32)).unwrap();
     println!("First-pass clock {first_s} s of --timeout {secs} s: {} rerun(s), {} job-s saved (arithmetic on counts, specs/tri/mutate/clock.t27, not a measurement).", clock::rerun_at_cap(h, a), clock::job_s_saved(h, a, u32::try_from(secs).unwrap_or(u32::MAX), first_s));
+    let others: Vec<_> = ran.iter().filter(|(_, f)| matches!(f, Fate::Unviable(w) if w.ends_with(answer::REPEATED))).collect();
+    let u = ran.iter().filter(|(_, f)| matches!(f, Fate::Unviable(_))).count() as u32;
+    println!("Compile answers (specs/tri/mutate/answer.t27, #12539): {} mutant(s) retried; of {u} unviable, {} settled (refusals, located errors, t27c gen refusals) and {} other answers that repeated.", RETRIED.load(SeqCst), answer::settled_unviable(u, others.len() as u32), others.len());
+    if !others.is_empty() { println!("{} OTHER ANSWERS -- unviable, neither an emitter refusal nor a located error, and the same answer came twice:", others.len()); }
+    for (m, f) in &others { if let Fate::Unviable(w) = f { println!("  {}:{} [{}]: {w}", file.display(), m.line, m.kind); } }
     if !not_run.is_empty() {
         println!("{} NOT RUN -- counted nowhere above:", not_run.len());
         for (m, e) in &not_run {
@@ -2212,40 +2226,13 @@ mod tests {
 
     // ---- #7148: a hang and a compile error are not kills ----
 
-    /// zig 0.16.0's own words for a lowered spec that does not compile, cut
-    /// from `zig test --test-no-exec` on t27c output of a probe spec
-    /// (2026-10-06): an invariant's assert, a comptime overflow inside an
-    /// invariant, an endless loop inside one, and a type error.
+    /// The glue only: what `compile_fate` makes of each class answer.t27 gives (the rule's own tests live in that spec).
     #[test]
-    fn zig_says_which_compile_error_was_a_check() {
-        let assert = "/tmp/m/inv.zig:8:9: error: assertion failed\n        @compileError(\"assertion failed\");\n\
-                      /tmp/m/inv.zig:34:47: note: called at comptime here\n";
-        let overflow = "/tmp/m/ovf.zig:21:11: error: overflow of integer type 'usize' with value '-1'\n\
-                        /tmp/m/ovf.zig:35:19: note: called at comptime here\n";
-        let quota = "/tmp/m/loop.zig:21:5: error: evaluation exceeded 1000 backwards branches\n    while (i < n) {\n\
-                     /tmp/m/loop.zig:21:5: note: use @setEvalBranchQuota() to raise the branch limit from 1000\n\
-                     /tmp/m/loop.zig:33:19: note: called at comptime here\n";
-        let typed = "/tmp/m/ty.zig:24:12: error: expected type 'usize', found 'bool'\n\
-                     /tmp/m/ty.zig:18:27: note: function return type declared here\n";
-        assert_eq!(compile_fate(assert), Fate::Killed(KilledBy::Invariant));
-        assert_eq!(
-            compile_fate(overflow),
-            Fate::Killed(KilledBy::Invariant),
-            "a safety check failing while an invariant is evaluated is the invariant noticing"
-        );
-        assert_eq!(
-            compile_fate(quota),
-            Fate::Hang("zig's comptime branch quota, evaluating an invariant"),
-            "the branch quota is comptime's timeout, though the note is there too"
-        );
-        assert_eq!(
-            compile_fate(typed),
-            Fate::Unviable("zig: error: expected type 'usize', found 'bool'".to_string())
-        );
-        assert_eq!(
-            compile_fate(""),
-            Fate::Unviable("zig: exited non-zero with no `error:` line".to_string())
-        );
+    fn compile_fate_acts_on_the_class_answer_t27_gives() {
+        assert_eq!(compile_fate("a.zig:1:1: error: assertion failed\na.zig:2:2: note: called at comptime here\n"), Fate::Killed(KilledBy::Invariant));
+        assert_eq!(compile_fate("a.zig:1:1: error: evaluation exceeded 1000 backwards branches\n"), Fate::Hang("zig's comptime branch quota, evaluating an invariant"));
+        assert_eq!(compile_fate("a.zig:1:1: error: expected type 'usize', found 'bool'\n"), Fate::Unviable("zig: error: expected type 'usize', found 'bool'".to_string()));
+        assert_eq!(compile_fate(""), Fate::Unviable("zig: exited non-zero with no `error:` line".to_string()));
     }
 
     /// A lowered spec in miniature, in t27c's shape: its assert helper, one
