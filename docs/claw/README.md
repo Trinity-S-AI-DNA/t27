@@ -106,10 +106,10 @@ heartbeat would be an external dispatch and is a separate decision.
 
 ## The inventory spec and how to regenerate it
 
-`specs/claw/gates.t27` holds three parallel `[68]str`-shaped arrays — `NAMES`
+`specs/claw/gates.t27` holds three parallel `[69]str`-shaped arrays — `NAMES`
 (workflow file stems), `CLASSES` (0 blocking / 1 soft / 2 reporting), `EVENTS`
 (trigger keys, comma-joined). Rows stay alphabetical and aligned; tests pin
-the alignment, the census (63/3/2), pairwise name uniqueness, and the
+the alignment, the census (64/3/2), pairwise name uniqueness, and the
 merge-critical rows.
 
 The class rule is mechanical, so the regeneration is too:
