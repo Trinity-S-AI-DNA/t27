@@ -39,6 +39,10 @@ mod verilog_names;
 #[path = "../gen/rust/compiler/hir_cost_models.rs"]
 #[allow(dead_code, unused_parens)]
 mod hir_cost_models;
+// specs/compiler/verilog_bram_shape.t27 (#12297), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/verilog_bram_shape.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, clippy::all)]
+mod verilog_bram_shape;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -3175,8 +3179,13 @@ the parser used to read it as `{}` followed by a negation",
             }
         }
 
-        // Main type identifier with namespace support (lexer::Lexer, base::types)
-        if self.current.kind == TokenKind::Ident {
+        // Main type identifier with namespace support (lexer::Lexer, base::types).
+        // The fn TYPE head rides here too (#11940 sub-slice 2a): `fn` lexes as
+        // KwFn, not Ident, so a fn-typed parameter (`cb: fn(S) -> S`) returned
+        // an EMPTY type and the header died on "Expected LBrace, got Comma".
+        if self.current.kind == TokenKind::Ident || self.current.kind == TokenKind::KwFn {
+            let fn_head = self.current.kind == TokenKind::KwFn;
+            let fn_line = self.current.line;
             ty.push_str(&self.current.lexeme);
             self.advance();
 
@@ -3218,6 +3227,21 @@ the parser used to read it as `{}` followed by a negation",
             // rather than in expression parsing, because the same tokens in an
             // expression position continue to mean a function call.
             self.parse_type_application_args(&mut ty);
+
+            // A fn TYPE's return rides with the type in both spellings: t27
+            // `fn(A) -> B`, Zig `fn(A) B`. After a complete type the only
+            // continuations are `,` `)` `}` `=`, so an arrow, or a type token
+            // on the fn's own line, is the return -- leaving Zig's `bool`
+            // behind made it a phantom struct field (#3225).
+            if fn_head {
+                let zig = self.current.line == fn_line && matches!(self.current.kind, TokenKind::Ident | TokenKind::KwVoid | TokenKind::KwFn | TokenKind::Question | TokenKind::Star | TokenKind::LBracket | TokenKind::LParen);
+                if self.current.kind == TokenKind::Arrow || zig {
+                    let arrow = self.current.kind == TokenKind::Arrow;
+                    if arrow { self.advance(); }
+                    let ret = self.parse_type_annotation();
+                    ty.push_str(&format!("{} {}", if arrow { "->" } else { "" }, ret));
+                }
+            }
         } else if self.current.kind == TokenKind::KwVoid {
             ty.push_str("void");
             self.advance();
@@ -3299,6 +3323,20 @@ the parser used to read it as `{}` followed by a negation",
         // Parse parameter list
         self.expect(TokenKind::LParen)?;
         while self.current.kind != TokenKind::RParen && self.current.kind != TokenKind::Eof {
+            // #11940 slice 1: comptime TYPE param, stored (name, "type").
+            // A param NAMED comptime is followed by ':'; a value param is
+            // refused at the 'type' check.
+            if self.current.kind == TokenKind::Ident && self.current.lexeme == "comptime" && self.peek.kind == TokenKind::Ident {
+                self.advance(); let name = self.current.lexeme.clone(); self.advance(); self.expect(TokenKind::Colon)?;
+                if self.current.kind != TokenKind::Ident || self.current.lexeme != "type" {
+                    return Err(format!("Comptime fn parameters must be ': type' (slice 1 of #11940), got '{}' at line {}", self.current.lexeme, self.current.line));
+                }
+                self.advance(); // consume 'type'
+                decl.params.push((name, "type".to_string()));
+                if self.current.kind == TokenKind::Comma { self.advance(); }
+                continue;
+            }
+
             // Parse param name.
             //
             // A KEYWORD HERE IS A NAME. The skip below was written as error recovery and
@@ -3336,7 +3374,22 @@ the parser used to read it as `{}` followed by a negation",
             }
 
             // Parse param type
-            let param_type = self.parse_type_annotation();
+            let mut param_type = self.parse_type_annotation();
+
+            // #11940 sub-slice 2a: an ARROW inside a parameter list can only
+            // be the return of the parameter's own fn type -- after a complete
+            // type the list's only continuations are `,` and `)`. It was read
+            // as a phantom name, so `fn modify(fn: Fn(S) -> S)` parsed as
+            // [("fn", "Fn(S)"), ("S", "")] and Zig got `fn modify(... Fn(S), S: )`
+            // (state.t27 modify, reader.t27 asks/local, writer.t27 censor).
+            // The arrow and its return are consumed INTO the parameter.
+            if self.current.kind == TokenKind::Arrow
+                && (param_type.starts_with("fn(") || param_type.starts_with("Fn("))
+            {
+                self.advance(); // consume ->
+                let ret = self.parse_type_annotation();
+                param_type = format!("{} -> {}", param_type, ret);
+            }
 
             decl.params.push((param_name, param_type));
 
@@ -8436,30 +8489,22 @@ impl Codegen {
             self.write("pub ");
         }
 
-        // W729: `pub const GFTernary = u8;` is a TYPE ALIAS, and the identifier
-        // on the right is the builtin type, not a name to look up. `zig_ident`
-        // escapes primitives as `@"u8"` -- correct for something NAMED u8,
-        // fatal here: Zig reports `use of undeclared identifier 'u8'` and the
-        // whole spec stops compiling, so its 18 test blocks had never run.
-        // The C backend has detected this pattern since it was written
-        // (`typedef uint8_t GFTernary;`); the Zig backend never did.
-        if node.children.len() == 1
-            && node.children[0].kind == NodeKind::ExprIdentifier
-            && {
-                // Same predicate `zig_ident` uses to decide something is a
-                // builtin type name -- uN/iN/fN plus the named primitives.
-                let n = &node.children[0].name;
-                matches!(
-                    n.as_str(),
-                    "bool" | "void" | "type" | "usize" | "isize"
-                        | "comptime_int" | "comptime_float"
-                ) || (n.len() >= 2
+        // W729: `pub const GFTernary = u8;` is a TYPE ALIAS -- the identifier on the
+        // right is a type, not a name to look up (`zig_ident` escapes primitives as
+        // @"u8"`, so the raw path emitted `use of undeclared identifier 'u8'`).
+        // #11940 sub-slice 3: a fn type is the same alias shape; its mapper removes
+        // the arrow Zig does not have.
+        if node.children.len() == 1 && node.children[0].kind == NodeKind::ExprIdentifier {
+            let n = node.children[0].name.clone();
+            let builtin = matches!(n.as_str(), "bool" | "void" | "type" | "usize" | "isize"
+                | "comptime_int" | "comptime_float")
+                || (n.len() >= 2
                     && (n.starts_with('u') || n.starts_with('i') || n.starts_with('f'))
-                    && n[1..].chars().all(|c| c.is_ascii_digit()))
+                    && n[1..].chars().all(|c| c.is_ascii_digit()));
+            if let Some(ty) = Self::t27_fn_type_to_zig(&n).or_else(|| builtin.then_some(n)) {
+                self.write_line(&format!("const {} = {};", node.name, ty));
+                return;
             }
-        {
-            self.write_line(&format!("const {} = {};", node.name, node.children[0].name));
-            return;
         }
 
         // A module-level `var` is MUTABLE. The parser records that in
@@ -8527,12 +8572,40 @@ impl Codegen {
     }
 
     fn gen_struct_decl(&mut self, node: &Node) {
+        // A parameterised const struct (`pub const Box(T) = struct { ... }`,
+        // parser ADR-008) cannot render as a plain Zig struct: the parameter
+        // would reach the field types as an undeclared identifier and the
+        // module would refuse to compile on every target (#11912). Zig's
+        // idiom for a generic type is a function returning the struct, so a
+        // generic declaration renders as
+        // `fn Box(comptime T: type) type { return struct { ... }; }`.
+        // The call sites (`Box(u8)`) already render as calls and compose
+        // unchanged; the plain (no-params) render keeps its exact old shape.
+        let generic = !node.params.is_empty();
         if node.extra_pub {
             self.write("pub ");
         }
 
-        self.write_line(&format!("const {} = struct {{", node.name));
-        self.indent();
+        if generic {
+            let param_list = node
+                .params
+                .iter()
+                .map(|(pname, _)| format!("comptime {}: type", Self::zig_ident(pname)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.write_line(&format!(
+                "fn {}({}) type {{",
+                Self::zig_ident(&node.name),
+                param_list
+            ));
+            self.indent();
+            self.write_indent();
+            self.write_line("return struct {");
+            self.indent();
+        } else {
+            self.write_line(&format!("const {} = struct {{", node.name));
+            self.indent();
+        }
 
         for field in &node.children {
             self.write_indent();
@@ -8555,7 +8628,15 @@ impl Codegen {
         }
 
         self.dedent();
+        if generic {
+            self.write_indent();
+        }
         self.write_line("};");
+        if generic {
+            self.dedent();
+            self.write_indent();
+            self.write_line("}");
+        }
     }
 
     /// Map a t27 tuple type `(T, U, ...)` to a Zig anonymous tuple-struct type
@@ -8748,6 +8829,17 @@ impl Codegen {
 
     fn t27_array_type_to_zig(ty: &str) -> String {
         let t = ty.trim();
+        // #11940: `?fn(A) -> R` slipped past the fn arm (starts with `?`).
+        if let Some(mapped) = t.strip_prefix('?')
+            .and_then(|i| Self::t27_fn_type_to_zig(i.trim()))
+        {
+            return format!("?{mapped}");
+        }
+        // #11940 sub-slice 3: a t27 fn TYPE is a type in every position this
+        // mapper serves; it used to pass through verbatim, arrow and all.
+        if let Some(mapped) = Self::t27_fn_type_to_zig(t) {
+            return mapped;
+        }
         // #6451: t27 also spells an optional Rust/TypeScript-style, AFTER the
         // type -- `OrgID?`, `str?`. Zig spells it `?T`; the suffix reached the
         // output verbatim and Zig answered "expected ',' after field" at the
@@ -8873,6 +8965,51 @@ impl Codegen {
             return t.to_string();
         }
         format!("{}{}", prefix, mapped)
+    }
+
+    /// #11940 sub-slice 3: a t27 fn TYPE renders as Zig's `fn (S) R`; a
+    /// multi-value return is the anonymous struct the tuple mapper builds. The
+    /// args end at the `)` MATCHING the opening one -- an argument may itself
+    /// be a fn type (`fn(A, ?fn(B) -> R) -> R2`), whose own `)` is not the end.
+    fn t27_fn_type_to_zig(text: &str) -> Option<String> {
+        let body = text.trim().strip_prefix("fn")?.trim_start().strip_prefix('(')?;
+        if body.is_empty() { return Some("fn () void".to_string()); }
+        let (mut depth, mut end) = (1i32, None);
+        for (i, b) in body.bytes().enumerate() {
+            depth += (b == b'(') as i32;
+            depth -= (b == b')') as i32;
+            if depth == 0 { end = Some(i); break; }
+        }
+        let end = end?;
+        let ret = body[end + 1..].trim();
+        let args: Vec<String> = Self::t27_top_level_commas(&body[..end]).into_iter()
+            .map(|a| Self::t27_array_type_to_zig(
+                if a.contains('(') { a.trim() }
+                else { a.rsplit(':').next().unwrap_or(&a).trim() }))
+            .collect();
+        let ret = ret.strip_prefix("->").map(str::trim).unwrap_or(ret);
+        let tail = if ret.is_empty() || ret == "void" {
+            " void".to_string()
+        } else {
+            format!(" {}", Self::t27_tuple_type_to_zig(ret)
+                .unwrap_or_else(|| Self::t27_array_type_to_zig(ret)))
+        };
+        Some(format!("fn ({}){}", args.join(", "), tail))
+    }
+
+    /// Split on commas OUTSIDE parens -- nested fn/tuple args carry their own.
+    fn t27_top_level_commas(args: &str) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut depth = 0i32;
+        for c in args.chars() {
+            match c {
+                '(' => { depth += 1; out.last_mut().unwrap().push(c); },
+                ')' => { depth -= 1; out.last_mut().unwrap().push(c); },
+                ',' if depth == 0 => out.push(String::new()),
+                c => out.last_mut().unwrap().push(c),
+            }
+        }
+        out
     }
 
     fn t27_tuple_type_to_zig(ty: &str) -> Option<String> {
@@ -9031,7 +9168,7 @@ impl Codegen {
         // to pick @truncate vs @intCast).
         self.zig_var_types.clear();
         for (pname, ptype) in &node.params {
-            if pname != "self" {
+            if pname != "self" && ptype != "type" { // #11940: a type param is not a value
                 self.zig_var_types.insert(pname.clone(), ptype.clone());
             }
         }
@@ -9066,7 +9203,7 @@ impl Codegen {
         let shadowed: Vec<String> = node
             .params
             .iter()
-            .filter(|(pname, ptype)| pname != "self" && body_muts.contains(pname) && (!(ptype.trim_start().starts_with('*') || ptype.trim_start().starts_with("[]")) || reassigned(&node.children, pname)))
+            .filter(|(pname, ptype)| pname != "self" && ptype.trim() != "type" && body_muts.contains(pname) && (!(ptype.trim_start().starts_with('*') || ptype.trim_start().starts_with("[]")) || reassigned(&node.children, pname)))
             .map(|(pname, _)| pname.clone())
             .collect();
 
@@ -9074,8 +9211,10 @@ impl Codegen {
         // way -- signature and body -- because the `_arg` RE-BINDING used for
         // mutable parameters would recreate the collision as a local.
         self.param_renames.clear();
-        for (pname, _) in node.params.iter() {
-            if pname != "self"
+        for (pname, ptype) in node.params.iter() {
+            // #11940: the W735 rename must not touch a type param -- a renamed
+            // `T_arg` would break every `T` the signature and body still spell.
+            if pname != "self" && ptype != "type"
                 && !shadowed.contains(pname)
                 && self.module_decl_names.contains(pname.as_str())
             {
@@ -9099,6 +9238,11 @@ impl Codegen {
         for (i, (pname, ptype)) in node.params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
+            }
+            // #11940 slice 1: type text "type" renders Zig's `comptime T: type`.
+            if ptype == "type" {
+                self.write(&format!("comptime {}: type", Self::zig_ident(pname)));
+                continue;
             }
             let arg_name = if shadowed.contains(pname) {
                 format!("{}_arg", pname)
@@ -9218,11 +9362,19 @@ impl Codegen {
                     ))
                     || (n.kind == NodeKind::ExprArrayLiteral
                         && text_has_ident(&n.extra_size, name))
+                    // #11940: a call-attached literal is TEXT on `value`, no
+                    // child nodes -- scan it too.
+                    || (n.kind == NodeKind::ExprCall && !n.value.is_empty() && text_has_ident(&n.value, name))
                     || param_referenced(&n.children, name)
             })
         }
-        for (pname, _) in &node.params {
-            if pname != "self" && !param_referenced(&node.children, pname) {
+        for (pname, ptype) in &node.params {
+            // #11940: a type param is used by the signature alone (`value: T`);
+            // discarding one the signature names is "pointless discard".
+            let signature_uses = ptype == "type"
+                && (node.extra_return_type.contains(pname.as_str())
+                    || node.params.iter().any(|(op, ot)| op != pname && ot != "type" && ot.contains(pname.as_str())));
+            if pname != "self" && !signature_uses && !param_referenced(&node.children, pname) {
                 self.write_indent();
                 // W735: an unused parameter that was RENAMED must be discarded
                 // under its new name, or Zig reports "unused function
@@ -10390,6 +10542,24 @@ impl Codegen {
                 self.write(&Self::zig_ident(&node.name));
             }
             NodeKind::ExprCall => {
+                // #5980: an import's body (`return @extern("sym");`, #8946)
+                // rendered verbatim is a two-argument Zig builtin with one
+                // argument -- the whole module refuses to compile under the
+                // reference, so even a spec's PURE tests never run
+                // (glass_window.t27: spec.zig:220, and pty_server beside it).
+                // The reference cannot reach the host across this boundary by
+                // construction; the import renders as the stub of the
+                // enclosing fn's own result type, and the pure tests run. The
+                // stub's value is deliberately useless: a verdict about host
+                // behaviour stays t27b's.
+                if node.name == "@extern" {
+                    match self.current_return_type.trim() {
+                        "" | "void" | "none" => {}
+                        t if t.contains("bool") => self.write("false"),
+                        _ => self.write("0"),
+                    }
+                    return;
+                }
                 // W572: a method call whose receiver could not be folded into
                 // the name keeps it as children[0].
                 if node.extra_kind == "method" && !node.children.is_empty() {
@@ -10613,8 +10783,7 @@ impl Codegen {
                     // `[]i32` ("expected type '[]i32', found 'struct { comptime
                     // T = 0, ... }'"), and only the callee's signature says what
                     // the element type is.
-                    let param_types = self.declared_fn_params.get(&node.name).cloned();
-                    for (i, arg) in node.children.iter().enumerate() {
+                    let param_types = self.declared_fn_params.get(&node.name).cloned();                    for (i, arg) in node.children.iter().enumerate() {
                         if i > 0 {
                             self.write(", ");
                         }
@@ -10669,6 +10838,9 @@ impl Codegen {
                         }
                     }
                     self.write(")");
+                    // #11940: a call-attached literal (`Box(T){ ... }`) is captured
+                    // as text on `value`; write it or the body emits a bare type.
+                    if !node.value.is_empty() { self.write(&node.value); }
                 }
             }
             NodeKind::ExprBinary => {
@@ -11831,24 +12003,9 @@ impl VerilogCodegen {
         })
     }
 
-    /// #5904: `uN` / `iN` with 1 <= N <= 128 -> `(N, signed)`. The one parser of
-    /// an integer type name, shared by `type_to_width`, `type_is_signed` and
-    /// `strict_port_width`. `usize`/`isize` do not match (no numeric suffix),
-    /// and neither do `u0`, `u129` or `u08`.
+    /// #5904: `uN` / `iN` with 1 <= N <= 128 -> `(N, signed)`; the rule is in specs/compiler/int_type_names.t27.
     fn int_type_bits(ty: &str) -> Option<(u32, bool)> {
-        let (signed, digits) = match ty.as_bytes().first()? {
-            b'u' => (false, &ty[1..]),
-            b'i' => (true, &ty[1..]),
-            _ => return None,
-        };
-        if digits.is_empty()
-            || digits.starts_with('0')
-            || !digits.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        let bits: u32 = digits.parse().ok()?;
-        (bits <= 128).then_some((bits, signed))
+        int_type_names::int_type_bits(ty.as_bytes()).map(|p| (p >> 1, p & 1 == 1))
     }
 
     /// Map t27 type to Verilog signedness
@@ -14782,6 +14939,13 @@ impl VerilogCodegen {
         self.write_line("endmodule");
         self.write_line("");
         self.write_line("`default_nettype wire");
+        // #12297: a big one-read one-write array gets a memory process of its own (specs/compiler/verilog_bram_shape.t27).
+        if !self.emit_test_assertions {
+            let text = crate::use_resolve::sized(|b, c| verilog_bram_shape::bram_text(self.output.as_bytes(), b, c));
+            if !text.is_empty() {
+                self.output = text;
+            }
+        }
     }
 
     fn gen_verilog_const(&mut self, node: &Node) {
@@ -27630,6 +27794,8 @@ impl RustCodegen {
                         if child.children.is_empty() || Self::is_undefined_init(&child.children) {
                             if child.extra_type.is_empty() {
                                 self.write_line(&format!("{} {};", kw, var_name));
+                            } else if let Some(zero) = Self::rust_array_zero_init(&typ) {
+                                self.write_line(&format!("{} {}: {} = {};", kw, var_name, typ, zero));
                             } else {
                                 self.write_line(&format!("{} {}: {};", kw, var_name, typ));
                             }
@@ -27832,6 +27998,27 @@ impl RustCodegen {
             && children[0].name == "undefined"
     }
 
+    /// Zero-initialiser for a Rust ARRAY type, for a local the spec declares
+    /// `= undefined` (or with no initialiser) and then fills through a
+    /// `&mut arr[0..n]` handed to a callee. rustc cannot see that write --
+    /// it does not count as initialising the array -- so the later read was
+    /// E0381 (#12036). `[0; n]` matches the interpreter, which reads only
+    /// the written prefix. NOT `Default::default()` (withdrawn #3223:
+    /// `[usize; 256]` has none), and not scalars: there a bare `let x: T;`
+    /// is legal and a read before a real assignment should fail loudly.
+    fn rust_array_zero_init(rust_type: &str) -> Option<String> {
+        let inner = rust_type.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (elem, count) = inner.split_once(';')?;
+        let zero = match elem.trim() {
+            "bool" => "false",
+            "f32" | "f64" => "0.0",
+            "usize" | "isize" => "0",
+            e if e.starts_with(['u', 'i']) && e[1..].bytes().all(|b| b.is_ascii_digit()) => "0",
+            _ => return None,
+        };
+        Some(format!("[{}; {}]", zero, count.trim()))
+    }
+
     fn rust_body_has_tail_expr(stmts: &[Node]) -> bool {
         stmts.last().is_some_and(|stmt| match stmt.kind {
             NodeKind::StmtExpr => stmt.children.len() == 1,
@@ -27917,6 +28104,8 @@ impl RustCodegen {
                 if stmt.children.is_empty() || Self::is_undefined_init(&stmt.children) {
                     if stmt.extra_type.is_empty() {
                         self.write_line(&format!("{} {};", kw, stmt.name));
+                    } else if let Some(zero) = Self::rust_array_zero_init(&typ) {
+                        self.write_line(&format!("{} {}: {} = {};", kw, stmt.name, typ, zero));
                     } else {
                         self.write_line(&format!("{} {}: {};", kw, stmt.name, typ));
                     }
@@ -28961,7 +29150,12 @@ impl RustCodegen {
                             if self.current_mut_slice_params.contains(a.as_str()) {
                                 continue;
                             }
-                            *a = format!("&mut {}", a);
+                            // The slice arm of `expr_to_rust` emits a SHARED
+                            // borrow (`&buf[0..5]`); wrapping it wholesale gave
+                            // `&mut &buf[0..5]`, a mut borrow OF a reference
+                            // (E0596, #12036). Borrow the place instead.
+                            let place = a.strip_prefix('&').filter(|r| !r.starts_with('&')).unwrap_or(a);
+                            *a = format!("&mut {}", place);
                         }
                     }
                     // `gen_fn` makes a bare `*T` parameter `&mut T`, so `&x` for it borrows
@@ -30779,49 +30973,11 @@ pub enum AsmSectionKind {
     Rodata,
 }
 
-impl AsmSectionKind {
-    pub fn from_i8(v: i8) -> Self {
-        match v {
-            0 => AsmSectionKind::Text,
-            1 => AsmSectionKind::Data,
-            2 => AsmSectionKind::Bss,
-            3 => AsmSectionKind::Rodata,
-            _ => AsmSectionKind::Text,
-        }
-    }
-    pub fn to_i8(&self) -> i8 {
-        match self {
-            AsmSectionKind::Text => 0,
-            AsmSectionKind::Data => 1,
-            AsmSectionKind::Bss => 2,
-            AsmSectionKind::Rodata => 3,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum AsmRelocKind {
     Abs32,
     Rel21,
     Gf16Label,
-}
-
-impl AsmRelocKind {
-    pub fn from_i8(v: i8) -> Self {
-        match v {
-            0 => AsmRelocKind::Abs32,
-            1 => AsmRelocKind::Rel21,
-            2 => AsmRelocKind::Gf16Label,
-            _ => AsmRelocKind::Abs32,
-        }
-    }
-    pub fn to_i8(&self) -> i8 {
-        match self {
-            AsmRelocKind::Abs32 => 0,
-            AsmRelocKind::Rel21 => 1,
-            AsmRelocKind::Gf16Label => 2,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -31908,12 +32064,6 @@ impl LinkerConfig {
 
     pub fn stack_top(&self) -> u32 {
         self.data_base.saturating_add(self.stack_size)
-    }
-
-    pub fn heap_start(&self) -> u32 {
-        self.data_base
-            .saturating_add(self.data_base)
-            .saturating_add(self.stack_size)
     }
 
     pub fn validate(&self) -> Vec<String> {
@@ -33031,10 +33181,6 @@ pub struct RouteEstimate {
 pub struct RouteModel;
 
 impl RouteModel {
-    pub const LOCAL_WIRE_UM: u32 = 500;
-    pub const MEDIUM_WIRE_UM: u32 = 2000;
-    pub const LONG_WIRE_UM: u32 = 5000;
-
     pub fn est_wire_length(fanout: u32) -> u32 {
         hir_cost_models::est_wire_length(fanout)
     }
@@ -33619,14 +33765,6 @@ impl HirRetimer {
         }
     }
 
-    pub fn retime_forward(&mut self, from: &str, to: &str, regs: u32) {
-        self.operations.push(RetimingOp::forward(from, to, regs));
-    }
-
-    pub fn retime_backward(&mut self, from: &str, to: &str, regs: u32) {
-        self.operations.push(RetimingOp::backward(from, to, regs));
-    }
-
     pub fn improvement_percent(&self) -> u32 {
         if self.original_crit_ps == 0 {
             return 0;
@@ -33683,9 +33821,6 @@ impl ConfigReg {
             writable: false,
             description: String::new(),
         }
-    }
-    pub fn byte_offset(&self) -> u32 {
-        self.offset / 8
     }
 }
 
@@ -38607,42 +38742,6 @@ mod tests_hir_assembler {
     }
 
     #[test]
-    fn test_section_kind_roundtrip() {
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Text.to_i8()),
-            AsmSectionKind::Text
-        );
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Data.to_i8()),
-            AsmSectionKind::Data
-        );
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Bss.to_i8()),
-            AsmSectionKind::Bss
-        );
-        assert_eq!(
-            AsmSectionKind::from_i8(AsmSectionKind::Rodata.to_i8()),
-            AsmSectionKind::Rodata
-        );
-    }
-
-    #[test]
-    fn test_reloc_kind_roundtrip() {
-        assert_eq!(
-            AsmRelocKind::from_i8(AsmRelocKind::Abs32.to_i8()),
-            AsmRelocKind::Abs32
-        );
-        assert_eq!(
-            AsmRelocKind::from_i8(AsmRelocKind::Rel21.to_i8()),
-            AsmRelocKind::Rel21
-        );
-        assert_eq!(
-            AsmRelocKind::from_i8(AsmRelocKind::Gf16Label.to_i8()),
-            AsmRelocKind::Gf16Label
-        );
-    }
-
-    #[test]
     fn test_full_assembly_program() {
         let mut asm = HirAssembler::new("trinity_hello");
         asm.define_symbol("_start", true);
@@ -40933,30 +41032,6 @@ mod tests_compiler_rejects {
             .unwrap_or_else(|e| panic!("compile_verilog failed unexpectedly: {}", e))
     }
 
-    /// Assert the recovered function body is left unimplemented and the bogus
-    /// token never leaked into codegen.
-    fn assert_dropped(v: &str, fn_name: &str, bogus_tokens: &[&str]) {
-        assert!(
-            v.contains("// TODO: implement"),
-            "recovered body should be left unimplemented, got:\n{}",
-            v
-        );
-        assert!(
-            !v.contains(&format!("{} = ", fn_name)),
-            "the rejected statement must be dropped, not lowered (no `{} = `), got:\n{}",
-            fn_name,
-            v
-        );
-        for tok in bogus_tokens {
-            assert!(
-                !v.contains(tok),
-                "bogus token `{}` must never reach codegen, got:\n{}",
-                tok,
-                v
-            );
-        }
-    }
-
     // Case 1: unknown cast type. `x as widget` -> the type is not in
     // VALID_CAST_TYPES, so the statement is dropped; `widget` never emitted.
     #[test]
@@ -41178,24 +41253,6 @@ mod tests_compiler_rejects {
     //
     // All outcomes below were observed empirically before being asserted.
     // -----------------------------------------------------------------------
-
-    /// Helper: assert a bogus top-level token was dropped during recovery and
-    /// never leaked into codegen, while the module skeleton still emitted.
-    fn assert_decl_dropped(v: &str, module_name: &str, bogus_tokens: &[&str]) {
-        assert!(
-            v.contains(&format!("module {} (", module_name)),
-            "the module skeleton must still emit after declaration recovery, got:\n{}",
-            v
-        );
-        for tok in bogus_tokens {
-            assert!(
-                !v.contains(tok),
-                "bogus top-level token `{}` must never reach codegen, got:\n{}",
-                tok,
-                v
-            );
-        }
-    }
 
     // (a) Unknown leading top-level token (`gibberish foo`) -> the declaration
     // parser errors, `skip_to_next_top_level()` drops the bogus tokens, and the
@@ -42657,11 +42714,6 @@ impl HirSvEmitter {
         self.output.push_str("endpackage\n\n");
     }
 
-    pub fn emit_interface(&mut self, iface: &SvInterface) {
-        self.output.push_str(&iface.emit());
-        self.output.push('\n');
-    }
-
     pub fn emit_module_sv(&mut self, hir: &HirModule) {
         self.output.push_str(&format!("module {} (\n", hir.name));
         for (i, port) in hir.ports.iter().enumerate() {
@@ -42742,75 +42794,6 @@ impl HirFirrtlEmitter {
             self.output
                 .push_str(&format!("    {} <= {}\n", assign.target, assign.value));
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct HirDiff {
-    pub field: String,
-    pub left: String,
-    pub right: String,
-}
-
-#[derive(Debug)]
-pub struct HirDiffEngine;
-
-impl HirDiffEngine {
-    pub fn diff(a: &HirModule, b: &HirModule) -> Vec<HirDiff> {
-        let mut diffs = Vec::new();
-        if a.name != b.name {
-            diffs.push(HirDiff {
-                field: "name".into(),
-                left: a.name.clone(),
-                right: b.name.clone(),
-            });
-        }
-        if a.ports.len() != b.ports.len() {
-            diffs.push(HirDiff {
-                field: "port_count".into(),
-                left: a.ports.len().to_string(),
-                right: b.ports.len().to_string(),
-            });
-        }
-        if a.signals.len() != b.signals.len() {
-            diffs.push(HirDiff {
-                field: "signal_count".into(),
-                left: a.signals.len().to_string(),
-                right: b.signals.len().to_string(),
-            });
-        }
-        if a.memories.len() != b.memories.len() {
-            diffs.push(HirDiff {
-                field: "memory_count".into(),
-                left: a.memories.len().to_string(),
-                right: b.memories.len().to_string(),
-            });
-        }
-        if a.bus_ports.len() != b.bus_ports.len() {
-            diffs.push(HirDiff {
-                field: "bus_count".into(),
-                left: a.bus_ports.len().to_string(),
-                right: b.bus_ports.len().to_string(),
-            });
-        }
-        if a.gf16_accels.len() != b.gf16_accels.len() {
-            diffs.push(HirDiff {
-                field: "gf16_count".into(),
-                left: a.gf16_accels.len().to_string(),
-                right: b.gf16_accels.len().to_string(),
-            });
-        }
-        if a.ternary_cores.len() != b.ternary_cores.len() {
-            diffs.push(HirDiff {
-                field: "ternary_count".into(),
-                left: a.ternary_cores.len().to_string(),
-                right: b.ternary_cores.len().to_string(),
-            });
-        }
-        diffs
-    }
-    pub fn equivalent(a: &HirModule, b: &HirModule) -> bool {
-        Self::diff(a, b).is_empty()
     }
 }
 
@@ -43035,9 +43018,6 @@ impl HirLinter {
             }
         }
         violations
-    }
-    pub fn lint_count(module: &HirModule) -> u32 {
-        Self::lint(module).len() as u32
     }
 }
 
@@ -43290,47 +43270,6 @@ mod tests_phase33_firrtl {
         assert!(s.contains("module firrtl_test"));
         assert!(s.contains("input in : UInt<8>"));
         assert!(s.contains("out <= tmp"));
-    }
-}
-
-#[cfg(test)]
-mod tests_phase34_diff {
-    use super::*;
-
-    fn mod_a() -> HirModule {
-        let mut m = HirModule::new("test");
-        m.ports.push(HirPort {
-            name: "clk".into(),
-            dir: HwPortDir::Input,
-            ty: HwType::Clock,
-        });
-        m
-    }
-
-    #[test]
-    fn test_diff_identical() {
-        assert!(HirDiffEngine::equivalent(&mod_a(), &mod_a()));
-    }
-
-    #[test]
-    fn test_diff_name() {
-        let mut b = mod_a();
-        b.name = "other".into();
-        let diffs = HirDiffEngine::diff(&mod_a(), &b);
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].field, "name");
-    }
-
-    #[test]
-    fn test_diff_ports() {
-        let mut b = mod_a();
-        b.ports.push(HirPort {
-            name: "extra".into(),
-            dir: HwPortDir::Input,
-            ty: HwType::Bool,
-        });
-        let diffs = HirDiffEngine::diff(&mod_a(), &b);
-        assert!(diffs.iter().any(|d| d.field == "port_count"));
     }
 }
 

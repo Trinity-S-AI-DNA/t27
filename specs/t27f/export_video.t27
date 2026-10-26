@@ -1,0 +1,436 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/export_video.t27 -- the same display list, exported: the per-frame hash record the
+// Railway lab encodes to MP4. Milestone M6 of T27F Live (epic gHashTag/t27#10266), issue
+// gHashTag/t27#10265. Design: docs/nona-02-organism/t27f/genui-research.md, sections 5.3 and 5.5.
+//
+// WHY THE SAME DISPLAY LIST (FR-001). The claim of M6 is that the live page and the posted video
+// are the same frames. That is only true if the exporter hashes the very op stream the browser
+// paints, so this card defines no second renderer and cannot have one: record_frame and
+// verify_frame both get their bytes from frame_stream, whose only statement is a call to
+// display_list::flatten_into -- the same function the browser loader executes. The fixture here
+// (fixture_scene) stands in for the scene a recorded log replays to at frame k; what is recorded
+// is what that scene flattened to, frame by frame. The hash is of the op stream and so is
+// independent of the preset: the preset pins the raster the encoder renders into, not the bytes.
+//
+// WHY A HASH PER FRAME (FR-002). An MP4 proves nothing by itself -- a re-encode, a crop or a
+// second renderer all produce video too. The evidence is the record: per frame, the index, the
+// opcode count, the byte count and the sha256 hex of its op stream. verify_frame re-derives the
+// hash from the scene replayed at frame k and refuses on the first differing hex letter with
+// E_HASH -- a wrong frame or a wrong scene is refused and named, never silently accepted. Every
+// recorded hash is 64 nonzero bytes (hash_hex emits hex letters), so an unrecorded slot reads as
+// zero and cannot pass for a digest.
+//
+// WHY THE ENCODER IS NOT HERE (FR-003). ffmpeg is lab plumbing, not spec: an encoder invocation
+// in this card could never be honest from a machine that cannot reach the lab. The card pins
+// what a record must mean -- the schedule (FPS=30), the two presets (1920x1080, 1080x1920), the
+// 30 s fixture at exactly 900 frames -- and states the gate as constants: ENCODER_HOST names the
+// Railway lab, HAS_LOCAL_ENCODE is false and asserted, so the rule "never on the owner's Mac" is
+// checked, not promised. The lab renders each frame's display list, encodes the MP4, and the
+// success gate is per-frame hash equality between this record and a browser replay of the log.
+//
+// THE SCHEDULE IS EXACT AND REFUSES. A record holds at most MAX_EXPORT_FRAMES = fps * 30 s = 900
+// frames. A 31st frame into a full record is E_FULL; a length whose schedule exceeds the cap is
+// E_RANGE; a preset that is not one of the two sizes is E_PRESET. Every refusal happens before
+// the first write, in the epic's discipline: refused, never truncated.
+//
+// NOT CLAIMED: no lab run has happened yet -- LAB_RUN_DONE is false and asserted, and the one
+// 30 s queen-live.mp4 of the success criteria is PENDING lab access (the Railway lab is not
+// reachable from the machine this card was written on); no encoder invocation exists in this
+// spec or its tests; the browser replay in the tests is the same pure flatten path run twice
+// through fixture_scene, not a run of a browser against the loader page; the equality checked is
+// op-stream equality, which is what M6's gate names, not a pixel comparison; no audio, no
+// variable frame rate, no codec or bitrate tuning.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module export_video;
+
+use t27f::scene::Scene;
+use t27f::scene::Op;
+use t27f::scene::scene_empty;
+use t27f::scene::apply_op;
+use t27f::scene::validate_scene;
+use t27f::scene::SCENE_OK;
+use t27f::scene::PRIM_GROUP;
+use t27f::scene::PRIM_RECT;
+use t27f::scene::PRIM_TEXT;
+use t27f::scene::PRIM_FACE;
+use t27f::scene::NO_PARENT;
+use t27f::scene::F_X;
+use t27f::scene::F_W;
+use t27f::scene::F_OPACITY;
+use t27f::scene::OP_ADD;
+use t27f::scene::OP_SET;
+use t27f::scene::MAX_NODES;
+use t27f::display_list::Stream;
+use t27f::display_list::stream_empty;
+use t27f::display_list::flatten_into;
+use t27f::display_list::MAX_OPS_PER_FRAME;
+use tri::crypto::sha256;
+
+pub const ID : str = "export-video";
+pub const VERSION : u8 = 1;
+
+// ---- the schedule ------------------------------------------------------------------------------------
+
+/// The clip for X is 30 seconds at 30 frames a second: exactly 900 frames, the record's cap.
+pub const FPS : u32 = 30;
+pub const EXPORT_SECONDS : u32 = 30;
+pub const MAX_EXPORT_FRAMES : u32 = FPS * EXPORT_SECONDS;   // 900
+pub const EXPORT_TARGET : str = "queen-live.mp4";
+
+/// The per-frame schedule: frame k covers [k/fps, (k+1)/fps) of the log. The count is exact --
+/// a 30 s log at 30 fps is 900 frames, never 899 or 901, and the 900-frame test says so.
+pub fn export_frame_count(seconds: u32) -> u32 {
+    return FPS * seconds;
+}
+
+// ---- the presets -------------------------------------------------------------------------------------
+
+/// The two sizes the issue fixes. The display list itself is preset-independent (the hash is of
+/// the op stream); the preset names the raster the lab encoder renders into.
+pub const PRESET_LANDSCAPE : u8 = 0;       // 1920x1080
+pub const PRESET_PORTRAIT : u8 = 1;        // 1080x1920
+pub const PRESET_KINDS : u8 = 2;
+pub const PRESET_NAMES : [2]str = ["1920x1080", "1080x1920"];
+
+pub fn preset_ok(p: u8) -> bool {
+    return p < PRESET_KINDS;
+}
+
+pub fn preset_width(p: u8) -> u32 {
+    if (p == PRESET_PORTRAIT) { return 1080; }
+    return 1920;
+}
+
+pub fn preset_height(p: u8) -> u32 {
+    if (p == PRESET_PORTRAIT) { return 1920; }
+    return 1080;
+}
+
+// ---- what the functions answer -----------------------------------------------------------------------
+
+pub const EXPORT_OK : u8 = 0;
+pub const E_PRESET : u8 = 1;               // the preset is not one of the two sizes: refused
+pub const E_RANGE : u8 = 2;                // seconds is 0 or its schedule exceeds the cap: refused
+pub const E_FULL : u8 = 3;                 // the record already holds its whole schedule: refused
+pub const E_BUDGET : u8 = 4;               // display_list refused the frame: passed through, named
+pub const E_HASH : u8 = 5;                 // the re-derived hash differs from the record: refused
+pub const E_INDEX : u8 = 6;                // the frame index is outside the record
+pub const RESULT_NAMES : [7]str = ["ok", "preset", "range", "full", "budget", "hash", "index"];
+
+// ---- the lab gate (FR-003), stated so a test can hold it ---------------------------------------------
+
+pub const ENCODER_HOST : str = "railway-lab";
+pub const HAS_LOCAL_ENCODE : bool = false; // the encoder never runs on the owner's Mac
+pub const LAB_RUN_DONE : bool = false;     // no lab run yet; flips only in the PR that has one
+
+// ---- the record --------------------------------------------------------------------------------------
+
+/// The record the lab encodes from. Columns are flat and indexed by frame number, as
+/// work_graph's columns are indexed by node: sha holds 64 hex letters per frame at k*64.
+/// HashHex emits letters only, so an unrecorded slot is all zero and cannot pass for a digest.
+pub const HASH_HEX_LEN : u32 = 64;         // display_list hashes with sha256::hash_hex
+
+pub const ExportRecord = struct {
+    preset : u8,                           // one of the two presets
+    seconds : u32,                         // the schedule the record committed to
+    frame_count : u32,                     // frames recorded so far; complete == fps * seconds
+    index : [900]u32,                      // frames[k].index
+    op_count : [900]u32,                   // frames[k].opcode count, display_list's budget units
+    byte_count : [900]u32,                 // frames[k].byte count of the op stream
+    sha : [57600]u8,                       // frames[k].sha256 hex, at k*64
+};
+
+/// Zero the record and commit it to a schedule. The checks run before the first write, so a
+/// refused init leaves the caller's record untouched.
+pub fn record_init(rec: *ExportRecord, preset: u8, seconds: u32) -> u8 {
+    if (!preset_ok(preset)) { return E_PRESET; }
+    if (seconds == 0 or export_frame_count(seconds) > MAX_EXPORT_FRAMES) { return E_RANGE; }
+    rec.preset = preset;
+    rec.seconds = seconds;
+    rec.frame_count = 0;
+    var i : u32 = 0;
+    while (i < MAX_EXPORT_FRAMES) {
+        rec.index[i as usize] = 0;
+        rec.op_count[i as usize] = 0;
+        rec.byte_count[i as usize] = 0;
+        i = i + 1;
+    }
+    var j : u32 = 0;
+    while (j < MAX_EXPORT_FRAMES * HASH_HEX_LEN) {
+        rec.sha[j as usize] = 0;
+        j = j + 1;
+    }
+    return EXPORT_OK;
+}
+
+/// The one path from scene to painted bytes: display_list::flatten_into, the function the browser
+/// loader executes. record_frame and verify_frame both get their bytes here and nowhere else, so
+/// a second renderer is not merely forbidden -- there is no place for one to stand (FR-001). The
+/// stream is reset first, so a frame's hash reads only the bytes its own flatten wrote.
+pub fn frame_stream(s: *Scene, st: *Stream) -> u8 {
+    st.n = 0;
+    st.ops = 0;
+    return flatten_into(s, st);
+}
+
+/// Render one frame of the export: flatten the scene through the browser's display list, hash the
+/// bytes, and append the frame's record. A frame over display_list's budget is E_BUDGET and the
+/// record is left as it was; a complete record refuses a further frame with E_FULL.
+pub fn record_frame(rec: *ExportRecord, s: *Scene, st: *Stream) -> u8 {
+    if (rec.frame_count >= export_frame_count(rec.seconds)) { return E_FULL; }
+    const r = frame_stream(s, st);
+    if (r != SCENE_OK) { return E_BUDGET; }
+    const hex = sha256::hash_hex(st.bytes[0..st.n]);
+    const f = rec.frame_count;
+    rec.index[f as usize] = f;
+    rec.op_count[f as usize] = st.ops;
+    rec.byte_count[f as usize] = st.n;
+    var i : u32 = 0;
+    while (i < HASH_HEX_LEN) {
+        rec.sha[f * HASH_HEX_LEN + i] = hex[i as usize];
+        i = i + 1;
+    }
+    rec.frame_count = f + 1;
+    return EXPORT_OK;
+}
+
+/// FR-002's gate: re-derive frame k's hash from the scene the log replays to at k -- the same
+/// frame_stream, so the same bytes the browser paints -- and compare letter by letter against the
+/// record. The first differing letter is E_HASH; a k outside the record is E_INDEX, not a guess.
+pub fn verify_frame(rec: *ExportRecord, k: u32, s: *Scene, st: *Stream) -> u8 {
+    if (k >= rec.frame_count) { return E_INDEX; }
+    const r = frame_stream(s, st);
+    if (r != SCENE_OK) { return E_BUDGET; }
+    const hex = sha256::hash_hex(st.bytes[0..st.n]);
+    var i : u32 = 0;
+    while (i < HASH_HEX_LEN) {
+        if (hex[i as usize] != rec.sha[k * HASH_HEX_LEN + i]) { return E_HASH; }
+        i = i + 1;
+    }
+    return EXPORT_OK;
+}
+
+// ---- the fixture -------------------------------------------------------------------------------------
+
+fn remu(a: u32, m: u32) -> u32 {
+    return a - @divTrunc(a, m) * m;
+}
+
+/// The scene the recorded log replays to at frame k: a group with a text label and a card, plus
+/// the face widget beside it, the card's x advancing three units a frame, the face's opacity
+/// pulsing over 128 frames and the card's width over 30. Deterministic in k alone -- the same log
+/// gives the same scene on the lab, in the browser and here -- and every consecutive pair of
+/// frames differs, which the 900-frame test checks hash by hash.
+pub fn fixture_scene(k: u32) -> Scene {
+    var s = scene_empty();
+    const add_group = Op{ .op = OP_ADD, .seq = 1, .prim = PRIM_GROUP, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const add_text = Op{ .op = OP_ADD, .seq = 2, .prim = PRIM_TEXT, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    const add_card = Op{ .op = OP_ADD, .seq = 3, .prim = PRIM_RECT, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    const add_face = Op{ .op = OP_ADD, .seq = 4, .prim = PRIM_FACE, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const move_x = Op{ .op = OP_SET, .seq = 5, .prim = 0, .parent = 0, .node = 2, .field = F_X, .value = @as(i32, @intCast(remu(k * 3 + 7, 240))) };
+    const pulse = Op{ .op = OP_SET, .seq = 6, .prim = 0, .parent = 0, .node = 3, .field = F_OPACITY, .value = 128 + @as(i32, @intCast(remu(k, 128))) };
+    const widen = Op{ .op = OP_SET, .seq = 7, .prim = 0, .parent = 0, .node = 2, .field = F_W, .value = 60 + @as(i32, @intCast(remu(@divTrunc(k, 30), 40))) };
+    assert(apply_op(&s, add_group) == SCENE_OK);
+    assert(apply_op(&s, add_text) == SCENE_OK);
+    assert(apply_op(&s, add_card) == SCENE_OK);
+    assert(apply_op(&s, add_face) == SCENE_OK);
+    assert(apply_op(&s, move_x) == SCENE_OK);
+    assert(apply_op(&s, pulse) == SCENE_OK);
+    assert(apply_op(&s, widen) == SCENE_OK);
+    return s;
+}
+
+// ---- tests -------------------------------------------------------------------------------------------
+
+test the_two_presets_are_exact_and_anything_else_is_refused {
+    assert(PRESET_KINDS == 2);
+    assert(PRESET_NAMES.len == 2);
+    assert(preset_width(PRESET_LANDSCAPE) == 1920);
+    assert(preset_height(PRESET_LANDSCAPE) == 1080);
+    assert(preset_width(PRESET_PORTRAIT) == 1080);
+    assert(preset_height(PRESET_PORTRAIT) == 1920);
+    // the two presets are one raster transposed: same pixel count, different shape
+    assert(preset_width(PRESET_LANDSCAPE) * preset_height(PRESET_LANDSCAPE) == preset_width(PRESET_PORTRAIT) * preset_height(PRESET_PORTRAIT));
+    // a record takes one of the two and refuses anything else, before any write
+    var rec : ExportRecord = undefined;
+    assert(record_init(&rec, PRESET_LANDSCAPE, EXPORT_SECONDS) == EXPORT_OK);
+    assert(record_init(&rec, PRESET_PORTRAIT, EXPORT_SECONDS) == EXPORT_OK);
+    assert(record_init(&rec, PRESET_KINDS, EXPORT_SECONDS) == E_PRESET);   // one past the last
+    assert(record_init(&rec, 200, EXPORT_SECONDS) == E_PRESET);
+    // and a length without a schedule is refused too: no seconds no clip, 31 s does not fit 900
+    assert(record_init(&rec, PRESET_LANDSCAPE, 0) == E_RANGE);
+    assert(record_init(&rec, PRESET_LANDSCAPE, EXPORT_SECONDS + 1) == E_RANGE);
+    assert(record_init(&rec, PRESET_LANDSCAPE, EXPORT_SECONDS) == EXPORT_OK);   // 900 == the cap
+}
+
+test a_30_second_log_at_30_fps_is_a_900_frame_record {                   // the issue's second scenario
+    var rec : ExportRecord = undefined;
+    assert(record_init(&rec, PRESET_LANDSCAPE, EXPORT_SECONDS) == EXPORT_OK);
+    var st = stream_empty();
+    var k : u32 = 0;
+    while (k < MAX_EXPORT_FRAMES) {
+        var s = fixture_scene(k);
+        assert(record_frame(&rec, &s, &st) == EXPORT_OK);
+        k = k + 1;
+    }
+    assert(rec.frame_count == 900);
+    assert(rec.frame_count == MAX_EXPORT_FRAMES);
+    assert(rec.frame_count == FPS * EXPORT_SECONDS);
+    assert(rec.index[0] == 0);
+    assert(rec.index[899] == 899);
+    // FR-002: every frame carries a real digest of a real stream -- no empty frames, no zero slots
+    k = 0;
+    while (k < rec.frame_count) {
+        assert(rec.op_count[k as usize] > 0);
+        assert(rec.byte_count[k as usize] > 0);
+        var i : u32 = 0;
+        while (i < HASH_HEX_LEN) {
+            assert(rec.sha[k * HASH_HEX_LEN + i] != 0);   // hex letters, never a zero byte
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    // the schedule animates: no two consecutive frames share a stream
+    k = 0;
+    while (k + 1 < rec.frame_count) {
+        var same : bool = true;
+        var i : u32 = 0;
+        while (i < HASH_HEX_LEN) {
+            if (rec.sha[k * HASH_HEX_LEN + i] != rec.sha[(k + 1) * HASH_HEX_LEN + i]) { same = false; }
+            i = i + 1;
+        }
+        assert(!same);
+        k = k + 1;
+    }
+    // the record refuses to grow past its own schedule: frame 900 of 900 is refused, named
+    var s901 = fixture_scene(901);
+    assert(record_frame(&rec, &s901, &st) == E_FULL);
+    assert(rec.frame_count == 900);
+    // spot re-verification across the clip: the recorded frames still verify against fresh replays
+    var s0 = fixture_scene(0);
+    assert(verify_frame(&rec, 0, &s0, &st) == EXPORT_OK);
+    var s449 = fixture_scene(449);
+    assert(verify_frame(&rec, 449, &s449, &st) == EXPORT_OK);
+    var s899 = fixture_scene(899);
+    assert(verify_frame(&rec, 899, &s899, &st) == EXPORT_OK);
+}
+
+test export_and_replay_hashes_agree_on_every_frame_of_a_small_fixture {  // the issue's first scenario
+    var rec : ExportRecord = undefined;
+    assert(record_init(&rec, PRESET_PORTRAIT, 1) == EXPORT_OK);   // 30 slots, 10 used
+    var st = stream_empty();
+    // export, as the lab does: render each frame's display list and record its hash
+    var k : u32 = 0;
+    while (k < 10) {
+        var s = fixture_scene(k);
+        assert(validate_scene(&s) == SCENE_OK);   // the browser only paints validated scenes
+        assert(record_frame(&rec, &s, &st) == EXPORT_OK);
+        k = k + 1;
+    }
+    assert(rec.frame_count == 10);
+    // the fixture flattens to 18 opcodes in 86 bytes: display_list's encoding of this scene, pinned
+    // so any change to the encoding moves this test loudly, on every backend
+    assert(rec.op_count[0] == 18);
+    assert(rec.byte_count[0] == 86);
+    // replay, as the browser does: rebuild the same scene from the log, paint the same display
+    // list -- every recorded hash must equal the freshly derived one, 10 of 10
+    k = 0;
+    var agree : u32 = 0;
+    while (k < 10) {
+        var s = fixture_scene(k);
+        assert(verify_frame(&rec, k, &s, &st) == EXPORT_OK);
+        agree = agree + 1;
+        k = k + 1;
+    }
+    assert(agree == 10);
+    // a frame past the record is a refused question, not a mismatch
+    var s10 = fixture_scene(10);
+    assert(verify_frame(&rec, 10, &s10, &st) == E_INDEX);
+}
+
+test a_wrong_hash_is_refused_never_silently_accepted {                   // FR-002's refusal
+    var rec : ExportRecord = undefined;
+    assert(record_init(&rec, PRESET_LANDSCAPE, 1) == EXPORT_OK);
+    var st = stream_empty();
+    var k : u32 = 0;
+    while (k < 10) {
+        var s = fixture_scene(k);
+        assert(record_frame(&rec, &s, &st) == EXPORT_OK);
+        k = k + 1;
+    }
+    // corrupt one letter of frame 3's hash: every other byte stays as the export wrote it
+    const kept = rec.sha[3 * HASH_HEX_LEN];
+    if (kept == 97) { rec.sha[3 * HASH_HEX_LEN] = 98; } else { rec.sha[3 * HASH_HEX_LEN] = 97; }
+    var s3 = fixture_scene(3);
+    assert(verify_frame(&rec, 3, &s3, &st) == E_HASH);
+    // the refusal is precise: the corrupted frame's neighbours still verify
+    var s2 = fixture_scene(2);
+    assert(verify_frame(&rec, 2, &s2, &st) == EXPORT_OK);
+    var s4 = fixture_scene(4);
+    assert(verify_frame(&rec, 4, &s4, &st) == EXPORT_OK);
+    // a wrong scene is the same refusal: frame 5 checked against frame 6's scene
+    var s6 = fixture_scene(6);
+    assert(verify_frame(&rec, 5, &s6, &st) == E_HASH);
+    // restore the letter and the frame verifies again: the record was the only lie
+    rec.sha[3 * HASH_HEX_LEN] = kept;
+    assert(verify_frame(&rec, 3, &s3, &st) == EXPORT_OK);
+}
+
+test a_scene_over_the_display_list_budget_is_refused_and_the_record_is_unchanged {
+    var rec : ExportRecord = undefined;
+    assert(record_init(&rec, PRESET_LANDSCAPE, 1) == EXPORT_OK);
+    var st = stream_empty();
+    var s = fixture_scene(0);
+    assert(record_frame(&rec, &s, &st) == EXPORT_OK);
+    assert(rec.frame_count == 1);
+    // 32 plain rects want 160 opcodes: display_list's budget refuses, the exporter names it E_BUDGET
+    var big = scene_empty();
+    var i : u32 = 0;
+    while (i < MAX_NODES) {
+        const a = Op{ .op = OP_ADD, .seq = i + 1, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+        assert(apply_op(&big, a) == SCENE_OK);
+        i = i + 1;
+    }
+    const frames_before = rec.frame_count;
+    const ops_before = rec.op_count[0];
+    const bytes_before = rec.byte_count[0];
+    assert(record_frame(&rec, &big, &st) == E_BUDGET);
+    assert(rec.frame_count == frames_before);   // refused, not truncated into the record
+    assert(rec.op_count[0] == ops_before);      // frame 0 untouched
+    assert(rec.byte_count[0] == bytes_before);
+    // and the refused frame left no half-written stream behind
+    assert(st.ops == 0);
+    assert(st.n == 0);
+}
+
+test the_export_rule_and_the_lab_gate_are_stated {                       // FR-003
+    assert(ENCODER_HOST == "railway-lab");
+    assert(HAS_LOCAL_ENCODE == false);      // the encoder never runs on the owner's Mac
+    assert(LAB_RUN_DONE == false);          // no lab run yet; the MP4 gate is pending lab access
+    assert(EXPORT_TARGET == "queen-live.mp4");
+    assert(FPS == 30);
+    assert(EXPORT_SECONDS == 30);
+    assert(EXPORT_OK == 0);
+    assert(RESULT_NAMES.len == 7);
+}
+
+invariant the_frame_cap_is_the_30_second_schedule {
+    assert(FPS == 30);
+    assert(EXPORT_SECONDS == 30);
+    assert(MAX_EXPORT_FRAMES == FPS * EXPORT_SECONDS);
+    assert(MAX_EXPORT_FRAMES == 900);
+    assert(EXPORT_OK == 0);
+    assert(RESULT_NAMES.len == 7);
+}
+
+invariant the_exporter_imports_the_browsers_flattener_and_no_other {
+    assert(MAX_OPS_PER_FRAME == 128);       // the frame budget this card inherits, display_list's own
+    assert(PRESET_KINDS == PRESET_NAMES.len);
+    assert(preset_ok(PRESET_LANDSCAPE));
+    assert(preset_ok(PRESET_PORTRAIT));
+    assert(!preset_ok(PRESET_KINDS));
+    assert(preset_width(PRESET_LANDSCAPE) * preset_height(PRESET_LANDSCAPE) == preset_width(PRESET_PORTRAIT) * preset_height(PRESET_PORTRAIT));
+    assert(ENCODER_HOST == "railway-lab");
+    assert(HAS_LOCAL_ENCODE == false);
+}

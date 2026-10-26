@@ -54,6 +54,7 @@ Use **domain directories**, not “one folder per agent.” Primary contact for 
 5. **Issue gate** — PRs should link issues (`Closes #N`) where project policy requires it.
    **Issue shape** -- a new issue stays open only if [`specs/policy/issue_shape.t27`](specs/policy/issue_shape.t27) (#7498) passes; otherwise `needs-boundary.yml` closes it seconds after filing, labelled `shape-refused`. That spec is the rule. Before `gh issue create`, load the skill [`.claude/skills/issue-shape/SKILL.md`](.claude/skills/issue-shape/SKILL.md): it explains the sections, the Boundary path trap, checking a body on the Railway lab, and recovery with `gh issue edit`.
 6. **Ring / gold work** — follow [`docs/nona-01-foundation/GOLDEN-RINGS-CANON.md`](docs/nona-01-foundation/GOLDEN-RINGS-CANON.md) for parser/compiler/spec changes; compiler seal path: `bootstrap/stage0/FROZEN_HASH`.
+7. **No litter** -- all t27 work lives in `~/t27` and its worktrees; no clones, worktrees or scratch in `~`, `/tmp` or `/private/tmp`, and 5.4 GiB must be free before a new worktree. The rules are in [`CLAUDE.md`](CLAUDE.md) "Where t27 work lives"; the T27 OS DOCTOR watches them.
 
 ---
 
@@ -315,6 +316,7 @@ Each gate is a spec. Read the spec, not a summary of it.
 - **Heavy runs do not go on a laptop.** Builds, corpus sweeps and mutation runs
   go to the Railway lab. A local Mac run has panicked the machine
   (2026-10-09).
+- **An edited import serves its sealed snapshot.** Cross-module consumers build against the import's seal, not the working tree: after editing an imported spec, `seal --save` it before rebuilding consumers -- and a consumer of a pub fn that calls a private helper needs that helper nameable, or the merged build fails on it (2026-10-23, #11777: identical error lines across different source texts were the tell).
 - **A merge is not a deploy.** A trinity merge is live on t27.ai only after the
   `gHashTag/ghashtag.github.io` publish workflow runs and its Pages build is
   `built`.

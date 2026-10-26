@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/tri/handoff/handoff.t27 -- the record one session leaves for the next (#12286).
+//
+// Collaboration runs through tri git. A session claims its key with
+// `tri loop claim <key>`, commits through `tri git commit`, and writes ONE
+// record per held task into docs/coordination/HANDOFF.md in that same commit;
+// the next session reads that file before it reads anything else. TASK.md's
+// Handoff log has not moved since 2026-04-06, so this is the channel that
+// actually carries context between agents -- and this spec is what a record
+// MEANS, so two sessions cannot spell the channel differently.
+//
+// A record is one line, five fields, split by '|'; a field never holds one --
+// the rule specs/t27os/lanes_view.t27 already proved on its own feed:
+//
+//   agent|task|state|issue|note
+//   Buffy|viz-distill-graph|doing|#12218|page lives in the spec, gen-js emits it
+//
+// States are the four a holder can be in, and transition_ok is the law of
+// moving between them: done is terminal, nothing jumps from taken to done, and
+// a repeat is not a move. The claim ledger (`tri loop claim`) refuses the same
+// pairs, which is why they are written here rather than remembered.
+//
+// The ledger side of that law has three fns, and the host (cli/tri/src/main.rs,
+// `trigit handoff`) runs them before it appends a byte: create_record builds the
+// line and refuses what a field cannot hold, find_last_state reads the last state
+// OF ONE TASK -- two tasks interleave in one ledger and the law belongs to the
+// task, not to whoever wrote last -- and may_write is transition_ok with a fresh
+// task open. put_lit and put_span are the two writers both readers share.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriHandoff;
+
+use t27os::devices::dv_line_end;
+
+/// The ledger every session reads first, relative to the repository root.
+pub const LEDGER : str = "docs/coordination/HANDOFF.md";
+
+/// Fields in a record.
+pub const FIELDS : u32 = 5;
+
+/// States, in the order the words appear in a record.
+pub const ST_TAKEN : u32 = 0;
+pub const ST_DOING : u32 = 1;
+pub const ST_BLOCKED : u32 = 2;
+pub const ST_DONE : u32 = 3;
+
+/// What state_code answers for a word it does not know.
+pub const ST_UNKNOWN : u32 = 99;
+
+/// Is the span exactly the literal? Compared byte by byte, so a longer or a
+/// shorter span is false rather than almost equal.
+pub fn span_is(s: []const u8, a: usize, b: usize, lit: string) -> bool {
+    if (b - a != lit.len) { return false; }
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (s[a + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The code of a state word, or ST_UNKNOWN. The span, not the whole line: the
+/// third field of a record is the only thing that names a state.
+pub fn state_code(s: []const u8, a: usize, b: usize) -> u32 {
+    if (span_is(s, a, b, "taken")) { return ST_TAKEN; }
+    if (span_is(s, a, b, "doing")) { return ST_DOING; }
+    if (span_is(s, a, b, "blocked")) { return ST_BLOCKED; }
+    if (span_is(s, a, b, "done")) { return ST_DONE; }
+    return ST_UNKNOWN;
+}
+
+/// Index of the nth '|' counting from 0, or `to` when there are not that many.
+/// A missing separator and a separator at the end of the span are told apart
+/// by the callers: this one only ever answers a position.
+pub fn nth_sep(s: []const u8, from: usize, to: usize, n: u32) -> usize {
+    var k : usize = from;
+    var seen : u32 = 0;
+    while (k < to) {
+        if (s[k] == '|') {
+            if (seen == n) { return k; }
+            seen = seen + 1;
+        }
+        k = k + 1;
+    }
+    return to;
+}
+
+/// How many fields the span holds: one more than its separators.
+pub fn count_fields(s: []const u8, from: usize, to: usize) -> u32 {
+    var n : u32 = 1;
+    var k : usize = from;
+    while (k < to) {
+        if (s[k] == '|') { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// The state code carried by the THIRD field, or ST_UNKNOWN when the record
+/// has no third field or the word is not one of the four.
+pub fn state_field_code(s: []const u8, from: usize, to: usize) -> u32 {
+    const a : usize = nth_sep(s, from, to, 1) + 1;
+    const b : usize = nth_sep(s, from, to, 2);
+    if (a > b) { return ST_UNKNOWN; }
+    return state_code(s, a, b);
+}
+
+/// May a holder move from a to b? A repeat is not a move, done is terminal,
+/// and taken cannot become done -- the work in between is the point.
+pub fn transition_ok(a: u32, b: u32) -> bool {
+    if (a == b) { return true; }
+    if (a == ST_DONE) { return false; }
+    if (a == ST_UNKNOWN) { return false; }
+    if (a == ST_TAKEN) { return b == ST_DOING or b == ST_BLOCKED; }
+    if (a == ST_DOING) { return b == ST_DONE or b == ST_BLOCKED; }
+    return b == ST_DOING or b == ST_DONE;
+}
+
+/// The whole contract on one span: five fields, a state word it knows, and no
+/// empty agent, task or note -- an empty note is the context nobody left.
+pub fn record_is_well_formed(s: []const u8, from: usize, to: usize) -> bool {
+    if (count_fields(s, from, to) != FIELDS) { return false; }
+    if (state_field_code(s, from, to) == ST_UNKNOWN) { return false; }
+    const e0 : usize = nth_sep(s, from, to, 0);
+    const e1 : usize = nth_sep(s, from, to, 1);
+    const e3 : usize = nth_sep(s, from, to, 3);
+    if (e0 == from) { return false; }
+    if (e0 + 1 >= e1) { return false; }
+    if (e3 + 1 >= to) { return false; }
+    return true;
+}
+
+/// The word of a state, or "" for a code this spec does not know. state_code
+/// and state_name are inverses on the four states a record may carry.
+pub fn state_name(s: u32) -> str {
+    if (s == ST_TAKEN) { return "taken"; }
+    if (s == ST_DOING) { return "doing"; }
+    if (s == ST_BLOCKED) { return "blocked"; }
+    if (s == ST_DONE) { return "done"; }
+    return "";
+}
+
+/// The word s laid into out, up to cap. The writer for a value that is already
+/// a string -- a field of the record being built, a word of the contract. The
+/// one copy of this loop: specs/tri/trigit/verbs.t27 writes its argv through it
+/// (#12419), so s is a byte slice, like put_span's, not a static string.
+pub fn put_lit(out: []u8, w: usize, cap: usize, s: []const u8) -> usize {
+    var i : usize = 0;
+    while ((i < s.len) and (w < cap)) {
+        out[w] = s[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    return w;
+}
+
+/// The span s[a..b] laid into out, up to cap: the reader's half of put_lit, for
+/// a line that lives inside the ledger text rather than in one string.
+pub fn put_span(out: []u8, w: usize, cap: usize, s: []const u8, a: usize, b: usize) -> usize {
+    var i : usize = a;
+    while ((i < b) and (w < cap)) {
+        out[w] = s[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    return w;
+}
+
+/// Does the value hold a '|'? A field never holds one (the rule
+/// specs/t27os/lanes_view.t27 proved on its feed), so a value that does is
+/// refused here, before it can split somebody else's record.
+pub fn has_bar(s: string) -> bool {
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] == '|') { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The line one held task gets: agent|task|state|issue|note, ending in the
+/// newline the ledger appends by. Returns 0 and writes nothing when any field
+/// is empty, the state is not one of the four words, the issue is not an issue
+/// (no leading '#'), or a field holds a '|'.
+pub fn create_record(out: []u8, cap: usize, agent: string, task: string, state: string, issue: string, note: string) -> usize {
+    if ((agent.len == 0) or (task.len == 0) or (note.len == 0)) { return 0; }
+    if ((issue.len < 2) or (issue[0] != '#')) { return 0; }
+    if (state_code(state, 0, state.len) == ST_UNKNOWN) { return 0; }
+    if (has_bar(agent) or has_bar(task) or has_bar(state) or has_bar(issue) or has_bar(note)) { return 0; }
+    var w : usize = 0;
+    w = put_lit(out, w, cap, agent);
+    w = put_lit(out, w, cap, "|");
+    w = put_lit(out, w, cap, task);
+    w = put_lit(out, w, cap, "|");
+    w = put_lit(out, w, cap, state);
+    w = put_lit(out, w, cap, "|");
+    w = put_lit(out, w, cap, issue);
+    w = put_lit(out, w, cap, "|");
+    w = put_lit(out, w, cap, note);
+    w = put_lit(out, w, cap, "\n");
+    return w;
+}
+
+/// The state of the LAST well-formed record OF THIS TASK in the ledger text,
+/// or ST_UNKNOWN when the task was never recorded. Not simply the last line:
+/// tasks interleave in one ledger, and transition_ok is the law of ONE task's
+/// record. Prose lines (a title, the format note) are not records and are skipped.
+pub fn find_last_state(f: []const u8, task: string) -> u32 {
+    var last : u32 = ST_UNKNOWN;
+    var at : usize = 0;
+    while (at < f.len) {
+        const le : usize = dv_line_end(f, at);
+        if (record_is_well_formed(f, at, le)) {
+            const e0 : usize = nth_sep(f, at, le, 0);
+            const e1 : usize = nth_sep(f, at, le, 1);
+            if (span_is(f, e0 + 1, e1, task)) { last = state_field_code(f, at, le); }
+        }
+        at = le + 1;
+    }
+    return last;
+}
+
+/// May a task whose last state is `last` move to `next`? A task nothing
+/// recorded yet may start anywhere -- the ledger is open at the start -- and
+/// from then on it is transition_ok and no more.
+pub fn may_write(last: u32, next: u32) -> bool {
+    if (last == ST_UNKNOWN) { return true; }
+    return transition_ok(last, next);
+}
+
+test span_is_compares_the_whole_span {
+    assert span_is("taken", 0, 5, "taken") == true
+    assert span_is("taken", 0, 4, "taken") == false
+    assert span_is("taken", 0, 6, "taken") == false
+}
+
+test state_code_names_four_states_and_refuses_the_rest {
+    assert state_code("taken", 0, 5) == 0
+    assert state_code("doing", 0, 5) == 1
+    assert state_code("blocked", 0, 7) == 2
+    assert state_code("done", 0, 4) == 3
+    assert state_code("hold", 0, 4) == 99
+}
+
+test nth_sep_walks_the_separators_left_to_right {
+    const r : str = "a|b|c|d|e";
+    assert nth_sep(r, 0, 9, 0) == 1
+    assert nth_sep(r, 0, 9, 1) == 3
+    assert nth_sep(r, 0, 9, 3) == 7
+    assert nth_sep(r, 0, 9, 4) == 9
+    assert nth_sep("solo", 0, 4, 0) == 4
+}
+
+test count_fields_counts_one_more_than_the_separators {
+    const r : str = "a|b|c|d|e";
+    assert count_fields(r, 0, 9) == 5
+    assert count_fields("solo", 0, 4) == 1
+    assert count_fields("a|", 0, 2) == 2
+}
+
+test state_field_code_reads_the_third_field {
+    const r : str = "Buffy|viz-distill-graph|doing|#12218|page lives in the spec";
+    assert state_field_code(r, 0, 59) == 1
+    assert state_field_code("a|b|done", 0, 8) == 3
+    assert state_field_code("a|b|holding", 0, 11) == 99
+    assert state_field_code("only|two", 0, 8) == 99
+}
+
+test transition_ok_holds_the_law_of_the_loop {
+    assert transition_ok(0, 1) == true
+    assert transition_ok(0, 2) == true
+    assert transition_ok(1, 3) == true
+    assert transition_ok(1, 2) == true
+    assert transition_ok(2, 1) == true
+    assert transition_ok(2, 3) == true
+    assert transition_ok(3, 3) == true
+    assert transition_ok(3, 1) == false
+    assert transition_ok(0, 3) == false
+    assert transition_ok(1, 0) == false
+    assert transition_ok(99, 0) == false
+}
+
+test state_name_is_the_inverse_of_state_code_on_the_four_and_on_the_rest {
+    assert state_name(ST_TAKEN) == "taken"
+    assert state_name(ST_DOING) == "doing"
+    assert state_name(ST_BLOCKED) == "blocked"
+    assert state_name(ST_DONE) == "done"
+    assert state_name(ST_UNKNOWN) == ""
+    assert state_name(42) == ""
+}
+
+test the_two_writers_lay_a_word_or_a_span_into_out_and_stop_at_cap {
+    let mut out : [8]u8 = [0; 8];
+    let w1 : usize = put_lit(out[0..8], 0, 8, "abc");
+    let w2 : usize = put_span(out[0..8], w1, 8, "hello world", 6, 11);
+    assert w1 == 3
+    assert w2 == 8
+    assert out[0] == 'a'
+    assert out[3] == 'w'
+    assert out[7] == 'd'
+    // cap is a stop, not a suggestion: the rest of the word is not written
+    assert put_lit(out[0..8], 0, 2, "abc") == 2
+    assert put_span(out[0..8], 0, 4, "hello", 0, 5) == 4
+}
+
+test create_record_builds_the_five_fields_and_refuses_what_a_field_cannot_hold {
+    let mut out : [128]u8 = [0; 128];
+    let n : usize = create_record(out[0..128], 128, "Buffy", "viz-distill-graph", "doing", "#12218", "page lives");
+    let mut want : [128]u8 = [0; 128];
+    let k : usize = put_lit(want[0..128], 0, 128, "Buffy|viz-distill-graph|doing|#12218|page lives\n");
+    assert n == k
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i]
+        i = i + 1;
+    }
+    // an empty field is no field: the note is the context nobody left
+    assert create_record(out[0..128], 128, "", "task", "doing", "#1", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "", "doing", "#1", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "task", "doing", "#1", "") == 0
+    // a state word it does not know, and an issue that is not an issue
+    assert create_record(out[0..128], 128, "agent", "task", "hold", "#1", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "task", "doing", "12218", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "task", "doing", "#", "x") == 0
+    // a field never holds one '|'
+    assert create_record(out[0..128], 128, "ag|ent", "task", "doing", "#1", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "ta|sk", "doing", "#1", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "task", "doi|ng", "#1", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "task", "doing", "#1|2", "x") == 0
+    assert create_record(out[0..128], 128, "agent", "task", "doing", "#1", "no|te") == 0
+}
+
+test find_last_state_reads_the_last_record_of_that_task_and_skips_the_rest {
+    const f : str = "Buffy|viz|doing|#1|note one\nCodex|gen|taken|#2|note two\nBuffy|viz|blocked|#1|note three\n";
+    // the task field, not the agent: Buffy's task is viz and Codex's is gen
+    assert find_last_state(f, "viz") == ST_BLOCKED
+    assert find_last_state(f, "gen") == ST_TAKEN
+    assert find_last_state(f, "Buffy") == ST_UNKNOWN
+    // the last line carries no newline and still counts
+    const g : str = "Buffy|viz|done|#1|last";
+    assert find_last_state(g, "viz") == ST_DONE
+    // a title is prose, not a record
+    const h : str = "# a title is not a record\nBuffy|viz|done|#1|x";
+    assert find_last_state(h, "viz") == ST_DONE
+    assert find_last_state("# a title is not a record\n", "viz") == ST_UNKNOWN
+}
+
+test may_write_opens_a_fresh_task_and_then_holds_the_law {
+    assert may_write(ST_UNKNOWN, ST_TAKEN) == true
+    assert may_write(ST_UNKNOWN, ST_DONE) == true
+    assert may_write(ST_TAKEN, ST_DOING) == true
+    assert may_write(ST_TAKEN, ST_BLOCKED) == true
+    assert may_write(ST_TAKEN, ST_DONE) == false
+    assert may_write(ST_DOING, ST_DONE) == true
+    assert may_write(ST_DOING, ST_TAKEN) == false
+    assert may_write(ST_BLOCKED, ST_DONE) == true
+    assert may_write(ST_BLOCKED, ST_TAKEN) == false
+    assert may_write(ST_DONE, ST_DONE) == true
+    assert may_write(ST_DONE, ST_DOING) == false
+}
+
+test record_is_well_formed_takes_five_fields_and_a_known_state {
+    const r : str = "Buffy|viz-distill-graph|doing|#12218|page lives in the spec";
+    assert record_is_well_formed(r, 0, 59) == true
+    assert record_is_well_formed("a|b|done|#1|x", 0, 13) == true
+    assert record_is_well_formed("a|b|held|#1|x", 0, 13) == false
+    assert record_is_well_formed("a|b|done|#1", 0, 11) == false
+    assert record_is_well_formed("|b|done|#1|x", 0, 12) == false
+    assert record_is_well_formed("a||done|#1|x", 0, 12) == false
+    assert record_is_well_formed("a|b|done|#1|", 0, 12) == false
+}
+
+invariant a_done_record_never_moves_again {
+    assert transition_ok(3, 0) == false
+    assert transition_ok(3, 2) == false
+    assert record_is_well_formed("a|b|done|#1|x", 0, 13) == true
+}

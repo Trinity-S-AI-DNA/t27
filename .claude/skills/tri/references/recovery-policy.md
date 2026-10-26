@@ -26,13 +26,13 @@ This document defines recovery and rollback procedures for Trinity S³AI.
 2. **Enable recovery mode**: Only repair operations allowed
 3. **Identify root cause**: Check health signals
 4. **Isolate failing domain**: Prevent cascade
-5. **Replay last clean seal**: `tri replay-step --last-clean`
+5. **Replay last clean seal**: `tri replay-step --last-clean` <!-- not built as a t27c subcommand -->
 6. **Re-verify**: Run full health check
 7. **Manual approval**: Required before resuming normal ops
 
 **Command:**
 ```bash
-tri recovery queen-critical
+tri recovery queen-critical <!-- not built as a t27c subcommand -->
 ```
 
 ### Level 2: Domain Critical
@@ -50,7 +50,7 @@ tri recovery queen-critical
 
 **Command:**
 ```bash
-tri recovery domain --affected <domain>
+tri recovery domain --affected <domain> <!-- not built as a t27c subcommand -->
 ```
 
 ### Level 3: Local Failure (Single Skill)
@@ -63,11 +63,11 @@ tri recovery domain --affected <domain>
 3. **If retry fails**: Rollback to spec_hash_before
 4. **Rollback spec**: `git restore <spec-file>`
 5. **Invalidate skill**: Mark skill as failed in registry
-6. **Record mistake**: `tri experience record --mistake`
+6. **Record mistake**: `tri experience record --mistake` <!-- not built as a t27c subcommand -->
 
 **Command:**
 ```bash
-tri recovery skill --id <skill_id> --retry-once
+tri recovery skill --id <skill_id> --retry-once <!-- not built as a t27c subcommand -->
 ```
 
 ## Replay vs Restart
@@ -85,7 +85,7 @@ tri recovery skill --id <skill_id> --retry-once
 tri seal list --status clean
 
 # Replay from that seal
-tri replay-step --seal <seal_id>
+tri replay-step --seal <seal_id> <!-- not built as a t27c subcommand -->
 
 # Continue workflow
 tri gen
@@ -99,7 +99,7 @@ When `tri verdict --toxic` returns toxic:
 
 ```bash
 # Step 1: Record mistake
-tri experience record --mistake \
+tri experience record --mistake \ <!-- not built as a t27c subcommand -->
   --reason "toxic verdict" \
   --spec <spec_path> \
   --verdict toxic \
@@ -109,7 +109,7 @@ tri experience record --mistake \
 git restore <spec_path>
 
 # Step 3: Replay last clean seal
-tri replay-step --last-clean
+tri replay-step --last-clean <!-- not built as a t27c subcommand -->
 
 # Step 4: Continue with corrected mutation
 ```
@@ -150,7 +150,7 @@ while queen_health < 0.9:
 
 **Command:**
 ```bash
-tri self-heal --max-iterations 5
+tri self-heal --max-iterations 5 <!-- not built as a t27c subcommand -->
 ```
 
 ## Recovery Logs
