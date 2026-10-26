@@ -1601,7 +1601,7 @@ fn cmd_golden(action: &str, plan: bool, queued: Option<u64>, issue: u64) -> Resu
     Ok(g::exit_code(code))
 }
 
-/// `trigit <verb>`: our own git's one command per act (specs/tri/trigit/verbs.t27, #11601): the spec decides the class; this glue runs one argv vector with no shell, reads the feed, or prints the spec's words. Same shape as cmd_golden.
+/// `trigit <verb>`: our own git's one command per act (specs/tri/trigit/verbs.t27, #11601): the spec decides the class; this glue runs one argv vector with no shell, reads the feed or the handoff ledger, or prints the spec's words. Same shape as cmd_golden.
 fn cmd_trigit(args: &[String]) -> Result<u8> {
     use tv as v;
     let leak = |s: String| -> &'static str { s.leak() };
@@ -1622,13 +1622,13 @@ fn cmd_trigit(args: &[String]) -> Result<u8> {
             let n = v::beat_push_argv(&mut buf, 4096, sha.as_bytes(), host.as_bytes()); if n == 0 { eprintln!("trigit beat: commit {sha} is not a hex id"); return Ok(1); }
             let (x, o) = run(&buf[..n], false); if x != 0 { eprintln!("trigit beat: push exit {x}: {o}"); return Ok(x); }
             let r = leak(format!("{}{}", v::ALIVE_PREF, host)); say(v::TV_BEAT, r.as_bytes(), sha.as_bytes(), &mut buf); }
-        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096);
-            let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096);
-            println!("{}", String::from_utf8_lossy(&buf[..n])); }
+        v::A_STATUS => { let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("trigit status: no HOME"))?; let n = v::feed_path(home.as_bytes(), &mut buf, 4096); let text = std::fs::read_to_string(String::from_utf8_lossy(&buf[..n]).into_owned()).map_err(|e| anyhow::anyhow!("trigit status: feed: {e}"))?; let n = v::status_text(text.as_bytes(), &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); }
         v::A_VERDICT => { let key = args.get(1).map(String::as_str).unwrap_or(""); let n = v::verdict_argv(&mut buf, 4096, key.as_bytes());
             if n == 0 { eprintln!("trigit verdict: need a key"); return Ok(1); }
             let (x, o) = run(&buf[..n], false); if o.is_empty() && x == 0 { println!("no verdict for {key}"); } else { println!("{}", o.trim()); } println!("{}", v::verdict_where()); }
         v::A_GOLDEN => return cmd_golden("land", false, None, 0),
+        v::A_HANDOFF => { let p = find_trinity_root()?.join(v::handoff_where()); let text = std::fs::read_to_string(&p).unwrap_or_default(); let head = args.get(1).cloned().unwrap_or_default(); if head.is_empty() { let n = v::handoff_text(text.as_bytes(), &mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(0); }
+            let (ag, ta, st, is) = (leak(head), leak(args.get(2).cloned().unwrap_or_default()), leak(args.get(3).cloned().unwrap_or_default()), leak(args.get(4).cloned().unwrap_or_default())); let nt = leak(args.get(5..).map(|r| r.join(" ")).unwrap_or_default()); let n = v::create_record(&mut buf, 4096, ag, ta, st, is, nt); if n == 0 { println!("{}", v::handoff_refusal()); return Ok(1); } let last = v::find_last_state(text.as_bytes(), ta); let code = v::state_code(st.as_bytes(), 0, st.len()); if !v::may_write(last, code) { println!("{}", v::move_refusal()); return Ok(1); } let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&p).map_err(|e| anyhow::anyhow!("trigit handoff: {e}"))?; if !text.is_empty() && !text.ends_with('\n') { std::io::Write::write_all(&mut f, b"\n").map_err(|e| anyhow::anyhow!("trigit handoff: {e}"))?; } std::io::Write::write_all(&mut f, &buf[..n]).map_err(|e| anyhow::anyhow!("trigit handoff: {e}"))?; let rec = leak(String::from_utf8_lossy(&buf[..n - 1]).into_owned()); say(v::TV_HANDOFF, rec.as_bytes(), v::handoff_where().as_bytes(), &mut buf); }
         _ => { let n = v::usage_text(&mut buf, 4096); println!("{}", String::from_utf8_lossy(&buf[..n])); return Ok(1); }
     }
     Ok(0)
