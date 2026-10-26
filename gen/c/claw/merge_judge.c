@@ -160,8 +160,8 @@ size_t t_p(uint8_t* dst, size_t cap, size_t w, uint32_t num, bool draft, uint32_
 size_t t_status(uint8_t* dst, size_t cap, size_t w, uint32_t sc);
 size_t t_row(uint8_t* dst, size_t cap, size_t w, uint8_t tag, uint32_t name, uint32_t run, uint32_t sc);
 size_t t_good_rows(uint8_t* dst, size_t cap, size_t w, uint32_t run0);
-size_t t_file(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t path);
-size_t t_named(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t name, uint32_t path);
+size_t t_file(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t pidx);
+size_t t_named(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t name, uint32_t pidx);
 size_t t_green(uint8_t* dst, size_t cap, size_t w, uint32_t num);
 size_t t_v(uint8_t* dst, size_t cap, bool draft, uint32_t labels, uint32_t head, uint32_t base, uint32_t mg, uint32_t sc, uint32_t closing, uint32_t age);
 uint8_t t_one(uint8_t* raw, size_t n);
@@ -945,24 +945,24 @@ size_t t_good_rows(uint8_t* dst, size_t cap, size_t w, uint32_t run0) {
     return t_row(dst, cap, x, 'K', 7, (run0 + 4), 0);
 }
 
-size_t t_file(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t path) {
+size_t t_file(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t pidx) {
     size_t x = put_str(dst, cap, w, "F\t", 2);
     x = put_count(dst, cap, x, num);
     x = put_byte(dst, cap, x, '\t');
-    x = put_str(dst, cap, x, T_PATHS[((size_t)(path))], T_PLENS[((size_t)(path))]);
+    x = put_str(dst, cap, x, T_PATHS[((size_t)(pidx))], T_PLENS[((size_t)(pidx))]);
     return put_byte(dst, cap, x, '\n');
 }
 
-size_t t_named(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t name, uint32_t path) {
+size_t t_named(uint8_t* dst, size_t cap, size_t w, uint32_t num, uint32_t name, uint32_t pidx) {
     size_t x = put_str(dst, cap, w, "O\t", 2);
     x = put_count(dst, cap, x, num);
     x = put_byte(dst, cap, x, '\t');
     x = put_str(dst, cap, x, T_NAMES[((size_t)(name))], T_NLENS[((size_t)(name))]);
     x = put_byte(dst, cap, x, '\t');
-    if ((path == 9)) {
+    if ((pidx == 9)) {
         x = put_byte(dst, cap, x, '-');
     } else {
-        x = put_str(dst, cap, x, T_PATHS[((size_t)(path))], T_PLENS[((size_t)(path))]);
+        x = put_str(dst, cap, x, T_PATHS[((size_t)(pidx))], T_PLENS[((size_t)(pidx))]);
     }
     return put_byte(dst, cap, x, '\n');
 }
