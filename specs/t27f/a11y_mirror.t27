@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/a11y_mirror.t27 -- T27F Live M3: the accessibility mirror of the HUD scene.
+// Issue gHashTag/t27#10262 (epic #10266). FR-002 and FR-003 of
+// docs/nona-02-organism/t27f/genui-research.md.
+//
+// WHY: a screen reader cannot read a scene graph; it reads text. FR-002: every
+// TEXT node and every focusable node of the HUD scene MUST have a mirror line --
+// one line of plain text naming the node kind and its provenance label, in node
+// order. In the HUD every work-graph node is presented: a SPEC, TASK or ARTIFACT
+// is task-card and ticker text, an AGENT is a status-bar row, an ACTION is a
+// ticker line. So the mirror conservatively writes one line per node: nothing a
+// sighted user sees goes unread by a screen reader.
+//
+// HOW: mirror_lines writes "<KIND> <id> <label>\n" per node into a caller buffer
+// and never writes a partial line: a line that does not fit whole is not begun.
+// The mirror is the full text of the scene, so it does not window by frame; the
+// frame rides the signature for parity with the hud.t27 scene functions. FR-003:
+// announcement_ok rate-limits state-change announcements to A11Y_MAX_PER_SEC per
+// second -- the same stated budget the HUD itself carries
+// (HUD_MAX_ANNOUNCEMENTS_PER_SEC, asserted equal in the invariant below).
+//
+// NOT CLAIMED: no focus model exists yet (the work graph carries no per-node
+// focusable flag; every node is treated as readable, which is the conservative
+// reading of FR-002); no platform screen-reader bridge (this spec produces the
+// text, a loader speaks it); the id in a line is the work-graph node id (AGENT
+// the pid, TASK the task number, SPEC the feed's spec id, ACTION the bus seq,
+// ARTIFACT the task number), not a DOM node. node_id is read as a field because
+// work_graph.t27 publishes no accessor for it (live_mode.t27 reads it the same
+// way); the kind and label go through the published accessors.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module a11y_mirror;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::nodes;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::node_label_at;
+use t27f::work_graph::NK_COUNT;
+use t27f::hud::HUD_MAX_ANNOUNCEMENTS_PER_SEC;
+
+// ---- the rate limit (FR-003) ----
+
+pub const A11Y_MAX_PER_SEC : u32 = 4;
+
+// The quiet gap between two announced state changes: a second divided by the
+// per-second budget, so the budget and the gap cannot drift apart (invariant
+// below). At 4 per second a screen reader announces at most one change per
+// 250 ms -- readable, not a flood.
+pub const A11Y_MIN_INTERVAL_MS : u32 = 1000 / A11Y_MAX_PER_SEC;
+
+/// True when a state change may be announced now: at least one quiet gap has
+/// passed since the last announcement. A clock that moved backwards sends
+/// nothing (no announcement storm on a corrected clock).
+pub fn announcement_ok(last_sent_ms: u64, now_ms: u64) -> bool {
+    if (now_ms < last_sent_ms) { return false; }
+    return (now_ms - last_sent_ms) >= (A11Y_MIN_INTERVAL_MS as u64);
+}
+
+// ---- the text of one node ----
+
+// The name a mirror line carries for each node kind, indexed by the NK_* codes
+// of work_graph.t27, and for each provenance label, indexed by the LABEL_* codes
+// of spec_graph.t27.
+pub const KIND_TEXTS : [5]str = ["SPEC", "AGENT", "TASK", "ACTION", "ARTIFACT"];
+pub const LABEL_TEXTS : [4]str = ["exact", "derived", "suggested", "unknown"];
+
+// One line is at most: kind 8 + sep 1 + id 20 digits + sep 1 + label 9 + newline
+// 1 = 40 bytes. The scratch holds 64; the tests pin the exact longest line.
+const LINE_CAP : usize = 64;
+
+// The digit byte is claw/text.t27's, imported, not restated (#11885).
+use claw::text::digit_byte;
+
+/// Write s at w, clipped at cap; the cursor advances by the full length either
+/// way (the write idiom of claw/text.t27), so a length computed from the cursor
+/// is the line's true length even when the bytes did not all land.
+fn put_text(out: []u8, cap: usize, w: usize, s: str) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        if (w + i < cap) { out[w + i] = s[i]; }
+        i = i + 1;
+    }
+    return w + s.len;
+}
+
+/// Write v in decimal at w, clipped at cap; cursor advances by the digit count.
+fn put_id(out: []u8, cap: usize, w: usize, v: u64) -> usize {
+    var tmp : [24]u8 = [0] ** 24;
+    var n : usize = 0;
+    var x : u64 = v;
+    if (x == 0) {
+        tmp[0] = digit_byte(0);
+        n = 1;
+    }
+    while (x > 0) {
+        tmp[n] = digit_byte((x % 10) as u32);
+        n = n + 1;
+        x = x / 10;
+    }
+    var k : usize = 0;
+    while (k < n) {
+        if (w + k < cap) { out[w + k] = tmp[n - 1 - k]; }
+        k = k + 1;
+    }
+    return w + n;
+}
+
+/// The bytes of one line, "<KIND> <id> <label>\n", written at w; returns the
+/// cursor after it. A node whose kind is not one of the five cannot be named,
+/// so no line exists for it (mirror_lines skips such a node entirely).
+fn line_bytes(out: []u8, w: usize, kind: u8, id: u64, label: u8) -> usize {
+    var k = put_text(out, LINE_CAP, w, KIND_TEXTS[kind as usize]);
+    k = put_text(out, LINE_CAP, k, " ");
+    k = put_id(out, LINE_CAP, k, id);
+    k = put_text(out, LINE_CAP, k, " ");
+    var l : usize = label as usize;
+    if (l > 3) { l = 3; }   // a label outside the four reads as unknown
+    k = put_text(out, LINE_CAP, k, LABEL_TEXTS[l]);
+    k = put_text(out, LINE_CAP, k, "\n");
+    return k;
+}
+
+/// Place one whole line into out at w, or nothing: the line is built in a
+/// scratch first, and a line that would not fit whole is not begun (a screen
+/// reader must never be handed the fragment "AGENT 1 exa").
+fn write_line(out: []u8, cap: usize, w: usize, kind: u8, id: u64, label: u8) -> usize {
+    var s : [64]u8 = [0] ** 64;
+    var len = line_bytes(s[0..64], 0, kind, id, label);
+    if (w + len > cap) { return w; }
+    var i : usize = 0;
+    while (i < len) {
+        out[w + i] = s[i];
+        i = i + 1;
+    }
+    return w + len;
+}
+
+// ---- the mirror (FR-002) ----
+
+/// Write one mirror line per node of the work graph, in node order, into out
+/// (cap usable bytes); returns the bytes actually written. Pure: the same graph
+/// mirrors to the same bytes at any frame. A node whose kind is out of range
+/// gets no line (nothing names it); every well-formed node gets exactly one.
+pub fn mirror_lines(wg: *WorkGraph, frame: u64, out: []u8, cap: usize) -> usize {
+    _ = frame;
+    var w : usize = 0;
+    var n : u32 = 0;
+    while (n < nodes(wg)) {
+        var k : u8 = node_kind_at_pub(wg, n);
+        if (k < NK_COUNT) {
+            var lab : u8 = node_label_at(wg, n);
+            var id : u64 = wg.node_id[n];
+            w = write_line(out, cap, w, k, id, lab);
+        }
+        n = n + 1;
+    }
+    return w;
+}
+
+/// The count of mirror lines the graph produces: mirror_lines run end to end
+/// into a scratch sized to hold every possible line (2048 nodes, 64 bytes each,
+/// never a partial line), then the newlines counted. Keeping this on the real
+/// writer means the count and the text cannot disagree.
+pub fn build_mirror(wg: *WorkGraph, frame: u64) -> u32 {
+    var buf : [131072]u8 = [0] ** 131072;
+    var n : usize = mirror_lines(wg, frame, buf[0..131072], 131072);
+    var lines : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (buf[i] == 10) { lines = lines + 1; }
+        i = i + 1;
+    }
+    return lines;
+}
+
+// ---- tests ----
+
+use t27f::work_graph::new_graph;
+use t27f::work_graph::apply_event;
+use t27f::work_graph::Event;
+use t27f::work_graph::EV_SPAWN;
+use t27f::work_graph::EV_DELIVER;
+use t27f::work_graph::D_NONE;
+use t27f::work_graph::D_OFFER;
+use t27f::work_graph::D_RESULT;
+use t27f::work_graph::WG_OK;
+
+// Two agents; an offer that names task 3 and spec 11; a result back that
+// produces the task's artifact. Seven nodes in creation order:
+// AGENT 1, AGENT 5, ACTION 2, TASK 3, SPEC 11, ACTION 4, ARTIFACT 3 -- all EXACT.
+fn mixed_graph() -> WorkGraph {
+    var g = new_graph();
+    var r = apply_event(&g, Event { kind: EV_SPAWN, from_pid: 1, to_pid: 5, task_no: 0, deliver: D_NONE, reason: 99, seq: 1, spec_id: 0 });
+    assert(r == WG_OK);
+    r = apply_event(&g, Event { kind: EV_DELIVER, from_pid: 1, to_pid: 5, task_no: 3, deliver: D_OFFER, reason: 99, seq: 2, spec_id: 11 });
+    assert(r == WG_OK);
+    r = apply_event(&g, Event { kind: EV_DELIVER, from_pid: 5, to_pid: 1, task_no: 3, deliver: D_RESULT, reason: 99, seq: 4, spec_id: 0 });
+    assert(r == WG_OK);
+    return g;
+}
+
+test "an empty graph mirrors to nothing" {
+    var g = new_graph();
+    var buf : [64]u8 = [0] ** 64;
+    assert(mirror_lines(&g, 0, buf[0..64], 64) == 0);
+    assert(build_mirror(&g, 0) == 0);
+    assert(buf[0] == 0);   // not even a partial byte was begun
+}
+
+test "the mixed graph mirrors to exactly the seven lines in node order" {
+    assert(KIND_TEXTS[0] == "SPEC");
+    assert(KIND_TEXTS[4] == "ARTIFACT");
+    assert(LABEL_TEXTS[3] == "unknown");
+    var g = mixed_graph();
+    var buf : [256]u8 = [0] ** 256;
+    var n = mirror_lines(&g, 0, buf[0..256], 256);
+    var want : [256]u8 = [0] ** 256;
+    var w = put_text(want[0..256], 256, 0, "AGENT 1 exact\nAGENT 5 exact\nACTION 2 exact\nTASK 3 exact\nSPEC 11 exact\nACTION 4 exact\nARTIFACT 3 exact\n");
+    assert(w == 102);
+    assert(n == w);
+    var k : usize = 0;
+    while (k < w) {
+        assert(buf[k] == want[k]);
+        k = k + 1;
+    }
+}
+
+test "build_mirror counts one line per node, the FR-002 count" {
+    var g = mixed_graph();
+    assert(nodes(&g) == 7);
+    assert(build_mirror(&g, 0) == 7);
+    assert(build_mirror(&g, 41) == 7);   // the count does not drift with the frame
+}
+
+test "the mirror text is identical at every frame" {
+    var g = mixed_graph();
+    var a : [256]u8 = [0] ** 256;
+    var b : [256]u8 = [0] ** 256;
+    var na = mirror_lines(&g, 0, a[0..256], 256);
+    var nb = mirror_lines(&g, 999, b[0..256], 256);
+    assert(na == nb);
+    assert(na == 102);
+    var k : usize = 0;
+    while (k < na) {
+        assert(a[k] == b[k]);
+        k = k + 1;
+    }
+}
+
+test "a cap that cannot hold a line never writes a partial line" {
+    var g = mixed_graph();
+    var buf : [64]u8 = [0] ** 64;
+    // no line of the mixed graph is shorter than 13 bytes ("TASK 3 exact\n"),
+    // so cap 12 writes nothing at all -- not even the fragment "AGENT 1 exa"
+    assert(mirror_lines(&g, 0, buf[0..64], 12) == 0);
+    assert(buf[0] == 0);
+    // cap 13 holds exactly the TASK line: the longer lines before and after it
+    // in node order are skipped whole, so only whole lines are ever handed over
+    assert(mirror_lines(&g, 0, buf[0..64], 13) == 13);
+    assert(buf[0] == 'T');
+    assert(buf[12] == 10);
+    assert(buf[13] == 0);
+    // cap 14 holds the first line ("AGENT 1 exact\n") and nothing after it
+    assert(mirror_lines(&g, 0, buf[0..64], 14) == 14);
+    assert(buf[13] == 10);
+    assert(buf[14] == 0);
+}
+
+test "the rate limit admits one announcement per quiet gap, no more" {
+    assert(A11Y_MIN_INTERVAL_MS == 250);
+    assert(announcement_ok(0, A11Y_MIN_INTERVAL_MS - 1) == false);
+    assert(announcement_ok(0, A11Y_MIN_INTERVAL_MS) == true);
+    assert(announcement_ok(1000, 1000 + A11Y_MIN_INTERVAL_MS - 1) == false);
+    assert(announcement_ok(1000, 1000 + A11Y_MIN_INTERVAL_MS) == true);
+    assert(announcement_ok(7, 7) == false);        // no time has passed
+    assert(announcement_ok(500, 499) == false);    // a clock that moved back
+    // a send every quiet gap chains: each next send waits for its own gap
+    assert(announcement_ok(0, 250) == true);
+    assert(announcement_ok(250, 499) == false);
+    assert(announcement_ok(250, 500) == true);
+}
+
+invariant the_announcement_budget_is_stated_once {
+    assert A11Y_MAX_PER_SEC == 4;
+    assert A11Y_MAX_PER_SEC == HUD_MAX_ANNOUNCEMENTS_PER_SEC;
+    assert A11Y_MIN_INTERVAL_MS == 250;
+    assert A11Y_MIN_INTERVAL_MS * A11Y_MAX_PER_SEC == 1000;
+    assert NK_COUNT == 5;
+}

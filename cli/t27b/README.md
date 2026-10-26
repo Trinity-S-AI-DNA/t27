@@ -7,6 +7,7 @@ outputs:
 * `t27b test`: an in-process JIT test runner. The code is written into one
   executable region (`MAP_JIT` on macOS; `mmap` RW, then `mprotect` RX on
   Linux) and the module's `test` blocks run there.
+* `t27b run <file.t27> <entry>`: the same path; a spec that passes its own tests may run a named pub fn whose return value is the exit code (#11824).
 * `t27b build -o out.o`: a relocatable object. On Linux it is an ELF64 `ET_REL` for
   aarch64 (`--elf`, specs/tri/t27b/elf.t27), which links with
   `aarch64-linux-gnu-gcc driver.c out.o`; elsewhere a Mach-O `MH_OBJECT` for arm64

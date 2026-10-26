@@ -746,3 +746,7 @@ Lab traps from this run:
 The graph IR is a schema (`specs/t27f/spec_graph.t27`) and `specs/t27f/spec_graph_export.t27` turns source into it, but only exact declarations, spans and edges within the IR's capacity, with `specs/t27f/spec_graph_derive.t27` adding the derived and unknown part by stated rules, and no host calls either yet; no renderer draws a T27F view in the Trinity UI, no
 runtime dispatches Bees from a spec, and nothing publishes on its own. If a step needs one of
 them, say that it is missing; do not simulate it.
+
+## Traps
+
+- 2026-10-25 2026-10-25 own-language refuses a new .html: hold the page as a PAGE array of lines in a .t27 spec, emit it with t27c gen-js, materialise the artefact into gitignored build/, and keep the materialiser inside a .md (#12218)

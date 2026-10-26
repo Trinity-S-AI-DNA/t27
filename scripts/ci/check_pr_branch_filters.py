@@ -71,7 +71,6 @@ MERGE_CRITICAL = (
 #   len(MERGE_CRITICAL) + len(NOT_MERGE_CRITICAL) + len(unclassified)
 # should equal the number of workflow files present.
 #
-#
 # A ceiling rather than a refusal, because some files cannot be classified in the
 # commit that discovers them and a gate that is red on the day it lands teaches
 # everyone to ignore red. It moves DOWN only: classify a file and lower this in
@@ -124,6 +123,8 @@ NOT_MERGE_CRITICAL = {
     "l1-traceability.yml": "not a required check for master branch protection",
     "wasm-explorer.yml": "builds and tests the wasm explorer binding on bootstrap/** and bindings/wasm-explorer/** changes; not a required check for master branch protection (#4489)",
     "xilinx7-l3-bench.yml": "a benchmark of the openXC7 back half on a shared runner; it measures, it does not gate a merge (#6068)",
+    "t27os.yml": "builds T27OS.app on PRs that touch specs/t27os/** (#11788); not a required check for master branch protection (#12358)",
+    "t27os-release.yml": "dispatch-only T27 OS release leg; the owner starts it and types yes; not a required check for master branch protection (#12479)",
 }
 
 FILTER_KEYS = ("branches", "branches-ignore")
