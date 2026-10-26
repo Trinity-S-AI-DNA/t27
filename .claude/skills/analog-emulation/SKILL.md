@@ -1,7 +1,7 @@
 ---
 id: analog-emulation
 name: analog-emulation
-description: Drive epic #10486, t27 analog emulation v0.1 with Symbiotic EDA -- an analog netlist with IHP SG13G2 models becomes one .t27 spec that is the reference model and the FPGA design, run per corner and judged by ngspice and Symbiotic EDA's evaluator. Use when working a milestone (M1-M6), when updating the status dashboard, or when writing a progress report to the Symbiotic EDA contact on X.
+description: Drive epic #10486, t27 analog emulation v0.1 with the external team -- an analog netlist with IHP SG13G2 models becomes one .t27 spec that is the reference model and the FPGA design, run per corner and judged by ngspice and the external team's evaluator. Use when working a milestone (M1-M6), when updating the status dashboard, or when writing a progress report to the external team's contact on X.
 argument-hint: "[milestone, e.g. M1] | report | dashboard"
 ---
 
@@ -25,7 +25,7 @@ argument-hint: "[milestone, e.g. M1] | report | dashboard"
 | M0, the pattern every cell follows | `specs/fpga/rc_filter_ax7203.t27`, #10276, PR #10278 |
 | Status dashboard | https://claude.ai/artifact/75G2ZjZ5CihcWPNLgFDxwD (private artifact; the owner shares it) |
 | External references | mirekez/cpphdl `analog/` (examples, IHP setup in `analog/pdk`), ckdur/asicone_sg13g2, regymm/pcie_7x |
-| The conversation | the owner's X chat with the Symbiotic EDA contact; context in the owner's memory, never in this repo |
+| The conversation | the owner's X chat with the external team's contact; context in the owner's memory, never in this repo |
 
 ## The milestone loop
 
@@ -35,7 +35,7 @@ Each milestone follows M0's shape. Do not mark one done until all five hold:
 2. **Tests on the lab.** Error bound against a float64 run of the same method, named in the spec. 0 vacuous. ngspice + IHP runs (M3 on) happen on the Railway lab, never on the Mac.
 3. **Negative control.** A mutant (truncation for rounding, a mis-stamped element, the wrong corner's table) that fails the tests, is refused by `t27c seal`, and on the board prints the predicted FAIL line.
 4. **Board receipt.** Bitstream from `t27b verilog` (no hand HDL, no XDC), run on the AX7203 bench (`board-eye`, `bench-agent` skills). Record LUT, FF, DSP, BRAM, Fmax and the UART line.
-5. **Oracle.** From M3 on, ngspice with the named PDK revision and corner. From M5 on, Symbiotic EDA's self-checking evaluator decides.
+5. **Oracle.** From M3 on, ngspice with the named PDK revision and corner. From M5 on, the external team's self-checking evaluator decides.
 
 Then: close the sub-issue with `Closes #N`, tick it in the epic, open the next milestone's sub-issue in the same Goal / Boundary / Scenarios / Requirements / Success Criteria shape (the issue-shape bot closes an issue without `## Success Criteria`), update the dashboard, and draft a report.
 
@@ -79,7 +79,7 @@ A `/loop` tick on this epic follows this order, so a new tick never undoes or du
 4. **Merge only green.** Auto-merge after the required checks pass. A red is inherited only if it is a subset of master's failures; `claw-sarif` failing on "permissions requested are not granted to this installation" is the known App-permission red (owner steps in `docs/claw/README.md`). Master's ruleset `t27-master-protection` requires only four checks: `validate`, `check-linked-issue`, `parse-ratchet`, `own-language` (`cli-tri`, `coverage`, `spec-guards`, `gate-topology` are not required). `mergeStateStatus` BLOCKED means a required check is pending, UNSTABLE means the four are green and a non-required one is red. Since 2026-10-25 16:50 a PR with the four green is hand-merged (`gh pr merge N --squash`) after every other red was read in its log and shown inherited and independent of the diff, with the basis posted as a PR comment BEFORE the merge (and its posting checked); the owner's veto default stands from 2026-10-26 12:00 +07.
 5. **Write state.** Edit the ledger row, tick the epic's Progress table, republish the dashboard, and add a learning to this skill when a trap cost more than one try. Renew the keep-awake hold at the start of each tick (it lapses after about 5 idle minutes). Then run `/self-cleanup` (`.claude/skills/self-cleanup/SKILL.md`): remove the worktrees and Zig caches of lanes whose PRs merged, and put the freed space in the row.
 6. **Requests out, never questions.** Owner, 2026-10-19: "do not ask, request; everything not forbidden is allowed". A blocked item is not parked as "waiting for the owner": name who holds what it needs, send that party a request with the options, a default and a time, and continue on the default. End every tick with `Requests out:` -- who, what, sent when, default, due. An unanswered request is chased once, then the default is taken and written in the ledger row. The owner is asked only for a password, a sign-in, a payment, a legal commitment or a choice between two businesses (rule: `CLAUDE.md` "Proactivity: request, do not ask").
-7. **Reports** to the partner: the owner gave standing permission on 2026-10-18 to message the Symbiotic EDA contact directly about anything the work needs and at every milestone. Read the chat for answers first in every tick.
+7. **Reports** to the partner: the owner gave standing permission on 2026-10-18 to message the external team's contact directly about anything the work needs and at every milestone. Read the chat for answers first in every tick.
 
 ## Claim guard
 
@@ -91,7 +91,7 @@ Every number that leaves the repo -- in a report, the dashboard, a post or a par
 - Say "table model of PSP103", not "the IHP transistor model", for M3-M4.
 - If a previous message overstated something, the next report corrects it explicitly.
 
-## Progress reports to the Symbiotic EDA contact
+## Progress reports to the external team's contact
 
 The owner wants a report on every breakthrough and every milestone. Since 2026-10-18 the owner's standing word is to message the contact directly about anything the work needs; keep every message within the claim guard.
 
@@ -108,7 +108,7 @@ The owner wants a report on every breakthrough and every milestone. Since 2026-1
   Next: <next milestone> by <date>. From you we would need: <item, if any>.
   <link to PR or issue>
   ```
-- **Privacy:** the chat is private. Nothing from it (names, budgets, proposals, payments, accounts) goes into the public repo, issues or PRs. The epic says "Symbiotic EDA" and nothing more personal.
+- **Privacy:** the chat is private. Nothing from it (names, budgets, proposals, payments, accounts) goes into the public repo, issues or PRs. The epic says "the external team" and nothing more personal.
 - **Sending on X:** in BrowserOS neo, open the chat in your own tab. `act type` and `insertText` drop characters in X's composer; use ONE `act fill` with the whole text (newlines included), compare the textarea's value with the intended text, then press the Send button by its ref. Read the chat first: X keeps message text in a shadow root and a virtualised list, so read `[role=log]` through the shadow roots and scroll it with mouse-wheel events.
 - After sending, add a line to the dashboard's report log and republish it.
 
@@ -119,7 +119,7 @@ The page is a single HTML file whose data sits in four arrays at the top of its 
 ## Traps
 
 - `gh` fails TLS inside the Claude sandbox (x509 OSStatus -26276); `curl` with `$(gh auth token)` against api.github.com works.
-- The asicone sub-blocks (`ro_reliability`, `saradc_auto`) are submodules on gitlab.symbioticeda.com; a shallow clone of asicone_sg13g2 leaves them empty. Ask for the netlist instead of guessing it.
+- The asicone sub-blocks (`ro_reliability`, `saradc_auto`) are submodules on a GitLab host of the external team; a shallow clone of asicone_sg13g2 leaves them empty. Ask for the netlist instead of guessing it.
 - `t27b` bitstream specs are skipped by the fpga-build job and have no gen-verilog rows (#10300); follow M0's ledger handling.
 - A PR that removes a dead `tri` mention must lower `MAX_DEAD_TRI` in `tools/check_documented_commands_exist.py` in the same commit (an equality ratchet; #10500 forgot, #10514 fixed master).
 - `t27b-native-ratchet` red with only UNLISTED rows for new specs is expected: spec PRs do not edit the ledger; the steward lists them from master runs (#8656).
