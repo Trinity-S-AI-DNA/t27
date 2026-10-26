@@ -74,4 +74,4 @@ A claim with no edit for 6 hours and no push on its branch is stale. Another age
 
 ## Rows
 
-A std::text and the is_digit migration. B std::mem. C #8769 (the unlock). D std::signmag (blocked on C). E alpha-rename-proof body key. F `tri boiler` and `tri dupes --like`. G loop-shape census. H import shortcut design. I this loop (card, skill, protocol). J the remaining `gen_w` `build_tree` copies. The sub-issue numbers are in the epic Dashboard.
+A std::text and the is_digit migration. B std::mem. C #8769 (the unlock). D std::signmag (blocked on C). E alpha-rename-proof body key. F tri boiler and `tri dupes --like`. G loop-shape census. H import shortcut design. I this loop (card, skill, protocol). J the remaining `gen_w` `build_tree` copies. The sub-issue numbers are in the epic Dashboard.
