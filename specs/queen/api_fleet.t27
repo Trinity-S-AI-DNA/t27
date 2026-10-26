@@ -201,6 +201,66 @@ pub fn rotate(keys: [FLEET_KEY_MAX]u8, count: u32, last: u8, model: u8, fallback
     return rotate_step(attempts, nxt != NO_FLEET_KEY, model, fallback_alive);
 }
 
+; --- 2b. The dispatcher (issue #12478): one call per key, least-loaded live key first -------
+
+/// How many calls one key may carry at once. The 2026-10-18 routing matrix (t27#10066, now the
+/// work-cheap rules) measured the bound: FIVE parallel calls on ONE z.ai key answered 429 and
+/// 529, while one call at a time per key clears a full batch; so the whole fleet runs at 1.
+pub const KEY_CONCURRENCY : u32 = 1;
+
+/// Whether the key at a position may take a call now: under the concurrency bound and not
+/// resting (rest_until is key_failover's cooldown mark; the host sets it on a 429, 529 or 1305).
+pub fn assignable(in_flight: u32, rest_until: u64, now: u64) -> bool {
+    if (in_flight >= KEY_CONCURRENCY) { return false; }
+    return rest_until <= now;
+}
+
+/// The next lane's key. `ranked` is the access scanner's ranked list, best first (issue
+/// #12476; its ranking rule is not copied here). The winner is the assignable key with the
+/// least in-flight load; ties go to the better rank. NO_FLEET_KEY means WAIT: every key is
+/// busy or resting. A waiting lane is not dropped -- it asks again after any key completes
+/// or its rest expires.
+pub fn assign_next(ranked: [FLEET_KEY_MAX]u8, count: u32, in_flight: [FLEET_KEY_MAX]u32,
+    rest_until: [FLEET_KEY_MAX]u64, now: u64) -> u8 {
+    if (count == 0) { return NO_FLEET_KEY; }
+    if (count > FLEET_KEY_MAX) { return NO_FLEET_KEY; }
+    var picked : u32 = FLEET_KEY_MAX;
+    var picked_load : u32 = 0;
+    var i : u32 = 0;
+    while (i < count) {
+        if (assignable(in_flight[i], rest_until[i], now)) {
+            if (picked == FLEET_KEY_MAX) {
+                picked = i;
+                picked_load = in_flight[i];
+            } else {
+                if (in_flight[i] < picked_load) {
+                    picked = i;
+                    picked_load = in_flight[i];
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (picked == FLEET_KEY_MAX) { return NO_FLEET_KEY; }
+    return ranked[picked];
+}
+
+/// FR-004: one result of the probe list rewrites its row IN PLACE -- same route_id, same slot
+/// count; the seed row is replaced, never appended. Gated by probe_updates (an inconclusive
+/// answer never touches a dated row). A durable answer rewrites status and date; the live-key
+/// mask is the probe's alive set on ALIVE and zero on any refusal or death.
+pub fn route_after_probe(row: FleetRoute, http_code: u32, marker: u8, alive_mask: u32, today: u32) -> FleetRoute {
+    if (probe_updates(row.route_id, http_code, marker) == false) { return row; }
+    let cls : u8 = probe_result(row.route_id, http_code, marker);
+    if (cls == RS_UNPROBED) { return row; }
+    var mask : u32 = 0;
+    if (cls == RS_ALIVE) { mask = alive_mask; }
+    return FleetRoute{.route_id = row.route_id, .provider = row.provider, .model = row.model,
+        .price_in_mus = row.price_in_mus, .price_out_mus = row.price_out_mus,
+        .status = cls, .probe_date = today, .key_mask = mask};
+}
+
+
 ; --- 3. The probe classification ------------------------------------------------------------------------
 
 /// Body markers a probe reads (z.ai's codes ride the body, not always the status).
@@ -447,7 +507,106 @@ test the_meter_credits_one_row_per_gate_pass {
     assert no_route.pay == PAY_NONE and no_route.mtri == 0;
 }
 
+/// FR-006: fake keys 1..7 only. Ten lanes over three live keys: one call per key at all times,
+/// the keys rotate in ranked order, and every lane is served.
+test ten_lanes_over_three_keys_never_put_two_calls_on_one_key {
+    var ranked : [FLEET_KEY_MAX]u8 = [1, 2, 3, 0, 0, 0, 0, 0];
+    var in_flight : [FLEET_KEY_MAX]u32 = [0, 0, 0, 0, 0, 0, 0, 0];
+    var rest : [FLEET_KEY_MAX]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let now : u64 = 1000;
+    var order : [10]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var lane_pos : [10]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var started : u32 = 0;
+    var finished : u32 = 0;
+    while (started < 10) {
+        let k : u8 = assign_next(ranked, 3, in_flight, rest, now);
+        if (k == NO_FLEET_KEY) {
+            // every key busy: the oldest lane in flight completes (FIFO) and frees its key
+            let pos : u32 = lane_pos[finished];
+            in_flight[pos] = in_flight[pos] - 1;
+            finished = finished + 1;
+        } else {
+            var q : u32 = 0;
+            while (q < 3) {
+                if (ranked[q] == k) {
+                    assert in_flight[q] == 0;
+                    in_flight[q] = in_flight[q] + 1;
+                    lane_pos[started] = q;
+                    q = 3;
+                }
+                q = q + 1;
+            }
+            order[started] = k;
+            started = started + 1;
+        }
+    }
+    assert order[0] == 1 and order[1] == 2 and order[2] == 3;
+    assert order[3] == 1 and order[4] == 2 and order[5] == 3;
+    assert order[6] == 1 and order[7] == 2 and order[8] == 3;
+    assert order[9] == 1;
+}
+
+/// A key that answered 429 rests (the host sets key_failover's cooldown mark); its next lane
+/// goes to the next live key, a lane with every key down reads WAIT and is not dropped, and
+/// the key comes back when its rest expires.
+test a_throttled_key_loses_its_lane_and_a_waiting_lane_is_not_dropped {
+    var ranked : [FLEET_KEY_MAX]u8 = [1, 2, 3, 0, 0, 0, 0, 0];
+    var in_flight : [FLEET_KEY_MAX]u32 = [0, 0, 0, 0, 0, 0, 0, 0];
+    var rest : [FLEET_KEY_MAX]u64 = [0, 0, 0, 0, 0, 0, 0, 0];
+    let now : u64 = 1000;
+    // key 1 answered 429: it rests for 600 seconds
+    rest[0] = now + 600;
+    assert assign_next(ranked, 3, in_flight, rest, now) == 2;
+    in_flight[1] = 1;
+    assert assign_next(ranked, 3, in_flight, rest, now) == 3;
+    // every key busy or resting: the answer is WAIT, not a crash and not a drop
+    in_flight[2] = 1;
+    assert assign_next(ranked, 3, in_flight, rest, now) == NO_FLEET_KEY;
+    // the rest expires: the waiting lane asks again and gets the resting key back
+    assert assign_next(ranked, 3, in_flight, rest, now + 601) == 1;
+    // the load clears too
+    var clear : [FLEET_KEY_MAX]u32 = [0, 0, 0, 0, 0, 0, 0, 0];
+    assert assign_next(ranked, 3, clear, rest, now + 601) == 1;
+}
+
+/// FR-004: a probe result REPLACES its seed row -- same route_id and identity fields, new
+/// status, new date, the probe's own alive mask on ALIVE and zero on a refusal. An
+/// inconclusive answer rewrites nothing, and nothing is appended.
+test a_probe_result_replaces_its_seed_row_and_appends_nothing {
+    // the never-probed nvidia row takes a live answer with its alive mask
+    let live : FleetRoute = route_after_probe(ROUTES[4], 200, BM_NONE, bit(1) + bit(2), 20261026);
+    assert live.route_id == 4 and live.status == RS_ALIVE;
+    assert live.probe_date == 20261026;
+    assert live.key_mask == bit(1) + bit(2);
+    assert live.provider == ROUTES[4].provider and live.model == ROUTES[4].model;
+    assert live.price_in_mus == PRICE_FREE and live.price_out_mus == PRICE_FREE;
+    // a refusal rewrites status and date and clears the mask; the row identity survives
+    let refused : FleetRoute = route_after_probe(ROUTES[2], 401, BM_NONE, 0, 20261027);
+    assert refused.route_id == 2 and refused.status == RS_REFUSED;
+    assert refused.probe_date == 20261027 and refused.key_mask == 0;
+    assert refused.model == MD_GLM_45_FLASH;
+    // an inconclusive answer on a dated row rewrites nothing
+    let untouched : FleetRoute = route_after_probe(ROUTES[2], 429, BM_NONE, bit(7), 20261027);
+    assert untouched.status == ROUTES[2].status;
+    assert untouched.probe_date == ROUTES[2].probe_date;
+    assert untouched.key_mask == ROUTES[2].key_mask;
+}
+
+/// FR-002: the measured bound is one call per key.
+test the_concurrency_bound_is_one_call_per_key {
+    assert KEY_CONCURRENCY == 1;
+    assert assignable(0, 0, 0);
+    assert assignable(KEY_CONCURRENCY, 0, 0) == false;
+    assert assignable(0, 5, 5);
+    assert assignable(0, 6, 5) == false;
+    // the model pair stays the one law (FR-003: by reference, never a second table)
+    assert fallback_model(MD_GLM_45_FLASH) == MD_GLM_47_FLASH;
+    assert fallback_model(MD_GLM_47_FLASH) == MD_GLM_45_FLASH;
+}
+
 ; --- 6. Invariants ---------------------------------------------------------------------------------------
+
+
 
 invariant the_status_vocabulary_is_the_matrixs_four_words {
     assert RS_ALIVE == 0 and RS_REFUSED == 1 and RS_DEAD == 2 and RS_UNPROBED == 3;
@@ -474,4 +633,10 @@ invariant the_meter_rate_is_the_owners_one_rate {
     assert KEY_CREDIT_MTRI == REWARD_PER_JOB_MTRI;
     assert KEY_CREDIT_MTRI == 1;
     assert PAY_NONE != PAY_NORMAL;
+}
+
+invariant the_dispatcher_bound_is_the_measured_one {
+    assert KEY_CONCURRENCY == 1;
+    assert assignable(1, 0, 0) == false;
+    assert NO_FLEET_KEY >= FLEET_KEY_MAX;
 }
