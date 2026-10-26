@@ -25700,12 +25700,15 @@ fn collect_top_level_decls(node: &Node, out: &mut Vec<(String, &'static str)>) {
 fn duplicate_top_level_decls(ast: &Node) -> Vec<DuplicateDecl> {
     let mut decls: Vec<(String, &'static str)> = Vec::new();
     collect_top_level_decls(ast, &mut decls);
+    for c in ast.children.iter().filter(|c| c.kind == NodeKind::ConstDecl) { // module level only: a local `const` is scope
+        decls.push((c.name.clone(), if c.extra_mutable { "var" } else { "const" }));
+    }
     // Four namespaces, not two. A test name collides only with another test
     // name: `struct deque_clear` beside `test deque_clear` is not a conflict
     // in any backend, and 138 names across 54 specs are exactly that shape.
     // Folding tests into "type" would report every one of them.
     let ns = |k: &str| match k {
-        "fn" => "value",
+        "fn" | "const" | "var" => "value",
         "test" => "test",
         "bench" => "bench",
         _ => "type",
@@ -25944,6 +25947,13 @@ drop the parameter from the declaration and keep it at each use, where it is und
     }
 
     for d in duplicate_top_level_decls(ast) {
+        if let DuplicateDecl::SameNamespace(name, kind, n) = &d { // an error, as E_NAME is in the self-hosted core (#10421); a bench stays a warning
+            if *kind != "bench" {
+                result.error_count += 1;
+                result.errors.push(format!("error: `{kind} {name}` is declared {n} times -- every backend rejects a redeclaration (gen-js kept the first copy, gen-c the last, before check refused it)"));
+                continue;
+            }
+        }
         let msg = match d {
             DuplicateDecl::SameNamespace(name, kind, n) => format!(
                 "warning: `{kind} {name}` is declared {n} times -- every backend rejects a redeclaration"
