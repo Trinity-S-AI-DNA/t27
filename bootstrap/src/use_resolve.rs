@@ -606,7 +606,7 @@ fn consumed_use(line: &str, specs_root: &Path, pulled: &HashSet<String>) -> Opti
     Some(format!("{}use {}{{{}}}; // {}", indent, prefix, kept.join(", "), note))
 }
 
-fn sized(f: impl Fn(&mut [u8], usize) -> usize) -> String {
+pub(crate) fn sized(f: impl Fn(&mut [u8], usize) -> usize) -> String {
     let mut out = vec![0u8; f(&mut [], 0)];
     let n = out.len();
     f(&mut out, n);
