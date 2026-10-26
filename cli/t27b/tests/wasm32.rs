@@ -2,8 +2,9 @@
 //! the public surface: the bytes `emit` writes, the exports they describe, and
 //! the refusals for everything a pub fn does beyond the supported shape.
 //!
-//! The private LEB128 helpers have their unit tests in the emitter itself
-//! (`cargo test -p t27b --lib`); this file holds what the canonical gate runs.
+//! The private LEB128 helpers' edges are pinned in the law itself
+//! (specs/tri/t27b/wasm.t27, floors 1-4: the uleb/sleb textbook vectors, the
+//! carrier crossings); this file holds what the canonical gate runs.
 
 use std::path::Path;
 use std::process::Command;
@@ -265,12 +266,8 @@ fn parameterized_beyond_the_cut_is_refused_by_name() {
     f.body = vec![Stmt::Eval(konst(Ty::U32, 9)), Stmt::Return(Some(konst(Ty::U32, 1)))];
     let e = wasm32_emitter::emit(&prog(vec![f])).expect_err("refused");
     assert_eq!(e.construct, "fn body");
-    // `&` is not on the floor (comparisons are, M-C -- their own test below)
-    let src = "pub fn andy(a: u32) -> u32 { return a & 1; }\n";
-    let e = wasm32_emitter::emit(&lower_src(src)).expect_err("refused");
-    assert_eq!(e.construct, "arithmetic op");
-    assert_eq!(e.func, "andy");
-    // a param'd fn computing a remainder (`%` is not on the floor)
+    // `&` is on the floor now (M-D, floor 13 -- its own test below); `%` is
+    // the refusing example
     let src = "pub fn remf(a: u32) -> u32 { return a % 16; }\n";
     let e = wasm32_emitter::emit(&lower_src(src)).expect_err("refused");
     assert_eq!(e.construct, "arithmetic op");
@@ -297,6 +294,8 @@ fn parameterized_beyond_the_cut_is_refused_by_name() {
 // t27f.build name (frames 1/2/3/65, latency 96/256, paints 0/1/1).
 #[test]
 fn live_closure_trio_module_node_verifies() {
+    use std::path::Path;
+    use std::process::Command;
     let spec = Path::new("../../../specs/t27f/live_scalar_closure.t27");
     if !spec.exists() {
         eprintln!("closure spec not found; skipping");
@@ -363,40 +362,37 @@ console.log(ok?'MC OK':'MC MISMATCH');";
     assert!(String::from_utf8_lossy(&out.stdout).contains("MC OK"), "a comparison mismatched in a standard runtime");
 }
 
-// The floor-12 cut (memory + data, the struct path's first missing floor in
-// #5980's dependency order): `emit` without an image is byte-identical to
-// the scalar cut; `emit_with_image` mounts the image as linear memory sized
-// pages_for(len), min = max, one active data segment at offset 0 -- and a
-// standard runtime validates the module.
+// The M-D cut (logic/shift, t27os#3's lane; the law's floor 13): six opcodes
+// byte-pinned, shr SIGNED on i32 / UNSIGNED on u32, Node proving all answers.
 #[test]
-fn data_image_mounts_as_memory_and_one_segment() {
-    let p = prog(vec![fn_const_ret("the_answer", Ty::I32, 42)]);
-    assert_eq!(wasm32_emitter::emit(&p).expect("emit").len(), 43); // no image: unchanged
-    let m = wasm32_emitter::emit_with_image(&p, &[42, 0, 0]).expect("emit");
-    let mut want = Vec::new();
-    want.extend_from_slice(b"\0asm\x01\x00\x00\x00"); // magic, version 1
-    want.extend_from_slice(&[0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f]); // type
-    want.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // function
-    want.extend_from_slice(&[0x05, 0x04, 0x01, 0x01, 0x01, 0x01]); // memory: 1 page, min=max
-    want.extend_from_slice(&[0x07, 0x0e, 0x01]); // export
-    want.extend_from_slice(b"\x0athe_answer\x00\x00");
-    want.extend_from_slice(&[0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b]); // code
-    want.extend_from_slice(&[0x0b, 0x09, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x03, 0x2a, 0x00, 0x00]); // data: 1 segment
-    assert_eq!(m, want);
-    assert_eq!(m.len(), 60);
-    // pages_for covers the image's tail page: the gx_ contract's 143,692
-    // bytes want exactly 3 pages (memtype 01 03 03)
-    let big = wasm32_emitter::emit_with_image(&p, &vec![0u8; 143_692]).expect("emit");
-    assert!(big.windows(6).any(|w| w == [0x05, 0x04, 0x01, 0x01, 0x03, 0x03]), "3 pages missing");
-    // a standard runtime compiles (validates) the mounted module
-    let dir = std::env::temp_dir().join(format!("t27b-wasm-mem-{}", std::process::id()));
+fn logic_shifts_lower_to_floor_thirteen_and_run() {
+    let src = concat!(
+        "pub fn band(a: i32, b: i32) -> i32 { return a & b; }\n",
+        "pub fn bor(a: i32, b: i32) -> i32 { return a | b; }\n",
+        "pub fn bxor(a: i32, b: i32) -> i32 { return a ^ b; }\n",
+        "pub fn shl(a: i32, n: i32) -> i32 { return a << n; }\n",
+        "pub fn shr(a: i32, n: i32) -> i32 { return a >> n; }\n",
+        "pub fn shru(a: u32, n: u32) -> u32 { return a >> n; }\n",
+    );
+    let m = wasm32_emitter::emit(&lower_src(src)).expect("emit");
+    for opcode in [0x71u8, 0x72, 0x73, 0x74, 0x75, 0x76] {
+        assert!(m.windows(5).any(|w| w == [0x20, 0x00, 0x20, 0x01, opcode]), "opcode {:#04x} missing", opcode);
+    }
+    let dir = std::env::temp_dir().join(format!("t27b-wasm-md-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
-    let path = dir.join("memdata.wasm");
+    let path = dir.join("md.wasm");
     std::fs::write(&path, &m).expect("write module");
+    // wasm truth: the amount masks & 31 (`3 << 32` is 3; t27 native traps --
+    // the divergence floor 13 names, as floor 5 named div_u's).
     let script = "const fs=require('fs');\
-new WebAssembly.Module(fs.readFileSync(process.argv[1]));\
-console.log('MEMDATA VALID');";
-    let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the floor-12 gate needs Node's WebAssembly");
+const e=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),{}).exports;\
+const ok=e.band(-1,0x0F0F)===0x0F0F&&e.band(0xF0F0F0F0,-1)===(0xF0F0F0F0|0)\
+&&e.bor(0x0F0F,-1)===-1&&e.bxor(0xAAAAAAAA,0x55555555)===-1&&e.bxor(-1,-1)===0\
+&&e.shl(1,31)===-2147483648&&e.shl(3,32)===3&&e.shl(0x40000001,1)===-2147483646\
+&&e.shr(-16,2)===-4&&e.shr(-1,31)===-1&&e.shr(3,32)===3&&e.shr(-2147483648,31)===-1\
+&&e.shru(0xFFFFFFC0,2)===1073741808&&e.shru(0x80000000,31)===1;\
+console.log(ok?'MD OK':'MD MISMATCH');";
+    let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the M-D gate needs Node's WebAssembly");
     assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("MEMDATA VALID"), "the runtime refused the memory+data module");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("MD OK"), "a logic/shift answer mismatched in a standard runtime");
 }
