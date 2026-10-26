@@ -124,6 +124,7 @@ NOT_MERGE_CRITICAL = {
     "wasm-explorer.yml": "builds and tests the wasm explorer binding on bootstrap/** and bindings/wasm-explorer/** changes; not a required check for master branch protection (#4489)",
     "xilinx7-l3-bench.yml": "a benchmark of the openXC7 back half on a shared runner; it measures, it does not gate a merge (#6068)",
     "t27os.yml": "builds T27OS.app on PRs that touch specs/t27os/** (#11788); not a required check for master branch protection (#12358)",
+    "t27os-release.yml": "dispatch-only T27 OS release leg; the owner starts it and types yes; not a required check for master branch protection (#12479)",
 }
 
 FILTER_KEYS = ("branches", "branches-ignore")
