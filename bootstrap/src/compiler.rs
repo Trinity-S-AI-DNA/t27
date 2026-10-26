@@ -2427,6 +2427,33 @@ the parser used to read it as `{}` followed by a negation",
                 self.parse_struct_body(&mut decl)?;
                 self.expect(TokenKind::RBrace)?;
             } else if self.current.kind == TokenKind::LBracket {
+                // 2026-10-26: a declared `[1]T` annotation pins the arity, so a
+                // bracketed single element in the value position is a ONE-ELEMENT
+                // LIST, not a dimension -- `[42]` is otherwise indistinguishable
+                // from the dimension of a `[42]T` spelling, which is why
+                // parse_bare_array_literal refuses single integer elements. The
+                // declared annotation settles that ambiguity: parse the one
+                // element directly (epic_progress.t27 DATE is the case that
+                // reached the legacy text collector as an ExprIdentifier).
+                let declared_arity_one = decl.extra_type.starts_with("[1]");
+                let mut one_element_handled = false;
+                if declared_arity_one {
+                    let save = self.save_state();
+                    self.advance(); // consume [
+                    if let Ok(elem) = self.parse_expr() {
+                        if self.current.kind == TokenKind::RBracket {
+                            self.advance(); // consume ]
+                            let mut lit = Node::new(NodeKind::ExprArrayLiteral);
+                            lit.children.push(elem);
+                            decl.children.push(lit);
+                            one_element_handled = true;
+                        }
+                    }
+                    if !one_element_handled {
+                        self.restore_state(save);
+                    }
+                }
+                if !one_element_handled {
                 // pub const TernaryWord = [WORD_BYTES]u8; or [_]u8{...} ** N
                 // W383: try to parse the bracket expression as an array literal.
                 // If it carries element children (e.g. [4]u16{...}), it is a ROM
@@ -2486,8 +2513,9 @@ the parser used to read it as `{}` followed by a negation",
                 if self.current.kind == TokenKind::Semicolon {
                     self.advance();
                 }
-                return Ok(decl);
+                return Ok(decl);                }
             } else if self.current.kind == TokenKind::LParen {
+
                 // W652: a PARENTHESISED initialiser -- `const P : u32 = (A + 1) * 2;`
                 // reached none of the branches below and fell through to the
                 // trailing default, which pushed no child at all. Verilog then
