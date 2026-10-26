@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/rotation_status.t27 -- the key-rotation line a Claude Code pane shows in its status line
+; (gHashTag/t27#12466; the rules of the rotation itself are keys.t27 and docs/t27os/keys-orchestration.md).
+; --
+; WHAT IS DECIDED HERE (every rule has a test below):
+; - THE LINE: one ASCII line of at most STATUS_LINE_MAX (80) bytes, built from counts and names only. A key value
+;   never reaches this file: nothing here takes one, and every test uses a fake table.
+;     zai key 2/6 | glm-4.5-flash | resting 1 | failovers 0       a key is free
+;     zai all keys resting, next in 42 s                           no key of the provider is free
+;     zai no keys stored                                           the profile's provider holds no key
+;     no key in use                                                the pane has no profile (a shell, an editor,
+;                                                                  a pane that started without a key)
+;   "key 2/6" is the key the pane holds (its number in the KEYS tab, 1 to 8, "-" when none) over the number of
+;   keys the provider holds; "resting" counts the keys whose rest has not ended; "failovers" is the pane's own
+;   count (pty_logic PK_DONE, ended by MAX_FAILOVERS); "next in N s" is the shortest rest left.
+; - THE MODEL is the pane's own (what its SessionStart hook reported, or the record kept) and, when the pane has
+;   none yet, the model its profile launches it with (pty_logic launch_model). A segment with no model is left out.
+; - NOTHING OUTSIDE PRINTABLE ASCII: a profile or model name is cut (PROFILE_SHOW, MODEL_SHOW) and every byte
+;   outside 32..126 becomes "?", so a stray byte cannot reach the terminal that draws the line.
+; WHAT IS NOT HERE: the socket and the print (pty_server.t27 run_status, mode T27OS_STATUS=1) and the settings
+; entry that makes Claude Code run it (session_store.t27 hooks_json, `statusLine`).
+; OP_STATUS, the request that asks the running server for the line of one pane, is defined here until pty_proto.t27
+; (next to OP_SETKEY, with is_request widened) takes it.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osRotationStatus;
+
+use t27os::session_store::put_dec;
+use t27os::editors::same_bytes;
+use t27os::keys::PROFILE_COUNT;
+use t27os::keys::PROFILE_PROVIDER;
+use t27os::keys::MAX_KEYS;
+use t27os::keys::KEY_NEVER;
+use t27os::keys::key_index;
+use t27os::keys::profile_name;
+use t27os::keys::profile_agent;
+use t27os::pty_logic::G_KREST;
+use t27os::pty_logic::G_PANEK;
+use t27os::pty_logic::PK;
+use t27os::pty_logic::PK_PROF;
+use t27os::pty_logic::PK_DONE;
+use t27os::pty_logic::key_present;
+use t27os::pty_logic::key_count;
+use t27os::pty_logic::key_put;
+use t27os::pty_logic::key_rest;
+use t27os::pty_logic::keys_init;
+use t27os::pty_logic::pane_key_get;
+use t27os::pty_logic::plan_pane_keys;
+use t27os::pty_logic::launch_model;
+use t27os::pty_logic::has_text;
+
+/// The request the server answers with the status line of the pane named in the frame's pane byte (RE_OK, the
+/// line as payload, no newline). A server built before this op answers RE_ERR, and the client prints nothing.
+pub const OP_STATUS : u8 = 11;
+/// The most bytes the line holds.
+pub const STATUS_LINE_MAX : usize = 80;
+/// A profile name is cut to this many bytes, a model name to MODEL_SHOW: with the longest of both and a two digit
+/// failover count the line is 78 bytes, so the cut at STATUS_LINE_MAX only guards a caller's own odd numbers.
+pub const PROFILE_SHOW : usize = 16;
+pub const MODEL_SHOW : usize = 24;
+
+/// Append up to `cap` bytes of s at `at`, every byte outside 32..126 as "?", and never past out.len; returns the
+/// position after them.
+fn put_clean(out: []u8, at: usize, s: []const u8, cap: usize) -> usize {
+    var n : usize = at;
+    var i : usize = 0;
+    while (i < s.len and i < cap and n < out.len) {
+        var b : u8 = s[i];
+        if (b < 32 or b > 126) { b = 63; }
+        out[n] = b;
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Append the decimal digits of v, clipped like put_clean.
+fn put_number(out: []u8, at: usize, v: u64) -> usize {
+    var d : [24]u8 = undefined;
+    const l : usize = put_dec(d[0..24], 0, v);
+    return put_clean(out, at, d[0..l], 24);
+}
+
+/// The line, written into out (at most STATUS_LINE_MAX bytes of it are used); returns its length.
+/// profile: the profile's name, empty when the pane has none. key: the key number the pane holds (1 to 8, 0 =
+/// none). keys: how many keys the provider holds. resting: how many of those still rest. failovers: the pane's
+/// count. model: the model name, empty to leave the segment out. wait_secs: seconds until the first resting key
+/// is free again (read only when every key rests).
+pub fn rotation_line(out: []u8, profile: []const u8, key: u32, keys: u32, resting: u32, failovers: u32, model: []const u8, wait_secs: u64) -> usize {
+    var lim : usize = out.len;
+    if (lim > STATUS_LINE_MAX) { lim = STATUS_LINE_MAX; }
+    const o : []u8 = out[0..lim];
+    if (profile.len == 0) { return put_clean(o, 0, "no key in use", STATUS_LINE_MAX); }
+    var n : usize = put_clean(o, 0, profile, PROFILE_SHOW);
+    if (keys == 0) { return put_clean(o, n, " no keys stored", STATUS_LINE_MAX); }
+    if (resting >= keys) {
+        n = put_clean(o, n, " all keys resting, next in ", STATUS_LINE_MAX);
+        n = put_number(o, n, wait_secs);
+        return put_clean(o, n, " s", STATUS_LINE_MAX);
+    }
+    n = put_clean(o, n, " key ", STATUS_LINE_MAX);
+    if (key == 0) {
+        n = put_clean(o, n, "-", STATUS_LINE_MAX);
+    } else {
+        n = put_number(o, n, @as(u64, key));
+    }
+    n = put_clean(o, n, "/", STATUS_LINE_MAX);
+    n = put_number(o, n, @as(u64, keys));
+    if (model.len > 0) {
+        n = put_clean(o, n, " | ", STATUS_LINE_MAX);
+        n = put_clean(o, n, model, MODEL_SHOW);
+    }
+    n = put_clean(o, n, " | resting ", STATUS_LINE_MAX);
+    n = put_number(o, n, @as(u64, resting));
+    n = put_clean(o, n, " | failovers ", STATUS_LINE_MAX);
+    return put_number(o, n, @as(u64, failovers));
+}
+
+/// The line of pane i (agent cell a) read from the server's key table at `now_ms`. `saved` is the model the pane
+/// reported (empty when none); the profile's launch model stands in for it. A pane with no profile, and every
+/// agent without one, gets the "no key in use" line. Reads counts and rest times only, never a key.
+pub fn pane_status_line(st: []const u64, i: usize, a: u32, saved: []const u8, now_ms: u64, out: []u8) -> usize {
+    const pk : usize = G_PANEK + i * PK;
+    const w : u64 = st[pk + PK_PROF];
+    if (profile_agent(a) == false or w >= @as(u64, PROFILE_COUNT)) {
+        return rotation_line(out, "", 0, 0, 0, 0, "", 0);
+    }
+    const pr : u32 = @as(u32, @intCast(w));
+    const prov : u32 = PROFILE_PROVIDER[pr];
+    var name : [24]u8 = undefined;
+    const nl : usize = profile_name(pr, name[0..24]);
+    var model : [64]u8 = undefined;
+    var ml : usize = put_clean(model[0..64], 0, saved, 60);
+    if (ml == 0) { ml = launch_model(st, i, a, false, "", model[0..64]); }
+    var resting : u32 = 0;
+    var wait : u64 = KEY_NEVER;
+    const now_s : u64 = now_ms / 1000;
+    var k : u32 = 0;
+    while (k < MAX_KEYS) {
+        if (key_present(st, prov, k)) {
+            const until : u64 = st[G_KREST + key_index(prov, k)];
+            if (until > now_s) {
+                resting = resting + 1;
+                if (until - now_s < wait) { wait = until - now_s; }
+            }
+        }
+        k = k + 1;
+    }
+    var secs : u64 = 0;
+    if (wait < KEY_NEVER) { secs = wait; }
+    return rotation_line(out, name[0..nl], pane_key_get(st, i, prov), key_count(st, prov), resting, @as(u32, @intCast(st[pk + PK_DONE])), model[0..ml], secs);
+}
+
+// ---- tests: fake tables only; each assert runs on a value the functions above compute ----
+
+/// A server table that holds `keys` keys of the first profile's provider (fake slots, no value), every key free.
+fn status_table(st: []u64, keys: u32) -> void {
+    var z : usize = 0;
+    while (z < 512) {
+        st[z] = 0;
+        z = z + 1;
+    }
+    keys_init(st);
+    var k : u32 = 0;
+    while (k < keys) {
+        key_put(st, PROFILE_PROVIDER[0], k, true, false);
+        k = k + 1;
+    }
+}
+
+test a_free_key_gives_the_profile_the_key_the_model_and_the_counts {
+    var out : [80]u8 = undefined;
+    var n : usize = rotation_line(out[0..80], "zai", 2, 6, 1, 0, "glm-4.5-flash", 0);
+    assert same_bytes(out[0..n], "zai key 2/6 | glm-4.5-flash | resting 1 | failovers 0");
+    // no model yet: the segment is left out, not shown empty
+    n = rotation_line(out[0..80], "anthropic-api", 1, 1, 0, 3, "", 0);
+    assert same_bytes(out[0..n], "anthropic-api key 1/1 | resting 0 | failovers 3");
+    // a pane that holds no key number while its provider holds keys
+    n = rotation_line(out[0..80], "zai", 0, 2, 0, 0, "m", 0);
+    assert same_bytes(out[0..n], "zai key -/2 | m | resting 0 | failovers 0");
+}
+
+test one_resting_key_is_counted_and_the_other_keys_still_serve {
+    var out : [80]u8 = undefined;
+    const n : usize = rotation_line(out[0..80], "zai", 3, 3, 2, 12, "glm-4.5-flash", 90);
+    // two of three rest: a key is free, so the wait is not shown
+    assert same_bytes(out[0..n], "zai key 3/3 | glm-4.5-flash | resting 2 | failovers 12");
+    assert has_text(out[0..n], "next in") == false;
+}
+
+test no_free_key_says_when_the_next_one_is {
+    var out : [80]u8 = undefined;
+    const n : usize = rotation_line(out[0..80], "zai", 2, 3, 3, 7, "glm-4.5-flash", 42);
+    assert same_bytes(out[0..n], "zai all keys resting, next in 42 s");
+    assert has_text(out[0..n], "glm") == false;
+    assert has_text(out[0..n], "failovers") == false;
+}
+
+test no_keys_stored_and_no_profile_have_their_own_lines {
+    var out : [80]u8 = undefined;
+    var n : usize = rotation_line(out[0..80], "zai", 0, 0, 0, 0, "glm-4.5-flash", 0);
+    assert same_bytes(out[0..n], "zai no keys stored");
+    n = rotation_line(out[0..80], "", 0, 0, 0, 0, "", 0);
+    assert same_bytes(out[0..n], "no key in use");
+    // an empty profile wins over every other fact: nothing else is named
+    n = rotation_line(out[0..80], "", 2, 3, 3, 7, "glm-4.5-flash", 42);
+    assert same_bytes(out[0..n], "no key in use");
+}
+
+test the_line_is_cut_at_80_bytes_and_holds_only_printable_ascii {
+    var longname : [60]u8 = undefined;
+    var j : usize = 0;
+    while (j < 60) {
+        longname[j] = 120;
+        j = j + 1;
+    }
+    // a newline, a high byte and a NUL inside the names
+    longname[3] = 10;
+    longname[4] = 200;
+    longname[5] = 0;
+    var big : [200]u8 = undefined;
+    var z : usize = 0;
+    while (z < 200) {
+        big[z] = 0;
+        z = z + 1;
+    }
+    const n : usize = rotation_line(big[0..200], longname[0..60], 4000000000, 4000000000, 3, 4000000000, longname[0..60], 0);
+    assert n <= 80;
+    assert n > 40;
+    // nothing was written past the cap
+    assert big[80] == 0;
+    assert big[199] == 0;
+    var i : usize = 0;
+    while (i < n) {
+        assert big[i] >= 32 and big[i] <= 126;
+        i = i + 1;
+    }
+    assert big[3] == 63 and big[4] == 63 and big[5] == 63;
+    // the names were cut: the 60 byte profile shows 16 bytes, so " key " follows them
+    assert big[16] == 32 and big[17] == 107;
+    // a short buffer is filled to its end and not past it
+    var small : [20]u8 = undefined;
+    const m : usize = rotation_line(small[0..20], "anthropic-api", 1, 6, 1, 0, "glm-4.5-flash", 0);
+    assert m == 20;
+    var w : usize = 0;
+    while (w < m) {
+        assert small[w] >= 32 and small[w] <= 126;
+        w = w + 1;
+    }
+    // the all-resting line with a 19 digit wait stays under the cap too
+    const r : usize = rotation_line(big[0..200], "ollama-cloud", 1, 8, 8, 48, "", 4000000000000000000);
+    assert r <= 80;
+    assert same_bytes(big[0..r], "ollama-cloud all keys resting, next in 4000000000000000000 s");
+}
+
+test a_pane_reads_its_line_from_the_server_table {
+    var st : [512]u64 = undefined;
+    var out : [80]u8 = undefined;
+    status_table(st[0..512], 3);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    var n : usize = pane_status_line(st[0..512], 0, 0, "", 1000000, out[0..80]);
+    // the first claude pane is on the z.ai profile with key 1 of 3, nothing resting, no failover yet
+    assert same_bytes(out[0..14], "zai key 1/3 | ");
+    assert has_text(out[0..n], " | resting 0 | failovers 0");
+    // key 2 rests: counted, the pane's own key and the key total are unchanged
+    key_rest(st[0..512], PROFILE_PROVIDER[0], 1, 2000);
+    n = pane_status_line(st[0..512], 0, 0, "", 1000000, out[0..80]);
+    assert same_bytes(out[0..14], "zai key 1/3 | ");
+    assert has_text(out[0..n], " | resting 1 | failovers 0");
+    // the rest has ended by then (2001 s): no key is resting any more
+    n = pane_status_line(st[0..512], 0, 0, "", 2001000, out[0..80]);
+    assert has_text(out[0..n], " | resting 0 | failovers 0");
+    // every key rests: the shortest rest left is the wait (1500 s - 1000 s)
+    key_rest(st[0..512], PROFILE_PROVIDER[0], 0, 3000);
+    key_rest(st[0..512], PROFILE_PROVIDER[0], 2, 1500);
+    n = pane_status_line(st[0..512], 0, 0, "", 1000000, out[0..80]);
+    assert same_bytes(out[0..n], "zai all keys resting, next in 500 s");
+}
+
+test the_failover_count_and_the_key_are_the_panes_own {
+    var st : [512]u64 = undefined;
+    var out : [80]u8 = undefined;
+    status_table(st[0..512], 3);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    plan_pane_keys(st[0..512], 1, 0, 1000100);
+    st[G_PANEK + 0 * PK + PK_DONE] = 5;
+    var n : usize = pane_status_line(st[0..512], 0, 0, "", 1000200, out[0..80]);
+    assert has_text(out[0..n], "key 1/3");
+    assert has_text(out[0..n], "failovers 5");
+    n = pane_status_line(st[0..512], 1, 0, "", 1000200, out[0..80]);
+    assert has_text(out[0..n], "key 2/3");
+    assert has_text(out[0..n], "failovers 0");
+}
+
+test the_model_comes_from_the_pane_first_and_from_its_profile_second {
+    var st : [512]u64 = undefined;
+    var out : [80]u8 = undefined;
+    var mb : [64]u8 = undefined;
+    status_table(st[0..512], 3);
+    plan_pane_keys(st[0..512], 0, 0, 1000000);
+    var n : usize = pane_status_line(st[0..512], 0, 0, "opus[1m]", 1000000, out[0..80]);
+    assert has_text(out[0..n], "zai key 1/3 | opus[1m] | resting 0");
+    // none reported yet: the profile's launch model, the same one a fresh start passes to claude
+    const ml : usize = launch_model(st[0..512], 0, 0, false, "", mb[0..64]);
+    assert ml > 0;
+    n = pane_status_line(st[0..512], 0, 0, "", 1000000, out[0..80]);
+    assert has_text(out[0..n], "opus") == false;
+    assert has_text(out[0..n], mb[0..ml]);
+    assert has_text(out[0..n], " | resting 0 | failovers 0");
+}
+
+test a_pane_without_a_profile_or_a_key_has_no_rotation_to_show {
+    var st : [512]u64 = undefined;
+    var out : [80]u8 = undefined;
+    status_table(st[0..512], 3);
+    // pane 3 never chose a profile (PK_UNSET)
+    var n : usize = pane_status_line(st[0..512], 3, 0, "", 1000000, out[0..80]);
+    assert same_bytes(out[0..n], "no key in use");
+    // a shell (cell 9) takes no profile, whatever the table holds: the same pane on the z.ai profile shows a line
+    st[G_PANEK + 0 * PK + PK_PROF] = 0;
+    n = pane_status_line(st[0..512], 0, 0, "", 1000000, out[0..80]);
+    assert same_bytes(out[0..14], "zai key -/3 | ");
+    n = pane_status_line(st[0..512], 0, 9, "", 1000000, out[0..80]);
+    assert same_bytes(out[0..n], "no key in use");
+    // a pane on the z.ai profile whose provider holds no key at all
+    status_table(st[0..512], 0);
+    st[G_PANEK + 5 * PK + PK_PROF] = 0;
+    n = pane_status_line(st[0..512], 5, 0, "glm-4.5-flash", 1000000, out[0..80]);
+    assert same_bytes(out[0..n], "zai no keys stored");
+}
+
+test the_longest_real_line_fits_under_the_cap_uncut {
+    var out : [80]u8 = undefined;
+    // the longest profile name, the last key of eight, a model cut at its 24 bytes, a two digit failover count
+    const n : usize = rotation_line(out[0..80], "anthropic-api", 8, 8, 7, 99, "abcdefghijklmnopqrstuvwxyz", 0);
+    assert n == 75;
+    assert same_bytes(out[0..n], "anthropic-api key 8/8 | abcdefghijklmnopqrstuvwx | resting 7 | failovers 99");
+    // the request that fetches it is the op after OP_SETKEY (10) in pty_proto.t27
+    assert OP_STATUS == 11;
+    assert STATUS_LINE_MAX == 80;
+}
