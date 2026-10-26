@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/key_rotation_msg.t27 -- key and model rotation as a supervised actor (gHashTag/t27#12596,
+; P2 of epic #12490). Only the MESSAGE and SUPERVISION layer lives here: three messages (PICK asks for
+; the next key, RESULT reports how the call ended, REST tells a parked rotator that the rest is over),
+; three actor states, five reply codes and the restart intensity of the supervised actor.
+; The messages carry key INDICES, masks and small codes, never key bytes: no function below takes or
+; returns a string or a byte array, so a key value cannot ride a message by construction.
+; This file restates no decision rule. Which refusals count and which key is next free are the rules of
+; specs/queen/key_failover.t27 (refusal classes, next_free, the pool-overload step); the rotation pick
+; and the model ladder (model_left) are the rules of specs/t27os/keys.t27. The functions here take
+; those OUTCOMES as inputs (u8, u32, bool) and map them to a state, a lane or a reply. Nothing here
+; calls those specs, and nothing here uses actors.t27: the two numbers it shares with it are checked in
+; the PR text, not by a `use`. No money word and no value claim: a reply is an index or a code.
+; Not here: the wiring, the mailbox and the key store. This is the decision table with tests, a
+; contract for the code that sends and receives the messages. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenKeyRotationMsg;
+
+; --- 1. Tags and lanes ------------------------------------------------------------------------------
+
+/// The three message tags of the rotation actor. They sit above the claim_msg.t27 tags (16..18), so a
+/// mailbox that carries both never confuses them, and all stay under the 64 tags one control lane word
+/// holds.
+pub const RK_TAG_PICK : u64 = 19;
+pub const RK_TAG_RESULT : u64 = 20;
+pub const RK_TAG_REST : u64 = 21;
+
+/// Whether a tag is one of the three rotation tags. Anything else, including 0 and the tags of the
+/// other protocols, is not: a receiver of this protocol drops what it does not know.
+pub fn rk_known_tag(tag : u64) -> bool {
+    if (tag == RK_TAG_PICK) { return true; }
+    if (tag == RK_TAG_RESULT) { return true; }
+    if (tag == RK_TAG_REST) { return true; }
+    return false;
+}
+
+/// The lane of a tag, with the numbers of actors.t27 (0 is the data lane, 1 the control lane). A PICK
+/// is work and rides the data lane. A RESULT and a REST ride the control lane: a full mailbox of picks
+/// must not hide a refusal, because a refusal that arrives late keeps handing out the refused key. Any
+/// other tag is data.
+pub fn rk_lane_of(tag : u64) -> u8 {
+    if (tag == RK_TAG_RESULT) { return 1; }
+    if (tag == RK_TAG_REST) { return 1; }
+    return 0;
+}
+
+; --- 2. States of the rotation actor ----------------------------------------------------------------
+
+/// The state of the rotation actor: waiting for a pick, answering one, or parked (it has given up and
+/// waits for a REST).
+pub const RK_IDLE : u8 = 0;
+pub const RK_ROTATING : u8 = 1;
+pub const RK_PARKED : u8 = 2;
+
+/// The next state after one message. The inputs are outcomes already decided elsewhere: pool_dry is
+/// the answer of the pool-overload step of key_failover.t27 (no key and no pool left to try), and
+/// intensity_gone is rk_gives_up of this file for the restarts in the period.
+/// - intensity_gone: PARKED from any state, whatever the tag (the supervisor gave the actor up).
+/// - PARKED: stays PARKED for every tag except REST; a REST clears it to IDLE (the intensity check
+///   above has already refused it when intensity_gone is true).
+/// - PICK in IDLE: ROTATING.
+/// - RESULT in ROTATING: IDLE, or PARKED when pool_dry.
+/// - anything else (an unknown tag, a PICK while ROTATING, a RESULT while IDLE): no change.
+pub fn rk_next_state(state : u8, tag : u64, pool_dry : bool, intensity_gone : bool) -> u8 {
+    if (intensity_gone) { return RK_PARKED; }
+    if (state == RK_PARKED) {
+        if (tag == RK_TAG_REST) { return RK_IDLE; }
+        return RK_PARKED;
+    }
+    if (state == RK_IDLE) {
+        if (tag == RK_TAG_PICK) { return RK_ROTATING; }
+        return RK_IDLE;
+    }
+    if (state == RK_ROTATING) {
+        if (tag == RK_TAG_RESULT) {
+            if (pool_dry) { return RK_PARKED; }
+            return RK_IDLE;
+        }
+        return RK_ROTATING;
+    }
+    return state;
+}
+
+; --- 3. Replies -------------------------------------------------------------------------------------
+
+/// The five replies to a PICK. KEY: the reply holds a key index. POOL_DRY: no key and no way on, the
+/// caller waits. NEXT_POOL: no key in this pool, try the next pool. NEXT_MODEL: the pools are used up
+/// but the model ladder has a step left. ESCALATE: the actor is parked, the question goes up.
+pub const RK_REPLY_KEY : u8 = 0;
+pub const RK_REPLY_POOL_DRY : u8 = 1;
+pub const RK_REPLY_NEXT_POOL : u8 = 2;
+pub const RK_REPLY_NEXT_MODEL : u8 = 3;
+pub const RK_REPLY_ESCALATE : u8 = 4;
+
+/// The index that means "no key": u32 max. Real key indices are small (a pool is far below 32 keys).
+pub const RK_NO_INDEX : u32 = 0xFFFFFFFF;
+
+/// The index a reply carries. next_free is the outcome of next_free in key_failover.t27 (an index, or
+/// RK_NO_INDEX when the pool has none). A reply never points back at the key that was just refused: if
+/// next_free equals refused, or is RK_NO_INDEX, the answer is RK_NO_INDEX; otherwise it is next_free.
+pub fn rk_reply_index(refused : u32, next_free : u32) -> u32 {
+    if (next_free == refused) { return RK_NO_INDEX; }
+    if (next_free == RK_NO_INDEX) { return RK_NO_INDEX; }
+    return next_free;
+}
+
+/// The reply code of a PICK. next_free is the outcome of next_free in key_failover.t27 (or the result
+/// of rk_reply_index), model_left the outcome of model_left in keys.t27, pool_has_next whether another
+/// pool is configured. Order: parked first (ESCALATE), then a key if there is one, then the next pool,
+/// then the next model, and only then POOL_DRY.
+pub fn rk_reply_code(next_free : u32, pool_has_next : bool, model_left : bool, parked : bool) -> u8 {
+    if (parked) { return RK_REPLY_ESCALATE; }
+    if (next_free != RK_NO_INDEX) { return RK_REPLY_KEY; }
+    if (pool_has_next) { return RK_REPLY_NEXT_POOL; }
+    if (model_left) { return RK_REPLY_NEXT_MODEL; }
+    return RK_REPLY_POOL_DRY;
+}
+
+; --- 4. Restart intensity ---------------------------------------------------------------------------
+
+/// How many restarts in one period the supervisor allows the rotation actor. It equals
+/// DOMAIN_MAX_RESTARTS of specs/queen/actors.t27 (line 635, value 3); the cross-check lives in the PR
+/// text, because a `use` of actors.t27 would splice that whole spec into this one.
+pub const RK_MAX_RESTARTS : u32 = 3;
+
+/// True when the restarts in the period, the latest included, exceed RK_MAX_RESTARTS: the same meaning
+/// as intensity_exceeded in actors.t27 (strictly greater, so 3 restarts are allowed and the 4th gives
+/// up). The result feeds the intensity_gone input of rk_next_state.
+pub fn rk_gives_up(restarts_in_period : u32) -> bool {
+    return restarts_in_period > RK_MAX_RESTARTS;
+}
+
+; --- 5. Tests ---------------------------------------------------------------------------------------
+
+test only_the_three_rotation_tags_are_known {
+    assert rk_known_tag(RK_TAG_PICK) == true;
+    assert rk_known_tag(RK_TAG_RESULT) == true;
+    assert rk_known_tag(RK_TAG_REST) == true;
+    assert rk_known_tag(0) == false;
+    assert rk_known_tag(3) == false;
+    assert rk_known_tag(18) == false;
+    assert rk_known_tag(22) == false;
+    assert rk_known_tag(99) == false;
+}
+
+test a_result_and_a_rest_ride_the_control_lane_a_pick_rides_data {
+    assert rk_lane_of(RK_TAG_RESULT) == 1;
+    assert rk_lane_of(RK_TAG_REST) == 1;
+    assert rk_lane_of(RK_TAG_PICK) == 0;
+    assert rk_lane_of(0) == 0;
+    assert rk_lane_of(99) == 0;
+}
+
+test a_pick_in_idle_starts_a_rotation {
+    assert rk_next_state(RK_IDLE, RK_TAG_PICK, false, false) == RK_ROTATING;
+    assert rk_next_state(RK_IDLE, RK_TAG_PICK, true, false) == RK_ROTATING;
+}
+
+test a_result_in_rotating_returns_to_idle_unless_the_pool_is_dry {
+    assert rk_next_state(RK_ROTATING, RK_TAG_RESULT, false, false) == RK_IDLE;
+    assert rk_next_state(RK_ROTATING, RK_TAG_RESULT, true, false) == RK_PARKED;
+}
+
+test messages_that_do_not_apply_leave_the_state_alone {
+    assert rk_next_state(RK_IDLE, RK_TAG_RESULT, false, false) == RK_IDLE;
+    assert rk_next_state(RK_IDLE, RK_TAG_REST, false, false) == RK_IDLE;
+    assert rk_next_state(RK_IDLE, 99, false, false) == RK_IDLE;
+    assert rk_next_state(RK_ROTATING, RK_TAG_PICK, false, false) == RK_ROTATING;
+    assert rk_next_state(RK_ROTATING, RK_TAG_REST, false, false) == RK_ROTATING;
+    assert rk_next_state(RK_ROTATING, 0, true, false) == RK_ROTATING;
+}
+
+test a_parked_actor_stays_parked_for_every_tag_but_rest {
+    assert rk_next_state(RK_PARKED, RK_TAG_PICK, false, false) == RK_PARKED;
+    assert rk_next_state(RK_PARKED, RK_TAG_RESULT, false, false) == RK_PARKED;
+    assert rk_next_state(RK_PARKED, RK_TAG_RESULT, true, false) == RK_PARKED;
+    assert rk_next_state(RK_PARKED, 99, false, false) == RK_PARKED;
+}
+
+test a_rest_clears_a_parked_actor_only_when_the_intensity_is_not_gone {
+    assert rk_next_state(RK_PARKED, RK_TAG_REST, false, false) == RK_IDLE;
+    assert rk_next_state(RK_PARKED, RK_TAG_REST, false, true) == RK_PARKED;
+    assert rk_next_state(RK_PARKED, RK_TAG_REST, true, true) == RK_PARKED;
+}
+
+test a_gone_intensity_parks_the_actor_from_any_state {
+    assert rk_next_state(RK_IDLE, RK_TAG_PICK, false, true) == RK_PARKED;
+    assert rk_next_state(RK_ROTATING, RK_TAG_RESULT, false, true) == RK_PARKED;
+    assert rk_next_state(RK_IDLE, 0, false, true) == RK_PARKED;
+    assert rk_next_state(RK_ROTATING, RK_TAG_PICK, false, true) == RK_PARKED;
+}
+
+test a_reply_never_points_back_at_the_refused_key {
+    assert rk_reply_index(2, 2) == RK_NO_INDEX;
+    assert rk_reply_index(0, 0) == RK_NO_INDEX;
+    assert rk_reply_index(7, 7) == RK_NO_INDEX;
+}
+
+test a_pool_with_no_next_free_key_replies_with_no_index {
+    assert rk_reply_index(2, RK_NO_INDEX) == RK_NO_INDEX;
+    assert rk_reply_index(RK_NO_INDEX, RK_NO_INDEX) == RK_NO_INDEX;
+}
+
+test a_different_free_key_passes_through {
+    assert rk_reply_index(2, 3) == 3;
+    assert rk_reply_index(3, 2) == 2;
+    assert rk_reply_index(0, 7) == 7;
+    assert rk_reply_index(RK_NO_INDEX, 4) == 4;
+}
+
+test a_parked_actor_escalates_whatever_else_is_left {
+    assert rk_reply_code(1, true, true, true) == RK_REPLY_ESCALATE;
+    assert rk_reply_code(RK_NO_INDEX, false, false, true) == RK_REPLY_ESCALATE;
+}
+
+test a_free_key_is_the_first_choice {
+    assert rk_reply_code(0, true, true, false) == RK_REPLY_KEY;
+    assert rk_reply_code(5, false, false, false) == RK_REPLY_KEY;
+}
+
+test with_no_key_the_next_pool_comes_before_the_next_model {
+    assert rk_reply_code(RK_NO_INDEX, true, true, false) == RK_REPLY_NEXT_POOL;
+    assert rk_reply_code(RK_NO_INDEX, true, false, false) == RK_REPLY_NEXT_POOL;
+}
+
+test with_no_key_and_no_pool_the_model_ladder_is_next {
+    assert rk_reply_code(RK_NO_INDEX, false, true, false) == RK_REPLY_NEXT_MODEL;
+}
+
+test with_nothing_left_the_pool_is_dry {
+    assert rk_reply_code(RK_NO_INDEX, false, false, false) == RK_REPLY_POOL_DRY;
+}
+
+test the_reply_index_feeds_the_reply_code {
+    assert rk_reply_code(rk_reply_index(2, 2), false, true, false) == RK_REPLY_NEXT_MODEL;
+    assert rk_reply_code(rk_reply_index(2, 3), false, true, false) == RK_REPLY_KEY;
+    assert rk_reply_code(rk_reply_index(2, RK_NO_INDEX), true, false, false) == RK_REPLY_NEXT_POOL;
+}
+
+test the_five_reply_codes_come_out_distinct {
+    assert rk_reply_code(1, false, false, false) != rk_reply_code(RK_NO_INDEX, true, false, false);
+    assert rk_reply_code(RK_NO_INDEX, true, false, false) != rk_reply_code(RK_NO_INDEX, false, true, false);
+    assert rk_reply_code(RK_NO_INDEX, false, true, false) != rk_reply_code(RK_NO_INDEX, false, false, false);
+    assert rk_reply_code(RK_NO_INDEX, false, false, false) != rk_reply_code(1, false, false, true);
+    assert rk_reply_code(1, false, false, false) != rk_reply_code(1, false, false, true);
+}
+
+test three_restarts_are_allowed_and_the_fourth_gives_up {
+    assert rk_gives_up(0) == false;
+    assert rk_gives_up(2) == false;
+    assert rk_gives_up(3) == false;
+    assert rk_gives_up(4) == true;
+    assert rk_gives_up(100) == true;
+}
+
+test the_restart_bound_agrees_with_the_actors_domain_bound_of_three {
+    var domain_max : u32 = 3;
+    assert rk_gives_up(domain_max) == false;
+    assert rk_gives_up(domain_max + 1) == true;
+}
+
+test the_give_up_check_feeds_the_state_machine {
+    assert rk_next_state(RK_IDLE, RK_TAG_PICK, false, rk_gives_up(3)) == RK_ROTATING;
+    assert rk_next_state(RK_IDLE, RK_TAG_PICK, false, rk_gives_up(4)) == RK_PARKED;
+    assert rk_next_state(RK_PARKED, RK_TAG_REST, false, rk_gives_up(3)) == RK_IDLE;
+    assert rk_next_state(RK_PARKED, RK_TAG_REST, false, rk_gives_up(4)) == RK_PARKED;
+}
+
+test for_any_refused_and_next_index_below_eight_the_reply_is_never_the_refused_key {
+    var refused : u32 = 0;
+    while (refused < 8) {
+        var next : u32 = 0;
+        while (next < 8) {
+            let r : u32 = rk_reply_index(refused, next);
+            assert r != refused;
+            if (next == refused) { assert r == RK_NO_INDEX; }
+            if (next != refused) { assert r == next; }
+            next = next + 1;
+        }
+        refused = refused + 1;
+    }
+}
+
+; --- 6. Invariants ----------------------------------------------------------------------------------
+
+invariant rk_tags_distinct_and_under_one_control_word { assert RK_TAG_PICK != RK_TAG_RESULT and RK_TAG_RESULT != RK_TAG_REST and RK_TAG_PICK != RK_TAG_REST and RK_TAG_PICK < 64 and RK_TAG_RESULT < 64 and RK_TAG_REST < 64; }
+invariant rk_no_index_is_above_any_real_key_index { assert RK_NO_INDEX > 31; }
+invariant rk_restart_bound_is_three { assert RK_MAX_RESTARTS == 3; }
