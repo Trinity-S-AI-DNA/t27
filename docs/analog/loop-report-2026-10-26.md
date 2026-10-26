@@ -157,3 +157,27 @@ Already in force, not a variant: start a gate only below load 15 (below 30 with 
 - Pull requests #12029, #12032, #12046, #12063, #12072, #12085, #12102, #12108, #12153, #12346, #12401, #12459, #12468, #12482, #12496, #12501, #12513, #12531, #12540, #12552.
 - Notes in `docs/analog/`: `v0.1-release-notes.md`, `seal-refusal-2026-10-25.md`, `reference-chain.md`, `competitors.md` (pointer only), `mutation-census-rest-2026-10-25.md`, `mutation-raw_writer-2026-10-25.md` and the other `mutation-*` notes and accepted-mutants files named by spec.
 - Not used: any web source, any note outside the list above.
+
+## 8. Update after the report (2026-10-26)
+
+This report merged on 2026-10-25 at 23:03Z (PR #12556). Two items that it lists as parked were settled by pull requests that merged after it. The lines named below are left as written; this section supersedes them. Tracking issue: #12640.
+
+### 8.1 First-pass clock wired (#12403, PR #12625)
+
+- PR #12625 merged 2026-10-26 04:52Z as `833925fe47`: `cli/tri/src/mutate.rs` +40 -973, `gen/rust/tri/mutate/clock.rs` +54, `docs/analog/mutate-first-pass-clock.md` +71, `tools/census/fetches.txt` +1 -1. The 973 deleted lines are the `--lab` transport that nothing used any more; the hand-written file ends smaller, so the foreign-line rule is met by deleting, with no label.
+- Issue #12403 is closed (PR #12635, a docs-only table of the measured runs, `2283ad50c8`). The wiring is on by default.
+- Superseded lines: section 2.4 ("it is wired nowhere" and the bullet "Slice 2 (#12403) would wire it ... Parked"); the section 3 row "Slice 2 of #12403 ... refused"; the section 4 row "Slice 2 of the first-pass clock, net +32 hand lines"; section 6 P3 ("slice 2 is not wired" and "needs the owner's call on the +32 hand lines").
+- Measured: the runs are in `docs/analog/mutate-first-pass-clock.md` (two pairs of the same `linear_zoh` gate, the wiring shorter in both, the verdict 223 killed / 2 survived / 27 hung / 0 unviable unchanged, start loads written down and not equal). Two pairs on one machine are not a benchmark; no general speed claim is made here. P3 stays a variant with its risk (a clock set too short turns slow-but-finishing mutants into hung).
+
+### 8.2 Compile answers read by a rule (#12539, PR #12636)
+
+- PR #12636 merged 2026-10-26 05:51Z as `46967d2b51`: new `specs/tri/mutate/answer.t27` +212 (module `TriMutateAnswer`, sealed, 11 tests and one invariant), `cli/tri/src/mutate.rs` +34 -47, `gen/rust/tri/mutate/answer.rs` +248, seal +33. Net hand-written lines: 13 fewer.
+- The driver no longer files every unknown compile error as unviable without a trace. `answer.t27` reads zig's first `error:` line as one of five answers (hang, invariant, refusal, located, other); only "other" (a driver or cache error that says nothing about the mutant) is asked once more, and an "other" that comes twice stays unviable and is tagged `REPEATED`. Issue #12539 is closed.
+- Superseded lines: section 2.4 ("#12539 ... Parked on the same foreign-line question"); the section 4 row "Silent unviable in the compiler-answer handling".
+- Measured (recorded on #12539): the success gate on `specs/analog/linear_zoh.t27` with the lane-built driver ended with exit 0, 421 s wall time, 223 killed / 2 survived / 27 hung / 0 unviable. The retry fired 0 times in that run (no cache error occurred), so the retry path rests on the unit tests of `answer.t27` and the glue test, not on a live run. How often a cache error happens is not measured.
+- Still open, unchanged: the cache folder emptied during a gate (the section 4 row on the cache cleaner, outside the loop's reach).
+
+### 8.3 What did not change
+
+- Every other section 4 row, including the owner decisions (#12116 SC-002, #12069), the three variants of section 5, and the speed variants P1 and P2.
+- Three lessons from this work were added to the `analog-emulation` skill (#12637, PR #12638): a gate for a driver change runs with the lane-built driver, a rule over a tool's text output lives in a sealed spec, and a path no live run exercised is reported with its live count.
