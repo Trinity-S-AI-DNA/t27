@@ -1,0 +1,745 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/pr_tools.t27 -- the six read-only TRI CLAW MCP tools that help with pull requests
+; (issue #12493). Each tool is a pure function from text to text: the host (the lab, the T27 OS
+; pane, the CI step) fetches the rows with plain git and gh commands and hands them in; the tool
+; answers in the report vocabulary of specs/claw/evidence.t27 (exact, derived, suggested, unknown).
+; An unknown stays unknown: no tool turns a missing input into a green answer.
+; --
+; Every rule here is a call into a spec that already holds it. This file copies no body:
+; - claw_pr_status      latest_plan (check_latest) and required_plan (required_red)
+; - claw_pr_red_origin  mj_rows, mj_row_kind, mj_red_state, mj_master (merge_judge), red_line and
+;                       the R_* reasons (red_origin)
+; - claw_pr_merge_plan  merge_plan (merge_judge, the merger's rules on the exact head, with the
+;                       discounted-check line) and ml_verdict (merge_lane)
+; - claw_pr_reseal_plan the seal-stale-reseal row of recipes
+; - claw_pr_dupe_group  the dupe-bless row of recipes and the dupe ratchet's new/grew/shrunk reading
+; - claw_pr_conflicts   the file list of a trial merge of master into the branch
+; The tool table PT_NAMES is the single source of the tool list: the count, the registry test and
+; claw_pr_tools_list all read it.
+; --
+; Inputs (the host builds them; the first two are the merger's own stream, see merge_judge.t27):
+; - status: rows "name TAB run TAB status TAB conclusion", one per line (check_latest rows).
+; - red_origin, merge_plan: the merge_judge stream (P, K, B, F lines). red_origin also takes the
+;   pull request number and answers for that block only. merge_plan also takes the lane stream
+;   merge_lane.ml_verdict reads (empty means unknown).
+; - reseal_plan: one stale seal spec path per line, specs/<dir>/<name>.t27.
+; - dupe_group: "D TAB group TAB count-now TAB count-in-ledger" per group and
+;   "S TAB group TAB spec-path" per spec of the group, built from python3 tools/dupe_scan.py and
+;   tools/duplicate_bodies_baseline.txt.
+; - conflicts: the conflicted files of a trial merge, one path per line; a lone "-" line says the
+;   trial merge ran and was clean; an empty input says it was not read.
+; Outputs: tagged lines. E (tool, label) closes every answer; T is a totals line; the other tags are
+; documented at each tool. Names, counts and paths only: no secret value is ever read or printed.
+; --
+; Seals and tests of this file are produced on the lab or in CI, never on the Mac (owner rule).
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+module ClawPrTools;
+
+use claw::sarif;
+use claw::text;
+use claw::queue_cost;
+use claw::check_latest;
+use claw::required_red;
+use claw::red_origin;
+use claw::merge_judge;
+use claw::evidence::{LABEL_EXACT, LABEL_DERIVED, LABEL_SUGGESTED, LABEL_UNKNOWN, LABEL_NAMES, LABEL_NAME_LENS, label_valid};
+use claw::github_surface::{level_of, L_NONE, L_READ, L_WRITE};
+use claw::merge_lane::{ml_verdict, ML_UNKNOWN};
+use claw::recipes::{class_of, tool_of, cmd_of, C_AUTO, C_OWNER};
+use t27mcp::service::{admit, home_of, name_ok, H_TRI_CLAW, A_MOUNT, A_REFUSE_COLLISION, A_REFUSE_NAME};
+
+/// The tool table. One row per tool; PT_NAME_LENS are hand counts, pinned against .len by a test.
+pub const PT_COUNT : usize = 6;
+pub const PT_NAMES : [6]str = [
+    "claw_pr_status", "claw_pr_red_origin", "claw_pr_merge_plan",
+    "claw_pr_reseal_plan", "claw_pr_dupe_group", "claw_pr_conflicts"
+];
+pub const PT_NAME_LENS : [6]usize = [14, 18, 18, 19, 18, 17];
+
+/// The github_surface each tool reads through: all six are L_READ.
+pub const PT_SURFACES : [6]str = ["pr-files", "pr-files", "pr-files", "spec-read", "spec-read", "pr-files"];
+
+/// The strongest label each tool may claim: 0 exact, 1 derived, 2 suggested (evidence.t27 order).
+pub const PT_LABELS : [6]u8 = [0, 1, 1, 2, 1, 0];
+
+pub const PT_MASTER : [3]str = ["green", "red", "unseen"];
+pub const PT_MASTER_LENS : [3]usize = [5, 3, 6];
+pub const PT_LANE : [4]str = ["idle", "flowing", "starved", "unknown"];
+pub const PT_LANE_LENS : [4]usize = [4, 7, 7, 7];
+pub const PT_CLASS : [3]str = ["auto", "review", "owner"];
+pub const PT_CLASS_LENS : [3]usize = [4, 6, 5];
+pub const PT_DUPE : [5]str = ["new", "grew", "inherited", "shrunk", "unknown"];
+pub const PT_DUPE_LENS : [5]usize = [3, 4, 9, 6, 7];
+
+pub const PT_KIND_SEAL : str = "seal-stale-reseal";
+pub const PT_KIND_BLESS : str = "dupe-bless";
+pub const PT_LOG_WHY : str = "master is red on this check and the file lists do not decide whose it is: read the run log";
+
+fn pt_put(out : []u8, cap : usize, w : usize, s : str) -> usize {
+    return put_str(out, cap, w, s, s.len);
+}
+
+fn pt_has(buf : []const u8, n : usize, s : str) -> bool {
+    return buf_has(buf, n, s, s.len);
+}
+
+/// "E TAB tool TAB label": the closing line of every answer. A label outside the vocabulary is unknown.
+fn pt_end(out : []u8, cap : usize, w : usize, tool : usize, label : u8) -> usize {
+    var l : u8 = label;
+    if (label_valid(l) == false) { l = LABEL_UNKNOWN; }
+    var p : usize = pt_put(out, cap, w, "E\t");
+    p = put_str(out, cap, p, PT_NAMES[tool], PT_NAME_LENS[tool]);
+    p = pt_put(out, cap, p, "\t");
+    p = put_str(out, cap, p, LABEL_NAMES[l as usize], LABEL_NAME_LENS[l as usize]);
+    return pt_put(out, cap, p, "\n");
+}
+
+/// The recipe class as a word; an unknown class prints as owner, the fail-closed side.
+fn pt_class(out : []u8, cap : usize, w : usize, c : u8) -> usize {
+    var k : u8 = c;
+    if (k > C_OWNER) { k = C_OWNER; }
+    return put_str(out, cap, w, PT_CLASS[k as usize], PT_CLASS_LENS[k as usize]);
+}
+
+/// A spec path: specs/ prefix and .t27 suffix, nothing shorter than one name character between.
+fn pt_is_spec(raw : []const u8, s : usize, e : usize) -> bool {
+    if (e - s < 11) { return false; }
+    if (qc_range_is(raw, s, s + 6, "specs/", 6) == false) { return false; }
+    return qc_range_is(raw, e - 4, e, ".t27", 4);
+}
+
+fn pt_is_seal(raw : []const u8, s : usize, e : usize) -> bool {
+    if (e - s < 16) { return false; }
+    return qc_range_is(raw, s, s + 15, ".trinity/seals/", 15);
+}
+
+/// A master row that decides: COMPLETED with SUCCESS or FAILURE. Cancelled or skipped say nothing.
+fn pt_decisive(raw : []const u8, ss : usize, se : usize, cs : usize, ce : usize) -> bool {
+    if (qc_range_is(raw, ss, se, "COMPLETED", 9) == false) { return false; }
+    if (qc_range_is(raw, cs, ce, "SUCCESS", 7)) { return true; }
+    return qc_range_is(raw, cs, ce, "FAILURE", 7);
+}
+
+/// The newest decisive master run of the check nm[ns..ne): run[0..1] is its id range in raw.
+/// mj_master answers the verdict only, so the run that backs it is looked up here.
+fn pt_master_run(raw : []const u8, n : usize, nm : []const u8, ns : usize, ne : usize, run : []usize) -> bool {
+    var f : [10]usize = undefined;
+    var have : bool = false;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls and mj_tag(raw, ls, le) == 'B' and qc_split(raw, ls, le, &f, 5)) {
+            if (mj_same(raw, f[2], f[3], nm, ns, ne) and pt_decisive(raw, f[6], f[7], f[8], f[9])) {
+                if (have == false or run_gt(raw, f[4], f[5], raw, run[0], run[1])) {
+                    run[0] = f[4];
+                    run[1] = f[5];
+                    have = true;
+                }
+            }
+        }
+        ls = le + 1;
+    }
+    return have;
+}
+
+/// Reading of a dupe group from its count now and in the ledger: 0 new, 1 grew, 2 inherited,
+/// 3 shrunk, 4 unreadable (a count that did not parse).
+fn pt_dupe_kind(now : i32, base : i32) -> u8 {
+    if (now < 0 or base < 0) { return 4; }
+    if (base == 0 and now > 0) { return 0; }
+    if (now > base) { return 1; }
+    if (now < base) { return 3; }
+    return 2;
+}
+
+/// Tool 1. L, C, V lines of the latest runs per check, R and F lines of the four required jobs,
+/// then E. exact when rows were read, unknown on an empty input.
+pub fn claw_pr_status(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var tmp : [1024]u8 = undefined;
+    var w : usize = latest_plan(raw, n, out, cap);
+    const m : usize = required_plan(raw, n, &tmp, 1024);
+    w = qc_put_range(out, cap, w, &tmp, 0, m);
+    var lab : u8 = LABEL_EXACT;
+    if (n == 0) { lab = LABEL_UNKNOWN; }
+    return pt_end(out, cap, w, 0, lab);
+}
+
+/// Tool 2. For every live non-required red of pull request num: a Q line "Q TAB check TAB master
+/// TAB run" (master is green, red or unseen, run is the newest decisive master run or -), then
+/// red_origin's O line (own, inherited or unknown, with the reason). T counts them. derived; unknown
+/// when the block is missing or any red stays unknown.
+pub fn claw_pr_red_origin(raw : []const u8, n : usize, num : i32, out : []u8, cap : usize) -> usize {
+    var f : [28]usize = undefined;
+    var bs : usize = 0;
+    var be : usize = n;
+    var total : i32 = -1;
+    var found : bool = false;
+    var closed : bool = false;
+    var w : usize = 0;
+    var ls : usize = 0;
+    while (ls < n and num > 0) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls and mj_tag(raw, ls, le) == 'P' and qc_split(raw, ls, le, &f, MJ_PF)) {
+            if (found and closed == false) {
+                be = ls;
+                closed = true;
+            }
+            if (found == false and parse_num(raw, f[2], f[3]) == num) {
+                found = true;
+                bs = ls;
+                total = parse_num(raw, f[26], f[27]);
+            }
+        }
+        ls = le + 1;
+    }
+    if (found == false) {
+        w = pt_put(out, cap, w, "T\tred-origin: no block for this pull request in the stream\n");
+        return pt_end(out, cap, w, 1, LABEL_UNKNOWN);
+    }
+    var rs : [16384]u8 = undefined;
+    var pos : [128]usize = undefined;
+    var ln : [1]usize = undefined;
+    var g : [8]usize = undefined;
+    var r : [1]u8 = undefined;
+    var run : [2]usize = undefined;
+    var cnt : [3]u32 = undefined;
+    cnt[0] = 0;
+    cnt[1] = 0;
+    cnt[2] = 0;
+    const rows : u32 = mj_rows(raw, bs, be, &rs, MJ_TABLE_CAP, &pos, &ln);
+    if (rows > MJ_MAX_ROWS or ln[0] > MJ_TABLE_CAP) {
+        w = pt_put(out, cap, w, "T\tred-origin: the check table is too large to read\n");
+        return pt_end(out, cap, w, 1, LABEL_UNKNOWN);
+    }
+    var rl : usize = 0;
+    while (rl < ln[0]) {
+        const re : usize = qc_line_end(&rs, ln[0], rl);
+        if (re > rl) {
+            if (mj_row_kind(&rs, ln[0], rl, re) == KIND_OTHER and qc_split(&rs, rl, re, &g, 4)) {
+                const st : u8 = mj_red_state(raw, n, num as u32, &rs, g[0], g[1], total, &r);
+                var mv : u8 = mj_master(raw, n, &rs, g[0], g[1]);
+                if (mv > M_UNSEEN) { mv = M_UNSEEN; }
+                w = pt_put(out, cap, w, "Q\t");
+                w = qc_put_range(out, cap, w, &rs, g[0], g[1]);
+                w = pt_put(out, cap, w, "\t");
+                w = put_str(out, cap, w, PT_MASTER[mv as usize], PT_MASTER_LENS[mv as usize]);
+                w = pt_put(out, cap, w, "\t");
+                if (mv != M_UNSEEN and pt_master_run(raw, n, &rs, g[0], g[1], &run)) {
+                    w = qc_put_range(out, cap, w, raw, run[0], run[1]);
+                } else {
+                    w = pt_put(out, cap, w, "-");
+                }
+                w = pt_put(out, cap, w, "\n");
+                if (st == RS_LOG) {
+                    cnt[2] = cnt[2] + 1;
+                    w = pt_put(out, cap, w, "O\tunknown\t");
+                    w = pt_put(out, cap, w, PT_LOG_WHY);
+                    w = pt_put(out, cap, w, "\n");
+                } else {
+                    var vd : u8 = verdict_of(r[0]);
+                    if (vd > 2) { vd = 2; }
+                    cnt[vd as usize] = cnt[vd as usize] + 1;
+                    w = red_line(r[0], out, cap, w);
+                }
+            }
+        }
+        rl = re + 1;
+    }
+    w = pt_put(out, cap, w, "T\tred-origin: ");
+    w = put_count(out, cap, w, cnt[0]);
+    w = pt_put(out, cap, w, " own, ");
+    w = put_count(out, cap, w, cnt[1]);
+    w = pt_put(out, cap, w, " inherited, ");
+    w = put_count(out, cap, w, cnt[2]);
+    w = pt_put(out, cap, w, " unknown of ");
+    w = put_count(out, cap, w, cnt[0] + cnt[1] + cnt[2]);
+    w = pt_put(out, cap, w, " red\n");
+    var lab : u8 = LABEL_DERIVED;
+    if (cnt[2] > 0) { lab = LABEL_UNKNOWN; }
+    return pt_end(out, cap, w, 1, lab);
+}
+
+/// Tool 3. merge_plan's own lines for every pull request in the stream (G merge, W wait, H hold,
+/// N needs a person, L wants a log, M summary; a red reads "check: own|unknown: why"), then
+/// "A TAB lane TAB word" from merge_lane's reading of the lane stream, then E (derived).
+pub fn claw_pr_merge_plan(raw : []const u8, n : usize, lane : []const u8, lane_n : usize, out : []u8, cap : usize) -> usize {
+    var w : usize = merge_plan(raw, n, out, cap);
+    var v : u8 = ml_verdict(lane, lane_n);
+    if (v > ML_UNKNOWN) { v = ML_UNKNOWN; }
+    w = pt_put(out, cap, w, "A\tlane\t");
+    w = put_str(out, cap, w, PT_LANE[v as usize], PT_LANE_LENS[v as usize]);
+    w = pt_put(out, cap, w, "\n");
+    return pt_end(out, cap, w, 2, LABEL_DERIVED);
+}
+
+/// Tool 4. Z lines for the stale seal specs, a T line with the count and the recipe's class and
+/// tool, P lines with the recipe's command and where it runs. suggested; unknown with no valid spec.
+pub fn claw_pr_reseal_plan(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var w : usize = 0;
+    var good : u32 = 0;
+    var bad : u32 = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            if (pt_is_spec(raw, ls, le)) {
+                good += 1;
+                w = pt_put(out, cap, w, "Z\t");
+                w = qc_put_range(out, cap, w, raw, ls, le);
+                w = pt_put(out, cap, w, "\n");
+            } else {
+                bad += 1;
+            }
+        }
+        ls = le + 1;
+    }
+    w = pt_put(out, cap, w, "T\treseal-plan: ");
+    w = put_count(out, cap, w, good);
+    w = pt_put(out, cap, w, " specs, ");
+    w = put_count(out, cap, w, bad);
+    w = pt_put(out, cap, w, " refused, class ");
+    w = pt_class(out, cap, w, class_of(PT_KIND_SEAL));
+    w = pt_put(out, cap, w, ", tool ");
+    w = pt_put(out, cap, w, tool_of(PT_KIND_SEAL));
+    w = pt_put(out, cap, w, "\nP\tcmd\t");
+    w = pt_put(out, cap, w, cmd_of(PT_KIND_SEAL));
+    w = pt_put(out, cap, w, "\nP\twhere\tlab: a master-built t27c, never a build on the Mac\n");
+    var lab : u8 = LABEL_SUGGESTED;
+    if (good == 0) { lab = LABEL_UNKNOWN; }
+    return pt_end(out, cap, w, 3, lab);
+}
+
+/// Tool 5. V lines "group TAB new|grew|inherited|shrunk|unknown", S lines passing the spec paths
+/// of each group through, a T line with the counts, and an H line naming the dupe-bless recipe
+/// when the only change is a shrink. derived; unknown when no group was read or a count was bad.
+pub fn claw_pr_dupe_group(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var f : [8]usize = undefined;
+    var cnt : [5]u32 = undefined;
+    var k : usize = 0;
+    while (k < 5) {
+        cnt[k] = 0;
+        k += 1;
+    }
+    var w : usize = 0;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls + 1 and raw[ls] == 'D' and qc_split(raw, ls, le, &f, 4)) {
+            const kd : u8 = pt_dupe_kind(parse_num(raw, f[4], f[5]), parse_num(raw, f[6], f[7]));
+            cnt[kd as usize] = cnt[kd as usize] + 1;
+            w = pt_put(out, cap, w, "V\t");
+            w = qc_put_range(out, cap, w, raw, f[2], f[3]);
+            w = pt_put(out, cap, w, "\t");
+            w = put_str(out, cap, w, PT_DUPE[kd as usize], PT_DUPE_LENS[kd as usize]);
+            w = pt_put(out, cap, w, "\n");
+        } else if (le > ls + 1 and raw[ls] == 'S' and qc_split(raw, ls, le, &f, 3)) {
+            w = pt_put(out, cap, w, "S\t");
+            w = qc_put_range(out, cap, w, raw, f[2], f[3]);
+            w = pt_put(out, cap, w, "\t");
+            w = qc_put_range(out, cap, w, raw, f[4], f[5]);
+            w = pt_put(out, cap, w, "\n");
+        }
+        ls = le + 1;
+    }
+    const groups : u32 = cnt[0] + cnt[1] + cnt[2] + cnt[3] + cnt[4];
+    w = pt_put(out, cap, w, "T\tdupe-group: ");
+    w = put_count(out, cap, w, cnt[0]);
+    w = pt_put(out, cap, w, " new, ");
+    w = put_count(out, cap, w, cnt[1]);
+    w = pt_put(out, cap, w, " grew, ");
+    w = put_count(out, cap, w, cnt[2]);
+    w = pt_put(out, cap, w, " inherited, ");
+    w = put_count(out, cap, w, cnt[3]);
+    w = pt_put(out, cap, w, " shrunk, ");
+    w = put_count(out, cap, w, cnt[4]);
+    w = pt_put(out, cap, w, " unreadable of ");
+    w = put_count(out, cap, w, groups);
+    w = pt_put(out, cap, w, " groups\n");
+    if (cnt[3] > 0 and cnt[0] == 0 and cnt[1] == 0) {
+        w = pt_put(out, cap, w, "H\tdupe-bless\tclass ");
+        w = pt_class(out, cap, w, class_of(PT_KIND_BLESS));
+        w = pt_put(out, cap, w, ", a shrink may be blessed, a new or grown group never\n");
+    }
+    var lab : u8 = LABEL_DERIVED;
+    if (groups == 0 or cnt[4] > 0) { lab = LABEL_UNKNOWN; }
+    return pt_end(out, cap, w, 4, lab);
+}
+
+/// Tool 6. X lines for the conflicted files of a trial merge, a T line with the file, spec and seal
+/// counts. exact when the trial merge was read (a lone "-" line is a clean one); unknown on an
+/// empty input.
+pub fn claw_pr_conflicts(raw : []const u8, n : usize, out : []u8, cap : usize) -> usize {
+    var w : usize = 0;
+    var files : u32 = 0;
+    var specs : u32 = 0;
+    var seals : u32 = 0;
+    var clean : bool = false;
+    var ls : usize = 0;
+    while (ls < n) {
+        const le : usize = qc_line_end(raw, n, ls);
+        if (le > ls) {
+            if (le - ls == 1 and raw[ls] == '-') {
+                clean = true;
+            } else {
+                files += 1;
+                if (pt_is_spec(raw, ls, le)) { specs += 1; }
+                if (pt_is_seal(raw, ls, le)) { seals += 1; }
+                w = pt_put(out, cap, w, "X\t");
+                w = qc_put_range(out, cap, w, raw, ls, le);
+                w = pt_put(out, cap, w, "\n");
+            }
+        }
+        ls = le + 1;
+    }
+    if (files == 0 and clean == false) {
+        w = pt_put(out, cap, w, "T\tconflicts: unknown, no trial merge was read\n");
+        return pt_end(out, cap, w, 5, LABEL_UNKNOWN);
+    }
+    w = pt_put(out, cap, w, "T\tconflicts: ");
+    w = put_count(out, cap, w, files);
+    w = pt_put(out, cap, w, " files, ");
+    w = put_count(out, cap, w, specs);
+    w = pt_put(out, cap, w, " specs, ");
+    w = put_count(out, cap, w, seals);
+    w = pt_put(out, cap, w, " seals\n");
+    return pt_end(out, cap, w, 5, LABEL_EXACT);
+}
+
+/// The tool list the MCP surface serves: "N TAB name TAB surface TAB label" per row of the table,
+/// then the count. Everything comes from the PT_ tables.
+pub fn claw_pr_tools_list(out : []u8, cap : usize) -> usize {
+    var w : usize = 0;
+    var i : usize = 0;
+    while (i < PT_COUNT) {
+        w = pt_put(out, cap, w, "N\t");
+        w = put_str(out, cap, w, PT_NAMES[i], PT_NAME_LENS[i]);
+        w = pt_put(out, cap, w, "\t");
+        w = pt_put(out, cap, w, PT_SURFACES[i]);
+        w = pt_put(out, cap, w, "\t");
+        w = put_str(out, cap, w, LABEL_NAMES[PT_LABELS[i] as usize], LABEL_NAME_LENS[PT_LABELS[i] as usize]);
+        w = pt_put(out, cap, w, "\n");
+        i += 1;
+    }
+    w = pt_put(out, cap, w, "T\ttools: ");
+    w = put_count(out, cap, w, PT_COUNT as u32);
+    return pt_put(out, cap, w, "\n");
+}
+
+/// The five rows of required_red's own fixture: check-linked-issue failed once and has a newer
+/// queued run, the other three required jobs passed.
+fn pt_rows5(dst : []u8, cap : usize) -> usize {
+    var w : usize = pt_put(dst, cap, 0, "Issue Gate/check-linked-issue\t39151562346\tCOMPLETED\tFAILURE\n");
+    w = pt_put(dst, cap, w, "Issue Gate/check-linked-issue\t39157315158\tQUEUED\t-\n");
+    w = pt_put(dst, cap, w, "CI/validate\t11\tCOMPLETED\tSUCCESS\n");
+    w = pt_put(dst, cap, w, "Parse/parse-ratchet\t12\tCOMPLETED\tSUCCESS\n");
+    return pt_put(dst, cap, w, "Own/own-language\t13\tCOMPLETED\tSUCCESS\n");
+}
+
+test pt_table_lengths_names_and_uniqueness {
+    assert PT_NAMES.len == PT_COUNT;
+    assert PT_NAME_LENS.len == PT_COUNT;
+    var i : usize = 0;
+    while (i < PT_COUNT) {
+        assert PT_NAMES[i].len == PT_NAME_LENS[i];
+        assert has_prefix(PT_NAMES[i], PT_NAME_LENS[i], "claw_pr_", 8);
+        var j : usize = i + 1;
+        while (j < PT_COUNT) {
+            assert str_eq(PT_NAMES[i], PT_NAME_LENS[i], PT_NAMES[j], PT_NAME_LENS[j]) == false;
+            j += 1;
+        }
+        i += 1;
+    }
+    assert PT_MASTER[0].len == PT_MASTER_LENS[0];
+    assert PT_MASTER[2].len == PT_MASTER_LENS[2];
+    assert PT_LANE[1].len == PT_LANE_LENS[1];
+    assert PT_CLASS[1].len == PT_CLASS_LENS[1];
+    assert PT_DUPE[2].len == PT_DUPE_LENS[2];
+    assert PT_DUPE[4].len == PT_DUPE_LENS[4];
+}
+
+test pt_registry_mounts_all_six_and_refuses_the_wrong_names {
+    var i : usize = 0;
+    while (i < PT_COUNT) {
+        assert name_ok(PT_NAMES[i]);
+        assert home_of(PT_NAMES[i]) == H_TRI_CLAW;
+        assert admit(PT_NAMES[i], H_TRI_CLAW) == A_MOUNT;
+        i += 1;
+    }
+    assert admit("t27_check", H_TRI_CLAW) == A_REFUSE_COLLISION;
+    assert admit("t27f_view", H_TRI_CLAW) == A_REFUSE_COLLISION;
+    assert admit("claw pr status", H_TRI_CLAW) == A_REFUSE_NAME;
+}
+
+test pt_surfaces_are_read_and_labels_are_in_the_vocabulary {
+    var i : usize = 0;
+    while (i < PT_COUNT) {
+        assert level_of(PT_SURFACES[i], false) == L_READ;
+        assert label_valid(PT_LABELS[i]);
+        i += 1;
+    }
+    assert level_of("merge-queue", false) == L_NONE;
+    assert level_of("merge-pr", true) == L_WRITE;
+    assert PT_LABELS[0] == LABEL_EXACT;
+    assert PT_LABELS[1] == LABEL_DERIVED;
+    assert PT_LABELS[3] == LABEL_SUGGESTED;
+    assert label_valid(9) == false;
+    assert label_valid(LABEL_UNKNOWN);
+}
+
+test pt_tools_list_names_every_tool_once {
+    var out : [1024]u8 = undefined;
+    const m : usize = claw_pr_tools_list(&out, 1024);
+    var i : usize = 0;
+    while (i < PT_COUNT) {
+        assert buf_has(&out, m, PT_NAMES[i], PT_NAME_LENS[i]);
+        i += 1;
+    }
+    assert pt_has(&out, m, "T\ttools: 6\n");
+    assert pt_has(&out, m, "N\tclaw_pr_reseal_plan\tspec-read\tsuggested\n");
+    assert pt_has(&out, m, "N\tclaw_pr_status\tpr-files\texact\n");
+}
+
+test pt_status_pending_required_job_is_pending_not_red {
+    var raw : [512]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    const n : usize = pt_rows5(&raw, 512);
+    assert n > 0;
+    const m : usize = claw_pr_status(&raw, n, &out, 1024);
+    assert pt_has(&out, m, "L\tlatest: ");
+    assert pt_has(&out, m, "C\tchecks: ");
+    assert pt_has(&out, m, "V\tpending\n");
+    assert pt_has(&out, m, "R\trequired: 3 pass, 0 failing, 1 pending, 0 missing, 0 unreadable rows\n");
+    assert pt_has(&out, m, "F\treq_red\tfalse\n");
+    assert pt_has(&out, m, "E\tclaw_pr_status\texact\n");
+}
+
+test pt_status_a_failing_required_job_is_red {
+    var out : [1024]u8 = undefined;
+    var raw : [128]u8 = undefined;
+    const n : usize = pt_put(&raw, 128, 0, "Issue Gate/check-linked-issue\t7\tCOMPLETED\tFAILURE\n");
+    const m : usize = claw_pr_status(&raw, n, &out, 1024);
+    assert pt_has(&out, m, "F\treq_red\ttrue\n");
+    assert pt_has(&out, m, "F\treq_red\tfalse\n") == false;
+    assert pt_has(&out, m, "E\tclaw_pr_status\texact\n");
+}
+
+test pt_status_an_empty_input_stays_unknown {
+    var raw : [16]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    const m : usize = claw_pr_status(&raw, 0, &out, 1024);
+    assert pt_has(&out, m, "E\tclaw_pr_status\tunknown\n");
+    assert pt_has(&out, m, "E\tclaw_pr_status\texact\n") == false;
+}
+
+test pt_red_origin_own_on_a_green_master {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var n : usize = t_red_pr(&raw, 4096, 0, 4);
+    n = t_row(&raw, 4096, n, 'B', 4, 250, 0);
+    const m : usize = claw_pr_red_origin(&raw, n, 5, &out, 4096);
+    assert buf_has(&out, m, T_NAMES[4], T_NLENS[4]);
+    assert pt_has(&out, m, "\tgreen\t250\n");
+    assert pt_has(&out, m, "O\town\t");
+    assert buf_has(&out, m, WHY_TEXTS[R_OWN_MERGE], WHY_LENS[R_OWN_MERGE]);
+    assert pt_has(&out, m, "T\tred-origin: 1 own, 0 inherited, 0 unknown of 1 red\n");
+    assert pt_has(&out, m, "E\tclaw_pr_red_origin\tderived\n");
+}
+
+test pt_red_origin_no_master_run_is_unseen_and_unknown {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    const n : usize = t_red_pr(&raw, 4096, 0, 4);
+    const m : usize = claw_pr_red_origin(&raw, n, 5, &out, 4096);
+    assert pt_has(&out, m, "\tunseen\t-\n");
+    assert pt_has(&out, m, "O\tunknown\t");
+    assert buf_has(&out, m, WHY_TEXTS[R_UNSEEN], WHY_LENS[R_UNSEEN]);
+    assert pt_has(&out, m, "T\tred-origin: 0 own, 0 inherited, 1 unknown of 1 red\n");
+    assert pt_has(&out, m, "E\tclaw_pr_red_origin\tunknown\n");
+}
+
+test pt_red_origin_red_master_without_file_lists_asks_for_the_log {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var n : usize = t_red_pr(&raw, 4096, 0, 4);
+    n = t_row(&raw, 4096, n, 'B', 4, 250, 1);
+    const m : usize = claw_pr_red_origin(&raw, n, 5, &out, 4096);
+    assert pt_has(&out, m, "\tred\t250\n");
+    assert pt_has(&out, m, "O\tunknown\t");
+    assert pt_has(&out, m, PT_LOG_WHY);
+    assert pt_has(&out, m, "E\tclaw_pr_red_origin\tunknown\n");
+}
+
+test pt_red_origin_inherited_when_master_names_a_path_outside_the_pr {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var n : usize = t_red_pr(&raw, 4096, 0, 4);
+    n = t_row(&raw, 4096, n, 'B', 4, 250, 1);
+    n = t_file(&raw, 4096, n, 5, 0);
+    n = t_file(&raw, 4096, n, 5, 1);
+    n = t_named(&raw, 4096, n, 5, 4, 3);
+    const m : usize = claw_pr_red_origin(&raw, n, 5, &out, 4096);
+    assert pt_has(&out, m, "\tred\t250\n");
+    assert pt_has(&out, m, "O\tinherited\t");
+    assert pt_has(&out, m, "T\tred-origin: 0 own, 1 inherited, 0 unknown of 1 red\n");
+    assert pt_has(&out, m, "E\tclaw_pr_red_origin\tderived\n");
+}
+
+test pt_red_origin_a_newer_passing_run_leaves_no_live_red {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var n : usize = t_red_pr(&raw, 4096, 0, 4);
+    n = t_row(&raw, 4096, n, 'K', 4, 301, 0);
+    const m : usize = claw_pr_red_origin(&raw, n, 5, &out, 4096);
+    assert pt_has(&out, m, "T\tred-origin: 0 own, 0 inherited, 0 unknown of 0 red\n");
+    assert pt_has(&out, m, "Q\t") == false;
+}
+
+test pt_red_origin_a_missing_block_or_number_stays_unknown {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    const n : usize = t_red_pr(&raw, 4096, 0, 4);
+    var m : usize = claw_pr_red_origin(&raw, n, 6, &out, 4096);
+    assert pt_has(&out, m, "no block for this pull request");
+    assert pt_has(&out, m, "E\tclaw_pr_red_origin\tunknown\n");
+    m = claw_pr_red_origin(&raw, n, 0, &out, 4096);
+    assert pt_has(&out, m, "E\tclaw_pr_red_origin\tunknown\n");
+    m = claw_pr_red_origin(&raw, 0, 5, &out, 4096);
+    assert pt_has(&out, m, "E\tclaw_pr_red_origin\tunknown\n");
+}
+
+test pt_merge_plan_a_green_pr_merges {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var lane : [16]u8 = undefined;
+    const n : usize = t_green(&raw, 4096, 0, 7);
+    assert t_one(&raw, n) == J_MERGE;
+    const m : usize = claw_pr_merge_plan(&raw, n, &lane, 0, &out, 4096);
+    assert t_g(&out, m, 7);
+    assert t_lines(&out, m, 'G') == 1;
+    assert t_summary(&out, m, 1, 0, 0, 0, 0, 0, 1);
+    assert pt_has(&out, m, "A\tlane\t");
+    assert pt_has(&out, m, "A\tlane\tflowing\n") == false;
+    assert pt_has(&out, m, "E\tclaw_pr_merge_plan\tderived\n");
+}
+
+test pt_merge_plan_a_held_label_is_held_not_merged {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var lane : [16]u8 = undefined;
+    const n : usize = t_v(&raw, 4096, false, 1, 0, 0, 0, 0, 1, 3600);
+    assert t_one(&raw, n) == J_HELD;
+    const m : usize = claw_pr_merge_plan(&raw, n, &lane, 0, &out, 4096);
+    assert t_has(&out, m, 'H', 5, J_HELD);
+    assert t_lines(&out, m, 'G') == 0;
+}
+
+test pt_merge_plan_an_own_red_names_the_check_and_the_reason {
+    var raw : [4096]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var lane : [16]u8 = undefined;
+    var n : usize = t_red_pr(&raw, 4096, 0, 4);
+    n = t_row(&raw, 4096, n, 'B', 4, 250, 0);
+    assert t_one(&raw, n) == J_RED;
+    const m : usize = claw_pr_merge_plan(&raw, n, &lane, 0, &out, 4096);
+    assert t_has_red(&out, m, 5, 4, R_OWN_MERGE);
+    assert t_lines(&out, m, 'G') == 0;
+    assert t_summary(&out, m, 0, 0, 0, 1, 0, 0, 1);
+}
+
+test pt_reseal_plan_lists_the_specs_and_the_lab_recipe {
+    var out : [2048]u8 = undefined;
+    var raw : [128]u8 = undefined;
+    const n : usize = pt_put(&raw, 128, 0, "specs/claw/pr_tools.t27\nspecs/queen/priority.t27\n");
+    const m : usize = claw_pr_reseal_plan(&raw, n, &out, 2048);
+    assert class_of(PT_KIND_SEAL) == C_AUTO;
+    assert pt_has(&out, m, "Z\tspecs/claw/pr_tools.t27\n");
+    assert pt_has(&out, m, "Z\tspecs/queen/priority.t27\n");
+    assert pt_has(&out, m, "T\treseal-plan: 2 specs, 0 refused, class auto, tool ");
+    assert pt_has(&out, m, tool_of(PT_KIND_SEAL));
+    assert pt_has(&out, m, cmd_of(PT_KIND_SEAL));
+    assert pt_has(&out, m, "P\twhere\tlab: a master-built t27c, never a build on the Mac\n");
+    assert pt_has(&out, m, "E\tclaw_pr_reseal_plan\tsuggested\n");
+}
+
+test pt_reseal_plan_refuses_lines_that_are_not_spec_paths {
+    var out : [2048]u8 = undefined;
+    var raw : [128]u8 = undefined;
+    const n : usize = pt_put(&raw, 128, 0, "tools/dupe_scan.py\nspecs/claw/x.json\nspecs/.t27\n");
+    const m : usize = claw_pr_reseal_plan(&raw, n, &out, 2048);
+    assert pt_has(&out, m, "T\treseal-plan: 0 specs, 3 refused, class ");
+    assert pt_has(&out, m, "Z\t") == false;
+    assert pt_has(&out, m, "E\tclaw_pr_reseal_plan\tunknown\n");
+}
+
+test pt_dupe_group_new_grew_inherited_with_the_spec_paths {
+    var out : [2048]u8 = undefined;
+    var raw : [256]u8 = undefined;
+    var n : usize = pt_put(&raw, 256, 0, "D\tput_lit\t3\t2\nS\tput_lit\tspecs/a/x.t27\n");
+    n = pt_put(&raw, 256, n, "D\tsame\t2\t2\nD\tfresh\t2\t0\nS\tfresh\tspecs/b/y.t27\n");
+    const m : usize = claw_pr_dupe_group(&raw, n, &out, 2048);
+    assert pt_has(&out, m, "V\tput_lit\tgrew\n");
+    assert pt_has(&out, m, "V\tsame\tinherited\n");
+    assert pt_has(&out, m, "V\tfresh\tnew\n");
+    assert pt_has(&out, m, "S\tput_lit\tspecs/a/x.t27\n");
+    assert pt_has(&out, m, "S\tfresh\tspecs/b/y.t27\n");
+    assert pt_has(&out, m, "T\tdupe-group: 1 new, 1 grew, 1 inherited, 0 shrunk, 0 unreadable of 3 groups\n");
+    assert pt_has(&out, m, "H\tdupe-bless") == false;
+    assert pt_has(&out, m, "E\tclaw_pr_dupe_group\tderived\n");
+}
+
+test pt_dupe_group_a_pure_shrink_points_at_the_bless_recipe {
+    var out : [2048]u8 = undefined;
+    var raw : [64]u8 = undefined;
+    const n : usize = pt_put(&raw, 64, 0, "D\tgone\t1\t2\n");
+    const m : usize = claw_pr_dupe_group(&raw, n, &out, 2048);
+    assert pt_has(&out, m, "V\tgone\tshrunk\n");
+    assert pt_has(&out, m, "H\tdupe-bless\tclass ");
+    assert pt_has(&out, m, "E\tclaw_pr_dupe_group\tderived\n");
+}
+
+test pt_dupe_group_a_bad_count_or_no_group_stays_unknown {
+    var out : [2048]u8 = undefined;
+    var raw : [64]u8 = undefined;
+    const n : usize = pt_put(&raw, 64, 0, "D\tg\tx\t2\n");
+    var m : usize = claw_pr_dupe_group(&raw, n, &out, 2048);
+    assert pt_has(&out, m, "V\tg\tunknown\n");
+    assert pt_has(&out, m, "E\tclaw_pr_dupe_group\tunknown\n");
+    var none : [8]u8 = undefined;
+    m = claw_pr_dupe_group(&none, 0, &out, 2048);
+    assert pt_has(&out, m, "E\tclaw_pr_dupe_group\tunknown\n");
+}
+
+test pt_conflicts_lists_files_and_counts_specs_and_seals {
+    var out : [2048]u8 = undefined;
+    var raw : [128]u8 = undefined;
+    const n : usize = pt_put(&raw, 128, 0, "specs/claw/a.t27\n.trinity/seals/claw_A.json\ntools/x.txt\n");
+    const m : usize = claw_pr_conflicts(&raw, n, &out, 2048);
+    assert pt_has(&out, m, "X\tspecs/claw/a.t27\n");
+    assert pt_has(&out, m, "X\t.trinity/seals/claw_A.json\n");
+    assert pt_has(&out, m, "X\ttools/x.txt\n");
+    assert pt_has(&out, m, "T\tconflicts: 3 files, 1 specs, 1 seals\n");
+    assert pt_has(&out, m, "E\tclaw_pr_conflicts\texact\n");
+}
+
+test pt_conflicts_a_clean_trial_merge_is_exact_and_an_unread_one_is_unknown {
+    var out : [2048]u8 = undefined;
+    var raw : [8]u8 = undefined;
+    const n : usize = pt_put(&raw, 8, 0, "-\n");
+    var m : usize = claw_pr_conflicts(&raw, n, &out, 2048);
+    assert pt_has(&out, m, "T\tconflicts: 0 files, 0 specs, 0 seals\n");
+    assert pt_has(&out, m, "E\tclaw_pr_conflicts\texact\n");
+    var none : [8]u8 = undefined;
+    m = claw_pr_conflicts(&none, 0, &out, 2048);
+    assert pt_has(&out, m, "T\tconflicts: unknown, no trial merge was read\n");
+    assert pt_has(&out, m, "E\tclaw_pr_conflicts\tunknown\n");
+    assert pt_has(&out, m, "E\tclaw_pr_conflicts\texact\n") == false;
+}
+
+test pt_conflicts_a_file_beats_the_clean_marker {
+    var out : [2048]u8 = undefined;
+    var raw : [32]u8 = undefined;
+    const n : usize = pt_put(&raw, 32, 0, "-\nspecs/a/b.t27\n");
+    const m : usize = claw_pr_conflicts(&raw, n, &out, 2048);
+    assert pt_has(&out, m, "T\tconflicts: 1 files, 1 specs, 0 seals\n");
+}

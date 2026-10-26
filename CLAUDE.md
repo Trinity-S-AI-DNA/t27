@@ -153,6 +153,12 @@ as a pane is the `t27os-orchestra` skill.
 `.claude/settings.json` sets `CLAUDE_CODE_SUBAGENT_MODEL` and each agent in `.claude/agents/` names its
 model.
 
+Every agent follows the cost prompt in the `work-cheap` skill, and every brief you hand to a pane, a subagent
+or a side session starts with it (owner, 2026-10-25). A task as a lane is the `worktree-lane` skill; a secret
+found on disk or in tool output is the `secret-hygiene` skill (names only, never a value). Which model and API
+accesses a pane can reach, which are known but not wired (NVIDIA NIM, DeepSeek, Moonshot, MiniMax) and how each
+one fails is the `access-map` skill; read it before you name a provider as available (owner, 2026-10-25).
+
 ---
 
 ## FPGA hardware & flashing (SSOT)
