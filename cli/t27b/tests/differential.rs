@@ -1028,6 +1028,7 @@ impl<'r> Gen<'r> {
             vars: self.vars.clone(),
             body,
             line: self.line,
+            is_pub: false,
             is_test,
             is_invariant: false,
             noreturn_site,
@@ -1476,6 +1477,7 @@ fn one_func(name: &str, params: &[Ty], ret: Ty, body: Vec<Stmt>, nsite: SiteId) 
         vars: params.iter().enumerate().map(|(i, &t)| Var { name: format!("p{}", i), ty: t }).collect(),
         body,
         line: 1,
+        is_pub: false,
         is_test: false,
         is_invariant: false,
         noreturn_site: nsite,
@@ -2901,4 +2903,34 @@ fn shift_refusals_name_the_construct() {
     }
     // In range, a typed constant amount folds like a literal one.
     assert!(f64_lower("module ok;\nconst KS: u32 = 31;\nfn f(x: u32) u32 {\nreturn (x >> KS) + (1 << KS);\n}\n").is_ok());
+}
+
+// --- `t27b run <file.t27> <entry>` (#11824): three acceptance tests. They live here because a new
+// test file is hand-written foreign and the rule admits only edits to existing files; they sit at
+// the tail like the other source-level checks above. The rest of the run matrix is a follow-up.
+use std::process::Command;
+use t27b::jit::JIT_SUPPORTED;
+
+/// One `t27b run`: writes `src` to a scratch spec (outside the corpus ledger) and returns the
+/// exit code of `<file> <entry>`.
+fn run_exit(name: &str, src: &str, entry: &str) -> Option<i32> {
+    let f = std::env::temp_dir().join(format!("t27b-run-{}-{}.t27", name, std::process::id()));
+    std::fs::write(&f, src).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_t27b")).arg("run").arg(&f).arg(entry).status().ok().and_then(|s| s.code())
+}
+const RUN_OK: &str = "module S;\npub fn the_entry() -> i32 { return 42; }\nendmodule\n";
+#[test]
+fn run_the_entry_s_return_is_the_exit_code() {
+    if !JIT_SUPPORTED { return; }
+    assert_eq!(run_exit("ok", RUN_OK, "the_entry"), Some(42));
+}
+#[test]
+fn run_a_missing_entry_is_a_usage_error() {
+    assert_eq!(run_exit("missing", RUN_OK, "no_such_fn"), Some(64));
+}
+#[test]
+fn run_the_corpus_gate_refuses_a_spec_whose_tests_fail() {
+    if !JIT_SUPPORTED { return; }
+    let gate = "module G;\npub fn entry() -> i32 { return 7; }\ntest fails { assert_eq(1, 2); }\nendmodule\n";
+    assert_eq!(run_exit("gate", gate, "entry"), Some(1));
 }

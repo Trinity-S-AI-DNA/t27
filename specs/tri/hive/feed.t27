@@ -1,0 +1,347 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/hive/feed.t27 -- the LAW of reading the T27 OS hive feed: which lane every record class feeds on a board view
+; Owner, 2026-10-24 (night loop): `tri trigit status` prints one line of the feed; a board view needs the whole read. This
+; file adds NO fact of its own about the feed: the FORMAT (one record per line, fields split by |, the payload rule, the
+; staleness rule) is t27os::devices, whose readers are imported here and never copied, and the page-level acceptance rail
+; is t27os::hive_feed_acceptance. Ruled HERE and nowhere else:
+; - THE LANES. Every record class lands on exactly one lane of a board view: the beat (S, the feed job's own run marker),
+;   the hosts (Z this machine, A a heartbeat from refs/swarm/alive), the pushes (B, a lane branch on origin), the release
+;   pointer (P, a t27os tag -- not a push: the tag lives on the own repo, the branch on origin), the trigit facts (G), the
+;   merges (M, master commits in the last 24 h), the claims (C). Both lists are closed; any other byte lands nowhere.
+; - THE MISSING RULE (owner). A record class the feed does not carry shows "not measured" (devices DV_NM), never a 0 that
+;   looks like a reading -- with the one exception devices already decided for its flow strip: once the beat proves the
+;   job ran, an empty COUNT class (claims C, pushed branches B) is a true zero, the job counted and found none. The tests
+;   pin this file to devices.dv_stage_value on the same feeds, so the two can never drift.
+; - THE FRESHNESS LANES. Only the beat and the host lanes carry an epoch: field 1 of an S or Z record, but field 2 of
+;   an A record, whose field 1 is the host NAME (devices' dv_hosts reads exactly these two fields). A heartbeat is fresh
+;   under devices.DV_STALE_S, stale at or beyond it, unknown when there is no heartbeat. devices.dv_state decides; this
+;   file only locates the epoch in the record and asks it.
+; - DRY (checked with `t27c dupes --name` before writing): no host exists for record_lane, board_row_lane, epoch_field,
+;   heartbeat_lane or missing_means. The kind bytes are NAMED here because devices' own parsers use them bare (83, 90,
+;   65, 66, 80, 71, 77, 67); naming them is this file's one addition, not a second definition.
+; - HONEST LIMITS. (1) This file reads and never writes: the feed job (devices DV_FEED_A..D) owns every byte written to
+;   feed.txt. (2) Rendering is the page's: the words ("n/m", ONLINE / OFFLINE / NO HEARTBEAT) and the lamps are devices'
+;   (dv_putm, DS_WORDS, dv_stage_lit); this file fixes only the VALUE an absent class shows. (3) LANE_RELEASE and
+;   LANE_MERGE exist so that every kind has one lane; the flow strip draws five stages (FS_*) and neither of these two,
+;   and a board that shows them breaks nothing here. (4) A lane is decided by the kind byte alone; whether a payload is
+;   to be trusted is devices' business (dv_payload_ok and dv_hosts refuse a bad one), and this file does not judge it.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriHiveFeed;
+
+use t27os::devices::dv_state;
+use t27os::devices::dv_nth;
+use t27os::devices::dv_count;
+use t27os::devices::dv_num;
+use t27os::devices::dv_line_end;
+use t27os::devices::dv_fstart;
+use t27os::devices::dv_fend;
+use t27os::devices::dv_stage_value;
+use t27os::devices::DV_NM;
+use t27os::devices::DV_NONE;
+use t27os::devices::DV_STALE_S;
+use t27os::devices::DS_UNKNOWN;
+use t27os::devices::DS_ONLINE;
+use t27os::devices::DS_OFFLINE;
+use t27os::devices::FS_CLAIMED;
+use t27os::devices::FS_MERGED;
+
+; --- 1. The record kinds and their one lane ---------------------------------------------------------------
+
+/// The kind byte that opens each record: the letter the feed job writes before the first |.
+pub const RK_S : u8 = 83;
+pub const RK_Z : u8 = 90;
+pub const RK_A : u8 = 65;
+pub const RK_B : u8 = 66;
+pub const RK_P : u8 = 80;
+pub const RK_G : u8 = 71;
+pub const RK_M : u8 = 77;
+pub const RK_C : u8 = 67;
+
+/// The board lanes, a closed list: 0 is unknown, 1..7 the seven lanes, LANE_KINDS the count.
+pub const LANE_UNKNOWN : u8 = 0;
+pub const LANE_BEAT : u8 = 1;
+pub const LANE_HOST : u8 = 2;
+pub const LANE_PUSH : u8 = 3;
+pub const LANE_RELEASE : u8 = 4;
+pub const LANE_TRIGIT : u8 = 5;
+pub const LANE_MERGE : u8 = 6;
+pub const LANE_CLAIM : u8 = 7;
+pub const LANE_KINDS : u8 = 8;
+pub const LANE_NAMES : [8]str = ["unknown", "beat", "host", "push", "release", "trigit", "merge", "claim"];
+
+/// The one lane a record class feeds: the closed mapping from the kind byte to the board; any other byte is
+/// unknown and lands nowhere.
+pub fn record_lane(kind: u8) -> u8 {
+    if (kind == RK_S) { return LANE_BEAT; }
+    if (kind == RK_Z or kind == RK_A) { return LANE_HOST; }
+    if (kind == RK_B) { return LANE_PUSH; }
+    if (kind == RK_P) { return LANE_RELEASE; }
+    if (kind == RK_G) { return LANE_TRIGIT; }
+    if (kind == RK_M) { return LANE_MERGE; }
+    if (kind == RK_C) { return LANE_CLAIM; }
+    return LANE_UNKNOWN;
+}
+
+/// The word a board row carries for a lane; any other code says unknown's word.
+pub fn lane_name(lane: u8) -> str {
+    if (lane >= LANE_KINDS) { return LANE_NAMES[0]; }
+    return LANE_NAMES[lane];
+}
+
+; --- 2. A line of the feed lands on its lane ---------------------------------------------------------------
+
+/// The lane the line starting at `at` feeds. A record is a kind byte followed by | -- the same well-formedness
+/// devices' dv_nth and dv_count read -- so an empty line, a junk line or the end of the feed lands nowhere.
+pub fn board_row_lane(f: []const u8, at: usize) -> u8 {
+    if (at >= f.len) { return LANE_UNKNOWN; }
+    const le : usize = dv_line_end(f, at);
+    if (le <= at + 1 or f[at + 1] != 124) { return LANE_UNKNOWN; }
+    return record_lane(f[at]);
+}
+
+; --- 3. The freshness lanes of a heartbeat ------------------------------------------------------------------
+
+/// True for the only lanes whose records carry an epoch: the beat and the hosts. A push or a claim carries an
+/// issue number in that place and a G line a key -- a number there is never a clock.
+pub fn carries_epoch(lane: u8) -> bool {
+    return lane == LANE_BEAT or lane == LANE_HOST;
+}
+
+/// The field a record's epoch lives in: S|<epoch> and Z|<epoch>|... carry the clock in field 1; an A record is
+/// A|<name>|<epoch>|..., so its clock is field 2. Meaningful only for the lanes that carry an epoch.
+pub fn epoch_field(kind: u8) -> u32 {
+    if (kind == RK_A) { return 2; }
+    return 1;
+}
+
+/// The freshness lane of the record at `at`, read at `now`: devices' staleness rule over the record's own epoch,
+/// at the field epoch_field names. No record, a lane that carries no epoch, or an unreadable epoch: unknown --
+/// a heartbeat never seen.
+pub fn heartbeat_lane(f: []const u8, at: usize, now: u64) -> u32 {
+    if (at >= f.len) { return DS_UNKNOWN; }
+    const le : usize = dv_line_end(f, at);
+    if (le <= at + 1 or f[at + 1] != 124) { return DS_UNKNOWN; }
+    const kind : u8 = f[at];
+    if (carries_epoch(record_lane(kind)) == false) { return DS_UNKNOWN; }
+    const es : usize = dv_fstart(f, at, le, epoch_field(kind));
+    const seen : u32 = dv_num(f, es, dv_fend(f, es, le));
+    if (seen == DV_NM) { return DS_UNKNOWN; }
+    return dv_state(now, @as(u64, seen));
+}
+
+; --- 4. What a missing record class means -------------------------------------------------------------------
+
+/// What a record class the feed does not carry shows on the board; the caller holds the absence
+/// (dv_count(f, kind) == 0). With no beat the job never ran, so nothing is a reading, not even a count:
+/// not measured. With the beat present, a missing COUNT class (claims C, pushed branches B) is a true zero
+/// -- the job counted and found none -- and a missing fact class is still not measured. Never a fake 0.
+pub fn missing_means(f: []const u8, kind: u8) -> u32 {
+    if (dv_nth(f, RK_S, 0) == DV_NONE) { return DV_NM; }
+    if (kind == RK_C or kind == RK_B) { return 0; }
+    return DV_NM;
+}
+
+; --- The synthetic feed --------------------------------------------------------------------------------------
+
+// Every class in the order the feed job writes them: the beat, this machine, two host heartbeats (one fresh at
+// the read time below, one exactly at the stale boundary), two pushes (one naming a host, one nobody's), the
+// release pair, three trigit facts, the merge count, two claims. One string literal, walked line by line below.
+const FEED : string = "S|1792770000\nZ|1792770000|hb1 host=mac-a build=4421 ver=0.1.0 tc=0.5.2 cpu=37 ram=61 disk=30 lanes=-\nA|mac-b|1792768800|hb1 host=mac-b build=4457 ver=0.1.1 tc=0.5.2 cpu=5 ram=40 disk=12 lanes=11367:4:1:3600\nA|mac-c|1792768200|hb1 host=mac-c build=4300 ver=0.1.0 tc=0.5.1 cpu=- ram=- disk=- lanes=-\nB|11367|mac-b\nB|9010|-\nP|t27os-latest|0f6d83e9\nP|t27os-v0.1.1-b4457|0f6d83e9\nG|unpushed|3\nG|since|45\nG|queue|6\nM|52\nC|11421\nC|11678\n";
+
+// The job never ran: facts on the lines, but no beat, so nothing on the board is a reading.
+const F_NO_S : string = "G|queue|6\nB|11367|mac-b\nC|11421\n";
+
+; --- Tests ---------------------------------------------------------------------------------------------------
+
+test the_kind_bytes_are_the_letters_the_feed_job_writes {
+    // each record opens with its letter: read the opening byte of the first line of every class back out of the feed
+    const f : []const u8 = FEED;
+    assert f[dv_nth(f, RK_S, 0)] == RK_S;
+    assert f[dv_nth(f, RK_Z, 0)] == RK_Z;
+    assert f[dv_nth(f, RK_A, 0)] == RK_A;
+    assert f[dv_nth(f, RK_B, 0)] == RK_B;
+    assert f[dv_nth(f, RK_P, 0)] == RK_P;
+    assert f[dv_nth(f, RK_G, 0)] == RK_G;
+    assert f[dv_nth(f, RK_M, 0)] == RK_M;
+    assert f[dv_nth(f, RK_C, 0)] == RK_C;
+    // the same bytes devices' own parsers use bare
+    assert RK_S == 'S' and RK_Z == 'Z' and RK_A == 'A' and RK_B == 'B';
+    assert RK_P == 'P' and RK_G == 'G' and RK_M == 'M' and RK_C == 'C';
+    assert RK_S == 83 and RK_Z == 90 and RK_A == 65 and RK_B == 66;
+    assert RK_P == 80 and RK_G == 71 and RK_M == 77 and RK_C == 67;
+    // where the clock lives in each record: field 1, except the A record whose name comes first
+    assert epoch_field(RK_S) == 1;
+    assert epoch_field(RK_Z) == 1;
+    assert epoch_field(RK_A) == 2;
+    assert epoch_field(RK_B) == 1;
+}
+
+test every_record_class_lands_on_exactly_one_lane_and_any_other_byte_lands_nowhere {
+    assert record_lane(RK_S) == LANE_BEAT;
+    assert record_lane(RK_Z) == LANE_HOST;
+    assert record_lane(RK_A) == LANE_HOST;
+    assert record_lane(RK_B) == LANE_PUSH;
+    assert record_lane(RK_P) == LANE_RELEASE;
+    assert record_lane(RK_G) == LANE_TRIGIT;
+    assert record_lane(RK_M) == LANE_MERGE;
+    assert record_lane(RK_C) == LANE_CLAIM;
+    // the kind list is closed: junk, the field split itself, and case slips land nowhere
+    assert record_lane('X') == LANE_UNKNOWN;
+    assert record_lane('s') == LANE_UNKNOWN;
+    assert record_lane('|') == LANE_UNKNOWN;
+    assert record_lane(0) == LANE_UNKNOWN;
+    assert record_lane(255) == LANE_UNKNOWN;
+    assert LANE_KINDS == 8;
+}
+
+test every_lane_has_its_word_and_the_others_say_unknown {
+    assert lane_name(LANE_BEAT) == "beat";
+    assert lane_name(LANE_HOST) == "host";
+    assert lane_name(LANE_PUSH) == "push";
+    assert lane_name(LANE_RELEASE) == "release";
+    assert lane_name(LANE_TRIGIT) == "trigit";
+    assert lane_name(LANE_MERGE) == "merge";
+    assert lane_name(LANE_CLAIM) == "claim";
+    assert lane_name(LANE_UNKNOWN) == "unknown";
+    assert lane_name(200) == "unknown";
+}
+
+test every_line_of_the_synthetic_feed_lands_on_its_lane {
+    const f : []const u8 = FEED;
+    var at : usize = 0;
+    assert board_row_lane(f, at) == LANE_BEAT;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_HOST;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_HOST;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_HOST;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_PUSH;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_PUSH;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_RELEASE;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_RELEASE;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_TRIGIT;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_TRIGIT;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_TRIGIT;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_MERGE;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_CLAIM;
+    at = dv_line_end(f, at) + 1;
+    assert board_row_lane(f, at) == LANE_CLAIM;
+    at = dv_line_end(f, at) + 1;
+    // the walk consumed the whole feed, and past the end lands nowhere
+    assert at == f.len;
+    assert board_row_lane(f, at) == LANE_UNKNOWN;
+}
+
+test a_line_that_is_not_a_record_lands_nowhere {
+    assert board_row_lane("hello\n", 0) == LANE_UNKNOWN;
+    assert board_row_lane("S", 0) == LANE_UNKNOWN;
+    assert board_row_lane("", 0) == LANE_UNKNOWN;
+    assert board_row_lane("|", 0) == LANE_UNKNOWN;
+    assert board_row_lane("s|1000\n", 0) == LANE_UNKNOWN;
+    // an empty first line does not stop the walk
+    assert board_row_lane("\nS|1000\n", 1) == LANE_BEAT;
+}
+
+test only_a_beat_or_host_record_answers_the_freshness_question {
+    const now : u64 = 1792770000;
+    // B carries an issue number in field 1, C a claim, G a key, P a tag, M a count: no clock, so no freshness
+    assert heartbeat_lane("B|11367|mac-b\n", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("C|11421\n", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("G|queue|6\n", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("P|t27os-latest|0f6d83e9\n", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("M|52\n", 0, now) == DS_UNKNOWN;
+    assert carries_epoch(LANE_BEAT);
+    assert carries_epoch(LANE_HOST);
+    assert carries_epoch(LANE_PUSH) == false;
+    assert carries_epoch(LANE_CLAIM) == false;
+    assert carries_epoch(LANE_UNKNOWN) == false;
+    // an unreadable or absent epoch was never seen
+    assert heartbeat_lane("Z|-|hb1 host=mac-a build=1\n", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("Z|x|hb1 host=mac-a build=1\n", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("Z|\n", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("", 0, now) == DS_UNKNOWN;
+    assert heartbeat_lane("hello\n", 0, now) == DS_UNKNOWN;
+}
+
+test fresh_is_under_the_stale_seconds_and_stale_is_at_or_beyond {
+    const f : []const u8 = FEED;
+    const now : u64 = 1792770000;
+    var at : usize = 0;
+    // the beat and this machine: age 0, fresh
+    assert heartbeat_lane(f, at, now) == DS_ONLINE;
+    at = dv_line_end(f, at) + 1;
+    assert heartbeat_lane(f, at, now) == DS_ONLINE;
+    at = dv_line_end(f, at) + 1;
+    // mac-b, 1200 s old: fresh
+    assert heartbeat_lane(f, at, now) == DS_ONLINE;
+    at = dv_line_end(f, at) + 1;
+    // mac-c, epoch 1792768200: 1799 s old is fresh, 1800 s old is stale -- the boundary is devices.DV_STALE_S
+    assert heartbeat_lane(f, at, now - 1) == DS_ONLINE;
+    assert heartbeat_lane(f, at, now) == DS_OFFLINE;
+    assert DV_STALE_S == 1800;
+    // a heartbeat dated ahead of the clock (skew) is fresh, never a negative age
+    assert heartbeat_lane(f, at, now - 10000) == DS_ONLINE;
+    // half a staleness later the whole feed is stale, the job's own beat included
+    assert heartbeat_lane(f, 0, now + DV_STALE_S) == DS_OFFLINE;
+    assert heartbeat_lane(f, 0, now + DV_STALE_S - 1) == DS_ONLINE;
+}
+
+test the_synthetic_feed_carries_every_lane_and_devices_reads_it_through_the_same_bytes {
+    const f : []const u8 = FEED;
+    assert dv_count(f, RK_S) == 1;
+    assert dv_count(f, RK_Z) == 1;
+    assert dv_count(f, RK_A) == 2;
+    assert dv_count(f, RK_B) == 2;
+    assert dv_count(f, RK_P) == 2;
+    assert dv_count(f, RK_G) == 3;
+    assert dv_count(f, RK_M) == 1;
+    assert dv_count(f, RK_C) == 2;
+    // devices' flow strip reads the same bytes: the claims count and the merge count
+    assert dv_stage_value(f, FS_CLAIMED) == 2;
+    assert dv_stage_value(f, FS_MERGED) == 52;
+}
+
+test a_feed_with_no_beat_shows_not_measured_never_zero {
+    // the sibling rail (specs/t27os/hive_feed_acceptance.t27) holds the same two facts: a missing record is
+    // DV_NM, and DV_NM is not 0
+    assert DV_NM != 0;
+    assert dv_num("-\n", 0, 1) == DV_NM;
+    assert missing_means(F_NO_S, RK_S) == DV_NM;
+    assert missing_means(F_NO_S, RK_Z) == DV_NM;
+    assert missing_means(F_NO_S, RK_A) == DV_NM;
+    assert missing_means(F_NO_S, RK_B) == DV_NM;
+    assert missing_means(F_NO_S, RK_P) == DV_NM;
+    assert missing_means(F_NO_S, RK_G) == DV_NM;
+    assert missing_means(F_NO_S, RK_M) == DV_NM;
+    assert missing_means(F_NO_S, RK_C) == DV_NM;
+    assert missing_means("", RK_C) == DV_NM;
+    assert missing_means("", RK_S) == DV_NM;
+    // the same feeds through devices' own gate: no beat, no reading -- the two laws cannot drift
+    assert dv_stage_value(F_NO_S, FS_CLAIMED) == DV_NM;
+    assert dv_stage_value("", FS_MERGED) == DV_NM;
+}
+
+test with_the_beat_present_a_missing_count_is_a_measured_zero_and_a_missing_fact_is_not {
+    assert missing_means("S|1000\n", RK_C) == 0;
+    assert missing_means("S|1000\n", RK_B) == 0;
+    assert missing_means("S|1000\n", RK_G) == DV_NM;
+    assert missing_means("S|1000\n", RK_M) == DV_NM;
+    assert missing_means("S|1000\n", RK_P) == DV_NM;
+    assert missing_means("S|1000\n", RK_Z) == DV_NM;
+    assert missing_means("S|1000\n", RK_A) == DV_NM;
+    // devices decides the same on the same feed: claims a real 0, trigit and merges n/m
+    assert dv_stage_value("S|1000\n", FS_CLAIMED) == 0;
+    assert dv_stage_value("S|1000\n", FS_MERGED) == DV_NM;
+}

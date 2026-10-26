@@ -1,0 +1,1467 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/policy/dupe_bodies.t27 -- the duplicate-bodies gate: which function bodies are written twice in the
+; spec corpus, and whether the ledger of the groups already known still holds. Epic gHashTag/t27#12444, row E
+; (issue #12449). The rule and the algorithm of tools/dupe_scan.py, written in t27 so that the ratchet needs no
+; foreign line, in the style of specs/policy/own_language.t27.
+; --
+; What it does. A body is the text from the `{` of a `fn` to its matching `}`, comments and blank runs
+; normalised away (plain key), or the alpha-normal form of specs/tools/dupes_key.t27 (alpha key: renamed
+; parameters, renamed locals and a char literal spelled as its number are the same body). A body shorter
+; than MIN_BODY characters is not evidence and is not counted. Bodies with the same key form a group; a
+; group is named by the least function name in it. The ledger lists, for each such name, the sizes of its
+; groups, largest first; the gate refuses a name the ledger does not know, a group that grew, and (so the
+; ceiling follows real work) a group that shrank or went. It moves down only, exactly like the Python ratchet.
+; --
+; Lowered by `t27c gen-c` to gen/c/policy/dupe_bodies.c (never hand-edited, L2). The plumbing is a printf'd
+; C main around run_all(), as in lefthook.yml: command text, no foreign file is written or edited.
+; --
+; Commands, from the repository root (target/ is untracked). GATE is built once; FEED is the file stream.
+;   GATE: printf '#include "gen/c/policy/dupe_bodies.c"\n#include <stdio.h>\nstatic uint8_t b[1<<26],o[1<<20],s[1<<24];static uint32_t w[1<<20];\nint main(int c,char**v){unsigned r=run_all(b,fread(b,1,sizeof b,stdin),v[1][0]-48,o,sizeof o-1,s,sizeof s,w,1<<20);fputs((char*)o,stdout);return r;}\n' | cc -w -I . -x c -o target/dupe-gate -
+;   FEED: for f in $(find specs -name '*.t27'|sort); do printf '#file %s %s\n' $(wc -c <$f) $f; cat $f; done
+;   check (exit 0 holds, 1 refused, 2 could not run):  { cat tools/duplicate_bodies_alpha_baseline.txt; FEED; } | target/dupe-gate 1
+;   bless (writes the ledger, ignores one in front):   { FEED; } | target/dupe-gate 3 > tools/duplicate_bodies_alpha_baseline.txt
+; Modes 0 and 2 are the plain key and the ledger tools/duplicate_bodies_baseline.txt of tools/dupe_scan.py, byte for byte.
+; Wiring into `tri pr preflight`, `tri land` and CI is the next phase (row E phase 3): a CI workflow is a foreign file.
+; --
+; Input, one stream (stdin of the C main): the ledger text first, then the files, each as a frame
+;     #file <size> <path> LF  <exactly size bytes>
+; and the next frame follows at once. The size, not a marker, ends a file: no spec byte can fake a frame.
+; frame_put() writes one frame (the producer the tests use). Specs under a scratch directory are not fed in.
+; --
+; Modes. MODE_PLAIN and MODE_ALPHA check the ledger; MODE_BLESS_PLAIN and MODE_BLESS_ALPHA write the ledger
+; text to out (nothing else). Exit: 0 holds, 1 refused (the text names what and why), 2 could not run (a
+; malformed frame, no spec, no ledger, a table or scratch buffer too small): could-not-run is never a pass.
+; --
+; Memory. The caller owns every buffer: buf (the stream), out, sc (scratch: three views of the largest file,
+; 5 * size + 4 bytes), ws (u32 words, NPART tables of wcap / NPART entries: one entry per counted body).
+; --
+; Known differences from tools/dupe_scan.py, each pinned by a test or by the equivalence run on the corpus:
+; the two hashes (modulo two primes below 2^31) replace sha256, so two different bodies share a key with a
+; chance near 2^-60 per pair; non-ASCII text is counted as UTF-8 characters (L3 keeps specs ASCII); a ledger
+; is trusted to list its sizes largest first, as bless writes them.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module policy::dupe_bodies;
+
+use std::text::is_word;
+use std::text::is_digit;
+use policy::own_language::put;
+use policy::own_language::put_range;
+use policy::own_language::put_msg;
+use tools::dupes_key::normalise_n;
+use verified::verdict_notes::put_u32;
+
+pub const MODE_PLAIN : u8 = 0;
+pub const MODE_ALPHA : u8 = 1;
+pub const MODE_BLESS_PLAIN : u8 = 2;
+pub const MODE_BLESS_ALPHA : u8 = 3;
+
+pub const MIN_BODY : usize = 60;
+pub const NPART : usize = 9;
+
+pub const CMP_LT : u8 = 0;
+pub const CMP_EQ : u8 = 1;
+pub const CMP_GT : u8 = 2;
+
+pub const MSG_MODE : str = "could not run: the mode is not 0, 1, 2 or 3$";
+pub const MSG_FRAME : str = "could not run: the stream holds a malformed frame (#file <size> <path>, then size bytes)$";
+pub const MSG_NOSPEC : str = "could not run: the stream holds no spec outside a scratch directory$";
+pub const MSG_SCRATCH : str = "could not run: the scratch buffer is smaller than 5 times the largest spec plus 4$";
+pub const MSG_TABLE : str = "could not run: more counted bodies than the tables hold$";
+pub const MSG_NOLEDGER : str = "could not run: no ledger in front of the files; bless once$";
+
+pub const MSG_SUM_A : str = "duplicate bodies: $";
+pub const MSG_SUM_B : str = " of $";
+pub const MSG_SUM_C : str = " in $";
+pub const MSG_SUM_D : str = " group(s) across $";
+pub const MSG_SUM_E : str = " spec(s)$";
+
+pub const MSG_NEW_A : str = "::error::a body written under $";
+pub const MSG_NEW_B : str = " is now copied $";
+pub const MSG_NEW_C : str = " time(s) and was in no ledger$";
+pub const MSG_GROWN_A : str = "::error::$";
+pub const MSG_GROWN_B : str = " was copied $";
+pub const MSG_GROWN_C : str = " and is now copied $";
+pub const MSG_REFUSE_1 : str = "A body written twice is a bug that has to be fixed twice. Reuse the$";
+pub const MSG_REFUSE_2 : str = "one that exists, or if this copy is deliberate, say so by moving the$";
+pub const MSG_REFUSE_3 : str = "ledger in the SAME commit: run this gate in bless mode, the command is$";
+pub const MSG_REFUSE_4 : str = "in the header of specs/policy/dupe_bodies.t27$";
+
+pub const MSG_FAIL : str = "FAIL: the corpus improved and the ledger did not move.$";
+pub const MSG_GONE : str = "  gone$";
+pub const MSG_ARROW : str = " -> $";
+pub const MSG_STALE_1 : str = "A ceiling left above the real number banks slack against the next copy.$";
+pub const MSG_STALE_2 : str = "Re-bless in the SAME commit: run this gate in bless mode, the command is$";
+pub const MSG_OK : str = "ok: no new duplicate body, and none of the known groups grew.$";
+
+pub const MSG_LEDGER_1 : str = "# Duplicate function bodies, by the names they are written under.$";
+pub const MSG_LEDGER_2 : str = "# Written by specs/policy/dupe_bodies.t27 in bless mode. The gate fails when a NEW$";
+pub const MSG_LEDGER_3 : str = "# group appears or an existing one grows; it moves down only.$";
+
+pub const BASE1 : u64 = 1000003;
+pub const PRIME1 : u64 = 2147483647;
+pub const BASE2 : u64 = 998244353;
+pub const PRIME2 : u64 = 2147483629;
+
+/// Is c a blank of the regex \s: space, TAB .. CR, and the ASCII separators 28 .. 31?
+fn db_ws(c: u8) -> bool {
+    return c == 32 or (c >= 9 and c <= 13) or (c >= 28 and c <= 31);
+}
+
+/// The first index in [i, n) that is not a blank; n when there is none.
+fn db_skip_ws(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i;
+    while (k < n and db_ws(s[k])) { k += 1; }
+    return k;
+}
+
+/// The index of the first LF in [i, n); n when there is none.
+fn db_eol(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i;
+    while (k < n and s[k] != '\n') { k += 1; }
+    return k;
+}
+
+/// Does s[i ..] begin with the first ln bytes of `lit`, all of them inside s[0 .. n)?
+fn db_is_at(s: []const u8, i: usize, n: usize, lit: []const u8, ln: usize) -> bool {
+    if (i + ln > n) { return false; }
+    var k : usize = 0;
+    while (k < ln) {
+        if (s[i + k] != lit[k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// One past the closing quote of the string that opens at s[i]; 0 when it never closes. A backslash
+/// escapes the byte after it, a newline included: a string may span lines.
+fn db_str_end(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i + 1;
+    while (k < n) {
+        if (s[k] == '\\') {
+            k += 2;
+        } else {
+            if (s[k] == '"') { return k + 1; }
+            k += 1;
+        }
+    }
+    return 0;
+}
+
+/// One past the closing quote of the single-quoted literal that opens at s[i]; 0 when the line ends first
+/// (a single-quoted literal never spans lines, as bootstrap/src/compiler.rs lexes it).
+fn db_chr_end(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i + 1;
+    while (k < n) {
+        if (s[k] == '\\') {
+            k += 2;
+        } else {
+            if (s[k] == '\'') { return k + 1; }
+            if (s[k] == '\n') { return 0; }
+            k += 1;
+        }
+    }
+    return 0;
+}
+
+/// One past the first "*/" after the "/*" that opens at s[i]; 0 when there is none.
+fn db_block_end(s: []const u8, i: usize, n: usize) -> usize {
+    var k : usize = i + 2;
+    while (k + 1 < n) {
+        if (s[k] == '*' and s[k + 1] == '/') { return k + 2; }
+        k += 1;
+    }
+    return 0;
+}
+
+/// One past the comment that opens at s[i] (the text starts at lo); 0 when none opens there. The forms
+/// bootstrap/src/compiler.rs lexes: `//` and `#` run to the line end, `;` at a line start followed by a
+/// space or tab does too, `/* */` is a block.
+fn db_comment_end(s: []const u8, lo: usize, i: usize, n: usize) -> usize {
+    if (s[i] == '#') { return db_eol(s, i, n); }
+    if (s[i] == '/' and i + 1 < n) {
+        if (s[i + 1] == '/') { return db_eol(s, i, n); }
+        if (s[i + 1] == '*') { return db_block_end(s, i, n); }
+    }
+    if (s[i] == ';' and i + 1 < n and (i == lo or s[i - 1] == '\n') and (s[i + 1] == ' ' or s[i + 1] == '\t')) {
+        return db_eol(s, i, n);
+    }
+    return 0;
+}
+
+/// One past the literal that opens at s[i]: "..." (also r"..."), or a single-quoted '...'; 0 when none.
+fn db_literal_end(s: []const u8, i: usize, n: usize) -> usize {
+    if (s[i] == '"') { return db_str_end(s, i, n); }
+    if (s[i] == 'r' and i + 1 < n and s[i + 1] == '"') { return db_str_end(s, i + 1, n); }
+    if (s[i] == '\'') { return db_chr_end(s, i, n); }
+    return 0;
+}
+
+/// Copy s[lo .. n) into mk with every comment and literal blanked (each byte but LF becomes a space), so
+/// offsets and line starts stay as they are: structure() of tools/dupe_scan.py. Returns n - lo.
+fn db_mask(s: []const u8, lo: usize, n: usize, mk: []u8) -> usize {
+    var i : usize = lo;
+    while (i < n) {
+        var e : usize = db_comment_end(s, lo, i, n);
+        if (e == 0) { e = db_literal_end(s, i, n); }
+        if (e == 0) {
+            mk[i - lo] = s[i];
+            i += 1;
+        } else {
+            while (i < e) {
+                if (s[i] == '\n') { mk[i - lo] = '\n'; } else { mk[i - lo] = ' '; }
+                i += 1;
+            }
+        }
+    }
+    return n - lo;
+}
+
+/// If a function header opens at the line start mk[i], the index just past its `(` or `<`; 0 when none
+/// does. FN_RE of tools/dupe_scan.py: blanks, an optional `pub` or `pub(...)` and a blank, `fn`, a blank,
+/// a name, optional blanks, then `(` or `<`.
+fn db_header_end(mk: []const u8, i: usize, n: usize) -> usize {
+    var p : usize = i;
+    while (p < n and (mk[p] == ' ' or mk[p] == '\t')) { p += 1; }
+    if (p + 2 < n and mk[p] == 'p' and mk[p + 1] == 'u' and mk[p + 2] == 'b') {
+        var q : usize = p + 3;
+        if (q < n and mk[q] == '(') {
+            q += 1;
+            while (q < n and mk[q] != ')') { q += 1; }
+            if (q >= n) { return 0; }
+            q += 1;
+        }
+        p = db_skip_ws(mk, q, n);
+        if (p == q) { return 0; }
+    }
+    if (p + 1 >= n or mk[p] != 'f' or mk[p + 1] != 'n') { return 0; }
+    const a : usize = db_skip_ws(mk, p + 2, n);
+    if (a == p + 2) { return 0; }
+    var b : usize = a;
+    while (b < n and is_word(mk[b])) { b += 1; }
+    if (b == a) { return 0; }
+    const c : usize = db_skip_ws(mk, b, n);
+    if (c < n and (mk[c] == '(' or mk[c] == '<')) { return c + 1; }
+    return 0;
+}
+
+/// One past the last byte of the function name whose header's `(` or `<` stands at mk[h].
+fn db_name_end(mk: []const u8, h: usize) -> usize {
+    var e : usize = h;
+    while (e > 0 and db_ws(mk[e - 1])) { e -= 1; }
+    return e;
+}
+
+/// The first byte of the name that ends just before mk[e].
+fn db_name_start(mk: []const u8, e: usize) -> usize {
+    var b : usize = e;
+    while (b > 0 and is_word(mk[b - 1])) { b -= 1; }
+    return b;
+}
+
+/// The index of the `{` that opens the body of the function whose header `(` or `<` stands at mk[h]; n
+/// when a `;` ends the header first (a prototype) or nothing opens. Parentheses and brackets nest, so the
+/// `;` of `[u8; 32]` is not the end.
+fn db_body_start(mk: []const u8, h: usize, n: usize) -> usize {
+    var pa : i32 = 0;
+    var br : i32 = 0;
+    var k : usize = h;
+    while (k < n) {
+        if (mk[k] == '(') { pa += 1; }
+        if (mk[k] == ')') { pa -= 1; }
+        if (mk[k] == '[') { br += 1; }
+        if (mk[k] == ']') { br -= 1; }
+        if (pa == 0 and br == 0) {
+            if (mk[k] == ';') { return n; }
+            if (mk[k] == '{') { return k; }
+        }
+        k += 1;
+    }
+    return n;
+}
+
+/// The index of the `}` that closes the `{` at mk[b]; n when it never closes.
+fn db_body_end(mk: []const u8, b: usize, n: usize) -> usize {
+    var depth : i32 = 0;
+    var k : usize = b;
+    while (k < n) {
+        if (mk[k] == '{') { depth += 1; }
+        if (mk[k] == '}') {
+            depth -= 1;
+            if (depth == 0) { return k; }
+        }
+        k += 1;
+    }
+    return n;
+}
+
+/// Write the plain form of s[from .. to) into out: each comment is a blank, each run of blanks is one
+/// space, literals stay as they stand, no blank at either end (normalise() of tools/dupe_scan.py). The
+/// comment forms are read inside the slice, as the Python reads the slice. Returns the bytes written,
+/// which may exceed cap (put keeps counting past the end).
+fn db_plain(s: []const u8, from: usize, to: usize, out: []u8, cap: usize) -> usize {
+    var w : usize = 0;
+    var gap : bool = false;
+    var i : usize = from;
+    while (i < to) {
+        const c : usize = db_comment_end(s, from, i, to);
+        if (c > 0) {
+            gap = true;
+            i = c;
+        } else {
+            if (db_ws(s[i])) {
+                gap = true;
+                i += 1;
+            } else {
+                var e : usize = db_literal_end(s, i, to);
+                if (e == 0) { e = i + 1; }
+                if (gap and w > 0) { w = put(out, w, cap, ' '); }
+                gap = false;
+                while (i < e) {
+                    w = put(out, w, cap, s[i]);
+                    i += 1;
+                }
+            }
+        }
+    }
+    return w;
+}
+
+/// How many characters s[0 .. n) holds as UTF-8: the bytes that are not continuation bytes (128 .. 191).
+fn db_chars(s: []const u8, n: usize) -> usize {
+    var c : usize = 0;
+    var k : usize = 0;
+    while (k < n) {
+        if (s[k] < 128 or s[k] >= 192) { c += 1; }
+        k += 1;
+    }
+    return c;
+}
+
+/// A polynomial hash of s[0 .. n) modulo the prime p with base b, folded with seed and with n. u64
+/// arithmetic and a prime below 2^31 keep every product under 2^61, so no backend wraps.
+fn db_hash(s: []const u8, n: usize, b: u64, p: u64, seed: u32) -> u32 {
+    var h : u64 = @as(u64, seed);
+    var k : usize = 0;
+    while (k < n) {
+        h = (h * b + @as(u64, s[k]) + 1) % p;
+        k += 1;
+    }
+    h = (h * b + @as(u64, n)) % p;
+    return h as u32;
+}
+
+/// The index of the first `(` in mk[from .. to); to when there is none.
+fn db_find_open(mk: []const u8, from: usize, to: usize) -> usize {
+    var k : usize = from;
+    while (k < to and mk[k] != '(') { k += 1; }
+    return k;
+}
+
+/// The index of the `)` that closes the `(` at mk[q]; to when it never closes before `to`.
+fn db_paren_end(mk: []const u8, q: usize, to: usize) -> usize {
+    var depth : i32 = 0;
+    var k : usize = q;
+    while (k < to) {
+        if (mk[k] == '(') { depth += 1; }
+        if (mk[k] == ')') {
+            depth -= 1;
+            if (depth == 0) { return k; }
+        }
+        k += 1;
+    }
+    return to;
+}
+
+/// Is a[ao .. ao + len) the same text as b[bo .. bo + len)?
+fn db_same_text(a: []const u8, ao: usize, b: []const u8, bo: usize, len: usize) -> bool {
+    var k : usize = 0;
+    while (k < len) {
+        if (a[ao + k] != b[bo + k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Bytes before the `$` of a `$`-terminated message.
+fn db_msg_len(msg: []const u8) -> usize {
+    var i : usize = 0;
+    while (msg[i] != '$') { i += 1; }
+    return i;
+}
+
+/// Compare the names buf[ao .. ao + al) and buf[bo .. bo + bl), byte by byte, the shorter first on a tie.
+fn db_name_cmp(buf: []const u8, ao: usize, al: usize, bo: usize, bl: usize) -> u8 {
+    var k : usize = 0;
+    while (k < al and k < bl) {
+        if (buf[ao + k] < buf[bo + k]) { return CMP_LT; }
+        if (buf[ao + k] > buf[bo + k]) { return CMP_GT; }
+        k += 1;
+    }
+    if (al < bl) { return CMP_LT; }
+    if (al > bl) { return CMP_GT; }
+    return CMP_EQ;
+}
+
+/// Write one frame of the stream: `#file <size> <path>` LF, then the content, which the size counts. Path and
+/// content are `$`-terminated messages and must not hold a `$`. The producer the tests use.
+pub fn frame_put(out: []u8, w: usize, cap: usize, path: []const u8, body: []const u8) -> usize {
+    const size : u32 = db_msg_len(body) as u32;
+    var p : usize = put_msg(out, w, cap, "#file $");
+    p = put_u32(out, p, cap, size);
+    p = put(out, p, cap, ' ');
+    p = put_msg(out, p, cap, path);
+    p = put(out, p, cap, '\n');
+    return put_msg(out, p, cap, body);
+}
+
+/// Where the frame at p ends (the next frame starts there); n + 1 when the frame at p is malformed: no
+/// `#file `, no size, no blank after it, an empty path, no LF, or fewer than size bytes left.
+fn db_frame_next(buf: []const u8, p: usize, n: usize) -> usize {
+    if (!db_is_at(buf, p, n, "#file ", 6)) { return n + 1; }
+    var k : usize = p + 6;
+    var size : usize = 0;
+    var digits : usize = 0;
+    while (k < n and is_digit(buf[k])) {
+        size = size * 10 + @as(usize, buf[k] - 48);
+        if (size > n) { return n + 1; }
+        digits += 1;
+        k += 1;
+    }
+    if (digits == 0 or k >= n or buf[k] != ' ') { return n + 1; }
+    const le : usize = db_eol(buf, k + 1, n);
+    if (le >= n or le == k + 1) { return n + 1; }
+    if (size > n - le - 1) { return n + 1; }
+    return le + 1 + size;
+}
+
+/// The start of the path of the frame at p (the frame is well formed).
+fn db_f_path(buf: []const u8, p: usize, n: usize) -> usize {
+    var k : usize = p + 6;
+    while (k < n and is_digit(buf[k])) { k += 1; }
+    return k + 1;
+}
+
+/// The first frame in buf[0 .. n): the first line that starts `#file ` and a digit; n when there is none.
+/// What stands before it is the ledger.
+fn db_first_frame(buf: []const u8, n: usize) -> usize {
+    var i : usize = 0;
+    while (i < n) {
+        if (db_is_at(buf, i, n, "#file ", 6) and i + 6 < n and is_digit(buf[i + 6])) { return i; }
+        i = db_eol(buf, i, n) + 1;
+    }
+    return n;
+}
+
+/// Are all frames from p0 to n well formed?
+fn db_frames_ok(buf: []const u8, p0: usize, n: usize) -> bool {
+    var p : usize = p0;
+    while (p < n) {
+        const nx : usize = db_frame_next(buf, p, n);
+        if (nx > n) { return false; }
+        p = nx;
+    }
+    return true;
+}
+
+/// Does the path buf[from .. to) hold `/scratch/`? Such a spec is not part of the corpus.
+fn db_in_scratch(buf: []const u8, from: usize, to: usize) -> bool {
+    var k : usize = from;
+    while (k + 9 <= to) {
+        if (db_is_at(buf, k, to, "/scratch/", 9)) { return true; }
+        k += 1;
+    }
+    return false;
+}
+
+/// How many frames from p0 are specs of the corpus (not under scratch)?
+fn db_frames_count(buf: []const u8, p0: usize, n: usize) -> usize {
+    var c : usize = 0;
+    var p : usize = p0;
+    while (p < n) {
+        const plo : usize = db_f_path(buf, p, n);
+        if (!db_in_scratch(buf, plo, db_eol(buf, plo, n))) { c += 1; }
+        p = db_frame_next(buf, p, n);
+    }
+    return c;
+}
+
+/// The size of the largest spec of the corpus among the frames from p0.
+fn db_frames_max(buf: []const u8, p0: usize, n: usize) -> usize {
+    var mx : usize = 0;
+    var p : usize = p0;
+    while (p < n) {
+        const plo : usize = db_f_path(buf, p, n);
+        const cs : usize = db_eol(buf, plo, n) + 1;
+        const nx : usize = db_frame_next(buf, p, n);
+        if (!db_in_scratch(buf, plo, cs - 1) and nx - cs > mx) { mx = nx - cs; }
+        p = nx;
+    }
+    return mx;
+}
+
+/// Find the counted bodies of the spec s[0 .. n), which starts at buf offset fo, and record them from
+/// entry m0 on: ws tables 0 and 1 hold the two hashes of the key, 2 and 3 the offset and the length of
+/// the function name in buf. The scratch sc holds, from 0: the mask (n), the parameter text (n), the plain
+/// body (n) and the alpha key (2n + 4). Returns the entry count; it passes tcap when the tables are full.
+fn db_scan_file(s: []const u8, fo: usize, n: usize, alpha: bool, sc: []u8, ws: []u32, tcap: usize, m0: usize) -> usize {
+    var m : usize = m0;
+    const b0 : usize = 2 * n;
+    const k0 : usize = 3 * n;
+    const kend : usize = 5 * n + 4;
+    const mn : usize = db_mask(s, 0, n, sc[0..n]);
+    var ls : usize = 0;
+    while (ls < mn) {
+        const he : usize = db_header_end(sc[0..n], ls, n);
+        if (he == 0) {
+            ls = db_eol(sc[0..n], ls, n) + 1;
+        } else {
+            const bs : usize = db_body_start(sc[0..n], he - 1, n);
+            if (bs < n) {
+                const be : usize = db_body_end(sc[0..n], bs, n);
+                if (be < n) {
+                    const pl : usize = db_plain(s, bs, be + 1, sc[b0..k0], n);
+                    if (db_chars(sc[b0..k0], pl) >= MIN_BODY) {
+                        var ko : usize = b0;
+                        var kl : usize = pl;
+                        if (alpha) {
+                            const q : usize = db_find_open(sc[0..n], he - 1, bs);
+                            var pm : usize = 0;
+                            if (q < bs) {
+                                pm = db_plain(s, q + 1, db_paren_end(sc[0..n], q, bs), sc[n..b0], n);
+                            }
+                            const al : usize = normalise_n(sc[n..b0], pm, sc[b0..k0], pl, sc[k0..kend], 2 * n + 4);
+                            if (al > 0) {
+                                ko = k0;
+                                kl = al;
+                            }
+                        }
+                        if (m < tcap) {
+                            const ne : usize = db_name_end(sc[0..n], he - 1);
+                            const nb : usize = db_name_start(sc[0..n], ne);
+                            ws[m] = db_hash(sc[ko..ko + kl], kl, BASE1, PRIME1, 1);
+                            ws[tcap + m] = db_hash(sc[ko..ko + kl], kl, BASE2, PRIME2, 2);
+                            ws[2 * tcap + m] = (fo + nb) as u32;
+                            ws[3 * tcap + m] = (ne - nb) as u32;
+                        }
+                        m += 1;
+                    }
+                }
+            }
+            ls = db_eol(sc[0..n], he, n) + 1;
+        }
+    }
+    return m;
+}
+
+/// Scan every spec of the corpus among the frames from p0 (all well formed): the entry count.
+fn db_scan_all(buf: []const u8, p0: usize, n: usize, alpha: bool, sc: []u8, ws: []u32, tcap: usize) -> usize {
+    var m : usize = 0;
+    var p : usize = p0;
+    while (p < n) {
+        const plo : usize = db_f_path(buf, p, n);
+        const cs : usize = db_eol(buf, plo, n) + 1;
+        const nx : usize = db_frame_next(buf, p, n);
+        if (!db_in_scratch(buf, plo, cs - 1)) {
+            m = db_scan_file(buf[cs..nx], cs, nx - cs, alpha, sc, ws, tcap, m);
+        }
+        p = nx;
+    }
+    return m;
+}
+
+/// The word at position i of the table that starts at ws[base], as a usize.
+fn db_at(ws: []const u32, base: usize, i: usize) -> usize {
+    return ws[base + i] as usize;
+}
+
+/// Is entry a ordered before entry b by the key (hash 1, then hash 2)?
+fn db_ent_less(ws: []const u32, tcap: usize, a: usize, b: usize) -> bool {
+    if (ws[a] != ws[b]) { return ws[a] < ws[b]; }
+    return ws[tcap + a] < ws[tcap + b];
+}
+
+/// Is group a ordered before group b: by name, then the larger size first? Tables 5, 6, 7 hold the name
+/// offset, the name length and the size of a group.
+fn db_grp_less(buf: []const u8, ws: []const u32, tcap: usize, a: usize, b: usize) -> bool {
+    const c : u8 = db_name_cmp(buf, db_at(ws, 5 * tcap, a), db_at(ws, 6 * tcap, a), db_at(ws, 5 * tcap, b), db_at(ws, 6 * tcap, b));
+    if (c == CMP_LT) { return true; }
+    if (c == CMP_GT) { return false; }
+    return ws[7 * tcap + a] > ws[7 * tcap + b];
+}
+
+/// Shell-sort the identity permutation of 0 .. cnt - 1 into the table at ws[base], with the comparator
+/// kind: 0 orders entries by key, 1 orders groups. In place, no recursion, no scratch.
+fn db_sort(buf: []const u8, ws: []u32, tcap: usize, cnt: usize, base: usize, kind: u8) -> usize {
+    var i : usize = 0;
+    while (i < cnt) {
+        ws[base + i] = i as u32;
+        i += 1;
+    }
+    var h : usize = 1;
+    while (h < cnt / 3) { h = 3 * h + 1; }
+    while (h >= 1) {
+        var k : usize = h;
+        while (k < cnt) {
+            const v : usize = db_at(ws, base, k);
+            var j : usize = k;
+            var moving : bool = true;
+            while (moving) {
+                moving = false;
+                if (j >= h) {
+                    const u : usize = db_at(ws, base, j - h);
+                    var before : bool = false;
+                    if (kind == 0) { before = db_ent_less(ws, tcap, v, u); } else { before = db_grp_less(buf, ws, tcap, v, u); }
+                    if (before) {
+                        ws[base + j] = u as u32;
+                        j -= h;
+                        moving = true;
+                    }
+                }
+            }
+            ws[base + j] = v as u32;
+            k += 1;
+        }
+        h = h / 3;
+    }
+    return cnt;
+}
+
+/// Group the sorted entries (table 4): every run of equal keys longer than 1 is a group, named by the
+/// least function name in it. Fills tables 5, 6, 7; returns the group count (at most cnt / 2).
+fn db_groups(buf: []const u8, ws: []u32, tcap: usize, cnt: usize) -> usize {
+    var ng : usize = 0;
+    var i : usize = 0;
+    while (i < cnt) {
+        const first : usize = db_at(ws, 4 * tcap, i);
+        var j : usize = i + 1;
+        while (j < cnt and ws[first] == ws[db_at(ws, 4 * tcap, j)] and ws[tcap + first] == ws[tcap + db_at(ws, 4 * tcap, j)]) { j += 1; }
+        if (j - i > 1) {
+            var best : usize = first;
+            var k : usize = i + 1;
+            while (k < j) {
+                const e : usize = db_at(ws, 4 * tcap, k);
+                if (db_name_cmp(buf, db_at(ws, 2 * tcap, e), db_at(ws, 3 * tcap, e), db_at(ws, 2 * tcap, best), db_at(ws, 3 * tcap, best)) == CMP_LT) {
+                    best = e;
+                }
+                k += 1;
+            }
+            ws[5 * tcap + ng] = ws[2 * tcap + best];
+            ws[6 * tcap + ng] = ws[3 * tcap + best];
+            ws[7 * tcap + ng] = (j - i) as u32;
+            ng += 1;
+        }
+        i = j;
+    }
+    return ng;
+}
+
+/// Close the text: NUL-terminate out (the caller passes cap = size - 1) and hand back the exit code.
+fn db_done(out: []u8, w: usize, cap: usize, rc: u32) -> u32 {
+    if (w < cap) { out[w] = 0; } else { out[cap] = 0; }
+    return rc;
+}
+
+/// One message and a newline.
+fn db_line(out: []u8, w: usize, cap: usize, msg: []const u8) -> usize {
+    return put(out, put_msg(out, w, cap, msg), cap, '\n');
+}
+
+/// Where the stripped content of the ledger line that starts at ls begins (the ledger is buf[0 .. p0)).
+fn db_l_a(buf: []const u8, ls: usize, p0: usize) -> usize {
+    return db_skip_ws(buf, ls, db_eol(buf, ls, p0));
+}
+
+/// One past the last non-blank byte of that line.
+fn db_l_e(buf: []const u8, ls: usize, p0: usize) -> usize {
+    const a : usize = db_l_a(buf, ls, p0);
+    var e : usize = db_eol(buf, ls, p0);
+    while (e > a and db_ws(buf[e - 1])) { e -= 1; }
+    return e;
+}
+
+/// The index of the last blank (a space) in [a, e); e when there is none.
+fn db_l_sp(buf: []const u8, a: usize, e: usize) -> usize {
+    var k : usize = e;
+    while (k > a) {
+        k -= 1;
+        if (buf[k] == ' ') { return k; }
+    }
+    return e;
+}
+
+/// Is buf[a .. e) made of digits and commas, with at least one digit?
+fn db_counts_ok(buf: []const u8, a: usize, e: usize) -> bool {
+    var digits : bool = false;
+    var k : usize = a;
+    while (k < e) {
+        if (is_digit(buf[k])) {
+            digits = true;
+        } else {
+            if (buf[k] != ',') { return false; }
+        }
+        k += 1;
+    }
+    return digits;
+}
+
+/// Is the line at ls a ledger entry: `NAME s1,s2,...`, not blank, not a `#` comment?
+fn db_lvalid(buf: []const u8, ls: usize, p0: usize) -> bool {
+    const a : usize = db_l_a(buf, ls, p0);
+    const e : usize = db_l_e(buf, ls, p0);
+    if (a >= e) { return false; }
+    if (buf[a] == '#') { return false; }
+    const sp : usize = db_l_sp(buf, a, e);
+    if (sp >= e or sp == a) { return false; }
+    return db_counts_ok(buf, sp + 1, e);
+}
+
+/// How many ledger entries are there?
+fn db_lcount(buf: []const u8, p0: usize) -> usize {
+    var c : usize = 0;
+    var ls : usize = 0;
+    while (ls < p0) {
+        if (db_lvalid(buf, ls, p0)) { c += 1; }
+        ls = db_eol(buf, ls, p0) + 1;
+    }
+    return c;
+}
+
+/// The line start of the last (last = true) or first entry named buf[no .. no + nl); p0 when there is none.
+fn db_lfind(buf: []const u8, p0: usize, no: usize, nl: usize, last: bool) -> usize {
+    var hit : usize = p0;
+    var ls : usize = 0;
+    while (ls < p0) {
+        if (db_lvalid(buf, ls, p0)) {
+            const a : usize = db_l_a(buf, ls, p0);
+            const sp : usize = db_l_sp(buf, a, db_l_e(buf, ls, p0));
+            if (sp - a == nl and db_same_text(buf, a, buf, no, nl)) {
+                if (!last) { return ls; }
+                hit = ls;
+            }
+        }
+        ls = db_eol(buf, ls, p0) + 1;
+    }
+    return hit;
+}
+
+/// The k-th number of the counts buf[cs .. ce) (empty parts do not count); 0 when there is none. A number
+/// stops growing past 10^12.
+fn db_cnt_nth(buf: []const u8, cs: usize, ce: usize, k: usize) -> u64 {
+    var idx : usize = 0;
+    var cur : u64 = 0;
+    var has : bool = false;
+    var i : usize = cs;
+    while (i <= ce) {
+        if (i == ce or buf[i] == ',') {
+            if (has) {
+                if (idx == k) { return cur; }
+                idx += 1;
+            }
+            cur = 0;
+            has = false;
+        } else {
+            if (cur < 1000000000000) { cur = cur * 10 + @as(u64, buf[i] - 48); }
+            has = true;
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+/// How many numbers are in the counts buf[cs .. ce)?
+fn db_cnt_count(buf: []const u8, cs: usize, ce: usize) -> usize {
+    var idx : usize = 0;
+    var has : bool = false;
+    var i : usize = cs;
+    while (i <= ce) {
+        if (i == ce or buf[i] == ',') {
+            if (has) { idx += 1; }
+            has = false;
+        } else {
+            has = true;
+        }
+        i += 1;
+    }
+    return idx;
+}
+
+/// One past the last group of the view entry that starts at GORD position i (the groups with one name).
+fn db_run_end(buf: []const u8, ws: []const u32, tcap: usize, ng: usize, i: usize) -> usize {
+    const g : usize = db_at(ws, 8 * tcap, i);
+    var j : usize = i + 1;
+    while (j < ng) {
+        const h : usize = db_at(ws, 8 * tcap, j);
+        if (db_name_cmp(buf, db_at(ws, 5 * tcap, g), db_at(ws, 6 * tcap, g), db_at(ws, 5 * tcap, h), db_at(ws, 6 * tcap, h)) != CMP_EQ) { return j; }
+        j += 1;
+    }
+    return ng;
+}
+
+/// The offset in buf of the name of the view entry at GORD position gi.
+fn db_vname_o(ws: []const u32, tcap: usize, gi: usize) -> usize {
+    return db_at(ws, 5 * tcap, db_at(ws, 8 * tcap, gi));
+}
+
+/// The length of that name.
+fn db_vname_l(ws: []const u32, tcap: usize, gi: usize) -> usize {
+    return db_at(ws, 6 * tcap, db_at(ws, 8 * tcap, gi));
+}
+
+/// The size of the k-th group (largest first) of the view entry at GORD position gi.
+fn db_vsize(ws: []const u32, tcap: usize, gi: usize, k: usize) -> u64 {
+    return ws[7 * tcap + db_at(ws, 8 * tcap, gi + k)] as u64;
+}
+
+/// The GORD position of the first group named buf[no .. no + nl); ng when no group has that name.
+fn db_view_find(buf: []const u8, ws: []const u32, tcap: usize, ng: usize, no: usize, nl: usize) -> usize {
+    var lo : usize = 0;
+    var hi : usize = ng;
+    while (lo < hi) {
+        const mid : usize = lo + (hi - lo) / 2;
+        const g : usize = db_at(ws, 8 * tcap, mid);
+        if (db_name_cmp(buf, db_at(ws, 5 * tcap, g), db_at(ws, 6 * tcap, g), no, nl) == CMP_LT) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < ng) {
+        const g2 : usize = db_at(ws, 8 * tcap, lo);
+        if (db_name_cmp(buf, db_at(ws, 5 * tcap, g2), db_at(ws, 6 * tcap, g2), no, nl) == CMP_EQ) { return lo; }
+    }
+    return ng;
+}
+
+/// Compare the sizes of the view entry (gi, vn groups) with the ledger counts buf[cs .. ce), element by
+/// element and then by length, as two Python lists compare: the view against the ledger.
+fn db_cmp_lists(buf: []const u8, ws: []const u32, tcap: usize, gi: usize, vn: usize, cs: usize, ce: usize) -> u8 {
+    const nl : usize = db_cnt_count(buf, cs, ce);
+    var k : usize = 0;
+    while (k < vn and k < nl) {
+        const a : u64 = db_vsize(ws, tcap, gi, k);
+        const b : u64 = db_cnt_nth(buf, cs, ce, k);
+        if (a < b) { return CMP_LT; }
+        if (a > b) { return CMP_GT; }
+        k += 1;
+    }
+    if (vn < nl) { return CMP_LT; }
+    if (vn > nl) { return CMP_GT; }
+    return CMP_EQ;
+}
+
+/// Write the view sizes as `[3, 2]`.
+fn db_put_view(out: []u8, w: usize, cap: usize, ws: []const u32, tcap: usize, gi: usize, vn: usize) -> usize {
+    var p : usize = put(out, w, cap, '[');
+    var k : usize = 0;
+    while (k < vn) {
+        if (k > 0) {
+            p = put(out, p, cap, ',');
+            p = put(out, p, cap, ' ');
+        }
+        p = put_u32(out, p, cap, db_vsize(ws, tcap, gi, k) as u32);
+        k += 1;
+    }
+    return put(out, p, cap, ']');
+}
+
+/// Write the ledger counts buf[cs .. ce) as `[3, 2]`.
+fn db_put_ledger(out: []u8, w: usize, cap: usize, buf: []const u8, cs: usize, ce: usize) -> usize {
+    const nl : usize = db_cnt_count(buf, cs, ce);
+    var p : usize = put(out, w, cap, '[');
+    var k : usize = 0;
+    while (k < nl) {
+        if (k > 0) {
+            p = put(out, p, cap, ',');
+            p = put(out, p, cap, ' ');
+        }
+        p = put_u32(out, p, cap, db_cnt_nth(buf, cs, ce, k) as u32);
+        k += 1;
+    }
+    return put(out, p, cap, ']');
+}
+
+/// The total of the group sizes: the copies.
+fn db_copies(ws: []const u32, tcap: usize, ng: usize) -> u32 {
+    var c : u32 = 0;
+    var g : usize = 0;
+    while (g < ng) {
+        c += ws[7 * tcap + g];
+        g += 1;
+    }
+    return c;
+}
+
+/// `duplicate bodies: C of M in G group(s) across F spec(s)` and a newline.
+fn db_summary(out: []u8, cap: usize, ws: []const u32, tcap: usize, m: usize, ng: usize, nf: usize) -> usize {
+    var w : usize = put_msg(out, 0, cap, MSG_SUM_A);
+    w = put_u32(out, w, cap, db_copies(ws, tcap, ng));
+    w = put_msg(out, w, cap, MSG_SUM_B);
+    w = put_u32(out, w, cap, m as u32);
+    w = put_msg(out, w, cap, MSG_SUM_C);
+    w = put_u32(out, w, cap, ng as u32);
+    w = put_msg(out, w, cap, MSG_SUM_D);
+    w = put_u32(out, w, cap, nf as u32);
+    w = put_msg(out, w, cap, MSG_SUM_E);
+    return put(out, w, cap, '\n');
+}
+
+/// The ledger line start of the least ledger name that no group carries and that is greater than the name
+/// buf[ca .. ca + cl) (any, when have is false); p0 when there is none.
+fn db_gone_next(buf: []const u8, p0: usize, ws: []const u32, tcap: usize, ng: usize, ca: usize, cl: usize, have: bool) -> usize {
+    var best : usize = p0;
+    var ba : usize = 0;
+    var bl : usize = 0;
+    var ls : usize = 0;
+    while (ls < p0) {
+        if (db_lvalid(buf, ls, p0)) {
+            const a : usize = db_l_a(buf, ls, p0);
+            const nl : usize = db_l_sp(buf, a, db_l_e(buf, ls, p0)) - a;
+            var later : bool = true;
+            if (have) { later = db_name_cmp(buf, a, nl, ca, cl) == CMP_GT; }
+            if (later and db_view_find(buf, ws, tcap, ng, a, nl) >= ng) {
+                var better : bool = best >= p0;
+                if (!better) { better = db_name_cmp(buf, a, nl, ba, bl) == CMP_LT; }
+                if (better) {
+                    best = ls;
+                    ba = a;
+                    bl = nl;
+                }
+            }
+        }
+        ls = db_eol(buf, ls, p0) + 1;
+    }
+    return best;
+}
+
+/// Write the ledger text of the groups found: three comment lines, then `NAME s1,s2,...` for each name,
+/// the largest group first, ties by name. Returns the end of the text.
+fn db_bless(buf: []const u8, ws: []const u32, tcap: usize, ng: usize, out: []u8, cap: usize) -> usize {
+    var w : usize = db_line(out, 0, cap, MSG_LEDGER_1);
+    w = db_line(out, w, cap, MSG_LEDGER_2);
+    w = db_line(out, w, cap, MSG_LEDGER_3);
+    var mx : usize = 0;
+    var g : usize = 0;
+    while (g < ng) {
+        if ((ws[7 * tcap + g] as usize) > mx) { mx = ws[7 * tcap + g] as usize; }
+        g += 1;
+    }
+    var s : usize = mx;
+    while (s >= 2) {
+        var i : usize = 0;
+        while (i < ng) {
+            const j : usize = db_run_end(buf, ws, tcap, ng, i);
+            if ((db_vsize(ws, tcap, i, 0) as usize) == s) {
+                w = put_range(out, w, cap, buf, db_vname_o(ws, tcap, i), db_vname_o(ws, tcap, i) + db_vname_l(ws, tcap, i));
+                w = put(out, w, cap, ' ');
+                var k : usize = 0;
+                while (k < j - i) {
+                    if (k > 0) { w = put(out, w, cap, ','); }
+                    w = put_u32(out, w, cap, db_vsize(ws, tcap, i, k) as u32);
+                    k += 1;
+                }
+                w = put(out, w, cap, '\n');
+            }
+            i = j;
+        }
+        s -= 1;
+    }
+    return w;
+}
+
+/// Check the groups found against the ledger buf[0 .. p0): 0 holds, 1 refused (a new or grown group, or a
+/// ceiling above the real number). m is the counted bodies, nf the specs.
+fn db_check(buf: []const u8, p0: usize, ws: []const u32, tcap: usize, m: usize, ng: usize, nf: usize, out: []u8, cap: usize) -> u32 {
+    var w : usize = db_summary(out, cap, ws, tcap, m, ng, nf);
+    var refused : u32 = 0;
+    var i : usize = 0;
+    while (i < ng) {
+        const j : usize = db_run_end(buf, ws, tcap, ng, i);
+        if (db_lfind(buf, p0, db_vname_o(ws, tcap, i), db_vname_l(ws, tcap, i), true) >= p0) {
+            w = put_msg(out, w, cap, MSG_NEW_A);
+            w = put_range(out, w, cap, buf, db_vname_o(ws, tcap, i), db_vname_o(ws, tcap, i) + db_vname_l(ws, tcap, i));
+            w = put_msg(out, w, cap, MSG_NEW_B);
+            w = db_put_view(out, w, cap, ws, tcap, i, j - i);
+            w = put_msg(out, w, cap, MSG_NEW_C);
+            w = put(out, w, cap, '\n');
+            refused += 1;
+        }
+        i = j;
+    }
+    i = 0;
+    while (i < ng) {
+        const j : usize = db_run_end(buf, ws, tcap, ng, i);
+        const ls : usize = db_lfind(buf, p0, db_vname_o(ws, tcap, i), db_vname_l(ws, tcap, i), true);
+        if (ls < p0) {
+            const cs : usize = db_l_sp(buf, db_l_a(buf, ls, p0), db_l_e(buf, ls, p0)) + 1;
+            const ce : usize = db_l_e(buf, ls, p0);
+            const nl : usize = db_cnt_count(buf, cs, ce);
+            if (j - i > nl or db_cmp_lists(buf, ws, tcap, i, j - i, cs, ce) == CMP_GT) {
+                w = put_msg(out, w, cap, MSG_GROWN_A);
+                w = put_range(out, w, cap, buf, db_vname_o(ws, tcap, i), db_vname_o(ws, tcap, i) + db_vname_l(ws, tcap, i));
+                w = put_msg(out, w, cap, MSG_GROWN_B);
+                w = db_put_ledger(out, w, cap, buf, cs, ce);
+                w = put_msg(out, w, cap, MSG_GROWN_C);
+                w = db_put_view(out, w, cap, ws, tcap, i, j - i);
+                w = put(out, w, cap, '\n');
+                refused += 1;
+            }
+        }
+        i = j;
+    }
+    if (refused > 0) {
+        w = put(out, w, cap, '\n');
+        w = db_line(out, w, cap, MSG_REFUSE_1);
+        w = db_line(out, w, cap, MSG_REFUSE_2);
+        w = db_line(out, w, cap, MSG_REFUSE_3);
+        w = db_line(out, w, cap, MSG_REFUSE_4);
+        return db_done(out, w, cap, 1);
+    }
+    const w0 : usize = w;
+    w = db_line(out, w, cap, MSG_FAIL);
+    const wh : usize = w;
+    i = 0;
+    while (i < ng) {
+        const j : usize = db_run_end(buf, ws, tcap, ng, i);
+        const ls : usize = db_lfind(buf, p0, db_vname_o(ws, tcap, i), db_vname_l(ws, tcap, i), true);
+        if (ls < p0) {
+            const cs : usize = db_l_sp(buf, db_l_a(buf, ls, p0), db_l_e(buf, ls, p0)) + 1;
+            const ce : usize = db_l_e(buf, ls, p0);
+            if (j - i <= db_cnt_count(buf, cs, ce) and db_cmp_lists(buf, ws, tcap, i, j - i, cs, ce) == CMP_LT) {
+                w = put(out, w, cap, ' ');
+                w = put(out, w, cap, ' ');
+                w = put_range(out, w, cap, buf, db_vname_o(ws, tcap, i), db_vname_o(ws, tcap, i) + db_vname_l(ws, tcap, i));
+                w = put(out, w, cap, ' ');
+                w = put(out, w, cap, ' ');
+                w = db_put_ledger(out, w, cap, buf, cs, ce);
+                w = put_msg(out, w, cap, MSG_ARROW);
+                w = db_put_view(out, w, cap, ws, tcap, i, j - i);
+                w = put(out, w, cap, '\n');
+            }
+        }
+        i = j;
+    }
+    var ca : usize = 0;
+    var cl : usize = 0;
+    var have : bool = false;
+    var gl : usize = db_gone_next(buf, p0, ws, tcap, ng, ca, cl, have);
+    while (gl < p0) {
+        ca = db_l_a(buf, gl, p0);
+        cl = db_l_sp(buf, ca, db_l_e(buf, gl, p0)) - ca;
+        have = true;
+        w = put(out, w, cap, ' ');
+        w = put(out, w, cap, ' ');
+        w = put_range(out, w, cap, buf, ca, ca + cl);
+        w = db_line(out, w, cap, MSG_GONE);
+        gl = db_gone_next(buf, p0, ws, tcap, ng, ca, cl, have);
+    }
+    if (w == wh) {
+        w = db_line(out, w0, cap, MSG_OK);
+        return db_done(out, w, cap, 0);
+    }
+    w = put(out, w, cap, '\n');
+    w = db_line(out, w, cap, MSG_STALE_1);
+    w = db_line(out, w, cap, MSG_STALE_2);
+    w = db_line(out, w, cap, MSG_REFUSE_4);
+    return db_done(out, w, cap, 1);
+}
+
+/// The gate. buf[0 .. n) is the stream (ledger, then frames); out and cap are the text (cap = size - 1);
+/// sc and scn the scratch; ws and wcap the tables. Returns 0 holds, 1 refused, 2 could not run.
+pub fn run_all(buf: []const u8, n: usize, mode: u8, out: []u8, cap: usize, sc: []u8, scn: usize, ws: []u32, wcap: usize) -> u32 {
+    if (mode > MODE_BLESS_ALPHA) { return db_done(out, db_line(out, 0, cap, MSG_MODE), cap, 2); }
+    const p0 : usize = db_first_frame(buf, n);
+    if (!db_frames_ok(buf, p0, n)) { return db_done(out, db_line(out, 0, cap, MSG_FRAME), cap, 2); }
+    const nf : usize = db_frames_count(buf, p0, n);
+    if (nf == 0) { return db_done(out, db_line(out, 0, cap, MSG_NOSPEC), cap, 2); }
+    if (5 * db_frames_max(buf, p0, n) + 4 > scn) { return db_done(out, db_line(out, 0, cap, MSG_SCRATCH), cap, 2); }
+    const tcap : usize = wcap / NPART;
+    const m : usize = db_scan_all(buf, p0, n, mode == MODE_ALPHA or mode == MODE_BLESS_ALPHA, sc, ws, tcap);
+    if (m > tcap) { return db_done(out, db_line(out, 0, cap, MSG_TABLE), cap, 2); }
+    const sm : usize = db_sort(buf, ws, tcap, m, 4 * tcap, 0);
+    const ng : usize = db_groups(buf, ws, tcap, sm);
+    const sg : usize = db_sort(buf, ws, tcap, ng, 8 * tcap, 1);
+    if (mode >= MODE_BLESS_PLAIN) { return db_done(out, db_bless(buf, ws, tcap, sg, out, cap), cap, 0); }
+    if (db_lcount(buf, p0) == 0) { return db_done(out, db_line(out, 0, cap, MSG_NOLEDGER), cap, 2); }
+    return db_check(buf, p0, ws, tcap, m, sg, nf, out, cap);
+}
+
+// ---- tests: the lexical layer ----
+
+test the_mask_blanks_comments_and_keeps_every_offset {
+    var mk : [64]u8 = undefined;
+    assert db_mask("x // c\ny \"s\" z", 0, 14, &mk) == 14;
+    assert mk[0] == 'x';
+    assert mk[2] == ' ' and mk[5] == ' ';
+    assert mk[6] == '\n';
+    assert mk[7] == 'y';
+    assert mk[9] == ' ' and mk[11] == ' ';
+    assert mk[13] == 'z';
+}
+
+test a_semicolon_comment_needs_a_line_start_and_a_blank {
+    var mk : [64]u8 = undefined;
+    assert db_mask("; ab\nx;y\n;z\n", 0, 12, &mk) == 12;
+    assert mk[0] == ' ' and mk[3] == ' ';
+    assert mk[5] == 'x' and mk[6] == ';' and mk[7] == 'y';
+    assert mk[9] == ';' and mk[10] == 'z';
+}
+
+test an_apostrophe_in_a_comment_does_not_hide_the_next_function {
+    var mk : [64]u8 = undefined;
+    assert db_mask("; the Queen's\nfn a() {}\n; it's\n", 0, 31, &mk) == 31;
+    assert mk[14] == 'f' and mk[15] == 'n';
+    assert mk[23] == '\n' and mk[24] == ' ' and mk[29] == ' ';
+}
+
+test a_single_quote_ends_at_the_newline {
+    var mk : [64]u8 = undefined;
+    assert db_mask("w = 4'hF;\nfn a() {}\nv = 1'b0;\n", 0, 30, &mk) == 30;
+    assert mk[5] == '\'' and mk[6] == 'h';
+    assert mk[10] == 'f' and mk[11] == 'n';
+}
+
+test an_unclosed_block_comment_or_string_is_plain_text {
+    var mk : [64]u8 = undefined;
+    assert db_mask("a /* b\nc", 0, 8, &mk) == 8;
+    assert mk[2] == '/' and mk[3] == '*' and mk[5] == 'b';
+    assert db_mask("a \"b", 0, 4, &mk) == 4;
+    assert mk[2] == '"' and mk[3] == 'b';
+}
+
+test a_block_comment_and_an_escaped_quote_are_one_token {
+    var mk : [64]u8 = undefined;
+    assert db_mask("a/* x\n*/b \"q\\\"r\" c", 0, 18, &mk) == 18;
+    assert mk[0] == 'a' and mk[1] == ' ' and mk[5] == '\n' and mk[6] == ' ' and mk[7] == ' ';
+    assert mk[8] == 'b' and mk[10] == ' ' and mk[12] == ' ' and mk[15] == ' ';
+    assert mk[17] == 'c';
+}
+
+test a_header_is_the_function_regex_of_the_python_ratchet {
+    assert db_header_end("pub fn foo(x)", 0, 13) == 11;
+    assert db_header_end("  fn bar<T>(x)", 0, 14) == 9;
+    assert db_header_end("pub(crate) fn baz (x)", 0, 21) == 19;
+    assert db_header_end("pub\n  fn q(", 0, 11) == 11;
+    assert db_header_end("fn a(", 0, 5) == 5;
+}
+
+test a_header_refuses_what_is_not_a_function {
+    assert db_header_end("fnord(x)", 0, 8) == 0;
+    assert db_header_end("public fn x(", 0, 12) == 0;
+    assert db_header_end("pubfn x(", 0, 8) == 0;
+    assert db_header_end("fn (x)", 0, 6) == 0;
+    assert db_header_end("fn x: u8", 0, 8) == 0;
+    assert db_header_end("x fn y(", 0, 7) == 0;
+    assert db_header_end("pub(x fn y(", 0, 11) == 0;
+}
+
+test a_name_is_read_back_from_its_header {
+    assert db_name_end("pub fn  foo (x)", 12) == 11;
+    assert db_name_start("pub fn  foo (x)", 11) == 8;
+    assert db_name_end("fn a<T>(", 4) == 4;
+    assert db_name_start("fn a<T>(", 4) == 3;
+}
+
+test the_body_starts_at_the_first_brace_outside_parentheses_and_brackets {
+    assert db_body_start("fn a(x: [u8; 32]) { }", 4, 21) == 18;
+    assert db_body_start("fn a() -> u32; fn b() { }", 4, 25) == 25;
+    assert db_body_start("fn a(", 4, 5) == 5;
+    assert db_body_start("fn a(x: u8) -> [4]u8 { }", 4, 24) == 21;
+}
+
+test the_body_ends_at_the_matching_brace {
+    assert db_body_end("{ { } } x", 0, 9) == 6;
+    assert db_body_end("{ { }", 0, 5) == 5;
+    assert db_body_end("{}", 0, 2) == 1;
+}
+
+test the_plain_form_is_comment_free_and_one_space_wide {
+    var o : [64]u8 = undefined;
+    assert db_plain("{ a  b // c\n  d }", 0, 17, &o, 64) == 9;
+    assert o[0] == '{' and o[1] == ' ' and o[2] == 'a' and o[3] == ' ' and o[4] == 'b';
+    assert o[5] == ' ' and o[6] == 'd' and o[7] == ' ' and o[8] == '}';
+}
+
+test whitespace_inside_a_literal_is_kept {
+    var o : [64]u8 = undefined;
+    assert db_plain("{ \"a  b\" }", 0, 10, &o, 64) == 10;
+    assert o[3] == 'a' and o[4] == ' ' and o[5] == ' ' and o[6] == 'b';
+}
+
+test a_brace_in_a_string_or_a_comment_is_not_structure {
+    var mk : [64]u8 = undefined;
+    assert db_mask("{ \"}\" /* } */ x }", 0, 17, &mk) == 17;
+    assert db_body_end(&mk, 0, 17) == 16;
+}
+
+test the_character_count_counts_characters_not_bytes {
+    assert db_chars("abc", 3) == 3;
+    assert db_chars("a\xc3\xa9b", 4) == 3;
+}
+
+test the_hash_tells_texts_apart_and_keeps_equal_texts_together {
+    assert db_hash("abc", 3, BASE1, PRIME1, 1) == db_hash("abc", 3, BASE1, PRIME1, 1);
+    assert db_hash("abc", 3, BASE1, PRIME1, 1) != db_hash("abd", 3, BASE1, PRIME1, 1);
+    assert db_hash("abc", 3, BASE1, PRIME1, 1) != db_hash("abc", 3, BASE1, PRIME1, 2);
+    assert db_hash("abc", 3, BASE1, PRIME1, 1) != db_hash("abc", 2, BASE1, PRIME1, 1);
+    assert db_hash("abc", 3, BASE2, PRIME2, 1) != db_hash("abd", 3, BASE2, PRIME2, 1);
+}
+
+// ---- tests: the gate ----
+
+pub const SPEC_A : str = "fn alpha_one(x: u32) -> u32 {\n    var t : u32 = x + 1;\n    var u : u32 = t * 2;\n    return u + t + x + 100;\n}\n$";
+pub const SPEC_B : str = "fn alpha_two(x: u32) -> u32 {\n    var t : u32 = x + 1;\n    var u : u32 = t * 2;\n    return u + t + x + 100;\n}\n$";
+pub const SPEC_E : str = "fn alpha_zz(x: u32) -> u32 {\n    var t : u32 = x + 1;\n    var u : u32 = t * 2;\n    return u + t + x + 100;\n}\n$";
+pub const SPEC_C : str = "fn alpha_three(y: u32) -> u32 {\n    var s : u32 = y + 1;\n    var v : u32 = s * 2;\n    return v + s + y + 100;\n}\n$";
+pub const SPEC_C2 : str = "fn alpha_tz(y: u32) -> u32 {\n    var s : u32 = y + 1;\n    var v : u32 = s * 2;\n    return v + s + y + 100;\n}\n$";
+pub const SPEC_D : str = "fn alpha_four(x: u32) -> u32 {\n    var t : u32 = x + 1; // add one\n    /* double it */ var u : u32 = t * 2;\n\n    return u + t + x + 100;\n}\n$";
+pub const SPEC_AF : str = "fn alpha_one(x: u32) -> u32 {\n    var t : u32 = x + 1;\n    var u : u32 = t * 2;\n    return u + t + x + 100;\n}\n#file 7 evil.t27\nzzzzzzz\n$";
+pub const SPEC_N1 : str = "fn dup_n(x: u32) -> u32 {\n    var t : u32 = x + 1;\n    var u : u32 = t * 2;\n    return u + t + x + 100;\n}\n$";
+pub const SPEC_N2 : str = "fn dup_n(y: u32) -> u32 {\n    var s : u32 = y * 7;\n    var v : u32 = s - 3;\n    return v * s * y + 200;\n}\n$";
+pub const SPEC_TINY : str = "fn tiny(x: u32) -> u32 { return x + 1; }\n$";
+pub const SPEC_PROTO : str = "fn proto_a(x: u32) -> u32;\nfn proto_b(x: u32) -> u32;\n$";
+
+/// Run the gate on the stream st[0 .. n) with fixed buffers; the text lands in out (1024 bytes).
+fn t_run(st: []const u8, n: usize, mode: u8, out: []u8) -> u32 {
+    var sc : [4096]u8 = undefined;
+    var ws : [1800]u32 = undefined;
+    return run_all(st, n, mode, out, 1023, &sc, 4096, &ws, 1800);
+}
+
+/// The index in out of the first occurrence of the `$`-terminated msg; 100000 when it is not there.
+fn t_pos(out: []const u8, msg: []const u8) -> usize {
+    const ln : usize = db_msg_len(msg);
+    var i : usize = 0;
+    while (out[i] != 0) {
+        if (db_is_at(out, i, 1024, msg, ln)) { return i; }
+        i += 1;
+    }
+    return 100000;
+}
+
+fn t_has(out: []const u8, msg: []const u8) -> bool {
+    return t_pos(out, msg) < 100000;
+}
+
+fn t_len(out: []const u8) -> usize {
+    var i : usize = 0;
+    while (out[i] != 0) { i += 1; }
+    return i;
+}
+
+test a_frame_is_a_size_a_path_and_exactly_size_bytes {
+    var st : [256]u8 = undefined;
+    assert frame_put(&st, 0, 255, "p.t27$", "abc$") == 17;
+    assert db_frame_next(&st, 0, 17) == 17;
+    assert db_f_path(&st, 0, 17) == 8;
+    assert db_frame_next("#file 4 p\nabc", 0, 13) == 14;
+    assert db_frame_next("#file 0 \n", 0, 9) == 10;
+    assert db_frame_next("#file x p\n", 0, 10) == 11;
+    assert db_frame_next("file 1 p\nz", 0, 10) == 11;
+}
+
+test the_ledger_ends_where_the_first_frame_starts {
+    assert db_first_frame("x 2\n#file 1 a\nz", 15) == 4;
+    assert db_first_frame("#file x\nabc\n", 12) == 12;
+    assert db_first_frame("", 0) == 0;
+}
+
+test two_equal_bodies_form_a_group {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert w < 4095;
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert t_has(&out, "alpha_one 2\n$");
+    assert !t_has(&out, "alpha_two$");
+}
+
+test a_ledger_that_matches_holds {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = put_msg(&st, 0, 4095, "# note\nalpha_one 2\n$");
+    w = frame_put(&st, w, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 0;
+    assert t_has(&out, "duplicate bodies: 2 of 2 in 1 group(s) across 2 spec(s)\n$");
+    assert t_has(&out, "ok: no new duplicate body, and none of the known groups grew.$");
+}
+
+test a_group_missing_from_the_ledger_is_refused {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = put_msg(&st, 0, 4095, "other 2\n$");
+    w = frame_put(&st, w, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 1;
+    assert t_has(&out, "::error::a body written under alpha_one is now copied [2] time(s) and was in no ledger\n$");
+    assert t_has(&out, "A body written twice is a bug that has to be fixed twice.$");
+}
+
+test a_grown_group_is_refused {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = put_msg(&st, 0, 4095, "alpha_one 2\n$");
+    w = frame_put(&st, w, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    w = frame_put(&st, w, 4095, "specs/e.t27$", SPEC_E);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 1;
+    assert t_has(&out, "::error::alpha_one was copied [2] and is now copied [3]\n$");
+}
+
+test a_shrunk_group_asks_for_a_new_ledger {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = put_msg(&st, 0, 4095, "alpha_one 3\n$");
+    w = frame_put(&st, w, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 1;
+    assert t_has(&out, "FAIL: the corpus improved and the ledger did not move.\n$");
+    assert t_has(&out, "  alpha_one  [3] -> [2]\n$");
+}
+
+test gone_groups_are_listed_by_name {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = put_msg(&st, 0, 4095, "alpha_one 2\nmmm_gone 4,2\nbbb_gone 2\n$");
+    w = frame_put(&st, w, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 1;
+    assert t_has(&out, "  bbb_gone  gone\n$");
+    assert t_pos(&out, "  bbb_gone  gone$") < t_pos(&out, "  mmm_gone  gone$");
+    assert !t_has(&out, "  alpha_one  gone$");
+}
+
+test a_comment_only_difference_is_a_duplicate {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/d.t27$", SPEC_D);
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert t_has(&out, "alpha_four 2\n$");
+}
+
+test a_renamed_clone_is_a_duplicate_in_alpha_mode_only {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/c.t27$", SPEC_C);
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert !t_has(&out, "alpha_$");
+    assert t_run(&st, w, MODE_BLESS_ALPHA, &out) == 0;
+    assert t_has(&out, "alpha_one 2\n$");
+}
+
+test the_alpha_ledger_round_trips {
+    var st : [4096]u8 = undefined;
+    var st2 : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var out2 : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    w = frame_put(&st, w, 4095, "specs/c.t27$", SPEC_C);
+    assert t_run(&st, w, MODE_BLESS_ALPHA, &out) == 0;
+    assert t_has(&out, "alpha_one 3\n$");
+    var w2 : usize = put_range(&st2, 0, 4095, &out, 0, t_len(&out));
+    w2 = frame_put(&st2, w2, 4095, "specs/a.t27$", SPEC_A);
+    w2 = frame_put(&st2, w2, 4095, "specs/b.t27$", SPEC_B);
+    w2 = frame_put(&st2, w2, 4095, "specs/c.t27$", SPEC_C);
+    assert t_run(&st2, w2, MODE_ALPHA, &out2) == 0;
+    assert t_has(&out2, "ok: no new duplicate body, and none of the known groups grew.$");
+    assert t_run(&st2, w2, MODE_PLAIN, &out2) == 1;
+}
+
+test a_short_body_is_not_counted {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_TINY);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_TINY);
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert !t_has(&out, "tiny$");
+}
+
+test a_prototype_is_not_a_body {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_PROTO);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_PROTO);
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert !t_has(&out, "proto$");
+}
+
+test a_scratch_spec_is_not_in_the_corpus {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = put_msg(&st, 0, 4095, "zzz 2\n$");
+    w = frame_put(&st, w, 4095, "specs/scratch/x.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 1;
+    assert t_has(&out, "duplicate bodies: 0 of 1 in 0 group(s) across 1 spec(s)\n$");
+}
+
+test a_fake_frame_inside_a_file_does_not_split_it {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_AF);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert t_has(&out, "alpha_one 2\n$");
+}
+
+test the_larger_group_is_listed_first {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    w = frame_put(&st, w, 4095, "specs/e.t27$", SPEC_E);
+    w = frame_put(&st, w, 4095, "specs/c.t27$", SPEC_C);
+    w = frame_put(&st, w, 4095, "specs/d.t27$", SPEC_C2);
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert t_has(&out, "alpha_one 3\n$");
+    assert t_has(&out, "alpha_three 2\n$");
+    assert t_pos(&out, "alpha_one 3$") < t_pos(&out, "alpha_three 2$");
+}
+
+test two_bodies_under_one_name_are_one_ledger_line {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = put_msg(&st, 0, 4095, "dup_n 3,2\n$");
+    w = frame_put(&st, w, 4095, "specs/a.t27$", SPEC_N1);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_N1);
+    w = frame_put(&st, w, 4095, "specs/c.t27$", SPEC_N2);
+    w = frame_put(&st, w, 4095, "specs/d.t27$", SPEC_N2);
+    w = frame_put(&st, w, 4095, "specs/e.t27$", SPEC_N2);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 0;
+    assert t_run(&st, w, MODE_BLESS_PLAIN, &out) == 0;
+    assert t_has(&out, "dup_n 3,2\n$");
+    var st2 : [4096]u8 = undefined;
+    var w2 : usize = put_msg(&st2, 0, 4095, "dup_n 2\n$");
+    w2 = frame_put(&st2, w2, 4095, "specs/a.t27$", SPEC_N1);
+    w2 = frame_put(&st2, w2, 4095, "specs/b.t27$", SPEC_N1);
+    w2 = frame_put(&st2, w2, 4095, "specs/c.t27$", SPEC_N2);
+    w2 = frame_put(&st2, w2, 4095, "specs/d.t27$", SPEC_N2);
+    w2 = frame_put(&st2, w2, 4095, "specs/e.t27$", SPEC_N2);
+    assert t_run(&st2, w2, MODE_PLAIN, &out) == 1;
+    assert t_has(&out, "::error::dup_n was copied [2] and is now copied [3, 2]\n$");
+}
+
+test what_cannot_run_is_never_a_pass {
+    var out : [1024]u8 = undefined;
+    assert t_run("#file 99 a.t27\nshort\n", 21, MODE_PLAIN, &out) == 2;
+    assert t_has(&out, "could not run: the stream holds a malformed frame$");
+    assert t_run("alpha_one 2\n", 12, MODE_PLAIN, &out) == 2;
+    assert t_has(&out, "could not run: the stream holds no spec$");
+    assert t_run("#file 0 \n", 9, MODE_PLAIN, &out) == 2;
+    assert t_run("", 0, 9, &out) == 2;
+    assert t_has(&out, "could not run: the mode is not 0, 1, 2 or 3\n$");
+}
+
+test no_ledger_cannot_check {
+    var st : [4096]u8 = undefined;
+    var out : [1024]u8 = undefined;
+    var w : usize = frame_put(&st, 0, 4095, "specs/a.t27$", SPEC_A);
+    w = frame_put(&st, w, 4095, "specs/b.t27$", SPEC_B);
+    assert t_run(&st, w, MODE_PLAIN, &out) == 2;
+    assert t_has(&out, "could not run: no ledger in front of the files; bless once\n$");
+}
