@@ -98,3 +98,17 @@ gh workflow run auto-merge-ready-prs.yml -R gHashTag/t27 -f dry_run=true
 `https://github.com/settings/apps/t27-bees` -> *Private keys* -> delete, then
 generate a new one and replace the file at the stored path. Removing the
 installation stops the bot everywhere at once.
+
+## Key and model matrix (probe of 2026-10-25, live calls)
+
+| Route | Price | Status that day |
+|---|---|---|
+| z.ai glm-4.5-flash (api.z.ai/api/anthropic) | $0 | ALIVE on ZAI_KEY_1, 2, 3, 5, 6 |
+| z.ai glm-4.7-flash (api.z.ai/api/anthropic) | $0 | ALIVE on ZAI_KEY_1, 3, 6; 2 and 5 unprobed that day |
+| zai-coding-plan glm-5.3-flash (opencode harness) | $0 | ALIVE (probe subagent answered) |
+| zai-coding-plan glm-5.3-highspeed | listed $0 | REFUSED -- "subscription plan does not yet include access" |
+
+A 401 on one model is not key death: the same hour every key answered on
+glm-4.5-flash. Re-probe the matrix before touching the pool. The routing law and
+the standing subagent header live in the skill free-fleet-routing; the scanner
+spec is issue #12170.

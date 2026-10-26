@@ -50,7 +50,7 @@ Output:
 
 ```bash
 # Record mistake (for experience learning)
-tri experience record --mistake "TRINITY value incorrect"
+tri experience record --mistake "TRINITY value incorrect" <!-- not built as a t27c subcommand -->
 --spec specs/math/sacred_physics.t27 \
 --hash a1b2c3d4... \
 --verdict toxic \
@@ -86,14 +86,14 @@ pub const TRINITY_EXTENDED: PackedTrit = @as(PackedTrit, 0b10_01_00_01);  // New
 
 ```bash
 tri skill begin "sacred-physics-extension"
-tri spec edit math/sacred_physics
-tri skill seal --hash
+tri spec edit math/sacred_physics <!-- not built as a t27c subcommand -->
+tri skill seal --hash <!-- not built as a t27c subcommand -->
 tri gen
 tri test
 tri verdict --sacred  # Now returns CLEAN
 tri experience save
-tri skill commit
-tri git commit -m "feat(sacred): add TRINITY_EXTENDED constant
+tri skill commit <!-- not built as a t27c subcommand -->
+tri git commit -m "feat(sacred): add TRINITY_EXTENDED constant <!-- not built as a t27c subcommand -->
 
 Hash seal: [computed]
 

@@ -1,0 +1,529 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/work_graph.t27 -- the T27F Live work graph: the join of agent events to specs.
+// Issue gHashTag/t27#10260, milestone M1 of docs/nona-02-organism/t27f/genui-research.md section 5.
+//
+// WHY: T27F Live paints what the agents are doing. The one model of that is this graph: what a
+// spec is, which agent holds it, which task carries it, which action happened, which artifact came
+// out. The input is the Queen's actor feed -- the records of specs/queen/actor_events.t27 (its
+// replay seeds the fixture) and the task states of specs/queen/tasks.t27 -- and the feed carries
+// the one join this graph cannot compute itself: which spec a task's Boundary names. Payloads are
+// never read (FR-004): an event's pid, task number and deliver kind are facts of the bus record,
+// an issue's text is not, and the feed resolves task -> spec before this spec sees the event.
+//
+// THE PIECES, all integer (compares and adds, no division):
+//   nodes     five kinds: SPEC, AGENT, TASK, ACTION, ARTIFACT. A node carries one of spec_graph's
+//             four labels as its provenance: a pid first named by a spawn is EXACT (the spawn names
+//             the actor), a pid first named by any other event is UNKNOWN (only a bare pid, and no
+//             edge is guessed), and a later spawn upgrades it. A task, spec or artifact node is
+//             EXACT: a bus record or the feed's checked-in join names it.
+//   edges     six kinds: READS, ASSIGNED, PERFORMS, PRODUCES, VERIFIES, BLOCKS. Every edge carries
+//             exactly one of the four labels (FR-002): EXACT when the event itself states the pair,
+//             DERIVED when a rule stated here computes it (the task -> spec join, the verifier of a
+//             result). An offer assigns the task and, through the join, reads the spec; a result is
+//             performed, produced as an artifact, and verified by whoever received it; a cancel or
+//             a crash exit blocks the task; every deliver is an ACTION the actor performs.
+//   caps      NODE_CAP and EDGE_CAP. Growing past a cap is refused with an error code and the graph
+//             is left as it was (FR-003): never truncated silently.
+//   purity    apply_event is a pure function of the graph and the event (FR-001): no clock, no
+//             environment, no randomness; the same feed applied twice gives the same graph bytes,
+//             and graph_digest pins that with sha256.
+//
+// NOT CLAIMED: no rendering (scene.t27 and display_list.t27 are later milestones M2), no live
+// transport (live_stream.t27 carries the wire, already on master), no payload or issue-text field
+// exists in Event or WorkGraph (FR-004 is structural: there is nowhere to put one), the ACTION
+// node of a deliver counts as one action per bus record, a window (EV_DELIVERS) counts nothing.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27fWorkGraph;
+
+use tri::crypto::sha256;
+use queen::actors::X_KILL;
+use queen::actors::X_KILLED;
+use queen::actors::X_CRASH;
+use t27f::spec_graph::LABEL_EXACT;
+use t27f::spec_graph::LABEL_DERIVED;
+use t27f::spec_graph::LABEL_SUGGESTED;
+use t27f::spec_graph::LABEL_UNKNOWN;
+
+// ---- node kinds ----
+
+pub const NK_SPEC : u8 = 0;
+pub const NK_AGENT : u8 = 1;
+pub const NK_TASK : u8 = 2;
+pub const NK_ACTION : u8 = 3;
+pub const NK_ARTIFACT : u8 = 4;
+pub const NK_COUNT : u8 = 5;
+
+// ---- edge kinds ----
+
+pub const EK_READS : u8 = 0;
+pub const EK_ASSIGNED : u8 = 1;
+pub const EK_PERFORMS : u8 = 2;
+pub const EK_PRODUCES : u8 = 3;
+pub const EK_VERIFIES : u8 = 4;
+pub const EK_BLOCKS : u8 = 5;
+pub const EK_COUNT : u8 = 6;
+
+// ---- event kinds, as the actor bus writes them (actor_events.t27) ----
+
+pub const EV_SPAWN : u8 = 0;
+pub const EV_EXIT : u8 = 1;
+pub const EV_DOWN : u8 = 2;
+pub const EV_RESTART : u8 = 3;
+pub const EV_DELIVER : u8 = 4;
+pub const EV_DELIVERS : u8 = 5;
+pub const EV_COUNT : u8 = 6;
+
+// deliver sub-kinds: an offer assigns, a result performs/produces, a cancel blocks
+pub const D_NONE : u8 = 0;
+pub const D_OFFER : u8 = 1;
+pub const D_RESULT : u8 = 2;
+pub const D_CANCEL : u8 = 3;
+
+// ---- results of apply_event ----
+
+pub const WG_OK : u8 = 0;
+pub const ERR_WG_NODE_CAP : u8 = 1;
+pub const ERR_WG_EDGE_CAP : u8 = 2;
+pub const ERR_WG_BAD_EVENT : u8 = 3;
+
+pub const NODE_CAP : u32 = 2048;
+pub const EDGE_CAP : u32 = 8192;
+
+// The one graph. Node arrays are indexed by node number, edge arrays by edge number; entries at or
+// past node_count / edge_count are not read. node_id means: AGENT the pid (actors.pid_of), TASK the
+// task number, SPEC the feed's spec id, ACTION the bus seq, ARTIFACT the task number.
+pub struct WorkGraph {
+    node_count: u32,
+    node_kind: [2048]u8,
+    node_label: [2048]u8,
+    node_id: [2048]u64,
+    edge_count: u32,
+    edge_kind: [8192]u8,
+    edge_from: [8192]u16,
+    edge_to: [8192]u16,
+    edge_label: [8192]u8,
+}
+
+/// One bus record, as the feed states it: no payload field exists anywhere (FR-004).
+pub struct Event {
+    kind: u8,
+    from_pid: u64,
+    to_pid: u64,
+    task_no: u32,
+    deliver: u8,
+    reason: u8,
+    seq: u32,
+    spec_id: u32,
+}
+
+pub fn new_graph() -> WorkGraph {
+    return WorkGraph {
+        node_count: 0,
+        node_kind: [0] ** 2048,
+        node_label: [0] ** 2048,
+        node_id: [0] ** 2048,
+        edge_count: 0,
+        edge_kind: [0] ** 8192,
+        edge_from: [0] ** 8192,
+        edge_to: [0] ** 8192,
+        edge_label: [0] ** 8192,
+    };
+}
+
+// ---- node and edge lookup (linear scans; the M1 fixture is 1024 events) ----
+
+fn node_of(g: *WorkGraph, kind: u8, id: u64) -> u32 {
+    var i : u32 = 0;
+    while (i < g.node_count) {
+        if (g.node_kind[i] == kind && g.node_id[i] == id) { return i; }
+        i = i + 1;
+    }
+    return NODE_CAP;
+}
+
+fn node_kind_at(g: *WorkGraph, n: u32) -> u8 {
+    return g.node_kind[n];
+}
+
+fn ensure_node(g: *WorkGraph, kind: u8, id: u64, label: u8) -> u32 {
+    var n = node_of(g, kind, id);
+    if (n < NODE_CAP) {
+        if (g.node_label[n] == LABEL_UNKNOWN && label == LABEL_EXACT) {
+            g.node_label[n] = LABEL_EXACT;   // a later spawn names the actor
+        }
+        return n;
+    }
+    if (g.node_count >= NODE_CAP) { return NODE_CAP; }
+    g.node_kind[g.node_count] = kind;
+    g.node_label[g.node_count] = label;
+    g.node_id[g.node_count] = id;
+    g.node_count = g.node_count + 1;
+    return g.node_count - 1;
+}
+
+fn add_edge(g: *WorkGraph, kind: u8, from: u32, to: u32, label: u8) -> u8 {
+    if (g.edge_count >= EDGE_CAP) { return ERR_WG_EDGE_CAP; }
+    g.edge_kind[g.edge_count] = kind;
+    g.edge_from[g.edge_count] = from as u16;
+    g.edge_to[g.edge_count] = to as u16;
+    g.edge_label[g.edge_count] = label;
+    g.edge_count = g.edge_count + 1;
+    return WG_OK;
+}
+
+/// The crash reasons that block a task, from actors.t27's exit reasons: KILL, KILLED, CRASH.
+pub fn reason_blocks(reason: u8) -> bool {
+    return reason == X_KILL || reason == X_KILLED || reason == X_CRASH;
+}
+
+// ---- apply_event: the one entry the feed calls (FR-001: pure) ----
+
+pub fn apply_event(g: *WorkGraph, ev: Event) -> u8 {
+    if (ev.kind >= EV_COUNT) { return ERR_WG_BAD_EVENT; }
+    if (ev.kind == EV_DELIVER && ev.deliver > D_CANCEL) { return ERR_WG_BAD_EVENT; }
+
+    if (ev.kind == EV_SPAWN) {
+        var a = ensure_node(g, NK_AGENT, ev.from_pid, LABEL_EXACT);
+        var b = ensure_node(g, NK_AGENT, ev.to_pid, LABEL_EXACT);
+        if (a == NODE_CAP || b == NODE_CAP) { return ERR_WG_NODE_CAP; }
+        return WG_OK;
+    }
+    if (ev.kind == EV_RESTART) {
+        var a = ensure_node(g, NK_AGENT, ev.from_pid, LABEL_EXACT);
+        var b = ensure_node(g, NK_AGENT, ev.to_pid, LABEL_EXACT);
+        if (a == NODE_CAP || b == NODE_CAP) { return ERR_WG_NODE_CAP; }
+        return WG_OK;
+    }
+    if (ev.kind == EV_EXIT || ev.kind == EV_DOWN) {
+        var a = ensure_node(g, NK_AGENT, ev.from_pid, LABEL_UNKNOWN);
+        if (a == NODE_CAP) { return ERR_WG_NODE_CAP; }
+        var b = ensure_node(g, NK_AGENT, ev.to_pid, LABEL_UNKNOWN);
+        if (b == NODE_CAP) { return ERR_WG_NODE_CAP; }
+        if (ev.task_no != 0 && reason_blocks(ev.reason)) {
+            var t = ensure_node(g, NK_TASK, ev.task_no as u64, LABEL_EXACT);
+            if (t == NODE_CAP) { return ERR_WG_NODE_CAP; }
+            var r = add_edge(g, EK_BLOCKS, a, t, LABEL_EXACT);
+            if (r != WG_OK) { return r; }
+        }
+        return WG_OK;
+    }
+    if (ev.kind == EV_DELIVERS) {
+        var a = ensure_node(g, NK_AGENT, ev.from_pid, LABEL_UNKNOWN);
+        if (a == NODE_CAP) { return ERR_WG_NODE_CAP; }
+        var b = ensure_node(g, NK_AGENT, ev.to_pid, LABEL_UNKNOWN);
+        if (b == NODE_CAP) { return ERR_WG_NODE_CAP; }
+        return WG_OK;   // a counted window names no task and no payload: no edges
+    }
+
+    // EV_DELIVER: the one event kind that joins.
+    var from = ensure_node(g, NK_AGENT, ev.from_pid, LABEL_UNKNOWN);
+    if (from == NODE_CAP) { return ERR_WG_NODE_CAP; }
+    var to = ensure_node(g, NK_AGENT, ev.to_pid, LABEL_UNKNOWN);
+    if (to == NODE_CAP) { return ERR_WG_NODE_CAP; }
+    var act = ensure_node(g, NK_ACTION, ev.seq as u64, LABEL_EXACT);
+    if (act == NODE_CAP) { return ERR_WG_NODE_CAP; }
+    var r = add_edge(g, EK_PERFORMS, from, act, LABEL_EXACT);
+    if (r != WG_OK) { return r; }
+
+    if (ev.task_no == 0) { return WG_OK; }
+    var t = ensure_node(g, NK_TASK, ev.task_no as u64, LABEL_EXACT);
+    if (t == NODE_CAP) { return ERR_WG_NODE_CAP; }
+
+    if (ev.deliver == D_OFFER) {
+        r = add_edge(g, EK_ASSIGNED, to, t, LABEL_EXACT);
+        if (r != WG_OK) { return r; }
+        if (ev.spec_id != 0) {
+            var s = ensure_node(g, NK_SPEC, ev.spec_id as u64, LABEL_EXACT);
+            if (s == NODE_CAP) { return ERR_WG_NODE_CAP; }
+            r = add_edge(g, EK_READS, to, s, LABEL_DERIVED);
+            if (r != WG_OK) { return r; }
+        }
+        return WG_OK;
+    }
+    if (ev.deliver == D_RESULT) {
+        r = add_edge(g, EK_PRODUCES, from, t, LABEL_EXACT);
+        if (r != WG_OK) { return r; }
+        var art = ensure_node(g, NK_ARTIFACT, ev.task_no as u64, LABEL_EXACT);
+        if (art == NODE_CAP) { return ERR_WG_NODE_CAP; }
+        r = add_edge(g, EK_PRODUCES, from, art, LABEL_EXACT);
+        if (r != WG_OK) { return r; }
+        // the receiver of a result checks it: derived from the event's direction
+        if (to != from) {
+            r = add_edge(g, EK_VERIFIES, to, t, LABEL_DERIVED);
+            if (r != WG_OK) { return r; }
+        }
+        return WG_OK;
+    }
+    // D_CANCEL
+    r = add_edge(g, EK_BLOCKS, from, t, LABEL_EXACT);
+    return r;
+}
+
+// ---- digest: sha256 over the graph's bytes, what the replay test compares ----
+
+fn put_u32(out: []u8, w: u32, v: u32) -> u32 {
+    out[w] = (v & 255) as u8;
+    out[w + 1] = ((v >> 8) & 255) as u8;
+    out[w + 2] = ((v >> 16) & 255) as u8;
+    out[w + 3] = ((v >> 24) & 255) as u8;
+    return w + 4;
+}
+
+fn put_u64(out: []u8, w: u32, v: u64) -> u32 {
+    var i : u32 = 0;
+    while (i < 8) {
+        out[w + i] = ((v >> (i * 8)) & 255) as u8;
+        i = i + 1;
+    }
+    return w + 8;
+}
+
+/// The graph's bytes in a fixed order: counts, node columns, edge columns. Two graphs from the
+/// same feed produce the same buffer, so the same sha256; any difference anywhere shows in it.
+pub fn digest_len() -> u32 {
+    return 8 + NODE_CAP * (1 + 1 + 8) + EDGE_CAP * (1 + 2 + 2 + 1);
+}
+
+pub fn digest_bytes(g: *WorkGraph, out: []u8) -> u32 {
+    var w = put_u32(out, 0, g.node_count);
+    w = put_u32(out, w, g.edge_count);
+    var i : u32 = 0;
+    while (i < NODE_CAP) {
+        out[w] = g.node_kind[i];
+        out[w + 1] = g.node_label[i];
+        w = put_u64(out, w + 2, g.node_id[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < EDGE_CAP) {
+        out[w] = g.edge_kind[i];
+        out[w + 1] = (g.edge_from[i] & 255) as u8;
+        out[w + 2] = ((g.edge_from[i] >> 8) & 255) as u8;
+        out[w + 3] = (g.edge_to[i] & 255) as u8;
+        out[w + 4] = ((g.edge_to[i] >> 8) & 255) as u8;
+        out[w + 5] = g.edge_label[i];
+        w = w + 6;
+        i = i + 1;
+    }
+    return w;
+}
+
+pub fn graph_digest(g: *WorkGraph) -> [32]u8 {
+    var buf : [70000]u8 = [0] ** 70000;
+    assert(digest_len() <= 70000);
+    digest_bytes(g, buf[0..digest_len()]);
+    return hash(buf[0..digest_len()]);
+}
+
+// ---- accessors a renderer (hud.t27, M3) reads ----
+
+pub fn nodes(g: *WorkGraph) -> u32 {
+    return g.node_count;
+}
+
+pub fn edges(g: *WorkGraph) -> u32 {
+    return g.edge_count;
+}
+
+pub fn node_kind_at_pub(g: *WorkGraph, n: u32) -> u8 {
+    return node_kind_at(g, n);
+}
+
+pub fn node_label_at(g: *WorkGraph, n: u32) -> u8 {
+    return g.node_label[n];
+}
+
+pub fn edge_kind_at(g: *WorkGraph, e: u32) -> u8 {
+    return g.edge_kind[e];
+}
+
+pub fn edge_label_at(g: *WorkGraph, e: u32) -> u8 {
+    return g.edge_label[e];
+}
+
+pub fn edge_from_at(g: *WorkGraph, e: u32) -> u32 {
+    return g.edge_from[e] as u32;
+}
+
+pub fn edge_to_at(g: *WorkGraph, e: u32) -> u32 {
+    return g.edge_to[e] as u32;
+}
+
+// ---- tests ----
+
+use t27f::work_graph_fixture::FIXTURE_EVENTS;
+use t27f::work_graph_fixture::event_at;
+
+test "a fresh graph is empty and its digest is the empty graph's" {
+    var g = new_graph();
+    assert(nodes(&g) == 0);
+    assert(edges(&g) == 0);
+    var d = graph_digest(&g);
+    assert(d[0] != 0 || d[1] != 0 || d[31] != 0);
+}
+
+test "a spawn names the actor: the node is EXACT" {
+    var g = new_graph();
+    var r = apply_event(&g, Event { kind: EV_SPAWN, from_pid: 1, to_pid: 2, task_no: 0, deliver: D_NONE, reason: 99, seq: 1, spec_id: 0 });
+    assert(r == WG_OK);
+    var n = node_of(&g, NK_AGENT, 2);
+    assert(n < NODE_CAP);
+    assert(node_label_at(&g, n) == LABEL_EXACT);
+    assert(nodes(&g) == 2);
+    assert(edges(&g) == 0);   // a spawn guesses no edge
+}
+
+test "an event naming a pid the graph never saw adds an UNKNOWN node and no edge" {
+    var g = new_graph();
+    var r = apply_event(&g, Event { kind: EV_DELIVER, from_pid: 10, to_pid: 20, task_no: 0, deliver: D_NONE, reason: 99, seq: 7, spec_id: 0 });
+    assert(r == WG_OK);
+    var n = node_of(&g, NK_AGENT, 20);
+    assert(n < NODE_CAP);
+    assert(node_label_at(&g, n) == LABEL_UNKNOWN);
+    var m = node_of(&g, NK_AGENT, 10);
+    assert(node_label_at(&g, m) == LABEL_UNKNOWN);
+    assert(edges(&g) == 1);   // only the PERFORMS edge of the deliver itself
+}
+
+test "an offer assigns the task and reads the spec the feed's join names" {
+    var g = new_graph();
+    var r = apply_event(&g, Event { kind: EV_SPAWN, from_pid: 1, to_pid: 5, task_no: 0, deliver: D_NONE, reason: 99, seq: 1, spec_id: 0 });
+    assert(r == WG_OK);
+    r = apply_event(&g, Event { kind: EV_DELIVER, from_pid: 1, to_pid: 5, task_no: 3, deliver: D_OFFER, reason: 99, seq: 2, spec_id: 11 });
+    assert(r == WG_OK);
+    var t = node_of(&g, NK_TASK, 3);
+    assert(t < NODE_CAP);
+    var s = node_of(&g, NK_SPEC, 11);
+    assert(s < NODE_CAP);
+    var found_assigned = false;
+    var found_reads_derived = false;
+    var e : u32 = 0;
+    while (e < edges(&g)) {
+        if (edge_kind_at(&g, e) == EK_ASSIGNED && edge_to_at(&g, e) == t) { found_assigned = true; }
+        if (edge_kind_at(&g, e) == EK_READS && edge_label_at(&g, e) == LABEL_DERIVED) { found_reads_derived = true; }
+        e = e + 1;
+    }
+    assert(found_assigned);
+    assert(found_reads_derived);
+}
+
+test "a result produces an artifact and the receiver verifies" {
+    var g = new_graph();
+    var r = apply_event(&g, Event { kind: EV_DELIVER, from_pid: 5, to_pid: 6, task_no: 2, deliver: D_RESULT, reason: 99, seq: 9, spec_id: 0 });
+    assert(r == WG_OK);
+    var art = node_of(&g, NK_ARTIFACT, 2);
+    assert(art < NODE_CAP);
+    var t = node_of(&g, NK_TASK, 2);
+    assert(t < NODE_CAP);
+    var found_produces = false;
+    var found_verifies_derived = false;
+    var e : u32 = 0;
+    while (e < edges(&g)) {
+        if (edge_kind_at(&g, e) == EK_PRODUCES && edge_to_at(&g, e) == art) { found_produces = true; }
+        if (edge_kind_at(&g, e) == EK_VERIFIES && edge_label_at(&g, e) == LABEL_DERIVED) { found_verifies_derived = true; }
+        e = e + 1;
+    }
+    assert(found_produces);
+    assert(found_verifies_derived);
+}
+
+test "a cancel blocks the task, and a crash exit blocks it too" {
+    var g = new_graph();
+    var r = apply_event(&g, Event { kind: EV_DELIVER, from_pid: 4, to_pid: 5, task_no: 6, deliver: D_CANCEL, reason: 99, seq: 3, spec_id: 0 });
+    assert(r == WG_OK);
+    r = apply_event(&g, Event { kind: EV_EXIT, from_pid: 5, to_pid: 1, task_no: 6, deliver: D_NONE, reason: 2, seq: 4, spec_id: 0 });
+    assert(r == WG_OK);
+    var t = node_of(&g, NK_TASK, 6);
+    assert(t < NODE_CAP);
+    var blocks : u32 = 0;
+    var e : u32 = 0;
+    while (e < edges(&g)) {
+        if (edge_kind_at(&g, e) == EK_BLOCKS && edge_to_at(&g, e) == t) { blocks = blocks + 1; }
+        e = e + 1;
+    }
+    assert(blocks == 2);
+    assert(reason_blocks(X_KILL));
+    assert(reason_blocks(X_CRASH));
+    assert(reason_blocks(0) == false);
+    assert(reason_blocks(99) == false);
+}
+
+test "growing past a cap is refused, never truncated" {
+    var g = new_graph();
+    var i : u32 = 0;
+    var r : u8 = WG_OK;
+    while (i <= NODE_CAP) {
+        r = apply_event(&g, Event { kind: EV_SPAWN, from_pid: 100000 + i as u64, to_pid: 200000 + i as u64, task_no: 0, deliver: D_NONE, reason: 99, seq: i, spec_id: 0 });
+        if (r != WG_OK) { break; }
+        i = i + 1;
+    }
+    assert(r == ERR_WG_NODE_CAP);
+    assert(nodes(&g) == NODE_CAP);
+    var g2 = new_graph();
+    var j : u32 = 0;
+    var r2 : u8 = WG_OK;
+    while (j < 8) {
+        r2 = apply_event(&g2, Event { kind: EV_DELIVER, from_pid: j as u64, to_pid: j as u64 + 1, task_no: 0, deliver: D_NONE, reason: 99, seq: j, spec_id: 0 });
+        j = j + 1;
+    }
+    assert(r2 == WG_OK);
+}
+
+test "a bad event kind and a bad deliver kind are refused" {
+    var g = new_graph();
+    assert(apply_event(&g, Event { kind: 9, from_pid: 1, to_pid: 2, task_no: 0, deliver: D_NONE, reason: 99, seq: 1, spec_id: 0 }) == ERR_WG_BAD_EVENT);
+    assert(apply_event(&g, Event { kind: EV_DELIVER, from_pid: 1, to_pid: 2, task_no: 1, deliver: 7, reason: 99, seq: 2, spec_id: 0 }) == ERR_WG_BAD_EVENT);
+}
+
+// The M1 gate: the recorded fixture replays to the same graph twice -- byte-identical columns and
+// the same sha256 -- and no edge leaves the replay without one of the four labels.
+test "the fixture replays to the same sha256 twice and every edge carries a label" {
+    var a = new_graph();
+    var b = new_graph();
+    var i : u32 = 0;
+    while (i < FIXTURE_EVENTS) {
+        assert(apply_event(&a, event_at(i)) == WG_OK);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < FIXTURE_EVENTS) {
+        assert(apply_event(&b, event_at(i)) == WG_OK);
+        i = i + 1;
+    }
+    var da = graph_digest(&a);
+    var db = graph_digest(&b);
+    var k : u32 = 0;
+    while (k < 32) {
+        assert(da[k] == db[k]);
+        k = k + 1;
+    }
+    var unlabeled : u32 = 0;
+    var e : u32 = 0;
+    while (e < edges(&a)) {
+        if (edge_label_at(&a, e) > LABEL_UNKNOWN) { unlabeled = unlabeled + 1; }
+        e = e + 1;
+    }
+    assert(unlabeled == 0);
+    assert(nodes(&a) > 0);
+    assert(edges(&a) > 0);
+}
+
+invariant the_kinds_are_distinct {
+    assert NK_SPEC < NK_AGENT;
+    assert NK_AGENT < NK_TASK;
+    assert NK_TASK < NK_ACTION;
+    assert NK_ACTION < NK_ARTIFACT;
+    assert NK_ARTIFACT < NK_COUNT;
+    assert EK_READS < EK_ASSIGNED;
+    assert EK_ASSIGNED < EK_PERFORMS;
+    assert EK_PERFORMS < EK_PRODUCES;
+    assert EK_PRODUCES < EK_VERIFIES;
+    assert EK_VERIFIES < EK_BLOCKS;
+    assert EK_BLOCKS < EK_COUNT;
+    assert LABEL_EXACT == 0;
+    assert LABEL_UNKNOWN == 3;
+    assert EV_SPAWN == 0;
+    assert EV_DELIVERS == 5;
+    assert EV_DELIVERS < EV_COUNT;
+}

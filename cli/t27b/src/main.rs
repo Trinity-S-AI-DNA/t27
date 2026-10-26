@@ -15,7 +15,7 @@ use t27b::timing::Phases;
 #[path = "../../../gen/rust/tri/t27b/check_budget.rs"] #[allow(dead_code, unused_parens)] mod check_budget; // --check fuel policy, t27c gen-rust of specs/tri/t27b/check_budget.t27 (#6664)
 #[path = "../../../gen/rust/tri/t27b/watch_build.rs"] #[allow(dead_code, unused_parens)] mod watch_build; // `t27b watch`: when to build, the temp path, when --then runs (#10859)
 use t27b::blockers::{self, Reference, Verdicts};
-use t27b::{a64, front, lower, macho};
+use t27b::{a64, front, lower, macho, wasm32_emitter};
 
 const EXIT_FAIL: u8 = 1;
 const EXIT_UNSUPPORTED: u8 = 2;
@@ -56,6 +56,7 @@ struct Opts {
     then: Option<String>,
     cmd: String,
     input: Option<String>,
+    entry: Option<String>,
     out: Option<String>,
     mode: OverflowMode,
     time: bool,
@@ -67,6 +68,8 @@ struct Opts {
     runner: Vec<String>,
     blockers: bool,
     elf: bool,
+    /// `--target wasm32` (`t27b build`): emit a WebAssembly module, not an object file.
+    target: Option<String>,
     reference: Option<String>,
     reference_cache: Option<String>,
     reference_timeout_ms: u64,
@@ -87,6 +90,7 @@ fn parse_args() -> Result<Opts, String> {
         cmd,
         then: None,
         input: None,
+        entry: None,
         out: None,
         mode: OverflowMode::Trap,
         time: false,
@@ -98,6 +102,7 @@ fn parse_args() -> Result<Opts, String> {
         runner: Vec::new(),
         blockers: false,
         elf: cfg!(target_os = "linux"),
+        target: None,
         reference: None,
         reference_cache: None,
         reference_timeout_ms: 300_000,
@@ -105,13 +110,7 @@ fn parse_args() -> Result<Opts, String> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "-o" => o.out = Some(args.next().ok_or("-o needs a path")?),
-            "--overflow" => {
-                o.mode = match args.next().as_deref() {
-                    Some("trap") => OverflowMode::Trap,
-                    Some("wrap") => OverflowMode::Wrap,
-                    _ => return Err("--overflow takes trap or wrap".into()),
-                }
-            }
+            "--overflow" => o.mode = match args.next().as_deref() { Some("trap") => OverflowMode::Trap, Some("wrap") => OverflowMode::Wrap, _ => return Err("--overflow takes trap or wrap".into()) },
             "--then" => o.then = Some(args.next().ok_or("--then needs a command")?),
             "--time" => o.time = true,
             "--quiet" | "-q" => o.quiet = true,
@@ -121,14 +120,16 @@ fn parse_args() -> Result<Opts, String> {
             "--blockers" => o.blockers = true,
             "--elf" => o.elf = true,
             "--macho" => o.elf = false,
+            "--target" => {
+                let t = args.next().ok_or("--target needs a value")?;
+                if t != "wasm32" {
+                    return Err(format!("--target takes wasm32, not {}", t));
+                }
+                o.target = Some(t);
+            }
             "--reference" => o.reference = Some(args.next().ok_or("--reference needs the t27c binary")?),
             "--reference-cache" => o.reference_cache = Some(args.next().ok_or("--reference-cache needs a path")?),
-            "--reference-timeout-ms" => {
-                o.reference_timeout_ms = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("--reference-timeout-ms takes a number")?
-            }
+            "--reference-timeout-ms" => o.reference_timeout_ms = args.next().and_then(|s| s.parse().ok()).ok_or("--reference-timeout-ms takes a number")?,
             "--json" => o.json = Some(args.next().ok_or("--json needs a path")?),
             "--runner" => {
                 o.runner = args
@@ -141,28 +142,17 @@ fn parse_args() -> Result<Opts, String> {
                     return Err("--runner needs a command".into());
                 }
             }
-            "--timeout-ms" => {
-                o.timeout_ms = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("--timeout-ms takes a number")?
-            }
-            "--jobs" | "-j" => {
-                o.jobs = args
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .filter(|&n| n > 0)
-                    .ok_or("--jobs takes a positive number")?
-            }
+            "--timeout-ms" => o.timeout_ms = args.next().and_then(|s| s.parse().ok()).ok_or("--timeout-ms takes a number")?,
+            "--jobs" | "-j" => o.jobs = args.next().and_then(|s| s.parse().ok()).filter(|&n| n > 0).ok_or("--jobs takes a positive number")?,
             s if s.starts_with('-') => return Err(format!("unknown option {}", s)),
             s => {
-                if o.input.is_some() {
-                    return Err(format!("unexpected argument {}", s));
-                }
-                o.input = Some(s.to_string());
+                if o.input.is_none() { o.input = Some(s.to_string()); }
+                else if o.cmd == "run" && o.entry.is_none() { o.entry = Some(s.to_string()); }
+                else { return Err(format!("unexpected argument {}", s)); }
             }
         }
     }
+    if o.cmd == "run" && o.entry.is_none() { return Err("run needs <file.t27> <entry>".into()); } // #11824
     Ok(o)
 }
 
@@ -170,18 +160,16 @@ fn main() -> ExitCode {
     // #7370: the reference runner (blockers.rs) reads `t27c test-report`'s words and takes any non-zero
     // exit for a broken tool, so every test-report it spawns keeps the exit of before #7370.
     std::env::set_var("T27C_TEST_REPORT_EXIT_ZERO", "1");
-    let o = match parse_args() {
-        Ok(o) => o,
-        Err(e) => return usage(&e),
-    };
+    let o = match parse_args() { Ok(o) => o, Err(e) => return usage(&e) };
     match o.cmd.as_str() {
-        "test" | "build" | "asm" | "verilog" | "ts" => {
+        "test" | "build" | "asm" | "verilog" | "ts" | "run" => {
             let Some(input) = o.input.clone() else {
                 return usage("missing input file");
             };
             match compile_front(&input, &o) {
                 Ok((prog, mut ph)) => match o.cmd.as_str() {
-                    "test" => cmd_test(&prog, &mut ph, &o),
+                    "test" | "run" => cmd_test(&prog, &mut ph, &o),
+                    "build" if o.target.as_deref() == Some("wasm32") => cmd_build_wasm(&prog, &mut ph, &o),
                     "build" => cmd_build(&prog, &mut ph, &o),
                     _ => cmd_asm(&prog),
                 },
@@ -281,18 +269,7 @@ fn show(ty: Ty, raw: u64) -> String {
 
 fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
     let code = ph.time("codegen", || codegen::compile(prog, TrapStyle::Jit, true));
-    let code = match code {
-        Ok(c) => c,
-        Err(e) => return codegen_error(&e),
-    };
-    let jit = ph.time("jit-map", || Jit::load(&code, prog.funcs.len(), &prog.data, &prog.globals));
-    let mut jit = match jit {
-        Ok(j) => j,
-        Err(e) => {
-            errln!("t27b: {}", e);
-            return ExitCode::from(EXIT_IO);
-        }
-    };
+    let mut jit = match code { Ok(c) => match ph.time("jit-map", || Jit::load(&c, prog.funcs.len(), &prog.data, &prog.globals)) { Ok(j) => j, Err(e) => { errln!("t27b: {}", e); return ExitCode::from(EXIT_IO) } }, Err(e) => return codegen_error(&e) };
     let mut passed = 0usize;
     let mut failed = 0usize;
     let (mut held, mut broken) = (0usize, 0usize);
@@ -425,10 +402,44 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
         errln!("t27b: {} JIT/interpreter mismatches", mismatches);
         return ExitCode::from(EXIT_MISMATCH);
     }
-    if failed + broken > 0 {
-        ExitCode::from(EXIT_FAIL)
-    } else {
-        ExitCode::SUCCESS
+    if failed + broken > 0 { return ExitCode::from(EXIT_FAIL); }
+    match o.entry.as_deref() { Some(entry) => run_entry(prog, &mut jit, entry), None => ExitCode::SUCCESS }
+}
+
+/// `t27b run` (#11824): the gate passed, so the named pub fn runs; its return value is the exit
+/// code -- the low 8 bits, two's complement, like a C main (-1 exits 255). Every scalar return
+/// the wasm32 emitter carries (#11840) is accepted; the full value also prints on stdout, one
+/// line `t27b run: <fn> = <value> (<type>)`, so a harness can compare it bit for bit with what
+/// another backend computes (tests/wasm32_equality.rs). A float's exit code is the low 8 bits
+/// of its bit pattern.
+fn run_entry(prog: &Program, jit: &mut Jit, entry: &str) -> ExitCode {
+    let Some(idx) = prog.func_index(entry) else { return usage(&format!("no fn `{}` in the spec", entry)) };
+    let f = &prog.funcs[idx];
+    if !(f.is_pub && f.nparams == 0) {
+        return usage(&format!("`{}` must be a pub fn with no parameters", entry));
+    }
+    let Some(ret) = f.ret else {
+        return usage(&format!("`{}` must return a scalar; a void fn has no value to run", entry));
+    };
+    if !wasm32_emitter::carries(ret) {
+        return usage(&format!("`{}` must return a scalar the run contract carries ({} does not)", entry, ret.name()));
+    }
+    match jit.call(idx as u32, &[]) {
+        Ok(raw) => {
+            // The value in the return type: ints wrap (two's complement), floats are their bits.
+            let (text, low8) = if ret == Ty::F32 {
+                let bits = raw as u32;
+                (format!("{:?}", f32::from_bits(bits) as f64), (bits & 0xff) as u8)
+            } else if ret == Ty::F64 {
+                (format!("{:?}", f64::from_bits(raw)), (raw & 0xff) as u8)
+            } else {
+                let v = ret.from_raw(raw);
+                (v.to_string(), (v & 0xff) as u8)
+            };
+            println!("t27b run: {} = {} ({})", entry, text, ret.name());
+            ExitCode::from(low8)
+        }
+        Err(tr) => { let s = &prog.sites[tr.site as usize]; errln!("t27b: `{}` trapped: {} at line {}", entry, s.kind.describe(), s.line); ExitCode::from(EXIT_FAIL) }
     }
 }
 
@@ -465,6 +476,35 @@ fn cmd_build(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `t27b build --target wasm32` (epic #11840, M-A): the pub fns with no
+/// parameters whose body is a single `return <const>;` become exported wasm
+/// functions; anything else in a pub fn is refused by name, never silently
+/// dropped. `--elf` / `--macho` do not apply: the output is a module, not an
+/// object file.
+fn cmd_build_wasm(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
+    let Some(out) = o.out.clone() else {
+        return usage("build needs -o <out.wasm>");
+    };
+    let wasm = ph.time("emit", || wasm32_emitter::emit(prog));
+    let wasm = match wasm {
+        Ok(w) => w,
+        Err(e) => {
+            errln!("t27b: {}", e.message());
+            return ExitCode::from(EXIT_CODEGEN);
+        }
+    };
+    let w = ph.time("write", || std::fs::write(&out, &wasm));
+    if let Err(e) = w {
+        errln!("t27b: cannot write {}: {}", out, e);
+        return ExitCode::from(EXIT_IO);
+    }
+    if o.time {
+        errln!("{}", ph.report());
+        errln!("t27b wasm: {} bytes", wasm.len());
+    }
+    ExitCode::SUCCESS
+}
+
 /// `t27b watch` (#10859): I/O only; when to build, the temp path and when --then runs are watch_build.t27.
 fn cmd_watch(o: &Opts) -> ExitCode {
     let (Some(input), Some(out)) = (o.input.clone(), o.out.clone()) else { return usage("watch needs <file.t27> -o <out.o>") };
@@ -497,17 +537,8 @@ fn use_closure(input: &Path) -> Vec<PathBuf> { // the spec and every spec its `u
 }
 
 fn cmd_asm(prog: &Program) -> ExitCode {
-    let code = match codegen::compile(prog, TrapStyle::Brk, true) {
-        Ok(c) => c,
-        Err(e) => return codegen_error(&e),
-    };
-    let linked = match codegen::link(Vec::new(), None, &code, prog.funcs.len()) {
-        Ok(l) => l,
-        Err(e) => {
-            errln!("t27b: {}", e);
-            return ExitCode::from(EXIT_CODEGEN);
-        }
-    };
+    let code = match codegen::compile(prog, TrapStyle::Brk, true) { Ok(c) => c, Err(e) => return codegen_error(&e) };
+    let linked = match codegen::link(Vec::new(), None, &code, prog.funcs.len()) { Ok(l) => l, Err(e) => { errln!("t27b: {}", e); return ExitCode::from(EXIT_CODEGEN) } };
     let mut starts: Vec<(usize, usize)> = linked
         .offsets
         .iter()
@@ -657,22 +688,11 @@ fn run_one(exe: &Path, file: &Path, o: &Opts) -> (Outcome, Option<Verdicts>) {
     let tests = matches!(c.code, Some(0) | Some(1) | Some(4)).then(|| blockers::t27b_verdicts(stdout));
     let outcome = match c.code {
         Some(0) => {
-            let total = stdout
-                .lines()
-                .last()
-                .and_then(|l| l.rsplit(", ").next())
-                .and_then(|t| t.strip_suffix(" total"))
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-            let invariants = stdout
-                .lines()
-                .find_map(|l| l.split_once(": invariants ").map(|x| x.1))
-                .and_then(|t| t.split(' ').next())
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(0);
-            let asserts = stdout
-                .lines()
-                .find_map(|l| l.split_once(": runtime asserts ").map(|x| x.1))
+            let total = stdout.lines().last().and_then(|l| l.rsplit(", ").next())
+                .and_then(|t| t.strip_suffix(" total")).and_then(|n| n.parse().ok()).unwrap_or(0);
+            let invariants = stdout.lines().find_map(|l| l.split_once(": invariants ").map(|x| x.1))
+                .and_then(|t| t.split(' ').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+            let asserts = stdout.lines().find_map(|l| l.split_once(": runtime asserts ").map(|x| x.1))
                 .and_then(|n| n.trim().parse::<u64>().ok());
             Outcome::Pass(total, invariants, asserts)
         }
