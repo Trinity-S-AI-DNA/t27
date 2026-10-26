@@ -78,11 +78,14 @@ MERGE_CRITICAL = (
 #
 # The ceiling is set to MAX_UNCLASSIFIED. If the number of unclassified files
 # exceeds the ceiling, the check fails.
-MAX_UNCLASSIFIED = 24
+MAX_UNCLASSIFIED = 23
 
 # Not merge-critical, and each exclusion is stated with its reason so that a
 # future reader can disagree with the reason rather than guess at the omission.
 NOT_MERGE_CRITICAL = {
+    "queue-health-report.yml": "reporting only; writes the queue counts into one issue on a schedule; its own failure gates no merge",
+    "pr-queue-drain.yml": "reporting only; drains the armed queue in batch; its own failure gates no merge",
+    "agent-runner-docker.yml": "a sandbox runner image build; the jobs that run inside it carry their own gates",
     "pr-dashboard.yml": "reporting only; a stale dashboard does not gate a merge",
     "seal-staleness-warn.yml": "warn-only by name and by intent",
     "auto-merge-ready-prs.yml": "it merges pull requests on a schedule; its own failure gates nothing",

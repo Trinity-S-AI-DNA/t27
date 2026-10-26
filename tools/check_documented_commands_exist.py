@@ -254,7 +254,9 @@ MUST_NOT_EXIST = ("gen-zig",)
 MAX_DEAD_TRI = 86
 
 TRI_MUST_EXIST = ("now", "wave", "gen", "skill", "seal")
-TRI_MUST_NOT_EXIST = ("gen-zig", "gen-dir", "spec", "git")
+# git graduated: `tri git` is real since trigit (ADR-002), so the planted dead
+# name moved to one that is absent from all four surfaces.
+TRI_MUST_NOT_EXIST = ("gen-zig", "gen-dir", "spec", "teleport")
 
 
 def refuse(msg: str) -> None:
