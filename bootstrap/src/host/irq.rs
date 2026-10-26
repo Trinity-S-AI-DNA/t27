@@ -220,11 +220,6 @@ impl<M: Mmio> IrqDrivenDriver<M> {
         &mut self.handler
     }
 
-    /// Consume the wrapper and return both halves.
-    pub fn into_parts(self) -> (BitnetDriver<M>, IrqHandler) {
-        (self.inner, self.handler)
-    }
-
     /// Wait for completion via the IRQ path.
     ///
     /// Each round invokes `handler.service(mmio)` once.  If
