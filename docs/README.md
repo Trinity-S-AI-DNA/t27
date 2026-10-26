@@ -24,6 +24,7 @@ First-party docs follow the **27-agent trinity alphabet** grouping: **three nona
 | [`coordination/TASK_PROTOCOL.md`](coordination/TASK_PROTOCOL.md) | Inter-agent TASK protocol. |
 | [`coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md`](coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md) | Phased plan: seed → tests → Queen brain (`tri`/`t27c`, conformance, codegen gap). |
 | [`coordination/inter-agent-handoff/`](coordination/inter-agent-handoff/) | Portable handoff bundle. |
+| [`coordination/HANDOFF.md`](coordination/HANDOFF.md) | The ledger `tri trigit handoff` reads and appends (#12286). |
 
 ## [`system/`](system/) — system documentation bodies (rendered at `t27.ai/#/docs`)
 
@@ -50,6 +51,7 @@ TDD, bootstrap/testing plans, math/physics test framework charter, PHI loop, tec
 | [`nona-03-manifest/CLAIM_TIERS.md`](nona-03-manifest/CLAIM_TIERS.md) | Policy: `claim_tier` for math/physics |
 | [`nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md`](nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md) | t27o on the roadmap repositories (coverage, refusal kinds, timing), its field and ten weaknesses (#10522) |
 | [`nona-03-manifest/VIZ-DISTILL-GRAPH.md`](nona-03-manifest/VIZ-DISTILL-GRAPH.md) | The spec corpus as one interactive Distill-style graph; materialise `build/viz/spec-graph.html` (#12218) |
+| [`nona-03-manifest/VIZ-PETAL-GUIDE.md`](nona-03-manifest/VIZ-PETAL-GUIDE.md) | Contributor guide: add the visualization for one more petal (start, write, test, check, land) through `viz_contract` and `petal_viz_plan` (#12173) |
 
 ## External Projects
 
