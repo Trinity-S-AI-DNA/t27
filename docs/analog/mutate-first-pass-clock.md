@@ -45,23 +45,41 @@ lines): 40 lines added to `mutate.rs`, 973 deleted.
 - `job_s_saved` multiplies counts the caller supplies; its precondition (hung x cap below 2^32) is the spec's.
 - Every number in the rule is proposed, not measured on t27 (`clock.t27`, last paragraph of its header).
 
-## Measurement (not part of the change that wires the clock)
+## Measurement (2026-10-26, two paired runs on one Mac)
 
-No speed claim is made here. This change wires the rule and deletes dead code; the before/after run is recorded on
-issue #12403 and in this table by the run that owns the machine. A claim needs both runs, their command and the load at
-the start:
+The command, the same in every run; only the `tri` binary differs (the driver of master before the wiring, and the
+driver of the wiring), the master-built `t27c` and the accepted file are shared:
 
 ```
-tri mutate spec --file specs/analog/linear_zoh.t27 --t27c <master-built t27c> --jobs 3 --timeout 45
+tri mutate spec --file specs/analog/linear_zoh.t27 --accepted docs/analog/mutation-accepted-linear_zoh.txt \
+  --t27c <master-built t27c> --jobs 3 --timeout 45
 ```
 
-| Run | Wall time | Load at start | Mutants (killed / survived / hung / unviable) | Reruns |
-|---|---|---|---|---|
-| Before (master driver) | not yet measured | | | |
-| After (this slice) | not yet measured | | | |
+| Pair | Run | Wall time | 1-min load at start | Mutants (killed / survived / hung / unviable) | Reruns | Exit |
+|---|---|---|---|---|---|---|
+| 1 | Before (driver of master before the wiring) | 708 s (11 min 48 s) | 30.54 | 223 / 2 / 27 / 0 | none (no first-pass clock) | 0 |
+| 1 | After (this slice) | 401 s (6 min 41 s) | 8.18 | 223 / 2 / 27 / 0 | 3 | 0 |
+| 2 | Before | 764 s (12 min 44 s) | 5.89 | 223 / 2 / 27 / 0 | none | 0 |
+| 2 | After | 485 s (8 min 5 s) | 26.88 | 223 / 2 / 27 / 0 | 3 | 0 |
 
-If the measured wall time is not shorter, the wiring must be switched off by default (issue #12403, Success Criteria)
-and this note must say so.
+What the table does and does not show:
+
+- The verdict is the same in all four runs. In pair 2 the two outputs differ by exactly one line, the new "First-pass
+  clock" summary line.
+- The wall time was shorter with the wiring in both pairs: by 307 s (43 %) in pair 1 and by 279 s (37 %) in pair 2.
+  Both savings are about the size the summary line computes (915 job-s over 3 jobs is 305 s); that line is arithmetic
+  on counts and is not a measurement, so the agreement is an observation, not a proof of cause.
+- The load was not controlled: the loads at start differ inside each pair (pair 1: the before run started under the
+  higher load; pair 2: the after run did), the 1-min load rose to 21-26 within minutes of any run starting, and one
+  sample of 64.68 was seen during the pair-2 after run. Other sessions used the machine at the same time. Pair 1 started
+  the wiring from a lower load and pair 2 from a higher one, and both show a saving, so the direction is the same under
+  both orders; the size is not pinned down.
+- Two pairs on one machine are not a benchmark. No general speed claim follows from them, and none is made: only that
+  on this gate, in these four runs, the wall time was shorter with the first-pass clock and the verdict did not change.
+
+The success criterion "same load class" of issue #12403 is therefore met only in part (the loads are written down, they
+are not equal). A third pair with the loads matched would settle the size; the wiring stays on by default because the
+direction held in both orders and the verdict never moved.
 
 ## Tests
 
