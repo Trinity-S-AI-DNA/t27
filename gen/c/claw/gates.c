@@ -22,12 +22,12 @@
 #define G_SOFT 1
 #define G_REPORTING 2
 #define G_UNKNOWN 255
-#define COUNT 67
-static const const char* NAMES[67] = { "agent-runner-docker", "auto-merge-ready-prs", "bootstrap-tests", "build-paper", "build-vivado-image", "catalog-count-gate", "cli-tri", "conflict-markers", "conformance-integrity-gate", "coq-kernel", "coq-proofs", "corpus-ratchet", "damage-negatives", "deploy-api", "documented-commands", "dupe-ratchet", "emit-bitexact-gate", "exhaustive-nightly", "fix-carries-source", "fpga-build", "gate-topology", "gf-wide-conformance", "gf16-conformance", "harness-scratch", "issue-gate", "l1-traceability", "lean-proofs", "loop-tools-gate", "needs-boundary", "oracle-nightly", "orphan-modules", "own-language", "pack-index-consistency-gate", "phi-loop-ci", "pr-budget", "pr-dashboard", "pusher", "queen-doctor", "queen-export-push", "queen-feed-empty-bodies", "queen-feed-roadmap", "queen-feed-untested", "queen-publish", "queen-refile", "queen-watchdog", "release", "rings-rust", "sandbox-docker", "sbom", "schema-validation", "scorecard", "seal-coverage", "seal-staleness-warn", "secret-scan", "sign-release", "spec-guards", "spec-parse-ratchet", "t27b-native", "t27o-golden", "t27o-release", "untrusted-input-gate", "verilog-widths", "vivado-synth", "wasm-explorer", "withdrawn-live-gate", "xilinx7-l3-bench", "zenodo-publish" };
-static const size_t NAME_LENS[67] = { 19, 20, 15, 11, 18, 18, 7, 16, 26, 10, 10, 14, 16, 10, 19, 12, 18, 18, 18, 10, 13, 19, 16, 15, 10, 15, 11, 15, 14, 14, 14, 12, 27, 11, 9, 12, 6, 12, 17, 23, 18, 19, 13, 12, 14, 7, 10, 14, 4, 17, 9, 13, 19, 11, 12, 11, 18, 11, 11, 12, 20, 14, 12, 13, 19, 16, 14 };
-static const uint8_t CLASSES[67] = { 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-static const size_t EVENT_LENS[67] = { 22, 46, 35, 35, 17, 30, 17, 35, 35, 35, 35, 35, 35, 22, 35, 35, 30, 26, 30, 35, 44, 35, 35, 35, 37, 30, 30, 35, 26, 26, 35, 12, 35, 30, 19, 30, 26, 26, 26, 26, 26, 26, 31, 26, 26, 7, 35, 22, 30, 35, 54, 35, 30, 35, 25, 35, 35, 35, 13, 4, 35, 35, 17, 17, 35, 30, 25 };
-static const const char* EVENTS[67] = { "push,workflow_dispatch", "schedule,pull_request_target,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push", "pull_request,push,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch,schedule", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request_target,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request", "push,pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request_target", "workflow_dispatch,pull_request", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "push,schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "release", "push,pull_request,workflow_dispatch", "push,workflow_dispatch", "push,release,workflow_dispatch", "pull_request,push,workflow_dispatch", "branch_protection_rule,schedule,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "release,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_call", "push", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_dispatch", "push,pull_request", "pull_request,push,workflow_dispatch", "workflow_dispatch,pull_request", "release,workflow_dispatch" };
+#define COUNT 69
+static const const char* NAMES[69] = { "agent-runner-docker", "auto-merge-ready-prs", "bootstrap-tests", "build-paper", "build-vivado-image", "catalog-count-gate", "cli-tri", "conflict-markers", "conformance-integrity-gate", "coq-kernel", "coq-proofs", "corpus-ratchet", "damage-negatives", "deploy-api", "documented-commands", "dupe-ratchet", "emit-bitexact-gate", "exhaustive-nightly", "fix-carries-source", "fpga-build", "gate-topology", "gf-wide-conformance", "gf16-conformance", "harness-scratch", "issue-gate", "l1-traceability", "lean-proofs", "loop-tools-gate", "needs-boundary", "oracle-nightly", "orphan-modules", "own-language", "pack-index-consistency-gate", "phi-loop-ci", "pr-budget", "pr-dashboard", "pusher", "queen-doctor", "queen-export-push", "queen-feed-empty-bodies", "queen-feed-roadmap", "queen-feed-untested", "queen-publish", "queen-refile", "queen-watchdog", "release", "rings-rust", "sandbox-docker", "sbom", "schema-validation", "scorecard", "seal-coverage", "seal-staleness-warn", "secret-scan", "sign-release", "spec-guards", "spec-parse-ratchet", "t27b-native", "t27o-golden", "t27o-release", "t27os", "t27os-release", "untrusted-input-gate", "verilog-widths", "vivado-synth", "wasm-explorer", "withdrawn-live-gate", "xilinx7-l3-bench", "zenodo-publish" };
+static const size_t NAME_LENS[69] = { 19, 20, 15, 11, 18, 18, 7, 16, 26, 10, 10, 14, 16, 10, 19, 12, 18, 18, 18, 10, 13, 19, 16, 15, 10, 15, 11, 15, 14, 14, 14, 12, 27, 11, 9, 12, 6, 12, 17, 23, 18, 19, 13, 12, 14, 7, 10, 14, 4, 17, 9, 13, 19, 11, 12, 11, 18, 11, 11, 12, 5, 13, 20, 14, 12, 13, 19, 16, 14 };
+static const uint8_t CLASSES[69] = { 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static const size_t EVENT_LENS[69] = { 22, 46, 35, 35, 17, 30, 17, 35, 35, 35, 35, 35, 35, 22, 35, 35, 30, 26, 30, 35, 44, 35, 35, 35, 37, 30, 30, 35, 26, 26, 35, 12, 35, 30, 19, 30, 26, 26, 26, 26, 26, 26, 31, 26, 26, 7, 35, 22, 30, 35, 54, 35, 30, 35, 25, 35, 35, 35, 13, 4, 12, 17, 35, 35, 17, 17, 35, 30, 25 };
+static const const char* EVENTS[69] = { "push,workflow_dispatch", "schedule,pull_request_target,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push", "pull_request,push,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch,schedule", "push,pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request_target,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request,push,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request", "push,pull_request,workflow_dispatch", "pull_request,workflow_dispatch", "pull_request_target", "workflow_dispatch,pull_request", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "push,schedule,workflow_dispatch", "schedule,workflow_dispatch", "schedule,workflow_dispatch", "release", "push,pull_request,workflow_dispatch", "push,workflow_dispatch", "push,release,workflow_dispatch", "pull_request,push,workflow_dispatch", "branch_protection_rule,schedule,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,workflow_dispatch", "push,pull_request,workflow_dispatch", "release,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_call", "push", "pull_request", "workflow_dispatch", "pull_request,push,workflow_dispatch", "pull_request,push,workflow_dispatch", "workflow_dispatch", "push,pull_request", "pull_request,push,workflow_dispatch", "workflow_dispatch,pull_request", "release,workflow_dispatch" };
 #define P_OK 0
 #define P_SPEC_ONLY 1
 #define P_DIR_ONLY 2
@@ -55,11 +55,11 @@ bool is_blocking(const char* name, size_t name_len);
 const char* events_of(const char* name, size_t name_len);
 size_t events_len_of(const char* name, size_t name_len);
 uint32_t count_class(uint8_t c);
-bool rows_filled(size_t name_lens[static 67], size_t event_lens[static 67]);
+bool rows_filled(size_t name_lens[static 69], size_t event_lens[static 69]);
 bool every_row_filled(void);
-bool names_unique_in(const char* names[static 67], size_t lens[static 67]);
+bool names_unique_in(const char* names[static 69], size_t lens[static 69]);
 bool all_names_unique(void);
-bool classes_known(uint8_t cl[static 67]);
+bool classes_known(uint8_t cl[static 69]);
 bool all_classes_known(void);
 size_t line_len(uint8_t* dir_text, size_t dir_len, size_t start);
 bool line_eq_name(uint8_t* dir_text, size_t start, size_t len, const char* name, size_t name_len);
@@ -78,7 +78,7 @@ bool str_eq(const char* a, size_t alen, const char* b, size_t blen);
    ------------------------------------------------------- */
 
 uint8_t class_of(const char* name, size_t name_len) {
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         if (str_eq(NAMES[i], NAME_LENS[i], name, name_len)) {
             return CLASSES[i];
         }
@@ -91,7 +91,7 @@ bool is_blocking(const char* name, size_t name_len) {
 }
 
 const char* events_of(const char* name, size_t name_len) {
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         if (str_eq(NAMES[i], NAME_LENS[i], name, name_len)) {
             return EVENTS[i];
         }
@@ -100,7 +100,7 @@ const char* events_of(const char* name, size_t name_len) {
 }
 
 size_t events_len_of(const char* name, size_t name_len) {
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         if (str_eq(NAMES[i], NAME_LENS[i], name, name_len)) {
             return EVENT_LENS[i];
         }
@@ -110,7 +110,7 @@ size_t events_len_of(const char* name, size_t name_len) {
 
 uint32_t count_class(uint8_t c) {
     uint32_t n = 0;
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         if ((CLASSES[i] == c)) {
             n += 1;
         }
@@ -118,8 +118,8 @@ uint32_t count_class(uint8_t c) {
     return n;
 }
 
-bool rows_filled(size_t name_lens[static 67], size_t event_lens[static 67]) {
-    for (size_t i = 0; i < 67; i++) {
+bool rows_filled(size_t name_lens[static 69], size_t event_lens[static 69]) {
+    for (size_t i = 0; i < 69; i++) {
         if ((name_lens[i] == 0)) {
             return false;
         }
@@ -134,9 +134,9 @@ bool every_row_filled(void) {
     return rows_filled(NAME_LENS, EVENT_LENS);
 }
 
-bool names_unique_in(const char* names[static 67], size_t lens[static 67]) {
-    for (size_t i = 0; i < 67; i++) {
-        for (size_t j = (i + 1); j < 67; j++) {
+bool names_unique_in(const char* names[static 69], size_t lens[static 69]) {
+    for (size_t i = 0; i < 69; i++) {
+        for (size_t j = (i + 1); j < 69; j++) {
             if (str_eq(names[i], lens[i], names[j], lens[j])) {
                 return false;
             }
@@ -149,8 +149,8 @@ bool all_names_unique(void) {
     return names_unique_in(NAMES, NAME_LENS);
 }
 
-bool classes_known(uint8_t cl[static 67]) {
-    for (size_t i = 0; i < 67; i++) {
+bool classes_known(uint8_t cl[static 69]) {
+    for (size_t i = 0; i < 69; i++) {
         if ((cl[i] != G_BLOCKING)) {
             if ((cl[i] != G_SOFT)) {
                 if ((cl[i] != G_REPORTING)) {
@@ -205,7 +205,7 @@ bool dir_has(uint8_t* dir_text, size_t dir_len, const char* name, size_t name_le
 }
 
 bool line_in_names(uint8_t* dir_text, size_t start, size_t len) {
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         if (line_eq_name(dir_text, start, len, NAMES[i], NAME_LENS[i])) {
             return true;
         }
@@ -218,7 +218,7 @@ int32_t claw_status(uint8_t* dir_text, size_t dir_len, uint8_t* out, size_t out_
     int32_t problems = 0;
     w = put_str(out, out_cap, w, AUDIT_HEAD, HEAD_LEN);
     w = put_str(out, out_cap, w, "\n", 1);
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         if ((dir_has(dir_text, dir_len, NAMES[i], NAME_LENS[i]) == false)) {
             w = put_str(out, out_cap, w, LINE_PREFIX[P_SPEC_ONLY], PREFIX_LENS[P_SPEC_ONLY]);
             w = put_str(out, out_cap, w, NAMES[i], NAME_LENS[i]);
@@ -270,7 +270,7 @@ size_t claw_coverage_report(uint8_t* out, size_t out_cap) {
         w = put_str(out, out_cap, w, " blocking=", 10);
         size_t shown = 0;
         size_t i = 0;
-        while ((i < 67)) {
+        while ((i < 69)) {
             if ((shown < 3)) {
                 if ((CLASSES[i] == c)) {
                     if ((shown == 0)) {
@@ -438,8 +438,8 @@ void test_critical_gates_present_and_blocking(void) {
     assert((is_blocking(c, 12) == true));
 }
 
-void test_class_census_62_3_2(void) {
-    assert((count_class(G_BLOCKING) == 62));
+void test_class_census_64_3_2(void) {
+    assert((count_class(G_BLOCKING) == 64));
     assert((count_class(G_SOFT) == 3));
     assert((count_class(G_REPORTING) == 2));
 }
@@ -469,7 +469,7 @@ void test_unknown_name_is_unknown_and_not_blocking(void) {
 }
 
 void test_events_len_of_answers_every_row(void) {
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         assert((events_len_of(NAMES[i], NAME_LENS[i]) == EVENT_LENS[i]));
     }
 }
@@ -487,7 +487,7 @@ void test_reporting_gates_never_block_a_merge(void) {
 void test_audit_clean_when_directory_matches_inventory(void) {
     uint8_t dir[8192] = {0};
     size_t w = 0;
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         w = put_str(&dir, 8192, w, NAMES[i], NAME_LENS[i]);
         w = put_str(&dir, 8192, w, "\n", 1);
     }
@@ -501,7 +501,7 @@ void test_audit_clean_when_directory_matches_inventory(void) {
 void test_audit_spec_only_when_a_workflow_file_is_missing(void) {
     uint8_t dir[8192] = {0};
     size_t w = 0;
-    for (size_t i = 1; i < 67; i++) {
+    for (size_t i = 1; i < 69; i++) {
         w = put_str(&dir, 8192, w, NAMES[i], NAME_LENS[i]);
         w = put_str(&dir, 8192, w, "\n", 1);
     }
@@ -515,7 +515,7 @@ void test_audit_spec_only_when_a_workflow_file_is_missing(void) {
 void test_audit_dir_only_for_an_unknown_workflow(void) {
     uint8_t dir[8192] = {0};
     size_t w = 0;
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         w = put_str(&dir, 8192, w, NAMES[i], NAME_LENS[i]);
         w = put_str(&dir, 8192, w, "\n", 1);
     }
@@ -528,7 +528,7 @@ void test_audit_dir_only_for_an_unknown_workflow(void) {
 void test_audit_ignores_blank_lines_in_the_directory(void) {
     uint8_t dir[8192] = {0};
     size_t w = 0;
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         w = put_str(&dir, 8192, w, NAMES[i], NAME_LENS[i]);
         w = put_str(&dir, 8192, w, "\n", 1);
     }
@@ -547,7 +547,7 @@ void test_audit_prefixes_name_the_problem_kind(void) {
 
 void test_every_row_round_trips_through_the_name_lookup(void) {
     size_t i = 0;
-    while ((i < 67)) {
+    while ((i < 69)) {
         assert((class_of(NAMES[i], NAME_LENS[i]) == CLASSES[i]));
         if ((CLASSES[i] == G_BLOCKING)) {
             assert((is_blocking(NAMES[i], NAME_LENS[i]) == true));
@@ -571,18 +571,18 @@ void test_coverage_report_carries_every_class(void) {
     assert((buf_has(&out, w, "G_BLOCKING", 10) == true));
     assert((buf_has(&out, w, "G_SOFT", 6) == true));
     assert((buf_has(&out, w, "G_REPORTING", 11) == true));
-    assert((buf_has(&out, w, "n=62", 4) == true));
+    assert((buf_has(&out, w, "n=64", 4) == true));
     assert((buf_has(&out, w, "n=3", 3) == true));
     assert((buf_has(&out, w, "n=2", 3) == true));
     assert((buf_has(&out, w, "n=0", 3) == true));
-    assert((buf_has(&out, w, "n=63", 4) == false));
+    assert((buf_has(&out, w, "n=65", 4) == false));
     assert((buf_has(&out, w, "G_UNKNOWN", 9) == true));
 }
 
 void test_audit_tail_line_matches_the_count(void) {
     uint8_t dir[8192] = {0};
     size_t w = 0;
-    for (size_t i = 0; i < 67; i++) {
+    for (size_t i = 0; i < 69; i++) {
         w = put_str(&dir, 8192, w, NAMES[i], NAME_LENS[i]);
         w = put_str(&dir, 8192, w, "\n", 1);
     }
@@ -595,7 +595,7 @@ void test_audit_tail_line_matches_the_count(void) {
     assert((buf_has(&out, 8192, DRIFT_TAIL, DRIFT_TAIL_LEN) == false));
     uint8_t gone[8192] = {0};
     size_t g = 0;
-    for (size_t i = 1; i < 67; i++) {
+    for (size_t i = 1; i < 69; i++) {
         g = put_str(&gone, 8192, g, NAMES[i], NAME_LENS[i]);
         g = put_str(&gone, 8192, g, "\n", 1);
     }
@@ -611,21 +611,21 @@ void test_audit_tail_line_matches_the_count(void) {
 void test_coverage_report_lines_are_exact(void) {
     uint8_t out[4096] = {0};
     size_t w = claw_coverage_report(&out, 4096);
-    assert((buf_has(&out, w, "G_BLOCKING n=62 blocking=true e.g. agent-runner-docker, bootstrap-tests, build-paper\n", 85) == true));
+    assert((buf_has(&out, w, "G_BLOCKING n=64 blocking=true e.g. agent-runner-docker, bootstrap-tests, build-paper\n", 85) == true));
     assert((buf_has(&out, w, "G_SOFT n=3 blocking=false e.g. oracle-nightly, queen-doctor, rings-rust\n", 72) == true));
     assert((buf_has(&out, w, "G_REPORTING n=2 blocking=false e.g. auto-merge-ready-prs, queen-publish\n", 72) == true));
 }
 
 void test_a_hole_in_either_column_fails_the_filled_check(void) {
     assert((rows_filled(NAME_LENS, EVENT_LENS) == true));
-    size_t n[67] = {0};
-    for (size_t i = 0; i < 67; i++) {
+    size_t n[69] = {0};
+    for (size_t i = 0; i < 69; i++) {
         n[i] = NAME_LENS[i];
     }
-    n[66] = 0;
+    n[68] = 0;
     assert((rows_filled(n, EVENT_LENS) == false));
-    size_t e[67] = {0};
-    for (size_t i = 0; i < 67; i++) {
+    size_t e[69] = {0};
+    for (size_t i = 0; i < 69; i++) {
         e[i] = EVENT_LENS[i];
     }
     e[0] = 0;
@@ -635,43 +635,43 @@ void test_a_hole_in_either_column_fails_the_filled_check(void) {
 }
 
 void test_a_repeated_name_is_caught_wherever_it_sits(void) {
-    const char* n[67] = {0};
-    for (size_t i = 0; i < 67; i++) {
+    const char* n[69] = {0};
+    for (size_t i = 0; i < 69; i++) {
         n[i] = NAMES[i];
     }
-    size_t l[67] = {0};
-    for (size_t i = 0; i < 67; i++) {
+    size_t l[69] = {0};
+    for (size_t i = 0; i < 69; i++) {
         l[i] = NAME_LENS[i];
     }
     n[5] = n[4];
     l[5] = l[4];
     assert((names_unique_in(n, l) == false));
-    const char* m[67] = {0};
-    for (size_t i = 0; i < 67; i++) {
+    const char* m[69] = {0};
+    for (size_t i = 0; i < 69; i++) {
         m[i] = NAMES[i];
     }
-    size_t k[67] = {0};
-    for (size_t i = 0; i < 67; i++) {
+    size_t k[69] = {0};
+    for (size_t i = 0; i < 69; i++) {
         k[i] = NAME_LENS[i];
     }
-    m[66] = m[0];
-    k[66] = k[0];
+    m[68] = m[0];
+    k[68] = k[0];
     assert((names_unique_in(m, k) == false));
 }
 
 void test_a_class_outside_the_three_is_unknown(void) {
     assert((classes_known(CLASSES) == true));
-    uint8_t c[67] = {0};
-    for (size_t i = 0; i < 67; i++) {
+    uint8_t c[69] = {0};
+    for (size_t i = 0; i < 69; i++) {
         c[i] = CLASSES[i];
     }
-    c[66] = G_UNKNOWN;
+    c[68] = G_UNKNOWN;
     assert((classes_known(c) == false));
-    c[66] = G_BLOCKING;
+    c[68] = G_BLOCKING;
     assert((classes_known(c) == true));
-    c[66] = G_SOFT;
+    c[68] = G_SOFT;
     assert((classes_known(c) == true));
-    c[66] = G_REPORTING;
+    c[68] = G_REPORTING;
     assert((classes_known(c) == true));
 }
 
@@ -688,7 +688,7 @@ int main(void) {
     test_known_classes_only();
     test_no_duplicate_names_pairwise();
     test_critical_gates_present_and_blocking();
-    test_class_census_62_3_2();
+    test_class_census_64_3_2();
     test_rows_stay_aligned_name_class_events();
     test_unknown_name_is_unknown_and_not_blocking();
     test_events_len_of_answers_every_row();
