@@ -39,6 +39,10 @@ mod verilog_names;
 #[path = "../gen/rust/compiler/hir_cost_models.rs"]
 #[allow(dead_code, unused_parens)]
 mod hir_cost_models;
+// specs/compiler/verilog_bram_shape.t27 (#12297), lowered by `t27c gen-rust`; never hand-edit it.
+#[path = "../gen/rust/compiler/verilog_bram_shape.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, clippy::all)]
+mod verilog_bram_shape;
 
 // ============================================================================
 // AST Node Types (from parser.t27)
@@ -11979,24 +11983,9 @@ impl VerilogCodegen {
         })
     }
 
-    /// #5904: `uN` / `iN` with 1 <= N <= 128 -> `(N, signed)`. The one parser of
-    /// an integer type name, shared by `type_to_width`, `type_is_signed` and
-    /// `strict_port_width`. `usize`/`isize` do not match (no numeric suffix),
-    /// and neither do `u0`, `u129` or `u08`.
+    /// #5904: `uN` / `iN` with 1 <= N <= 128 -> `(N, signed)`; the rule is in specs/compiler/int_type_names.t27.
     fn int_type_bits(ty: &str) -> Option<(u32, bool)> {
-        let (signed, digits) = match ty.as_bytes().first()? {
-            b'u' => (false, &ty[1..]),
-            b'i' => (true, &ty[1..]),
-            _ => return None,
-        };
-        if digits.is_empty()
-            || digits.starts_with('0')
-            || !digits.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        let bits: u32 = digits.parse().ok()?;
-        (bits <= 128).then_some((bits, signed))
+        int_type_names::int_type_bits(ty.as_bytes()).map(|p| (p >> 1, p & 1 == 1))
     }
 
     /// Map t27 type to Verilog signedness
@@ -14930,6 +14919,13 @@ impl VerilogCodegen {
         self.write_line("endmodule");
         self.write_line("");
         self.write_line("`default_nettype wire");
+        // #12297: a big one-read one-write array gets a memory process of its own (specs/compiler/verilog_bram_shape.t27).
+        if !self.emit_test_assertions {
+            let text = crate::use_resolve::sized(|b, c| verilog_bram_shape::bram_text(self.output.as_bytes(), b, c));
+            if !text.is_empty() {
+                self.output = text;
+            }
+        }
     }
 
     fn gen_verilog_const(&mut self, node: &Node) {
