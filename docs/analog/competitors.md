@@ -201,9 +201,9 @@ Headline result of the research (details below):
 - It states "Simulated time does not imply real-time execution" and does not mention FPGA targeting [V] (src:cpphdl-analog).
 - How t27 differs or loses: same numerical recipe (MNA, fixed-step backward Euler, ngspice check) in software; t27 adds FPGA execution, fixed-point, PDK-model tables. cpphdl has broader block catalogs and a refinement-based verification method; t27 has no published equivalent.
 
-### 5.5 uberWAVE (Symbiotic EDA side)
+### 5.5 uberWAVE (the external team's side)
 
-- "Full featured live interactive waveform viewer", open source, analog and mixed-signal, displays NGSpice results; NLnet NGI0 Commons Fund, grant started August 2025; repository on a Symbiotic EDA GitLab server; license and feature list not stated on the NLnet page [V] (src:nlnet-uberwave). I found nothing public on the partner's "self-checking analog evaluator" [U].
+- "Full featured live interactive waveform viewer", open source, analog and mixed-signal, displays NGSpice results; NLnet NGI0 Commons Fund, grant started August 2025; repository on a GitLab server of the external team; license and feature list not stated on the NLnet page [V] (src:nlnet-uberwave). I found nothing public on the partner's "self-checking analog evaluator" [U].
 
 ### 5.6 IHP Open PDK (SG13G2) as reference data
 
@@ -296,7 +296,7 @@ Thresholds below are my proposals [I] unless a source is cited; each needs owner
 
 - Scale: published solvers cap at roughly 144 switches / 256-344 states on large FPGAs [V]; t27's dense M on XC7A200T (740 DSP, 0 DSP used so far) will need a sparse or time-multiplexed MAC plan [I].
 - Positioning: claiming novelty over msdsl or cpphdl is unsafe; they share much of the method [V].
-- Partner dependency: public information on Symbiotic EDA's evaluator was not found [U]; do not cite capability that is not public.
+- Partner dependency: public information on the external team's evaluator was not found [U]; do not cite capability that is not public.
 
 ---
 
