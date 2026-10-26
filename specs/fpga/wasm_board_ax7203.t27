@@ -33,6 +33,52 @@
 ; shr_u, rotl/rotr, and div/rem signed and unsigned (a 32-clock restoring divider), plus the
 ; program store loaded over the wire. The MVP spec keeps proving what this cell does not run.
 ; -
+; P6 DESIGN FLOOR (2026-10-25), the architectural increment after P5 (the label stack,
+; in flight as #12010/#12011): the 64-bit datapath, law before silicon. Today st[] and
+; the answer register res are 32-bit, so i64.const and f64.const land wholesale only as
+; far as their low half -- the honest boundary the P3/P4 comments above record. This
+; floor is the design that removes it, stated where it will be executed and tested where
+; it can be tested today, in simulation, without silicon and without touching one
+; executable line.
+; STACK_2x32. Every logical stack slot becomes TWO u32 words: slot k's low word at
+; st[2k] (st_lo) and its high word at st[2k+1] (st_hi), little-endian word order to
+; match the wire's little-endian byte order. sp counts words: a push adds 2, a pop
+; removes 2, so sp is even forever (the parity invariant); underflow is sp < 2,
+; overflow is sp + 2 > STACK_WORDS. Slots are UNIFORM: an i32 or f32 value occupies
+; the lo word with hi zero, an i64 or f64 value occupies both -- one slot shape for
+; every type, so sp arithmetic never depends on the type sitting on the stack. The
+; physical array doubles, 16 words to STACK_WORDS = 32, keeping STACK_MAX = 16 as the
+; LOGICAL depth it already names; the live dispatch below still runs the one-word
+; model until the silicon increment migrates it.
+; I64.ADD = TWO ADDS + ONE CARRY. The opcode byte is 0x7C (pinned by the t27b
+; emitter's law, specs/tri/t27b/wasm.t27, the i64 stack floor). The compute law:
+; lo = add64_lo(a_lo, b_lo) -- verbatim today's i32.add; c = add64_c(a_lo, b_lo) --
+; a single bit, the u64-widened low sum crossing 0xFFFFFFFF; hi = add64_hi(a_hi,
+; b_hi, c) -- the second add absorbs the carry, and a carry OUT of the high add is
+; dropped, wraparound, the same law i32.add already follows at 32 bits. Silicon
+; shape: two shallow conditional 32-bit adds, the second with carry-in, the same
+; cone i32.add already closes inside the phase-gated 34.3 MHz engine bar -- no
+; microsequence, unlike mul and div. With two-word slots, i64.const's SLEB128
+; submachine assembles into both words (the ERR_LEB continuation boundary moves
+; outward to i64's ten bytes) and f64.const lands wholesale: eight bytes, one slot.
+; THE TWO-WORD ANSWER: OP_RUN_USER64. Chosen over a high-word register + one read,
+; because WORD_BITS = 24 is a property of the FIVE-BYTE frame, not of the silicon:
+; a hi-register read through that frame could never express more than 24 of the
+; high word's 32 bits -- 48 of 64 answer bits observable -- while claiming
+; bit-exactness. OP_RUN_USER64 = 0xFC instead: a request byte for byte identical to
+; OP_RUN_USER, answered RESP_OK SEQ w0..w7 -- 10 bytes, BOTH answer words in full,
+; low word first, little-endian. The answer register becomes the pair (res, res_hi);
+; an i32 answer keeps res_hi = 0 by the uniform-slot law, so every 5-byte response
+; stays byte-identical and old hosts and vectors see no change. WITNESS
+; CONSEQUENCE: the die witness inside the t27os receipt (runs/<sha>.json, the
+; receipt that follows a merged die witness, specs/t27os/receipt_result.t27) records
+; response bytes, so with the 10-byte frame it can carry i64 answers bit-exactly --
+; all eight bytes -- where today's answer carries only the low 24 bits.
+; The p6 tests below are SIMULATION LAW: they prove the carry arithmetic, the slot
+; addressing and the frame layout in test-report today, the sweep against an
+; independent no-overflow reference model; they claim nothing about silicon until
+; the datapath increment lands and the fleet crossing runs it on the die.
+; -
 ; THE WIRE. The TRI-NET node link, the one that carried 1035886/1035886 TNF16 requests and
 ; 251616/251616 mxdot4 requests at 1144744 baud with none lost: CFGMCLK between 65.6 and
 ; 68.7 MHz, divider 60, one start bit, 8 data bits LSB first, one stop bit.
@@ -89,6 +135,10 @@ pub const REQ_BYTES : u32 = 38;
 pub const BODY_BYTES : u32 = 36;
 pub const RESP_BYTES : u8 = 5;
 pub const WORD_BITS : u8 = 24;
+; P6 design floor: OP_RUN_USER64's response is 10 bytes -- RESP_OK, SEQ, then BOTH
+; answer words little-endian (8 bytes). WORD_BITS = 24 stays the width of the FIVE-byte
+; frame; the 64-bit frame answers in full. Every other response keeps RESP_BYTES = 5.
+pub const RESP64_BYTES : u8 = 10;
 pub const X_OFF : u32 = 4;
 pub const Y_OFF : u32 = 20;
 
@@ -97,6 +147,12 @@ pub const OP_LOAD_PAGE : u8 = 0xFE;
 pub const OP_RUN_USER : u8 = 0xFD;
 pub const CODE_PAGES : u32 = 4;
 pub const PAGE_BYTES : u32 = 32;
+; P6 design floor (2026-10-25): OP_RUN_USER64 runs the loaded program like OP_RUN_USER
+; -- a request byte for byte identical -- but answers BOTH answer words: RESP_OK SEQ
+; w0..w7, 10 bytes, low word first. Not yet in the executed set; the dispatch arm and
+; the widened txq land with the datapath increment. 0xFC is the next special below
+; OP_RUN_USER (0xFD) and OP_LOAD_PAGE (0xFE); program ids stay 0..PROGS-1.
+pub const OP_RUN_USER64 : u8 = 0xFC;
 
 ; --- Machine ----------------------------------------------------------------------------
 pub const STACK_MAX : u32 = 16;
@@ -104,6 +160,15 @@ pub const LOCALS : u32 = 4;
 pub const CODE_BYTES : u32 = 101;
 pub const CODE_PAD : u32 = 128;
 pub const I32_MASK : u64 = 0xFFFFFFFF;
+; P6 design floor (2026-10-25): the STACK_2x32 constants, law before silicon. SLOT_WORDS
+; is the words per logical slot; STACK_WORDS is the physical word count the silicon
+; increment grows st[] to -- 2 x STACK_MAX by hand, written flat like every other const
+; here (STACK_MAX stays the LOGICAL depth it already names, 16 slots, so test
+; machine_consts keeps its meaning). The live st stays [STACK_MAX]u32 until that
+; increment; the addressing law itself (slot k at 2k, 2k+1) is testable today and is,
+; as p6_stack_2x32_addressing.
+pub const SLOT_WORDS : u32 = 2;
+pub const STACK_WORDS : u32 = 32;
 
 ; --- opcodes, WebAssembly MVP final bytes (pinned by test opcode_bytes_are_real_wasm) ----
 pub const OP_END : u8 = 0x0B;
@@ -157,6 +222,12 @@ pub const OP_I32_SHR_S : u8 = 0x75;
 pub const OP_I32_SHR_U : u8 = 0x76;
 pub const OP_I32_ROTL : u8 = 0x77;
 pub const OP_I32_ROTR : u8 = 0x78;
+; P6 design floor (2026-10-25): the byte i64.add will dispatch on when the datapath
+; lands -- 0x7C, pinned by the t27b emitter's law (specs/tri/t27b/wasm.t27, the i64
+; stack floor), NOT yet in the executed set. The compute law is the three helpers
+; add64_lo / add64_c / add64_hi below: two adds and one carry, tested in simulation by
+; p6_i64_add_carry_law and p6_i64_add_carry_negative_control.
+pub const OP_I64_ADD : u8 = 0x7C;
 
 ; --- error codes (the MVP numbers; 4 was free and P2 gives it to divide-by-zero)
 pub const ERR_NONE : u8 = 0;
