@@ -15,6 +15,8 @@
 //! dispatch-only and delete belongs to whoever owns the workflow.
 
 use anyhow::{Context, Result};
+#[path = "../../../gen/rust/claw/text.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
+mod ct; // t27c gen-rust of specs/claw/text.t27: token_occurrences/is_ident_byte (the orphaned-tests boundary count) moved out of this file into the spec (#11783)
 use clap::Subcommand;
 use std::process::Command;
 
@@ -2604,7 +2606,7 @@ fn orphaned_tests(src: &str) -> Vec<String> {
         if !has_assert {
             continue;
         }
-        if token_occurrences(src, &name) <= 1 {
+        if ct::token_occurrences(Box::leak(src.to_string().into_boxed_str()), src.len(), Box::leak(name.clone().into_boxed_str()), name.len()) <= 1 {
             out.push(name);
         }
     }
@@ -2618,27 +2620,6 @@ fn orphaned_tests(src: &str) -> Vec<String> {
 /// every `match`, every `pat`. The first version of this counted substrings and
 /// declared an orphaned `async fn a()` to be a called helper -- its own test
 /// caught it, which is the only reason this reads `token` and not `matches`.
-fn token_occurrences(text: &str, name: &str) -> usize {
-    let bytes = text.as_bytes();
-    let mut n = 0;
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(name) {
-        let at = from + rel;
-        let before_ok = at == 0 || !is_ident_byte(bytes[at - 1]);
-        let end = at + name.len();
-        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
-        if before_ok && after_ok {
-            n += 1;
-        }
-        from = at + name.len().max(1);
-    }
-    n
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 /// What a compiler warning says about the code, coarser than rustc's lint name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WarnClass {
