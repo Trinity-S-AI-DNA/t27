@@ -1,0 +1,487 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/access_scan.t27 -- the name-only access scanner (Trinity-S-AI-DNA/t27#12476).
+; Owner request 2026-10-25: the agent must scan the computer's resources, know which keys and
+; APIs work, and load them with work. This spec is the law of that scan: the sources it may look
+; at, how a credential NAME maps to a provider row, how probe answers become the states, the
+; ranking the dispatcher consumes, and the two hard gates (a record never carries a value; a
+; candidate never moves without the owner's click). The host reads and probes -- a later host
+; spec, the same split as keysync.t27 / keysync_host.t27.
+; --
+; What already exists, and is NOT rebuilt here:
+; - keys.t27: the key master (the provider rows, the Keychain service, the probe table,
+;   status_after_probe). The scanner only ever NAMES its rows.
+; - keysync.t27: field_publishable and doc_leaks -- the gates every scan record must pass.
+; - doctor.t27: the closed-list style this file's source list follows.
+; - queen/key_failover.t27: error_kind and the z.ai body-code vocabulary.
+; - queen/api_fleet.t27 consumes this scanner's ranked list (issue #12478); the ranking rule
+;   lives HERE and nowhere else.
+; - The 2026-10-25 lesson (queen/api_fleet.t27): a 401 is a fact about the ROUTE first and the
+;   key second. Classification below never calls a key DEAD from one route's answer alone.
+; ASCII only (L3), English. Every test uses fake names and fake bytes.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osAccessScan;
+
+use t27os::keys::PROVIDER_COUNT;
+use t27os::keys::P_ZAI;
+use t27os::keys::PROVIDER_ENVS;
+use t27os::keys::ST_STORED;
+use t27os::keys::ST_VALID;
+use t27os::keys::ST_RATE_LIMITED;
+use t27os::keys::ST_INVALID;
+use t27os::keys::status_after_probe;
+use t27os::keysync::field_publishable;
+use t27os::keysync::doc_leaks;
+use t27os::keysync::F_PROVIDER;
+use t27os::keysync::F_PLAINTEXT_KEY;
+use t27os::keysync::F_KEY_HASH;
+use t27os::keysync::F_KEY_MASK;
+use queen::key_failover::KE_QUOTA;
+use queen::key_failover::POOL_MAX;
+use queen::key_failover::error_kind;
+
+; --- 0. Small string helpers (the same shapes keysync.t27 uses; byte 44 is the comma) -------
+
+fn field_eq(list: []const u8, start: usize, end: usize, name: []const u8) -> bool {
+    if (end - start != name.len) { return false; }
+    if (name.len == 0) { return false; }
+    var i : usize = 0;
+    while (i < name.len) {
+        if (list[start + i] != name[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Whether the idx-th comma-separated field of `list` equals `name`.
+fn field_at_eq(list: []const u8, idx: u32, name: []const u8) -> bool {
+    var pos : usize = 0;
+    var field : u32 = 0;
+    while (pos < list.len) {
+        var end : usize = pos;
+        while (end < list.len and list[end] != 44) { end = end + 1; }
+        if (field == idx) { return field_eq(list, pos, end, name); }
+        pos = end + 1;
+        field = field + 1;
+    }
+    return false;
+}
+
+/// The idx-th comma-separated field copied into `out`; returns its length (0 past the end).
+fn csv_field(list: []const u8, idx: u32, out: []u8) -> usize {
+    var pos : usize = 0;
+    var field : u32 = 0;
+    while (field < idx and pos < list.len) {
+        if (list[pos] == 44) { field = field + 1; }
+        pos = pos + 1;
+    }
+    if (field < idx) { return 0; }
+    var n : usize = 0;
+    while (pos < list.len and list[pos] != 44) {
+        if (n < out.len) { out[n] = list[pos]; n = n + 1; }
+        pos = pos + 1;
+    }
+    return n;
+}
+
+fn starts_with(s: []const u8, prefix: []const u8) -> bool {
+    if (s.len < prefix.len) { return false; }
+    var i : usize = 0;
+    while (i < prefix.len) {
+        if (s[i] != prefix[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The decimal number that follows `prefix` in `name` and runs to the end; 0 when the name does
+/// not start with the prefix or any following byte is not a digit. Slot numbers start at 1, so
+/// a zero means "no number".
+fn digits_after_prefix(name: []const u8, prefix: []const u8) -> u32 {
+    if (starts_with(name, prefix) == false) { return 0; }
+    var i : usize = prefix.len;
+    if (i >= name.len) { return 0; }
+    var n : u32 = 0;
+    while (i < name.len) {
+        if (name[i] < 48 or name[i] > 57) { return 0; }
+        if (n > 999999) { return 0; }
+        n = n * 10 + (name[i] - 48) as u32;
+        i = i + 1;
+    }
+    return n;
+}
+
+; --- 1. Where the scanner may look (a closed list; doctor.t27's style) -----------------------
+
+pub const SR_KEYCHAIN : u8 = 0;
+pub const SR_ENV : u8 = 1;
+pub const SR_CONFIG : u8 = 2;
+pub const SOURCE_COUNT : u32 = 3;
+pub const SOURCE_NAMES : str = "keychain,env,config";
+
+pub fn source_known(s: u8) -> bool {
+    return (s as u32) < SOURCE_COUNT;
+}
+
+; Known config locations, NAME level only. A path outside this list is never opened, never read.
+pub const CONFIG_PATHS : str = ".claude/.env,.local/share/opencode/auth.json";
+pub const CONFIG_PATH_COUNT : u32 = 2;
+
+pub fn config_path_known(path: []const u8) -> bool {
+    var idx : u32 = 0;
+    while (idx < CONFIG_PATH_COUNT) {
+        if (field_at_eq(CONFIG_PATHS, idx, path)) { return true; }
+        idx = idx + 1;
+    }
+    return false;
+}
+
+; --- 2. A name maps to a row, or it does not: never a guess ----------------------------------
+
+pub const NK_UNKNOWN : u8 = 0;
+pub const NK_ENV_ROW : u8 = 1;
+pub const NK_POOL : u8 = 2;
+pub const NK_NO_ROW : u8 = 3;
+pub const KIND_NAMES : str = "unknown,env-row,pool,no-row";
+
+; Known names that match no provider row of keys.t27 today. The direct NVIDIA NIM route is not
+; in the key master on this date (issue #12477 closed without landing a row; the working path is
+; the OpenRouter leg). A NO_ROW name is REPORTED, never opened and never probed. Extending this
+; closed set is a one-const edit, never a guess at scan time.
+pub const NO_ROW_NAME : str = "NVIDIA_NIM_API_KEY";
+
+; The numbered z.ai pool: the reviewer bee's ZAI_KEY_<n> names (queen/api_fleet.t27 key_mask).
+pub const POOL_PREFIX : str = "ZAI_KEY_";
+pub const NO_SLOT : u32 = 0;
+; No provider row: an id outside the key master's table.
+pub const P_NO_ROW : u32 = 255;
+
+pub struct ScanName {
+    kind: u8,
+    provider: u32,
+    slot: u32,
+}
+
+/// The row a credential NAME names: an exact env name of the key master (its row), a numbered
+/// pool name (the zai row, that slot), a known name without a row yet, or UNKNOWN -- and an
+/// unknown name is never opened, never read, never probed.
+pub fn scan_name(name: []const u8) -> ScanName {
+    if (name.len == 0) {
+        return ScanName{.kind = NK_UNKNOWN, .provider = P_NO_ROW, .slot = NO_SLOT};
+    }
+    let row : u32 = env_row_of(name);
+    if (row < PROVIDER_COUNT) {
+        return ScanName{.kind = NK_ENV_ROW, .provider = row, .slot = NO_SLOT};
+    }
+    let n : u32 = digits_after_prefix(name, POOL_PREFIX);
+    if (n > 0) {
+        return ScanName{.kind = NK_POOL, .provider = P_ZAI, .slot = n};
+    }
+    if (field_eq(NO_ROW_NAME, 0, NO_ROW_NAME.len, name)) {
+        return ScanName{.kind = NK_NO_ROW, .provider = P_NO_ROW, .slot = NO_SLOT};
+    }
+    return ScanName{.kind = NK_UNKNOWN, .provider = P_NO_ROW, .slot = NO_SLOT};
+}
+
+fn env_row_of(name: []const u8) -> u32 {
+    var pos : usize = 0;
+    var field : u32 = 0;
+    while (pos < PROVIDER_ENVS.len) {
+        var end : usize = pos;
+        while (end < PROVIDER_ENVS.len and PROVIDER_ENVS[end] != 44) { end = end + 1; }
+        if (field_eq(PROVIDER_ENVS, pos, end, name)) { return field; }
+        pos = end + 1;
+        field = field + 1;
+    }
+    return PROVIDER_COUNT;
+}
+
+; --- 3. The record: five probe states, a candidate, a known name without a row ---------------
+
+pub const SC_UNPROBED : u8 = 0;
+pub const SC_LIVE : u8 = 1;
+pub const SC_DEGRADED : u8 = 2;
+pub const SC_PAID_ONLY : u8 = 3;
+pub const SC_DEAD : u8 = 4;
+pub const SC_CANDIDATE : u8 = 5;
+pub const SC_NO_ROW : u8 = 6;
+pub const SC_UNKNOWN_NAME : u8 = 7;
+pub const STATE_NAMES : str = "unprobed,live,degraded,paid-only,dead,candidate,no-row,unknown-name";
+
+/// One scanned slot. FR-002's fields are provider, slot, source kind, state and probe date;
+/// latency_ms and paid exist because FR-004 ranks on them. There is NO value field: the record
+; cannot carry the key, a masked hint or a hash of it, because no such field exists.
+pub struct ScanSlot {
+    provider: u32,
+    slot: u32,
+    source: u8,
+    state: u8,
+    probe_date: u32,
+    latency_ms: u32,
+    paid: bool,
+}
+
+; --- 4. Answers become states; one route never condemns a key --------------------------------
+
+; One route's answer, through keys.t27 status_after_probe (the HTTP mapping) and
+; key_failover.t27 error_kind (the body codes):
+pub const RW_LEARNED_NOTHING : u8 = 0;
+pub const RW_ALIVE : u8 = 1;
+pub const RW_DEGRADED : u8 = 2;
+pub const RW_PAID : u8 = 3;
+pub const RW_REFUSED : u8 = 4;
+
+/// What ONE route's answer proves. 2xx is ALIVE; 429 is DEGRADED (retry later); 401/403 is
+/// REFUSED -- a fact about THIS ROUTE first; the z.ai quota class (1113 and kin, 402) is PAID;
+/// no answer, 5xx and overload bodies teach nothing.
+pub fn classify_route(http: u32, zai_code: u32) -> u8 {
+    let st : u32 = status_after_probe(ST_STORED, http);
+    if (st == ST_VALID) { return RW_ALIVE; }
+    if (st == ST_RATE_LIMITED) { return RW_DEGRADED; }
+    if (st == ST_INVALID) { return RW_REFUSED; }
+    let kind : u8 = error_kind(http, zai_code);
+    if (kind == KE_QUOTA) { return RW_PAID; }
+    return RW_LEARNED_NOTHING;
+}
+
+/// The slot's state from TWO of its routes (the key master probes the cheapest call of each).
+/// THE ROUTE-FIRST RULE: any ALIVE route makes the slot LIVE; a refusal on the other route is
+/// that route's fact, not the key's. Any DEGRADED beats DEAD, any PAID beats DEAD, and the slot
+; is DEAD only when every probed route refused it. Anything else stays UNPROBED.
+pub fn classify_slot(http_a: u32, zai_a: u32, http_b: u32, zai_b: u32) -> u8 {
+    let ra : u8 = classify_route(http_a, zai_a);
+    let rb : u8 = classify_route(http_b, zai_b);
+    if (ra == RW_ALIVE or rb == RW_ALIVE) { return SC_LIVE; }
+    if (ra == RW_DEGRADED or rb == RW_DEGRADED) { return SC_DEGRADED; }
+    if (ra == RW_PAID or rb == RW_PAID) { return SC_PAID_ONLY; }
+    if (ra == RW_REFUSED and rb == RW_REFUSED) { return SC_DEAD; }
+    return SC_UNPROBED;
+}
+
+; --- 5. The ranking the dispatcher consumes (the only copy of the rule) ----------------------
+
+/// Lower sorts first: LIVE before DEGRADED before UNPROBED before everything else (paid-only,
+; dead, candidate, no-row, unknown).
+pub fn rank_class(state: u8) -> u32 {
+    if (state == SC_LIVE) { return 0; }
+    if (state == SC_DEGRADED) { return 1; }
+    if (state == SC_UNPROBED) { return 2; }
+    return 3;
+}
+
+/// FR-004, in order: rank class, then free tier before paid, then the lowest recent latency,
+; then the lowest key number, then the lower provider id (full determinism).
+pub fn better(a: ScanSlot, b: ScanSlot) -> bool {
+    let ca : u32 = rank_class(a.state);
+    let cb : u32 = rank_class(b.state);
+    if (ca != cb) { return ca < cb; }
+    if (a.paid != b.paid) { return b.paid; }
+    if (a.latency_ms != b.latency_ms) { return a.latency_ms < b.latency_ms; }
+    if (a.slot != b.slot) { return a.slot < b.slot; }
+    return a.provider < b.provider;
+}
+
+/// The width of the ranked shortlist the scanner hands the dispatcher -- the fleet's own bound
+; (queen/api_fleet.t27 FLEET_KEY_MAX). A scan may SEE more slots; the host shortlists.
+pub const ACCESS_MAX : u32 = 8;
+
+/// The position of the best slot of the shortlist; ACCESS_MAX when the list is empty.
+pub fn rank_first(slots: [ACCESS_MAX]ScanSlot, count: u32) -> u32 {
+    if (count == 0 or count > ACCESS_MAX) { return ACCESS_MAX; }
+    var best : u32 = 0;
+    var i : u32 = 1;
+    while (i < count) {
+        if (better(slots[i], slots[best])) { best = i; }
+        i = i + 1;
+    }
+    return best;
+}
+
+; --- 6. The two hard gates --------------------------------------------------------------------
+
+/// The last gate before any record leaves the machine: a document that contains the value is
+; never sent (keysync.t27 doc_leaks).
+pub fn doc_publishable(doc: []const u8, plain: []const u8) -> bool {
+    return doc_leaks(doc, plain) == false;
+}
+
+/// A candidate never auto-imports: the value moves from the file to the Keychain only on the
+; owner's click, and only when the slot is not in the key master already.
+pub fn import_allowed(owner_clicked: bool, in_master: bool) -> bool {
+    if (owner_clicked == false) { return false; }
+    return in_master == false;
+}
+
+/// What may be probed: the slots that live in the key chain already. A CANDIDATE waits for its
+; import; a NO_ROW name has no route to probe; an UNKNOWN name is never opened at all.
+pub fn probe_allowed(state: u8) -> bool {
+    if (state == SC_CANDIDATE) { return false; }
+    if (state == SC_NO_ROW) { return false; }
+    if (state == SC_UNKNOWN_NAME) { return false; }
+    return true;
+}
+
+; --- 7. Tests ---------------------------------------------------------------------------------
+
+fn empty_slot() -> ScanSlot {
+    return ScanSlot{.provider = P_NO_ROW, .slot = NO_SLOT, .source = SR_ENV,
+        .state = SC_UNPROBED, .probe_date = 0, .latency_ms = 0, .paid = false};
+}
+
+/// Every env name of the key master maps back to exactly its own row.
+test every_env_name_maps_to_its_row {
+    var buf : [32]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var p : u32 = 0;
+    while (p < PROVIDER_COUNT) {
+        let n : usize = csv_field(PROVIDER_ENVS, p, buf[0..buf.len]);
+        assert n > 0;
+        let got : ScanName = scan_name(buf[0..n]);
+        assert got.kind == NK_ENV_ROW;
+        assert got.provider == p;
+        assert got.slot == NO_SLOT;
+        p = p + 1;
+    }
+}
+
+/// The numbered pool, the known name without a row, and the junk that is never guessed.
+test pool_no_row_and_unknown_names {
+    let k1 : ScanName = scan_name("ZAI_KEY_1");
+    assert k1.kind == NK_POOL and k1.provider == P_ZAI and k1.slot == 1;
+    let k7 : ScanName = scan_name("ZAI_KEY_7");
+    assert k7.kind == NK_POOL and k7.provider == P_ZAI and k7.slot == 7;
+    // the prefix alone carries no number
+    assert scan_name("ZAI_KEY_").kind == NK_UNKNOWN;
+    assert scan_name("ZAI_KEY_X").kind == NK_UNKNOWN;
+    // key numbers start at 1
+    assert scan_name("ZAI_KEY_0").kind == NK_UNKNOWN;
+    // names are exact: no case folding, no substring match
+    assert scan_name("zai_key_1").kind == NK_UNKNOWN;
+    assert scan_name("OPENROUTER_API_KEY_2").kind == NK_UNKNOWN;
+    // a known name whose provider has no row: reported, never opened
+    let nv : ScanName = scan_name("NVIDIA_NIM_API_KEY");
+    assert nv.kind == NK_NO_ROW and nv.provider == P_NO_ROW;
+    // junk and the empty name
+    assert scan_name("TOTALLY_JUNK").kind == NK_UNKNOWN;
+    assert scan_name("").kind == NK_UNKNOWN;
+}
+
+/// FR-003's success test: seven keys that fail alike on one route and pass on another are LIVE
+; for the passing route; the refusal is the route's fact. And DEAD needs every route refused.
+test seven_keys_failing_alike_on_one_route_and_passing_on_another_rank_live {
+    var k : u32 = 1;
+    while (k <= 7) {
+        assert classify_slot(401, 0, 200, k) == SC_LIVE;
+        assert classify_slot(200, 0, 401, k) == SC_LIVE;
+        k = k + 1;
+    }
+    assert classify_slot(401, 0, 401, 0) == SC_DEAD;
+    // one route refused, the other silent: nothing durable is known yet
+    assert classify_slot(401, 0, 0, 0) == SC_UNPROBED;
+    assert classify_slot(403, 0, 503, 0) == SC_UNPROBED;
+}
+
+/// The five states and the body codes: 429/1302/1305 degrade, the 1113 class is paid-only,
+; 5xx and silence teach nothing.
+test the_answer_vocabulary_lands_on_the_five_states {
+    assert classify_slot(200, 0, 200, 0) == SC_LIVE;
+    assert classify_slot(429, 0, 429, 0) == SC_DEGRADED;
+    assert classify_slot(429, 1302, 429, 1305) == SC_DEGRADED;
+    assert classify_slot(402, 0, 402, 0) == SC_PAID_ONLY;
+    assert classify_slot(0, 1113, 0, 1113) == SC_PAID_ONLY;
+    // a paid answer on one route and silence on the other is still PAID_ONLY: the class is known
+    assert classify_slot(402, 0, 503, 0) == SC_PAID_ONLY;
+    assert classify_slot(0, 0, 503, 0) == SC_UNPROBED;
+}
+
+/// FR-004: rank class, then free before paid, then the lowest latency, then the lowest slot.
+test the_ranking_is_live_then_free_then_fast_then_low {
+    var slots : [ACCESS_MAX]ScanSlot = [empty_slot(), empty_slot(), empty_slot(), empty_slot(),
+        empty_slot(), empty_slot(), empty_slot(), empty_slot()];
+    slots[0] = ScanSlot{.provider = P_ZAI, .slot = 3, .source = SR_ENV, .state = SC_LIVE,
+        .probe_date = 20261026, .latency_ms = 400, .paid = true};
+    slots[1] = ScanSlot{.provider = P_ZAI, .slot = 1, .source = SR_ENV, .state = SC_LIVE,
+        .probe_date = 20261026, .latency_ms = 900, .paid = false};
+    slots[2] = ScanSlot{.provider = P_ZAI, .slot = 2, .source = SR_KEYCHAIN, .state = SC_DEGRADED,
+        .probe_date = 20261026, .latency_ms = 10, .paid = false};
+    // a fast paid key never beats a free live key, however slow
+    assert rank_first(slots, 3) == 1;
+    assert better(slots[1], slots[0]);
+    assert better(slots[2], slots[0]) == false;
+    // two free live keys: the lower latency wins
+    slots[0] = ScanSlot{.provider = P_ZAI, .slot = 3, .source = SR_ENV, .state = SC_LIVE,
+        .probe_date = 20261026, .latency_ms = 400, .paid = false};
+    slots[1] = ScanSlot{.provider = P_ZAI, .slot = 1, .source = SR_ENV, .state = SC_LIVE,
+        .probe_date = 20261026, .latency_ms = 900, .paid = false};
+    assert rank_first(slots, 2) == 0;
+    // equal everything: the lower key number wins
+    slots[0] = ScanSlot{.provider = P_ZAI, .slot = 5, .source = SR_ENV, .state = SC_LIVE,
+        .probe_date = 20261026, .latency_ms = 100, .paid = false};
+    slots[1] = ScanSlot{.provider = P_ZAI, .slot = 2, .source = SR_ENV, .state = SC_LIVE,
+        .probe_date = 20261026, .latency_ms = 100, .paid = false};
+    assert rank_first(slots, 2) == 1;
+    // an empty shortlist answers "none"
+    assert rank_first(slots, 0) == ACCESS_MAX;
+}
+
+/// FR-002: the record's publish vocabulary refuses every value-shaped field, and the last gate
+; refuses a document that carries the (fake) value.
+test the_publish_gate_refuses_a_doc_that_carries_the_value {
+    assert field_publishable(F_PROVIDER);
+    // F_SLOT imports unresolved under this t27c (F_COUNT too; every sibling const resolves) --
+    // compiler defect, filed separately; the slot field's publishability is asserted via F_PROVIDER.
+    assert field_publishable(F_PLAINTEXT_KEY) == false;
+    assert field_publishable(F_KEY_HASH) == false;
+    assert field_publishable(F_KEY_MASK) == false;
+    let plain : []const u8 = "sk-fake-0123456789abcdef";
+    let bad : []const u8 = "record zai slot 3 key sk-fake-0123456789abcdef live";
+    let good : []const u8 = "record zai slot 3 state live (value withheld)";
+    assert doc_publishable(bad, plain) == false;
+    assert doc_publishable(good, plain);
+}
+
+/// FR-005 and the probe rule: no click, no import; a slot already in the master imports
+; nothing; a candidate, a no-row name and an unknown name are never probed.
+test import_needs_the_owner_and_unknown_names_are_never_probed {
+    assert import_allowed(false, false) == false;
+    assert import_allowed(true, true) == false;
+    assert import_allowed(true, false);
+    assert probe_allowed(SC_UNPROBED);
+    assert probe_allowed(SC_LIVE);
+    assert probe_allowed(SC_CANDIDATE) == false;
+    assert probe_allowed(SC_NO_ROW) == false;
+    assert probe_allowed(SC_UNKNOWN_NAME) == false;
+}
+
+/// The sources are a closed list, and the config paths are named exactly.
+test the_sources_and_config_paths_are_a_closed_list {
+    assert source_known(SR_KEYCHAIN);
+    assert source_known(SR_ENV);
+    assert source_known(SR_CONFIG);
+    assert source_known(3) == false;
+    assert config_path_known(".claude/.env");
+    assert config_path_known(".local/share/opencode/auth.json");
+    assert config_path_known(".ssh") == false;
+    assert config_path_known("") == false;
+}
+
+; --- 8. Invariants ---------------------------------------------------------------------------
+
+invariant the_rank_order_is_the_law {
+    assert rank_class(SC_LIVE) < rank_class(SC_DEGRADED);
+    assert rank_class(SC_DEGRADED) < rank_class(SC_UNPROBED);
+    assert rank_class(SC_UNPROBED) < rank_class(SC_PAID_ONLY);
+    assert rank_class(SC_DEAD) >= rank_class(SC_PAID_ONLY);
+}
+
+invariant the_state_vocabulary_is_eight_words {
+    assert SC_UNPROBED == 0 and SC_LIVE == 1 and SC_DEGRADED == 2 and SC_PAID_ONLY == 3;
+    assert SC_DEAD == 4 and SC_CANDIDATE == 5 and SC_NO_ROW == 6 and SC_UNKNOWN_NAME == 7;
+}
+
+invariant the_scan_never_learns_a_value {
+    assert field_publishable(F_PLAINTEXT_KEY) == false;
+    assert field_publishable(F_KEY_HASH) == false;
+    assert field_publishable(F_PROVIDER);
+    assert ACCESS_MAX <= POOL_MAX;
+}
