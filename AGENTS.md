@@ -630,3 +630,15 @@ The signature image of the project, on every home surface (t27.ai main page, the
 3. **The motion is a .t27 law, one for every platform.** Spiral radius, angular speed, drift, the pointer push and the limits live in one spec (extend `specs/t27f/petal_menu.t27`, which owns the 27-petal geometry) with tests; the site, T27 OS and the FPGA draw from it. No hand-written animation logic in TS, Swift or Verilog.
 4. **Calm and legible.** Formulas never cover the logo or the petals' hit areas, never overlap each other, and slow down near the pointer instead of fleeing; respect reduced-motion settings (static orbit). Black ground, matte glass, formulas in white at reading size.
 5. **Science first.** Clicking a formula opens its card: the expression, the predicted and measured value, the deviation, the source (CODATA or PDG) and the paper. The visual invites a check; it never claims more than the registry proves.
+
+## Epic progress posts
+
+Owner, 2026-10-26: every epic and every initiative (issue -> epic -> initiative, the label
+`initiative`; the three most prioritized initiatives are pinned on the issues page) carries
+public progress posts in one house format: a `.t27` card with the percent, the breakthroughs
+and the blockers, redrawn after every iteration. Claude drafts, the owner approves.
+
+This is a pointer, not the rule. The rule lives in the skill `epic-progress-posts`; the
+publication path in the skill `tri-blog` (a `blog` subcommand of the built `tri` does not exist
+yet: #12630); the card spec is the one those skills name; the first dashboard run this way is
+#12387; #12629 filed this section.
