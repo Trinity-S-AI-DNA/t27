@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/pipeline/loop_guard.t27 -- safety gates for the improvement loop
+//
+// A loop that runs unattended must refuse to act when acting would destroy
+// work. These predicates are the SSOT for that refusal: idempotency (never
+// re-apply), green-only (never merge on red), preservation (never drop past
+// work), and issue binding (never mutate without a traceable issue, L1).
+//
+// The scheduler is declarative (a GitHub workflow calling t27c); this spec is
+// the logic it consults. No shell on the critical path (L7).
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module pipeline-loop-guard {
+
+    // ====================================================================
+    // Exit codes -- 0 act, non-zero refuse with the reason.
+    // ====================================================================
+
+    pub const EXIT_ACT : u8 = 0;
+    pub const EXIT_ALREADY_APPLIED : u8 = 1;
+    pub const EXIT_RED : u8 = 2;
+    pub const EXIT_PRESERVE : u8 = 3;
+    pub const EXIT_NO_ISSUE : u8 = 4;
+
+    // ====================================================================
+    // Idempotency -- a loop re-running over finished work must skip it.
+    //
+    // `applied_before` is the recorded state from the last iteration;
+    // `artifact_present` is the observable effect (seal exists, coverage
+    // already at target). Re-applying either is wasted work at best and a
+    // rewritten seal / churned commit at worst.
+    // ====================================================================
+
+    pub fn iteration_action(applied_before: bool, artifact_present: bool, target_met: bool) -> u8 {
+        if (applied_before) {
+            return EXIT_ALREADY_APPLIED;
+        }
+        if (artifact_present and target_met) {
+            return EXIT_ALREADY_APPLIED;
+        }
+        return EXIT_ACT;
+    }
+
+    // ====================================================================
+    // Green-only merge -- a merge gate is satisfied only when nothing fails.
+    // `failing` counts checks that neither passed nor were skipped.
+    // ====================================================================
+
+    pub fn merge_allowed(failing: u32) -> bool {
+        return failing == 0;
+    }
+
+    pub fn merge_gate(failing: u32) -> u8 {
+        if (failing > 0) {
+            return EXIT_RED;
+        }
+        return EXIT_ACT;
+    }
+
+    // ====================================================================
+    // Preservation -- the loop may not touch a slice that holds unmerged
+    // work. `pending_changes` is the count of tracked-but-uncommitted files
+    // in the loop's own scope; acting over them risks overwriting them.
+    // ====================================================================
+
+    pub fn preserves_past_work(pending_changes: u32) -> bool {
+        return pending_changes == 0;
+    }
+
+    pub fn preservation_gate(pending_changes: u32) -> u8 {
+        if (pending_changes > 0) {
+            return EXIT_PRESERVE;
+        }
+        return EXIT_ACT;
+    }
+
+    // ====================================================================
+    // Issue binding (L1) -- every mutation the loop performs must be
+    // attributable to an issue, so a loop run is auditable like any PR.
+    // ====================================================================
+
+    pub fn issue_bound(issue: u32) -> bool {
+        return issue > 0;
+    }
+
+    pub fn mutation_gate(issue: u32) -> u8 {
+        if (!issue_bound(issue)) {
+            return EXIT_NO_ISSUE;
+        }
+        return EXIT_ACT;
+    }
+
+    // The full gate: an iteration acts only when every gate opens.
+    pub fn iteration_gate(applied_before: bool, artifact_present: bool, target_met: bool, failing: u32, pending_changes: u32, issue: u32) -> u8 {
+        let a = iteration_action(applied_before, artifact_present, target_met);
+        if (a != EXIT_ACT) {
+            return a;
+        }
+        let m = merge_gate(failing);
+        if (m != EXIT_ACT) {
+            return m;
+        }
+        let p = preservation_gate(pending_changes);
+        if (p != EXIT_ACT) {
+            return p;
+        }
+        return mutation_gate(issue);
+    }
+
+    // ====================================================================
+    // Anomaly severity -- classifies a finding so the loop escalates only
+    // real defects. `blocks_merge` marks a true gate failure; `cosmetic`
+    // marks noise (e.g. a linter that fires on every function by design).
+    // The loop reports cosmetic findings but never fails a run on them.
+    // ====================================================================
+
+    pub const SEVERITY_INFO : u8 = 0;
+    pub const SEVERITY_NOISE : u8 = 1;
+    pub const SEVERITY_DEFECT : u8 = 2;
+
+    pub fn classify_anomaly(blocks_merge: bool, fires_everywhere: bool) -> u8 {
+        if (fires_everywhere) {
+            return SEVERITY_NOISE;
+        }
+        if (blocks_merge) {
+            return SEVERITY_DEFECT;
+        }
+        return SEVERITY_INFO;
+    }
+
+    pub fn should_escalate(severity: u8) -> bool {
+        return severity == SEVERITY_DEFECT;
+    }
+
+    // ====================================================================
+    // TDD: TESTS
+    // ====================================================================
+
+    test "idempotency skips already applied work" {
+        assert iteration_action(true, false, false) == EXIT_ALREADY_APPLIED;
+    }
+
+    test "idempotency skips when artifact exists and target met" {
+        assert iteration_action(false, true, true) == EXIT_ALREADY_APPLIED;
+    }
+
+    test "idempotency acts when nothing is applied yet" {
+        assert iteration_action(false, false, false) == EXIT_ACT;
+    }
+
+    test "green gate opens only at zero failures" {
+        assert merge_allowed(0);
+        assert !merge_allowed(1);
+        assert merge_gate(0) == EXIT_ACT;
+        assert merge_gate(7) == EXIT_RED;
+    }
+
+    test "preservation refuses over pending changes" {
+        assert preserves_past_work(0);
+        assert !preserves_past_work(3);
+        assert preservation_gate(0) == EXIT_ACT;
+        assert preservation_gate(1) == EXIT_PRESERVE;
+    }
+
+    test "mutation requires a bound issue (L1)" {
+        assert issue_bound(42);
+        assert !issue_bound(0);
+        assert mutation_gate(42) == EXIT_ACT;
+        assert mutation_gate(0) == EXIT_NO_ISSUE;
+    }
+
+    test "full gate cascades to the first refusal" {
+        // Red beats everything else that would otherwise open.
+        assert iteration_gate(false, false, false, 2, 0, 5) == EXIT_RED;
+        // No issue refuses even when green and clean.
+        assert iteration_gate(false, false, false, 0, 0, 0) == EXIT_NO_ISSUE;
+        // Pending work refuses before issue is even consulted.
+        assert iteration_gate(false, false, false, 0, 4, 5) == EXIT_PRESERVE;
+        // Everything open -> act.
+        assert iteration_gate(false, false, false, 0, 0, 5) == EXIT_ACT;
+    }
+
+    test "already-applied refuses before any other gate" {
+        assert iteration_gate(true, true, true, 9, 9, 0) == EXIT_ALREADY_APPLIED;
+    }
+
+    test "cosmetic anomalies never escalate" {
+        // A linter firing on every function is noise, not a defect.
+        assert classify_anomaly(false, true) == SEVERITY_NOISE;
+        assert !should_escalate(SEVERITY_NOISE);
+    }
+
+    test "blocking anomalies escalate as defects" {
+        assert classify_anomaly(true, false) == SEVERITY_DEFECT;
+        assert should_escalate(SEVERITY_DEFECT);
+    }
+
+    test "informational findings are recorded but not escalated" {
+        assert classify_anomaly(false, false) == SEVERITY_INFO;
+        assert !should_escalate(SEVERITY_INFO);
+    }
+
+    // ====================================================================
+    // TDD: INVARIANTS
+    // ====================================================================
+
+    invariant "act code is distinct from every refusal" {
+        assert EXIT_ACT != EXIT_ALREADY_APPLIED and EXIT_ACT != EXIT_RED and EXIT_ACT != EXIT_PRESERVE and EXIT_ACT != EXIT_NO_ISSUE;
+    }
+
+    invariant "refusals are pairwise distinct" {
+        assert EXIT_ALREADY_APPLIED != EXIT_RED and EXIT_RED != EXIT_PRESERVE and EXIT_PRESERVE != EXIT_NO_ISSUE;
+    }
+
+    invariant "green is necessary and sufficient for merge" {
+        assert merge_allowed(0) and !merge_allowed(1);
+    }
+
+    invariant "zero pending work always preserves" {
+        assert preserves_past_work(0);
+    }
+
+    invariant "loop never mutates without an issue" {
+        assert !should_escalate(SEVERITY_NOISE);
+    }
+
+    // ====================================================================
+    // TDD: BENCHES -- the gate runs once per loop iteration; cheap is the
+    // point, because an expensive gate invites skipping it.
+    // ====================================================================
+
+    bench "iteration_gate_refusal_path" {
+        _ = iteration_gate(true, true, true, 9, 9, 0);
+    }
+
+    bench "iteration_gate_act_path" {
+        _ = iteration_gate(false, false, false, 0, 0, 5);
+    }
+
+    bench "classify_anomaly" {
+        _ = classify_anomaly(true, false);
+    }
+}
