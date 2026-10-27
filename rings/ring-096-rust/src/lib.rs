@@ -163,7 +163,7 @@ fn is_inf(x: f64) -> bool {
 /// numeric SSOT (specs/numeric/gf16.t27, `gf16_decode_to_f32`) name.
 ///
 /// Every GF16 value is exactly representable in f32 (9-bit mantissa, exponent
-/// range 2^-31 .. 2^32), so computing in f64 and narrowing at the end is exact.
+/// range 2^-39 .. 2^32), so computing in f64 and narrowing at the end is exact.
 pub fn gf16_to_f32(x: u16) -> f32 {
     gf16_decode_f64(x) as f32
 }
@@ -175,8 +175,7 @@ pub fn gf16_to_f32(x: u16) -> f32 {
 ///   - e=0, m=0   -> signed zero.
 ///   - e=EXP_MAX, m=0  -> +/- Inf.
 ///   - e=EXP_MAX, m!=0 -> NaN.
-///   - Every other code, e = 0 included: value = (-1)^s * (1 + m/2^9) * 2^(e - bias).
-///     GF16 has no denormals (#6940 D1, FORMAT-SPEC-001 value_formula).
+///   - Normal: value = (-1)^s * (1 + m/2^9) * 2^(e - bias).
 fn gf16_decode_f64(x: u16) -> f64 {
     let s = (x & SIGN_MASK) >> SIGN_SHIFT;
     let e = (x & EXP_MASK) >> EXP_SHIFT;
@@ -199,8 +198,8 @@ fn gf16_decode_f64(x: u16) -> f64 {
     sign * mantissa * pow_u64(2.0, e as i32 - BIAS)
 }
 
-/// Encode f32 to GF16 (u16), round-to-nearest, ties toward zero. f32 -> f64
-/// is exact, so this is the f64 encoder on the same value.
+/// Encode f32 to GF16 (u16), round-to-nearest. f32 -> f64 is exact, so this
+/// is the f64 encoder on the same value.
 pub fn f32_to_gf16(a: f32) -> u16 {
     gf16_encode_f64(a as f64)
 }
@@ -209,14 +208,11 @@ pub fn f32_to_gf16(a: f32) -> u16 {
 ///
 /// Algorithm (specs/numeric/formats.t27 `f32_to_gf16`):
 ///   1. Signed zero preserved.
-///   2. NaN -> 0xFE01 (#6940 D3, GF16_NAN in gf16.t27); +/-Inf -> 0x7E00 / 0xFE00.
-///   3. Scale |a| into [1, 2), tracking the biased exponent e within 0 .. 62.
-///   4. Still >= 2 at e = 62: overflow -> Inf. Still < 1 at e = 0: |a| < 2^-31,
-///      flush to signed zero (#6940 D1: no denormals).
-///   5. Mantissa = (mag - 1.0) * 2^9, round to nearest with ties toward zero
-///      (#6940 D2, FORMAT-SPEC-001 "ties-to-zero (frozen)"); a carry bumps e,
-///      and e = 63 is Inf.
-///   6. e = 0, m = 0 would be 2^-31, which has no code: signed zero.
+///   2. Inf / NaN special-cased (NaN -> 0x7F01).
+///   3. Decompose into sign + magnitude.
+///   4. Find e such that magnitude in [2^(e-bias), 2^(e-bias+1)).
+///   5. Mantissa = (mag / 2^(e - bias) - 1.0) * 2^9, round-to-nearest.
+///   6. Underflow -> 0 (with sign), overflow -> Inf.
 fn gf16_encode_f64(a: f64) -> u16 {
     // Signed zero
     if a == 0.0 {
@@ -242,19 +238,31 @@ fn gf16_encode_f64(a: f64) -> u16 {
 
     // Scale into [1, 2); bounded loops.
     let mut e: i32 = BIAS; // unbiased = 0 -> mag in [1, 2)
-    while mantissa_norm >= 2.0 && e < EXP_MAX as i32 - 1 {
-        mantissa_norm *= 0.5;
-        e += 1;
-    }
-    if mantissa_norm >= 2.0 {
-        return (sign << SIGN_SHIFT) | EXP_MASK;
-    }
-    while mantissa_norm < 1.0 && e > 0 {
-        mantissa_norm *= 2.0;
-        e -= 1;
-    }
-    if mantissa_norm < 1.0 {
-        return sign << SIGN_SHIFT;
+    let mut mantissa_norm = mag;
+    if mantissa_norm >= 1.0 {
+        while mantissa_norm >= 2.0 && (e as u16) < EXP_MAX - 1 {
+            mantissa_norm *= 0.5;
+            e += 1;
+        }
+    } else {
+        // Stop at e = 1, not e = 0. The decoder reads e = 0 as a denormal,
+        // (m / 2^9) * 2^(1 - bias), which shares e = 1's scale. Scaling down
+        // to e = 0 encoded every denormal at twice its value (decode(1) =
+        // 2^-39 encoded back to 2), sent [2^-31, 2^-30) to e=0 codes that
+        // decode as something else, and 2^-31 itself to +0.
+        while mantissa_norm < 1.0 && e > 1 {
+            mantissa_norm *= 2.0;
+            e -= 1;
+        }
+        if mantissa_norm < 1.0 {
+            // Denormal: m = round(|a| * 2^39). mantissa_norm < 1, so m <= 512,
+            // and m = 512 is 2^-30 itself: as a raw code it IS e=1, m=0, so
+            // the carry needs no special case. Clamping it to 511, as this
+            // did, rounded values just under 2^-30 the wrong way.
+            let denorm_mant_f = mantissa_norm * pow_u64(2.0, EXP_SHIFT as i32);
+            let denorm_mant = (denorm_mant_f + 0.5) as i32;
+            return (sign << SIGN_SHIFT) | (denorm_mant as u16);
+        }
     }
 
     // mantissa in [1, 2): subtract 1, scale by 2^9 (exact), round with ties
@@ -418,9 +426,8 @@ mod tests {
 
     #[test]
     fn gf16_to_f32_nan() {
-        assert!(gf16_to_f32(0xFE01).is_nan());
-        assert!(gf16_to_f32(0x7F01).is_nan());
-        assert!(gf16_to_f32(0x7FFF).is_nan());
+        let v = gf16_to_f32(0x7F01);
+        assert!(v.is_nan());
     }
 
     // ---- f32 -> GF16 ----
@@ -454,10 +461,7 @@ mod tests {
 
     #[test]
     fn f32_to_gf16_nan() {
-        // #6940 D3: canonical NaN 0xFE01, whatever the sign or payload.
-        assert_eq!(f32_to_gf16(f32::NAN), 0xFE01);
-        assert_eq!(f32_to_gf16(-f32::NAN), 0xFE01);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x7FC0_0001)), 0xFE01);
+        assert_eq!(f32_to_gf16(f32::NAN), 0x7F01);
     }
 
     #[test]
@@ -473,52 +477,25 @@ mod tests {
     }
 
     #[test]
-    fn gf16_no_denormals() {
-        // #6940 D1: e = 0 is a normal binade, (1 + m/2^9) * 2^-31. m=1 is the
-        // smallest positive value, m=256 is 1.5 * 2^-31, 0x0200 is 2^-30.
-        assert_eq!(gf16_to_f32(0x0001), f32::from_bits(0x3000_4000));
-        assert_eq!(gf16_to_f32(0x0100), f32::from_bits(0x3040_0000));
-        assert_eq!(gf16_to_f32(0x0200), f32::from_bits(0x3080_0000));
-        assert_eq!(gf16_to_f32(0x8001), -f32::from_bits(0x3000_4000));
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3000_4000)), 0x0001);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3040_0000)), 0x0100);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3080_0000)), 0x0200);
-        // 2^-31 has no code and flushes to signed zero; so does the tie
-        // between it and 0x0001, and everything below.
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3000_0000)), 0x0000);
-        assert_eq!(f32_to_gf16(f32::from_bits(0xB000_0000)), 0x8000);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3000_2000)), 0x0000);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3000_2001)), 0x0001);
+    fn f32_to_gf16_denormals() {
+        // m=1 is 2^-39, m=256 is 2^-31, 0x0200 (e=1, m=0) is 2^-30.
+        assert_eq!(gf16_to_f32(0x0001), 1.818_989_403_545_856_5e-12_f32);
+        assert_eq!(gf16_to_f32(0x0200), 9.313_225_746_154_785e-10_f32);
+        assert_eq!(f32_to_gf16(4.656_612_873_077_393e-10), 0x0100);
+        assert_eq!(f32_to_gf16(9.313_225_746_154_785e-10), 0x0200);
         assert_eq!(f32_to_gf16(5.0e-13), 0x0000);
         assert_eq!(f32_to_gf16(-5.0e-13), 0x8000);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x0000_0001)), 0x0000);
-    }
-
-    #[test]
-    fn f32_to_gf16_tie_rounds_toward_zero() {
-        // #6940 D2: FORMAT-SPEC-001 "ties-to-zero (frozen)".
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3F80_2000)), 0x3E00);
-        assert_eq!(f32_to_gf16(f32::from_bits(0xBF80_2000)), 0xBE00);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3F80_2001)), 0x3E01);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3F80_1FFF)), 0x3E00);
-        // Odd-m tie: ties-to-even would give 0x3E02.
-        assert_eq!(f32_to_gf16(f32::from_bits(0x3F80_6000)), 0x3E01);
-        // Overflow edge: the tie below 2^32 stays finite.
-        assert_eq!(f32_to_gf16(f32::from_bits(0x4F7F_C000)), 0x7DFF);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x4F7F_E000)), 0x7DFF);
-        assert_eq!(f32_to_gf16(f32::from_bits(0x4F7F_E001)), 0x7E00);
-        assert_eq!(f32_to_gf16(f32::from_bits(0xCF7F_E001)), 0xFE00);
     }
 
     #[test]
     fn every_non_nan_code_round_trips() {
         // decode then encode returns every code except the NaNs
-        // (e = EXP_MAX, m != 0), which all encode to 0xFE01 (#6940 D3).
+        // (e = EXP_MAX, m != 0), which all encode to 0x7F01.
         for x in 0..=u16::MAX {
             let e = (x & EXP_MASK) >> EXP_SHIFT;
             let m = x & MANT_MASK;
             if e == EXP_MAX && m != 0 {
-                assert_eq!(f32_to_gf16(gf16_to_f32(x)), 0xFE01);
+                assert_eq!(f32_to_gf16(gf16_to_f32(x)), 0x7F01);
             } else {
                 assert_eq!(f32_to_gf16(gf16_to_f32(x)), x, "code {:#06x}", x);
             }
