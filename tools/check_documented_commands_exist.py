@@ -251,7 +251,7 @@ MUST_NOT_EXIST = ("gen-zig",)
 # is how a gate gets muted, and excluding those families by path would be an
 # exclusion made by argument. So: the list prints every run, and the number can
 # only fall. A new dead `tri` name still fails.
-MAX_DEAD_TRI = 86
+MAX_DEAD_TRI = 68
 
 TRI_MUST_EXIST = ("now", "wave", "gen", "skill", "seal")
 # git graduated (trigit, ADR-002): the planted dead name moved to an absent one.
