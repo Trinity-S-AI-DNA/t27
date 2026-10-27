@@ -1,12 +1,12 @@
 # t27 documentation index
 
-First-party docs follow the **27-agent trinity alphabet** grouping: **three nonas** (3×9) from **`docs/agents/AGENTS_ALPHABET.md`**, plus **`agents/`** and **`coordination/`**.
+First-party docs follow the **27-agent trinity alphabet** grouping: **three nonas** (3×9) from **`docs/agents/AGENTS_ALPHABET.md`**, plus **`agents/`**, **`coordination/`**, and **`clara/`**.
 
 ## Root (stable anchors)
 
 | Path | Role |
 |------|------|
-| **[`NOW.md`](NOW.md)** | Rolling snapshot; sync gates require frequent updates. |
+| **[`NOW.md`](../NOW.md)** | Rolling snapshot (repo root); sync gates require frequent updates. |
 | **[`T27-CONSTITUTION.md`](T27-CONSTITUTION.md)** | Repository constitution (**SSOT-MATH**, **LANG-EN**, **DOCS-TREE**). |
 | **[`OWNERS.md`](OWNERS.md)** | Docs tree ownership note. |
 
@@ -24,13 +24,6 @@ First-party docs follow the **27-agent trinity alphabet** grouping: **three nona
 | [`coordination/TASK_PROTOCOL.md`](coordination/TASK_PROTOCOL.md) | Inter-agent TASK protocol. |
 | [`coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md`](coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md) | Phased plan: seed → tests → Queen brain (`tri`/`t27c`, conformance, codegen gap). |
 | [`coordination/inter-agent-handoff/`](coordination/inter-agent-handoff/) | Portable handoff bundle. |
-| [`coordination/HANDOFF.md`](coordination/HANDOFF.md) | The ledger `tri trigit handoff` reads and appends (#12286). |
-
-## [`system/`](system/) — system documentation bodies (rendered at `t27.ai/#/docs`)
-
-| Path | Role |
-|---|---|
-| [`system/project.md`](system/project.md) .. [`system/evidence.md`](system/evidence.md) | English canonical prose of the seven chapters declared in [`specs/docs/`](../specs/docs/); sections are checked against `SECTIONS` at site build. |
 
 ## [`nona-01-foundation/`](nona-01-foundation/) — agents **A–I**
 
@@ -49,25 +42,12 @@ TDD, bootstrap/testing plans, math/physics test framework charter, PHI loop, tec
 | [`nona-03-manifest/T27-MATH-PHYSICS-TEST-FRAMEWORK-SPEC.md`](nona-03-manifest/T27-MATH-PHYSICS-TEST-FRAMEWORK-SPEC.md) | Rings 050–054: oracles, `claim_tier`, sprints A–E, CI ladder |
 | [`nona-03-manifest/T27-UNIFIED-AXIOM-THEOREM-FORMAT-SYSTEM.md`](nona-03-manifest/T27-UNIFIED-AXIOM-THEOREM-FORMAT-SYSTEM.md) | Axioms/theorems/catalog + `FORMAT-SPEC-001` / `axiom_system.json` |
 | [`nona-03-manifest/CLAIM_TIERS.md`](nona-03-manifest/CLAIM_TIERS.md) | Policy: `claim_tier` for math/physics |
-| [`nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md`](nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md) | t27o on the roadmap repositories (coverage, refusal kinds, timing), its field and ten weaknesses (#10522) |
-| [`nona-03-manifest/VIZ-DISTILL-GRAPH.md`](nona-03-manifest/VIZ-DISTILL-GRAPH.md) | The spec corpus as one interactive Distill-style graph; materialise `build/viz/spec-graph.html` (#12218) |
-| [`nona-03-manifest/VIZ-PETAL-GUIDE.md`](nona-03-manifest/VIZ-PETAL-GUIDE.md) | Contributor guide: add the visualization for one more petal (start, write, test, check, land) through `viz_contract` and `petal_viz_plan` (#12173) |
 
 ## External Projects
 
 | Project | Description | Link |
 |---------|-------------|-------|
-
-## TRI-NET cross-line package (docs-only)
-
-| Path | Role |
-|------|------|
-| [`TRI_NET_WHITEPAPER.md`](TRI_NET_WHITEPAPER.md) | Position paper -- open high-assurance ternary AI silicon substrate. |
-| [`TRI_NET_API.md`](TRI_NET_API.md) | File-based, read-only external integration contract (schema MAJOR=1). |
-| [`GF16_BFLOAT16_NMSE_PROTOCOL.md`](GF16_BFLOAT16_NMSE_PROTOCOL.md) | Distribution-explicit NMSE comparison protocol; L5 identity-witness-gated. |
-| [`22FDX_TOPS_W_PROJECTION.md`](22FDX_TOPS_W_PROJECTION.md) | Energy projection methodology with C1..C5 confidence bands (projection, not measured). |
-| [`ZENODO_BUNDLES.md`](ZENODO_BUNDLES.md) | v1 / v2 / v3 Zenodo bundle plan -- no DOI quoted before upload. |
-| [`SCIENTIFIC_IMPROVEMENT_PLAN.md`](SCIENTIFIC_IMPROVEMENT_PLAN.md) | 2026 t27-side roadmap (CL-01..04, EN-01..03, SN-01..03, PUB-01..03, OS-01..03). |
+| **CLARA DARPA PA-25-07-02** | DARPA CLARA submission package (moved 2026-04-15) | [ghashTag/trinity-clara](https://github.com/gHashTag/trinity-clara) |
 
 ---
 

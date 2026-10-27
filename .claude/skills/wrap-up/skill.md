@@ -1,28 +1,47 @@
 ---
 name: wrap-up
 description: Format and upload session wrap-up to NotebookLM for persistent semantic memory
-version: 1.0.0
+version: 1.1.0
 author: Trinity S3AI Framework
 ---
 
 # Wrap-Up Skill
 
-<!-- only-t27-rule -->
-> **Only t27: everything is written in `.t27`.** (Owner hard rule 2026-10-05; budget #7371; restated in every skill per #7588.)
-> - New logic starts as a `.t27` spec with `test` / `invariant` blocks. It reaches Rust, C, Zig, JS or Python only through `t27c gen-*`, and generated files are never hand-edited (L2).
-> - Hand-written code in any other language is denied by the hooks and by CI: `.rs .py .ts .js .sh .zig .c .go .v .yml .toml`, Dockerfile, Makefile; the full list is in `specs/policy/own_language.t27`.
-> - Existing foreign code is debt that only shrinks. Delete it, or replace it with a spec and its generated output.
-> - Thin hand-written glue is capped at 40 added lines per file and 80 per PR. No label lifts the cap. Never split a PR to slip under it.
-> - What gen cannot express yet is a compiler defect. File it on #5980 with a minimal `.t27` repro instead of writing the code by hand.
-> - This rule overrides any step below that says to write a script or code in another language. The full text is in `AGENTS.md`, "Only t27".
-
 Upload session summaries to NotebookLM for cross-session memory persistence.
 
+## MANDATORY: Notebook ID Required
+
+**L7 UNITY Requirement:** Wrap-up without `notebook_id` is rejected.
+
+Before using this skill, you MUST have:
+1. Run `t27c bridge task start --title "your task"`
+2. Or run `t27c bridge task attach --notebook_id "..."`
+
+The wrap-up will be uploaded to the notebook specified in `.trinity/current_task/.notebook_id`.
+
+If no notebook is configured, this skill will fail with an error.
+
+<<<<<<< Updated upstream
+<<<<<<< Updated upstream
+=======
+## What It Does
+
+>>>>>>> Stashed changes
+=======
+>>>>>>> Stashed changes
 ## What It Does
 
 1. Extracts session context from `.trinity/` state files
 2. Formats summary as Markdown with metadata
 3. Uploads to NotebookLM as searchable source
+
+## MANDATORY: Notebook Required
+
+**⚠️ Wrap-up without a task notebook is REJECTED**
+
+Before running wrap-up, you MUST have:
+- A valid `.trinity/current_task/.notebook_id` file
+- Run `t27c task start --title "your task"` to create one
 
 ## Usage
 
@@ -37,6 +56,18 @@ Or with full details:
          --decisions "Used notebooklm-py SDK with cookie auth" \
          --files "contrib/backend/notebooklm/*.py" \
          --steps "Run integration tests"
+```
+
+## Prerequisites
+
+```bash
+# 1. Initialize task (creates notebook)
+t27c task start --title "Your task description"
+
+# 2. Do your work...
+
+# 3. Run wrap-up (requires valid notebook)
+/wrap-up --summary "completed task" --decisions "..." --files "..." --steps "..."
 ```
 
 ## Implementation
@@ -61,7 +92,7 @@ This skill uses the t27 spec-first approach:
 ## Configuration
 
 - **Auth**: Cookie-based via `notebooklm login` (stores in `~/.notebooklm/storage_state.json`)
-- **Active Notebook**: Set via `--notebook` flag (default: "t27-QUEEN-BRAIN")
+- **Active Notebook**: Read from `.trinity/current_task/.notebook_id`
 - **Default Notebook**: "t27-QUEEN-BRAIN" (creates if not exists)
 - **Storage**: `~/.notebooklm/` — browser profile, storage state
 

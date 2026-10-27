@@ -1,5 +1,4 @@
 ---
-model: sonnet
 description: Trinity Agent (Queen) - Orchestrates multi-agent coordination, executes AEL v2.0
 color: "#ef4444"
 orchestrator: true

@@ -145,7 +145,7 @@ Conclusion:
 ## Files Structure
 
 ```
-research/trinity-pellis-paper/
+/Users/playra/t27/research/trinity-pellis-paper/
 ├── alpha_s_golden_ratio.pdf           [Current preprint]
 ├── alpha_s_golden_ratio.tex          [Preprint LaTeX]
 ├── references.bib                     [Bibliography]
@@ -159,7 +159,7 @@ research/trinity-pellis-paper/
 ├── banks_zaks_fixed_point.tex        [Path 2: Banks-Zaks analysis]
 └── banks_zaks_verification.py          [Path 2: Banks-Zaks verification]
 
-research/                    [Repository root]
+/Users/playra/t27/research/                    [Repository root]
 ├── toda_numerical_results.json     [Zamolodchikov E8 Toda - CRITICAL!]
 ├── toda_derivation.json             [E8 Toda theory derivation]
 ├── toda_quantum_correction.json     [Quantum corrections]

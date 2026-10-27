@@ -3,8 +3,8 @@
 
 ## Primary
 
-**R-Reasoning** — AR pipeline, ASP, proof traces, explainability.
+**R-Reasoning** — CLARA AR pipeline, ASP, proof traces, explainability.
 
 ## Dependencies
 
-- `contrib/backend/` services when integrated.
+- `clara-bridge/`, `contrib/backend/` services when integrated.

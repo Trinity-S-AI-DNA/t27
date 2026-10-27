@@ -3,24 +3,6 @@
 
 set -e
 
-# W707: this file named one developer's home SIX times, and it is an EXAMPLE --
-# the one kind of file whose whole purpose is to be copied. Anyone who copied it
-# got a script that works on exactly one machine.
-#
-# `git rev-parse --show-toplevel` is what secret-scan's own error message
-# recommends, and it is right here: the example lives inside the repository it
-# needs. T27_ROOT overrides it for a copy taken elsewhere.
-# `|| true`: `set -e` is on, and a failing `git rev-parse` inside a command
-# substitution kills the script before the check below can print anything. The
-# first version of this exited 128 in silence, which the out-of-repository
-# control caught immediately.
-T27_ROOT=${T27_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || true)}
-if [[ -z "$T27_ROOT" || ! -f "$T27_ROOT/Cargo.toml" ]]; then
-    echo "Cannot locate the t27 repository root."
-    echo "  Run this from inside a checkout, or: export T27_ROOT=/path/to/t27"
-    exit 1
-fi
-
 echo "🔥 QMTECH XC7A100T Minimal Example Build"
 echo "=========================================="
 
@@ -47,7 +29,7 @@ check_t27c() {
     if ! command -v t27c &> /dev/null; then
         echo -e "${RED}Error: t27c not found${NC}"
         echo -e "${YELLOW}Build Trinity t27 toolchain first:${NC}"
-        echo -e "${YELLOW}  cd $T27_ROOT${NC}"
+        echo -e "${YELLOW}  cd /Users/playom/t27${NC}"
         echo -e "${YELLOW}  cargo build --release -p t27c${NC}"
         exit 1
     fi
@@ -55,7 +37,7 @@ check_t27c() {
 
 # Function to check if we're in Trinity project
 check_project() {
-    if [[ ! -f "$T27_ROOT/Cargo.toml" ]]; then
+    if [[ ! -f "/Users/playom/t27/Cargo.toml" ]]; then
         echo -e "${RED}Error: Not in Trinity project${NC}"
         echo -e "${YELLOW}This example must be run from within the Trinity project${NC}"
         exit 1
@@ -87,7 +69,7 @@ clean() {
     rm -rf build/ 2>/dev/null || true
     
     # Clean Trinity build if exists
-    cd $T27_ROOT
+    cd /Users/playom/t27
     if [[ -d "build/fpga" ]]; then
         rm -rf build/fpga/generated/*
         rm -f build/fpga/bitstream.bit
@@ -101,7 +83,7 @@ clean() {
 smoke_test() {
     echo -e "${GREEN}💨 Running smoke test (Verilog generation)...${NC}"
     
-    cd $T27_ROOT
+    cd /Users/playom/t27
     if ./target/release/t27c fpga-build --board "$BOARD" --profile minimal --smoke; then
         echo -e "${GREEN}✅ Smoke test passed!${NC}"
     else
@@ -114,7 +96,7 @@ smoke_test() {
 synthesis() {
     echo -e "${GREEN}⚙️  Running synthesis (Yosys + nextpnr)...${NC}"
     
-    cd $T27_ROOT
+    cd /Users/playom/t27
     if ./target/release/t27c fpga-build --board "$BOARD" --profile minimal --synth-only; then
         echo -e "${GREEN}✅ Synthesis completed!${NC}"
         echo -e "${YELLOW}📊 Synthesis results:${NC}"
@@ -132,7 +114,7 @@ synthesis() {
 full_build() {
     echo -e "${GREEN}🔨 Running full build...${NC}"
     
-    cd $T27_ROOT
+    cd /Users/playom/t27
     
     # Step 1: Smoke test
     echo -e "${YELLOW}Step 1: Verilog generation...${NC}"

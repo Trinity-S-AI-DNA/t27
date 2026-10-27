@@ -37,6 +37,25 @@
 
 ---
 
+## Canonical iteration schema
+
+*When recording work iterations (PHI LOOP cycles), use this schema:*
+
+```markdown
+## Iteration <N>
+- **Goal**: <single capability, one sentence>
+- **Spec delta**: <which .t27 spec changed>
+- **Generated artifacts**: <zig/verilog/c outputs>
+- **Tests**: <test/invariant/bench executed>
+- **Seal**: <hash or PENDING>
+- **Verdict**: CLEAN | TOXIC
+- **Next constraint**: <single next bottleneck>
+```
+
+*This aligns with PHI LOOP (§4) and ISSUE-GATE laws (L1–L7).*
+
+---
+
 ## Handoff log
 
 *Format: `YYYY-MM-DDTHH:MMZ` | `agent_id` | intent | outcome | next (newest last).*
@@ -44,6 +63,7 @@
 - 2026-04-06T12:00Z | cursor-agent | Bootstrap TASK Protocol v1.0 + build.rs validation + Anchor #141 | protocol landed | maintainers set locks when parallel work starts
 - 2026-04-06T18:00Z | cursor-agent | Add `docs/coordination/inter-agent-handoff/` bundle (scientific excellence EPICs + zip) + TASK_PROTOCOL §8 pointer | landed | downstream agents read README in bundle; normative state stays TASK.md + #141
 - 2026-04-06T18:30Z | cursor-agent | Add `ERRATA_PERPLEXITY_HANDOFF.md` (Epoch-2 / “create RESEARCH_CLAIMS” text is non-canonical) | landed | agents with Perplexity paste read errata before executing TASK-01.1
+- 2026-04-07T00:00Z | autonomous-agent | Add canonical iteration schema to TASK.md per Ring 032 | schema embedded | Ring 032 closure pending
 
 ---
 
@@ -148,7 +168,4 @@
 
 ---
 
-*English only in this file.*- 2026-10-23T07:10Z | buffy-agent | tri-git release coverage (git.t27 0->100%, typecheck 0/0) + loop_guard safe-loop spec + issues #11730-#11733 reopened via issue-shape | landed in this PR | tooling bugs stay open in #11730-#11733; skill .claude/skills/tri-git-coverage/; no lock held
-- 2026-10-25T09:10Z | queen-live-lane | CYCLE PROVEN: the reviewer bee reviewed PR #12177 end to end on the free fleet (glm-4.7-flash, 88 s, $0.00), posted REQUEST_CHANGES with line-level evidence, caught the operator's OWN mistakes (a re-trigger commit missing its issue reference; stale seals), and the operator fixed them -- the system polices itself | #12177 (bee branch, Auto Merge gate armed) | re-review pending after the history fix; pool capacity flapped 8->2 keys same morning, re-probe per api_fleet.t27 before routing
-- 2026-10-25T10:20Z | owner-directive | NO RAILWAY: the owner corrected the record ("у нас нет Railway!!! у нас все запускается децентрализовано через T27OS") -- every agent brief that proposes a Railway deploy/redeploy step is WRONG; deployment is T27 OS decentralized (t27os executor, cards in specs/crons/, artifacts in runs/); legacy *.up.railway.app URLs are footprints, not steps | skill t27os-deploy | re-point any Railway step to a T27OS card (the feed lane trios#2822 included)
-- 2026-10-25T1016Z | day-chronicle | the day the swarm became self-sustaining: 64 t27 + 7 trinity + 1 trios PRs merged by 10:13Z; wasm32_emitter.rs deleted whole and --target wasm32 runs on the law alone (#12044, trio sha256 8ba8961b byte-identical), stateful floors 12-16 as law (#12178), the gx_ data-plane law (#12148), api_fleet.t27 the free-fleet law (#12180); the bee's first posted review policed the operator's own commits (#12177, glm-4.7-flash, 88 s, $0.00) and the GNN article went live (t27.ai/t27f/gnn/, trinity #1745); honest costs: two subagent deaths to the 5h limit (artifacts survived), two near-miss branch wipes recovered, pool capacity flapped 8->2 keys | #10262 (chronicle comment) | #6198 still open; floor 17 in #12308
+*English only in this file.*

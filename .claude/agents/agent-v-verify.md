@@ -1,6 +1,5 @@
 ---
 id: agent-v-verify
-model: sonnet
 name: Agent V - Verification
 description: Validates generated code against specifications, runs conformance tests, ensures L1-L7 compliance
 triggers:

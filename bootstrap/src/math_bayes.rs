@@ -184,7 +184,7 @@ fn compute_sacred_evidence(
     p_random: f64,
     data_norm: f64,
 ) -> ModelEvidence {
-    let n_obs = (k * n) as usize;  // Total observations
+    let n_obs = k * n;  // Total observations
 
     // Maximum likelihood:
     // For Sacred Formula, the compact structure suggests the model captures genuine patterns
@@ -219,7 +219,7 @@ fn compute_null_evidence(
     p_random: f64,
     data_norm: f64,
 ) -> ModelEvidence {
-    let n_obs = (k * n) as usize;
+    let n_obs = k * n;
 
     // Maximum likelihood under H₀:
     // Matches occur randomly with probability p_random
@@ -363,8 +363,7 @@ fn run_verification(experience_path: Option<String>, min_log_bf: f64) -> anyhow:
     let mut success_count = 0;
     let mut min_log_bf = f64::MAX;
 
-    let empty_vec: Vec<serde_json::Value> = Vec::new();
-    for entry in data.as_array().unwrap_or(&empty_vec).iter() {
+    for entry in data.as_array().unwrap_or(&serde_json::json!([])).iter() {
         if let Some(event) = entry.get("event") {
             if event.as_str() == Some("math_compare") {
                 // Extract configuration
@@ -405,5 +404,4 @@ pub fn run_bayes_command(
             run_verification(experience_path, min_log_bf)?;
         }
     }
-    Ok(())
 }

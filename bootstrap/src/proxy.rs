@@ -1,40 +1,24 @@
 // bootstrap/src/proxy.rs
 // Request proxy middleware for sandbox containers
 
-// The gates in this file are honest about what each item needs (#5448).
-//
-// `axum` and `tokio` are OPTIONAL dependencies switched on only by
-// `feature = "server"`, and `AppState`/`Session` in main.rs carry the same
-// gate. Anything that touches them is gated on the feature ALONE: gating it on
-// `any(feature = "server", test)` turned it on under a plain `cargo test`
-// without its crates, and the whole bin test target failed to compile.
-//
-// The two token parsers need nothing else optional. `HeaderMap` and `Uri` are
-// taken from `hyper`, which re-exports the same `http` 1.x types axum does.
-// `hyper` is optional (feature `server`) and is also a dev-dependency, so the
-// parsers and their unit tests still type-check and run in a default
-// `cargo test` -- which is what #2301 asked for. Outside tests, main.rs builds
-// this module only with `server`.
-#[cfg(any(feature = "server", test))]
-use {
-    hyper::{HeaderMap, Uri},
-    std::collections::HashMap,
-};
-
 #[cfg(feature = "server")]
 use {
     axum::{
         body::{Body, Bytes},
         extract::{Request, State},
-        http::{Method, StatusCode},
+        http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
         response::{IntoResponse, Response},
+    },
+    std::{
+        collections::HashMap,
+        sync::Arc,
     },
     crate::{AppState, Session},
     http_body_util::{BodyExt, Full},
 };
 
 /// Extract token from query parameters
-#[cfg(any(feature = "server", test))]
+#[cfg(feature = "server")]
 fn extract_token_from_query(uri: &Uri) -> Option<String> {
     uri.query()
         .and_then(|q| serde_urlencoded::from_str::<HashMap<String, String>>(q).ok())
@@ -43,7 +27,7 @@ fn extract_token_from_query(uri: &Uri) -> Option<String> {
 
 /// Extract token from Authorization header
 /// Format: "Bearer <token>" or "Sandbox <token>"
-#[cfg(any(feature = "server", test))]
+#[cfg(feature = "server")]
 fn extract_token_from_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")
@@ -170,10 +154,9 @@ async fn proxy_to_container(
         Ok(req) => {
             // Use hyper v1 client for making the request
             let connector = hyper_util::client::legacy::connect::HttpConnector::new();
-            let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(connector);
+            let mut builder = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
 
-            match client.request(req).await {
+            match builder.build(connector).request(req).await {
                 Ok(mut resp) => {
                     // Build the response
                     let mut response_builder = Response::builder()
@@ -251,7 +234,6 @@ pub async fn check_container_health(service_id: &str) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::header::HeaderValue;
 
     #[test]
     fn test_extract_token_from_query() {

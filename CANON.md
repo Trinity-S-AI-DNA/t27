@@ -1,7 +1,7 @@
 # CANON.md — Golden rings, seals, and project dashboard
 
 **Status:** Active (root standard — read with `AGENTS.md`, `SOUL.md`, `CLAUDE.md`)  
-**Companion:** `FROZEN.md` (normative freeze standard), `docs/nona-01-foundation/SEED-RINGS.md`, `**docs/RINGS.md` (Rings 32+ review-grade roadmap — constitutional law)**, `stage0/FROZEN_HASH`, `docs/T27-CONSTITUTION.md`, `docs/TECHNOLOGY-TREE.md`
+**Companion:** `FROZEN.md` (normative freeze standard), `docs/SEED-RINGS.md`, `**docs/RINGS.md` (Rings 32+ review-grade roadmap — constitutional law)**, `stage0/FROZEN_HASH`, `docs/T27-CONSTITUTION.md`, `docs/TECHNOLOGY-TREE.md`
 
 This file is the **single source and dashboard** for: where **GOLD** lives, what **REFACTOR-HEAP** must be migrated out, **recorded compiler seals**, and the **ring roadmap**. **Nothing outside the golden cycle is product truth.**
 
@@ -82,7 +82,7 @@ High-level status aligned with `docs/TECHNOLOGY-TREE.md` (detail lives there). U
 | 9–12  | TRUNK — Zig / Verilog / C backends, seal CLI                    | Complete               |
 | 13–15 | BRANCH — AR pipeline, Queen+NN, full spec suite                 | Complete               |
 | 16–17 | CANOPY — self-hosting fixed point                               | Complete               |
-| 18–24 | AR integration                                                   | Complete               |
+| 18–24 | CLARA AR integration                                            | Complete               |
 | 25–31 | Gen backends + conformance hardening                            | Complete               |
 | 32–35 | Hardening (docs, validation scripts, CI)                        | In progress            |
 | 36+   | Zig/C/Verilog compile in CI, cross-backend conformance, benches | Planned                |
@@ -102,10 +102,10 @@ Each **ring increment** is a **micro-iteration**. Minimum bar before a commit cl
 | Step | Command / artifact                                           | Pass criterion                                                                                                         |
 | ---- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
 | M1   | `cd bootstrap && cargo build` (or `--release`)               | **Must succeed** — runs `build.rs` language guard + builds `t27c`.                                                     |
-| M2   | `./target/release/t27c parse <new-or-touched.t27>` | **Parse OK** for every spec touched in the PR.                                                                         |
+| M2   | `./bootstrap/target/release/t27c parse <new-or-touched.t27>` | **Parse OK** for every spec touched in the PR.                                                                         |
 | M3   | `cargo test` in `bootstrap/`                                 | **All tests green** for compiler changes.                                                                              |
 | M4   | `bash tests/run_all.sh` (CI)                                 | Full spec parse/gen sweep as defined by the repo.                                                                      |
-| M5   | Update `**stage0/FROZEN_HASH`**                              | **Only when intentionally sealing a ring** — SHA-256 of `bootstrap/src/compiler.rs` (see `docs/nona-01-foundation/SEED-RINGS.md` step 8). |
+| M5   | Update `**stage0/FROZEN_HASH`**                              | **Only when intentionally sealing a ring** — SHA-256 of `bootstrap/src/compiler.rs` (see `docs/SEED-RINGS.md` step 8). |
 | M6   | Seal / experience                                            | `.trinity/seals/*.json` updated where required; optional `.trinity/experience/` record.                                |
 
 
@@ -122,7 +122,7 @@ If **M1–M4** are not green, the change is **not gold** — use a draft branch 
 | `**bootstrap/src/compiler.rs` (+ lexer/parser/codegen in `bootstrap/src/`)** | **Only** allowed hand-written compiler implementation until self-host ring.        |
 | `**stage0/FROZEN_HASH`**                                                     | Cryptographic **seal** of the compiler snapshot for the current ring baseline.     |
 | `**.trinity/seals/*.json`**                                                  | Module seals — gold for verified spec revisions.                                   |
-| `**docs/nona-01-foundation/SEED-RINGS.md` + this file (`CANON.md`)**                            | Process gold — rings, micro-iterations, dashboard.                                 |
+| `**docs/SEED-RINGS.md` + this file (`CANON.md`)**                            | Process gold — rings, micro-iterations, dashboard.                                 |
 | `**docs/RINGS.md`**                                                          | Process gold — **Rings 32+** review-grade repository law (epics, tasks, timeline). |
 | `**docs/T27-CONSTITUTION.md` + `docs/SOUL.md` Law #1**                       | Policy gold — language and SSOT.                                                   |
 
@@ -138,7 +138,7 @@ Everything here is **acknowledged non-gold**. Do **not** copy patterns into new 
 
 | Bucket                               | Pointer                                   | Summary                                                               |
 | ------------------------------------ | ----------------------------------------- | --------------------------------------------------------------------- |
-| Non-t27 languages on critical path   | `docs/QUEEN-LOTUS-SEED-LANGUAGE-PURGE.md` | Python conformance runners, Kepler tests, legacy `t27c.py`, etc.             |
+| Non-t27 languages on critical path   | `docs/QUEEN-LOTUS-SEED-LANGUAGE-PURGE.md` | Python CLARA runner, Kepler tests, legacy `t27c.py`, etc.             |
 | IEEE f32/f64 instead of GF16 primary | `docs/NUMERIC-GF16-DEBT-INVENTORY.md`     | nn/, vsa/, math/, physics/, AR composition `f32`, etc.                |
 | GF4–GF32 spec files                  | Same inventory §1                         | `**[REFERENCE]`** only — not an excuse to add `f64` in product paths. |
 | Vendored forests                     | `external/opencode/`                      | Not Trinity gold; submodule or delete policy.                         |
@@ -164,7 +164,7 @@ Everything here is **acknowledged non-gold**. Do **not** copy patterns into new 
 
 **Ordered priorities (suggested):**
 
-1. **P0 Python on verdict path** — `conformance/kepler_newton_tests.py` → spec + `tri` (see TZ-T27-001).
+1. **P0 Python on verdict path** — `conformance/kepler_newton_tests.py`, `clara-bridge/run_scenario.py` → spec + `tri` (see TZ-T27-001).
 2. **Language guard convergence** — keep `build.rs` + CI; long-term single `t27c lint-lang` (Python checker is temporary duplicate).
 3. **Numeric debt** — burn down `NUMERIC-GF16-DEBT-INVENTORY.md` from hottest product paths first.
 4. **Vendor boundaries** — `external/opencode/` submodule or remove; never teach agents to patch for Trinity features.
@@ -190,17 +190,13 @@ Everything here is **acknowledged non-gold**. Do **not** copy patterns into new 
 ## 8. Single-command cheat sheet (local micro-iteration)
 
 ```bash
-cargo build --release -p t27c && ./target/release/t27c parse specs/base/types.t27
+cd bootstrap && cargo build --release \
+  && ./target/release/t27c parse ../specs/base/types.t27
 ```
 
-Run from the **repo root**. `bootstrap/` is a workspace member, so the binary is
-emitted to the workspace-root `target/`, never to `bootstrap/target/`.
+Regenerate **canonical** Zig tree (default output `**gen/zig`**, no flags needed): from repo root, `./bootstrap/target/release/t27c compile-all`. Use `--backend verilog` / `c` for `**gen/verilog**` / `**gen/c**`.
 
-Regenerate **canonical** Zig tree (default output `**gen/zig`**, no flags needed): from repo root, `./target/release/t27c compile-all`. Use `--backend verilog` / `c` for `**gen/verilog**` / `**gen/c**`.
-
-Substitute your changed spec paths. Full sweep: `./scripts/tri test`, or
-`./target/release/t27c suite --repo-root .`. There is **no** shell test harness
-under `tests/` (L7 UNITY); the Rust runner is the only sweep entry point.
+Substitute your changed spec paths. Full sweep: `**bash tests/run_all.sh**`.
 
 ---
 
@@ -218,7 +214,7 @@ under `tests/` (L7 UNITY); the Rust runner is the only sweep entry point.
 
 ## 10. RINGS law — review-grade repository (constitutional)
 
-**Article RINGS.** For **Ring 31 and below**, closure is defined by `**docs/nona-01-foundation/SEED-RINGS.md`**, `**CANON.md` §§0–8**, and `**FROZEN.md`**. For **Ring 32 and above**, closure **also** requires progress against `**docs/RINGS.md`**: reproducibility, persistent citation identity, explicit **claim status** for physics-adjacent material, formal spec depth, numeric validation, testing maturity, and supply-chain documentation — as enumerated in that file’s EPICs.
+**Article RINGS.** For **Ring 31 and below**, closure is defined by `**docs/SEED-RINGS.md`**, `**CANON.md` §§0–8**, and `**FROZEN.md`**. For **Ring 32 and above**, closure **also** requires progress against `**docs/RINGS.md`**: reproducibility, persistent citation identity, explicit **claim status** for physics-adjacent material, formal spec depth, numeric validation, testing maturity, and supply-chain documentation — as enumerated in that file’s EPICs.
 
 **Binding rules:**
 

@@ -19,10 +19,7 @@ PI = math.pi
 E = math.e
 
 # ============ PATHS ============
-# From this file's location, not from the machine it was written on: this
-# was an absolute path into one developer's home directory and could
-# therefore run for exactly one person.
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = "/Users/playra/t27"
 LOG_FILE = os.path.join(REPO_ROOT, "overnight_errors.log")
 PROGRESS_FILE = os.path.join(REPO_ROOT, "OVERNIGHT_PROGRESS.md")
 

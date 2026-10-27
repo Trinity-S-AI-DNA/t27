@@ -160,13 +160,17 @@ fn main() -> Result<()> {
         Cmd::Reload => {
             cable.shift_ir(dlc10::ir::JPROGRAM)?;
             cable.cycle_tck(64)?;
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            eprintln!("[reload] JPROGRAM sent, waiting 500ms for reconfig...");
+            std::thread::sleep(std::time::Duration::from_millis(500));
             cable.shift_ir(dlc10::ir::JSTART)?;
             cable.cycle_tck(2000)?;
+            eprintln!("[reload] JSTART sent, waiting 200ms for startup...");
+            std::thread::sleep(std::time::Duration::from_millis(200));
             cable.go_test_logic_reset()?;
             let stat = cable.read_cfg_reg(dlc10::cfg_reg::STAT)?;
             let bits = dlc10::StatBits::from_raw(stat);
-            println!("STAT=0x{:08X} DONE={} EOS={}", bits.raw, bits.done as u8, bits.eos as u8);
+            let bootsts = cable.read_cfg_reg(dlc10::cfg_reg::BOOTSTS)?;
+            println!("STAT=0x{:08X} DONE={} EOS={} BOOTSTS=0x{:08X}", bits.raw, bits.done as u8, bits.eos as u8, bootsts);
             if bits.done {
                 println!("FPGA reloaded from flash OK!");
             } else {

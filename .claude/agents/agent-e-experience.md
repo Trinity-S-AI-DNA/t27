@@ -1,6 +1,5 @@
 ---
 id: agent-e-experience
-model: sonnet
 name: Agent E - Experience
 description: Captures learnings from PHI LOOP cycles, maintains semantic memory, updates agent behaviors
 triggers:

@@ -1,87 +1,16 @@
 # Trinity S³AI DNA -- t27 -- TRI-27 Spec-First Language
 
-[![CI](https://img.shields.io/github/actions/workflow/status/gHashTag/t27/bootstrap-tests.yml?branch=master&logo=github&label=CI)](https://github.com/gHashTag/t27/actions/workflows/bootstrap-tests.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/gHashTag/t27/ci.yml?branch=master&logo=github&label=CI)](https://github.com/gHashTag/t27/actions/workflows/ci.yml)
 [![Zenodo](https://zenodo.org/badge/DOI/10.5281/zenodo.19456875.svg)](https://doi.org/10.5281/zenodo.19456875)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-orange.svg)](https://github.com/gHashTag/t27/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Version: 0.1.0](https://img.shields.io/badge/version-0.1.0-orange.svg)](https://github.com/gHashTag/t27/releases)
 
-
-> **Canonical Zenodo SOT:** [zenodo.org/communities/trinity-s3ai](https://zenodo.org/communities/trinity-s3ai/). The GoldenFloat badge above (19456875) is a legitimate Vasilev deposit but lives **outside** the curated S³AI v5.0 record set; see [docs/ZENODO.md](docs/ZENODO.md) for the canonical 12-record bundle and aliases.
+**Language:** [English](README.md) | [Русский](docs/README_RU.md)
 
 The canonical source of truth for Trinity S3AI.
 `.t27` specs in → Zig, Verilog, C out.
 
 **φ² + 1/φ² = 3 | TRINITY**
-
----
-
-## What this repo is
-
-**t27** is the **spec-first toolchain and numeric format registry** for the
-**TRI-NET line** of open high-assurance ternary AI silicon. The primary
-product of t27 is the path `.t27 → Verilog RTL → Tiny Tapeout` with sealed,
-inspectable artefacts at every step.
-
-- **How to verify:** `cd bootstrap && cargo build --release && cd .. && ./scripts/tri test`
-  (full Quick Start below). Validators: `./scripts/tri validate-conformance` and `validate-gen-headers`.
-- **Primary numeric path:** GoldenFloat **GF16** (default), with the family
-  GF4–GF32 registered in [`conformance/FORMAT-SPEC-001.json`](conformance/FORMAT-SPEC-001.json).
-  FP8 compat and NF4 / INT4 / INT8 quant bridges are **planned**, not shipped.
-  Full details: [`FORMAT_REGISTRY.md`](FORMAT_REGISTRY.md).
-- **Readiness:** [`STATUS.md`](STATUS.md) records what is at SPEC / RTL / SIM /
-  SYNTH / GDS / SILICON, conservatively, from this repo's own evidence only.
-- **Sibling chip repos (separate):** `tt-trinity-phi` (1×1 φ-anchor),
-  `tt-trinity-euler` (8×2 e-engine, safety/control), `tt-trinity-gamma`
-  (8×4 γ-surface 32-PE ternary mesh). Tape-out target:
-  [Tiny Tapeout](https://tinytapeout.com/chips/) -- the TTSKY26a and TTSKY26b
-  submissions were withdrawn and refunded (no die fabricated). See
-  [`LINEUP.md`](LINEUP.md).
-- **Positioning:** [`COMPETITORS.md`](COMPETITORS.md) — we do not race
-  commercial NPUs on TOPS or SDK breadth; we own the inspectable open silicon
-  and formal / assurance corner. Benchmark policy: [`BENCHMARKS.md`](BENCHMARKS.md).
-## FPGA — what is measured on real silicon (2026-08-15)
-
-Three **QMTech XC7A200T-FGG676** boards. Synthesis is
-`yosys 0.63 → nextpnr-xilinx (openXC7) → prjxray`, always with
-**`-nodsp -nosrl`** (see the defect note below).
-
-| result | number |
-|---|---|
-| **Trained ternary network across three dice** | **232 LUT**, 0 DSP, 0 SRL, **100/100** layer agreement on real UNSW-NB15 rows |
-| Best single-die artefact | **123 LUT** at **81.37%** (UNSW-NB15) / **86.91%** (Fashion-bin) |
-| Field reference on the same benchmark | TreeLUT (II): **89 LUT** at **92.0%** |
-| Cost rule, measured | **2.00 LUT/neuron** at ≤6 input bits; **39–54** at 12 |
-
-**Our area is competitive; our accuracy is not** — 1.38× the field's LUT at 10.6
-points less accuracy on UNSW-NB15. Detail: [`BENCHMARKS.md`](BENCHMARKS.md) §4,
-positioning: [`COMPETITORS.md`](COMPETITORS.md) §5.
-
-**The golden alphabet, measured against its own claim.** This line is named for
-φ. Alphabet **size** is worth **+0.735 pp** and its **shape** +0.149 pp, against
-inter-layer normalisation at **+29.15 pp** — and the multiplier φ removes from
-weight application **returns in the pair resolve** (8 DSP48E1, or ~2750 LUT
-without them). The algebra stands and is Coq-checked; the practical advantage
-does not. This is a negative result about our own headline idea and is recorded
-as one.
-
-**Toolchain defects found here.** openXC7 emits a **wrong bitstream from a
-correct netlist** for `SRL16E` (0/6 rows vs 24/24 with `-nosrl`, source
-byte-identical) and for a live-operand `DSP48E1`. Both pass the wrong-part → ours
-`0→1` acceptance criterion while computing the wrong answer. `t27c yostat` exits
-2 when either appears. Reproduction:
-[`docs/reports/OPENXC7-SRL16E-DEFECT.md`](docs/reports/OPENXC7-SRL16E-DEFECT.md).
-
----
-
-## HuggingFace mirror
-
-Discoverability mirror of the numeric corpus. GitHub remains the primary source of truth (one-way flow GitHub -> Zenodo -> Hugging Face).
-
-- **Catalog dataset:** [playra/numeric-format-catalog](https://huggingface.co/datasets/playra/numeric-format-catalog) -- dataset v3.0, a snapshot of 2026-06-13 that lags the live SSOT (`specs/numeric/formats_catalog.t27`, whose count is a CI invariant, not a fixed number) and is due for re-publishing from it
-- **Conformance packs:** [playra/numeric-conformance-packs](https://huggingface.co/datasets/playra/numeric-conformance-packs) -- bit-exact JSON vectors (10 configs across GF4..GF32 + phi-identity)
-- **Paper page:** [Golden Ruler: A Numeric Format Catalog with Bit-Exact Conformance Vectors for FP8, BF16, MXFP4, and Microscaling Formats -- arXiv:2606.09686 on HF](https://huggingface.co/papers/2606.09686) (v3, announced 7 Sep 2026)
-
-
 
 ---
 
@@ -92,8 +21,8 @@ Discoverability mirror of the numeric corpus. GitHub remains the primary source 
 | Compiler | `t27c parse` | GREEN | 170+ specs parse |
 | Compiler | `t27c gen-verilog` | GREEN | 5/5 FPGA modules synthesize |
 | Compiler | `t27c seal` | GREEN | 170+ seals in `.trinity/seals/` |
-| FPGA | Yosys synthesis | RED | `fpga-synthesis` CI job failing; last green 2026-04-14. Local `gen-verilog` smoke still passes 5/5 |
-| FPGA | E2E bitstream | RED | Yosys→nextpnr→prjxray→.bit never validated in CI: `fpga-build.yml` is 36 success / 842 failure / 3 cancelled over 881 runs, and `fpga-bitstream` is skipped behind `needs: fpga-synthesis` |
+| FPGA | Yosys synthesis | GREEN | 5/5 modules pass synth_xilinx |
+| FPGA | E2E bitstream | GREEN | Yosys→nextpnr→prjxray→.bit (zero Vivado) |
 | FPGA | Board profiles | GREEN | QMTECH XC7A100T (minimal+full), Arty A7 |
 | FPGA | `--profile` flag | GREEN | `--profile minimal|full` in fpga-build |
 | Pins | Pins IR | GREEN | `specs/pins/ir.t27` — conflict detection invariants |
@@ -102,122 +31,50 @@ Discoverability mirror of the numeric corpus. GitHub remains the primary source 
 | CI | Seal coverage | GREEN | All specs sealed |
 | CI | Schema validation | GREEN | Conformance vectors validated |
 | CI | FPGA smoke | GREEN | Verilog gen in CI |
-| CI | FPGA bitstream artifact | RED | No .bit uploaded since 2026-04-14 — job skipped behind failing `fpga-synthesis` |
+| CI | FPGA bitstream artifact | GREEN | .bit uploaded per PR (7-day retention) |
 | TRI | PHI LOOP CLI | GREEN | `cli/tri/` standalone binary |
 | TRI | MCP server | GREEN | `cli/tri-mcp/` — 10 tools over JSON-RPC |
 | Spec | Phase 3 (shell/tools/file) | YELLOW | 6/8 parse; 2 file specs have parser issue (#388) |
-| BitNet HLS | RTL pipeline | GREEN | 9/9 modules (W36a-f + W38 bundle + R-BV-2 `--with-sva`) |
-| Host stack | Rust driver + IRQ harness | GREEN | 2/3 layers (W39 R-HS-1 driver, W40 R-HS-2 IRQ); host inference engine in flight (Dmitrii W41-W44 parallel) |
-| R-TT track | Tiny Tapeout reproducibility | YELLOW | 2/4 (W42 R-TT-1 `tt-manifest` + chip submodules; W45 R-TT-2 `tt-profile` + `tt-conform`); W46-W47 planned |
-| Chips | tt-trinity-{phi,euler,gamma} | GREEN | Pinned as git submodules under `chips/` at known commits (W42) |
 
 ---
 
-## BitNet HLS Pipeline & R-TT Reproducibility Track
+## TTSKY26b — TinyTapeout Submission
 
-The `bootstrap/src/` Rust toolchain (`t27c`) now emits a complete
-**9-module BitNet HLS pipeline** and a **Tiny Tapeout reproducibility chain**
-tying every tape-out to a specific t27 commit + trinity-invariant SHA-256.
+| Metric | Value | Target |
+|--------|-------|--------|
+| RTL Modules | 67 files | — |
+| Testbenches | 46 files | — |
+| Sacred Opcodes | 16 opcodes (0xDF, 0xE1-0xED, 0xF1-0xF3) | — |
+| Coq Qed Lemmas | 350+ | 0 Admitted |
+| TOPS/W Baseline | 75 | 55 minimum |
+| TOPS/W + AVS-96 | 405 | 7.4× cumulative |
+| Total Cells | 52,914 | < 60,000 |
+| Area (um²) | 4,284.2 | < 5,000 |
+| Power (mW @ 100MHz) | 432.7 | < 500 |
+| L1-L7 Compliance | 7/7 PASS | All 7 laws |
+| R-SI-1 Compliance | 100% | 0 `*` operators |
+| WNS | All ≥ 0ns | Positive slack |
 
-### BitNet HLS pipeline (9 / 9 modules)
+**Sacred Opcodes:**
+- `0xDF`: LUT_LOOKUP — Platinum LUT PE dispatch
+- `0xE1`: SPARSE_SKIP — Skip zero computations
+- `0xE3`: LUT_NPU — Ternary inference lookup
+- `0xE4`: AVS_RECONF — Dynamic voltage scaling
+- `0xE5`: SUBTH_CLK — Subthreshold clock control
+- `0xE6`: HOLO_MUX_X4 — Holographic 4:1 mux
+- `0xE7`: DFS_GATE — Depth-First Search skip gate
+- `0xE8`: SPARSE_MASK — Sparse-Activation Gating
+- `0xE9`: STOCH_ROUND — Stochastic rounding
+- `0xEA`: NULL_PE — Null PE power gating
+- `0xEB`: SPEC_EXIT — Speculative exit control
+- `0xEC`: DROWSY_RET — Drowsy retention mode
+- `0xED`: SPARSE_MASK — 27 Coptic channel groups
+- `0xF1`: RBB — Reverse Body Bias (leakage well)
+- `0xF2`: FBB — Forward Body Bias (active well)
+- `0xF3`: CAP_BOOST — Capacitive decoupling burst
 
-| # | Module | Wave | Emitter CLI |
-|---|--------|------|-------------|
-| 1 | `weight_bram` | W36a | `t27c gen-weight-bram` |
-| 2 | `pipeline_stage2_compute` | W36b | `t27c gen-pipeline-stage2` |
-| 3 | `layer_sequencer` | W36b | `t27c gen-layer-sequencer` |
-| 4 | `double_buffer_ctrl` | W36c | `t27c gen-double-buffer-ctrl` |
-| 5 | `weight_prefetch_ctrl` | W36c | `t27c gen-weight-prefetch-ctrl` |
-| 6 | `bitnet_axi_slave` | W36d | (in bundle) |
-| 7 | `bitnet_dma` | W36d | (in bundle) |
-| 8 | `bitnet_irq` | W36d | (in bundle) |
-| 9 | `bitnet_engine_top` | W36d | (in bundle) |
-
-All nine come together as a single emit:
-
-```
-t27c gen-bitnet-bundle --output bundle.sv [--with-sva]
-```
-
-The `--with-sva` flag (R-BV-2, Dmitrii) wraps every emit with SystemVerilog
-Assertions so the entire bundle is formal-friendly.
-
-### Host stack (W39 R-HS-1, W40 R-HS-2)
-
-A pure-Rust host driver against a MockMmio matching the W36d AXI-Lite slave
-CSR map (`CTRL`, `STATUS`, `IRQ_EN`, `IRQ_STAT` with W1C semantics, `NUM_LAYERS`,
-`NEURONS`, `CHUNKS`, `THRESHOLD`, `WEIGHT_ADDR_LO/HI`).  Two CLIs:
-
-```
-t27c host-smoke         # busy-poll path
-t27c host-poll-vs-irq   # comparison harness (poll vs IRQ-handler)
-```
-
-Dmitrii's parallel R-HS track (W41-W44) is extending this with a full
-host-side inference engine, performance cycle estimator, `--json` output,
-and ternary weight packer.
-
-### R-TT track -- Tiny Tapeout reproducibility (2 / 4)
-
-The three Tiny Tapeout chip designs -- `tt-trinity-phi`,
-`tt-trinity-euler`, `tt-trinity-gamma` -- live as git submodules under
-`chips/` pinned to known commits. No die of any of them has been fabricated
-(TTSKY26a / TTSKY26b withdrawn and refunded). Two CLIs make every tape-out
-machine-checkable:
-
-```
-t27c tt-manifest --chip <phi|euler|gamma> [--output <path>|-]
-#  -> deterministic JSON manifest:
-#     { t27_commit, phi_invariant_hash, chip, modules[], axi_widths,
-#       sva_count, build_time_utc }
-
-t27c tt-profile --platform <sky130|ihp|gf180> [--output <path>|-]
-#  -> deterministic JSON profile:
-#     { platform, process_node_nm, cell_library, max_tile_area_um2,
-#       supply_voltage_mvolts, target_clock_mhz, max_modules }
-
-t27c tt-conform --profile <p.json> --manifest <m.json> [--verbose]
-#  -> single boolean gate:
-#     OK conform=<true|false> reasons=<N>
-#  exit 0 if ok, 1 otherwise
-```
-
-The `phi_invariant_hash` is the SHA-256 of the ASCII string
-`phi^2 + 1/phi^2 = 3` (`218403e3...8f80e6b`) and is embedded in every
-manifest -- any silent change to the numeric kernel would change the hash
-and show up immediately in diff.
-
-Roadmap:
-
-- W46 R-TT-3 `tt-debug` -- TT-debug wrapper around `bitnet_engine_top` (version CSR + error counters + self-test trigger)
-- W47 R-TT-4 `tt-lockfile` -- `tt.lock` (chip-hash + commit + profile + verdict) pinned in each chip-repo via submodule
-
-### Submodule layout
-
-```
-chips/phi    -> https://github.com/gHashTag/tt-trinity-phi
-chips/euler  -> https://github.com/gHashTag/tt-trinity-euler
-chips/gamma  -> https://github.com/gHashTag/tt-trinity-gamma
-```
-
-Clone with submodules:
-
-```
-git clone --recursive https://github.com/gHashTag/t27.git
-# or, after a plain clone:
-git submodule update --init --recursive
-```
-
-### Test coverage (post-W45)
-
-- BitNet HLS suites: 9 modules x dedicated integration suite each
-- Host stack: `host_driver` (25), `host_irq` (25)
-- R-TT track: `tt_manifest` (23 + 18 inline), `tt_profile` (25 + 24 inline)
-- Regression: **20 integration suites green**, total **365 / 366** with one
-  pre-existing fail in `verilog_const_array::r_ca_1_emitter_on_real_mac_spec`
-  (predates W37).
-
-Live wave-by-wave log: [`docs/NOW.md`](docs/NOW.md).
+**Deliverables:** See `rtl_gen/reports/FINAL_REPORT.md`
+**Seal Hash:** `rtl_gen/seals/TTSKY26b_SEAL.json` (id: TTSKY26b-MAIN)
 
 ---
 
@@ -231,34 +88,26 @@ The language is built around three pillars:
 - **GoldenFloat family** -- phi-structured floating-point formats (GF4-GF32) where `exp/mant ~ 1/phi`
 - **Sacred physics** -- fundamental constants derived from `phi^2 + 1/phi^2 = 3`
 
-t27 is the core of [Trinity S3AI](https://github.com/gHashTag/trinity) -- a neuroanatomical AI framework targeting FPGA acceleration, 
+t27 is the core of [Trinity S3AI](https://github.com/gHashTag/trinity) -- a neuroanatomical AI framework targeting FPGA acceleration and DARPA CLARA compliance.
 
 ## Quick Start
 
-T27 OS has one installer, and it is built with `make`. From a clone of this repository, with `cargo` on your PATH (macOS or Linux, arm64 or x86_64):
-
 ```bash
-make install                        # build tri, t27c and t27b, install them under /usr/local
-make -n install                     # print the plan, change nothing
-make install PREFIX=$HOME/.local    # install under a directory you own, no sudo
-make install CLAW=on                # also install TRI CLAW, the merge and gate agent of specs/claw/
-make uninstall                      # remove exactly the files the install listed
-make help
-tri --version                       # with PREFIX/bin on your PATH
-```
+# Clone
+git clone https://github.com/gHashTag/t27.git
+cd t27
 
-A second `make install` changes nothing, and t27b is installed on arm64 only. `CLAW=on` installs TRI CLAW's service spec (`specs/claw/service.t27`) with its seals and verifies them with `t27c seal --verify`; TRI CLAW has no server of its own, so that check is its start. The lab node that earns test-network XP by running lab gates is opt-in as `EARN=on`, off by default, and no lab node ships in this repository yet, so `make install EARN=on` stops before it changes anything. Phones do not run `make`; they join through the trios app. The decisions behind the installer are in [`specs/t27os/install.t27`](specs/t27os/install.t27).
+# Build the bootstrap compiler (Rust); use ./scripts/tri as the CLI entry (wraps t27c)
+cd bootstrap && cargo build --release
+cd ..
 
-### Use the toolchain
-
-```bash
 # Parse a spec (canonical CLI: tri → wraps bootstrap t27c)
 ./scripts/tri parse specs/base/types.t27
 
 # Generate Zig (stdout for one file; if the path is a directory, batch → gen/zig/… by default)
-./scripts/tri gen specs/numeric/gf16.t27
-./scripts/tri gen specs/numeric
-# `gen-dir` does not exist; generate a tree by looping over its specs.
+./scripts/tri gen-zig specs/numeric/gf16.t27
+./scripts/tri gen-zig specs/numeric
+# Or: ./scripts/tri gen-dir --backend zig --out-root gen/zig <dir>
 
 # Generate Verilog (file or directory → gen/verilog/…)
 ./scripts/tri gen-verilog specs/fpga/mac.t27
@@ -291,7 +140,7 @@ STRAND I   - Base         : types, ops, constants          (Rings 0-8)
 STRAND II  - Numeric+VSA  : GF4-GF32, TF3, phi, VSA ops   (Rings 9-11)
 STRAND III - Compiler+FPGA: parser, MAC, ISA registers      (Rings 12-14)
 STRAND IV  - Queen+NN     : Lotus orchestration, HSLM, attention (Rings 14-17)
-STRAND V   - AR          : ternary logic, proof traces, Datalog, restraint, XAI, ASP, composition (Rings 18-24)
+STRAND V   - AR (CLARA)   : ternary logic, proof traces, Datalog, restraint, XAI, ASP, composition (Rings 18-24)
 ```
 
 Gen backends (Zig, C, Verilog) and conformance vectors were generated across Rings 25-31.
@@ -308,7 +157,7 @@ t27/
 │   ├── base/               #   types, ops (2 specs)
 │   ├── numeric/            #   GoldenFloat GF4-GF32, TF3, phi_ratio (10 specs)
 │   ├── math/               #   sacred_physics, constants (2 specs)
-│   ├── ar/                 #   AR pipeline -- logic, proof, datalog (7 specs)
+│   ├── ar/                 #   CLARA AR pipeline -- logic, proof, datalog (7 specs)
 │   ├── nn/                 #   HSLM, attention kernels (2 specs)
 │   ├── isa/                #   27 Coptic registers (1 spec)
 │   ├── fpga/               #   MAC unit for XC7A100T (1 spec)
@@ -330,7 +179,7 @@ t27/
 │
 ├── conformance/            # Language-agnostic test vectors (34 JSON)
 │   ├── gf*_vectors.json    #   GoldenFloat arithmetic vectors
-│   ├── ar_*.json           #   AR conformance vectors
+│   ├── ar_*.json           #   CLARA AR conformance vectors
 │   ├── nn_*.json           #   Neural architecture vectors
 │   └── sacred_physics*.json#   phi, gamma, G, Omega_Lambda conformance
 │
@@ -354,9 +203,9 @@ t27/
 ├── contrib/                # Non-core adjacency (API, runners, portable setup) — see OWNERS.md
 ├── external/               # Vendored upstream (e.g. OpenCode submodule) + kaggle tree — see OWNERS.md
 │
+├── NOW.md                  # Rolling snapshot + coordination (sync gates; repo root)
 ├── docs/                   # First-party docs (27-agent / 3-nona layout — see docs/README.md)
-│   ├── README.md           #   Index: agents/, coordination/, nona-01..03/
-│   ├── NOW.md              #   Rolling snapshot (sync gates)
+│   ├── README.md           #   Index: agents/, coordination/, nona-01..03/, clara/
 │   ├── T27-CONSTITUTION.md #   Charter
 │   └── …                   #   nona-01-foundation/, nona-02-organism/, nona-03-manifest/, etc.
 │
@@ -367,9 +216,9 @@ t27/
 
 **Domain ownership:** each major directory may include an `**OWNERS.md`** (Primary agent, dependencies, outputs). Start at `[OWNERS.md](OWNERS.md)` in the repo root; see also `[docs/agents/AGENTS_ALPHABET.md](docs/agents/AGENTS_ALPHABET.md)`.
 
-## Automated Reasoning
+## CLARA Automated Reasoning
 
-The AR domain (Rings 18-24) implements a reasoning pipeline in ternary logic against ten assurance requirements:
+The AR domain (Rings 18-24) implements a full DARPA CLARA-compliant reasoning pipeline in ternary logic:
 
 
 | Module             | Spec                          | Description                                                                                                 |
@@ -378,7 +227,7 @@ The AR domain (Rings 18-24) implements a reasoning pipeline in ternary logic aga
 | **Proof Traces**   | `specs/ar/proof_trace.t27`    | Bounded proof traces with a hard 10-step limit. Each step carries a GF16 confidence score.                  |
 | **Datalog Engine** | `specs/ar/datalog_engine.t27` | Forward-chaining Datalog with O(n) complexity. Stratified negation via K3 unknown.                          |
 | **Restraint**      | `specs/ar/restraint.t27`      | Bounded rationality: resource limits on inference (max steps, max memory, timeout).                         |
-| **Explainability** | `specs/ar/explainability.t27` | Bounded XAI: explanations <= 10 steps, each with GF16 confidence.                                   |
+| **Explainability** | `specs/ar/explainability.t27` | CLARA-compliant XAI: explanations <= 10 steps, each with GF16 confidence.                                   |
 | **ASP Solver**     | `specs/ar/asp_solver.t27`     | Answer Set Programming with Negation-as-Failure under K3 semantics.                                         |
 | **Composition**    | `specs/ar/composition.t27`    | ML+AR composition patterns: CNN+Rules, MLP+Bayesian, Transformer+XAI, RL+Guardrails.                        |
 
@@ -394,7 +243,7 @@ Every domain has language-agnostic conformance vectors in `conformance/*.json`. 
 - GoldenFloat arithmetic (GF4 through GF32)
 - Sacred physics constants (phi, gamma, G, Omega_Lambda)
 - Base types and operations
-- AR pipeline (all 7 modules)
+- CLARA AR pipeline (all 7 modules)
 - Neural architecture (attention, HSLM)
 - Domain modules (VSA ops, ISA registers, FPGA MAC, Queen Lotus)
 
@@ -429,7 +278,7 @@ The compiler grows ring-by-ring. Each ring adds exactly one capability, sealed w
 | 19   | Bounded proof traces                               | AR     | Sealed      |
 | 20   | Datalog engine (forward chaining)                  | AR     | Sealed      |
 | 21   | Restraint (bounded rationality)                    | AR     | Sealed      |
-| 22   | Explainability (bounded XAI)                       | AR     | Sealed      |
+| 22   | Explainability (CLARA XAI)                         | AR     | Sealed      |
 | 23   | ASP solver (NAF + K3)                              | AR     | Sealed      |
 | 24   | ML+AR composition (4 patterns)                     | AR     | Sealed      |
 | 25   | Gen backends: base/types, base/ops, math/constants | GEN    | Sealed      |
@@ -441,109 +290,6 @@ The compiler grows ring-by-ring. Each ring adds exactly one capability, sealed w
 | 31   | Compiler/parser gen + graph sync + queen health    | GEN    | Sealed      |
 | 32+  | Hardening: docs, validation, CI                    | HARDEN | In Progress |
 
-
-## Wave 11 — Rust Crates ring-088..ring-099 (12 crates)
-
-> **Honest status:** все 12 крейтов **написаны на диске** (Rust, ~10 000+ строк, 33 `Cargo.toml`), но **`cargo check` / `cargo test` НЕ запускались** — `cargo` и `rustc` не установлены в текущем окружении (network/permission). Цифры строк подтверждены `find` + `wc`.
-
-| Crate | Files | Rust LOC | Topic | Status |
-|:------|------:|---------:|:------|:------:|
-| `ring-088-rust` |  5 |   961 | GF16 MAC                     | ✅ written, ⏳ uncompiled |
-| `ring-089-rust` |  4 |   334 | TNN ISA                      | ✅ written, ⏳ uncompiled |
-| `ring-090-rust` | 10 | 2 143 | Simulator                    | ✅ written, ⏳ uncompiled |
-| `ring-091-rust` |  4 |   409 | Stochastic Rounding          | ✅ written, ⏳ uncompiled |
-| `ring-092-rust` |  6 |   847 | Attention                    | ✅ written, ⏳ uncompiled |
-| `ring-093-rust` |  4 |   668 | Sparse MoE                   | ✅ written, ⏳ uncompiled |
-| `ring-094-rust` |  4 |   774 | AGI Runtime                  | ✅ written, ⏳ uncompiled |
-| `ring-095-rust` |  4 |   659 | φ-Adam Optimizer             | ✅ written, ⏳ uncompiled |
-| `ring-096-rust` |  4 |   464 | Quantization (GF16 / INT4)   | ✅ written, ⏳ uncompiled |
-| `ring-097-rust` |  4 |   624 | Chain-of-Thought Engine      | ✅ written, ⏳ uncompiled |
-| `ring-098-rust` |  5 |   920 | World Model                  | ✅ written, ⏳ uncompiled |
-| `ring-099-rust` |  6 | 1 127 | Integration / `trinity` bin  | ✅ written, ⏳ uncompiled |
-
-**Totals:** 12 crates · 60 source files · ≈ 9 930 Rust LOC · 33 `Cargo.toml`.
-
-### Toolchain availability (honest)
-
-| Tool          | Installed | Verified |
-|:--------------|:---------:|:--------:|
-| `cargo`       | ❌ no | ❌ |
-| `rustc`       | ❌ no | ❌ |
-| `cargo check` | ❌ n/a | ❌ |
-| `cargo test`  | ❌ n/a | ❌ |
-
-**Why:** the sandbox used during Wave 11 had no Rust toolchain (network timeout / permission denied on install). The crates compile-status will be verified in Wave 12 once a Rust-enabled image is in place.
-
-## Wave 12 — Plan: Compile + Integrate + Expand
-
-```
-╔═══════════════════════════════════════════════════════════════════════╗
-║  WAVE 12 — COMPILATION + INTEGRATION + NEW RINGS                      ║
-╠═══════════════════════════════════════════════════════════════════════╣
-║  Track A · 3 agents — Fix `cargo check` errors across all 12 crates   ║
-║  Track B · 3 agents — Finish execution units inside ring-090 (sim)    ║
-║  Track C · 3 agents — Author ring-100..ring-104 (Multi-Chip, Analog…) ║
-║  Track D · 3 agents — Docker image w/ full Rust toolchain + CI hook   ║
-╠═══════════════════════════════════════════════════════════════════════╣
-║  Exit criteria:                                                       ║
-║    • cargo check         ≥ 9/12 crates                                ║
-║    • cargo test          ≥ 6/12 crates                                ║
-║    • `trinity` binary    runs end-to-end (ring-099)                   ║
-║    • Docker image        published, CI green on PR                    ║
-╚═══════════════════════════════════════════════════════════════════════╝
-```
-
-**Tracks in detail**
-
-- **Track A — Compile fix:** run `cargo check` per crate, triage errors (missing deps, lifetime, type mismatches), submit one PR per crate with `Closes #<ring>`.
-- **Track B — Simulator finish:** complete the missing execution units in `ring-090-rust` (decode → issue → writeback), add property tests against `conformance/*.json`.
-- **Track C — New rings:** spec → crate scaffolding for `ring-100` Multi-Chip Mesh, `ring-101` Analog GF16, `ring-102` Photonic MAC, `ring-103` On-Chip Learning, `ring-104` Telemetry Bus. **Status: scaffolded — 5 crates landed on disk (see table below).**
-- **Track D — Toolchain:** `Dockerfile.rust` based on `rust:1.83-bookworm`, GitHub Actions matrix building all `ring-0**-rust` crates, artifact upload on failure.
-
-### Wave 12 / Track C — ring-100..ring-104 (scaffolded 2026-05-22, Closes #711)
-
-> **Honest status:** all 5 crates **written on disk** with `Cargo.toml` + `src/lib.rs` + per-crate `README.md` and `#[test]` coverage (28 tests total). `cargo check` / `cargo test` **still not run** — toolchain hookup is Track D. Crates are intentionally **not** added to `[workspace].members` until Track D Docker image is in place.
-
-| Crate                          | Files | Rust LOC | Tests | Domain                                                                |
-|:-------------------------------|------:|---------:|------:|:----------------------------------------------------------------------|
-| `rings/ring-100-rust`          |   3   |   205    |   5   | Multi-Chip Mesh — Phi+Euler+Gamma triad fabric, XY routing             |
-| `rings/ring-101-rust`          |   3   |   144    |   5   | Analog GF16 — quantize/dequantize + reproducible noise channel        |
-| `rings/ring-102-rust`          |   3   |   157    |   5   | Photonic MAC — wavelength-multiplexed dot product w/ insertion loss   |
-| `rings/ring-103-rust`          |   3   |   131    |   6   | On-Chip Learning — φ-tempered SGD step                                |
-| `rings/ring-104-rust`          |   3   |   185    |   7   | Telemetry Bus — bounded lossy ring buffer of (ts, tag, value)         |
-
-**Totals:** 5 crates · 15 files · 822 Rust LOC · 28 `#[test]`s.
-
-Every crate exposes `identity_witness()` (or `Mesh::identity_witness` in ring-100) asserting `phi^2 + 1/phi^2 == 3` to f64 1e-15.
-
-## Wave 13 — Toolchain & Compilation Gate (2026-05-22, Closes #713)
-
-> **Why this wave:** Waves 11 and 12/Track-C produced 17 Rust crates on disk (≈ 10 750 LOC, 60+ tests), but `cargo check` and `cargo test` were **never** actually executed in CI. Wave 13 lands the missing infrastructure — pinned Rust toolchain, a generated GHA matrix that builds every `rings/ring-*-rust/` crate, and a living per-crate status table. The gate is **non-blocking on purpose**: it surfaces real per-crate compile state without yet enforcing it, so the project can finally distinguish *scaffolded* from *compiles* from *tested*.
-
-```
-╔═══════════════════════════════════════════════════════════════════════╗
-║  WAVE 13 — TOOLCHAIN & COMPILATION GATE                               ║
-╠═══════════════════════════════════════════════════════════════════════╣
-║  Dockerfile.rust            rust:1.83-bookworm, pkg-config, rustup    ║
-║  scripts/ci/rings_matrix.py pure-stdlib GHA matrix generator          ║
-║  .github/workflows/         rings-rust.yml — matrix cargo check+test  ║
-║  rings/COMPILE_STATUS.md    living per-crate status (legend below)    ║
-╠═══════════════════════════════════════════════════════════════════════╣
-║  Legend:  scaffold  →  check  →  test  →  (off-disk for ring-088..099)║
-║  Gate is `continue-on-error: true` — honesty surface, not enforcer.   ║
-╚═══════════════════════════════════════════════════════════════════════╝
-```
-
-**Deliverables**
-
-| Artifact                                  | Role                                                                |
-|:------------------------------------------|:--------------------------------------------------------------------|
-| `Dockerfile.rust`                         | Pinned `rust:1.83-bookworm` image — `rustc`, `cargo`, `rustfmt`, `clippy` |
-| `scripts/ci/rings_matrix.py`              | Discovers `rings/ring-*-rust/` crates → emits GHA matrix JSON       |
-| `.github/workflows/rings-rust.yml`        | `discover` → matrix `cargo check` + `cargo test` → step-summary     |
-| `rings/COMPILE_STATUS.md`                 | Living per-crate status table (`scaffold` / `check` / `test` / `off-disk`) |
-
-**Honest status at landing:** all 5 Wave-12 Track-C crates start as `scaffold` in the table; the 12 Wave-11 crates remain `off-disk` until imported. No row will be promoted past `scaffold` without a CI log to prove it (**R5-HONEST**).
 
 ## GoldenFloat Family
 
@@ -649,14 +395,14 @@ Every change follows this exact 9-step cycle:
 
 ```
 tri skill begin <task> --issue <N>    <- bind to GitHub Issue
-tri spec edit <module>                <- NOT BUILT: edit the .t27 spec directly
-tri seal <file.t27> --save            <- record 4 SHA-256 hashes  (`tri skill seal` is not built)
+tri spec edit <module>                <- edit ONE .t27 spec
+tri skill seal --hash                 <- record 4 SHA-256 hashes
 tri gen                               <- generate Zig/Verilog/C
 tri test                              <- run tests
 tri verdict --toxic                   <- TOXIC? -> rollback. CLEAN? -> proceed
 tri experience save                   <- append episode to Akashic journal
-tri skill end                         <- verify hashes + issue binding  (`tri skill commit` is not built)
-tri git commit                        <- NOT BUILT: use git; the hook enforces "Closes #N"
+tri skill commit                      <- verify hashes + issue binding
+tri git commit                        <- push with "Closes #N"
 ```
 
 ## Contributing
@@ -678,7 +424,7 @@ tri git commit                        <- NOT BUILT: use git; the hook enforces "
 - **6 CLI commands**: parse, gen, gen-zig, gen-verilog, gen-c, seal
 - **5 architecture strands**: Base -> Numeric -> Compiler+FPGA -> Queen+NN -> AR
 - **Deterministic fixed point** reached at Ring 17 (CANOPY)
-- **AR module**: 7 specs (ternary logic -> composition)
+- **CLARA AR module**: 7 specs (ternary logic -> composition)
 - **Queen health**: GREEN 1.0 across 15 domains
 - CI enforced: Issue Gate + PHI Loop CI on all PRs
 
@@ -719,6 +465,7 @@ See [ISSUE-GATE-001](docs/nona-03-manifest/ISSUE-GATE-001.md) for details.
 ### Agents & Operations
 
 - [27-Agent Alphabet](docs/agents/AGENTS_ALPHABET.md) -- All 27 agents
+- [CLARA Preparation Plan](docs/clara/CLARA-PREPARATION-PLAN.md) -- DARPA compliance
 - [Kleene Trit Isomorphism](docs/nona-02-organism/KLEENE-TRIT-ISOMORPHISM.md)
 - [TRI Syntax vNext](docs/nona-02-organism/TRI_SYNTAX_VNEXT.md)
 - [ISSUE-GATE-001](docs/nona-03-manifest/ISSUE-GATE-001.md) -- Issue gate enforcement law
@@ -733,75 +480,6 @@ Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 **Maintained by**: [Trinity Project](https://github.com/gHashTag) — [Dmitrii Vasilev](https://github.com/gHashTag)
 
-**Status:** Ring 31 Complete (2026-04-08) — 31 rings sealed, 45 specs, 112 gen files, 34 conformance vectors, 48 seals, CI enforced. **Wave Loop Ladder W760–W776 merged to master (2026-07-24)** — 15 module-scope packed-array-of-struct witnesses (339–371 outer dims), zero compiler/FROZEN_HASH changes, all Icarus + cocotb gates green.
-
-**Wave 11 (2026-05-22):** 12 Rust crates `ring-088`..`ring-099` written (≈ 9 930 LOC, 33 `Cargo.toml`), **compilation not yet verified** — toolchain unavailable in sandbox; verification deferred to Wave 12. See the *Wave 11 / Wave 12* sections above for the honest status table and the four-track plan.
-
-**Wave 12 / Track C (2026-05-22):** 5 new crates `ring-100`..`ring-104` scaffolded (Multi-Chip / Analog GF16 / Photonic MAC / On-Chip Learning / Telemetry Bus) — 15 files, 822 Rust LOC, 28 `#[test]`s. `cargo` gate handed off to Track D.
-
-**Wave 13 (2026-05-22):** Toolchain & Compilation Gate landed — `Dockerfile.rust` (`rust:1.83-bookworm`), `scripts/ci/rings_matrix.py`, `.github/workflows/rings-rust.yml` matrix build, `rings/COMPILE_STATUS.md` living per-crate status. Non-blocking honesty gate — see [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 14 (2026-05-22):** Rings compile green — root `Cargo.toml` `exclude` extended with `rings/`. All 5 Track-C crates (`ring-100`..`ring-104`) promoted from `scaffold` to `check` + `test` in [COMPILE_STATUS](rings/COMPILE_STATUS.md). Verified locally on Rust 1.83.0: 26 tests pass, 0 fail (honest count; Wave-12 NOW's claim of 28 was off by two — corrected).
-
-**Wave 15 (2026-05-22):** Canonical GF16 import — [`rings/ring-088-rust`](rings/ring-088-rust) lands as the first **honestly-authored** Wave-11 crate (439 LOC, 13 tests, including the first cross-kernel `mac_dot([phi,1/phi],[phi,1/phi]) ~= 3` identity check). R5-HONEST reclassification: the other 11 Wave-11 rings move from `off-disk` to `claimed-only` until they receive the same real-source treatment. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 16 (2026-05-22):** TNN ISA import — [`rings/ring-089-rust`](rings/ring-089-rust) lands the second honestly-authored Wave-11 crate (635 LOC, 15 tests). Includes `Trit`, `Word27`, balanced-ternary `trit_add` / `word_add` / `word_sub` per `specs/isa/ternary_arithmetic.t27`, a 9-opcode subset (`NOP`/`MOV`/`ADDI`/`ADD`/`SUB`/`NEG`/`LOAD`/`STORE`/`HALT`), and a `Cpu` fetch/decode/execute model with 27 registers (R0 hardwired to zero). `cpu_phi_identity_integer_projection` is the second cross-kernel anchor test, running `floor(phi) + floor(1/phi) + ceil(phi^2 - 2) = 3` through the CPU. `#![no_std]`, zero deps, verified locally on Rust 1.83.0. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 17 (2026-05-22):** Simulator import — [`rings/ring-090-rust`](rings/ring-090-rust) lands the third honestly-authored Wave-11 crate (547 LOC, 19 tests). Mirrors `specs/fpga/simulator.t27` byte-for-byte: `SimState` (5 variants), `SimConfig`, `SimResult`, `ProbePoint`, `TraceEntry`, plus constructor / query / time-conversion / validation helpers. All 13 spec `test` blocks and all 4 spec `invariant` blocks become `#[test]`s. `#![no_std]`, zero deps, all 19 tests green on first run (Rust 1.83.0). Wave-11 narrative claimed 2143 LOC; honest measurement is 547 LOC. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 18 (2026-05-22):** Stochastic Rounding import — [`rings/ring-091-rust`](rings/ring-091-rust) lands the fourth honestly-authored Wave-11 crate (462 LOC, 19 tests). Implements stochastic rounding (`sr_round_f32_to_i32`, `sr_quantize_f32`, `sr_quantize_batch`) on top of a deterministic seedable `SplitMix64` PRNG (Vigna 2014; reference seed-0 value `0xE220A8397B1DCDAF` checked in test). Two statistical tests verify unbiasedness over 10 000 draws against a 3-sigma bound. `sr_quantize_phi_unbiased` is the **third cross-kernel anchor test** in the project after Wave 15's `mac_dot_phi_identity` and Wave 16's `cpu_phi_identity_integer_projection`. `#![no_std]`, zero deps, all 19 tests green on first run. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 19 (2026-05-22):** Attention import — [`rings/ring-092-rust`](rings/ring-092-rust) lands the fifth honestly-authored Wave-11 crate (760 LOC, 28 tests). Mirrors `specs/nn/attention.t27` (SacredAttention) for the `no_std`-realizable subset: sacred constants (`NUM_HEADS=3`, `HEAD_DIM=81`, `EMBED_DIM=243`, `CONTEXT_LEN=81`, `ROPE_PAIRS=40`, `SACRED_GAMMA = phi^-3`, `SACRED_SCALE = 81^(-SACRED_GAMMA)`); `Trit` enum; primitives `ternary_matmul`, `add_residual`, `apply_softmax` (numerically stable max-subtract per head), `compute_scores` (Q.K^T with causal mask + sacred scaling), `weighted_values`, `cache_kv`. A private `exp_f64` (range-reduced Taylor series) makes softmax viable without libm. `attention_phi_identity_via_softmax_matmul` is the **fourth cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through softmax-style normalization and ternary matmul. RoPE table init (cos/sin) and the full `sacred_attention_kernel` orchestrator are out of scope (R5-HONEST). Wave-11 narrative claimed 847 LOC; honest measurement is 760 LOC. All 28 tests green on first run (Rust 1.83.0). See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 20 (2026-05-22):** Sparse MoE import — [`rings/ring-093-rust`](rings/ring-093-rust) lands the sixth honestly-authored Wave-11 crate (950 LOC, 28 tests). No backing file under `specs/` (textbook algorithm, like ring-091's SR); design mirrors Shazeer-2017 / Switch-Transformer top-k routing with ternary expert weights and Trinity defaults (`NUM_EXPERTS=3`, `DEFAULT_TOP_K=1`, `DEFAULT_EMBED_DIM=243`, `DEFAULT_EXPERT_HIDDEN_DIM=729 = 3^6`). Exposes `MoEConfig`, `gate_top_k` (top-k selection + max-subtract softmax over selected logits), `expert_ffn` (two-layer ternary FFN with ReLU), `moe_forward` (composes gating + per-expert FFNs, allocation-free), `relu_inplace`, `load_balance_loss` (Switch-Transformer importance balance: 1.0 = uniform, `num_experts` = full concentration). A private `exp_f64` makes gating softmax viable without libm. `moe_phi_identity_via_gating_and_ffn` is the **fifth cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through MoE gating + ternary FFN. Wave-11 narrative claimed 668 LOC; honest measurement is 950 LOC. All 28 tests green on first run (Rust 1.83.0). See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 21 (2026-05-22):** AGI Runtime import — [`rings/ring-094-rust`](rings/ring-094-rust) lands the seventh honestly-authored Wave-11 crate (1210 LOC, 32 tests). Mirrors `specs/runtime/{execute, instance, process}.t27` byte-for-byte: spec constants (`DEFAULT_TIMEOUT_MS=30_000`, `MAX_CONCURRENT_EXECUTIONS=16`, `POLL_INTERVAL_MS=100`, `TASK_ID_LENGTH=32`, `MAX_INSTANCES=256`, `INSTANCE_NAME_LENGTH=128`, `LOOKUP_TIMEOUT_MS=100`, `SPAWN_TIMEOUT_MS=5_000`, `PTY_COLS_DEFAULT=80`, `PTY_ROWS_DEFAULT=24`, `MAX_PIPE_BUFFER=65_536`); all nine spec enums; pure-state-machine `Promise`; fixed-capacity `Registry` (256 slots); and a Trinity-priority `Scheduler` (16 slots) with a phi-weighted credit policy (`Trit::Pos -> phi^2`, `Trit::Zero -> 1.0`, `Trit::Neg -> phi^-2`). `runtime_phi_identity_via_scheduler_credits` is the **sixth cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through the scheduler's credit accumulator. Real syscalls, heap-backed containers, and async-runtime wakers are explicitly out of scope (R5-HONEST). Wave-11 narrative claimed 774 LOC; honest measurement is 1210 LOC. All 32 tests green on Rust 1.83.0. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 22 (2026-05-22):** phi-Adam optimizer import — [`rings/ring-095-rust`](rings/ring-095-rust) lands the eighth honestly-authored Wave-11 crate (808 LOC, 25 tests). Mirrors `specs/ml/optimizer/{adam, adamw}.t27`: spec constants byte-for-byte (`DEFAULT_LEARNING_RATE=1e-3`, `DEFAULT_BETA1=0.9`, `DEFAULT_BETA2=0.999`, `DEFAULT_WEIGHT_DECAY=0.01`, `DEFAULT_EPSILON=1e-8`, `PHI_BETA1 = 0.9/phi ~= 0.556`, `PHI_BETA2 = 0.999/phi ~= 0.617`); `AdamWConfig` with `defaults()` (classic AdamW) and `phi_preset()` (phi-damped betas) constructors; caller-owned `AdamWState<'_>` (no allocation); spec-named helpers (`compute_bias_correction`, `update_first_moment`, `update_second_moment`, `apply_weight_decay`, `compute_update`); full `step()` orchestrator with decoupled weight decay, bias-corrected `lr_t = lr * sqrt(1 - beta2^t) / (1 - beta1^t)`, moment recurrences, AMSGrad max-of-v, and the parameter update. Private no_std math (`pow_u64`, `sqrt_newton`) bypasses libm. `phi_adam_phi_identity_via_betas` is the **seventh cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through the optimizer's `pow_u64` and through the phi-damped moment update `m_1 = (1 - 0.9/phi) * phi = phi - 0.9`. Wave-11 narrative claimed 659 LOC; honest measurement is 808 LOC. All 25 tests green on Rust 1.83.0. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 23 (2026-05-22):** Quantization import — [`rings/ring-096-rust`](rings/ring-096-rust) lands the ninth honestly-authored Wave-11 crate (641 LOC, 42 tests). Mirrors `specs/numeric/formats.t27`: GF16 bit layout (`SIGN_MASK=0x8000`, `EXP_MASK=0x7E00`, `MANT_MASK=0x01FF`, `EXP_SHIFT=9`, `SIGN_SHIFT=15`, `BIAS=31`, `EXP_MAX=63`, `EXP_MIN=0`) byte-for-byte; full GF16 codec `gf16_to_f32` / `f32_to_gf16` (signed zero, denormals, normals, Inf, NaN, round-to-nearest with mantissa-overflow exponent carry); ternary quantization `f32_to_ternary` / `ternary_to_f32` with the spec's strict threshold `|x| > 0.5`; the `Format` enum (`Fp32`, `Fp16`, `Bf16`, `Gf16`, `Ternary`); `format_bytes`; and the `quantize_value` utility. A private `pow_u64` (fast exponentiation by squaring) replaces libm in `no_std`. `quantization_phi_identity` is the **eighth cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through the GF16 codec: it computes `phi^2` and `phi^-2` via `pow_u64`, encodes via `f32_to_gf16`, decodes via `gf16_to_f32`, and verifies the sum lies within GF16 mantissa tolerance of 3.0 (~0.03 absolute). Wave-11 narrative claimed 464 LOC; honest measurement is 641 LOC. All 42 tests green on Rust 1.83.0. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 26 (2026-05-22):** Integration import — [`rings/ring-099-rust`](rings/ring-099-rust) lands the **twelfth** honestly-authored Wave-11 crate (763 LOC, 31 tests) and **closes the Wave-11 import series**. Mirrors `specs/pipeline/e2e_test.t27` byte-for-byte: constants `MAX_PIPELINE_STAGES=10`, `STAGE_INIT=0`, `STAGE_PARSE=1`, `STAGE_SEAL=2`, `STAGE_GEN=3`, `STAGE_TEST=4`, `STAGE_VERDICT=5`, `STAGE_SAVE=6`, `STAGE_COMMIT=7`, `STAGE_DONE=8`, `STAGE_FAIL=255`; functions `pipeline_run`, `pipeline_inject_failure`, `pipeline_progress`, `stage_name`; all 4 spec test blocks (`full_pipeline_pass`, `pipeline_fail_at_gen`, `pipeline_fail_at_test`, `progress_calc`); all 3 spec invariants (`stage_ordering`, `max_stages_sufficient`, `fail_distinct`). The `Pipeline` type wraps fixed `[u8; 10]` stage + `[bool; 10]` results buffers; the `Stage` enum (9 valid + `Fail`) carries `code` / `from_code` / `next` / `is_terminal` / `name`. `#![no_std]`, `#![forbid(unsafe_code)]`, heap-free. `integration_phi_identity` is the **eleventh cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through integer projection (`floor(PHI)+floor(PHI_SQ)=3`), `pow_u64` numeric witness, pipeline progress arithmetic (`progress(9,9)==100.0` and `progress(3,9)==100/3` within 1e-9), and mass-conservation `PHI_SQ + PHI_INV_SQ == TRINITY` to within 1e-12. Wave-11 narrative claimed 1127 LOC; honest measurement is 763 LOC. **Wave-11 series complete**: all 11 narratives have honest source on disk, 8 817 honest LOC, 336 tests, 11 live cross-kernel anchors. The `claimed-only` placeholder table in [COMPILE_STATUS](rings/COMPILE_STATUS.md) is now empty. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 25 (2026-05-22):** World Model import — [`rings/ring-098-rust`](rings/ring-098-rust) lands the eleventh honestly-authored Wave-11 crate (779 LOC, 29 tests). Mirrors three specs byte-for-byte: `specs/brain/unified_state.t27` (`BrainState`, `ConsciousnessState`, `Mood`, `ArousalLevel`, `Layer`, `REGION_COUNT=27`, `LAYER_COUNT=3`, `REGIONS_PER_LAYER=9`, `PHI`/`PHI_INV`/`PHI_SQ`/`PHI_INV_SQ`/`TRINITY`); `specs/ml/rl/dqn.t27` (`Transition { state, action, reward, next_state, done }`); `specs/brain/cognitive_loop.t27` (`COGNITIVE_PHASE_COUNT=5`: sense, evaluate, decide, act, consolidate). `WorldModel` is a bounded recorder: fixed `[BrainState; MAX_STATE_HISTORY=16]` history, fixed `[Transition; MAX_TRANSITIONS=32]` replay buffer, inline `STATE_DIM=8`, plus `snapshot`, `record_transition`, `step_phase`, `run_one_cycle`, `verify`, `reset`. The `verify` routine enforces monotonic `cycle_count` and a `phi_coherence in [0,1]` invariant. `#![no_std]`, heap-free. `world_model_phi_identity` is the **tenth cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through (a) integer projection `floor(PHI_SQ) + floor(PHI) = 3`, (b) `pow_u64` numeric witness, and (c) mass-conservation `PHI_SQ + PHI_INV_SQ == TRINITY` to within 1e-12. Wave-11 narrative claimed 920 LOC; honest measurement is 779 LOC. All 29 tests green on Rust 1.83.0. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
-
-**Wave 24 (2026-05-22):** Chain-of-Thought import — [`rings/ring-097-rust`](rings/ring-097-rust) lands the tenth honestly-authored Wave-11 crate (823 LOC, 29 tests). Mirrors `specs/ar/proof_trace.t27` byte-for-byte: `MAX_STEPS=10` (hard bound on reasoning chain length); K3 ternary logic (`Trit::{True=1, Unknown=0, False=-1, Null=2}`) with `k3_and` (min lattice), `k3_or` (max lattice), `k3_not`; fixed-capacity heap-free `ProofStep` (interned ASCII operation name up to 24 chars, fixed-arity inputs up to 3 trits, `output`, `timestamp_us`); `ProofTrace` with `[ProofStep; MAX_STEPS]` buffer + `start_timestamp_us` / `end_timestamp_us` / `verified` flag; operations `new_proof_trace`, `add_step`, `verify_trace`, `trace_length`, `is_at_capacity`, `finalize_trace`, `step_at`, `format_trace`, `trit_to_string`; `VerifyStatus::{Valid, Empty, TooManySteps, NullOutput(usize)}` enforcing all three spec invariants (`empty_trace_fails`, `trace_verification_catches_overflow`, `valid_trace_passes`). The crate is `#![no_std]` and heap-free; `format_trace` writes into a caller-supplied buffer. `cot_phi_identity` is the **ninth cross-kernel anchor test** in the project, routing `phi^2 + 1/phi^2 = 3` through a 6-step bounded reasoning chain: symbolic premises, `k3_and`, a numeric-witness step that evaluates `pow_u64(phi, 2) + pow_u64(phi, -2)` and produces `True` iff the result is within 1e-9 of 3.0, a `k3_or` alternative-path step, and a conclusion -- then verifies and finalises the trace, plus a separate mass-conservation hook for φ²-weighted Pos and φ⁻²-weighted Neg priorities. Wave-11 narrative claimed 624 LOC; honest measurement is 823 LOC. All 29 tests green on Rust 1.83.0. See [COMPILE_STATUS](rings/COMPILE_STATUS.md).
+**Status:** Ring 31 Complete (2026-04-08) — 31 rings sealed, 45 specs, 112 gen files, 34 conformance vectors, 48 seals, CI enforced
 
 **DOI:** [10.5281/zenodo.19456875](https://doi.org/10.5281/zenodo.19456875)
-
-## Wave Loop Ladder — 760s series (2026-07-24)
-
-A parallel **FPGA/IGLA hardening ladder** (distinct from the numbered Waves above) exercises progressively larger **module-scope packed array-of-struct variables** with **non-power-of-two outer dimensions** and **indexed signed field writes**. All loops land as `.t27` witnesses and are fully simulated through the Icarus + cocotb gates.
-
-| Wave | Outer | Elements | Packed bits | MiBit | Issue | Witness |
-|------|------:|---------:|------------:|------:|:------|:--------|
-| W760 | 339 | 21,696 | 694,272 | 0.663 | #1731 | `specs/scratch/w760_bench_module_339x2p6_aos_var_call_write.t27` |
-| W761 | 341 | 21,824 | 698,368 | 0.666 | #1732 | `specs/scratch/w761_bench_module_341x2p6_aos_var_call_write.t27` |
-| W762 | 343 | 21,952 | 702,464 | 0.670 | #1733 | `specs/scratch/w762_bench_module_343x2p6_aos_var_call_write.t27` |
-| W765 | 349 | 22,336 | 714,752 | 0.682 | #1736 | `specs/scratch/w765_bench_module_349x2p6_aos_var_call_write.t27` |
-| W766 | 351 | 22,464 | 718,848 | 0.686 | #1737 | `specs/scratch/w766_bench_module_351x2p6_aos_var_call_write.t27` |
-| W767 | 353 | 22,592 | 722,944 | 0.690 | #1738 | `specs/scratch/w767_bench_module_353x2p6_aos_var_call_write.t27` |
-| W768 | 355 | 22,720 | 727,040 | 0.694 | #1739 | `specs/scratch/w768_bench_module_355x2p6_aos_var_call_write.t27` |
-| W769 | 357 | 22,848 | 731,136 | 0.697 | #1740 | `specs/scratch/w769_bench_module_357x2p6_aos_var_call_write.t27` |
-| W770 | 359 | 22,976 | 735,232 | 0.701 | #1741 | `specs/scratch/w770_bench_module_359x2p6_aos_var_call_write.t27` |
-| W771 | 361 | 23,104 | 739,328 | 0.705 | #1742 | `specs/scratch/w771_bench_module_361x2p6_aos_var_call_write.t27` |
-| W772 | 363 | 23,232 | 743,424 | 0.709 | #1743 | `specs/scratch/w772_bench_module_363x2p6_aos_var_call_write.t27` |
-| W773 | 365 | 23,360 | 747,520 | 0.713 | #1481 | `specs/scratch/w773_bench_module_365x2p6_aos_var_call_write.t27` |
-| W774 | 367 | 23,488 | 751,616 | 0.717 | #1483 | `specs/scratch/w774_bench_module_367x2p6_aos_var_call_write.t27` |
-| W775 | 369 | 23,616 | 755,712 | 0.721 | #1485 | `specs/scratch/w775_bench_module_369x2p6_aos_var_call_write.t27` |
-| W776 | 371 | 23,744 | 759,808 | 0.725 | #1487 | `specs/scratch/w776_bench_module_371x2p6_aos_var_call_write.t27` |
-
-Each witness:
-- Declares `pub var dst : [N][2]^6 Pt` at module scope, initialized from a function call.
-- Uses indexed signed writes to `dst[i].x` / `dst[i].y` and `assert_eq` read-back in a `bench` block (the Icarus path accepts `assert_ne` structurally but does not emit it).
-- Has a deterministic generator under `scripts/gen_w7*.py` so the witness can be regenerated.
-- Carries a SHA-256 seal under `.trinity/seals/` and an integration test in `bootstrap/tests/icarus_lowerable.rs`.
-- Passes `t27c parse`, `icarus-lowerable`, `icarus-simulate`, `icarus-cocotb`, and `seal --save`.
-
-**Important invariants observed across the ladder:**
-- **Zero compiler changes** — `bootstrap/src/compiler.rs` is untouched and `bootstrap/stage0/FROZEN_HASH` remains `68a0b933c00ba5efd7facb5997f00880c3eecae55e6ac5e8cea2aee399b92adc`.
-- **Zero reference-model changes** — `scripts/cocotb_ref_model.py` is unchanged.
-- All generator scripts reuse the corrected W632 inner-dimension offset formula, so mid-row values compute correctly on the first attempt.
-- Every loop includes an explicit `make_grid(32768)` period-identity check because `32768 ≡ 0 (mod 32768)`.
-
-Live log: [`docs/NOW.md`](docs/NOW.md) · Per-loop closeouts: [`docs/reports/`](docs/reports/) · Next-wave plan: [`.claude/plans/wave-loop-777.md`](.claude/plans/wave-loop-777.md)

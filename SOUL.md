@@ -33,7 +33,7 @@ All files in the following categories MUST contain only ASCII characters (U+0000
 - **Non-Latin scripts**: Greek, Arabic, Chinese, Japanese, Korean, etc., unless an Architect-approved exception exists
 
 ### §1.2. First-party documentation language
-Markdown under `docs/`, `specs/`, `architecture/`, `conformance/`, and root project Markdown (`README.md`, `AGENTS.md`, `CLAUDE.md`, `TASK.md`) **MUST be English**, except paths listed in **`docs/.legacy-non-english-docs`** (grandfathered) and anything under **`external/`**.
+Markdown under `docs/`, `specs/`, `architecture/`, `clara-bridge/`, `conformance/`, and root project Markdown (`README.md`, `AGENTS.md`, `CLAUDE.md`, `NOW.md`, `SOUL.md`) **MUST be English**, except paths listed in **`docs/.legacy-non-english-docs`** (grandfathered) and anything under **`external/`**.
 
 ### §1.3. Enforcement
 The parser rejects Cyrillic in source with:
@@ -41,7 +41,7 @@ The parser rejects Cyrillic in source with:
 error: Language policy violation: source file contains Cyrillic characters (U+0400-U+04FF). Source files must be ASCII-only. See SOUL.md Article I.
 ```
 
-CI runs `scripts/check-first-party-doc-language.sh` on pull requests.
+CI runs `./scripts/tri lint-docs` (forwards to **`t27c lint-docs`**) on pull requests.
 
 **Compiler build:** `cargo build` in `bootstrap/` runs `build.rs`, which fails the build if Cyrillic appears in specs, bootstrap Rust sources, or unlisted first-party Markdown (this Article; expanded enforcement notes in `docs/nona-03-manifest/SOUL.md` Law #1).
 
@@ -240,7 +240,7 @@ Additionally, the **Language Policy** (Article I) ensures universality and clari
 ### §8.3. NO-PYTHON / NO-SHELL (critical path)
 - **All** validation, conformance gates, doc language checks, and φ binary64 cross-checks live in **`t27c`** (Rust) — **`lint-docs`**, **`validate-phi`**, **`suite`**, **`validate-conformance`**, etc.
 - **Python** is **not** permitted on the engineering critical path; legacy scripts are removed once a **`t27c`** subcommand exists.
-- **CI** invokes **`./scripts/tri <subcommand>`** or **`target/release/t27c --repo-root . <subcommand>`** — not ad-hoc **`.sh`** wrappers.
+- **CI** invokes **`./scripts/tri <subcommand>`** or **`bootstrap/target/release/t27c --repo-root . <subcommand>`** — not ad-hoc **`.sh`** wrappers.
 
 ### §8.4. Rationale
 Aligns the repository with **TDD-MANDATE** and **SSOT-MATH**: behavior lives in specs + compiler, not in untested bash. Reduces macOS/Linux drift (`realpath`, `find`, `readlink`) and quoting/glob hazards. A single **TCB** for tooling (**`rustc` + `t27c`**) supports tool-qualification discipline (e.g. DO-330-style narratives).

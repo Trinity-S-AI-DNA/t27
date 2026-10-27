@@ -1,59 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // t27/specs/nn/attention.t27
 // Sacred Attention Specification
-// Multi-head causal attention with phi-RoPE and sacred scaling (d_k^(-phi^3))
-// phi^2 + 1/phi^2 = 3 | TRINITY
-//
-// This spec never compiled: it read constants::PHI_CUBED_INV and
-// constants::PHI, which math::constants does not define for t27c ("use of
-// undeclared identifier 'constants'"); it computed its scale with a pow()
-// that has a negative non-integer exponent; its tests built buffers with
-// `AttentionBuffers{...}` and called functions that take a pointer to them;
-// and the second module appended below it (AttentionQKGainAblation) had two
-// functions with empty bodies, called run_attention_with_gain and
-// attention_forward, which exist nowhere, and asserted gain constants against
-// themselves.
-//
-// It is written out now with only `use base::types`:
-//   - phi, phi^-3 and the sacred scale 81^(-phi^-3) are local constants; the
-//     tests check them against independent identities (phi^2 = phi + 1,
-//     phi^2 + phi^-2 = 3, phi^-3 = sqrt(5) - 2, exp(-phi^-3 ln 81)).
-//   - the buffers are slices the caller owns, so every step can be tested on
-//     its own; the phi-RoPE tables live in module storage.
-//   - the causal mask is a very negative score, not 0.0: with 0.0 a masked
-//     position still received softmax weight exp(0 - max) > 0, so any call
-//     with seq_len > position + 1 read the future.
-//   - the QK-gain ablation is one scalar, qk_gain, applied to Q and K before
-//     the dot product (so it multiplies the score by gain^2), with the
-//     variants phi^2, 1.0, learned-at-1.0 and sqrt(phi) as constants.
-// Dropped, because nothing here implements or measures them: the bidirectional
-// and sparse attention types and the six phase constants (no code reads them);
-// the ablation's training run (run_attention_with_gain, a BPB measurement);
-// the `bench` blocks (their targets named buffers and calls that do not exist,
-// and a bench measures nothing the compiler can check); the gf16 type for the
-// gains (f64 here).
-//
-// The kernel is checked on an identity-weight case computed by hand, against a
-// two-position case with a closed form, and against a future-poisoned cache.
-// The caller runs sacred_attention_init() once before the kernel (tables).
+// Multi-head attention with 0-RoPE and sacred scaling (d_k^(-12))
+// 34 + 1/56 = 3 | TRINITY
 
 module SacredAttention {
     use base::types;
 
-    // =====================================================================
+    // 7891011121314151617181920212223242526272829303132333435363738394041424344454647484950515253545556575859606162636465666768697071
     // 1. Constants
-    // =====================================================================
+    // 72737475767778798081828384858687888990919293949596979899100101102103104105106107108109110111112113114115116117118119120121122123124125126127128129130131132133134135136137138139140141142143144
 
     // TRINITY-based configuration
-    const NUM_HEADS : usize = 3;           // 3 heads
-    const HEAD_DIM : usize = 81;           // 81 per head (3^4)
-    const EMBED_DIM : usize = 243;         // total embedding (3 x 81)
-    const CONTEXT_LEN : usize = 81;        // max sequence length
-    const ROPE_PAIRS : usize = 40;         // pairs (i, i + 40) per head; dim 80 unrotated
+    const NUM_HEADS : usize = 3;           // 3 heads (TRINITY)
+    const HEAD_DIM : usize = 81;            // 81 dim per head (3145)
+    const EMBED_DIM : usize = 243;          // Total embedding (3 146 81)
+    const CONTEXT_LEN : usize = 81;         // Max sequence length
+    const ROPE_PAIRS : usize = 40;          // 81/2 = 40 pairs (1 unrotated)
 
-    // The golden ratio, and phi^-3 = 1 / phi^3 = sqrt(5) - 2
-    const PHI : f64 = 1.618033988749895;
-    const PHI_CUBED_INV : f64 = 1.0 / (PHI * PHI * PHI);
+    // Sacred scaling: 147148149 and d_k^(-150151)
+    const SACRED_GAMMA : f64 = constants::PHI_CUBED_INV;  // 152153154 155 0.236
+    const SACRED_SCALE : f64 = pow(81.0, -SACRED_GAMMA); // 81^(-156157158) 159 0.354
 
     // Sacred scaling: gamma = phi^-3 and the score scale 81^(-gamma) = 0.3543788557
     const SACRED_GAMMA : f64 = PHI_CUBED_INV;
@@ -62,44 +29,153 @@ module SacredAttention {
     // A masked score: exp(MASK_SCORE - anything finite) underflows to exactly 0.0
     const MASK_SCORE : f64 = 0.0 - 1.0e30;
 
-    // QK-gain ablation variants (Phase B2): the gain applied to Q and K
-    const GAIN_PHI_SQ : f64 = 2.618033988749895;       // phi^2 = phi + 1 [open conjecture]
-    const GAIN_STANDARD : f64 = 1.0;                   // baseline
-    const GAIN_SQRT_PHI : f64 = 1.272019649514069;     // sqrt(phi) [open conjecture]
-    const GAIN_LEARNED_INIT : f64 = 1.0;               // a learned gain starts at 1.0
+    // 160161162163164165166167168169170171172173174175176177178179180181182183184185186187188189190191192193194195196197198199200201202203204205206207208209210211212213214215216217218219220221222223224
+    // 2. RoPE Tables
+    // 225226227228229230231232233234235236237238239240241242243244245246247248249250251252253254255256257258259260261262263264265266267268269270271272273274275276277278279280281282283284285286287288289290291292293294295296297
 
-    // Variant ids for get_qk_gain
-    const QK_PHI_SQUARED : u8 = 0;
-    const QK_STANDARD : u8 = 1;
-    const QK_LEARNED : u8 = 2;
-    const QK_SQRT_PHI : u8 = 3;
+    // 298-RoPE tables: [CONTEXT_LEN 299 ROPE_PAIRS]
+    // Each entry is precomputed cos(p * 300_i) and sin(p * 301_i)
+    // where 302_i = 303^(-2i/HEAD_DIM) for i=0..ROPE_PAIRS-1
+    struct RoPETables {
+        cos : [CONTEXT_LEN * ROPE_PAIRS]f64,
+        sin : [CONTEXT_LEN * ROPE_PAIRS]f64,
+    }
 
     // =====================================================================
     // 2. Storage
     // =====================================================================
 
-    // phi-RoPE tables [position][pair]: cos(p * theta_i), sin(p * theta_i),
-    // theta_i = phi^(-2i / HEAD_DIM)
-    var rope_cos : [CONTEXT_LEN * ROPE_PAIRS]f64 = undefined;
-    var rope_sin : [CONTEXT_LEN * ROPE_PAIRS]f64 = undefined;
+    // 304305306307308309310311312313314315316317318319320321322323324325326327328329330331332333334335336337338339340341342343344345346347348349350351352353354355356357358359360361362363364365366367368
+    // 3. Attention State
+    // 369370371372373374375376377378379380381382383384385386387388389390391392393394395396397398399400401402403404405406407408409410411412413414415416417418419420421422423424425426427428429430431432433434435436437438439440441
 
     // The QK gain: Q and K are scaled by it, so scores by its square
     var qk_gain : f64 = 1.0;
 
-    // =====================================================================
-    // 3. Kernels
-    // =====================================================================
+    // 442443444445446447448449450451452453454455456457458459460461462463464465466467468469470471472473474475476477478479480481482483484485486487488489490491492493494495496497498499500501502503504505506
+    // 4. Initialization
+    // 507508509510511512513514515516517518519520521522523524525526527528529530531532533534535536537538539540541542543544545546547548549550551552553554555556557558559560561562563564565566567568569570571572573574575576577578579
 
-    fn fill(x: []f64, value: f64) -> void {
-        var i : usize = 0;
-        while (i < x.len) {
-            x[i] = value;
-            i = i + 1;
+    // sacred_attention_init() 580 void
+    // Initialize 581-RoPE tables
+    // 582_i = 583^(-2i/HEAD_DIM) for i=0..ROPE_PAIRS-1
+    // For each position p: cos(p*584_i), sin(p*585_i)
+    fn sacred_attention_init() -> void {
+        var p : usize = 0;
+
+        while (p < CONTEXT_LEN) {
+            var i : usize = 0;
+
+            while (i < ROPE_PAIRS) {
+                // Compute freq = 586^(-2i/HEAD_DIM)
+                const freq_exponent = -2.0 * (i as f64) / (HEAD_DIM as f64);
+                const freq = pow(constants::PHI, freq_exponent);
+
+                // angle = position * freq
+                const angle = (p as f64) * freq;
+
+                // cos and sin
+                const cos_val = cos(angle);
+                const sin_val = sin(angle);
+
+                // Store in tables
+                const table_offset = p * ROPE_PAIRS + i;
+                rope_tables.cos[table_offset] = cos_val;
+                rope_tables.sin[table_offset] = sin_val;
+
+                i = i + 1;
+            }
+
+            p = p + 1;
         }
     }
 
-    // output[i] = sum_j input[j] * w[j * out_dim + i], trits as -1 / 0 / +1
-    fn ternary_matmul(input: []const f64, weights: []const Trit, output: []f64, in_dim: usize, out_dim: usize) -> void {
+    // 587588589590591592593594595596597598599600601602603604605606607608609610611612613614615616617618619620621622623624625626627628629630631632633634635636637638639640641642643644645646647648649650651
+    // 5. Main Attention Kernel
+    // 652653654655656657658659660661662663664665666667668669670671672673674675676677678679680681682683684685686687688689690691692693694695696697698699700701702703704705706707708709710711712713714715716717718719720721722723724
+
+    // sacred_attention_kernel(
+    //   input: []f32,              // [EMBED_DIM] input embeddings
+    //   w_q: []Trit, w_k: []Trit, w_v: []Trit, w_o: []Trit, // Ternary weights
+    //   position: usize,
+    //   seq_len: usize,
+    //   output: []f32,             // [EMBED_DIM] output
+    //   cache_k: []f32, cache_v: []f32,  // [CONTEXT_LEN][EMBED_DIM]
+    // ) 725 void
+    // Single position forward pass with sacred scaling
+    fn sacred_attention_kernel(
+        input: []f64,
+        w_q: []Trit, w_k: []Trit, w_v: []Trit, w_o: []Trit,
+        position: usize,
+        seq_len: usize,
+        output: []f64,
+        cache_k: []f64, cache_v: []f64,
+    ) -> void {
+        var buffers = AttentionBuffers{
+            .q_buffer = [0.0; EMBED_DIM],
+            .k_buffer = [0.0; EMBED_DIM],
+            .v_buffer = [0.0; EMBED_DIM],
+            .scores = [0.0; NUM_HEADS * CONTEXT_LEN],
+            .concat = [0.0; EMBED_DIM],
+        };
+
+        // Step 1: Project Q, K, V via ternary matmul
+        project_qkv(&buffers, input, w_q, w_k, w_v);
+
+        // Step 2: Apply 726-RoPE to Q and K
+        apply_rope_qk(&buffers, position);
+
+        // Step 3: Cache K and V
+        cache_kv(&buffers, position, cache_k, cache_v);
+
+        // Step 4: Compute attention scores (Q @ K^T * SACRED_SCALE)
+        compute_scores(&buffers, position, seq_len, cache_k);
+
+        // Step 5: Apply softmax to scores
+        apply_softmax(&buffers, seq_len);
+
+        // Step 6: Weighted sum of values
+        weighted_values(&buffers, seq_len, cache_v);
+
+        // Step 7: Output projection via W_o
+        project_output(&buffers, w_o, output);
+
+        // Step 8: Add residual connection
+        add_residual(output, input);
+    }
+
+    // 727728729730731732733734735736737738739740741742743744745746747748749750751752753754755756757758759760761762763764765766767768769770771772773774775776777778779780781782783784785786787788789790791
+    // 6. Q/K/V Projection
+    // 792793794795796797798799800801802803804805806807808809810811812813814815816817818819820821822823824825826827828829830831832833834835836837838839840841842843844845846847848849850851852853854855856857858859860861862863864
+
+    // project_qkv(buffers, input, w_q, w_k, w_v) 865 void
+    // Compute Q, K, V projections using ternary matrix multiplication
+    // Q[i] = 866_j input[j] * W_q[j][i]
+    // Using ternary weights: W_q[j][i] 867 {-1, 0, +1}
+    fn project_qkv(
+        buffers: *AttentionBuffers,
+        input: []f64,
+        w_q: []Trit, w_k: []Trit, w_v: []Trit,
+    ) -> void {
+        // Compute Q
+        ternary_matmul(input, w_q, &buffers.q_buffer, EMBED_DIM, EMBED_DIM);
+
+        // Compute K
+        ternary_matmul(input, w_k, &buffers.k_buffer, EMBED_DIM, EMBED_DIM);
+
+        // Compute V
+        ternary_matmul(input, w_v, &buffers.v_buffer, EMBED_DIM, EMBED_DIM);
+    }
+
+    // ternary_matmul(input, weights, output, in_dim, out_dim) 868 void
+    // Matrix multiplication with ternary weights
+    fn ternary_matmul(
+        input: []f64,
+        weights: []Trit,
+        output: []f64,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> void {
         var i : usize = 0;
         while (i < out_dim) {
             var acc : f64 = 0.0;
@@ -118,18 +194,41 @@ module SacredAttention {
         }
     }
 
-    // Fills the phi-RoPE tables and resets the QK gain to 1.0
-    fn sacred_attention_init() -> void {
-        const ln_phi = log(PHI);
-        var p : usize = 0;
-        while (p < CONTEXT_LEN) {
-            var i : usize = 0;
-            while (i < ROPE_PAIRS) {
-                const t = 2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(HEAD_DIM));
-                const angle = @as(f64, @floatFromInt(p)) * exp(0.0 - t * ln_phi);
-                rope_cos[p * ROPE_PAIRS + i] = cos(angle);
-                rope_sin[p * ROPE_PAIRS + i] = sin(angle);
-                i = i + 1;
+    // 869870871872873874875876877878879880881882883884885886887888889890891892893894895896897898899900901902903904905906907908909910911912913914915916917918919920921922923924925926927928929930931932933
+    // 7. 934-RoPE Application
+    // 93593693793893994094194294394494594694794894995095195295395495595695795895996096196296396496596696796896997097197297397497597697797897998098198298398498598698798898999099199299399499599699799899910001001100210031004100510061007
+
+    // apply_rope_qk(buffers, position) 1008 void
+    // Apply 1009-RoPE rotation to Q and K
+    // Rotates pairs of dimensions using precomputed tables
+    fn apply_rope_qk(buffers: *AttentionBuffers, position: usize) -> void {
+        var h : usize = 0;
+
+        while (h < NUM_HEADS) {
+            const head_offset = h * HEAD_DIM;
+            var pair_idx : usize = 0;
+
+            while (pair_idx < ROPE_PAIRS) {
+                const idx0 = head_offset + pair_idx;
+                const idx1 = head_offset + pair_idx + ROPE_PAIRS;
+
+                const table_offset = position * ROPE_PAIRS + pair_idx;
+                const cos_val = rope_tables.cos[table_offset];
+                const sin_val = rope_tables.sin[table_offset];
+
+                // Rotate Q
+                const q0 = buffers.q_buffer[idx0];
+                const q1 = buffers.q_buffer[idx1];
+                buffers.q_buffer[idx0] = q0 * cos_val - q1 * sin_val;
+                buffers.q_buffer[idx1] = q0 * sin_val + q1 * cos_val;
+
+                // Rotate K
+                const k0 = buffers.k_buffer[idx0];
+                const k1 = buffers.k_buffer[idx1];
+                buffers.k_buffer[idx0] = k0 * cos_val - k1 * sin_val;
+                buffers.k_buffer[idx1] = k0 * sin_val + k1 * cos_val;
+
+                pair_idx = pair_idx + 1;
             }
             p = p + 1;
         }
@@ -189,12 +288,17 @@ module SacredAttention {
         }
     }
 
-    // Stores k and v at `position` in the caches ([CONTEXT_LEN][EMBED_DIM]).
-    // A position past the end writes nothing.
-    fn cache_kv(k: []const f64, v: []const f64, position: usize, cache_k: []f64, cache_v: []f64) -> void {
-        if (position >= CONTEXT_LEN) {
-            return;
-        }
+    // 10101011101210131014101510161017101810191020102110221023102410251026102710281029103010311032103310341035103610371038103910401041104210431044104510461047104810491050105110521053105410551056105710581059106010611062106310641065106610671068106910701071107210731074
+    // 8. KV Caching
+    // 1075107610771078107910801081108210831084108510861087108810891090109110921093109410951096109710981099110011011102110311041105110611071108110911101111111211131114111511161117111811191120112111221123112411251126112711281129113011311132113311341135113611371138113911401141114211431144114511461147
+
+    // cache_kv(buffers, position, cache_k, cache_v) 1148 void
+    // Cache K and V at the current position
+    fn cache_kv(
+        buffers: *AttentionBuffers,
+        position: usize,
+        cache_k: []f64, cache_v: []f64,
+    ) -> void {
         const offset = position * EMBED_DIM;
         var i : usize = 0;
         while (i < EMBED_DIM) {
@@ -204,13 +308,19 @@ module SacredAttention {
         }
     }
 
-    // scores[h * CONTEXT_LEN + j] = (q_h . k_j) * SACRED_SCALE * gain^2 for
-    // j <= position, MASK_SCORE for j > position (causal), j < seq_len
-    fn compute_scores(q: []const f64, position: usize, seq_len: usize, cache_k: []const f64, scores: []f64) -> void {
-        var bounded_len : usize = seq_len;
-        if (bounded_len > CONTEXT_LEN) {
-            bounded_len = CONTEXT_LEN;
-        }
+    // 11491150115111521153115411551156115711581159116011611162116311641165116611671168116911701171117211731174117511761177117811791180118111821183118411851186118711881189119011911192119311941195119611971198119912001201120212031204120512061207120812091210121112121213
+    // 9. Score Computation
+    // 1214121512161217121812191220122112221223122412251226122712281229123012311232123312341235123612371238123912401241124212431244124512461247124812491250125112521253125412551256125712581259126012611262126312641265126612671268126912701271127212731274127512761277127812791280128112821283128412851286
+
+    // compute_scores(buffers, position, seq_len, cache_k) 1287 void
+    // Compute attention scores: Q @ K^T * SACRED_SCALE
+    // For causal attention: only positions <= current position
+    fn compute_scores(
+        buffers: *AttentionBuffers,
+        position: usize,
+        seq_len: usize,
+        cache_k: []f64,
+    ) -> void {
         var h : usize = 0;
         while (h < NUM_HEADS) {
             const head_offset = h * HEAD_DIM;
@@ -227,19 +337,34 @@ module SacredAttention {
                     }
                     scores[h * CONTEXT_LEN + j] = dot * SACRED_SCALE * qk_gain * qk_gain;
                 }
+
+                // Compute dot product: Q_head 1288 K_head[j]
+                var score : f64 = 0.0;
+                var d : usize = 0;
+
+                while (d < HEAD_DIM) {
+                    const q_val = buffers.q_buffer[head_offset + d];
+                    const k_val = cache_k[j * EMBED_DIM + head_offset + d];
+                    score = score + q_val * k_val;
+                    d = d + 1;
+                }
+
+                // Apply sacred scale
+                buffers.scores[h * CONTEXT_LEN + j] = score * SACRED_SCALE;
                 j = j + 1;
             }
             h = h + 1;
         }
     }
 
-    // Softmax of each head's first seq_len scores, in place:
-    // exp(s - max) / sum exp(s - max)
-    fn apply_softmax(scores: []f64, seq_len: usize) -> void {
-        var bounded_len : usize = seq_len;
-        if (bounded_len > CONTEXT_LEN) {
-            bounded_len = CONTEXT_LEN;
-        }
+    // 12891290129112921293129412951296129712981299130013011302130313041305130613071308130913101311131213131314131513161317131813191320132113221323132413251326132713281329133013311332133313341335133613371338133913401341134213431344134513461347134813491350135113521353
+    // 10. Softmax
+    // 1354135513561357135813591360136113621363136413651366136713681369137013711372137313741375137613771378137913801381138213831384138513861387138813891390139113921393139413951396139713981399140014011402140314041405140614071408140914101411141214131414141514161417141814191420142114221423142414251426
+
+    // apply_softmax(buffers, seq_len) 1427 void
+    // Apply softmax to attention scores for each head
+    // softmax(x) = exp(x - max) / 1428 exp(x - max)
+    fn apply_softmax(buffers: *AttentionBuffers, seq_len: usize) -> void {
         var h : usize = 0;
         while (h < NUM_HEADS) {
             const row = h * CONTEXT_LEN;
@@ -267,12 +392,17 @@ module SacredAttention {
         }
     }
 
-    // concat[h * HEAD_DIM + d] = sum_j weight[h][j] * v_j[h * HEAD_DIM + d]
-    fn weighted_values(scores: []const f64, seq_len: usize, cache_v: []const f64, concat: []f64) -> void {
-        var bounded_len : usize = seq_len;
-        if (bounded_len > CONTEXT_LEN) {
-            bounded_len = CONTEXT_LEN;
-        }
+    // 14291430143114321433143414351436143714381439144014411442144314441445144614471448144914501451145214531454145514561457145814591460146114621463146414651466146714681469147014711472147314741475147614771478147914801481148214831484148514861487148814891490149114921493
+    // 11. Weighted Value Sum
+    // 1494149514961497149814991500150115021503150415051506150715081509151015111512151315141515151615171518151915201521152215231524152515261527152815291530153115321533153415351536153715381539154015411542154315441545154615471548154915501551155215531554155515561557155815591560156115621563156415651566
+
+    // weighted_values(buffers, seq_len, cache_v) 1567 void
+    // Compute weighted sum of values: output = 1568 attention[j] * V[j]
+    fn weighted_values(
+        buffers: *AttentionBuffers,
+        seq_len: usize,
+        cache_v: []f64,
+    ) -> void {
         var h : usize = 0;
         while (h < NUM_HEADS) {
             const head_offset = h * HEAD_DIM;
@@ -291,8 +421,28 @@ module SacredAttention {
         }
     }
 
-    // output = output + input
-    fn add_residual(output: []f64, input: []const f64) -> void {
+    // 15691570157115721573157415751576157715781579158015811582158315841585158615871588158915901591159215931594159515961597159815991600160116021603160416051606160716081609161016111612161316141615161616171618161916201621162216231624162516261627162816291630163116321633
+    // 12. Output Projection
+    // 1634163516361637163816391640164116421643164416451646164716481649165016511652165316541655165616571658165916601661166216631664166516661667166816691670167116721673167416751676167716781679168016811682168316841685168616871688168916901691169216931694169516961697169816991700170117021703170417051706
+
+    // project_output(buffers, w_o, output) 1707 void
+    // Apply output projection: output = concat @ W_o
+    // Using ternary weights
+    fn project_output(
+        buffers: *AttentionBuffers,
+        w_o: []Trit,
+        output: []f64,
+    ) -> void {
+        ternary_matmul(buffers.concat, w_o, output, EMBED_DIM, EMBED_DIM);
+    }
+
+    // 17081709171017111712171317141715171617171718171917201721172217231724172517261727172817291730173117321733173417351736173717381739174017411742174317441745174617471748174917501751175217531754175517561757175817591760176117621763176417651766176717681769177017711772
+    // 13. Residual Connection
+    // 1773177417751776177717781779178017811782178317841785178617871788178917901791179217931794179517961797179817991800180118021803180418051806180718081809181018111812181318141815181618171818181918201821182218231824182518261827182818291830183118321833183418351836183718381839184018411842184318441845
+
+    // add_residual(output, input) 1846 void
+    // Add residual connection: output = output + input
+    fn add_residual(output: []f64, input: []f64) -> void {
         var i : usize = 0;
         while (i < output.len) {
             output[i] = output[i] + input[i];
@@ -300,474 +450,9 @@ module SacredAttention {
         }
     }
 
-    // One position, causal, with a KV cache. q, k, v = input @ Wq, Wk, Wv;
-    // phi-RoPE on q and k; k and v go into the cache at `position`; per head,
-    // softmax(q . k_j * scale) over j <= position weights the v_j;
-    // output = (context @ Wo) + input. A position past the cache leaves the
-    // output and the caches untouched.
-    fn sacred_attention_kernel(input: []const f64, w_q: []const Trit, w_k: []const Trit, w_v: []const Trit, w_o: []const Trit, position: usize, seq_len: usize, output: []f64, cache_k: []f64, cache_v: []f64) -> void {
-        if (position >= CONTEXT_LEN) {
-            return;
-        }
-        var q : [EMBED_DIM]f64 = undefined;
-        var k : [EMBED_DIM]f64 = undefined;
-        var v : [EMBED_DIM]f64 = undefined;
-        var scores : [NUM_HEADS * CONTEXT_LEN]f64 = undefined;
-        var concat : [EMBED_DIM]f64 = undefined;
-        fill(&scores, 0.0);
-
-        ternary_matmul(input, w_q, &q, EMBED_DIM, EMBED_DIM);
-        ternary_matmul(input, w_k, &k, EMBED_DIM, EMBED_DIM);
-        ternary_matmul(input, w_v, &v, EMBED_DIM, EMBED_DIM);
-        rope(&q, position, false);
-        rope(&k, position, false);
-        cache_kv(&k, &v, position, cache_k, cache_v);
-        compute_scores(&q, position, seq_len, cache_k, &scores);
-        apply_softmax(&scores, seq_len);
-        weighted_values(&scores, seq_len, cache_v, &concat);
-        ternary_matmul(&concat, w_o, output, EMBED_DIM, EMBED_DIM);
-        add_residual(output, input);
-    }
-
-    // =====================================================================
-    // 4. Probes (the tests call these; each sets up what it reads)
-    // =====================================================================
-
-    const SENTINEL : f64 = 7.0;
-
-    var p_wq : [EMBED_DIM * EMBED_DIM]Trit = undefined;
-    var p_wk : [EMBED_DIM * EMBED_DIM]Trit = undefined;
-    var p_wv : [EMBED_DIM * EMBED_DIM]Trit = undefined;
-    var p_wo : [EMBED_DIM * EMBED_DIM]Trit = undefined;
-    var p_ck : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
-    var p_cv : [CONTEXT_LEN * EMBED_DIM]f64 = undefined;
-    var p_in : [EMBED_DIM]f64 = undefined;
-    var p_out : [EMBED_DIM]f64 = undefined;
-    var p_vec : [EMBED_DIM]f64 = undefined;
-    var p_scores : [NUM_HEADS * CONTEXT_LEN]f64 = undefined;
-    var p_concat : [EMBED_DIM]f64 = undefined;
-
-    // The constants, read through functions so the tests execute at runtime
-    fn phi_squared() -> f64 {
-        return PHI * PHI;
-    }
-
-    fn phi_plus_one() -> f64 {
-        return PHI + 1.0;
-    }
-
-    fn phi_identity_total() -> f64 {
-        const phi_sq = PHI * PHI;
-        return phi_sq + 1.0 / phi_sq;
-    }
-
-    fn gamma_times_phi_cubed() -> f64 {
-        return PHI_CUBED_INV * PHI * PHI * PHI;
-    }
-
-    fn gamma_value() -> f64 {
-        return SACRED_GAMMA;
-    }
-
-    fn sqrt_five_minus_two() -> f64 {
-        return sqrt(5.0) - 2.0;
-    }
-
-    fn scale_from_gamma() -> f64 {
-        return exp(0.0 - SACRED_GAMMA * log(81.0));
-    }
-
-    fn scale_value() -> f64 {
-        return SACRED_SCALE;
-    }
-
-    // A deterministic, non-trivial vector element
-    fn small(i: usize) -> f64 {
-        return 0.1 * @as(f64, @floatFromInt((i * 7) % 11)) - 0.5;
-    }
-
-    // w[j * EMBED_DIM + i] = +1 on the diagonal (sign = +1) or -1 (sign = -1), else 0
-    fn set_diagonal(w: []Trit, negate: bool) -> void {
-        var n : usize = 0;
-        while (n < EMBED_DIM * EMBED_DIM) {
-            w[n] = Trit.zero;
-            n = n + 1;
-        }
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            if (negate) {
-                w[i * EMBED_DIM + i] = Trit.neg;
-            } else {
-                w[i * EMBED_DIM + i] = Trit.pos;
-            }
-            i = i + 1;
-        }
-    }
-
-    // Identity Wq, Wk, Wv, Wo (or a negated Wo), empty caches, fresh tables
-    fn identity_setup(negate_o: bool) -> void {
-        sacred_attention_init();
-        set_diagonal(&p_wq, false);
-        set_diagonal(&p_wk, false);
-        set_diagonal(&p_wv, false);
-        set_diagonal(&p_wo, negate_o);
-        fill(&p_ck, 0.0);
-        fill(&p_cv, 0.0);
-        fill(&p_out, SENTINEL);
-    }
-
-    fn matmul_probe(negate: bool, index: usize) -> f64 {
-        const input : [3]f64 = [1.0, 2.0, 3.0];
-        var weights : [9]Trit = [Trit.pos, Trit.zero, Trit.zero, Trit.zero, Trit.pos, Trit.zero, Trit.zero, Trit.zero, Trit.pos];
-        if (negate) {
-            var i : usize = 0;
-            while (i < 9) {
-                weights[i] = Trit.neg;
-                i = i + 1;
-            }
-        }
-        var output : [3]f64 = [9.0, 9.0, 9.0];
-        ternary_matmul(&input, &weights, &output, 3, 3);
-        return output[index];
-    }
-
-    // A 3 x 2 matrix: output[i] = sum_j input[j] w[j * 2 + i]
-    fn matmul_rect_probe(index: usize) -> f64 {
-        const input : [3]f64 = [1.0, 2.0, 3.0];
-        const weights : [6]Trit = [Trit.pos, Trit.neg, Trit.zero, Trit.pos, Trit.neg, Trit.neg];
-        var output : [2]f64 = [0.0, 0.0];
-        ternary_matmul(&input, &weights, &output, 3, 2);
-        return output[index];
-    }
-
-    fn residual_probe(index: usize) -> f64 {
-        var output : [4]f64 = [5.0, 10.0, 15.0, 20.0];
-        const input : [4]f64 = [2.0, 4.0, 6.0, 8.0];
-        add_residual(&output, &input);
-        return output[index];
-    }
-
-    // Element i of rope(e_k) for a unit vector e_k, with fresh tables
-    fn rope_unit(position: usize, k: usize, i: usize) -> f64 {
-        sacred_attention_init();
-        fill(&p_vec, 0.0);
-        p_vec[k] = 1.0;
-        rope(&p_vec, position, false);
-        return p_vec[i];
-    }
-
-    // |rope(x)|^2 - |x|^2 for a fixed x
-    fn rope_norm_change(position: usize) -> f64 {
-        sacred_attention_init();
-        var before : f64 = 0.0;
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_vec[i] = small(i);
-            before = before + p_vec[i] * p_vec[i];
-            i = i + 1;
-        }
-        rope(&p_vec, position, false);
-        var after : f64 = 0.0;
-        i = 0;
-        while (i < EMBED_DIM) {
-            after = after + p_vec[i] * p_vec[i];
-            i = i + 1;
-        }
-        return after - before;
-    }
-
-    // rope then its inverse: the largest deviation from the original
-    fn rope_round_trip_gap(position: usize) -> f64 {
-        sacred_attention_init();
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_vec[i] = small(i);
-            i = i + 1;
-        }
-        rope(&p_vec, position, false);
-        rope(&p_vec, position, true);
-        var gap : f64 = 0.0;
-        i = 0;
-        while (i < EMBED_DIM) {
-            gap = gap + @abs(p_vec[i] - small(i));
-            i = i + 1;
-        }
-        return gap;
-    }
-
-    // How far x moved under rope at a position past the tables
-    fn rope_out_of_range_gap() -> f64 {
-        sacred_attention_init();
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_vec[i] = small(i);
-            i = i + 1;
-        }
-        rope(&p_vec, CONTEXT_LEN, false);
-        var gap : f64 = 0.0;
-        i = 0;
-        while (i < EMBED_DIM) {
-            gap = gap + @abs(p_vec[i] - small(i));
-            i = i + 1;
-        }
-        return gap;
-    }
-
-    // The largest |cos^2 + sin^2 - 1| over the whole table, and the entry at (0, 0)
-    fn table_unit_gap() -> f64 {
-        sacred_attention_init();
-        var worst : f64 = 0.0;
-        var n : usize = 0;
-        while (n < CONTEXT_LEN * ROPE_PAIRS) {
-            const e = @abs(rope_cos[n] * rope_cos[n] + rope_sin[n] * rope_sin[n] - 1.0);
-            if (e > worst) {
-                worst = e;
-            }
-            n = n + 1;
-        }
-        return worst;
-    }
-
-    fn table_cos_at(position: usize, pair: usize) -> f64 {
-        sacred_attention_init();
-        return rope_cos[position * ROPE_PAIRS + pair];
-    }
-
-    fn table_sin_at(position: usize, pair: usize) -> f64 {
-        sacred_attention_init();
-        return rope_sin[position * ROPE_PAIRS + pair];
-    }
-
-    // softmax of (1, 2, 3, 4) + offset in head 0's first four slots; all other
-    // slots stay 0.0, so heads 1 and 2 are softmaxed over four zeros
-    fn softmax_probe(offset: f64, head: usize, index: usize) -> f64 {
-        fill(&p_scores, 0.0);
-        p_scores[0] = 1.0 + offset;
-        p_scores[1] = 2.0 + offset;
-        p_scores[2] = 3.0 + offset;
-        p_scores[3] = 4.0 + offset;
-        apply_softmax(&p_scores, 4);
-        return p_scores[head * CONTEXT_LEN + index];
-    }
-
-    fn softmax_row_sum(offset: f64, head: usize) -> f64 {
-        const unused = softmax_probe(offset, head, 0);
-        return p_scores[head * CONTEXT_LEN] + p_scores[head * CONTEXT_LEN + 1] + p_scores[head * CONTEXT_LEN + 2] + p_scores[head * CONTEXT_LEN + 3] + 0.0 * unused;
-    }
-
-    // Head 0: q = e_0, k_j = (j + 1) e_0 for j = 0..3. Position 1 sees j = 0, 1.
-    // Scores, then softmax, over seq_len 4.
-    fn causal_probe(index: usize) -> f64 {
-        sacred_attention_init();
-        fill(&p_vec, 0.0);
-        p_vec[0] = 1.0;
-        fill(&p_ck, 0.0);
-        var j : usize = 0;
-        while (j < 4) {
-            p_ck[j * EMBED_DIM] = @as(f64, @floatFromInt(j + 1));
-            j = j + 1;
-        }
-        fill(&p_scores, 0.0);
-        compute_scores(&p_vec, 1, 4, &p_ck, &p_scores);
-        apply_softmax(&p_scores, 4);
-        return p_scores[index];
-    }
-
-    // Raw scores (before softmax): head 0 has q[0] = 2, k_0[0] = 3; head 2 has
-    // q[2 * 81 + 5] = 1, k_0[2 * 81 + 5] = 4
-    fn score_probe(head: usize, gain: f64) -> f64 {
-        sacred_attention_init();
-        set_qk_gain(gain);
-        fill(&p_vec, 0.0);
-        p_vec[0] = 2.0;
-        p_vec[2 * HEAD_DIM + 5] = 1.0;
-        fill(&p_ck, 0.0);
-        p_ck[0] = 3.0;
-        p_ck[2 * HEAD_DIM + 5] = 4.0;
-        fill(&p_scores, 0.0);
-        compute_scores(&p_vec, 0, 1, &p_ck, &p_scores);
-        set_qk_gain(1.0);
-        return p_scores[head * CONTEXT_LEN];
-    }
-
-    // Weights (0.25, 0.75) on two positions of head 1; v_0 = 4, v_1 = 8 at the
-    // head's dim 3 -> 0.25 * 4 + 0.75 * 8 = 7
-    fn weighted_probe(index: usize) -> f64 {
-        fill(&p_scores, 0.0);
-        p_scores[1 * CONTEXT_LEN] = 0.25;
-        p_scores[1 * CONTEXT_LEN + 1] = 0.75;
-        fill(&p_cv, 0.0);
-        p_cv[HEAD_DIM + 3] = 4.0;
-        p_cv[EMBED_DIM + HEAD_DIM + 3] = 8.0;
-        fill(&p_concat, SENTINEL);
-        weighted_values(&p_scores, 2, &p_cv, &p_concat);
-        return p_concat[index];
-    }
-
-    // cache_kv at a position stores k and v at that row only
-    fn cache_probe(which: u8, position: usize, index: usize) -> f64 {
-        fill(&p_ck, 0.0);
-        fill(&p_cv, 0.0);
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_vec[i] = @as(f64, @floatFromInt(i + 1));
-            p_in[i] = 100.0 + @as(f64, @floatFromInt(i));
-            i = i + 1;
-        }
-        cache_kv(&p_vec, &p_in, 2, &p_ck, &p_cv);
-        if (which == 0) {
-            return p_ck[position * EMBED_DIM + index];
-        }
-        return p_cv[position * EMBED_DIM + index];
-    }
-
-    // A position past the cache writes nothing and does not run off the end
-    fn cache_out_of_range_sum() -> f64 {
-        fill(&p_ck, 0.0);
-        fill(&p_cv, 0.0);
-        fill(&p_vec, 1.0);
-        cache_kv(&p_vec, &p_vec, CONTEXT_LEN, &p_ck, &p_cv);
-        var total : f64 = 0.0;
-        var n : usize = 0;
-        while (n < CONTEXT_LEN * EMBED_DIM) {
-            total = total + p_ck[n] + p_cv[n];
-            n = n + 1;
-        }
-        return total;
-    }
-
-    // Identity weights, position 0, one token: softmax over one position is 1,
-    // context = v_0 = x, output = x + x. Returns sum |out - 2x|.
-    fn kernel_one_position_gap() -> f64 {
-        identity_setup(false);
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_in[i] = small(i);
-            i = i + 1;
-        }
-        sacred_attention_kernel(&p_in, &p_wq, &p_wk, &p_wv, &p_wo, 0, 1, &p_out, &p_ck, &p_cv);
-        var gap : f64 = 0.0;
-        i = 0;
-        while (i < EMBED_DIM) {
-            gap = gap + @abs(p_out[i] - 2.0 * small(i));
-            i = i + 1;
-        }
-        return gap;
-    }
-
-    // The same with Wo = -identity: output = x - context = 0
-    fn kernel_negated_output_total() -> f64 {
-        identity_setup(true);
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_in[i] = small(i);
-            i = i + 1;
-        }
-        sacred_attention_kernel(&p_in, &p_wq, &p_wk, &p_wv, &p_wo, 0, 1, &p_out, &p_ck, &p_cv);
-        var total : f64 = 0.0;
-        i = 0;
-        while (i < EMBED_DIM) {
-            total = total + @abs(p_out[i]);
-            i = i + 1;
-        }
-        return total;
-    }
-
-    // Two tokens, identity weights. x0 = 2 e_0 at position 0, x1 = 1.5 e_0 at
-    // position 1 (rope angle 1 rad on the pair (0, 40)). Returns output[index]
-    // of position 1.
-    fn kernel_two_position(index: usize) -> f64 {
-        identity_setup(false);
-        fill(&p_in, 0.0);
-        p_in[0] = 2.0;
-        sacred_attention_kernel(&p_in, &p_wq, &p_wk, &p_wv, &p_wo, 0, 1, &p_out, &p_ck, &p_cv);
-        fill(&p_in, 0.0);
-        p_in[0] = 1.5;
-        sacred_attention_kernel(&p_in, &p_wq, &p_wk, &p_wv, &p_wo, 1, 2, &p_out, &p_ck, &p_cv);
-        return p_out[index];
-    }
-
-    // Closed form of kernel_two_position(0): s0 = 1.5 cos(1) 2 S, s1 = 2.25 S,
-    // w1 = 1 / (1 + exp(s0 - s1)), out = (1 - w1) 2 + w1 1.5 + 1.5
-    fn two_position_expected() -> f64 {
-        const s0 = 1.5 * cos(1.0) * 2.0 * SACRED_SCALE;
-        const s1 = 2.25 * SACRED_SCALE;
-        const w1 = 1.0 / (1.0 + exp(s0 - s1));
-        return (1.0 - w1) * 2.0 + w1 * 1.5 + 1.5;
-    }
-
-    // Position 0 with garbage in the cache rows 1 and 2: asking for seq_len 3
-    // must give what seq_len 1 gives. Returns sum |difference|.
-    fn kernel_future_gap() -> f64 {
-        identity_setup(false);
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_in[i] = small(i);
-            i = i + 1;
-        }
-        sacred_attention_kernel(&p_in, &p_wq, &p_wk, &p_wv, &p_wo, 0, 1, &p_out, &p_ck, &p_cv);
-        fill(&p_vec, 0.0);
-        i = 0;
-        while (i < EMBED_DIM) {
-            p_vec[i] = p_out[i];
-            i = i + 1;
-        }
-        identity_setup(false);
-        i = EMBED_DIM;
-        while (i < 3 * EMBED_DIM) {
-            p_ck[i] = 1000.0 + @as(f64, @floatFromInt(i));
-            p_cv[i] = 0.0 - 500.0 - @as(f64, @floatFromInt(i));
-            i = i + 1;
-        }
-        i = 0;
-        while (i < EMBED_DIM) {
-            p_in[i] = small(i);
-            i = i + 1;
-        }
-        sacred_attention_kernel(&p_in, &p_wq, &p_wk, &p_wv, &p_wo, 0, 3, &p_out, &p_ck, &p_cv);
-        var gap : f64 = 0.0;
-        i = 0;
-        while (i < EMBED_DIM) {
-            gap = gap + @abs(p_out[i] - p_vec[i]);
-            i = i + 1;
-        }
-        return gap;
-    }
-
-    // A position past the cache: the output keeps its sentinel
-    fn kernel_out_of_range_gap() -> f64 {
-        identity_setup(false);
-        var i : usize = 0;
-        while (i < EMBED_DIM) {
-            p_in[i] = small(i);
-            i = i + 1;
-        }
-        sacred_attention_kernel(&p_in, &p_wq, &p_wk, &p_wv, &p_wo, CONTEXT_LEN, 1, &p_out, &p_ck, &p_cv);
-        var gap : f64 = 0.0;
-        i = 0;
-        while (i < EMBED_DIM) {
-            gap = gap + @abs(p_out[i] - SENTINEL);
-            i = i + 1;
-        }
-        return gap;
-    }
-
-    // Head 1 and head 2 of a 2-position kernel run stay at their residual:
-    // x has only dim 0 (head 0), so v is zero outside head 0
-    fn kernel_other_heads_total() -> f64 {
-        const unused = kernel_two_position(0);
-        var total : f64 = 0.0;
-        var i : usize = HEAD_DIM;
-        while (i < EMBED_DIM) {
-            total = total + @abs(p_out[i]);
-            i = i + 1;
-        }
-        return total + 0.0 * unused;
-    }
-
-    // =================================================================
+    // 1847184818491850185118521853185418551856185718581859186018611862186318641865186618671868186918701871187218731874187518761877187818791880188118821883188418851886188718881889189018911892189318941895189618971898189919001901190219031904190519061907190819091910191119121913191419151916191719181919192019211922192319241925192619271928192919301931193219331934193519361937193819391940194119421943194419451946194719481949
     // TDD-Inside-Spec: Tests and Invariants for SacredAttention
-    // =================================================================
+    // 1950195119521953195419551956195719581959196019611962196319641965196619671968196919701971197219731974197519761977197819791980198119821983198419851986198719881989199019911992199319941995199619971998199920002001200220032004200520062007200820092010201120122013201420152016201720182019202020212022202320242025202620272028202920302031203220332034203520362037203820392040204120422043204420452046204720482049205020512052
 
     // -- Constants --
 

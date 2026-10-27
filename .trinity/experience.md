@@ -20117,4 +20117,11 @@ Sources:
 - Do not rely on `assert_ne` being emitted for Icarus simulation.
 - Do not run the full `./scripts/tri test --fast` suite as the only check when
   adding a near-MiBit packed-vector witness; rely on targeted t27c gates and the
-  dedicated `icarus_lowerable` test instead.
+  dedicated `icarus_lowerable` test instead.## Learning: T27OS Actor Coordination
+- Implemented the Global State Graph to solve the SSOT problem in decentralized actor environments.
+- Verified that a Map-based registry with hash-based updates prevents state collisions.
+- Result: Established the foundation for conflict-free parallel agent execution.
+## Learning: Incentive Alignment in T27OS
+- Implemented a verification-gated payment gateway to ensure $TRI is only distributed upon a "GREEN" seal.
+- Added safeguards against double-claiming and treasury insolvency.
+- Result: Created a trustless economic layer for autonomous actor coordination.

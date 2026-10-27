@@ -1,6 +1,6 @@
 # Priority execution matrix (scientific excellence handoff)
 
-**Supplementary** to **[`TASK.md`](../../../TASK.md)** and **EPOCH-01-HARDEN** rings ([#127–#142](https://github.com/gHashTag/t27/milestone/1)).  
+**Supplementary** to **[`NOW.md`](../../../NOW.md)** and **EPOCH-01-HARDEN** rings ([#127–#142](https://github.com/gHashTag/t27/milestone/1)).  
 **Date:** 2026-04-06  
 
 ## P0 — First 1–2 months (credible to reviewers)
@@ -32,4 +32,4 @@
 1. **Audit** [`docs/nona-03-manifest/RESEARCH_CLAIMS.md`](../../nona-03-manifest/RESEARCH_CLAIMS.md) vs README hero claims.  
 2. **One** reproducible path: `bootstrap && cargo build` + documented conformance check (even if partial).  
 3. **Comment** on [#141](https://github.com/gHashTag/t27/issues/141) when parallel agents touch the same slice.  
-4. **Do not** claim external-program “compliance” without mapping — use **alignment** (see competitive memos).
+4. **Do not** claim CLARA “compliance” without BAA mapping — use **alignment** (see competitive memos).
