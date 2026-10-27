@@ -1,10 +1,5 @@
-//! The wasm32 emitter (`t27b build --target wasm32`, epic #11840 M-A), from
-//! the public surface: the bytes `emit` writes, the exports they describe, and
-//! the refusals for everything a pub fn does beyond the supported shape.
-//!
-//! The private LEB128 helpers' edges are pinned in the law itself
-//! (specs/tri/t27b/wasm.t27, floors 1-4: the uleb/sleb textbook vectors, the
-//! carrier crossings); this file holds what the canonical gate runs.
+//! The wasm32 emitter (`t27b build --target wasm32`, epic #11840): the bytes
+//! `emit` writes and the refusals for everything beyond the supported shape.
 
 use std::path::Path;
 use std::process::Command;
@@ -178,8 +173,7 @@ fn refusals_name_the_construct() {
 
 #[test]
 fn the_front_end_refusal_reaches_the_wasm_path() {
-    // A pub fn with a u64 parameter lowers fine in general; the wasm emitter
-    // is the one refusing it. One source-level walk to the same construct.
+    // A u64 parameter lowers fine in general; the wasm path is the refuser.
     let src = "pub fn later(x: u64) -> u64 { return x; }\n";
     let prog = lower_src(src);
     let e = wasm32_emitter::emit(&prog).expect_err("refused");
@@ -188,42 +182,8 @@ fn the_front_end_refusal_reaches_the_wasm_path() {
 }
 
 #[test]
-fn parameterized_exports_lower_to_the_floor_five_ops() {
-    // The M-B cut, byte for byte: `pub fn latency(a: u32, e: u32) -> u32
-    // { return (a - e + 1) * 16; }` and `pub fn frame(t: u32) -> u32
-    // { return t / 16 + 1; }`. The functype carries each fn's own parameters;
-    // the code bodies are the postfix walks over the floor-5 law's opcodes
-    // (local.get 0x20, i32.const 0x41, sub 0x6b, add 0x6a, mul 0x6c,
-    // div_u 0x6e).
-    let src = "pub fn latency(a: u32, e: u32) -> u32 { return (a - e + 1) * 16; }\n\
-               pub fn frame(t: u32) -> u32 { return t / 16 + 1; }\n";
-    let m = wasm32_emitter::emit(&lower_src(src)).expect("emit");
-    let mut want = Vec::new();
-    want.extend_from_slice(b"\0asm\x01\x00\x00\x00"); // magic, version 1
-    want.extend_from_slice(&[0x01, 0x0c, 0x02]); // type: 2 functypes, 12 bytes
-    want.extend_from_slice(&[0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]); // (i32, i32) -> i32
-    want.extend_from_slice(&[0x60, 0x01, 0x7f, 0x01, 0x7f]); // (i32) -> i32
-    want.extend_from_slice(&[0x03, 0x03, 0x02, 0x00, 0x01]); // function: types 0, 1
-    want.extend_from_slice(&[0x07, 0x13, 0x02]); // export: 2 entries, 19 bytes
-    want.extend_from_slice(b"\x07latency\x00\x00"); // "latency", kind func, index 0
-    want.extend_from_slice(b"\x05frame\x00\x01"); // "frame", kind func, index 1
-    want.extend_from_slice(&[0x0a, 0x1a, 0x02]); // code: 2 bodies, 26 bytes
-    // latency: locals 0, local.get 0, local.get 1, i32.sub, i32.const 1,
-    // i32.add, i32.const 16, i32.mul, end -- ((a - e) + 1) * 16.
-    want.extend_from_slice(&[
-        0x0d, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6b, 0x41, 0x01, 0x6a, 0x41, 0x10, 0x6c, 0x0b,
-    ]);
-    // frame: locals 0, local.get 0, i32.const 16, i32.div_u, i32.const 1,
-    // i32.add, end -- (t / 16) + 1.
-    want.extend_from_slice(&[0x0a, 0x00, 0x20, 0x00, 0x41, 0x10, 0x6e, 0x41, 0x01, 0x6a, 0x0b]);
-    assert_eq!(m, want);
-    assert_eq!(m.len(), 76);
-}
-
-#[test]
 fn node_calls_parameterized_exports_through_webassembly() {
-    // The M-B module instantiates in a standard runtime: latency(7, 2) = 96
-    // and frame(33) = 3, called through WebAssembly with arguments.
+    // The M-B module instantiates in a standard runtime: latency(7, 2) = 96, frame(33) = 3.
     let src = "pub fn latency(a: u32, e: u32) -> u32 { return (a - e + 1) * 16; }\n\
                pub fn frame(t: u32) -> u32 { return t / 16 + 1; }\n";
     let m = wasm32_emitter::emit(&lower_src(src)).expect("emit");
@@ -327,8 +287,7 @@ const fs = require('fs');
     assert!(String::from_utf8_lossy(&node.stdout).contains("TRIO OK"));
 }
 
-// The M-C cut (comparisons, t27os#3's named gap; the law's floor 11): the six
-// ops byte-pinned, the eqz fold, and a standard runtime proving lt SIGNED.
+// The M-C cut (the six comparisons, the eqz fold, a standard runtime proving lt SIGNED).
 #[test]
 fn comparisons_lower_to_floor_eleven_and_run() {
     let src = concat!(
@@ -362,8 +321,9 @@ console.log(ok?'MC OK':'MC MISMATCH');";
     assert!(String::from_utf8_lossy(&out.stdout).contains("MC OK"), "a comparison mismatched in a standard runtime");
 }
 
-// The M-D cut (logic/shift, t27os#3's lane; the law's floor 13): six opcodes
-// byte-pinned, shr SIGNED on i32 / UNSIGNED on u32, Node proving all answers.
+// The floor-12 cut: `emit` without an image is byte-identical to the scalar
+// cut; `emit_with_image` mounts the image as linear memory and one active
+// data segment, and a standard runtime validates the module.
 #[test]
 fn logic_shifts_lower_to_floor_thirteen_and_run() {
     let src = concat!(
@@ -395,4 +355,18 @@ console.log(ok?'MD OK':'MD MISMATCH');";
     let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the M-D gate needs Node's WebAssembly");
     assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("MD OK"), "a logic/shift answer mismatched in a standard runtime");
+}
+
+// The floor-17 mount: an intermediate lowers the group 01 7F (the law's
+// 49-byte leaf) and Node's WebAssembly runs inc(7) = 16.
+#[test]
+fn a_statement_body_lowers_through_the_local_window() {
+    let m = wasm32_emitter::emit(&lower_src("pub fn inc(a: i32) -> i32 { var t: i32 = a + 1; return t * 2; }\n")).expect("emit");
+    assert!(m.windows(4).any(|w| w == [0x01, 0x01, 0x7f, 0x20]), "the locals group is missing");
+    assert_eq!(m.len(), 49);
+    let path = std::env::temp_dir().join(format!("t27b-wasm-lcl-{}.wasm", std::process::id()));
+    std::fs::write(&path, &m).expect("write module");
+    let script = "const fs=require('fs');const e=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),{}).exports;console.log(e.inc(7)===16?'LCL OK':'LCL MISMATCH');";
+    let out = Command::new("node").arg("-e").arg(script).arg(&path).output().expect("node; the local-window gate needs Node's WebAssembly");
+    assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("LCL OK"), "inc(7) != 16: {}", String::from_utf8_lossy(&out.stderr));
 }

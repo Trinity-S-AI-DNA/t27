@@ -41,15 +41,14 @@ mod wasm_law;
 
 /// The wasm32 emit adapter (the emitter file deleted, owner rule 2026-10-24,
 /// PR thread #11983): the IR half of the flatten is ir::wasm_facts; this
-/// takes walk_refusal's verdict and composes the module through walk_prog +
-/// compose_module. No emitter logic lives here.
+/// takes walk_refusal's verdict and composes the module through
+/// walk_prog_locals + compose_module_with_image_l (floor 17's mount).
 pub mod wasm32_emitter {
     use super::ir::{Program, Ty};
     use super::wasm_law as w;
 
-    /// Why a pub fn (or the module) is not emitable, shaped like
-    /// codegen::CodegenError so the CLI prints it and `corpus` parses the
-    /// construct out of it; message() is the law's refusal_message.
+    /// Why a pub fn (or the module) is not emitable; message() is the law's
+    /// refusal_message, the phrasing `corpus` parses.
     #[derive(Debug)]
     pub struct EmitError {
         pub construct: String,
@@ -69,15 +68,13 @@ pub mod wasm32_emitter {
         }
     }
 
-    /// True when the wasm32 path carries this scalar (`t27b run`'s contract,
-    /// #11824: the native value and the wasm value stay comparable).
+    /// True when the wasm32 path carries this scalar (`t27b run`'s contract, #11824).
     pub fn carries(ty: Ty) -> bool {
         w::carries(ty.name().as_bytes())
     }
 
     /// The EmitError of a refused walk: the verdict's row mapped back to its
-    /// fn name and line, the law's construct and detail (the typed details
-    /// read the refusing row's own type name or op byte).
+    /// fn name and line, the law's construct and detail.
     fn refusal_error(p: &Program, facts: &[u8], s: &[u8], ns: &[u8], verdict: u8) -> EmitError {
         let row = w::walk_refusal_row(facts, s, ns);
         let (func, line) = if row == w::fact_rows(facts) {
@@ -132,18 +129,18 @@ pub mod wasm32_emitter {
         if verdict != w::REF_OK {
             return Err(refusal_error(p, &facts, &s, &ns, verdict));
         }
-        let (k, bcap) = (w::fact_rows(&facts), w::bodies_cap(&facts, &s, &ns));
+        let (k, bcap) = (w::fact_rows(&facts), w::bodies_cap_l(&facts, &s, &ns));
         let cap = w::scratch_cap(s.len(), bcap, k) + 64 + image.len() + 24;
-        let (mut names, mut descs, mut bodies) =
-            (vec![0u8; s.len()], vec![0u8; k * w::DESC_ROW], vec![0u8; bcap]);
+        let (mut names, mut descs, mut bodies, mut locals) = (vec![0u8; s.len()], vec![0u8; k * w::DESC_ROW], vec![0u8; bcap], vec![0u8; k * 4]);
         let (mut out, mut scratch) = (vec![0u8; cap], vec![0u8; cap]);
-        let dn = w::walk_prog(&mut names, &mut descs, &mut bodies, &facts, &s, &ns);
+        let dn = w::walk_prog_locals(&mut names, &mut descs, &mut bodies, &mut locals, &facts, &s, &ns);
         let used = &descs[..dn];
-        let n = w::compose_module_with_image(
+        let n = w::compose_module_with_image_l(
             &mut out,
             &names[..w::walk_names_len(used)],
             used,
             &bodies[..w::walk_bodies_len(used)],
+            &locals,
             image,
             &mut scratch,
         );
