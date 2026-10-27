@@ -38,3 +38,22 @@ commit, push, open the PR, `gh pr merge --squash --auto`. Two past traps this
 card encodes: `;`-comments inside a test body are a parse error (module level
 only), and [1]T arrays hit the #5980 single-element defect (entry 0 shipped
 as scalars; [2]T and [3]T emit cleanly).
+
+## The [N+1] skeleton, ready to fill
+
+Copy this over the arrays, replace every MEASURE with the live command's
+number, flip every SHOWN to index N, and the test-report does the rest. The
+numbers are placeholders by design: a placeholder that reaches master is a
+lie, so the card's own asserts are the gate that stops it.
+
+    pub const DATE: [4]u32 = [20261026, 20261027, 20261027, MEASURE];
+    pub const EPIC: [4]u32 = [12660, 12660, 12660, 12660];
+    pub const OPEN_START: [4]u32 = [55, 14, 16, MEASURE];   // = OPEN_END[2]
+    pub const OPEN_END: [4]u32 = [25, 16, 13, MEASURE];
+    pub const MERGED: [4]u32 = [54, 7, 18, MEASURE];
+    pub const BR_START: [4]u32 = [6391, 678, 696, MEASURE]; // = BR_END[2]
+    pub const BR_END: [4]u32 = [678, 696, 736, MEASURE];
+    pub const QUEUE_PEAK: [4]u32 = [502, 139, 139, MEASURE];
+
+    // every SHOWN_*: the newest index becomes 3; the percent sign falls out
+    // of the live numbers -- keep it honest either way.
