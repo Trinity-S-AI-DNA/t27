@@ -224,8 +224,7 @@ fn compile_front(input: &str, o: &Opts) -> Result<(Program, Phases), u8> {
         return Err(lower::verilog(&parsed.ast, o.cmd == "ts", &o.top).map_or_else(|e| { errln!("{}", e); EXIT_UNSUPPORTED }, |v| { out(&v); 0 }));
     }
     if o.blockers {
-        // Every unsupported construct, not just the first; a file with none
-        // goes on to the normal path below.
+        // Every unsupported construct, not just the first; a file with none goes on to the normal path below.
         let rejects = lower::blockers_src(&parsed.ast, o.mode, Some(&src));
         if !rejects.is_empty() {
             for r in &rejects {
@@ -276,6 +275,7 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
     let mut mismatches = 0usize;
     // Runtime asserts the interpreter executed (#6115), with `--check` only.
     let mut runtime_asserts = 0u64;
+    let mut ct_verified = 0u64;
     let mut asserts_known = true;
     let mut lines: Vec<String> = Vec::new();
     let mut fuel_left = check_budget::FILE_FUEL;
@@ -287,8 +287,7 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
             // One in-process iteration per test, for the warmup series (#7596).
             lines.push(format!("TIME {} {}", f.name, t1.elapsed().as_nanos()));
         }
-        // An invariant runs exactly like a test and is reported apart from
-        // the tests, prefixed `INVARIANT`.
+        // An invariant runs exactly like a test and is reported apart from the tests, prefixed `INVARIANT`.
         let tag = if f.is_invariant { "INVARIANT " } else { "" };
         match r {
             Ok(_) => {
@@ -324,9 +323,9 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
             let want = it.call(id, &[]);
             fuel_left = check_budget::spend(fuel_left, it.fuel);
             runtime_asserts += it.asserts;
+            ct_verified += it.ct_verified;
             if matches!(want, Err(Stop::Fuel) | Err(Stop::Depth)) {
-                // The interpreter stopped early: its count is a lower bound,
-                // so it cannot show that the pass is vacuous.
+                // The interpreter stopped early: its count is a lower bound, so it cannot show that the pass is vacuous.
                 asserts_known = false;
             }
             let agree = match (&r, &want) {
@@ -378,10 +377,10 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
         );
     }
     if o.check {
-        // Read by `corpus`: a pass with 0 here is `pass_vacuous` (#6115).
-        // Counted over tests and invariants, callees included.
+        // Read by `corpus` (#6115): 0/0 is `pass_vacuous`, 0 with ct > 0 is `pass_ct`.
         if asserts_known {
             outln!("{}: runtime asserts {}", name, runtime_asserts);
+            outln!("{}: ct-verified {}", name, ct_verified);
         } else {
             outln!("{}: runtime asserts unknown", name);
         }
@@ -407,11 +406,10 @@ fn cmd_test(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
 }
 
 /// `t27b run` (#11824): the gate passed, so the named pub fn runs; its return value is the exit
-/// code -- the low 8 bits, two's complement, like a C main (-1 exits 255). Every scalar return
-/// the wasm32 emitter carries (#11840) is accepted; the full value also prints on stdout, one
-/// line `t27b run: <fn> = <value> (<type>)`, so a harness can compare it bit for bit with what
-/// another backend computes (tests/wasm32_equality.rs). A float's exit code is the low 8 bits
-/// of its bit pattern.
+/// code -- the low 8 bits, two's complement, like a C main (-1 exits 255; a float's exit code
+/// is the low 8 bits of its bit pattern). Every scalar return the wasm32 emitter carries
+/// (#11840) is accepted; the value also prints as `t27b run: <fn> = <value> (<type>)` so a
+/// harness can compare it bit for bit with another backend (tests/wasm32_equality.rs).
 fn run_entry(prog: &Program, jit: &mut Jit, entry: &str) -> ExitCode {
     let Some(idx) = prog.func_index(entry) else { return usage(&format!("no fn `{}` in the spec", entry)) };
     let f = &prog.funcs[idx];
@@ -477,10 +475,9 @@ fn cmd_build(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
 }
 
 /// `t27b build --target wasm32` (epic #11840, M-A): the pub fns with no
-/// parameters whose body is a single `return <const>;` become exported wasm
-/// functions; anything else in a pub fn is refused by name, never silently
-/// dropped. `--elf` / `--macho` do not apply: the output is a module, not an
-/// object file.
+/// parameters whose body is a single `return <const>;` become exported wasm functions;
+/// anything else in a pub fn is refused by name, never dropped. `--elf` / `--macho` do not
+/// apply: the output is a module, not an object file.
 fn cmd_build_wasm(prog: &Program, ph: &mut Phases, o: &Opts) -> ExitCode {
     let Some(out) = o.out.clone() else {
         return usage("build needs -o <out.wasm>");
@@ -596,7 +593,7 @@ fn verdicts_json(v: &[(String, bool)]) -> String {
 enum Outcome {
     /// Tests run, invariants run, runtime asserts executed (None: not
     /// counted, or the interpreter stopped early).
-    Pass(usize, usize, Option<u64>),
+    Pass(usize, usize, Option<u64>, u64),
     TestFail(String),
     Unsupported(Vec<String>),
     FrontEnd(String),
@@ -611,7 +608,8 @@ impl Outcome {
     fn label(&self) -> &'static str {
         match self {
             // A pass that executed no runtime assert checked nothing (#6115).
-            Outcome::Pass(_, _, Some(0)) => "pass_vacuous",
+            Outcome::Pass(_, _, Some(0), 0) => "pass_vacuous",
+            Outcome::Pass(_, _, Some(0), _) => "pass_ct",
             Outcome::Pass(..) => "pass",
             Outcome::TestFail(_) => "fail",
             Outcome::Unsupported(_) => "blocked",
@@ -694,7 +692,9 @@ fn run_one(exe: &Path, file: &Path, o: &Opts) -> (Outcome, Option<Verdicts>) {
                 .and_then(|t| t.split(' ').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
             let asserts = stdout.lines().find_map(|l| l.split_once(": runtime asserts ").map(|x| x.1))
                 .and_then(|n| n.trim().parse::<u64>().ok());
-            Outcome::Pass(total, invariants, asserts)
+            let ct = stdout.lines().find_map(|l| l.split_once(": ct-verified ").map(|x| x.1))
+                .and_then(|n| n.trim().parse::<u64>().ok()).unwrap_or(0);
+            Outcome::Pass(total, invariants, asserts, ct)
         }
         Some(1) => Outcome::TestFail(
             stdout
@@ -808,10 +808,8 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
     let mut results = std::mem::take(&mut *results.lock().unwrap());
     results.sort_by_key(|r| r.i);
 
-    // A timeout in the parallel pass may be contention, not the file: on the
-    // lab at --jobs 24 a file that passes natively in 4 ms timed out at 60 s
-    // (#6063). Each one gets one sequential retry with the same timeout; the
-    // retry's verdict is final, and the record says it was retried.
+    // A timeout in the parallel pass may be contention, not the file: on the lab at --jobs 24 a file that passes natively in 4 ms timed out at 60 s
+    // (#6063). Each one gets one sequential retry with the same timeout; the retry's verdict is final, and the record says it was retried.
     let n_timeout = results.iter().filter(|r| matches!(r.r, Outcome::Timeout)).count();
     if n_timeout > 0 {
         errln!("t27b: retrying {} timed-out file(s) one at a time", n_timeout);
@@ -825,6 +823,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
 
     let (mut pass, mut pass_tests, mut pass_inv, mut pass_zero) = (0, 0usize, 0usize, 0);
     let mut pass_vacuous = 0usize;
+    let mut pass_ct = 0usize;
     let (mut fail, mut unsup, mut fe, mut mism, mut cg, mut tout, mut crash) = (0, 0, 0, 0, 0, 0, 0);
     let mut first: HashMap<String, usize> = HashMap::new();
     let mut all: HashMap<String, usize> = HashMap::new();
@@ -835,9 +834,9 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             outln!("RETRIED     {}: timeout, then {} on a sequential retry", name, r.label());
         }
         match r {
-            Outcome::Pass(n, inv, asserts) => {
+            Outcome::Pass(n, inv, asserts, ct) => {
                 if *asserts == Some(0) {
-                    pass_vacuous += 1;
+                    if *ct == 0 { pass_vacuous += 1 } else { pass_ct += 1 }
                 } else {
                     pass += 1;
                 }
@@ -916,6 +915,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
         pass, pass_tests, pass_inv, pass_zero
     );
     outln!("  pass, 0 runtime asserts   : {} (pass_vacuous: not counted above)", pass_vacuous);
+    outln!("  pass, ct-verified only    : {} (pass_ct: not counted above)", pass_ct);
     outln!("  supported, a test fails   : {} (a test or an invariant)", fail);
     outln!("  rejected (unsupported)    : {}", unsup);
     outln!("  front-end error           : {}", fe);
@@ -1002,7 +1002,7 @@ fn cmd_corpus(dir: &Path, o: &Opts) -> ExitCode {
             .zip(&retried)
             .map(|(row, again)| {
                 let (i, r, rf) = (&row.i, &row.r, &row.rf);
-                let (tests, inv, asserts) = if let Outcome::Pass(n, inv, a) = r { (*n, *inv, *a) } else { (0, 0, None) };
+                let (tests, inv, asserts, _ct) = if let Outcome::Pass(n, inv, a, c) = r { (*n, *inv, *a, *c) } else { (0, 0, None, 0) };
                 // Each construct once, in the order the lowering reported them.
                 let mut blockers: Vec<&str> = Vec::new();
                 if let Outcome::Unsupported(cs) = r {
