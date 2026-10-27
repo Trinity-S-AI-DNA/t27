@@ -39,6 +39,10 @@ enum Commands {
     Parse {
         /// Input file path
         input: String,
+
+        /// Emit JSON instead of Rust Debug format
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Generate Zig code from .t27 file
@@ -51,6 +55,562 @@ enum Commands {
     GenVerilog {
         /// Input file path
         input: String,
+
+        /// Append companion SVA assertions after endmodule (Wave 38, R-BV-2).
+        /// Reads behavior blocks from the source or from --sva-behaviors JSON.
+        #[arg(long)]
+        with_sva: bool,
+
+        /// Path to a JSON file containing behavior objects for SVA generation.
+        /// Each object: {"name":"...","given":"...","when":"...","then":"..."}
+        /// Only used with --with-sva.
+        #[arg(long)]
+        sva_behaviors: Option<String>,
+    },
+
+    /// Generate self-checking Verilog testbench from .t27 file
+    /// (same output used by icarus-simulate).
+    #[command(name = "gen-verilog-for-simulation")]
+    GenVerilogForSimulation {
+        /// Input file path
+        input: String,
+    },
+
+    /// Debug: dump Hardware IR (HIR) from .t27 file
+    DebugHir {
+        /// Input file path
+        input: String,
+    },
+
+    /// Generate Verilog from .t27 file via HIR path (AST -> HIR -> Verilog)
+    GenVerilogHir {
+        /// Input file path
+        input: String,
+
+        /// Append companion SVA assertions after endmodule (Wave 38, R-BV-2).
+        #[arg(long)]
+        with_sva: bool,
+
+        /// Path to a JSON file containing behavior objects for SVA generation.
+        #[arg(long)]
+        sva_behaviors: Option<String>,
+    },
+
+    /// Generate a Verilog testbench from a .t27 file and run it with Icarus
+    /// Verilog (iverilog + vvp). Emits active test assertions inside
+    /// `// synthesis translate_off` regions.
+    IcarusSimulate {
+        /// Input file path
+        input: String,
+    },
+
+    /// Check whether a .t27 spec is in the Icarus-lowerable subset using the
+    /// structural classifier. Prints a machine-readable verdict.
+    IcarusLowerable {
+        /// Input file path
+        input: String,
+        /// Emit JSON verdict on stdout
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Run generated Verilog through a Python reference-model cross-check.
+    /// The reference model extracts expected assert_eq literals from the t27
+    /// AST, runs Icarus Verilog (via cocotb when available, otherwise via
+    /// direct iverilog/vvp), and verifies that the simulation log reports PASS
+    /// for every statically evaluable test block.
+    IcarusCocotb {
+        /// Input file path
+        input: String,
+    },
+
+    /// Emit the balanced-ternary HW primitive library (trit stdlib) as one
+    /// self-contained Verilog file. No input spec required.
+    ///
+    /// Modules emitted: trit_not, trit_and, trit_or, trit_half_adder,
+    /// trit_full_adder, trit_multiply, trit3_add. Encoding: 2'b00 = -1,
+    /// 2'b01 = 0, 2'b10 = +1. See bootstrap/src/trit_stdlib.rs.
+    #[command(name = "gen-trit-stdlib")]
+    GenTritStdlib {
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a SystemVerilog Assertions block from a single behavior-DSL description.
+    ///
+    /// Wave 34 (R-SV-1). Consumes a behavior (name + given clause + when clause
+    /// + then clause) and emits a self-contained IEEE 1800 SVA block consisting
+    /// of `property p_<name>; ... endproperty`, `assert_<idx>_<name>: assert
+    /// property (...) else $error(...);`, and `cover_<idx>_<name>: cover
+    /// property (...);`. Vocabulary ported from gHashTag/vibee-lang.
+    #[command(name = "gen-behavior-sva")]
+    GenBehaviorSva {
+        /// Behavior identifier. Must be a valid Verilog identifier
+        /// (`[A-Za-z_][A-Za-z0-9_]*`); used as the suffix in `p_<name>`,
+        /// `assert_<idx>_<name>`, `cover_<idx>_<name>`.
+        #[arg(long)]
+        name: String,
+
+        /// Free-form "given" clause -> SVA antecedent.
+        #[arg(long)]
+        given: String,
+
+        /// Free-form "when" clause -> SVA clock-edge timing.
+        #[arg(long)]
+        when: String,
+
+        /// Free-form "then" clause -> SVA consequent.
+        #[arg(long)]
+        then: String,
+
+        /// Integer suffix used in `assert_<index>_<name>` and
+        /// `cover_<index>_<name>`. Defaults to 0.
+        #[arg(long, default_value_t = 0)]
+        index: usize,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit extended behavior-DSL SVA blocks with multi-clause antecedents,
+    /// `##N` delay, and `s_eventually` (Wave 37, R-BV-1).
+    ///
+    /// Reads a JSON array of behavior objects and emits self-contained
+    /// SystemVerilog Assertions with IEEE 1800 temporal operators.
+    #[command(name = "gen-behavior-sva-v2")]
+    GenBehaviorSvaV2 {
+        /// Path to a JSON file containing an array of behavior objects.
+        /// Each object has fields: name, given, when, then.
+        #[arg(long)]
+        behaviors_json: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `pipeline_stage2_compute` SIMD compute stage with
+    /// accumulator (Wave 36b, R-BN-2).
+    ///
+    /// The emitted module consumes one 54-bit input/weight chunk per cycle
+    /// and accumulates the dot-product result into a signed 16-bit
+    /// accumulator. Depends on the `trit27_dot_product` primitive emitted by
+    /// `t27c gen-trit-stdlib` (Wave 33).
+    #[command(name = "gen-pipeline-stage2")]
+    GenPipelineStage2 {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `pipeline_stage2_compute`.
+        #[arg(long, default_value = "pipeline_stage2_compute")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `layer_sequencer` FSM module that walks the
+    /// `(neuron_id, chunk_id)` grid (Wave 36b, R-BN-2).
+    ///
+    /// Three-state FSM (IDLE / RUN / DONE_ST). Drives the `valid`,
+    /// `first_chunk`, `last_chunk`, `done` strobes consumed by
+    /// `pipeline_stage2_compute`.
+    #[command(name = "gen-layer-sequencer")]
+    GenLayerSequencer {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `layer_sequencer`.
+        #[arg(long, default_value = "layer_sequencer")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `double_buffer_ctrl` ping-pong activation buffer
+    /// controller (Wave 36c, R-BN-3).
+    ///
+    /// Toggles `use_buffer_a` on every `layer_done` strobe so even
+    /// layers read buffer A / write buffer B, and odd layers read B /
+    /// write A. Forwards `neuron_id` to both read and write address.
+    #[command(name = "gen-double-buffer-ctrl")]
+    GenDoubleBufferCtrl {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `double_buffer_ctrl`.
+        #[arg(long, default_value = "double_buffer_ctrl")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `weight_prefetch_ctrl` DDR-to-BRAM weight streaming
+    /// FSM (Wave 36c, R-BN-3).
+    ///
+    /// Three-state FSM (IDLE / FETCH / DONE_ST). Issues AXI read
+    /// transactions, truncates 64-bit AXI words to the BitNet 54-bit
+    /// packed-trit format, and streams them into the on-chip weight
+    /// BRAM at consecutive addresses.
+    #[command(name = "gen-weight-prefetch-ctrl")]
+    GenWeightPrefetchCtrl {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `weight_prefetch_ctrl`.
+        #[arg(long, default_value = "weight_prefetch_ctrl")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `axi_lite_slave` AMBA AXI4-Lite CSR aperture
+    /// (Wave 36d, R-BN-4).
+    ///
+    /// 16-entry control/status register map (CTRL, STATUS, IRQ_EN,
+    /// IRQ_STAT, NUM_LAYERS, NEURONS, CHUNKS, THRESHOLD, plus 64-bit
+    /// WEIGHT/INPUT/OUTPUT DDR addresses and 64-bit CYCLES counter).
+    /// Unmapped reads return `32'hDEADBEEF`; all responses OKAY.
+    #[command(name = "gen-axi-lite-slave")]
+    GenAxiLiteSlave {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `axi_lite_slave`.
+        #[arg(long, default_value = "axi_lite_slave")]
+        module_name: String,
+
+        /// AXI address-bus width in bits (clamped to 1..=16).
+        #[arg(long, default_value_t = 8)]
+        addr_width: u32,
+
+        /// AXI data-bus width in bits (clamped to 1..=64).
+        #[arg(long, default_value_t = 32)]
+        data_width: u32,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `interrupt_controller` SystemVerilog module
+    /// (Wave 36f, R-BN-6).
+    ///
+    /// Three sticky IRQ sources (inference_done, dma_done, error)
+    /// gated by a 3-bit `irq_enable` mask. `status_read` clears the
+    /// `irq_status` latch (read-to-clear). `irq_out` is the OR of
+    /// `irq_status & irq_enable`.
+    #[command(name = "gen-interrupt-controller")]
+    GenInterruptController {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `interrupt_controller`.
+        #[arg(long, default_value = "interrupt_controller")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `bitnet_engine_top` SystemVerilog module
+    /// (Wave 36f, R-BN-6).
+    ///
+    /// Top-level wrapper that instantiates `multilayer_sequencer` +
+    /// `double_buffer_ctrl` and exposes a host-startable multi-layer
+    /// BitNet inference engine with a 32-bit free-running cycle
+    /// counter gated by `busy`.
+    #[command(name = "gen-bitnet-engine-top")]
+    GenBitnetEngineTop {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `bitnet_engine_top`.
+        #[arg(long, default_value = "bitnet_engine_top")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a canonical Tiny Tapeout platform profile (Sky130 / IHP / GF180).
+    ///
+    /// Wave 45 (R-TT-2): deterministic JSON profile of a PDK target.
+    /// If `--output` is omitted or `-`, prints to stdout.
+    #[command(name = "tt-profile")]
+    TtProfile {
+        /// Platform: sky130 | ihp | gf180.
+        #[arg(long)]
+        platform: String,
+
+        /// Output path; `-` or omitted -> stdout.
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Check whether a TtManifest conforms to a TtPlatformProfile.
+    ///
+    /// Wave 45 (R-TT-2): loads both JSONs, prints
+    /// `OK conform=<bool> reasons=<N>` to stdout.  Exit code 0 if ok, 1 otherwise.
+    #[command(name = "tt-conform")]
+    TtConform {
+        /// Path to a profile JSON (as emitted by `tt-profile`).
+        #[arg(long)]
+        profile: String,
+
+        /// Path to a manifest JSON (as emitted by `tt-manifest`).
+        #[arg(long)]
+        manifest: String,
+
+        /// If set, also print the verdict JSON to stdout.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+
+    /// Emit a SystemVerilog `tt_debug` wrapper around `bitnet_engine_top`.
+    ///
+    /// Wave 49 (R-TT-3): adds Tiny Tapeout debug aperture [0x40, 0x60) with
+    /// version CSR, error counters (AXI / DMA / IRQ / CSR), and self-test
+    /// trigger / result registers.  Reads `--manifest` JSON for chip-slug and
+    /// commit hash.  If `--output` is omitted or `-`, prints to stdout.
+    #[command(name = "gen-tt-debug-wrapper")]
+    GenTtDebugWrapper {
+        /// Path to a TtManifest JSON (as emitted by `tt-manifest`).
+        #[arg(long)]
+        manifest: String,
+
+        /// Inner module name (default: `bitnet_engine_top`).
+        #[arg(long)]
+        inner: Option<String>,
+
+        /// Output path; `-` or omitted -> stdout.
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Emit a deterministic Tiny Tapeout manifest for one of the three
+    /// silicon variants (phi / euler / gamma).
+    ///
+    /// Wave 42 (R-TT-1): JSON pinning t27 commit + trinity-invariant hash to
+    /// chip variant.  If `--output` is omitted or `-`, prints to stdout.
+    #[command(name = "tt-manifest")]
+    TtManifest {
+        /// Chip variant: phi | euler | gamma.
+        #[arg(long)]
+        chip: String,
+
+        /// Output path; `-` or omitted -> stdout.
+        #[arg(long)]
+        output: Option<String>,
+
+        /// Override t27 commit (default: env `T27_COMMIT` or `unknown`).
+        #[arg(long)]
+        commit: Option<String>,
+
+        /// Override build_time_utc RFC3339 string (default: now UTC).
+        #[arg(long)]
+        build_time: Option<String>,
+
+        /// SVA assertion count to record (default: 0).
+        #[arg(long, default_value_t = 0)]
+        sva_count: u32,
+    },
+
+    /// Compare poll-driven and IRQ-driven completion paths against MockMmio.
+    ///
+    /// Wave 40 (R-HS-2): runs the same configure / start sequence twice --
+    /// once driving completion via `BitnetDriver::wait_done` (busy poll),
+    /// once via `IrqDrivenDriver::wait_done_irq` (interrupt service routine).
+    /// Asserts identical CSR-write counts and prints both observed IRQ_STAT
+    /// values.
+    #[command(name = "host-poll-vs-irq")]
+    HostPollVsIrq {
+        /// Number of layers to program (default: 2).
+        #[arg(long, default_value_t = 2)]
+        num_layers: u32,
+
+        /// Neurons per layer (default: 16).
+        #[arg(long, default_value_t = 16)]
+        neurons: u32,
+
+        /// Chunks per neuron (default: 4).
+        #[arg(long, default_value_t = 4)]
+        chunks: u32,
+
+        /// Signed threshold value (default: 1).
+        #[arg(long, default_value_t = 1)]
+        threshold: u32,
+
+        /// 64-bit weight base address as decimal (default: 0).
+        #[arg(long, default_value_t = 0)]
+        weight_addr: u64,
+
+        /// Maximum poll iterations / service rounds (default: 16).
+        #[arg(long, default_value_t = 16)]
+        max_polls: u32,
+    },
+
+    /// Run a host-side BitNet driver smoke test against an in-memory MockMmio.
+    ///
+    /// Wave 39 (R-HS-1): exercises configure -> start -> wait_done -> dump
+    /// using `host::BitnetDriver<MockMmio>`. Prints `OK <num_writes>w/<num_reads>r`
+    /// on success or a structured error line.
+    #[command(name = "host-smoke")]
+    HostSmoke {
+        /// Number of layers to program (default: 2).
+        #[arg(long, default_value_t = 2)]
+        num_layers: u32,
+
+        /// Neurons per layer (default: 16).
+        #[arg(long, default_value_t = 16)]
+        neurons: u32,
+
+        /// Chunks per neuron (default: 4).
+        #[arg(long, default_value_t = 4)]
+        chunks: u32,
+
+        /// Signed threshold value (default: 1).
+        #[arg(long, default_value_t = 1)]
+        threshold: u32,
+
+        /// 64-bit weight base address as decimal (default: 0).
+        #[arg(long, default_value_t = 0)]
+        weight_addr: u64,
+
+        /// Maximum poll iterations before timeout (default: 16).
+        #[arg(long, default_value_t = 16)]
+        max_polls: u32,
+    },
+
+    /// Emit a complete BitNet HLS bundle (Wave 38, R-SI-1).
+    ///
+    /// Composes all 9 BitNet HLS module emitters (W36a-f) plus the
+    /// behavior-DSL v2 SVA emitter (W37) into a single output directory.
+    /// Writes 11 files: 9 SystemVerilog modules, 1 SVA property file,
+    /// and 1 ASCII `manifest.txt` listing file sizes. Pure composition
+    /// over existing `pub fn build_*` emitters -- no new RTL surface.
+    #[command(name = "gen-bitnet-bundle")]
+    GenBitnetBundle {
+        /// Engine-top module identifier (default: `bitnet_engine_top`).
+        #[arg(long, default_value = "bitnet_engine_top")]
+        top_name: String,
+
+        /// AXI-Lite slave address width in bits (default: 32).
+        #[arg(long, default_value_t = 32)]
+        axi_addr_width: u32,
+
+        /// AXI-Lite slave data width in bits (default: 32).
+        #[arg(long, default_value_t = 32)]
+        axi_data_width: u32,
+
+        /// Output directory. Created if missing.
+        #[arg(long)]
+        output_dir: String,
+    },
+
+    /// Emit a BitNet `dma_controller` SystemVerilog module
+    /// (Wave 36e, R-BN-5).
+    ///
+    /// AXI4 master DMA engine that streams 64-bit beats between an
+    /// off-chip DDR backing store and an on-chip local memory.
+    /// Six-state FSM (IDLE -> READ_ADDR|WRITE_ADDR -> READ_DATA|
+    /// WRITE_DATA -> DONE_ST -> IDLE). `direction` selects the
+    /// transfer sense (0 = read DDR into local, 1 = write local
+    /// out to DDR); `length` is the byte count.
+    #[command(name = "gen-dma-controller")]
+    GenDmaController {
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `dma_controller`.
+        #[arg(long, default_value = "dma_controller")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a BitNet `weight_bram` dual-port BRAM SystemVerilog module
+    /// (Wave 36a, R-BN-1).
+    ///
+    /// Generates a self-contained `module <name> #(parameter DEPTH, ADDR_WIDTH)
+    /// (...) ... endmodule` with one synchronous read port (1-cycle latency)
+    /// and one synchronous write port guarded by `wr_en`. Defaults match the
+    /// upstream vibee-lang emitter: DEPTH=4096, ADDR_WIDTH=12, DATA_WIDTH=54
+    /// (27 ternary trits packed 2 bits/trit).
+    #[command(name = "gen-weight-bram")]
+    GenWeightBram {
+        /// Number of storage words. Zero falls back to 4096.
+        #[arg(long, default_value_t = 4096)]
+        depth: u32,
+
+        /// Address bus width in bits. Zero falls back to 12.
+        #[arg(long, default_value_t = 12)]
+        addr_width: u32,
+
+        /// Word width in bits. Zero falls back to 54.
+        #[arg(long, default_value_t = 54)]
+        data_width: u32,
+
+        /// Verilog module identifier. Invalid identifiers fall back to
+        /// `weight_bram`.
+        #[arg(long, default_value = "weight_bram")]
+        module_name: String,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Emit a phi-invariant golden-identity self-check SystemVerilog snippet
+    /// (Wave 35, R-SC-1).
+    ///
+    /// Generates a `localparam real PHI` / `localparam real GOLDEN_IDENTITY`
+    /// pair plus an `initial begin ... if (...) $fatal(1, ...); end` block
+    /// that verifies the sacred trinity identity `phi^2 + 1/phi^2 = 3` at
+    /// elaboration time. With `--wrap` the snippet is enclosed in a formal-
+    /// guarded `module <name> (); ... endmodule` wrapper. Algorithm ported
+    /// from gHashTag/vibee-lang.
+    #[command(name = "gen-phi-selfcheck")]
+    GenPhiSelfcheck {
+        /// Symmetric tolerance window around 3.0. Non-finite or non-positive
+        /// values fall back to the upstream default (0.01).
+        #[arg(long, default_value_t = 0.01)]
+        tolerance: f64,
+
+        /// When set, emit a self-contained `\`ifdef FORMAL` module wrapper
+        /// using this identifier as the module name. Otherwise only the
+        /// bare snippet is emitted (intended to be pasted inside an existing
+        /// module body).
+        #[arg(long)]
+        wrap: Option<String>,
+
+        /// Output file path. If omitted, the Verilog is written to stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Assemble ternary assembly source into machine code
+    Asm {
+        /// Input .t27 assembly source file
+        input: String,
+        /// Output binary file path (stdout if omitted)
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Output format: binary, hex, or vlog (Verilog $readmemh)
+        #[arg(long, default_value = "hex")]
+        format: String,
+    },
+
+    /// Generate testbench from .t27 HIR module
+    GenTestbench {
+        /// Input .t27 file
+        input: String,
+        /// Clock period in ns
+        #[arg(long, default_value_t = 10)]
+        period_ns: u32,
+        /// Max simulation cycles
+        #[arg(long, default_value_t = 10000)]
+        max_cycles: u32,
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<String>,
     },
 
     /// Generate C code (.c/.h style) from .t27 file
@@ -141,6 +701,22 @@ enum Commands {
         /// Repository root (default: current directory)
         #[arg(long, default_value = ".")]
         repo_root: PathBuf,
+
+        /// Run Icarus Verilog simulation on lowerable specs.
+        #[arg(long, default_value_t = false)]
+        icarus_simulate: bool,
+
+        /// Restrict Icarus simulation to specs the classifier marks lowerable.
+        #[arg(long, default_value_t = false)]
+        icarus_lowerable: bool,
+
+        /// Run the Python reference-model cocotb cross-check on lowerable specs.
+        #[arg(long, default_value_t = false)]
+        cocotb: bool,
+
+        /// Skip long-running phases (parse/typecheck/gen are still run).
+        #[arg(long, default_value_t = false)]
+        fast: bool,
     },
 
     /// Validate conformance/*.json files (JSON + vector keys)
@@ -1720,46 +2296,18 @@ async fn run_server(port_arg: &str) -> anyhow::Result<()> {
 // Command Handlers
 // ============================================================================
 
-/// Top-level items of a module body, as (label, first line, last line).
-/// Line-based, and it says so: the suite's own phase is the authority on the
-/// COUNT, and this only has to point at the construct. An item starts at a line
-/// whose indentation is one level in and whose first word is a keyword, and ends
-/// where the next one starts.
-fn top_level_items(src: &str) -> Vec<(String, usize, usize)> {
-    const KEYWORDS: &[&str] = &[
-        "fn", "test", "invariant", "bench", "type", "const", "let", "use", "spec",
-        "struct", "enum", "impl", "on", "mem", "port", "wire", "reg", "assert",
-    ];
-    let lines: Vec<&str> = src.lines().collect();
-    let mut starts: Vec<(String, usize)> = Vec::new();
-    for (i, ln) in lines.iter().enumerate() {
-        let t = ln.trim_start();
-        let indent = ln.len() - t.len();
-        if indent == 0 || indent > 8 {
-            continue;
-        }
-        let first = t.split_whitespace().next().unwrap_or("");
-        if KEYWORDS.contains(&first) {
-            let name = t.split_whitespace().nth(1).unwrap_or("").trim_matches(|c: char| {
-                !c.is_alphanumeric() && c != '_'
-            });
-            starts.push((format!("{first} {name}"), i));
-        }
-    }
-    let mut out = Vec::new();
-    for k in 0..starts.len() {
-        let end = if k + 1 < starts.len() { starts[k + 1].1 } else { lines.len() };
-        out.push((starts[k].0.clone(), starts[k].1, end));
-    }
-    out
-}
-
 fn run_parse(input_path: &str, json: bool) -> anyhow::Result<()> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)?;
 
     match compiler::Compiler::parse_ast(&source) {
-        Ok(ast) => println!("{:#?}", ast),
+        Ok(ast) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&ast)?);
+            } else {
+                println!("{:#?}", ast);
+            }
+        }
         Err(e) => anyhow::bail!("Parse error: {}", e),
     }
     Ok(())
@@ -2636,7 +3184,42 @@ fn run_gen(input_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_gen_verilog(input_path: &str) -> anyhow::Result<()> {
+ fn run_gen_verilog(
+    input_path: &str,
+    with_sva: bool,
+    sva_behaviors: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = Path::new(input_path);
+    let source = fs::read_to_string(path)?;
+
+    match compiler::Compiler::compile_verilog(&source) {
+        Ok(verilog_code) => {
+            print!("{}", verilog_code);
+            if with_sva {
+                let behaviors = load_sva_behaviors(sva_behaviors)?;
+                let module_name = extract_module_name_from_verilog(&verilog_code);
+                let sva_block = behavior_sva_v2::build_behavior_sva_bind_block(&module_name, &behaviors);
+                if !sva_block.is_empty() {
+                    print!("{}", sva_block);
+                }
+            }
+        }
+        Err(e) => anyhow::bail!("Compile error: {}", e),
+    }
+    Ok(())
+}
+
+fn run_gen_verilog_for_simulation(input_path: &str) -> anyhow::Result<()> {
+    let path = Path::new(input_path);
+    let source = fs::read_to_string(path)?;
+    match compiler::Compiler::compile_verilog_for_simulation(&source) {
+        Ok(verilog) => print!("{}", verilog),
+        Err(e) => anyhow::bail!("Simulation Verilog generation error: {}", e),
+    }
+    Ok(())
+}
+
+fn run_debug_hir(input_path: &str) -> anyhow::Result<()> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)?;
 
@@ -2678,8 +3261,7 @@ fn run_gen_verilog_hir(
 fn run_icarus_simulate(input_path: &str) -> anyhow::Result<()> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)?;
-    typecheck_gate(path, &source)?;
-    let verilog = compiler::Compiler::compile_verilog_for_simulation_at(&source, path)
+    let verilog = compiler::Compiler::compile_verilog_for_simulation(&source)
         .map_err(|e| anyhow::anyhow!("Verilog generation error: {}", e))?;
 
     let name = path
@@ -2814,11 +3396,10 @@ fn run_icarus_cocotb(input_path: &str) -> anyhow::Result<()> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", input_path))?;
-    typecheck_gate(path, &source)?;
 
     let ast = compiler::Compiler::parse_ast(&source)
         .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
-    let verilog = compiler::Compiler::compile_verilog_for_simulation_at(&source, path)
+    let verilog = compiler::Compiler::compile_verilog_for_simulation(&source)
         .map_err(|e| anyhow::anyhow!("Verilog generation error: {}", e))?;
 
     // The generated Verilog may use a synthetic module name when the source
@@ -7550,9 +8131,92 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Parse { input } => run_parse(&input)?,
+        Commands::Parse { input, json } => run_parse(&input, json)?,
         Commands::Gen { input } => run_gen(&input)?,
-        Commands::GenVerilog { input } => run_gen_verilog(&input)?,
+        Commands::GenVerilog { input, with_sva, sva_behaviors } =>
+            run_gen_verilog(&input, with_sva, sva_behaviors.as_deref())?,
+        Commands::GenVerilogForSimulation { input } =>
+            run_gen_verilog_for_simulation(&input)?,
+        Commands::DebugHir { input } => run_debug_hir(&input)?,
+        Commands::GenVerilogHir { input, with_sva, sva_behaviors } =>
+            run_gen_verilog_hir(&input, with_sva, sva_behaviors.as_deref())?,
+        Commands::IcarusSimulate { input } => run_icarus_simulate(&input)?,
+        Commands::IcarusLowerable { input, json } => run_icarus_lowerable(&input, json)?,
+        Commands::IcarusCocotb { input } => run_icarus_cocotb(&input)?,
+        Commands::GenTritStdlib { output } => run_gen_trit_stdlib(output.as_deref())?,
+        Commands::GenBehaviorSva {
+            name,
+            given,
+            when,
+            then,
+            index,
+            output,
+        } => run_gen_behavior_sva(&name, &given, &when, &then, index, output.as_deref())?,
+        Commands::GenBehaviorSvaV2 {
+            behaviors_json,
+            output,
+        } => run_gen_behavior_sva_v2(&behaviors_json, output.as_deref())?,
+        Commands::GenPhiSelfcheck {
+            tolerance,
+            wrap,
+            output,
+        } => run_gen_phi_selfcheck(tolerance, wrap.as_deref(), output.as_deref())?,
+        Commands::GenWeightBram {
+            depth,
+            addr_width,
+            data_width,
+            module_name,
+            output,
+        } => run_gen_weight_bram(depth, addr_width, data_width, &module_name, output.as_deref())?,
+        Commands::GenPipelineStage2 { module_name, output } => {
+            run_gen_pipeline_stage2(&module_name, output.as_deref())?
+        }
+        Commands::GenLayerSequencer { module_name, output } => {
+            run_gen_layer_sequencer(&module_name, output.as_deref())?
+        }
+        Commands::GenDoubleBufferCtrl { module_name, output } => {
+            run_gen_double_buffer_ctrl(&module_name, output.as_deref())?
+        }
+        Commands::GenWeightPrefetchCtrl { module_name, output } => {
+            run_gen_weight_prefetch_ctrl(&module_name, output.as_deref())?
+        }
+        Commands::GenAxiLiteSlave { module_name, addr_width, data_width, output } => {
+            run_gen_axi_lite_slave(&module_name, addr_width, data_width, output.as_deref())?
+        }
+        Commands::GenDmaController { module_name, output } => {
+            run_gen_dma_controller(&module_name, output.as_deref())?
+        }
+        Commands::GenInterruptController { module_name, output } => {
+            run_gen_interrupt_controller(&module_name, output.as_deref())?
+        }
+        Commands::GenBitnetEngineTop { module_name, output } => {
+            run_gen_bitnet_engine_top(&module_name, output.as_deref())?
+        }
+        Commands::GenBitnetBundle { top_name, axi_addr_width, axi_data_width, output_dir } => {
+            run_gen_bitnet_bundle(&top_name, axi_addr_width, axi_data_width, &output_dir)?
+        }
+        Commands::HostSmoke { num_layers, neurons, chunks, threshold, weight_addr, max_polls } => {
+            run_host_smoke(num_layers, neurons, chunks, threshold, weight_addr, max_polls)?
+        }
+        Commands::HostPollVsIrq { num_layers, neurons, chunks, threshold, weight_addr, max_polls } => {
+            run_host_poll_vs_irq(num_layers, neurons, chunks, threshold, weight_addr, max_polls)?
+        }
+        Commands::TtManifest { chip, output, commit, build_time, sva_count } => {
+            run_tt_manifest(&chip, output.as_deref(), commit.as_deref(), build_time.as_deref(), sva_count)?
+        }
+        Commands::TtProfile { platform, output } => {
+            run_tt_profile(&platform, output.as_deref())?
+        }
+        Commands::TtConform { profile, manifest, verbose } => {
+            run_tt_conform(&profile, &manifest, verbose)?
+        }
+        Commands::GenTtDebugWrapper { manifest, inner, output } => {
+            run_gen_tt_debug_wrapper(&manifest, inner.as_deref(), output.as_deref())?
+        }
+        Commands::Asm { input, output, format } => run_asm(&input, output.as_deref(), &format)?,
+        Commands::GenTestbench { input, period_ns, max_cycles, output } => {
+            run_gen_testbench(&input, period_ns, max_cycles, output.as_deref())?
+        }
         Commands::GenC { input } => run_gen_c(&input)?,
         Commands::GenRust { input } => run_gen_rust(&input)?,
         Commands::Conformance { input } => run_conformance(&input)?,
@@ -7567,7 +8231,25 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stats => run_stats()?,
         Commands::Serve { port } => run_server(&port).await?,
         Commands::Bridge { command } => bridge::run_bridge(command)?,
-        Commands::Suite { repo_root } => suite::run_comprehensive(&repo_root)?,
+        Commands::Enrich { notebook, all, force, token, lang } => enrichment::run_enrich(notebook, all, force, token, lang)?,
+        Commands::Audio { notebook, all, dry_run, bilingual, workers, token, project, location, region } => {
+            enrichment::run_audio(notebook, all, dry_run, bilingual, workers, token, project, location, region)?;
+        }
+        Commands::Suite {
+            repo_root,
+            icarus_simulate,
+            icarus_lowerable,
+            cocotb,
+            fast,
+        } => suite::run_comprehensive(
+            &repo_root,
+            suite::SuiteOptions {
+                icarus_simulate,
+                icarus_lowerable,
+                cocotb,
+                fast,
+            },
+        )?,
         Commands::ValidateConformance { repo_root } => {
             suite::validate_conformance(&repo_root)?
         }
@@ -7612,9 +8294,92 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Parse { input } => run_parse(&input)?,
+        Commands::Parse { input, json } => run_parse(&input, json)?,
         Commands::Gen { input } => run_gen(&input)?,
-        Commands::GenVerilog { input } => run_gen_verilog(&input)?,
+        Commands::GenVerilog { input, with_sva, sva_behaviors } =>
+            run_gen_verilog(&input, with_sva, sva_behaviors.as_deref())?,
+        Commands::GenVerilogForSimulation { input } =>
+            run_gen_verilog_for_simulation(&input)?,
+        Commands::DebugHir { input } => run_debug_hir(&input)?,
+        Commands::GenVerilogHir { input, with_sva, sva_behaviors } =>
+            run_gen_verilog_hir(&input, with_sva, sva_behaviors.as_deref())?,
+        Commands::IcarusSimulate { input } => run_icarus_simulate(&input)?,
+        Commands::IcarusLowerable { input, json } => run_icarus_lowerable(&input, json)?,
+        Commands::IcarusCocotb { input } => run_icarus_cocotb(&input)?,
+        Commands::GenTritStdlib { output } => run_gen_trit_stdlib(output.as_deref())?,
+        Commands::GenBehaviorSva {
+            name,
+            given,
+            when,
+            then,
+            index,
+            output,
+        } => run_gen_behavior_sva(&name, &given, &when, &then, index, output.as_deref())?,
+        Commands::GenBehaviorSvaV2 {
+            behaviors_json,
+            output,
+        } => run_gen_behavior_sva_v2(&behaviors_json, output.as_deref())?,
+        Commands::GenPhiSelfcheck {
+            tolerance,
+            wrap,
+            output,
+        } => run_gen_phi_selfcheck(tolerance, wrap.as_deref(), output.as_deref())?,
+        Commands::GenWeightBram {
+            depth,
+            addr_width,
+            data_width,
+            module_name,
+            output,
+        } => run_gen_weight_bram(depth, addr_width, data_width, &module_name, output.as_deref())?,
+        Commands::GenPipelineStage2 { module_name, output } => {
+            run_gen_pipeline_stage2(&module_name, output.as_deref())?
+        }
+        Commands::GenLayerSequencer { module_name, output } => {
+            run_gen_layer_sequencer(&module_name, output.as_deref())?
+        }
+        Commands::GenDoubleBufferCtrl { module_name, output } => {
+            run_gen_double_buffer_ctrl(&module_name, output.as_deref())?
+        }
+        Commands::GenWeightPrefetchCtrl { module_name, output } => {
+            run_gen_weight_prefetch_ctrl(&module_name, output.as_deref())?
+        }
+        Commands::GenAxiLiteSlave { module_name, addr_width, data_width, output } => {
+            run_gen_axi_lite_slave(&module_name, addr_width, data_width, output.as_deref())?
+        }
+        Commands::GenDmaController { module_name, output } => {
+            run_gen_dma_controller(&module_name, output.as_deref())?
+        }
+        Commands::GenInterruptController { module_name, output } => {
+            run_gen_interrupt_controller(&module_name, output.as_deref())?
+        }
+        Commands::GenBitnetEngineTop { module_name, output } => {
+            run_gen_bitnet_engine_top(&module_name, output.as_deref())?
+        }
+        Commands::GenBitnetBundle { top_name, axi_addr_width, axi_data_width, output_dir } => {
+            run_gen_bitnet_bundle(&top_name, axi_addr_width, axi_data_width, &output_dir)?
+        }
+        Commands::HostSmoke { num_layers, neurons, chunks, threshold, weight_addr, max_polls } => {
+            run_host_smoke(num_layers, neurons, chunks, threshold, weight_addr, max_polls)?
+        }
+        Commands::HostPollVsIrq { num_layers, neurons, chunks, threshold, weight_addr, max_polls } => {
+            run_host_poll_vs_irq(num_layers, neurons, chunks, threshold, weight_addr, max_polls)?
+        }
+        Commands::TtManifest { chip, output, commit, build_time, sva_count } => {
+            run_tt_manifest(&chip, output.as_deref(), commit.as_deref(), build_time.as_deref(), sva_count)?
+        }
+        Commands::TtProfile { platform, output } => {
+            run_tt_profile(&platform, output.as_deref())?
+        }
+        Commands::TtConform { profile, manifest, verbose } => {
+            run_tt_conform(&profile, &manifest, verbose)?
+        }
+        Commands::GenTtDebugWrapper { manifest, inner, output } => {
+            run_gen_tt_debug_wrapper(&manifest, inner.as_deref(), output.as_deref())?
+        }
+        Commands::Asm { input, output, format } => run_asm(&input, output.as_deref(), &format)?,
+        Commands::GenTestbench { input, period_ns, max_cycles, output } => {
+            run_gen_testbench(&input, period_ns, max_cycles, output.as_deref())?
+        }
         Commands::GenC { input } => run_gen_c(&input)?,
         Commands::GenRust { input } => run_gen_rust(&input)?,
         Commands::Conformance { input } => run_conformance(&input)?,
@@ -7628,7 +8393,25 @@ fn main() -> anyhow::Result<()> {
         Commands::CompileProject { backend, output } => run_compile_project(&backend, &output)?,
         Commands::Stats => run_stats()?,
         Commands::Bridge { command } => bridge::run_bridge(command)?,
-        Commands::Suite { repo_root } => suite::run_comprehensive(&repo_root)?,
+        Commands::Enrich { notebook, all, force, token, lang } => enrichment::run_enrich(notebook, all, force, token, lang)?,
+        Commands::Audio { notebook, all, dry_run, bilingual, workers, token, project, location, region } => {
+            enrichment::run_audio(notebook, all, dry_run, bilingual, workers, token, project, location, region)?;
+        }
+        Commands::Suite {
+            repo_root,
+            icarus_simulate,
+            icarus_lowerable,
+            cocotb,
+            fast,
+        } => suite::run_comprehensive(
+            &repo_root,
+            suite::SuiteOptions {
+                icarus_simulate,
+                icarus_lowerable,
+                cocotb,
+                fast,
+            },
+        )?,
         Commands::ValidateConformance { repo_root } => {
             suite::validate_conformance(&repo_root)?
         }
@@ -7663,6 +8446,97 @@ fn main() -> anyhow::Result<()> {
         Commands::Flatten { input, output } => run_flatten(&input, output.as_deref())?,
         Commands::DepsTree { repo_root } => run_deps_tree(&repo_root)?,
         Commands::Todo { repo_root } => run_todo(&repo_root)?,
+        Commands::Rename { input, from, to, dry_run } => run_rename(&input, &from, &to, dry_run)?,
+        Commands::Spellcheck { input, max_distance } => run_spellcheck(&input, max_distance)?,
+        Commands::Coverage { input } => run_coverage(&input)?,
+        Commands::Validate { repo_root } => run_validate(&repo_root)?,
+        Commands::Xref { input, symbol } => run_xref(&input, &symbol)?,
+        Commands::BenchCompile { repo_root, iterations } => run_bench_compile(&repo_root, iterations)?,
+        Commands::Minify { input } => run_minify(&input)?,
+        Commands::Count { input } => run_count(&input)?,
+        Commands::CheckDeps { repo_root } => run_check_deps(&repo_root)?,
+        Commands::Stack { input } => run_stack(&input)?,
+        Commands::Dupes { repo_root } => run_dupes(&repo_root)?,
+        Commands::Init { name, output_dir } => run_init(&name, &output_dir)?,
+        Commands::Exports { input } => run_exports(&input)?,
+        Commands::ApiDiff { left, right } => run_api_diff(&left, &right)?,
+        Commands::Loc { input } => run_loc(&input)?,
+        Commands::Merge { inputs, output } => run_merge(&inputs, output.as_deref())?,
+        Commands::Types { input } => run_types(&input)?,
+        Commands::ToJson { input } => run_to_json(&input)?,
+        Commands::Summary { repo_root } => run_summary(&repo_root)?,
+        Commands::Sort { input } => run_sort(&input)?,
+        Commands::UsedBy { symbol, repo_root } => run_used_by(&symbol, &repo_root)?,
+        Commands::Visualize { input, depth } => run_visualize(&input, depth)?,
+        Commands::BenchEndpoints { .. } => {
+            eprintln!("Error: 'bench-endpoints' requires 'server' feature");
+            std::process::exit(1);
+        }
+        Commands::Complexity { input } => run_complexity(&input)?,
+        Commands::Strings { input } => run_strings(&input)?,
+        Commands::Symbols { input, kind } => run_symbols(&input, kind.as_deref())?,
+        Commands::AstDump { input } => run_ast_dump(&input)?,
+        Commands::Hash { input } => run_hash(&input)?,
+        Commands::Depth { input } => run_depth(&input)?,
+        Commands::Orphans { input } => run_orphans(&input)?,
+         Commands::FpgaBuild { smoke, synth_only, minimal, device, top, docker, use_hir, nextpnr, chipdb, xdc, fasm2frames, frames2bit, prjxray_db, output } => {
+             let repo_root = std::env::current_dir()?;
+             run_fpga_build(&repo_root, smoke, synth_only, minimal, &device, &top, docker, use_hir, nextpnr.as_deref(), chipdb.as_deref(), xdc.as_deref(), fasm2frames.as_deref(), frames2bit.as_deref(), prjxray_db.as_deref(), &output)?;
+         }
+         Commands::ValidateSeals { pr_files } => {
+             run_validate_seals(&pr_files)?;
+         }
+         Commands::ValidatePhiIdentity => {
+             run_validate_phi_identity()?;
+         }
+         Commands::CheckClaimTiers => {
+             eprintln!("Check claim tiers: requires repo_root, use t27c --repo-root . check-claim-tiers");
+         }
+         Commands::BrainSealRefresh => {
+             eprintln!("Brain seal refresh: requires repo_root, use t27c --repo-root . brain-seal-refresh");
+         }
+         Commands::Formula { cmd } => {
+             let repo_root = std::env::current_dir()?;
+             formula_eval::run_formula_command(cmd, &repo_root)?;
+         }
+         Commands::Chimera { threshold, limit } => {
+             let repo_root = std::env::current_dir()?;
+             run_chimera(&repo_root, threshold, limit)?;
+         }
+         Commands::Sensitivity { id, param, min, max, n } => {
+             let repo_root = std::env::current_dir()?;
+             run_sensitivity(&repo_root, &id, &param, min, max, n)?;
+         }
+         Commands::Math { cmd } => {
+             let repo_root = std::env::current_dir()?;
+             math_compare::run_math_command(cmd, &repo_root)?;
+         }
+         Commands::Notebook { cmd } => {
+             let repo_root = std::env::current_dir()?;
+             notebook::run_nb(cmd, &repo_root)?;
+         }
+        Commands::TernaryEncode { value } => {
+            use crate::ternary::encode_trits;
+            let encoded = encode_trits(value);
+            println!("Encoded {} as ternary: {:?}", value, encoded);
+        }
+        Commands::TernaryDecode { trits } => {
+            use crate::ternary::{parse_trits, decode_trits};
+            match parse_trits(&trits) {
+                Some(encoding) => {
+                    let decoded = decode_trits(encoding);
+                    println!("Decoded ternary \"{}\" as integer: {}", trits, decoded);
+                }
+                None => {
+                    eprintln!("Error: Invalid ternary format. Use format like \"[-1, 0, 1]\"");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::SynthReadiness { specs_dir } => run_synth_readiness(&specs_dir)?,
+        Commands::TriStatus => {
+            println!("TRI PHI LOOP: status pending implementation");
+        }
         Commands::Serve { .. } => {
             eprintln!("Error: 'serve' command requires 'server' feature");
             eprintln!("Build with: cargo build --release --features server");

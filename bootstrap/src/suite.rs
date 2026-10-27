@@ -3,10 +3,24 @@
 
 use anyhow::Context;
 use chrono::Local;
+use serde_json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
+
+/// Options for the comprehensive repository suite.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SuiteOptions {
+    /// Run Icarus Verilog simulation on lowerable specs.
+    pub icarus_simulate: bool,
+    /// Restrict Icarus simulation to specs the classifier marks lowerable.
+    pub icarus_lowerable: bool,
+    /// Run the Python reference-model cocotb cross-check on lowerable specs.
+    pub cocotb: bool,
+    /// Skip long-running phases where possible.
+    pub fast: bool,
+}
 
 fn t27c_exe() -> anyhow::Result<PathBuf> {
     std::env::current_exe().context("current_exe failed (expected t27c binary)")
@@ -130,8 +144,323 @@ fn cmd_gen_stdout(repo: &Path, rel: &str) -> anyhow::Result<Vec<u8>> {
     Ok(st.stdout)
 }
 
+fn cmd_gen_verilog_stdout(repo: &Path, rel: &str) -> anyhow::Result<Vec<u8>> {
+    let exe = t27c_exe()?;
+    let st = Command::new(&exe)
+        .current_dir(repo)
+        .args(["gen-verilog", rel])
+        .output()?;
+    if !st.status.success() {
+        let err = String::from_utf8_lossy(&st.stderr);
+        anyhow::bail!("gen-verilog failed: {}", err.trim());
+    }
+    Ok(st.stdout)
+}
+
+fn yosys_available() -> bool {
+    Command::new("yosys")
+        .arg("-q")
+        .arg("-p")
+        .arg("echo on")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn icarus_tools_available() -> bool {
+    let iverilog = Command::new("iverilog")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let vvp = Command::new("vvp")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    iverilog && vvp
+}
+
+fn cmd_icarus_simulate(repo: &Path, rel: &str) -> anyhow::Result<String> {
+    let exe = t27c_exe()?;
+    let st = Command::new(&exe)
+        .current_dir(repo)
+        .args(["icarus-simulate", rel])
+        .output()?;
+    let out = String::from_utf8_lossy(&st.stdout).to_string();
+    if !st.status.success() {
+        let err = String::from_utf8_lossy(&st.stderr);
+        anyhow::bail!("{}", format!("Icarus simulation failed: {} {}", err.trim(), out.trim()).trim());
+    }
+    Ok(out)
+}
+
+fn cmd_icarus_cocotb(repo: &Path, rel: &str) -> anyhow::Result<()> {
+    let exe = t27c_exe()?;
+    let st = Command::new(&exe)
+        .current_dir(repo)
+        .args(["icarus-cocotb", rel])
+        .output()?;
+    let out = String::from_utf8_lossy(&st.stdout).to_string();
+    if !st.status.success() {
+        let err = String::from_utf8_lossy(&st.stderr);
+        anyhow::bail!(
+            "{}",
+            format!(
+                "cocotb reference-model failed: {} {}",
+                err.trim(),
+                out.trim()
+            )
+            .trim()
+        );
+    }
+    Ok(())
+}
+
+fn icarus_regression_specs(repo: &Path) -> Vec<PathBuf> {
+    // W531: include W5xx structural/struct witnesses and W3xx primitive-array
+    // witnesses that are now lowered with unpacked Verilog arrays.
+    collect_t27(&repo.join("specs/scratch"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("w5") || s.starts_with("w3"))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn icarus_baseline_path(repo: &Path, rel: &str) -> PathBuf {
+    repo.join(".trinity")
+        .join("icarus-baselines")
+        .join(rel)
+        .with_extension("json")
+}
+
+fn normalize_icarus_output(text: &str) -> Vec<String> {
+    // W538/W551: the Icarus simulation baseline tracks [TEST] and [BENCH]
+    // status lines. VCD capture diagnostics and scalar probe debug lines are
+    // intentionally omitted so the baseline stays focused on pass/fail transitions.
+    text.lines()
+        .map(|l| l.trim_end().to_string())
+        .filter(|l| {
+            if l.is_empty() {
+                return false;
+            }
+            if l.starts_with("VCD info:") || l.starts_with("VCD warning:") {
+                return false;
+            }
+            if l.starts_with("[PROBE]") {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn load_icarus_baseline(path: &Path) -> anyhow::Result<Vec<String>> {
+    let raw = fs::read_to_string(path)?;
+    let json: serde_json::Value = serde_json::from_str(&raw)?;
+    let lines = json
+        .get("lines")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(lines)
+}
+
+fn save_icarus_baseline(path: &Path, lines: &[String]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::json!({ "lines": lines });
+    fs::write(path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
+}
+
+fn is_icarus_lowerable(repo: &Path, rel: &str) -> bool {
+    // W534: structural classifier is the authoritative lowerability predicate.
+    // The Verilog backend is then used as a cross-check: any spec whose
+    // generated Verilog contains `UNSUPPORTED_ICARUS` or is rejected by
+    // `iverilog -g2012` is excluded from Icarus simulation.
+    let path = repo.join(rel);
+    let source = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let structural = match crate::compiler::Compiler::is_icarus_lowerable(&source) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if !structural {
+        return false;
+    }
+
+    let exe = match t27c_exe() {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let st = Command::new(&exe)
+        .current_dir(repo)
+        .args(["gen-verilog", rel])
+        .output();
+    let Ok(st) = st else { return false };
+    if !st.status.success() {
+        return false;
+    }
+    let out = String::from_utf8_lossy(&st.stdout);
+    if out.contains("UNSUPPORTED_ICARUS") {
+        return false;
+    }
+    let tmp = std::env::temp_dir().join(format!("t27c_icarus_lowerable_{}.v", rel.replace('/', "_")));
+    if fs::write(&tmp, out.as_bytes()).is_err() {
+        return false;
+    }
+    let compile = Command::new("iverilog")
+        .args(["-g2012", "-o", "/dev/null", &tmp.to_string_lossy()])
+        .output();
+    let Ok(compile) = compile else { return false };
+    compile.status.success()
+}
+
+fn cmd_icarus_simulate_with_baseline(repo: &Path, rel: &str) -> anyhow::Result<()> {
+    let out = cmd_icarus_simulate(repo, rel)?;
+    let baseline = icarus_baseline_path(repo, rel);
+    let actual = normalize_icarus_output(&out);
+    if baseline.exists() {
+        let expected = load_icarus_baseline(&baseline)?;
+        if actual != expected {
+            anyhow::bail!(
+                "Icarus output does not match baseline {}\nexpected: {:?}\nactual:   {:?}",
+                baseline.display(),
+                expected,
+                actual
+            );
+        }
+    } else {
+        save_icarus_baseline(&baseline, &actual)?;
+        println!("  recorded Icarus baseline: {}", baseline.display());
+    }
+    Ok(())
+}
+
+/// IGLA specs known to be yosys-clean through `t27c gen-verilog`.
+/// All 27 IGLA specs are now clean after W378 fixed Defect 6 (`let`
+/// destructuring lowering).
+fn igla_clean_specs() -> Vec<String> {
+    vec![
+        "specs/igla/coder/arch.t27".into(),
+        "specs/igla/coder/bench_proxy.t27".into(),
+        "specs/igla/coder/benchmark.t27".into(),
+        "specs/igla/coder/dataset.t27".into(),
+        "specs/igla/coder/eval.t27".into(),
+        "specs/igla/coder/pipeline.t27".into(),
+        "specs/igla/coder/prm.t27".into(),
+        "specs/igla/coder/tokenizer.t27".into(),
+        "specs/igla/coder/training.t27".into(),
+        "specs/igla/coder/weights.t27".into(),
+        "specs/igla/race/adder_tree.t27".into(),
+        "specs/igla/race/backend.t27".into(),
+        "specs/igla/race/bram_weights.t27".into(),
+        "specs/igla/race/cordic.t27".into(),
+        "specs/igla/race/cordic_fixed.t27".into(),
+        "specs/igla/race/cordic_top.t27".into(),
+        "specs/igla/race/eda.t27".into(),
+        "specs/igla/race/formal.t27".into(),
+        "specs/igla/race/gemm.t27".into(),
+        "specs/igla/race/opcodes.t27".into(),
+        "specs/igla/race/rtl.t27".into(),
+        "specs/igla/race/systolic_array.t27".into(),
+        "specs/igla/race/systolic_ternary.t27".into(),
+        "specs/igla/race/ternary_gemm.t27".into(),
+        "specs/igla/race/ternary_inference.t27".into(),
+        "specs/igla/race/ternary_mac.t27".into(),
+        "specs/igla/race/yosys.t27".into(),
+    ]
+}
+
+fn cmd_fpga_smoke_gate(repo: &Path) -> anyhow::Result<()> {
+    let bit = repo.join("fpga").join("verilog").join("ternary_mac_demo_top_200t.bit");
+    if !bit.is_file() {
+        println!("  SKIP: demo bitstream not found at {}", bit.display());
+        return Ok(());
+    }
+
+    let script = repo.join("scripts").join("dump_bit_config.py");
+    let st = Command::new("python3")
+        .arg(&script)
+        .arg(&bit)
+        .output()
+        .with_context(|| format!("spawning {} for FPGA smoke gate", script.display()))?;
+    if !st.status.success() {
+        let err = String::from_utf8_lossy(&st.stderr);
+        anyhow::bail!("dump_bit_config.py failed: {}", err.trim());
+    }
+
+    let v_paths: Vec<PathBuf> = [
+        repo.join("fpga").join("verilog").join("ternary_mac_synth.v"),
+        repo.join("fpga").join("verilog").join("ternary_mac_demo_top.v"),
+    ]
+    .into_iter()
+    .filter(|p| p.is_file())
+    .collect();
+
+    if !v_paths.is_empty() && yosys_available() {
+        let reads: Vec<String> = v_paths
+            .iter()
+            .map(|p| format!("read_verilog -sv {}", p.display()))
+            .collect();
+        let st = Command::new("yosys")
+            .arg("-q")
+            .arg("-p")
+            .arg(format!(
+                "{}; synth_xilinx -top ternary_mac_demo_top -family xc7; stat",
+                reads.join("; ")
+            ))
+            .output()
+            .context("spawning yosys for FPGA smoke gate")?;
+        if !st.status.success() {
+            let err = String::from_utf8_lossy(&st.stderr);
+            anyhow::bail!("yosys rejected demo Verilog: {}", err.trim());
+        }
+        println!("  yosys synthesis smoke: OK");
+    } else {
+        println!("  SKIP: yosys or demo Verilog unavailable");
+    }
+
+    Ok(())
+}
+
+fn cmd_gen_verilog_yosys_smoke(repo: &Path, rel: &str) -> anyhow::Result<()> {
+    let verilog = cmd_gen_verilog_stdout(repo, rel)?;
+    let tmp = std::env::temp_dir().join(format!("t27c_yosys_smoke_{}.v", rel.replace('/', "_")));
+    fs::write(&tmp, &verilog)
+        .with_context(|| format!("writing temporary Verilog for yosys smoke: {}", tmp.display()))?;
+    let st = Command::new("yosys")
+        .arg("-q")
+        .arg("-p")
+        .arg(format!("read_verilog -sv {}", tmp.display()))
+        .output()
+        .context("spawning yosys for gen-verilog smoke")?;
+    if !st.status.success() {
+        let err = String::from_utf8_lossy(&st.stderr);
+        anyhow::bail!("yosys rejected generated Verilog: {}", err.trim());
+    }
+    let err = String::from_utf8_lossy(&st.stderr);
+    if !err.trim().is_empty() {
+        eprintln!("WARN yosys warnings for {}: {}", rel, err.trim());
+    }
+    Ok(())
+}
+
 /// Phases 1–6: same coverage as legacy `tests/run_all.sh`.
-pub fn run_comprehensive(repo_root: &Path) -> anyhow::Result<()> {
+pub fn run_comprehensive(repo_root: &Path, opts: SuiteOptions) -> anyhow::Result<()> {
     let repo = fs::canonicalize(repo_root)
         .with_context(|| format!("cannot canonicalize repo root {}", repo_root.display()))?;
 
@@ -199,6 +528,93 @@ pub fn run_comprehensive(repo_root: &Path) -> anyhow::Result<()> {
     )?;
     println!("Gen Verilog: {} passed, {} failed", p3p, p3f);
 
+    println!("--- Phase 3b: Gen Verilog Yosys Smoke ---");
+    let mut p3b_fail = 0usize;
+    if yosys_available() {
+        let mut smoke_targets = specs_scratch.clone();
+        for rel in igla_clean_specs() {
+            smoke_targets.push(repo.join(&rel));
+        }
+        smoke_targets.sort();
+        smoke_targets.dedup();
+        let (p3bp, p3bf) = run_phase(
+            &repo,
+            "gen-verilog-yosys-smoke",
+            cmd_gen_verilog_yosys_smoke,
+            &smoke_targets,
+        )?;
+        println!("Gen Verilog Yosys Smoke: {} passed, {} failed", p3bp, p3bf);
+        p3b_fail = p3bf;
+    } else {
+        println!("Yosys not available; skipping gen-verilog yosys smoke gate");
+    }
+
+    println!("--- Phase 3c: FPGA Board-Less Smoke Gate ---");
+    let mut p3c_fail = 0usize;
+    if let Err(e) = cmd_fpga_smoke_gate(&repo) {
+        eprintln!("FPGA smoke gate failed: {}", e);
+        p3c_fail = 1;
+    }
+
+    println!("--- Phase 3d: Icarus Verilog Simulation Gate ---");
+    let mut p3d_fail = 0usize;
+    if opts.icarus_simulate || opts.icarus_lowerable {
+        if icarus_tools_available() {
+            // W530 first regression suite: W493–W529 lowerable scratch witnesses.
+            let mut sim_targets = icarus_regression_specs(&repo);
+            if opts.icarus_lowerable {
+                sim_targets.retain(|f| {
+                    let rel = match rel_arg(&repo, f) {
+                        Ok(r) => r,
+                        Err(_) => return false,
+                    };
+                    is_icarus_lowerable(&repo, &rel)
+                });
+            }
+            let (p3dp, p3df) = run_phase(
+                &repo,
+                "icarus-simulate",
+                cmd_icarus_simulate_with_baseline,
+                &sim_targets,
+            )?;
+            println!("Icarus Simulation: {} passed, {} failed", p3dp, p3df);
+            p3d_fail = p3df;
+        } else {
+            println!("iverilog/vvp not available; skipping Icarus simulation gate");
+        }
+    } else {
+        println!("Icarus simulation gate disabled (use --icarus-simulate or --icarus-lowerable)");
+    }
+
+    println!("--- Phase 3e: Cocotb Reference-Model Cross-Check Gate ---");
+    let mut p3e_fail = 0usize;
+    if opts.cocotb {
+        if icarus_tools_available() {
+            let mut cocotb_targets = icarus_regression_specs(&repo);
+            if opts.icarus_lowerable {
+                cocotb_targets.retain(|f| {
+                    let rel = match rel_arg(&repo, f) {
+                        Ok(r) => r,
+                        Err(_) => return false,
+                    };
+                    is_icarus_lowerable(&repo, &rel)
+                });
+            }
+            let (p3ep, p3ef) = run_phase(
+                &repo,
+                "icarus-cocotb",
+                cmd_icarus_cocotb,
+                &cocotb_targets,
+            )?;
+            println!("Cocotb Reference Model: {} passed, {} failed", p3ep, p3ef);
+            p3e_fail = p3ef;
+        } else {
+            println!("iverilog/vvp not available; skipping cocotb reference-model gate");
+        }
+    } else {
+        println!("Cocotb reference-model gate disabled (use --cocotb)");
+    }
+
     println!("--- Phase 4: Gen C ---");
     let (p4p, p4f) = run_phase(
         &repo,
@@ -232,16 +648,20 @@ pub fn run_comprehensive(repo_root: &Path) -> anyhow::Result<()> {
 
     println!();
     println!("=== SUMMARY ===");
-    let total_fail = p1f + p1bf + gf16_fail + p2f + p2bf + p3f + p4f + p5f + fp_diff;
-    println!("Parse failures:    {}", p1f);
-    println!("Typecheck fails:   {}", p1bf);
-    println!("GF16 conformance:  {}", gf16_fail);
-    println!("Gen Zig failures:  {}", p2f);
-    println!("Gen Rust failures: {}", p2bf);
-    println!("Gen Verilog fails: {}", p3f);
-    println!("Gen C failures:    {}", p4f);
-    println!("Seal mismatches:   {}", p5f);
-    println!("FP divergences:    {}", fp_diff);
+    let total_fail = p1f + p1bf + gf16_fail + p2f + p2bf + p3f + p3b_fail + p3c_fail + p3d_fail + p3e_fail + p4f + p5f + fp_diff;
+    println!("Parse failures:           {}", p1f);
+    println!("Typecheck fails:          {}", p1bf);
+    println!("GF16 conformance:         {}", gf16_fail);
+    println!("Gen Zig failures:         {}", p2f);
+    println!("Gen Rust failures:        {}", p2bf);
+    println!("Gen Verilog fails:        {}", p3f);
+    println!("Gen Verilog smoke fails:  {}", p3b_fail);
+    println!("FPGA smoke fails:         {}", p3c_fail);
+    println!("Icarus simulation fails:  {}", p3d_fail);
+    println!("Cocotb reference fails:   {}", p3e_fail);
+    println!("Gen C failures:           {}", p4f);
+    println!("Seal mismatches:          {}", p5f);
+    println!("FP divergences:           {}", fp_diff);
     println!("TOTAL FAILURES:    {}", total_fail);
     println!();
     if total_fail == 0 {
