@@ -3134,6 +3134,110 @@ impl Parser {
 pub struct Codegen {
     output: String,
     indent: u32,
+    /// Locals reassigned somewhere in the current fn/test/bench body: Zig needs
+    /// them declared `var`, and it ERRORS both on a mutated `const` and on a
+    /// never-mutated `var` -- so the choice must be inferred, exactly like the
+    /// Rust backend's collect_mutable_names.
+    mut_names: std::collections::HashSet<String>,
+    /// Names that already received `_ = &name;`. Zig treats that as a USE, so a
+    /// later bare `_ = name;` is a "pointless discard of local variable" and the
+    /// file stops compiling. W730 measured 9 of 130 generating specs hitting it.
+    discarded_by_ref: std::collections::HashSet<String>,
+    /// Names the enclosing Zig CONTAINER declares. A Zig parameter may not
+    /// shadow one; t27 permits it (W734: fanout, clock_cfg, slack, diff_text
+    /// each name a parameter after a FUNCTION in the same module).
+    module_decl_names: std::collections::HashSet<String>,
+    /// #6295: the module-level `var`s among `module_decl_names`. A test block
+    /// that writes `rx_ready = false;` to one of these sets module state; it
+    /// does not bind a new local.
+    module_var_names: std::collections::HashSet<String>,
+    /// All module-level declarations (both var and const) so test/bench assignments
+    /// don't create conflicting local bindings.
+    module_scope_names: std::collections::HashSet<String>,
+    /// Parameter renames in force for the function being emitted. The `_arg`
+    /// re-binding used for MUTABLE parameters cannot serve the shadow case --
+    /// `var fanout = fanout_arg;` recreates the very collision it was meant to
+    /// remove ("local variable shadows declaration"). So a shadowing parameter
+    /// is renamed all the way through: signature AND every body reference.
+    param_renames: std::collections::HashMap<String, String>,
+    /// Declared value bindings in the current fn/test/bench. A value named
+    /// f16 needs quoting; an unbound f16 expression still denotes a type.
+    zig_value_names: std::collections::HashSet<String>,
+    /// Functions the spec declares itself. Bare `abs(`/`sqrt(`/... are mapped
+    /// to Zig builtins ONLY when absent from this set, so a spec that defines
+    /// its own `fn max(...)` still calls its own.
+    declared_fns: std::collections::HashSet<String>,
+    /// How many times each test name has already been emitted. Zig requires
+    /// test names to be unique within a file and rejects the whole file
+    /// otherwise; four IGLA RACE specs accumulated colliding names across
+    /// waves (`cordic_fixed_sin_zero_angle` appears seven times). Suffixing
+    /// repeats keeps every test runnable instead of losing the file.
+    test_name_counts: std::collections::HashMap<String, u32>,
+    /// Declared parameter types, by function name. An anonymous list `.{ … }`
+    /// coerces to `[N]T` but NOT to `[]T`, so an array-literal argument passed
+    /// where the callee declares a slice needs `&[_]T{ … }` -- and the element
+    /// type is only knowable from the callee's signature.
+    declared_fn_params: std::collections::HashMap<String, Vec<String>>,
+    /// Declared return type by function name, so a positional destructure of a
+    /// NAMED-tuple return can be lowered to field accesses (W596).
+    declared_fn_returns: std::collections::HashMap<String, String>,
+    /// Locals bound to an array literal and later passed where a callee
+    /// declares a SLICE, mapped to the element type the callee requires. Such a
+    /// local must be a real `[_]T{ … }` array and be passed by reference; an
+    /// anonymous `.{ … }` cannot coerce to `[]T`.
+    slice_locals: std::collections::HashMap<String, String>,
+    /// Locals bound to the undefined scaffold helpers `default_input()` /
+    /// `valid_input()`, mapped to the Zig type their consumer declares.
+    scaffold_locals: std::collections::HashMap<String, String>,
+    /// W625: UNTYPED locals whose initializer is `.len`-tainted, so the binding
+    /// is `usize` in Zig. Found by forcing analysis of the 14% of generated
+    /// bodies nothing referenced (T21): `estimate_10k_size` in `coder/dataset`
+    /// carries a length through FOUR untyped `const`s before returning it under
+    /// `-> u32`, and W624's expression-local taint could not see it. A local
+    /// with a DECLARED type never enters this set -- the W624 `let` rule
+    /// already casts at the binding, so the name really is that type. See T23.
+    len_locals: std::collections::HashSet<String>,
+    /// Enum types the spec declares. Used to lower `<`/`>` on enum variants to
+    /// a tag comparison -- Zig has no ordering on enums.
+    declared_enums: std::collections::HashSet<String>,
+    /// W609: `(struct, field) -> declared type`. The Zig backend collected
+    /// struct field NAMES (for `string_names` / `float_names` / `signed_names`)
+    /// but never their types, so a slice-typed field receiving an array literal
+    /// got `.{ a, b }` -- which Zig rejects with "type '[]T' does not support
+    /// array initialization syntax". 589 sites across 20 specs.
+    struct_field_types: std::collections::HashMap<(String, String), String>,
+    /// Field and parameter names the spec declares with a string type. Zig has
+    /// no `==` for slices, and the literal-operand test cannot see
+    /// `a.name == b.name`, where BOTH sides are `[]const u8` expressions.
+    string_names: std::collections::HashSet<String>,
+    /// Field and parameter names the spec declares with a float type, so a cast
+    /// can pick `@floatCast` over `@floatFromInt` (W592).
+    float_names: std::collections::HashSet<String>,
+    /// Names the spec declares with a SIGNED integer type. Zig refuses `/` on
+    /// signed integers -- the rounding mode must be explicit -- so a division
+    /// with a known-signed operand is emitted as `@divTrunc` (W593).
+    signed_names: std::collections::HashSet<String>,
+    /// Declared return type of the function currently being emitted, so a
+    /// returned array literal can be given the element type the signature
+    /// requires (W593).
+    current_return_type: String,
+    /// W566: param/typed-local name -> t27 type, scoped to the current fn body.
+    /// Lets ExprCast tell a narrowing integer cast (needs `@truncate`) from a
+    /// widening one (needs `@intCast`) without a full type checker.
+    zig_var_types: std::collections::HashMap<String, String>,
+    /// The declared integer type of the declaration whose initializer is being
+    /// emitted right now, if it has one.
+    ///
+    /// A shift with a runtime amount needs its LHS pinned to a width, because
+    /// `comptime_int << runtime` is not a thing in Zig. With no other
+    /// information the width was inferred from the literal's MAGNITUDE, so `1`
+    /// became `u32` -- and `var half: i32 = @as(u32, 1) << @intCast(d);` is a
+    /// u32 expression initialising an i32, which Zig rejects.
+    ///
+    /// Measured: 58 emitted sites carry `@as(u32, 1) <<`, and 33 of them are a
+    /// declaration that states its type. The type was in hand two lines above
+    /// the expression that had to guess it.
+    zig_decl_int_ty: Option<String>,
 }
 
 impl Codegen {
@@ -3141,6 +3245,28 @@ impl Codegen {
         Self {
             output: String::new(),
             indent: 0,
+            mut_names: std::collections::HashSet::new(),
+            discarded_by_ref: std::collections::HashSet::new(),
+            module_decl_names: std::collections::HashSet::new(),
+            module_var_names: std::collections::HashSet::new(),
+            module_scope_names: std::collections::HashSet::new(),
+            param_renames: std::collections::HashMap::new(),
+            zig_value_names: std::collections::HashSet::new(),
+            declared_fns: std::collections::HashSet::new(),
+            test_name_counts: std::collections::HashMap::new(),
+            declared_fn_params: std::collections::HashMap::new(),
+            declared_fn_returns: std::collections::HashMap::new(),
+            slice_locals: std::collections::HashMap::new(),
+            scaffold_locals: std::collections::HashMap::new(),
+            len_locals: std::collections::HashSet::new(),
+            declared_enums: std::collections::HashSet::new(),
+            struct_field_types: std::collections::HashMap::new(),
+            string_names: std::collections::HashSet::new(),
+            float_names: std::collections::HashSet::new(),
+            signed_names: std::collections::HashSet::new(),
+            current_return_type: String::new(),
+            zig_var_types: std::collections::HashMap::new(),
+            zig_decl_int_ty: None,
         }
     }
 
@@ -3277,6 +3403,73 @@ impl Codegen {
         self.output
     }
 
+    /// Collect the names the Zig container will declare, so a parameter cannot
+    /// silently shadow one. Called once per module walk.
+    fn collect_module_decl_names(&mut self, decls: &[Node]) {
+        self.module_decl_names.clear();
+        self.module_var_names.clear();
+        self.collect_module_scope_names(decls);
+        for d in decls {
+            if matches!(
+                d.kind,
+                NodeKind::FnDecl | NodeKind::StructDecl | NodeKind::EnumDecl
+            ) && !d.name.is_empty()
+            {
+                self.module_decl_names.insert(d.name.clone());
+            }
+        }
+    }
+
+    /// Collect all module-level declarations (both var and const) so test/bench
+    /// assignments don't create conflicting local bindings.
+    fn collect_module_scope_names(&mut self, decls: &[Node]) {
+        self.module_scope_names.clear();
+        for d in decls {
+            // Collect module-level vars (represented as const with extra_mutable=true)
+            if d.kind == NodeKind::ConstDecl && d.extra_mutable && !d.name.is_empty() {
+                self.module_scope_names.insert(d.name.clone());
+            }
+            // Collect module-level consts (represented as const with extra_mutable=false)
+            if d.kind == NodeKind::ConstDecl && !d.extra_mutable && !d.name.is_empty() {
+                self.module_scope_names.insert(d.name.clone());
+            }
+        }
+    }
+
+    /// Apply any rename in force for the function being emitted.
+    fn renamed(&self, n: &str) -> String {
+        self.param_renames.get(n).cloned().unwrap_or_else(|| n.to_string())
+    }
+
+    /// Local declarations in a FN BODY whose name collides with a container
+    /// declaration. W736 measured ten specs where Zig answers "local variable
+    /// shadows declaration of 'x'". Renaming every occurrence inside the
+    /// function is safe precisely BECAUSE Zig forbids the shadow: the spec
+    /// cannot also be calling the module-level name from here.
+    ///
+    /// SCOPE, and it is a real limit: only `StmtLocal` is collected. Inside a
+    /// test or bench block the same source line parses as `StmtAssign`, and
+    /// extending this to cover that was attempted and REVERTED -- it renamed
+    /// references while the binding site kept its old name, turning a shadow
+    /// error into "use of undeclared identifier", which is worse. Nine specs
+    /// still carry the defect and they are named in T271.
+    fn collect_shadowing_locals(
+        decls: &[Node],
+        module_names: &std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for d in decls {
+            if matches!(d.kind, NodeKind::StmtLocal)
+                && !d.name.is_empty()
+                && module_names.contains(d.name.as_str())
+                && !out.contains(&d.name)
+            {
+                out.push(d.name.clone());
+            }
+            Self::collect_shadowing_locals(&d.children, module_names, out);
+        }
+    }
+
     fn gen_decl(&mut self, node: &Node) {
         match node.kind {
             NodeKind::ConstDecl => self.gen_const_decl(node),
@@ -3409,6 +3602,70 @@ impl Codegen {
 
         self.dedent();
         self.write_line("}");
+        for n in &local_floats {
+            self.float_names.remove(n);
+        }
+        for n in &local_signed {
+            self.signed_names.remove(n);
+        }
+        for n in &param_float {
+            self.float_names.remove(n);
+        }
+        for n in &param_signed {
+            self.signed_names.remove(n);
+        }
+        for n in &param_string {
+            self.string_names.remove(n);
+        }
+        self.zig_value_names.clear();
+    }
+
+    /// #6295: the renames a test or bench block needs, set up the way
+    /// `gen_fn_decl` sets up W736. A `StmtLocal` named like a module
+    /// declaration, and a first `name = ...` binding named like a module
+    /// declaration that is NOT a module `var`, are new locals and get `_lv`.
+    /// A write to a module `var` is left alone: it is an assignment.
+    fn block_shadow_renames(&mut self, children: &[Node]) {
+        self.param_renames.clear();
+        let mut shadow_locals: Vec<String> = Vec::new();
+        Self::collect_shadowing_locals(children, &self.module_decl_names, &mut shadow_locals);
+        for stmt in children {
+            if stmt.kind == NodeKind::StmtAssign
+                && stmt.children.len() >= 2
+                && stmt.children[0].kind == NodeKind::ExprIdentifier
+            {
+                let n = &stmt.children[0].name;
+                if self.module_decl_names.contains(n.as_str())
+                    && !self.module_scope_names.contains(n.as_str())
+                    && !shadow_locals.contains(n)
+                {
+                    shadow_locals.push(n.clone());
+                }
+            }
+        }
+        for l in shadow_locals {
+            self.param_renames.entry(l.clone()).or_insert(format!("{}_lv", l));
+        }
+    }
+
+    /// #6295: is this top-level block statement the FIRST binding of a name?
+    /// A name the block already declared with `var`/`let` is not, and neither
+    /// is a write to a module `var` or `const` (unless a block local shadows it).
+    fn block_fresh_binding(
+        &self,
+        stmt: &Node,
+        bound: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if stmt.kind == NodeKind::StmtLocal && !stmt.name.is_empty() {
+            bound.insert(stmt.name.clone());
+        }
+        stmt.kind == NodeKind::StmtAssign
+            && stmt.children.len() >= 2
+            && stmt.children[0].kind == NodeKind::ExprIdentifier
+            && !stmt.children[0].name.is_empty()
+            && !(self.module_scope_names.contains(stmt.children[0].name.as_str())
+                && !self.param_renames.contains_key(&stmt.children[0].name))
+            && bound.insert(stmt.children[0].name.clone())
     }
 
     fn gen_test_block(&mut self, node: &Node) {
@@ -21382,5 +21639,85 @@ mod tests_phase40_coverage {
         cm.hit("g1");
         cm.hit("g1");
         assert!(cm.is_complete());
+    }
+}
+
+/// Regression test for #6771: test/bench assignments to module-level vars
+/// should not create conflicting local bindings.
+#[cfg(test)]
+mod tests_6771_module_var_assignments {
+    use super::*;
+
+    const TEST_SPEC: &str = r#"module TestAssignGlobal {
+    var counter : u32 = 0;
+
+    fn bump() {
+        counter = counter + 1;
+    }
+
+    test assigns_module_var {
+        counter = 5;
+        bump();
+        invariant counter == 6;
+    }
+}"#;
+
+    const BENCH_SPEC: &str = r#"module TestAssignGlobal {
+    var trace_en : bool = false;
+
+    bench bench_trace_enable {
+        trace_en = true;
+        invariant trace_en == true;
+    }
+}"#;
+
+    fn zig(src: &str) -> String {
+        Compiler::compile(src).expect("gen-zig should succeed")
+    }
+
+    #[test]
+    fn test_assigns_module_var_not_const() {
+        let z = zig(TEST_SPEC);
+        // The test should generate `counter = 5;` not `const counter = 5;`
+        assert!(
+            z.contains("counter = 5;"),
+            "Expected 'counter = 5;' in generated Zig, got:\n{}",
+            z
+        );
+        // There should be no `const counter = ` declaration
+        assert!(
+            !z.contains("const counter = "),
+            "Found unexpected 'const counter = ' in generated Zig:\n{}",
+            z
+        );
+        // The module-level var should be declared at the top
+        assert!(
+            z.contains("var counter: u32 = 0;"),
+            "Expected module-level 'var counter: u32 = 0;' in generated Zig, got:\n{}",
+            z
+        );
+    }
+
+    #[test]
+    fn test_bench_assigns_module_var_not_const() {
+        let z = zig(BENCH_SPEC);
+        // The bench should generate `trace_en = true;` not `const trace_en = true;`
+        assert!(
+            z.contains("trace_en = true;"),
+            "Expected 'trace_en = true;' in generated Zig, got:\n{}",
+            z
+        );
+        // There should be no `const trace_en = ` declaration
+        assert!(
+            !z.contains("const trace_en = "),
+            "Found unexpected 'const trace_en = ' in generated Zig:\n{}",
+            z
+        );
+        // The module-level var should be declared at the top
+        assert!(
+            z.contains("var trace_en: bool = false;"),
+            "Expected module-level 'var trace_en: bool = false;' in generated Zig, got:\n{}",
+            z
+        );
     }
 }
