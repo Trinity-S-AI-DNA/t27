@@ -492,7 +492,6 @@ pub fn lower_src<'a>(ast: &'a Node, mode: OverflowMode, src: Option<&'a str>) ->
 /// item: lowering continues past each rejection (statement by statement, and
 /// operand by operand inside an expression), and a value built from a rejected
 /// one is dropped without a second report. Empty when the module lowers.
-///
 /// A rejected top-level declaration (a `struct`, an `enum`) is still one
 /// entry: its members are not looked into, so a file's list is a lower bound.
 pub fn blockers(ast: &Node, mode: OverflowMode) -> Vec<Reject> {
@@ -4080,7 +4079,7 @@ impl<'a> Lower<'a> {
             "|" => ArithOp::Or,
             "^" => ArithOp::Xor,
             "<<" => if trap { ArithOp::Shl } else { ArithOp::ShlW },
-            ">>" => if trap { ArithOp::Shr } else { ArithOp::ShrW },
+            ">>" => if trap && !matches!(&a, Val::E(e) if matches!(e.ty, Ty::U32 | Ty::U16 | Ty::U8)) && !matches!(&a, Val::P(_, LTy::S(Ty::U32 | Ty::U16 | Ty::U8))) { ArithOp::Shr } else { ArithOp::ShrW }, // #12835: an unsigned dividend ALWAYS lowers to the unsigned shift (wasm masks & 31 -- divergence floor 13)
             _ => return self.reject(&format!("ExprBinary({})", op), String::new()),
         };
         if aop.is_shift() {

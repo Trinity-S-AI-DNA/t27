@@ -52,6 +52,18 @@ pub const OP_I32_MUL: u8 = 0x6C;
 
 pub const OP_I32_DIV_U: u8 = 0x6E;
 
+pub const OP_I32_AND: u8 = 0x71;
+
+pub const OP_I32_OR: u8 = 0x72;
+
+pub const OP_I32_XOR: u8 = 0x73;
+
+pub const OP_I32_SHL: u8 = 0x74;
+
+pub const OP_I32_SHR_S: u8 = 0x75;
+
+pub const OP_I32_SHR_U: u8 = 0x76;
+
 pub const OP_I32_EQZ: u8 = 0x45;
 
 pub const OP_SELECT: u8 = 0x1B;
@@ -633,6 +645,20 @@ pub const WOP_DIV: u8 = 6;
 
 pub const WOP_REM: u8 = 8;
 
+pub const WOP_AND: u8 = 9;
+
+pub const WOP_OR: u8 = 10;
+
+pub const WOP_XOR: u8 = 11;
+
+pub const WOP_SHL: u8 = 12;
+
+pub const WOP_SHR: u8 = 13;
+
+pub const WOP_SHL_W: u8 = 14;
+
+pub const WOP_SHR_W: u8 = 15;
+
 pub fn module_func() -> &'static str {
     return "(module)";
 }
@@ -759,7 +785,7 @@ pub fn refusal_detail(code: u8) -> &'static str {
         return "the wasm32 emitter reads the fn's parameters only";
     }
     if (code == REF_EXPRESSION_KIND) {
-        return "the wasm32 emitter lowers parameters, i32 constants, + - * / and == != < <= > >= only";
+        return "the wasm32 emitter lowers parameters, i32 constants, + - * / & | ^ << >> and == != < <= > >= only";
     }
     if (code == REF_FN_BODY_SELECT) {
         return "the wasm32 emitter lowers `return <expr>;` or `if (<param> == 0) { return <const>; } return <const>;` only";
@@ -795,7 +821,7 @@ pub fn i32_results_detail(out: &mut [u8], at: usize, ty: &[u8]) -> usize {
 }
 
 pub fn arith_op_detail(out: &mut [u8], at: usize, op: u8) -> usize {
-    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter lowers + - * / on the i32 carrier, `");
+    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter lowers + - * / & | ^ << >> on the i32 carrier, `");
     n = put_bytes(out, n, arith_debug_name(op).as_bytes());
     return put_bytes(out, n, b"` here");
 }
@@ -829,7 +855,7 @@ pub fn refused_local_variable(var_idx: u32, nparams: u32) -> bool {
 }
 
 pub fn refused_arithmetic_op(op: u8) -> bool {
-    return ((((op != WOP_ADD) && (op != WOP_SUB)) && (op != WOP_MUL)) && (op != WOP_DIV));
+    return (((((((((((op != WOP_ADD) && (op != WOP_SUB)) && (op != WOP_MUL)) && (op != WOP_DIV)) && (op != WOP_AND)) && (op != WOP_OR)) && (op != WOP_XOR)) && (op != WOP_SHL)) && (op != WOP_SHR)) && (op != WOP_SHL_W)) && (op != WOP_SHR_W));
 }
 
 pub fn refused_expression_kind(kind: u8) -> bool {
@@ -1006,6 +1032,33 @@ pub fn arith_opcode(op: u8) -> u8 {
     return 0;
 }
 
+pub fn bitwise_opcode(op: u8) -> u8 {
+    if (op == WOP_AND) {
+        return OP_I32_AND;
+    }
+    if (op == WOP_OR) {
+        return OP_I32_OR;
+    }
+    if (op == WOP_XOR) {
+        return OP_I32_XOR;
+    }
+    return 0;
+}
+
+pub fn shift_opcode(op: u8, left_signed: bool) -> u8 {
+    if ((op == WOP_SHL) || (op == WOP_SHL_W)) {
+        return OP_I32_SHL;
+    }
+    if (op == WOP_SHR) {
+        return OP_I32_SHR_S;
+    }
+    if (op == WOP_SHR_W) {
+        return OP_I32_SHR_U;
+    }
+    _ = left_signed;
+    return 0;
+}
+
 pub fn cmp_opcode(op: u8) -> u8 {
     if (op == 0) {
         return OP_I32_EQ;
@@ -1037,6 +1090,12 @@ pub fn lower_expr_node(out: &mut [u8], at: usize, kind: u8, v: u64, var_idx: u32
     }
     if (kind == EK_ARITH) {
         let mut oc: u8 = arith_opcode(op);
+        if (oc == 0) {
+            oc = bitwise_opcode(op);
+        }
+        if (oc == 0) {
+            oc = shift_opcode(op, (v != 0));
+        }
         if (oc == 0) {
             return at;
         }
