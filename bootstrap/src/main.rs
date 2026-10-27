@@ -1720,7 +1720,41 @@ async fn run_server(port_arg: &str) -> anyhow::Result<()> {
 // Command Handlers
 // ============================================================================
 
-fn run_parse(input_path: &str) -> anyhow::Result<()> {
+/// Top-level items of a module body, as (label, first line, last line).
+/// Line-based, and it says so: the suite's own phase is the authority on the
+/// COUNT, and this only has to point at the construct. An item starts at a line
+/// whose indentation is one level in and whose first word is a keyword, and ends
+/// where the next one starts.
+fn top_level_items(src: &str) -> Vec<(String, usize, usize)> {
+    const KEYWORDS: &[&str] = &[
+        "fn", "test", "invariant", "bench", "type", "const", "let", "use", "spec",
+        "struct", "enum", "impl", "on", "mem", "port", "wire", "reg", "assert",
+    ];
+    let lines: Vec<&str> = src.lines().collect();
+    let mut starts: Vec<(String, usize)> = Vec::new();
+    for (i, ln) in lines.iter().enumerate() {
+        let t = ln.trim_start();
+        let indent = ln.len() - t.len();
+        if indent == 0 || indent > 8 {
+            continue;
+        }
+        let first = t.split_whitespace().next().unwrap_or("");
+        if KEYWORDS.contains(&first) {
+            let name = t.split_whitespace().nth(1).unwrap_or("").trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '_'
+            });
+            starts.push((format!("{first} {name}"), i));
+        }
+    }
+    let mut out = Vec::new();
+    for k in 0..starts.len() {
+        let end = if k + 1 < starts.len() { starts[k + 1].1 } else { lines.len() };
+        out.push((starts[k].0.clone(), starts[k].1, end));
+    }
+    out
+}
+
+fn run_parse(input_path: &str, json: bool) -> anyhow::Result<()> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)?;
 
@@ -1729,6 +1763,866 @@ fn run_parse(input_path: &str) -> anyhow::Result<()> {
         Err(e) => anyhow::bail!("Parse error: {}", e),
     }
     Ok(())
+}
+
+fn run_catalog_gate(catalog: &str, specs_dir: &str, verbose: bool) -> anyhow::Result<()> {
+    let r = catalog_gate::run(Path::new(catalog), Path::new(specs_dir))?;
+    println!("--- catalog gate: {} ---", catalog);
+    if verbose {
+        for (k, v) in &r.by_cluster {
+            println!("  {:<20} {}", k, v);
+        }
+        println!();
+    }
+    println!("  records            {}", r.records);
+    println!("  fn getters         {}", r.getters);
+    println!();
+    println!("  shape classification (the exceptions ARE the work):");
+    for (k, v) in &r.by_shape {
+        println!("    {:<14} {}", k, v);
+    }
+    println!();
+    println!("  checks run:");
+    for (k, v) in &r.checked {
+        println!("    {:<24} {}", k, v);
+    }
+    println!();
+    match &r.emitted {
+        Some(msg) => println!("  emitted artifacts: {}", msg),
+        None => println!("  emitted artifacts: not checked"),
+    }
+    println!();
+    if r.findings.is_empty() {
+        println!("  FINDINGS  none");
+    } else {
+        println!("  FINDINGS  {}", r.findings.len());
+        for f in &r.findings {
+            println!("    [{}] {}: {}", f.check, f.id, f.detail);
+        }
+    }
+    // W702: this command printed `FINDINGS 3` and returned 0.
+    //
+    // Measured before the change: `t27c catalog-gate; echo $?` gives EXIT=0 with
+    // three findings on screen. Its only terminator was `Ok(())`. A verdict a
+    // caller cannot read is decoration, and the CLI is where a human runs this
+    // gate by hand -- the suite counts the same findings and is the only reason
+    // any of them reach a build.
+    //
+    // `ALLOWED` is shared with the suite so the two cannot drift into
+    // disagreeing about which findings are debt.
+    let unexpected = r
+        .findings
+        .iter()
+        .filter(|f| !catalog_gate::ALLOWED.contains(&f.id.as_str()))
+        .count();
+    if unexpected > 0 {
+        anyhow::bail!(
+            "{} unexpected catalog finding(s) ({} allowed as debt)",
+            unexpected,
+            r.findings.len() - unexpected
+        );
+    }
+    Ok(())
+}
+
+fn run_test_report_tree(specs_dir: &str, include_scratch: bool, verbose: bool) -> anyhow::Result<()> {
+    let root = Path::new(specs_dir);
+    if !root.is_dir() {
+        anyhow::bail!("not a directory: {}", specs_dir);
+    }
+    let t = test_report::run_tree(root, include_scratch);
+    for r in &t.reports {
+        match &r.blocked {
+            Some(why) if verbose => {
+                println!("  BLOCKED  {}  ({})", r.spec, why.lines().next().unwrap_or(""))
+            }
+            Some(_) => {}
+            None if r.total == 0 && r.invariants > 0 => println!(
+                "  {:>4} inv   proved  {}",
+                r.invariants, r.spec
+            ),
+            None if r.total == 0 => {
+                if verbose {
+                    println!(
+                        "  {}  {}",
+                        if r.stub { "STUB     " } else { "NO TESTS " },
+                        r.spec
+                    )
+                }
+            }
+            None => println!(
+                "  {:>4}/{:<4} {:>5.1}%  {}",
+                r.passed,
+                r.total,
+                (r.passed as f64) * 100.0 / (r.total as f64),
+                r.spec
+            ),
+        }
+    }
+    println!();
+    println!("--- per-test measurement over the tree ---");
+    println!("  specs MEASURED           {}", t.measured);
+    println!("    of those, 100%          {}", t.perfect);
+    println!("  specs INVARIANTS ONLY    {}   (comptime -- compiling IS the check)", t.invariants_only);
+    println!("  specs with NO TESTS      {}   <- L4 TESTABILITY", t.no_tests);
+    println!("  specs that are STUBS     {}   (declare nothing -- UNWRITTEN, not untested)", t.stubs);
+    println!("  specs BLOCKED            {}", t.blocked);
+    println!();
+    println!("  tests run                {}", t.tests);
+    println!("  pass                     {}", t.passed);
+    println!("  FAIL                     {}", t.failed);
+    println!("  invariants proved         {}", t.invariants);
+    if t.tests > 0 {
+        println!(
+            "  rate                     {:.1}%",
+            (t.passed as f64) * 100.0 / (t.tests as f64)
+        );
+    }
+    // #6509: a pass that executed no runtime assert certifies nothing (T730).
+    println!();
+    println!("  checked passes           {}   (executed at least one runtime assert)", t.checked);
+    println!("  VACUOUS passes           {}   (executed 0 runtime asserts, #6509)", t.vacuous);
+    println!("  uncounted passes         {}   (counting build did not compile)", t.not_counted);
+    println!("  specs every pass vacuous {}   (t27b pass_vacuous, #6115)", t.vacuous_specs);
+    println!();
+    println!("  Five populations, deliberately not merged. BLOCKED never produced");
+    println!("  a binary. INVARIANTS ONLY has no test functions but its invariants");
+    println!("  are comptime -- it COMPILED, so they held. A STUB declares nothing");
+    println!("  at all: it is UNWRITTEN (W586's category), and calling it an L4");
+    println!("  violation overstates the debt. NO TESTS has declarations and");
+    println!("  checks none of them -- that is the L4 violation. Only MEASURED");
+    println!("  specs have a rate.");
+    Ok(())
+}
+
+/// #7565: every `use` edge under `specs_dir`, "importer\timported", sorted -- the `--graph`
+/// section specs/ci/affected.t27 reads, from the resolver t27c compiles with.
+fn run_use_edges(specs_dir: &Path) -> anyhow::Result<()> {
+    let mut files = Vec::new();
+    for e in walkdir::WalkDir::new(specs_dir) {
+        let p = e?.into_path();
+        if p.extension().is_some_and(|x| x == "t27") {
+            files.push(p);
+        }
+    }
+    files.sort();
+    for f in files {
+        let src = fs::read_to_string(&f).with_context(|| format!("{}", f.display()))?;
+        for t in use_resolve::use_edges(&src, specs_dir) {
+            println!("{}\t{}", f.display(), t.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_test_report(spec: &str, specs_dir: &str, verbose: bool) -> anyhow::Result<()> {
+    let path = Path::new(spec);
+    if !path.is_file() {
+        anyhow::bail!("not a file: {}", spec);
+    }
+    let r = test_report::run(path, Path::new(specs_dir));
+    println!("--- test report: {} ---", r.spec);
+    if let Some(why) = &r.blocked {
+        println!("  BLOCKED  {}", why);
+        println!();
+        println!("  A blocked spec is not a failing one. It never produced a");
+        println!("  binary, so it has no per-test result to report.");
+        return test_report_exit_now(&r);
+    }
+    for o in &r.outcomes {
+        if !o.passed {
+            println!("  FAIL  {}", o.name);
+        } else if verbose {
+            println!("  pass  {}", o.name);
+        }
+    }
+    println!();
+    println!("  tests       {}", r.total);
+    println!("  pass        {}", r.passed);
+    println!("  FAIL        {}", r.failed);
+    if r.invariants > 0 {
+        println!(
+            "  invariants  {}   proved -- comptime, so compiling IS the check",
+            r.invariants
+        );
+    }
+    if r.total > 0 {
+        println!(
+            "  rate    {:.1}%",
+            (r.passed as f64) * 100.0 / (r.total as f64)
+        );
+    }
+    // #6509: per-test runtime assert counts and the vacuous-pass summary,
+    // after the totals so the lines above read exactly as before.
+    let lines = r.assert_lines();
+    if !lines.is_empty() {
+        println!();
+        for l in lines {
+            println!("{}", l);
+        }
+    }
+    test_report_exit_now(&r)
+}
+
+/// #7370: exit as specs/compiler/test_report_exit.t27 says, once the report is printed.
+fn test_report_exit_now(r: &test_report::Report) -> anyhow::Result<()> {
+    let var: &'static str = Box::leak(std::env::var(test_report_exit::OPT_OUT_VAR).unwrap_or_default().into());
+    let code = test_report_exit::exit_with(r.blocked.is_some(), r.failed as u64, test_report_exit::opted_out(var));
+    if code != test_report_exit::EXIT_GREEN {
+        std::io::Write::flush(&mut std::io::stdout())?;
+        std::process::exit(code as i32);
+    }
+    Ok(())
+}
+
+fn run_impl_status(specs_dir: &str, include_scratch: bool, verbose: bool) -> anyhow::Result<()> {
+    let root = Path::new(specs_dir);
+    if !root.is_dir() {
+        anyhow::bail!("not a directory: {}", specs_dir);
+    }
+    let r = impl_status::run(root, include_scratch);
+    if verbose {
+        for (f, empty, total) in &r.detail {
+            println!("{}: {} of {} function(s) have no body", f, empty, total);
+        }
+        println!();
+    }
+    println!("--- implementation status ---");
+    println!("  specs fully implemented   {}", r.implemented);
+    println!("  specs with NO functions   {}", r.bodiless);
+    println!("  specs PARTLY written      {}", r.partial);
+    println!("  specs entirely UNWRITTEN  {}", r.unwritten);
+    println!("  specs that do not parse   {}", r.unparsable);
+    let total = r.implemented + r.bodiless + r.partial + r.unwritten + r.unparsable;
+    println!("  ------------------------  ---");
+    println!("  specs total               {}", total);
+    println!();
+    println!("  functions declared        {}", r.total_fns);
+    println!("  functions with NO BODY    {}", r.empty_fns);
+    println!();
+    println!("  An unwritten spec is not a broken one. Before W586 both were");
+    println!("  reported as COMPILE_FAIL and counted together.");
+    println!();
+    println!("  W689: a spec with NO functions is counted separately. It used to");
+    println!("  be added to `fully implemented` -- it has no MISSING bodies, so");
+    println!("  the arithmetic was sound and the label was not. That merge put");
+    println!("  61 specs holding one module line and two `use`s into the headline");
+    println!("  number, overstating it by 21%.");
+    Ok(())
+}
+
+fn run_cc_gate(specs_dir: &str, include_scratch: bool, verbose: bool) -> anyhow::Result<()> {
+    let root = Path::new(specs_dir);
+    if !root.is_dir() {
+        anyhow::bail!("not a directory: {}", specs_dir);
+    }
+    let report = match cc_gate::run(root, include_scratch) {
+        Some(r) => r,
+        None => {
+            println!("--- C gate ---");
+            println!("  SKIPPED: no C compiler found (tried cc, clang, gcc)");
+            return Ok(());
+        }
+    };
+    if verbose {
+        for (f, e) in &report.failures {
+            println!("{}: {}", f, e);
+        }
+        println!();
+    }
+    // The CLASS table is the load-bearing metric while the classes are large:
+    // a header must clear every one of them to compile, so fixing a class moves
+    // specs from failing on A to failing on B without moving the header count
+    // at all (W584).
+    println!("--- C gate ({} -fsyntax-only) ---", report.cc);
+    let mut classes: Vec<_> = report.classes.iter().collect();
+    classes.sort_by(|a, b| b.1.cmp(a.1));
+    for (class, n) in &classes {
+        println!("  {:>5}  {}", n, class);
+    }
+    println!();
+    println!("  specs scanned          {}", report.total);
+    println!("  headers that COMPILE   {}", report.compiled);
+    println!("  headers that FAIL      {}", report.failed);
+    println!(
+        "    of those, UNWRITTEN  {}   (every function body empty -- not a header defect)",
+        report.unwritten
+    );
+    println!(
+        "    genuinely broken     {}",
+        report.failed.saturating_sub(report.unwritten)
+    );
+    println!("  no header generated    {}", report.gen_failed);
+    Ok(())
+}
+
+fn run_lex_dropped(specs_dir: &str) -> anyhow::Result<()> {
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(specs_dir)];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().map(|n| n == "scratch").unwrap_or(false) {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("t27") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    let mut by_char: std::collections::BTreeMap<char, usize> = std::collections::BTreeMap::new();
+    let mut by_file: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for f in &files {
+        let src = match std::fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut lexer = compiler::Lexer::new(&src);
+        loop {
+            let t = lexer.next_token();
+            if t.kind == compiler::TokenKind::Eof {
+                break;
+            }
+        }
+        if !lexer.dropped.is_empty() {
+            *by_file.entry(f.display().to_string()).or_insert(0) += lexer.dropped.len();
+            for (c, _) in &lexer.dropped {
+                *by_char.entry(*c).or_insert(0) += 1;
+            }
+        }
+    }
+    println!("--- characters the lexer silently discards ---");
+    let total: usize = by_char.values().sum();
+    let mut chars: Vec<_> = by_char.into_iter().collect();
+    chars.sort_by(|a, b| b.1.cmp(&a.1));
+    for (c, n) in &chars {
+        println!("  {:>8}  {:?}", n, c);
+    }
+    println!("  {:>8}  TOTAL across {} spec(s)", total, by_file.len());
+    let mut top: Vec<_> = by_file.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("  most affected specs:");
+    // W637: a capped list must say it is capped (T46).
+    let __total = top.len();
+    for (f, n) in top.iter().take(10) {
+        println!("    {:>6}  {}", n, f);
+    }
+    if __total > 10 {
+        println!("    ... and {} more not shown", __total - 10);
+    }
+    Ok(())
+}
+
+fn run_parse_conform() -> anyhow::Result<()> {
+    let failures = parse_conform::run();
+    let total = parse_conform::total();
+    for f in &failures {
+        println!("case     {}", f.name);
+        println!("  expected {}", f.expected);
+        println!("  actual   {}", f.actual);
+        println!("  note     {}", f.note);
+        println!();
+    }
+    println!("--- parser conformance ---");
+    println!("  cases      {}", total);
+    println!("  passing    {}", total - failures.len());
+    println!("  failing    {}", failures.len());
+    if !failures.is_empty() {
+        anyhow::bail!("{} parser conformance failure(s)", failures.len());
+    }
+    Ok(())
+}
+
+/// Name the top-level items the parser stops on, by removing one at a time.
+/// `--show` prints WHAT was dropped and is the direct answer; this is for the
+/// case where the dropped tokens alone do not say which construct owns them.
+/// It exists because a command that answered this did not, and I built a whole
+/// second command around it before finding `parse-complete --show`, which had
+/// been printing the tokens with their source line all along -- better than the
+/// version I wrote. Two commands answering one question is the same defect as
+/// two seal-naming conventions: the second one is where the drift lives.
+fn run_bisect(path: &str) -> anyhow::Result<()> {
+    let src = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {path}"))?;
+    let base = match compiler::Compiler::parse_ast_accounted(&src) {
+        Err(e) => {
+            println!("{path} does not parse at all -- that is `parse`'s question, not this one");
+            println!("  {e}");
+            return Ok(());
+        }
+        Ok((_, n)) => n,
+    };
+    println!("{path}: {base} top-level token(s) discarded");
+    if base == 0 {
+        println!("  the parser consumed everything it was given");
+        return Ok(());
+    }
+    let lines: Vec<&str> = src.lines().collect();
+    let items = top_level_items(&src);
+    println!("  {} top-level item(s) to try", items.len());
+    let mut named = 0usize;
+    for (label, a, b) in &items {
+        let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+        kept.extend_from_slice(&lines[..*a]);
+        kept.extend_from_slice(&lines[*b..]);
+        // A removal that breaks parsing entirely says nothing about the
+        // discard: an item that cannot be tested is not evidence.
+        if let Ok((_, n)) = compiler::Compiler::parse_ast_accounted(&kept.join("\n")) {
+            if n < base {
+                println!("  -{:>4} without `{}`  (lines {}-{})", base - n, label, a + 1, b);
+                named += 1;
+            }
+        }
+    }
+    if named == 0 {
+        println!("  no single top-level item accounts for it: the discard is inside");
+        println!("  one of them, or in text this line-based split does not see.");
+    }
+    Ok(())
+}
+
+/// Contiguous runs of dropped tokens, as `(head lexeme, token count)`.
+/// A run breaks at a line gap: the spans carry a line but no column, so two
+/// dropped regions on the same line are indistinguishable from one, and a blank
+/// or surviving line between them is the only separator available. That is a
+/// deliberate under-count of runs, never an over-count -- it can merge two
+/// causes into one, and cannot invent a cause that is not there.
+fn dropped_runs(records: &[(u32, String, &'static str)]) -> Vec<(String, &'static str, usize)> {
+    let mut runs: Vec<(String, &'static str, usize)> = Vec::new();
+    let mut prev: Option<(u32, &'static str)> = None;
+    for (line, lex, chan) in records {
+        // A run continues only while BOTH hold: the lines are adjacent and the
+        // recovery is the same one. Two channels meeting on consecutive lines
+        // are two findings, and merging them would attribute one's tokens to the
+        // other's head.
+        match prev {
+            Some((p, c)) if *line <= p + 1 && c == *chan => {
+                if let Some(last) = runs.last_mut() {
+                    last.2 += 1;
+                }
+            }
+            _ => runs.push((lex.clone(), *chan, 1)),
+        }
+        prev = Some((*line, *chan));
+    }
+    runs
+}
+
+fn run_parse_complete(
+    specs_dir: &str,
+    include_scratch: bool,
+    show: Option<&str>,
+    bisect: Option<&str>,
+    causes: bool,
+    fallbacks: bool,
+) -> anyhow::Result<()> {
+    if let Some(path) = bisect {
+        return run_bisect(path);
+    }
+    // W699: `--fallbacks --show <spec>` scopes the census to one file.
+    //
+    // The corpus view says a shape exists 19 times in 1 spec and cannot say
+    // WHICH -- and a census that names a target you then cannot open is an
+    // instrument that stops one step short.
+    //
+    // W702: this arm was moved above the `--show` handler so it could win when
+    // BOTH flags are given, and its `if fallbacks` guard was left behind. Plain
+    // `--show` then printed the fallback view instead of the token view it is
+    // documented to print, and the token view became unreachable. Nothing
+    // failed: both outputs are plausible, and the flag that selects between
+    // them was the one that stopped being read.
+    if fallbacks {
+        if let Some(path) = show {
+            let src = std::fs::read_to_string(path)?;
+            let events = compiler::Compiler::parse_ast_bdd_fallbacks(&src)
+                .map_err(|e| anyhow::anyhow!("{} does not parse: {}", path, e))?;
+            if events.is_empty() {
+                println!("{}: no whole-block fallback", path);
+                return Ok(());
+            }
+            let lines: Vec<&str> = src.lines().collect();
+            println!("{}: {} whole-block fallback(s)", path, events.len());
+            println!();
+            for (line, why, clause) in &events {
+                let text = lines.get((*line as usize).saturating_sub(1)).unwrap_or(&"");
+                println!("  {:5}| {}", line, text.trim_end());
+                println!("        {why} (on `{clause}`)");
+            }
+            return Ok(());
+        }
+    }
+    // W634: single-file mode -- print what was discarded, grouped by line, so a
+    // human can decide whether any of it is content a theorem depends on.
+    if let Some(path) = show {
+        let src = std::fs::read_to_string(path)?;
+        let spans = compiler::Compiler::parse_ast_dropped_spans(&src)
+            .map_err(|e| anyhow::anyhow!("{} does not parse: {}", path, e))?;
+        if spans.is_empty() {
+            println!("{}: nothing discarded", path);
+            return Ok(());
+        }
+        let lines: Vec<&str> = src.lines().collect();
+        let mut by_line: std::collections::BTreeMap<u32, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (l, lex) in &spans {
+            by_line.entry(*l).or_default().push(lex.clone());
+        }
+        println!("{}: {} token(s) DISCARDED across {} line(s)", path, spans.len(), by_line.len());
+        println!();
+        for (l, toks) in &by_line {
+            let text = lines.get((*l as usize).saturating_sub(1)).unwrap_or(&"");
+            println!("  {:5}| {}", l, text.trim_end());
+            println!("        dropped: {}", toks.join(" "));
+        }
+        return Ok(());
+    }
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(specs_dir)];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if !include_scratch && p.file_name().map(|n| n == "scratch").unwrap_or(false) {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("t27") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+
+    // W699: what the parser STOPPED ON, corpus-wide.
+    //
+    // The classification this replaces was a keyword match over the printed
+    // traces, run from outside the compiler -- it guessed `forall` from the
+    // presence of the word. This asks the record: the head of each contiguous
+    // dropped run IS the token recovery began at. `forall` is not the answer it
+    // gives, and the answer it gives is better.
+    if fallbacks {
+        let mut by: std::collections::BTreeMap<(&'static str, String), (usize, std::collections::BTreeSet<String>)> =
+            std::collections::BTreeMap::new();
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            let Ok(events) = compiler::Compiler::parse_ast_bdd_fallbacks(&src) else {
+                continue;
+            };
+            for (_, why, clause) in events {
+                let e = by.entry((why, clause)).or_insert((0, Default::default()));
+                e.0 += 1;
+                e.1.insert(f.display().to_string());
+            }
+        }
+        let mut rows: Vec<_> = by.iter().collect();
+        rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
+        println!("--- whole-block fallbacks, by why ---");
+        println!();
+        println!("  {:>6} {:>6}  why                             clause", "events", "specs");
+        for ((why, clause), (n, specs)) in &rows {
+            println!("  {:>6} {:>6}  {:<31} {}", n, specs.len(), why, clause);
+        }
+        println!();
+        println!(
+            "  {} shape(s), {} event(s)",
+            rows.len(),
+            rows.iter().map(|(_, (n, _))| n).sum::<usize>()
+        );
+        println!();
+        println!("  An event is one BLOCK, not one token: a fallback that costs 600");
+        println!("  tokens and one that costs 3 count the same here. Read this beside");
+        println!("  `--causes`, never instead of it.");
+        return Ok(());
+    }
+
+    if causes {
+        let mut runs_by_head: std::collections::BTreeMap<String, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        let mut specs_by_head: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut unread = 0usize;
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else {
+                unread += 1;
+                continue;
+            };
+            // A file that does not parse at all has no drop record to read --
+            // and it is the `parse` phase's business, not this one.
+            let Ok(records) = compiler::Compiler::parse_ast_dropped_records(&src) else {
+                continue;
+            };
+            if records.is_empty() {
+                continue;
+            }
+            for (head, chan, n) in dropped_runs(&records) {
+                let key = format!("{chan:<19} {head}");
+                let e = runs_by_head.entry(key.clone()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += n;
+                specs_by_head
+                    .entry(key)
+                    .or_default()
+                    .insert(f.display().to_string());
+            }
+        }
+        let mut rows: Vec<_> = runs_by_head.iter().collect();
+        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(a.0.cmp(b.0)));
+        println!("--- what the parser stopped on ---");
+        println!();
+        println!("  {:>8} {:>6} {:>6}  channel            head token", "tokens", "runs", "specs");
+        for (head, (runs, toks)) in &rows {
+            println!(
+                "  {:>8} {:>6} {:>6}  {}",
+                toks,
+                runs,
+                specs_by_head[*head].len(),
+                head
+            );
+        }
+        println!();
+        println!(
+            "  {} distinct head token(s), {} run(s), {} token(s)",
+            rows.len(),
+            rows.iter().map(|(_, (r, _))| r).sum::<usize>(),
+            rows.iter().map(|(_, (_, t))| t).sum::<usize>()
+        );
+        if unread > 0 {
+            println!("  {unread} file(s) could not be read -- NOT counted as anything");
+        }
+        println!();
+        println!("  A run breaks at a LINE GAP. The spans carry a line and no column, so");
+        println!("  two dropped regions on one line read as one: this under-counts runs and");
+        println!("  cannot invent a cause that is not there.");
+        return Ok(());
+    }
+
+    let (mut ok, mut truncated, mut rejected) = (0usize, 0usize, 0usize);
+    let (mut discarded, mut discarded_tokens) = (0usize, 0usize);
+    for f in &files {
+        let src = match std::fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if compiler::Compiler::parse_ast(&src).is_err() {
+            rejected += 1;
+            continue;
+        }
+        match compiler::Compiler::parse_ast_strict(&src) {
+            Ok(_) => {
+                // W633: reaching EOF is NOT the same as reading everything.
+                // Top-level drop-recovery resyncs past an unrecognised
+                // declaration, so a parse can reach EOF having thrown tokens
+                // away -- and `parse_ast_strict` calls that "consume all".
+                match compiler::Compiler::parse_ast_accounted(&src) {
+                    Ok((_, 0)) => ok += 1,
+                    Ok((_, n)) => {
+                        discarded += 1;
+                        discarded_tokens += n;
+                        println!("{}: DISCARDED {} top-level token(s)", f.display(), n);
+                    }
+                    Err(_) => ok += 1,
+                }
+            }
+            Err(e) => {
+                truncated += 1;
+                println!("{}: {}", f.display(), e);
+            }
+        }
+    }
+    println!();
+    println!("--- parse completeness ---");
+    println!("  specs scanned            {}", files.len());
+    println!("  parse and consume all    {}", ok);
+    println!("  parse but TRUNCATE       {}", truncated);
+    println!("  parse but DISCARD        {} ({} token(s))", discarded, discarded_tokens);
+    println!("  do not parse             {}", rejected);
+    Ok(())
+}
+
+fn run_lex_conform() -> anyhow::Result<()> {
+    let failures = lex_conform::run();
+    let total = lex_conform::total();
+    for f in &failures {
+        println!("input    {:?}", f.input);
+        println!("  expected {}", f.expected);
+        println!("  actual   {}", f.actual);
+        println!("  note     {}", f.note);
+        println!();
+    }
+    println!("--- lexer conformance ---");
+    println!("  cases      {}", total);
+    println!("  passing    {}", total - failures.len());
+    println!("  failing    {}", failures.len());
+    if failures.iter().any(|f| f.boundary) {
+        println!(
+            "  ({} of the failures are BOUNDARY cases: behaviour that was measured,",
+            failures.iter().filter(|f| f.boundary).count()
+        );
+        println!("   not designed. A boundary failure means someone changed it silently.)");
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("{} lexer conformance failure(s)", failures.len());
+    }
+    Ok(())
+}
+
+fn run_check_calls(specs_dir: &str, include_scratch: bool) -> anyhow::Result<()> {
+    let root = Path::new(specs_dir);
+    if !root.is_dir() {
+        anyhow::bail!("not a directory: {}", specs_dir);
+    }
+    let findings = check_calls::check_tree(root, !include_scratch);
+    let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut by_callee: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for f in &findings {
+        *by_kind.entry(f.kind).or_insert(0) += 1;
+        *by_callee.entry(f.callee.clone()).or_insert(0) += 1;
+        println!("{}:{}: {}: {} -- {}", f.file, f.line, f.kind, f.callee, f.detail);
+    }
+    println!();
+    println!("--- call-site check ---");
+    for (k, n) in &by_kind {
+        println!("  {:<22} {}", k, n);
+    }
+    println!("  {:<22} {}", "TOTAL", findings.len());
+    if !by_callee.is_empty() {
+        println!("  most affected callees:");
+        let mut top: Vec<_> = by_callee.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        // W637: a capped list must say it is capped (T46).
+        let __total = top.len();
+        for (name, n) in top.iter().take(8) {
+            println!("    {:<28} {}", name, n);
+        }
+        if __total > 8 {
+            println!("    ... and {} more not shown", __total - 8);
+        }
+    }
+    Ok(())
+}
+
+/// #6446: the source a file-based command typechecks, chosen the way
+/// `run_typecheck` always chose it -- the `use`-spliced source if it parses,
+/// else the raw file (the second field says the raw one was used). `None` when
+/// neither parses: that is a parse error, and the backend reports it in its own
+/// words.
+fn typecheck_input_ast(path: &Path, raw: &str) -> Option<(compiler::Node, bool)> {
+    let spliced = use_resolve::resolve(path, raw);
+    match compiler::Compiler::parse_ast(&spliced) {
+        Ok(ast) => Some((ast, false)),
+        Err(_) => compiler::Compiler::parse_ast(raw).ok().map(|ast| (ast, true)),
+    }
+}
+
+/// #6446: the refusal text, or `None` when typecheck accepts the AST.
+fn typecheck_refusal_for_ast(label: &str, ast: &compiler::Node) -> Option<String> {
+    let result = compiler::typecheck_ast(ast);
+    if result.ok {
+        return None;
+    }
+    let mut msg = format!(
+        "typecheck refused {}: {} error(s), so nothing is generated for it (#6446)",
+        label, result.error_count
+    );
+    for err in &result.errors {
+        msg.push_str("\n  - ");
+        msg.push_str(err);
+    }
+    Some(msg)
+}
+
+/// #6446: every gen path runs typecheck first. `tri misread` found 35 specs
+/// that typecheck refused while `gen`, `gen-rust` and the rest emitted code for
+/// them anyway -- `pub f: ,`, a field with no type, generated as Rust that does
+/// not compile, and every gate that only asked "did gen exit 0?" stayed green.
+/// A refused spec now generates nothing and the command exits non-zero with
+/// the same messages `t27c typecheck` prints. There is no flag to skip this:
+/// a skip flag would be the next gate that stays green.
+fn typecheck_gate(path: &Path, raw: &str) -> anyhow::Result<()> {
+    // #7176: a `use` the splice finds no spec for is named here, once per gen
+    // command, before anything that could fail on the names it would have
+    // brought. A warning: the exit code and stdout do not change.
+    for note in use_resolve::missing_use_notes(path, raw) {
+        eprintln!("{}", note);
+    }
+    if let Some((ast, _)) = typecheck_input_ast(path, raw) {
+        if let Some(msg) = typecheck_refusal_for_ast(&path.display().to_string(), &ast) {
+            anyhow::bail!("{}", msg);
+        }
+    }
+    Ok(())
+}
+
+/// #6446: the same gate for a source with no file behind it (the HTTP server,
+/// `compile-all`, `compile-project`). No `use` splice, since there is no path to
+/// resolve imports from.
+fn typecheck_refusal_for_source(label: &str, source: &str) -> Option<String> {
+    let ast = compiler::Compiler::parse_ast(source).ok()?;
+    typecheck_refusal_for_ast(label, &ast)
+}
+
+/// #6446: run `backend` only on a source typecheck accepts.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+fn gated_backend(
+    source: &str,
+    backend: fn(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    match typecheck_refusal_for_source("source", source) {
+        Some(msg) => Err(msg),
+        None => backend(source),
+    }
+}
+
+/// What gen, gen-c and gen-rust emit (W584: `use` resolution is backend-agnostic) and seal --verify reads.
+fn gen_resolved(input_path: &str, compile: fn(&str) -> Result<String, String>) -> anyhow::Result<String> {
+    let path = Path::new(input_path);
+    let raw = fs::read_to_string(path)?;
+    typecheck_gate(path, &raw)?;
+    // W569: `use a::b::c` was parsed and then ignored, so a spec failed on
+    // names declared in exactly the module it imported. Splice in the
+    // declarations this spec actually needs before compiling.
+    //
+    // Safety contract, the same one the W559 lowering carries: this may only
+    // ADD declarations, never break a spec. If the spliced source stops
+    // compiling, the original is used and the spec generates exactly what it
+    // generated before.
+    let resolved = use_resolve::resolve(path, &raw);
+    for note in use_resolve::unresolved_notes(&resolved) {
+        eprintln!("{}", note);
+    }
+    let code = match compile(&resolved) {
+        Ok(code) => code,
+        Err(spliced_err) => match compile(&raw) {
+            Ok(code) => {
+                // The splice is discarded here and the unresolved source used
+                // instead. Without this line that is invisible: the command
+                // succeeds, and every import it resolved is silently gone.
+                eprintln!(
+                    "note: spliced source did not compile, falling back to the \
+            unresolved original -- imported declarations are NOT in this output"
+                );
+                code
+            }
+            Err(_) => anyhow::bail!("Compile error: {}", spliced_err),
+        },
+    };
+    Ok(code)
 }
 
 fn run_gen(input_path: &str) -> anyhow::Result<()> {
@@ -1746,9 +2640,754 @@ fn run_gen_verilog(input_path: &str) -> anyhow::Result<()> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)?;
 
-    match compiler::Compiler::compile_verilog(&source) {
-        Ok(verilog_code) => print!("{}", verilog_code),
-        Err(e) => anyhow::bail!("Compile error: {}", e),
+    match compiler::Compiler::debug_hir(&source) {
+        Ok(hir_dump) => print!("{}", hir_dump),
+        Err(e) => anyhow::bail!("HIR conversion error: {}", e),
+    }
+    Ok(())
+}
+
+fn run_gen_verilog_hir(
+    input_path: &str,
+    with_sva: bool,
+    sva_behaviors: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = Path::new(input_path);
+    let source = fs::read_to_string(path)?;
+    typecheck_gate(path, &source)?;
+
+    match compiler::Compiler::compile_verilog_hir(&source) {
+        Ok(verilog) => {
+            print!("{}", verilog);
+            if with_sva {
+                let behaviors = load_sva_behaviors(sva_behaviors)?;
+                let module_name = extract_module_name_from_verilog(&verilog);
+                let sva_block = behavior_sva_v2::build_behavior_sva_bind_block(&module_name, &behaviors);
+                if !sva_block.is_empty() {
+                    print!("{}", sva_block);
+                }
+            }
+        }
+        Err(e) => anyhow::bail!("HIR Verilog generation error: {}", e),
+    }
+    Ok(())
+}
+
+/// W530: generate Verilog with active test assertions and run it through
+/// Icarus Verilog (iverilog + vvp).
+fn run_icarus_simulate(input_path: &str) -> anyhow::Result<()> {
+    let path = Path::new(input_path);
+    let source = fs::read_to_string(path)?;
+    typecheck_gate(path, &source)?;
+    let verilog = compiler::Compiler::compile_verilog_for_simulation_at(&source, path)
+        .map_err(|e| anyhow::anyhow!("Verilog generation error: {}", e))?;
+
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "icarus_sim".to_string());
+    let tmp = std::env::temp_dir().join(format!("t27c_icarus_{}", name));
+    let v_path = tmp.with_extension("v");
+    let vvp_path = tmp.with_extension("vvp");
+
+    fs::write(&v_path, verilog)
+        .with_context(|| format!("writing temporary Verilog {}", v_path.display()))?;
+
+    let compile = std::process::Command::new("iverilog")
+        .args([
+            "-g2012",
+            "-o",
+            &vvp_path.to_string_lossy(),
+            &v_path.to_string_lossy(),
+        ])
+        .output()
+        .context("spawning iverilog")?;
+    if !compile.status.success() {
+        let err = String::from_utf8_lossy(&compile.stderr);
+        anyhow::bail!("iverilog rejected generated Verilog:\n{}", err.trim());
+    }
+
+    let sim = std::process::Command::new("vvp")
+        .arg(&vvp_path)
+        .output()
+        .context("spawning vvp")?;
+    let stdout = String::from_utf8_lossy(&sim.stdout);
+    let stderr = String::from_utf8_lossy(&sim.stderr);
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+    if !sim.status.success() {
+        anyhow::bail!("vvp simulation exited with non-zero status");
+    }
+    if stdout.lines().any(|l| {
+        (l.starts_with("[TEST]") || l.starts_with("[BENCH]")) && l.contains(": FAILED")
+    }) {
+        anyhow::bail!("Icarus simulation reported test/bench failures");
+    }
+    Ok(())
+}
+
+/// W534: run the structural Icarus-lowerability classifier on a single spec and
+/// print a machine-readable verdict.
+fn run_icarus_lowerable(input_path: &str, json: bool) -> anyhow::Result<()> {
+    let source = fs::read_to_string(input_path)
+        .with_context(|| format!("failed to read {}", input_path))?;
+    let verdict = compiler::Compiler::is_icarus_lowerable(&source);
+    let lowerable = match &verdict {
+        Ok(v) => *v,
+        Err(_) => false,
+    };
+    if json {
+        let value = serde_json::json!({
+            "path": input_path,
+            "lowerable": lowerable,
+            "reason": verdict.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        if lowerable {
+            println!("lowerable");
+        } else {
+            let reason = verdict.as_ref().err().map(|e| e.to_string()).unwrap_or_else(|| "not lowerable".to_string());
+            println!("not_lowerable: {}", reason);
+        }
+    }
+    Ok(())
+}
+
+/// W536: locate a Python interpreter that can import cocotb. Falls back to
+/// plain ``python3`` and direct iverilog/vvp mode if cocotb is not available.
+fn find_cocotb_python() -> (String, bool) {
+    if let Ok(python) = std::env::var("T27_COCOTB_PYTHON") {
+        let has_cocotb = std::process::Command::new(&python)
+            .args(["-c", "import cocotb"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        return (python, has_cocotb);
+    }
+    for python in ["python3", "python"] {
+        let has_cocotb = std::process::Command::new(python)
+            .args(["-c", "import cocotb"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if has_cocotb {
+            return (python.to_string(), true);
+        }
+    }
+    ("python3".to_string(), false)
+}
+
+/// W536: locate ``scripts/cocotb_ref_model.py`` relative to the repo root.
+fn find_cocotb_ref_model_script() -> anyhow::Result<PathBuf> {
+    let from_cwd = std::env::current_dir()
+        .ok()
+        .map(|d| d.join("scripts").join("cocotb_ref_model.py"));
+    if let Some(p) = from_cwd {
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    let from_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            // target/release/t27c  ->  repo root
+            exe.parent().and_then(|d| d.parent()).map(|root| {
+                root.join("scripts").join("cocotb_ref_model.py")
+            })
+        });
+    if let Some(p) = from_exe {
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    anyhow::bail!("could not find scripts/cocotb_ref_model.py; run t27c from the repo root")
+}
+
+/// W536: generate self-checking Verilog, dump the AST as JSON, and run the
+/// Python reference-model cross-check.
+fn run_icarus_cocotb(input_path: &str) -> anyhow::Result<()> {
+    let path = Path::new(input_path);
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", input_path))?;
+    typecheck_gate(path, &source)?;
+
+    let ast = compiler::Compiler::parse_ast(&source)
+        .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+    let verilog = compiler::Compiler::compile_verilog_for_simulation_at(&source, path)
+        .map_err(|e| anyhow::anyhow!("Verilog generation error: {}", e))?;
+
+    // The generated Verilog may use a synthetic module name when the source
+    // lacks an explicit ``module`` declaration, so take the top module name
+    // from the emitted text rather than the AST.
+    let top_module = extract_module_name_from_verilog(&verilog);
+
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "cocotb".to_string());
+    let tmp = std::env::temp_dir().join(format!(
+        "t27c_cocotb_{}_{}", name, std::process::id()));
+    fs::create_dir_all(&tmp)
+        .with_context(|| format!("creating temp directory {}", tmp.display()))?;
+
+    let v_path = tmp.join("DUT.v");
+    let ast_path = tmp.join("ast.json");
+    fs::write(&v_path, verilog)
+        .with_context(|| format!("writing temporary Verilog {}", v_path.display()))?;
+    fs::write(&ast_path, serde_json::to_string_pretty(&ast)?)
+        .with_context(|| format!("writing temporary AST JSON {}", ast_path.display()))?;
+
+    let script = find_cocotb_ref_model_script()?;
+    let (python, has_cocotb) = find_cocotb_python();
+
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script)
+        .arg("--ast-json")
+        .arg(&ast_path)
+        .arg("--verilog")
+        .arg(&v_path)
+        .arg("--top-module")
+        .arg(&top_module);
+    if has_cocotb {
+        cmd.arg("--use-cocotb");
+    }
+
+    let out = cmd.output().context("spawning cocotb reference model")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+    if !out.status.success() {
+        anyhow::bail!("cocotb reference-model cross-check failed for {}", input_path);
+    }
+    Ok(())
+}
+
+fn load_sva_behaviors(sva_behaviors: Option<&str>) -> anyhow::Result<Vec<behavior_sva::Behavior<'static>>> {
+    match sva_behaviors {
+        Some(path) => {
+            let json_str = fs::read_to_string(path)
+                .with_context(|| format!("failed to read SVA behaviors JSON from {}", path))?;
+            let behaviors_json: Vec<BehaviorJson> = serde_json::from_str(&json_str)
+                .with_context(|| "failed to parse SVA behaviors JSON")?;
+            Ok(behaviors_json
+                .into_iter()
+                .map(|b| behavior_sva::Behavior {
+                    name: Box::leak(b.name.into_boxed_str()),
+                    given: Box::leak(b.given.into_boxed_str()),
+                    when: Box::leak(b.when.into_boxed_str()),
+                    then: Box::leak(b.then.into_boxed_str()),
+                })
+                .collect())
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn extract_module_name_from_verilog(verilog: &str) -> String {
+    for line in verilog.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("module ") {
+            if let Some(name) = trimmed.strip_prefix("module ").and_then(|s| s.split_whitespace().next()) {
+                return name.trim_end_matches('(').to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Wave 32 (R-TS-1): emit the balanced-ternary HW primitive library.
+/// Writes the full trit stdlib (7 modules) to `output` if provided, otherwise
+/// to stdout. Pure additive surface -- does not parse or touch any .t27 spec.
+/// See bootstrap/src/trit_stdlib.rs for the emitter and per-module truth tables.
+fn run_gen_trit_stdlib(output: Option<&str>) -> anyhow::Result<()> {
+    let verilog = trit_stdlib::build_trit_stdlib_verilog();
+    match output {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory for {}", path)
+                    })?;
+                }
+            }
+            fs::write(path, &verilog)
+                .with_context(|| format!("failed to write trit stdlib to {}", path))?;
+            eprintln!("trit stdlib written to {} ({} bytes)", path, verilog.len());
+        }
+        None => print!("{}", verilog),
+    }
+    Ok(())
+}
+
+fn run_gen_behavior_sva(
+    name: &str,
+    given: &str,
+    when: &str,
+    then: &str,
+    index: usize,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let behavior = behavior_sva::Behavior {
+        name,
+        given,
+        when,
+        then,
+    };
+    // build_behavior_sva_file always uses 0-based enumerate indexing. For the
+    // CLI we honour --index by splicing the user-indexed block in place of the
+    // auto-indexed one so the timescale/nettype band is preserved.
+    let wrapped = behavior_sva::build_behavior_sva_file(std::slice::from_ref(&behavior));
+    let auto_block = behavior_sva::build_behavior_sva_block(&behavior, 0);
+    let user_block = behavior_sva::build_behavior_sva_block(&behavior, index);
+    let verilog = wrapped.replace(&auto_block, &user_block);
+    match output {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory for {}", path)
+                    })?;
+                }
+            }
+            fs::write(path, &verilog)
+                .with_context(|| format!("failed to write behavior SVA to {}", path))?;
+            eprintln!("behavior SVA written to {} ({} bytes)", path, verilog.len());
+        }
+        None => print!("{}", verilog),
+    }
+    Ok(())
+}
+
+fn run_gen_pipeline_stage2(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_pipeline::build_pipeline_stage2(module_name);
+    write_verilog_to_output(&verilog, output, "pipeline_stage2")
+}
+
+fn run_gen_double_buffer_ctrl(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_buffers::build_double_buffer_ctrl(module_name);
+    write_verilog_to_output(&verilog, output, "double_buffer_ctrl")
+}
+
+fn run_gen_weight_prefetch_ctrl(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_buffers::build_weight_prefetch_ctrl(module_name);
+    write_verilog_to_output(&verilog, output, "weight_prefetch_ctrl")
+}
+
+fn run_gen_axi_lite_slave(
+    module_name: &str,
+    addr_width: u32,
+    data_width: u32,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_axi::build_axi_lite_slave(module_name, addr_width, data_width);
+    write_verilog_to_output(&verilog, output, "axi_lite_slave")
+}
+
+fn run_gen_dma_controller(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_dma::build_dma_controller(module_name);
+    write_verilog_to_output(&verilog, output, "dma_controller")
+}
+
+fn run_gen_interrupt_controller(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_irq::build_interrupt_controller(module_name);
+    write_verilog_to_output(&verilog, output, "interrupt_controller")
+}
+
+fn run_gen_bitnet_engine_top(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_top::build_bitnet_engine_top(module_name);
+    write_verilog_to_output(&verilog, output, "bitnet_engine_top")
+}
+
+fn run_gen_bitnet_bundle(
+    top_name: &str,
+    axi_addr_width: u32,
+    axi_data_width: u32,
+    output_dir: &str,
+) -> anyhow::Result<()> {
+    let cfg = bitnet_bundle::BundleConfig {
+        top_name,
+        axi_addr_width,
+        axi_data_width,
+    };
+    let dir = std::path::Path::new(output_dir);
+    let written = bitnet_bundle::write_bundle(&cfg, dir)
+        .with_context(|| format!("failed to write BitNet HLS bundle to {}", output_dir))?;
+    eprintln!(
+        "BitNet HLS bundle: wrote {} files to {}",
+        written.len(),
+        output_dir
+    );
+    for path in &written {
+        eprintln!("  {}", path.display());
+    }
+    Ok(())
+}
+
+fn run_host_smoke(
+    num_layers: u32,
+    neurons: u32,
+    chunks: u32,
+    threshold: u32,
+    weight_addr: u64,
+    max_polls: u32,
+) -> anyhow::Result<()> {
+    use host::{BitnetDriver, MockMmio};
+    let mut driver = BitnetDriver::new(MockMmio::with_csrs_zeroed());
+    driver
+        .configure(num_layers, neurons, chunks, threshold, weight_addr)
+        .map_err(|e| anyhow::anyhow!("configure failed: {:?}", e))?;
+    driver.enable_irqs(host::csr_map::IRQ_ALL_MASK);
+    driver.start();
+    // Simulate hardware completing the inference immediately for the smoke
+    // test: latch `done` and the inference_done IRQ before polling.
+    driver.mmio_mut().set_done(true);
+    driver.mmio_mut().latch_irq(host::csr_map::IRQ_INFERENCE_DONE_MASK);
+    driver
+        .wait_done(max_polls)
+        .map_err(|e| anyhow::anyhow!("wait_done failed: {:?}", e))?;
+    let snap = driver.dump();
+    let w = driver.mmio().write_count();
+    let r = driver.mmio().read_count();
+    println!(
+        "OK {}w/{}r layers={} neurons={} chunks={} threshold={} weight_addr=0x{:016x} irq_stat=0x{:08x}",
+        w,
+        r,
+        snap.num_layers,
+        snap.neurons,
+        snap.chunks,
+        snap.threshold,
+        snap.weight_addr_64(),
+        snap.irq_stat
+    );
+    Ok(())
+}
+
+fn run_host_poll_vs_irq(
+    num_layers: u32,
+    neurons: u32,
+    chunks: u32,
+    threshold: u32,
+    weight_addr: u64,
+    max_polls: u32,
+) -> anyhow::Result<()> {
+    use host::{BitnetDriver, IrqDrivenDriver, IrqHandler, IrqSource, MockMmio};
+
+    // -- Path A: classic busy-poll completion ---------------------------
+    let mut d_poll = BitnetDriver::new(MockMmio::with_csrs_zeroed());
+    d_poll
+        .configure(num_layers, neurons, chunks, threshold, weight_addr)
+        .map_err(|e| anyhow::anyhow!("poll configure failed: {:?}", e))?;
+    d_poll.enable_irqs(host::csr_map::IRQ_ALL_MASK);
+    d_poll.start();
+    d_poll.mmio_mut().set_done(true);
+    d_poll.mmio_mut().latch_irq(host::csr_map::IRQ_INFERENCE_DONE_MASK);
+    d_poll
+        .wait_done(max_polls)
+        .map_err(|e| anyhow::anyhow!("poll wait_done failed: {:?}", e))?;
+    let snap_poll = d_poll.dump();
+    let poll_w = d_poll.mmio().write_count();
+    let poll_r = d_poll.mmio().read_count();
+
+    // -- Path B: IRQ-driven completion ----------------------------------
+    fn noop() {}
+    let mut d_irq = IrqDrivenDriver::new(
+        BitnetDriver::new(MockMmio::with_csrs_zeroed()),
+        IrqHandler::new(),
+    );
+    d_irq.handler_mut().register(IrqSource::InferenceDone, noop);
+    d_irq.handler_mut().register(IrqSource::Error, noop);
+    d_irq
+        .driver_mut()
+        .configure(num_layers, neurons, chunks, threshold, weight_addr)
+        .map_err(|e| anyhow::anyhow!("irq configure failed: {:?}", e))?;
+    d_irq.driver_mut().enable_irqs(host::csr_map::IRQ_ALL_MASK);
+    d_irq.driver_mut().start();
+    d_irq
+        .driver_mut()
+        .mmio_mut()
+        .latch_irq(host::csr_map::IRQ_INFERENCE_DONE_MASK);
+    d_irq
+        .wait_done_irq(max_polls)
+        .map_err(|e| anyhow::anyhow!("irq wait_done_irq failed: {:?}", e))?;
+    let snap_irq = d_irq.driver_mut().dump();
+    let irq_w = d_irq.driver().mmio().write_count();
+    let irq_r = d_irq.driver().mmio().read_count();
+
+    let writes_match = poll_w == irq_w;
+    let csr_match = snap_poll.num_layers == snap_irq.num_layers
+        && snap_poll.neurons == snap_irq.neurons
+        && snap_poll.chunks == snap_irq.chunks
+        && snap_poll.threshold == snap_irq.threshold
+        && snap_poll.weight_addr_64() == snap_irq.weight_addr_64();
+
+    println!(
+        "OK poll={}w/{}r irq={}w/{}r writes_match={} csr_match={} irq_stat_poll=0x{:08x} irq_stat_irq=0x{:08x}",
+        poll_w, poll_r, irq_w, irq_r, writes_match, csr_match, snap_poll.irq_stat, snap_irq.irq_stat
+    );
+    Ok(())
+}
+
+fn run_tt_manifest(
+    chip_str: &str,
+    output: Option<&str>,
+    commit: Option<&str>,
+    build_time: Option<&str>,
+    sva_count: u32,
+) -> anyhow::Result<()> {
+    use tt_manifest::{AxiWidths, TtChip, TtManifest};
+
+    let chip = TtChip::from_str(chip_str)
+        .map_err(|e| anyhow::anyhow!("--chip parse error: {}", e))?;
+
+    let commit_owned: String = match commit {
+        Some(c) => c.to_string(),
+        None => std::env::var("T27_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+    };
+
+    let build_time_owned: String = match build_time {
+        Some(t) => t.to_string(),
+        None => chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+
+    let manifest = TtManifest::new(
+        &commit_owned,
+        chip,
+        TtManifest::canonical_modules(),
+        AxiWidths::canonical(),
+        sva_count,
+        &build_time_owned,
+    );
+
+    let json = manifest
+        .to_json()
+        .map_err(|e| anyhow::anyhow!("manifest serialization failed: {}", e))?;
+
+    match output {
+        None | Some("-") => {
+            println!("{}", json);
+        }
+        Some(path) => {
+            std::fs::write(path, &json)
+                .with_context(|| format!("writing tt-manifest to {}", path))?;
+            eprintln!("OK tt-manifest chip={} bytes={} -> {}", chip.slug(), json.len(), path);
+        }
+    }
+    Ok(())
+}
+
+fn run_tt_profile(platform_str: &str, output: Option<&str>) -> anyhow::Result<()> {
+    use tt_profile::{TtPlatform, TtPlatformProfile};
+
+    let platform = TtPlatform::from_str(platform_str)
+        .map_err(|e| anyhow::anyhow!("--platform parse error: {}", e))?;
+    let profile = TtPlatformProfile::canonical_for(platform);
+    let json = profile
+        .to_json()
+        .map_err(|e| anyhow::anyhow!("profile serialization failed: {}", e))?;
+
+    match output {
+        None | Some("-") => println!("{}", json),
+        Some(path) => {
+            std::fs::write(path, &json)
+                .with_context(|| format!("writing tt-profile to {}", path))?;
+            eprintln!("OK tt-profile platform={} bytes={} -> {}", platform.slug(), json.len(), path);
+        }
+    }
+    Ok(())
+}
+
+fn run_tt_conform(profile_path: &str, manifest_path: &str, verbose: bool) -> anyhow::Result<()> {
+    use tt_manifest::TtManifest;
+    use tt_profile::TtPlatformProfile;
+
+    let p_text = std::fs::read_to_string(profile_path)
+        .with_context(|| format!("reading profile {}", profile_path))?;
+    let m_text = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading manifest {}", manifest_path))?;
+    let profile = TtPlatformProfile::from_json(&p_text)
+        .map_err(|e| anyhow::anyhow!("profile parse error: {}", e))?;
+    let manifest = TtManifest::from_json(&m_text)
+        .map_err(|e| anyhow::anyhow!("manifest parse error: {}", e))?;
+
+    let verdict = profile.check_manifest(&manifest);
+    println!("OK conform={} reasons={}", verdict.ok, verdict.reasons.len());
+    if verbose {
+        let j = verdict.to_json().map_err(|e| anyhow::anyhow!("verdict serialize failed: {}", e))?;
+        println!("{}", j);
+    }
+    if !verdict.ok {
+        for r in &verdict.reasons {
+            eprintln!("reason: {}", r);
+        }
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_gen_tt_debug_wrapper(
+    manifest_path: &str,
+    inner: Option<&str>,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    use tt_debug::TtDebugWrapper;
+    use tt_manifest::TtManifest;
+
+    let m_text = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading manifest {}", manifest_path))?;
+    let manifest = TtManifest::from_json(&m_text)
+        .map_err(|e| anyhow::anyhow!("manifest parse error: {}", e))?;
+    let inner_name = inner.unwrap_or("bitnet_engine_top");
+    let wrapper = TtDebugWrapper::new(inner_name, &manifest);
+    let verilog = wrapper.emit();
+    write_verilog_to_output(&verilog, output, "tt_debug_wrapper")
+}
+
+fn run_gen_layer_sequencer(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = bitnet_pipeline::build_layer_sequencer(module_name);
+    write_verilog_to_output(&verilog, output, "layer_sequencer")
+}
+
+fn write_verilog_to_output(
+    verilog: &str,
+    output: Option<&str>,
+    label: &str,
+) -> anyhow::Result<()> {
+    match output {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory for {}", path)
+                    })?;
+                }
+            }
+            fs::write(path, verilog)
+                .with_context(|| format!("failed to write {} to {}", label, path))?;
+            eprintln!("{} written to {} ({} bytes)", label, path, verilog.len());
+        }
+        None => print!("{}", verilog),
+    }
+    Ok(())
+}
+
+fn run_gen_weight_bram(
+    depth: u32,
+    addr_width: u32,
+    data_width: u32,
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = weight_bram::build_weight_bram(weight_bram::WeightBramConfig {
+        depth,
+        addr_width,
+        data_width,
+        module_name,
+    });
+    match output {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory for {}", path)
+                    })?;
+                }
+            }
+            fs::write(path, &verilog)
+                .with_context(|| format!("failed to write weight_bram to {}", path))?;
+            eprintln!("weight_bram written to {} ({} bytes)", path, verilog.len());
+        }
+        None => print!("{}", verilog),
+    }
+    Ok(())
+}
+
+fn run_gen_phi_selfcheck(
+    tolerance: f64,
+    wrap: Option<&str>,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let verilog = match wrap {
+        Some(module_name) => phi_selfcheck::build_phi_selfcheck_module(module_name, tolerance),
+        None => phi_selfcheck::build_phi_selfcheck(tolerance),
+    };
+    match output {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory for {}", path)
+                    })?;
+                }
+            }
+            fs::write(path, &verilog)
+                .with_context(|| format!("failed to write phi selfcheck to {}", path))?;
+            eprintln!("phi selfcheck written to {} ({} bytes)", path, verilog.len());
+        }
+        None => print!("{}", verilog),
+    }
+    Ok(())
+}
+
+fn run_gen_testbench(input_path: &str, period_ns: u32, max_cycles: u32, output: Option<&str>) -> anyhow::Result<()> {
+    let path = Path::new(input_path);
+    let source = fs::read_to_string(path)?;
+    typecheck_gate(path, &source)?;
+
+    let ast = compiler::Compiler::parse_ast(&source)
+        .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+
+    // #5978: the DUT name must match the HIR module line, which sanitizes the
+    // name (a dotted `sandbox.health` is not a Verilog identifier).
+    let module_name = if !ast.name.is_empty() {
+        compiler::VerilogCodegen::sanitize_identifier(&ast.name)
+    } else {
+        "dut".to_string()
+    };
+    let mut tb = compiler::HirTestbench::new(&module_name, max_cycles, period_ns);
+
+    for node in &ast.children {
+        if node.kind == compiler::NodeKind::ConstDecl {
+            if node.extra_mutable {
+                tb.probe(&node.name);
+            }
+        }
+    }
+
+    let verilog = tb.emit_verilog();
+    match output {
+        Some(out) => fs::write(out, &verilog)?,
+        None => print!("{}", verilog),
     }
     Ok(())
 }
@@ -1765,13 +3404,93 @@ fn run_gen_c(input_path: &str) -> anyhow::Result<()> {
 }
 
 fn run_gen_rust(input_path: &str) -> anyhow::Result<()> {
+    print!("{}", gen_resolved(input_path, compiler::Compiler::compile_rust)?);
+    Ok(())
+}
+
+/// Get a spec into an AST the declaration backends can walk, and hand back the
+/// display name they put in the generated file's header.
+/// `use` resolution runs first, as it does for gen-c and gen-rust: it is
+/// backend-agnostic, and a backend that skips it silently drops every imported
+/// declaration.
+/// It is one function because `gen-js` and `gen-ts` must fail on the same
+/// inputs. Two copies of this would be two answers to "did the imports land?"
+/// for one spec, and the second copy is where the fallback below gets forgotten.
+fn ast_for_codegen(input_path: &str) -> anyhow::Result<(compiler::Node, String)> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)?;
 
-    match compiler::Compiler::compile_rust(&source) {
-        Ok(rust_code) => print!("{}", rust_code),
-        Err(e) => anyhow::bail!("Compile error: {}", e),
+/// `gen-js`: print the spec's declarations as a JavaScript ES module.
+/// Our MCP servers run on JavaScript, and until this existed a .t27 spec that
+/// described one had no way to reach them -- so each such spec grew a
+/// hand-written generator in a foreign language beside it, and that generator,
+/// not the compiler, decided what the artifact said.
+fn run_gen_js(input_path: &str) -> anyhow::Result<()> {
+    let (ast, name) = ast_for_codegen(input_path)?;
+    match codegen_js::generate(&ast, &name) {
+        Ok(code) => {
+            print!("{}", code);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("{}", e),
     }
+}
+
+/// `gen-ts`: the same declarations, with the types the spec declared for them.
+/// `gen-js` closed the hole where a hand-written generator decided what the
+/// artifact said. It left a smaller one: a `.t27` declaration carries a type,
+/// an ES module has nowhere to put it, and a `.d.ts` written by hand beside the
+/// output would be that same deciding-generator one file over. This prints the
+/// types from the spec, so there is nothing left to hand-write.
+fn run_gen_ts(input_path: &str) -> anyhow::Result<()> {
+    let (ast, name) = ast_for_codegen(input_path)?;
+    match codegen_ts::generate(&ast, &name) {
+        Ok(code) => {
+            print!("{}", code);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("{}", e),
+    }
+}
+
+/// `gen-python`: the same declarations, in the language the analysis harnesses
+/// around this repo actually run. Every Python script that needed a spec's
+/// constants was reading them from a hand-maintained copy -- the deciding-
+/// generator hole `gen-js` closed, back again one language over. This prints
+/// the module from the spec, so the copy does not exist.
+fn run_gen_python(input_path: &str) -> anyhow::Result<()> {
+    let (ast, name) = ast_for_codegen(input_path)?;
+    match codegen_python::generate(&ast, &name) {
+        Ok(code) => {
+            print!("{}", code);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("{}", e),
+    }
+}
+
+/// `gen-json` (#10050): the IGLA board event a spec states, as one JSON object. Every value comes
+/// through the gen-js layer, which spells it as JSON does; this only arranges them, cells zipped.
+fn run_gen_json(input_path: &str) -> anyhow::Result<()> {
+    let (ast, _) = ast_for_codegen(input_path)?;
+    let scope = codegen_js::Bound::in_spec(&ast);
+    let v = |name: &str| -> anyhow::Result<String> {
+        let found = ast.children.iter().find(|n| n.kind == compiler::NodeKind::ConstDecl && n.name == name);
+        let node = found.ok_or_else(|| anyhow::anyhow!("gen-json: the spec declares no const {name}"))?;
+        codegen_js::const_value(&codegen_js::JS, node, &scope).map_err(anyhow::Error::msg)
+    };
+    let items = |name: &str| -> anyhow::Result<Vec<String>> {
+        let s = v(name)?;
+        Ok(s.trim_matches(|c| c == '[' || c == ']').split(", ").map(String::from).collect())
+    };
+    let (status, pct) = (items("CELL_STATUS")?, items("CELL_PCT")?);
+    anyhow::ensure!(status.len() == pct.len(), "gen-json: {} statuses, {} percents", status.len(), pct.len());
+    let (ks, kp) = (v("KEY_STATUS")?, v("KEY_PCT")?);
+    let cells: Vec<_> = status.iter().zip(&pct).map(|(s, p)| format!("{{{ks}:{s},{kp}:{p}}}")).collect();
+    let lens = items("LENS_PCT")?.join(",");
+    let metrics = format!("{{{}:[{lens}],{}:[{}]}}", v("KEY_LENS")?, v("KEY_CELLS")?, cells.join(","));
+    let (job, stage, msg, progress) = (v("JOB")?, v("STAGE")?, v("MSG")?, v("PROGRESS")?);
+    println!("{{\"job\":{job},\"stage\":{stage},\"msg\":{msg},\"progress\":{progress},\"metrics\":{metrics}}}");
     Ok(())
 }
 
@@ -1891,9 +3610,45 @@ fn compute_seal_hashes(input_path: &str) -> anyhow::Result<SealHashes> {
     })
 }
 
-/// Path to the seal JSON file for a given module
-fn seal_file_path(module: &str) -> std::path::PathBuf {
-    Path::new(".trinity").join("seals").join(format!("{}.json", module))
+/// The `spec_path` a seal records: relative to the working directory, which is
+/// the directory `.trinity/seals` resolves against, with `/` separators.
+/// #6913: the path used to be recorded as typed. `t27c seal --save` given an
+/// absolute path committed three seals (#6789) naming the sealing agent's own
+/// worktree, which every checker then found dangling; and the twin refresh in
+/// `run_seal`, which matches `spec_path` by string, skipped the repo-relative
+/// twins without a word. A spec outside the working directory is refused: its
+/// seal would land in this store under a path no checker here can open.
+fn seal_spec_path(input_path: &str) -> anyhow::Result<String> {
+    use std::path::Component;
+    let path = Path::new(input_path);
+    let plain = path
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    let rel: std::path::PathBuf = if plain {
+        path.components()
+            .filter(|c| *c != Component::CurDir)
+            .collect()
+    } else {
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        let full = path
+            .canonicalize()
+            .with_context(|| format!("resolving {}", input_path))?;
+        match full.strip_prefix(&cwd) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => anyhow::bail!(
+                "{} is outside the working directory {}: a seal records its spec relative to \
+                 the directory .trinity/seals resolves against, so run t27c seal from the \
+                 repository root that holds this spec",
+                input_path,
+                cwd.display()
+            ),
+        }
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    Ok(parts.join("/"))
 }
 
 fn run_seal(input_path: &str, save: bool, verify: bool) -> anyhow::Result<()> {
@@ -2563,6 +4318,1710 @@ fn run_typecheck(input_path: &str, json: bool) -> anyhow::Result<()> {
             println!("  - {}", err);
         }
     }
+    Ok(())
+}
+
+fn run_validate_seals(pr_files: &str) -> Result<(), anyhow::Error> {
+    let files: Vec<&str> = pr_files.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if files.is_empty() {
+        println!("No spec files to validate.");
+        return Ok(());
+    }
+    println!("Validating seals for {} spec files...", files.len());
+    let mut failures = 0;
+    for spec_path in &files {
+        let path = std::path::Path::new(spec_path);
+        if !path.exists() {
+            println!("  SKIP {} (not found)", spec_path);
+            continue;
+        }
+        match compute_seal_hashes(spec_path) {
+            Ok(current) => {
+                let seal_path = seal_file_path(&current.module, spec_path);
+                if seal_path.exists() {
+                    let saved_data = std::fs::read_to_string(&seal_path)
+                        .with_context(|| format!("reading seal {}", seal_path.display()))?;
+                    let saved: serde_json::Value = serde_json::from_str(&saved_data)
+                        .with_context(|| format!("parsing seal {}", seal_path.display()))?;
+                    let saved_hash = saved.get("spec_hash").and_then(|v| v.as_str()).unwrap_or("");
+                    if saved_hash == current.spec_hash {
+                        println!("  OK {} (seal match)", spec_path);
+                    } else {
+                        eprintln!("  FAIL {} (seal mismatch)", spec_path);
+                        failures += 1;
+                    }
+                } else {
+                    println!("  SKIP {} (no saved seal at {})", spec_path, seal_path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("  FAIL {} (compute error: {})", spec_path, e);
+                failures += 1;
+            }
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{} seal validation failures", failures);
+    }
+    println!("Seal validation passed for all {} files.", files.len());
+    Ok(())
+}
+
+fn run_validate_phi_identity() -> Result<(), anyhow::Error> {
+    let phi: f64 = (1.0 + 5.0_f64.sqrt()) / 2.0;
+    let phi_sq = phi * phi;
+    let phi_inv_sq = 1.0 / (phi * phi);
+    let identity = phi_sq + phi_inv_sq;
+    let tolerance = 1e-10;
+    if (identity - 3.0).abs() < tolerance {
+        println!("L5 PHI-IDENTITY CHECK PASSED: phi^2 + phi^-2 = {:.15} (delta = {:.2e})", identity, (identity - 3.0).abs());
+        Ok(())
+    } else {
+        anyhow::bail!("L5 PHI-IDENTITY CHECK FAILED: phi^2 + phi^-2 = {:.15} (expected 3.0, delta = {:.2e})", identity, (identity - 3.0).abs())
+    }
+}
+
+/// Synthesis-in-the-loop gate.
+/// `synth-readiness` scans specs statically (parse / typecheck / gen succeeded).
+/// That is exactly the measurement the literature warns is optimistic: Fu et al.,
+/// "Synthesis-in-the-Loop Evaluation of LLMs for RTL Generation" (arXiv:2603.11287),
+/// report that simulation-level pass rates materially overstate true hardware
+/// readiness, because code can simulate and still fail to synthesize.
+/// This gate closes that gap for t27's own backend: it emits Verilog for each
+/// spec and then actually invokes yosys `synth_xilinx`, reporting the fraction
+/// that survives to a gate-level netlist along with the cell count.
+fn run_synth_gate(
+    repo_root: &Path,
+    specs_dir: &str,
+    arch: &str,
+    min_pass_rate: Option<f64>,
+    yosys: &str,
+) -> anyhow::Result<()> {
+    let dir = repo_root.join(specs_dir);
+    if !dir.is_dir() {
+        anyhow::bail!("not a directory: {}", dir.display());
+    }
+    let t27c = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("t27c"));
+
+    let mut specs: Vec<PathBuf> = walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |x| x == "t27"))
+        .filter(|e| !e.path().to_string_lossy().contains("testbench"))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    specs.sort();
+
+    let work = repo_root.join("build/synth-gate");
+    fs::create_dir_all(&work).context("create build/synth-gate")?;
+
+    println!("=== Synthesis-in-the-loop gate: {} ===", dir.display());
+    println!("Emitting Verilog, then running `{} synth_xilinx -arch {}` on each.\n", yosys, arch);
+    println!("{:<48} {:>10} {:>10}", "spec", "gen", "synth");
+
+    let (mut gen_ok, mut synth_ok, mut total) = (0usize, 0usize, 0usize);
+    let (mut hollow, mut with_logic) = (0usize, 0usize);
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    for spec in &specs {
+        total += 1;
+        let stem = spec.file_stem().and_then(|s| s.to_str()).unwrap_or("spec");
+        let vpath = work.join(format!("{}.v", stem));
+        let rel = spec.strip_prefix(repo_root).unwrap_or(spec).display().to_string();
+        let short = if rel.len() > 46 { rel[rel.len() - 46..].to_string() } else { rel.clone() };
+
+        // Stage 1 -- emit Verilog.
+        let vfile = match fs::File::create(&vpath) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("{:<48} {:>10} {:>10}", short, "IO-ERR", "-");
+                failures.push((rel, format!("create output: {}", e)));
+                continue;
+            }
+        };
+        let gen = std::process::Command::new(&t27c)
+            .arg("gen-verilog")
+            .arg(spec)
+            .stdout(vfile)
+            .stderr(std::process::Stdio::null())
+            .status();
+        let gen_good = matches!(gen, Ok(s) if s.success())
+            && fs::metadata(&vpath).map(|m| m.len() > 0).unwrap_or(false);
+        if !gen_good {
+            println!("{:<48} {:>10} {:>10}", short, "FAIL", "-");
+            failures.push((rel, "gen-verilog failed or produced no output".to_string()));
+            continue;
+        }
+        gen_ok += 1;
+
+        // Stage 2 -- real synthesis.
+        let script = format!(
+            "read_verilog -sv {}; synth_xilinx -abc9 -nocarry -arch {}; stat",
+            vpath.display(),
+            arch
+        );
+        let out = std::process::Command::new(yosys)
+            .arg("-p")
+            .arg(&script)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                synth_ok += 1;
+                // "Synthesized" is not the same as "produced hardware". A spec
+                // whose functions are emitted but never instantiated yields a
+                // netlist of $print cells and I/O buffers that yosys reports as
+                // 0 logic cells. Counting that as a success is exactly the kind
+                // of overstatement this gate exists to prevent.
+                let text = String::from_utf8_lossy(&o.stdout);
+                let lcs = text
+                    .lines()
+                    .rev()
+                    .find_map(|l| {
+                        let t = l.trim();
+                        t.strip_prefix("Estimated number of LCs:")
+                            .and_then(|n| n.trim().parse::<u64>().ok())
+                    })
+                    .unwrap_or(0);
+                if lcs == 0 {
+                    hollow += 1;
+                    println!("{:<48} {:>10} {:>10}  {}", short, "ok", "ok", "HOLLOW (0 logic cells)");
+                } else {
+                    with_logic += 1;
+                    println!("{:<48} {:>10} {:>10}  {} LC", short, "ok", "ok", lcs);
+                }
+            }
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let first = err
+                    .lines()
+                    .find(|l| l.contains("ERROR"))
+                    .unwrap_or("synthesis failed")
+                    .trim()
+                    .to_string();
+                println!("{:<48} {:>10} {:>10}", short, "ok", "FAIL");
+                failures.push((rel, first));
+            }
+            Err(e) => {
+                println!("{:<48} {:>10} {:>10}", short, "ok", "NO-YOSYS");
+                failures.push((rel, format!("cannot run {}: {}", yosys, e)));
+            }
+        }
+    }
+
+    let rate = if total > 0 { synth_ok as f64 / total as f64 } else { 0.0 };
+    println!(
+        "\nTOTAL {} specs: gen-verilog ok {} ({:.1}%), synthesized {} ({:.1}%)",
+        total,
+        gen_ok,
+        if total > 0 { 100.0 * gen_ok as f64 / total as f64 } else { 0.0 },
+        synth_ok,
+        100.0 * rate
+    );
+    println!(
+        "  of those synthesized: {} produced logic, {} are HOLLOW (0 logic cells)",
+        with_logic, hollow
+    );
+    if hollow > 0 {
+        println!(
+            "\nA HOLLOW result means yosys accepted the Verilog and emitted a netlist with\n\
+             ZERO logic cells -- typically the spec's functions are emitted as Verilog\n\
+             `function` definitions that nothing instantiates, so synthesis optimises them\n\
+             away. Such a spec produces no hardware; do not count it as silicon-ready."
+        );
+    }
+
+    if !failures.is_empty() {
+        println!("\nFailures ({}):", failures.len());
+        for (path, why) in failures.iter().take(20) {
+            println!("  {} -- {}", path, why);
+        }
+        if failures.len() > 20 {
+            println!("  ... and {} more", failures.len() - 20);
+        }
+    }
+
+    println!(
+        "\nA spec that parses and generates is not a spec that synthesizes.\n\
+         Static readiness (`synth-readiness`) overstates hardware readiness --\n\
+         see Fu et al., arXiv:2603.11287."
+    );
+
+    if let Some(limit) = min_pass_rate {
+        if rate < limit {
+            anyhow::bail!(
+                "synthesis pass rate {:.1}% is below the required {:.1}%",
+                100.0 * rate,
+                100.0 * limit
+            );
+        }
+        println!("\nPASS: {:.1}% >= required {:.1}%", 100.0 * rate, 100.0 * limit);
+    }
+    Ok(())
+}
+
+/// Per-spec vacuity counts. A block is *vacuous* when every statement in it is
+/// `assert true`; an invariant is vacuous when its expression is the literal
+/// `true`. Such a check accepts every possible implementation, so it carries
+/// zero information about correctness while still satisfying L4 TESTABILITY by
+/// letter.
+#[derive(Default, Clone)]
+struct VacuityCounts {
+    tests_total: usize,
+    tests_vacuous: usize,
+    inv_total: usize,
+    inv_vacuous: usize,
+    /// Braceless `test name` followed by given/when/then. The parser creates a
+    /// TestBlock for these -- so they are COUNTED as tests -- but the backends
+    /// emit an empty body, so the assertion is discarded and the test always
+    /// passes. Verified in W555: a spec asserting `x == 999` where x is 2
+    /// generates `test "..." {}` and zig reports "All tests passed".
+    tests_bdd: usize,
+}
+
+/// Strip a `//` line comment, honouring nothing else -- `.t27` has no string
+/// literals containing `//` in test bodies, and a false strip would only make
+/// the scan more conservative (fewer blocks judged vacuous).
+fn strip_line_comment(line: &str) -> &str {
+    match line.find("//") {
+        Some(i) => &line[..i],
+        None => line,
+    }
+}
+
+/// True when the statement is exactly `assert true`, with optional semicolon.
+fn is_vacuous_stmt(stmt: &str) -> bool {
+    let s = stmt.trim().trim_end_matches(';').trim();
+    s == "assert true"
+}
+
+fn scan_vacuity(src: &str) -> VacuityCounts {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut c = VacuityCounts::default();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let line = strip_line_comment(raw);
+        let trimmed = line.trim_start();
+
+        let is_block = (trimmed.starts_with("test ") || trimmed.starts_with("bench "))
+            && line.contains('{');
+
+        // Braceless `test <name>` with a given/when/then body: counted by the
+        // parser, discarded by every backend.
+        if !is_block && trimmed.starts_with("test ") && !line.contains('{') {
+            let looks_bdd = lines
+                .iter()
+                .skip(i + 1)
+                .take(4)
+                .any(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("given ") || t.starts_with("when ") || t.starts_with("then ")
+                });
+            if looks_bdd {
+                c.tests_bdd += 1;
+            }
+        }
+
+        if is_block {
+            c.tests_total += 1;
+            // Walk to the matching close brace, collecting the body.
+            let mut depth: i32 =
+                line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            let mut body: Vec<String> = Vec::new();
+            let mut j = i;
+            while depth > 0 && j + 1 < lines.len() {
+                j += 1;
+                let b = strip_line_comment(lines[j]);
+                depth += b.matches('{').count() as i32 - b.matches('}').count() as i32;
+                body.push(b.to_string());
+            }
+            // Drop blanks and the trailing brace line, then decide.
+            let stmts: Vec<String> = body
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "}")
+                .collect();
+            if !stmts.is_empty() && stmts.iter().all(|s| is_vacuous_stmt(s)) {
+                c.tests_vacuous += 1;
+            }
+            i = j;
+        } else if trimmed.starts_with("invariant ") {
+            if let Some(colon) = line.find(':') {
+                c.inv_total += 1;
+                let expr = line[colon + 1..].trim().trim_end_matches(';').trim();
+                if expr == "true" || expr == "1 == 1" {
+                    c.inv_vacuous += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    c
+}
+
+/// Audit the seal store.
+/// A seal whose every `gen_hash_*` is "none" records that no backend produced
+/// output. Such a seal VERIFIES GREEN (none matches none) while certifying
+/// nothing -- it converts the integrity gate from a mismatch alarm into a
+/// rubber stamp. Wave 551 found 30 seals degraded that way, and the wave-loop
+/// that found them had caused all 30 itself by resealing unparseable specs.
+/// This also reports seals whose spec file has gone missing, and seals whose
+/// spec no longer generates any backend output (the live version of the same
+/// problem).
+fn run_seal_audit(repo_root: &Path, seals_dir: &str, strict: bool) -> anyhow::Result<()> {
+    let dir = repo_root.join(seals_dir);
+    if !dir.is_dir() {
+        anyhow::bail!("not a directory: {}", dir.display());
+    }
+
+    let mut total = 0usize;
+    let mut vacuous: Vec<String> = Vec::new();
+    let mut missing_spec: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    let mut healthy = 0usize;
+
+    // module name -> every spec carrying it, hashed. Needed because the fpga_*
+    // seals predate the spec_path field and carry only `module` -- and the module
+    // is the name DECLARED INSIDE the spec, exactly as compute_seal_hashes derives
+    // it. Filename matching is wrong twice over on this case-insensitive
+    // filesystem: fpga_Router paired with specs/server/router.t27 and reported a
+    // stale seal that was not stale.
+    let mut mod2: std::collections::HashMap<String, Vec<(PathBuf, String)>> =
+        std::collections::HashMap::new();
+    let mut stack = vec![repo_root.join("specs")];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("t27") {
+                let Ok(src) = fs::read_to_string(&p) else { continue };
+                let name = extract_module_name(&src).unwrap_or_else(|| {
+                    p.file_stem().unwrap_or_default().to_string_lossy().to_string()
+                });
+                let h = sha256_hex(src.as_bytes());
+                mod2.entry(name).or_default().push((p, h));
+            }
+        }
+    }
+
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    entries.sort();
+
+    for path in &entries {
+        total += 1;
+        let txt = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&txt) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("missing");
+        let gens = [
+            get("gen_hash_zig"),
+            get("gen_hash_verilog"),
+            get("gen_hash_c"),
+            get("gen_hash_rust"),
+        ];
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let spec_path = get("spec_path");
+
+        if gens.iter().all(|g| *g == "none") {
+            vacuous.push(format!("{}  ({})", name, spec_path));
+            continue;
+        }
+        if spec_path != "missing" && !repo_root.join(spec_path).exists() {
+            missing_spec.push(format!("{}  ({})", name, spec_path));
+            continue;
+        }
+        // STALENESS: does the sealed spec_hash still match the spec on disk?
+        // "healthy" used to mean only "not vacuous, file exists" -- two seals
+        // whose specs were edited 2 and 8 days AFTER sealing counted healthy.
+        let want = get("spec_hash");
+        let want = want.strip_prefix("sha256:").unwrap_or(want);
+        if want != "missing" && !want.is_empty() {
+            let cands: Vec<String> = if spec_path != "missing" {
+                fs::read_to_string(repo_root.join(spec_path))
+                    .map(|s| vec![sha256_hex(s.as_bytes())])
+                    .unwrap_or_default()
+            } else {
+                mod2.get(get("module"))
+                    .map(|v| v.iter().map(|(_, h)| h.clone()).collect())
+                    .unwrap_or_default()
+            };
+            if !cands.is_empty() && !cands.iter().any(|h| h == want) {
+                let whereat = if spec_path != "missing" {
+                    spec_path.to_string()
+                } else {
+                    mod2.get(get("module"))
+                        .and_then(|v| v.first())
+                        .map(|(p, _)| p.display().to_string())
+                        .unwrap_or_default()
+                };
+                stale.push(format!("{}  ({})", name, whereat));
+                continue;
+            }
+        }
+        healthy += 1;
+    }
+
+    println!("=== Seal audit: {} ===", dir.display());
+    println!("  seals total          : {}", total);
+    println!("  healthy              : {}", healthy);
+    println!("  VACUOUS (all 'none') : {}", vacuous.len());
+    println!("  spec file missing    : {}", missing_spec.len());
+    println!("  STALE (spec edited)  : {}", stale.len());
+
+    if !vacuous.is_empty() {
+        println!("\nVacuous seals -- every gen_hash is \"none\", so they verify green");
+        println!("while recording that nothing was ever generated:");
+        for v in vacuous.iter().take(40) {
+            println!("  {}", v);
+        }
+        if vacuous.len() > 40 {
+            println!("  ... and {} more", vacuous.len() - 40);
+        }
+    }
+    if !missing_spec.is_empty() {
+        println!("\nSeals whose spec file no longer exists:");
+        for m in missing_spec.iter().take(20) {
+            println!("  {}", m);
+        }
+        if missing_spec.len() > 20 {
+            println!("  ... and {} more", missing_spec.len() - 20);
+        }
+    }
+
+    if !stale.is_empty() {
+        println!("\nSTALE seals -- the spec was edited after sealing and never resealed,");
+        println!("so the seal certifies a file that no longer exists in that form:");
+        for s_ in stale.iter().take(20) {
+            println!("  {}", s_);
+        }
+    }
+
+    // Stale fails under --strict, like the other classes. The first draft failed
+    // unconditionally on stale -- measured immediately after: 281 of 1,715 seals
+    // are stale, so an unconditional failure makes the command permanently red
+    // and therefore ignored. The number is the finding; the ratchet is --strict.
+    if strict && (!vacuous.is_empty() || !missing_spec.is_empty() || !stale.is_empty()) {
+        anyhow::bail!(
+            "seal audit failed: {} vacuous, {} orphaned, {} stale",
+            vacuous.len(),
+            missing_spec.len(),
+            stale.len()
+        );
+    }
+    Ok(())
+}
+
+fn run_validate_vacuity(
+    repo_root: &Path,
+    specs_dir: &str,
+    max_ratio: Option<f64>,
+    top: usize,
+) -> anyhow::Result<()> {
+    let root = repo_root.join(specs_dir);
+    if !root.exists() {
+        anyhow::bail!("specs directory not found: {}", root.display());
+    }
+
+    let mut rows: Vec<(String, VacuityCounts)> = Vec::new();
+    let mut total = VacuityCounts::default();
+    // `.tri` is documented in SOUL.md as "TRI high-level specifications", but it
+    // is a DIFFERENT language (`spec X`, `--` comments, `pub const NAME u32 = 1`)
+    // and no tool in this repository parses it. Counting them with the .t27
+    // scanner would produce nonsense, and silently skipping them is how they
+    // stayed invisible to every census. Report them instead.
+    let mut tri_skipped: Vec<String> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let p = entry.path();
+        let ext = p.extension().and_then(|s| s.to_str());
+        if ext == Some("tri") {
+            tri_skipped.push(
+                p.strip_prefix(repo_root).unwrap_or(p).display().to_string(),
+            );
+            continue;
+        }
+        if ext != Some("t27") {
+            continue;
+        }
+        let src = match fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let c = scan_vacuity(&src);
+        total.tests_total += c.tests_total;
+        total.tests_vacuous += c.tests_vacuous;
+        total.inv_total += c.inv_total;
+        total.inv_vacuous += c.inv_vacuous;
+        total.tests_bdd += c.tests_bdd;
+
+        if c.tests_total > 0 || c.inv_total > 0 || c.tests_bdd > 0 {
+            let rel = p.strip_prefix(repo_root).unwrap_or(p).display().to_string();
+            rows.push((rel, c));
+        }
+    }
+
+    rows.sort_by(|a, b| b.1.tests_vacuous.cmp(&a.1.tests_vacuous));
+
+    println!("=== Vacuity report: {} ===", root.display());
+    println!(
+        "{:<58} {:>6} {:>8} {:>7} {:>6} {:>6}",
+        "spec", "tests", "vacuous", "%", "inv", "vac"
+    );
+    for (path, c) in rows.iter().take(top) {
+        let pct = if c.tests_total > 0 {
+            100.0 * c.tests_vacuous as f64 / c.tests_total as f64
+        } else {
+            0.0
+        };
+        println!(
+            "{:<58} {:>6} {:>8} {:>6.1}% {:>6} {:>6}",
+            path, c.tests_total, c.tests_vacuous, pct, c.inv_total, c.inv_vacuous
+        );
+    }
+    if rows.len() > top {
+        println!("... and {} more specs", rows.len() - top);
+    }
+
+    let test_pct = if total.tests_total > 0 {
+        100.0 * total.tests_vacuous as f64 / total.tests_total as f64
+    } else {
+        0.0
+    };
+    let inv_pct = if total.inv_total > 0 {
+        100.0 * total.inv_vacuous as f64 / total.inv_total as f64
+    } else {
+        0.0
+    };
+    println!(
+        "\nTOTAL over {} specs: tests={} vacuous={} ({:.1}%)  invariants={} vacuous={} ({:.1}%)",
+        rows.len(),
+        total.tests_total,
+        total.tests_vacuous,
+        test_pct,
+        total.inv_total,
+        total.inv_vacuous,
+        inv_pct
+    );
+
+    if !tri_skipped.is_empty() {
+        println!(
+            "\n  NOT ANALYSED: {} `.tri` file(s). SOUL.md documents .tri as a spec\n\
+             \x20 format, but it is a different language and no tool here parses it,\n\
+             \x20 so these are outside every count above:",
+            tri_skipped.len()
+        );
+        for t in tri_skipped.iter().take(10) {
+            println!("      {}", t);
+        }
+        if tri_skipped.len() > 10 {
+            println!("      ... and {} more", tri_skipped.len() - 10);
+        }
+    }
+
+    // Until W559 a braceless given/when/then body was discarded by the parser
+    // and the test always passed, so those blocks counted as asserting nothing.
+    // They now lower to real assertions, so only `assert true` bodies remain
+    // vacuous. Shapes the lowering cannot model still fall back to the old
+    // skip; this static scan cannot tell those apart, so the figure below is a
+    // lower bound on what executes.
+    let dead = total.tests_vacuous;
+    let all_blocks = total.tests_total + total.tests_bdd;
+    println!(
+        "  BDD-form tests (given/when/then, lowered to assertions since W559): {}",
+        total.tests_bdd
+    );
+    if all_blocks > 0 {
+        println!(
+            "\n  tests that assert nothing: {} of {} ({:.1}%)",
+            dead,
+            all_blocks,
+            100.0 * dead as f64 / all_blocks as f64
+        );
+    }
+
+    println!(
+        "\nA body that is only `assert true` passes for EVERY implementation, so it\n\
+         contributes zero discriminating power while satisfying L4 by letter.\n\
+         Braceless given/when/then bodies were also inert until W559 -- the parser\n\
+         discarded them and the test always passed -- and now lower to real\n\
+         assertions. Shapes the lowering cannot model still fall back to a skip,\n\
+         so the ratio above is a lower bound on what actually executes."
+    );
+
+    if let Some(limit) = max_ratio {
+        let offenders: Vec<&(String, VacuityCounts)> = rows
+            .iter()
+            .filter(|(_, c)| {
+                c.tests_total > 0
+                    && (c.tests_vacuous as f64 / c.tests_total as f64) > limit
+            })
+            .collect();
+        if !offenders.is_empty() {
+            eprintln!(
+                "\nFAIL: {} spec(s) exceed the vacuity limit of {:.1}%:",
+                offenders.len(),
+                limit * 100.0
+            );
+            for (path, c) in offenders.iter().take(top) {
+                eprintln!(
+                    "  {} -- {}/{} vacuous",
+                    path, c.tests_vacuous, c.tests_total
+                );
+            }
+            anyhow::bail!("vacuity gate failed");
+        }
+        println!("\nPASS: no spec exceeds the vacuity limit of {:.1}%", limit * 100.0);
+    }
+
+    Ok(())
+}
+
+/// Board bring-up profile. Values are the SSOT from `fpga/HARDWARE_SSOT.md`;
+/// when that file and this table disagree, the file wins -- fix this table.
+struct BoardProfile {
+    name: &'static str,
+    part: &'static str,
+    /// JTAG IDCODE as reported by `openFPGALoader --detect`.
+    idcode: &'static str,
+    /// openFPGALoader `--cable` profile for the programmer wired to this board.
+    cable: &'static str,
+    /// Canonical demo bitstream, relative to the repo root.
+    default_bitstream: &'static str,
+}
+
+fn board_profile(name: &str) -> anyhow::Result<BoardProfile> {
+    match name {
+        // The physically connected board: QMTech Wukong V1 carrying an XC7A200T.
+        "wukong-a200t" => Ok(BoardProfile {
+            name: "QMTech Wukong V1 (XC7A200T-FGG676)",
+            part: "xc7a200tfgg676-1",
+            idcode: "0x03636093",
+            cable: "digilent_hs2",
+            // v2 supersedes v1: v1's LEDs are driven at ~10^8 Hz from a ring
+            // oscillator and its accumulate path is tied off, so a successful
+            // flash is indistinguishable from a dead datapath (see
+            // docs/fpga/IGLA_FPGA_LAUNCH_PLAN.md section 2).
+            default_bitstream: "fpga/verilog/ternary_mac_demo_top_v2_200t.bit",
+        }),
+        // Legacy 100T build kept for the pre-2026-07-03 assumption.
+        "wukong-a100t" => Ok(BoardProfile {
+            name: "QMTech Wukong V1 (XC7A100T-FGG676, legacy)",
+            part: "xc7a100tfgg676-1",
+            idcode: "0x13631093",
+            cable: "digilent_hs2",
+            default_bitstream: "fpga/verilog/ternary_mac_demo_top.bit",
+        }),
+        // A different board entirely -- never mix its csg324 package into Wukong flows.
+        "arty-a7" => Ok(BoardProfile {
+            name: "Digilent Arty A7-100T (XC7A100T-CSG324)",
+            part: "xc7a100tcsg324-1",
+            idcode: "0x13631093",
+            cable: "digilent",
+            default_bitstream: "fpga/openxc7-synth/blink_j26.bit",
+        }),
+        other => anyhow::bail!(
+            "unknown board '{}' (known: wukong-a200t, wukong-a100t, arty-a7)",
+            other
+        ),
+    }
+}
+
+/// Build a nextpnr-xilinx chipdb.
+///
+/// This encodes the flow Wave 553 established after Waves 549-552 recorded the
+/// step as permanently blocked. The blocker was never the machine: `bbaexport`
+/// peaks at ~7.06 GB, Docker Desktop was allocated 3.83 GiB, and the host had
+/// 8 GB. So the memory-hungry step runs NATIVELY and only the small assembly
+/// step goes back into the container.
+///
+/// Two failure modes are handled explicitly because they cost two waves:
+///   * `bbaexport.py` prints NOTHING when the OOM killer takes it -- exit 137.
+///   * the prjxray database is not at /prjxray/database (that holds only
+///     settings.sh); it ships under nextpnr-xilinx/xilinx/external.
+/// Freeze ceremony (M5). `CANON.md` says: "Do not silently edit FROZEN_HASH --
+/// update only via freeze ceremony per FROZEN.md section 5 (use
+/// `cargo run --release -- frozen-digest` to print a fresh line)."
+///
+/// That command was referenced in FROZEN.md, CANON.md and build.rs's own panic
+/// message, but did not exist -- the same documented-but-missing class as
+/// `fpga-flash` before Wave 549. It exists now, so the ceremony can actually be
+/// performed instead of hand-editing the seal.
+///
+/// Prints `<64-hex-sha256> <repo-relative-path>`, which is the operational line
+/// `bootstrap/stage0/FROZEN_HASH` expects.
+fn run_frozen_digest(path: Option<&str>) -> anyhow::Result<()> {
+    let rel = path.unwrap_or("bootstrap/src/compiler.rs");
+    let bytes = fs::read(rel).with_context(|| format!("reading {}", rel))?;
+    println!("{} {}", sha256_hex(&bytes), rel);
+    Ok(())
+}
+
+/// Read a whole input: a file, or stdin for `None` / `-`.
+fn read_t27a_input(path: Option<&str>) -> anyhow::Result<String> {
+    match path {
+        None | Some("-") => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).context("reading stdin")?;
+            Ok(s)
+        }
+        Some(p) => fs::read_to_string(p).with_context(|| format!("reading {}", p)),
+    }
+}
+
+/// What an `ASM_*` status of specs/isa/t27a.t27 means, for the error line.
+fn t27a_status_text(status: u32) -> &'static str {
+    match status {
+        t27a::ASM_NO_MNEMONIC => "no mnemonic",
+        t27a::ASM_UNKNOWN_MNEMONIC => "unknown mnemonic",
+        t27a::ASM_BAD_SEPARATOR => "missing or misplaced operand separator",
+        t27a::ASM_BAD_REGISTER => "register out of range or misspelled",
+        t27a::ASM_BAD_IMMEDIATE => "immediate does not fit the field",
+        t27a::ASM_TRAILING_TEXT => "trailing text after the instruction",
+        t27a::ASM_BAD_WORD => "bad .word operand",
+        _ => "rejected",
+    }
+}
+
+/// `t27c asm` (#6507). Plumbing only: every decision -- mnemonics, operand
+/// forms, register and immediate ranges, the T736 field table -- is
+/// specs/isa/t27a.t27 lowered by `t27c gen-rust` into `t27a`. It replaces an
+/// earlier `asm` that parsed its input, ignored it, and printed the same three
+/// hard-coded words for every file.
+fn run_asm(input: Option<&str>) -> anyhow::Result<()> {
+    // gen-rust lowers the spec's `string` to `&'static str`; the source is read
+    // once and kept for the life of this short process.
+    let src: &'static str = Box::leak(read_t27a_input(input)?.into_boxed_str());
+    let name = input.unwrap_or("<stdin>");
+    let mut rejected = 0usize;
+    for (n, line) in src.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let status = t27a::assemble_status(line);
+        if status == t27a::ASM_OK {
+            println!("0x{:08x}", t27a::assemble(line));
+        } else {
+            eprintln!("{}:{}: {} (status {}): {}", name, n + 1, t27a_status_text(status), status, line);
+            rejected += 1;
+        }
+    }
+    if rejected > 0 {
+        anyhow::bail!("{} line(s) did not assemble", rejected);
+    }
+    Ok(())
+}
+
+/// `t27c disasm` (#6507). Plumbing only, as `run_asm`: the listing is
+/// `listing_len` / `listing_char` of specs/isa/t27a.t27. Undefined bytes and
+/// non-canonical words list as `.word N`, which `t27c asm` reads back.
+fn run_disasm(words: &[String]) -> anyhow::Result<()> {
+    let stdin_text;
+    let tokens: Vec<&str> = if words.is_empty() {
+        stdin_text = read_t27a_input(None)?;
+        stdin_text.split_whitespace().collect()
+    } else {
+        words.iter().map(|s| s.as_str()).collect()
+    };
+    for tok in tokens {
+        let parsed = match tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            Some(hex) => u32::from_str_radix(hex, 16),
+            None => tok.parse::<u32>(),
+        };
+        let w = parsed.with_context(|| format!("`{}` is not a 32-bit word (0x-hex or decimal)", tok))?;
+        let listing: String = (0..t27a::listing_len(w))
+            .map(|k| char::from(t27a::listing_char(w, k) as u8))
+            .collect();
+        println!("{}", listing);
+    }
+    Ok(())
+}
+
+fn run_fpga_chipdb(
+    repo_root: &Path,
+    device: &str,
+    image: &str,
+    work: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let workdir = repo_root.join(work);
+    let bba = workdir.join(format!("{}.bba", device));
+    let bin = workdir.join(format!("{}.bin", device));
+
+    println!("=== FPGA chipdb: {} ===", device);
+    println!("  work dir : {}", workdir.display());
+
+    if bin.exists() && !force {
+        let sz = fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+        println!("  chipdb   : already present ({} bytes) -- pass --force to rebuild", sz);
+        return Ok(());
+    }
+    fs::create_dir_all(&workdir).context("create chipdb work dir")?;
+
+    // ---- Stage 1: extract the toolchain inputs from the image (once) -------
+    let py = workdir.join("python/bbaexport.py");
+    if !py.exists() {
+        println!("\n  [1/3] extracting prjxray-db + metadata from {} ...", image);
+        let create = std::process::Command::new("docker")
+            .args(["create", image])
+            .output()
+            .context("docker create -- is Docker running?")?;
+        if !create.status.success() {
+            anyhow::bail!(
+                "docker create failed: {}",
+                String::from_utf8_lossy(&create.stderr).trim()
+            );
+        }
+        let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+        let copies: [(&str, PathBuf); 4] = [
+            ("/nextpnr-xilinx/xilinx/python", workdir.clone()),
+            ("/nextpnr-xilinx/xilinx/constids.inc", workdir.clone()),
+            (
+                "/nextpnr-xilinx/xilinx/external/prjxray-db/artix7",
+                workdir.join("prjxray-db"),
+            ),
+            (
+                "/nextpnr-xilinx/xilinx/external/nextpnr-xilinx-meta/artix7",
+                workdir.join("meta"),
+            ),
+        ];
+        for (src, dst) in &copies {
+            fs::create_dir_all(dst).ok();
+            let st = std::process::Command::new("docker")
+                .arg("cp")
+                .arg(format!("{}:{}", cid, src))
+                .arg(dst)
+                .status();
+            match st {
+                Ok(s) if s.success() => println!("        got {}", src),
+                _ => {
+                    let _ = std::process::Command::new("docker").args(["rm", &cid]).output();
+                    anyhow::bail!("docker cp failed for {}", src);
+                }
+            }
+        }
+        let _ = std::process::Command::new("docker").args(["rm", &cid]).output();
+    } else {
+        println!("\n  [1/3] inputs already extracted");
+    }
+
+    // ---- Stage 2: bbaexport, NATIVELY (this is the ~7 GB step) ------------
+    if !bba.exists() || force {
+        println!("  [2/3] bbaexport (native -- needs ~7 GB RAM, several minutes) ...");
+        let status = std::process::Command::new("python3")
+            .arg(workdir.join("python/bbaexport.py"))
+            .arg("--xray").arg(workdir.join("prjxray-db/artix7"))
+            .arg("--metadata").arg(workdir.join("meta/artix7"))
+            .arg("--constids").arg(workdir.join("constids.inc"))
+            .arg("--device").arg(device)
+            .arg("--bba").arg(&bba)
+            .status()
+            .context("running python3 bbaexport.py")?;
+
+        if !status.success() {
+            let code = status.code().unwrap_or(-1);
+            if code == 137 || code == -9 {
+                anyhow::bail!(
+                    "bbaexport was KILLED (exit {}), which means the OOM killer took it.\n\
+                     It peaks around 7 GB for a 200T part. This step must run natively --\n\
+                     inside Docker it dies against the Desktop memory allocation.\n\
+                     Free memory or use a larger host; note the tool prints nothing when killed.",
+                    code
+                );
+            }
+            anyhow::bail!("bbaexport failed with exit {}", code);
+        }
+        let sz = fs::metadata(&bba).map(|m| m.len()).unwrap_or(0);
+        if sz == 0 {
+            anyhow::bail!("bbaexport exited 0 but produced an empty .bba -- treat as failure");
+        }
+        println!("        .bba {} bytes", sz);
+    } else {
+        println!("  [2/3] .bba already present");
+    }
+
+    // ---- Stage 3: bbasm, in Docker (small) --------------------------------
+    println!("  [3/3] bbasm (Docker) ...");
+    let status = std::process::Command::new("docker")
+        .arg("run").arg("--rm")
+        .arg("-v").arg(format!("{}:/out", workdir.display()))
+        .arg(image)
+        .arg("bbasm").arg("--le")
+        .arg(format!("/out/{}.bba", device))
+        .arg(format!("/out/{}.bin", device))
+        .status()
+        .context("running bbasm in Docker")?;
+    if !status.success() {
+        anyhow::bail!("bbasm failed with exit {}", status.code().unwrap_or(-1));
+    }
+
+    let sz = fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+    if sz == 0 {
+        anyhow::bail!("bbasm exited 0 but produced an empty chipdb");
+    }
+    println!("\n=== chipdb ready: {} ({} bytes) ===", bin.display(), sz);
+    println!("Feed it to nextpnr-xilinx with --chipdb {}", bin.display());
+    Ok(())
+}
+
+fn run_fpga_flash(
+    repo_root: &Path,
+    bitstream: Option<&str>,
+    board: &str,
+    cable: Option<&str>,
+    mode: &str,
+    dry_run: bool,
+    loader: &str,
+) -> anyhow::Result<()> {
+    let profile = board_profile(board)?;
+    let cable = cable.unwrap_or(profile.cable);
+
+    let write_flash = match mode {
+        "sram" => false,
+        "flash" => true,
+        other => anyhow::bail!("unknown --mode '{}' (expected 'sram' or 'flash')", other),
+    };
+
+    let bit_rel = bitstream.unwrap_or(profile.default_bitstream);
+    let bit_path = if Path::new(bit_rel).is_absolute() {
+        PathBuf::from(bit_rel)
+    } else {
+        repo_root.join(bit_rel)
+    };
+
+    println!("=== FPGA Flash ===");
+    println!("  board      : {} [{}]", profile.name, board);
+    println!("  part       : {}", profile.part);
+    println!("  expect id  : {}", profile.idcode);
+    println!("  cable      : {}", cable);
+    println!("  mode       : {}", if write_flash { "flash (persistent SPI boot)" } else { "sram (volatile)" });
+    println!("  bitstream  : {}", bit_path.display());
+
+    // Pre-flight 1: the bitstream must exist and be non-empty.
+    let meta = fs::metadata(&bit_path)
+        .with_context(|| format!("bitstream not found: {}", bit_path.display()))?;
+    if meta.len() == 0 {
+        anyhow::bail!("bitstream is empty: {}", bit_path.display());
+    }
+    println!("  size       : {} bytes  [OK]", meta.len());
+
+    // Pre-flight 2: the loader must be on PATH.
+    let scan = std::process::Command::new(loader).arg("--scan-usb").output();
+    let scan = match scan {
+        Ok(out) => out,
+        Err(e) => anyhow::bail!(
+            "cannot run '{}': {}. Install it (brew install openfpgaloader) or pass --loader <path>.",
+            loader, e
+        ),
+    };
+    let scan_txt = format!(
+        "{}{}",
+        String::from_utf8_lossy(&scan.stdout),
+        String::from_utf8_lossy(&scan.stderr)
+    );
+
+    // Pre-flight 3: a programmer must actually be attached.
+    let cable_present = !scan_txt.contains("No USB devices found");
+
+    let argv = {
+        let mut v = vec![format!("--cable {}", cable)];
+        if write_flash {
+            v.push("--write-flash".to_string());
+        }
+        v.push(bit_path.display().to_string());
+        v.join(" ")
+    };
+
+    if dry_run {
+        println!("  cable link : {}", if cable_present { "PRESENT" } else { "ABSENT" });
+        println!("\n  would run  : {} {}", loader, argv);
+        println!(
+            "\n  verdict    : {}",
+            if cable_present {
+                "READY -- rerun without --dry-run to program the board"
+            } else {
+                "BLOCKED -- no programmer on USB; connect the cable, then rerun"
+            }
+        );
+        return Ok(());
+    }
+
+    if !cable_present {
+        anyhow::bail!(
+            "no USB programmer detected -- '{} --scan-usb' reports no devices.\n\
+             Connect the {} cable to the board and the host, then retry.\n\
+             Use --dry-run to validate the bitstream and command without hardware.",
+            loader, cable
+        );
+    }
+
+    println!("\n  running    : {} {}", loader, argv);
+    let mut cmd = std::process::Command::new(loader);
+    cmd.arg("--cable").arg(cable);
+    if write_flash {
+        cmd.arg("--write-flash");
+    }
+    cmd.arg(&bit_path);
+    let status = cmd
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .with_context(|| format!("{} invocation failed", loader))?;
+    if !status.success() {
+        anyhow::bail!("{} exited with {}", loader, status);
+    }
+    println!("\n=== Flash OK ({}) ===", if write_flash { "flash" } else { "sram" });
+    Ok(())
+}
+
+fn run_fpga_build(
+    repo_root: &Path,
+    smoke: bool,
+    synth_only: bool,
+    minimal: bool,
+    device: &str,
+    top: &str,
+    docker: Option<bool>,
+    use_hir: bool,
+    nextpnr_path: Option<&str>,
+    chipdb_path: Option<&str>,
+    xdc_path: Option<&str>,
+    fasm2frames_path: Option<&str>,
+    frames2bit_path: Option<&str>,
+    prjxray_db_path: Option<&str>,
+    output: &str,
+) -> anyhow::Result<()> {
+    // #2225: P&R against a database for a different part is silent poison — the
+    // router succeeds against whatever database it is handed, and the mismatch
+    // surfaces two steps later in fasm2frames as "Part None not found". Check the
+    // pair HERE, before minutes of synthesis, where the cause is still visible.
+    if let Some(p) = chipdb_path {
+        let stem = Path::new(p)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if stem != device {
+            anyhow::bail!(
+                "chipdb/device mismatch: --chipdb names '{}' but --device is '{}'.\n\
+                 nextpnr would place-and-route against the wrong database and the\n\
+                 build would fail two steps later in fasm2frames. Pass a matching pair.",
+                stem, device
+            );
+        }
+    }
+    let specs_dir = repo_root.join("specs/fpga");
+    let build_dir = repo_root.join(output);
+    let gen_dir = build_dir.join("generated");
+    let t27c = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("t27c"));
+
+    fs::create_dir_all(&gen_dir).context("create build/fpga/generated")?;
+    let synth_dir = build_dir.join("synth");
+    fs::create_dir_all(&synth_dir).context("create build/fpga/synth")?;
+
+    // T75: the set is the DIRECTORY, not a literal. It used to be a hardcoded
+    // array of 36 names, and it had drifted in both directions: five names had
+    // no spec and printed `SKIP (spec not found)` without failing, while four
+    // specs sat in specs/fpga/ and were never generated at all -- bpsk (the
+    // merged BPSK modem core), power_analysis, ternary_link and
+    // vcd_conformance_compare. Measured with this same t27c and the
+    // elaboration ratchet's own iverilog invocation, those four carry 14 real
+    // errors the ratchet had never counted, and nothing bounded their growth.
+    //
+    // Reading the directory makes "the fpga module set" mean what it says, and
+    // a spec added tomorrow is covered without anyone remembering this list.
+    let mut modules: Vec<String> = fs::read_dir(&specs_dir)
+        .with_context(|| format!("read {}", specs_dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("t27"))
+        .filter_map(|e| e.path().file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
+    modules.sort();
+    if modules.is_empty() {
+        anyhow::bail!(
+            "no .t27 spec found under {} -- the scan is broken, not the tree",
+            specs_dir.display()
+        );
+    }
+
+    println!("=== FPGA Build: Verilog generation{}===", if use_hir { " (HIR path) " } else { " " });
+    println!("  {} spec(s) under {}", modules.len(), specs_dir.display());
+    let mut generated_count = 0u32;
+    for module in &modules {
+        let spec_file = specs_dir.join(format!("{}.t27", module));
+        let out_file = gen_dir.join(format!("{}.v", module));
+        // #10300: a pin attribute (`const x_LOC : str`) marks t27b's bitstream idiom. Its
+        // pins and primitive instances are lowered by `t27b verilog`, which builds the
+        // board RTL; gen-verilog has no such lowering and would lint a file nobody ships.
+        let src = fs::read_to_string(&spec_file).with_context(|| format!("read {}", spec_file.display()))?;
+        if src.lines().any(|l| l.starts_with("const ") && l.contains("_LOC : str")) {
+            println!("  SKIP {}.v (t27b bitstream spec; `t27b verilog` lowers it)", module);
+            continue;
+        }
+        let gen_cmd = if use_hir { "gen-verilog-hir" } else { "gen-verilog" };
+        let status = std::process::Command::new(&t27c)
+            .arg(gen_cmd)
+            .arg(&spec_file)
+            .stdout(std::fs::File::create(&out_file)?)
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .context(format!("t27c {}", gen_cmd))?;
+        if !status.success() {
+            anyhow::bail!("t27c {} failed for {}", gen_cmd, module);
+        }
+        println!("  OK {}.v ({})", module, gen_cmd);
+        generated_count += 1;
+    }
+
+    let top_wrapper = gen_dir.join(format!("{}.v", top));
+    if minimal {
+        let wrapper_source = format!(
+r#"`timescale 1ns / 1ps
+
+module {top} (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        uart_rx,
+    output wire        uart_tx,
+    output wire [7:0]  led
+);
+    wire sys_clk   = clk;
+    wire sys_rst_n = rst_n;
+
+    reg [26:0] heartbeat_ctr;
+    always @(posedge sys_clk) begin
+        if (!sys_rst_n)
+            heartbeat_ctr <= 27'd0;
+        else
+            heartbeat_ctr <= heartbeat_ctr + 1'b1;
+    end
+
+    assign led[0] = heartbeat_ctr[24];
+    assign led[1] = 1'b0;
+    assign led[2] = 1'b0;
+    assign led[3] = 1'b0;
+    assign led[4] = 1'b0;
+    assign led[5] = 1'b0;
+    assign led[6] = 1'b0;
+    assign led[7] = 1'b0;
+    assign uart_tx = uart_rx;
+endmodule
+"#
+        );
+        fs::write(&top_wrapper, &wrapper_source)?;
+        println!("  OK {}.v (minimal top-level)", top);
+    } else {
+        let wrapper_source = format!(
+r#"`timescale 1ns / 1ps
+
+module {top} (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        uart_rx,
+    output wire        uart_tx,
+    output wire        spi_cs,
+    output wire        spi_sck,
+    output wire        spi_mosi,
+    input  wire        spi_miso,
+    output wire [7:0]  led,
+    output wire        mac_done,
+    output wire [31:0] mac_result
+);
+    wire sys_clk   = clk;
+    wire sys_rst_n = rst_n;
+
+    // ---- Heartbeat counter (LED[0] blinks at ~0.9 Hz @ 12 MHz) ----
+    reg [26:0] heartbeat_ctr;
+    always @(posedge sys_clk) begin
+        if (!sys_rst_n)
+            heartbeat_ctr <= 27'd0;
+        else
+            heartbeat_ctr <= heartbeat_ctr + 1'b1;
+    end
+
+    // ---- ZeroDSP_MAC instantiation ----
+    wire mac_ready;
+    ZeroDSP_MAC u_mac (
+        .clk    (sys_clk),
+        .rst_n  (sys_rst_n),
+        .en     (1'b1),
+        .ready  (mac_ready)
+    );
+
+    // ---- ZeroDSP_UART instantiation ----
+    wire uart_ready;
+    ZeroDSP_UART u_uart (
+        .clk    (sys_clk),
+        .rst_n  (sys_rst_n),
+        .en     (1'b1),
+        .ready  (uart_ready)
+    );
+
+    // ---- SPI_Master instantiation ----
+    wire spi_ready;
+    SPI_Master u_spi (
+        .clk    (sys_clk),
+        .rst_n  (sys_rst_n),
+        .en     (1'b1),
+        .ready  (spi_ready)
+    );
+
+    // ---- FPGA_Bridge instantiation ----
+    wire bridge_ready;
+    FPGA_Bridge u_bridge (
+        .clk    (sys_clk),
+        .rst_n  (sys_rst_n),
+        .en     (1'b1),
+        .ready  (bridge_ready)
+    );
+
+    // ---- ZeroDSP_TopLevel instantiation ----
+    wire sys_ready;
+    ZeroDSP_TopLevel u_top_level (
+        .clk    (sys_clk),
+        .rst_n  (sys_rst_n),
+        .en     (1'b1),
+        .ready  (sys_ready)
+    );
+
+    // ---- Output assignments ----
+    assign led[0]     = heartbeat_ctr[24];
+    assign led[1]     = mac_ready;
+    assign led[2]     = uart_ready;
+    assign led[3]     = spi_ready;
+    assign led[4]     = bridge_ready;
+    assign led[5]     = sys_ready;
+    assign led[6]     = 1'b0;
+    assign led[7]     = 1'b0;
+    assign uart_tx    = uart_rx;
+    assign mac_done   = mac_ready;
+    assign mac_result = {{5'd0, heartbeat_ctr}};
+    assign spi_cs     = 1'b1;
+    assign spi_sck    = 1'b0;
+    assign spi_mosi   = 1'b0;
+endmodule
+"#
+        );
+        fs::write(&top_wrapper, &wrapper_source)?;
+        println!("  OK {}.v (top-level wrapper)", top);
+    }
+
+    println!("Verilog generation: {} modules + wrapper", generated_count);
+
+    if smoke {
+        println!("=== Smoke test passed (gen-only) ===");
+        return Ok(());
+    }
+
+    let use_docker = docker.unwrap_or_else(|| {
+        std::process::Command::new("yosys")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+    });
+
+    let synth_json = synth_dir.join("synth.json");
+
+    let synth_script = build_dir.join("synth.ys");
+    let verilog_files = if minimal {
+        format!("{gen}/{top}.v", gen = gen_dir.display(), top = top)
+    } else {
+        format!("{gen}/mac.v {gen}/uart.v {gen}/spi.v {gen}/bridge.v {gen}/top_level.v {gen}/{top}.v", gen = gen_dir.display(), top = top)
+    };
+    fs::write(
+        &synth_script,
+        format!(
+            // -sv: the emitter uses SV static casts. -DSIMULATION: strips `ifndef
+            // SIMULATION` bench blocks whose $display carries non-constant
+            // args that synthesis cannot evaluate (mac.v:535; the repo
+            // convention, see suite.rs and verify_emit_bitexact.py).
+            "read_verilog -sv -DSIMULATION {files}\nhierarchy -check -top {top}\nproc; opt; fsm; opt; memory; opt\nsynth_xilinx -top {top}\nwrite_json {json}\nstat\n",
+            files = verilog_files,
+            top = top,
+            json = synth_json.display(),
+        ),
+    )?;
+
+    if use_docker {
+        if std::process::Command::new("docker")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            anyhow::bail!("Docker is required for synthesis but not installed. Use --smoke for gen-only, or install Yosys locally and pass --docker false.");
+        }
+        println!("=== Synthesizing with Yosys (Docker) ===");
+        let status = std::process::Command::new("docker")
+            .args(["run", "--rm", "-v", &format!("{}:/project", repo_root.display()), "-w", "/project", "hdlc/oss-cad-suite:latest", "yosys", "-s", &format!("{}", synth_script.display())])
+            .status()
+            .context("docker run yosys")?;
+        if !status.success() {
+            anyhow::bail!("Yosys synthesis failed");
+        }
+        println!("Synthesis complete (Docker).");
+    } else {
+        println!("=== Synthesizing with local Yosys ===");
+        let status = std::process::Command::new("yosys")
+            .arg("-s")
+            .arg(&synth_script)
+            .current_dir(&synth_dir)
+            .status()
+            .context("yosys")?;
+        if !status.success() {
+            anyhow::bail!("Yosys synthesis failed");
+        }
+        println!("Synthesis complete.");
+    }
+
+    if !synth_json.exists() {
+        anyhow::bail!("Yosys did not produce synth.json at {}", synth_json.display());
+    }
+    println!("  JSON netlist: {}", synth_json.display());
+
+    if synth_only {
+        println!("=== Stopped after synthesis (--synth-only) ===");
+        return Ok(());
+    }
+
+    // ---- Step: Resolve toolchain paths ----
+    let nextpnr_bin = match nextpnr_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let default = PathBuf::from("build/nextpnr-xilinx/build/nextpnr-xilinx");
+            if repo_root.join(&default).exists() {
+                repo_root.join(&default)
+            } else {
+                anyhow::bail!("nextpnr-xilinx not found. Pass --nextpnr <path> or place at build/nextpnr-xilinx/build/nextpnr-xilinx");
+            }
+        }
+    };
+
+    let chipdb = match chipdb_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            // Derive the default from --device instead of naming one part: a
+            // hardcoded 100T filename here is exactly how the 200T default flip
+            // survived P&R against the wrong database (#2225).
+            let default = PathBuf::from(format!("build/fpga/chipdb/{}.bin", device));
+            if repo_root.join(&default).exists() {
+                repo_root.join(&default)
+            } else {
+                anyhow::bail!("Chipdb not found. Pass --chipdb <path> or place at build/fpga/chipdb/{}.bin", device);
+            }
+        }
+    };
+
+    // Generate nextpnr-compatible XDC.
+    // For minimal mode, produce a clean XDC with only valid chipdb pins.
+    // For full mode, preprocess the Vivado XDC for nextpnr compatibility.
+    let xdc = synth_dir.join("nextpnr.xdc");
+    if minimal {
+        let minimal_xdc = r#"# nextpnr-compatible XDC for minimal design (prjxray-verified pins)
+ set_property -dict { PACKAGE_PIN E3    IOSTANDARD LVCMOS33 } [get_ports clk]
+ create_clock -add -name sys_clk -period 83.333 -waveform {0 41.666} [get_ports clk]
+ # C18/T14/T15 had never met a real chipdb (the placeholder was zeroes) and
+ # nextpnr rejects C18: the device has no such pin. Arty A7-100T: ck_rst=C2,
+ # uart_txd_in(host->FPGA)=A9, uart_rxd_out(FPGA->host)=D10; clk=E3 was right.
+ set_property -dict { PACKAGE_PIN C2    IOSTANDARD LVCMOS33 } [get_ports rst_n]
+set_property -dict { PACKAGE_PIN A9    IOSTANDARD LVCMOS33 } [get_ports uart_rx]
+set_property -dict { PACKAGE_PIN D10   IOSTANDARD LVCMOS33 } [get_ports uart_tx]
+set_property -dict { PACKAGE_PIN H17   IOSTANDARD LVCMOS33 } [get_ports led[0]]
+set_property -dict { PACKAGE_PIN K15   IOSTANDARD LVCMOS33 } [get_ports led[1]]
+set_property -dict { PACKAGE_PIN J13   IOSTANDARD LVCMOS33 } [get_ports led[2]]
+set_property -dict { PACKAGE_PIN N14   IOSTANDARD LVCMOS33 } [get_ports led[3]]
+set_property -dict { PACKAGE_PIN R18   IOSTANDARD LVCMOS33 } [get_ports led[4]]
+set_property -dict { PACKAGE_PIN U18   IOSTANDARD LVCMOS33 } [get_ports led[5]]
+set_property -dict { PACKAGE_PIN T13   IOSTANDARD LVCMOS33 } [get_ports led[6]]
+set_property -dict { PACKAGE_PIN T11   IOSTANDARD LVCMOS33 } [get_ports led[7]]
+"#;
+        fs::write(&xdc, minimal_xdc)?;
+    } else {
+        let xdc_source = match xdc_path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let default = repo_root.join("specs/fpga/constraints/qmtech_a100t.xdc");
+                if default.exists() {
+                    default
+                } else {
+                    anyhow::bail!("XDC constraints not found. Pass --xdc <path>");
+                }
+            }
+        };
+        let raw = fs::read_to_string(&xdc_source).context("read XDC")?;
+        let mut out = String::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with("set_false_path") {
+                continue;
+            }
+            if trimmed.contains("[current_design]") {
+                continue;
+            }
+            let l = if trimmed.contains("PULLUP") {
+                trimmed.replace("PULLUP true", "").replace("  ", " ")
+            } else {
+                trimmed.to_string()
+            };
+            let l = l.replace("[get_ports { ", "[get_ports ").replace(" }]", "]");
+            out.push_str(&l);
+            out.push('\n');
+        }
+        fs::write(&xdc, &out)?;
+    }
+
+    let fasm_output = synth_dir.join("design.fasm");
+    let frames_output = synth_dir.join("design.frames");
+    let bit_output = build_dir.join(format!("{}.bit", top));
+
+    // ---- Step 2: nextpnr-xilinx Place & Route ----
+    println!("=== Place & Route (nextpnr-xilinx) ===");
+    println!("  chipdb: {}", chipdb.display());
+    println!("  JSON:   {}", synth_json.display());
+    println!("  XDC:    {}", xdc.display());
+    println!("  FASM:   {}", fasm_output.display());
+
+    let status = std::process::Command::new(&nextpnr_bin)
+        .arg("--chipdb").arg(&chipdb)
+        .arg("--json").arg(&synth_json)
+        .arg("--xdc").arg(&xdc)
+        .arg("--fasm").arg(&fasm_output)
+        .current_dir(&synth_dir)
+        .status()
+        .context("nextpnr-xilinx")?;
+    if !status.success() {
+        anyhow::bail!("nextpnr-xilinx P&R failed");
+    }
+    if !fasm_output.exists() {
+        anyhow::bail!("nextpnr did not produce FASM at {}", fasm_output.display());
+    }
+    println!("P&R complete. FASM: {}", fasm_output.display());
+
+    // ---- Step 3: fasm2frames ----
+    let fasm2frames = match fasm2frames_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let default = repo_root.join("build/fpga/prjxray/utils/fasm2frames.py");
+            if default.exists() {
+                default
+            } else {
+                anyhow::bail!("fasm2frames.py not found. Pass --fasm2frames <path> or clone prjxray to build/fpga/prjxray/");
+            }
+        }
+    };
+
+    let prjxray_db = match prjxray_db_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let default = repo_root.join("build/nextpnr-xilinx/xilinx/external/prjxray-db/artix7");
+            if default.exists() {
+                default
+            } else {
+                anyhow::bail!("prjxray-db not found. Pass --prjxray-db <path>");
+            }
+        }
+    };
+
+    // Ensure prjxray mapping files exist (required by fasm2frames)
+    let mapping_dir = prjxray_db.join("mapping");
+    if !mapping_dir.exists() {
+        fs::create_dir_all(&mapping_dir)?;
+    }
+    let parts_yaml = mapping_dir.join("parts.yaml");
+    if !parts_yaml.exists() {
+        fs::write(&parts_yaml, format!(
+"\"{device}\":
+  device: \"xc7a100t\"
+  package: \"csg324\"
+  speedgrade: \"1\"
+", device = device))?;
+    }
+    let devices_yaml = mapping_dir.join("devices.yaml");
+    if !devices_yaml.exists() {
+        fs::write(&devices_yaml, "\"xc7a100t\":\n  fabric: \"xc7a100t\"\n")?;
+    }
+
+    println!("=== FASM → Frames ===");
+    let status = std::process::Command::new("python3")
+        .arg(&fasm2frames)
+        .arg("--db-root").arg(&prjxray_db)
+        .arg("--part").arg(device)
+        .arg(&fasm_output)
+        .arg(&frames_output)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .current_dir(&synth_dir)
+        .env("PYTHONPATH", format!(
+            "{}:{}",
+            repo_root.join("build/fpga/venv/lib/python3.13/site-packages").display(),
+            repo_root.join("build/fpga/prjxray").display()
+        ))
+        .status()
+        .context("fasm2frames")?;
+    if !status.success() {
+        anyhow::bail!("fasm2frames failed");
+    }
+    if !frames_output.exists() {
+        anyhow::bail!("fasm2frames did not produce frames at {}", frames_output.display());
+    }
+    println!("Frames: {}", frames_output.display());
+
+    // ---- Step 4: xc7frames2bit ----
+    let xc7frames2bit = match frames2bit_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let default = repo_root.join("build/fpga/prjxray/build/tools/xc7frames2bit");
+            if default.exists() {
+                default
+            } else {
+                anyhow::bail!("xc7frames2bit not found. Pass --frames2bit <path> or build prjxray at build/fpga/prjxray/");
+            }
+        }
+    };
+
+    // Generate YAML part file for xc7frames2bit (needs configuration_ranges format)
+    let part_yaml = synth_dir.join("part.yaml");
+    {
+        let part_json_path = prjxray_db.join(device).join("part.json");
+        let part_json = fs::read_to_string(&part_json_path)
+            .context("read part.json")?;
+        let pj: serde_json::Value = serde_json::from_str(&part_json)?;
+        let idcode = pj["idcode"].as_u64().unwrap_or(0x3631093);
+        let mut yaml = format!("!<xilinx/xc7series/part>\nidcode: 0x{:08x}\nconfiguration_ranges:\n", idcode);
+        let mut offset = 0u32;
+        if let Some(gcr) = pj["global_clock_regions"].as_object() {
+            for (region_name, region) in gcr {
+                let row_half = region_name;
+                if let Some(rows) = region["rows"].as_object() {
+                    for (row_id, row_data) in rows {
+                        if let Some(buses) = row_data["configuration_buses"].as_object() {
+                            for (bus_name, bus_data) in buses {
+                                if let Some(cols) = bus_data["configuration_columns"].as_object() {
+                                    for (col_id, col_data) in cols {
+                                        let fc = col_data["frame_count"].as_u64().unwrap_or(0) as u32;
+                                        yaml.push_str(&format!(
+"  - !<xilinx/xc7series/configuration_frame_range>
+    begin: !<xilinx/xc7series/configuration_frame_address>
+      block_type: {}
+      row_half: {}
+      row: {}
+      column: {}
+      minor: 0
+    end: !<xilinx/xc7series/configuration_frame_address>
+      block_type: {}
+      row_half: {}
+      row: {}
+      column: {}
+      minor: {}
+", bus_name, row_half, row_id, col_id, bus_name, row_half, row_id, col_id, fc));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fs::write(&part_yaml, &yaml)?;
+    }
+
+    println!("=== Frames → Bitstream ===");
+    let status = std::process::Command::new(&xc7frames2bit)
+        .arg(format!("--part_file={}", part_yaml.display()))
+        .arg(format!("--part_name={}", device))
+        .arg(format!("--frm_file={}", frames_output.display()))
+        .arg(format!("--output_file={}", bit_output.display()))
+        .status()
+        .context("xc7frames2bit")?;
+    if !status.success() {
+        anyhow::bail!("xc7frames2bit failed");
+    }
+    if !bit_output.exists() {
+        anyhow::bail!("xc7frames2bit did not produce bitstream at {}", bit_output.display());
+    }
+
+    let bit_size = fs::metadata(&bit_output)?.len();
+    println!("Bitstream: {} ({} bytes)", bit_output.display(), bit_size);
+    println!("=== FPGA E2E build finished ===");
+    Ok(())
+}
+
+/// Run chimera search for finding new formulas
+fn run_chimera(_repo_root: &Path, threshold: f64, limit: usize) -> anyhow::Result<()> {
+    let base_formulas = chimera_engine::base_formula_values();
+    let operators = chimera_engine::default_operators();
+    let targets = chimera_engine::pdg_targets();
+
+    let results = chimera_engine::chimera_search(&base_formulas, &operators, &targets, threshold);
+
+    println!("| Target | Chimera | Value | Δ% | Status |");
+    println!("|--------|---------|-------|-----|--------|");
+    for r in results.iter().take(limit) {
+        println!(
+            "| {} | `{}` | {:.5} | {:.3}% | {} |",
+            r.target_name, r.expr, r.chimera_value, r.error_pct, r.status
+        );
+    }
+    if results.is_empty() {
+        println!("No chimera matches found within {}% threshold", threshold);
+    } else {
+        println!("\nFound {} chimera candidate(s)", results.len());
+    }
+    Ok(())
+}
+
+/// Run sensitivity analysis for a formula
+fn run_sensitivity(
+    _repo_root: &Path,
+    formula_id: &str,
+    param_name: &str,
+    min: Option<f64>,
+    max: Option<f64>,
+    n: usize,
+) -> anyhow::Result<()> {
+    let range = match (min, max) {
+        (Some(mn), Some(mx)) => (mn, mx),
+        _ => sensitivity::default_param_range(param_name),
+    };
+
+    let points = sensitivity::sensitivity_scan(formula_id, param_name, range, n);
+
+    println!("| {} | F('{}') | Delta% |", param_name, formula_id);
+    println!("|--------|----------|--------|");
+    let step = if points.len() > 10 { points.len() / 10 } else { 1 };
+    for p in points.iter().step_by(step.max(1)) {
+        println!(
+            "| {:.4} | {:.3} | {:.3}% |",
+            p.param_value, p.formula_value, p.error_pct
+        );
+    }
+
+    if let Some(best) = sensitivity::find_minimum(&points) {
+        println!("\nMinimum at {}={:.6} -> Delta={:.3}%", param_name, best.param_value, best.error_pct);
+    }
+
     Ok(())
 }
 
