@@ -67,22 +67,18 @@ MERGE_CRITICAL = (
 
 # The two lists above are a partition ONLY of the files they name. Everything
 # else in .github/workflows/ was read by nothing here, and the summary printed
-# the two counts beside the file count without ever subtracting them: 
-#   len(MERGE_CRITICAL) + len(NOT_MERGE_CRITICAL) + len(unclassified)
-# should equal the number of workflow files present.
-#
-# A ceiling rather than a refusal, because some files cannot be classified in the
-# commit that discovers them and a gate that is red on the day it lands teaches
-# everyone to ignore red. It moves DOWN only: classify a file and lower this in
-# the same commit, so the next unclassified workflow cannot hide in the slack.
-#
-# The ceiling is set to MAX_UNCLASSIFIED. If the number of unclassified files
-# exceeds the ceiling, the check fails.
-MAX_UNCLASSIFIED = 24
+# len(MERGE_CRITICAL) + len(NOT_MERGE_CRITICAL) + len(unclassified) equals the
+# workflow files present. A ceiling, not a refusal: a gate red on the day it
+# lands teaches everyone to ignore red. It moves DOWN only -- classify a file
+# and lower this in the same commit; over the ceiling the check fails.
+MAX_UNCLASSIFIED = 23
 
-# Not merge-critical, and each exclusion is stated with its reason so that a
-# future reader can disagree with the reason rather than guess at the omission.
+# Not merge-critical; each exclusion states its reason, so a reader can
+# disagree with the reason rather than guess at the omission.
 NOT_MERGE_CRITICAL = {
+    "queue-health-report.yml": "reporting only; writes the queue counts into one issue on a schedule; its own failure gates no merge",
+    "pr-queue-drain.yml": "reporting only; drains the armed queue in batch; its own failure gates no merge",
+    "agent-runner-docker.yml": "a sandbox runner image build; the jobs that run inside it carry their own gates",
     "pr-dashboard.yml": "reporting only; a stale dashboard does not gate a merge",
     "seal-staleness-warn.yml": "warn-only by name and by intent",
     "auto-merge-ready-prs.yml": "it merges pull requests on a schedule; its own failure gates nothing",
