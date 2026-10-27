@@ -160,6 +160,14 @@ use t27os::pty_sys::sys_listen;
 use t27os::pty_sys::sys_accept;
 use t27os::pty_sys::sys_poll;
 use t27os::pty_sys::sys_forkpty;
+// the stage-2 router, hosted (issue 12797): the actor laws, the wire composition, the bind bytes.
+// AF_UNIX and SOCK_STREAM are already pty_client's above; the stream kind is one law.
+use t27os::router_actor::CONN_MAILBOX;
+use t27os::router_actor::FAULT_LIMIT;
+use t27os::router_actor::BACKOFF_TICKS;
+use t27os::router_actor::tick_decision;
+use t27os::router_actor::router_listen;
+use t27os::router_serve::serve_answer;
 use t27os::pty_sys::sys_execv;
 use t27os::pty_sys::sys_exit;
 use t27os::pty_sys::sys_waitpid;
@@ -311,6 +319,13 @@ use t27os::pty_logic::spawn_cwd_len;
 use t27os::pty_logic::O_RING;
 use t27os::pty_logic::MEM_SIZE;
 use t27os::pty_logic::TICK_MS;
+use t27os::pty_logic::G_RTL;
+use t27os::pty_logic::G_RFAULTS;
+use t27os::pty_logic::G_RBACKOFF;
+use t27os::pty_logic::G_RCFD;
+use t27os::pty_logic::G_RCLEN;
+use t27os::pty_logic::O_RTRD;
+use t27os::pty_logic::RT_CAP;
 use t27os::pty_logic::SIGHUP_RING;
 use t27os::pty_logic::pane_alloc;
 use t27os::pty_logic::tv_ms;
@@ -1498,6 +1513,103 @@ fn sup_tick(st: []u64, mem: []u8, sup: []u64) -> void {
     sup[SX_OPEN] = sup_launch(st, mem);
 }
 
+// ---- the stage-2 router, hosted (issue 12797) --------------------------------------------------
+//
+// The server binds 127.0.0.1:47127 (router.t27 names them; the bytes are router_sock.t27's) and
+// serves the wire with router_serve.t27 serve_answer, as an actor (router_actor.t27): at most
+// CONN_MAILBOX connections in the mailbox, one step per poll wake, and a burst of broken clients
+// backs the conn loop off for BACKOFF_TICKS ticks while panes and the supervisor keep ticking.
+// Until the outbound provider client lands (its own spec), the walk's body is the router's own
+// honest error: the request is served, and no provider is wired to the server's walk yet.
+
+/// The mailbox bound, pinned to the actor law (router_actor.t27 CONN_MAILBOX).
+const RT_CONNS : usize = 8;
+
+/// Opens the router's listener by the actor law (router_actor router_listen): the fd lands in
+/// G_RTL; a refusal leaves it 0 and the server goes on serving panes only (one line says so).
+fn router_open(st: []u64, mem: []u8) -> void {
+    const fd : i32 = router_listen();
+    if (fd < 0) {
+        say("t27os-server: router: no listener, panes only\n");
+        return;
+    }
+    st[G_RTL] = @as(u64, @intCast(fd)) + 1;
+    say("t27os-server: router: listening on 127.0.0.1:47127\n");
+}
+
+/// One accept: into a free mailbox slot, or refused at accept time (the mailbox never grows).
+fn router_accept(st: []u64, mem: []u8) -> void {
+    const nfd : i32 = sys_accept(@as(i32, @intCast(st[G_RTL] - 1)), 0, 0);
+    if (nfd < 0) { return; }
+    var slot : usize = RT_CONNS;
+    var q : usize = 0;
+    while (q < RT_CONNS) {
+        if (st[G_RCFD + q] == 0 and slot == RT_CONNS) { slot = q; }
+        q = q + 1;
+    }
+    if (slot == RT_CONNS) {
+        sys_close(nfd);
+        return;
+    }
+    st[G_RCFD + slot] = @as(u64, @intCast(nfd)) + 1;
+    st[G_RCLEN + slot] = 0;
+}
+
+/// The length of the request head: the index just past the first empty line (CR LF CR LF).
+/// 0 while the head has not arrived whole.
+fn http_head_end(buf: []const u8) -> usize {
+    var i : usize = 0;
+    while (i + 3 < buf.len) {
+        if (buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10) {
+            return i + 4;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// The length of the buffer's first line, the CR or LF stripped; the whole buffer when no end.
+fn request_line_len(buf: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < buf.len) {
+        if (buf[i] == 13 or buf[i] == 10) { return i; }
+        i = i + 1;
+    }
+    return buf.len;
+}
+
+/// The walk's body until the outbound provider client lands (its own spec): an honest error
+/// object that says the request was served and no provider is wired to the server's walk yet.
+fn router_walk_body(out: []u8) -> usize {
+    var n : usize = 0;
+    n = put_bytes(out, n, "{\"error\":{\"type\":\"router_walk_not_wired\",\"message\":\"no provider client is wired to the server walk yet\"}}");
+    return n;
+}
+
+/// One actor step for one router connection: read what arrived, and once the head is whole,
+/// put the wire answer down (serve_answer) and report the connection done. false closes the
+/// connection: the read ended, the buffer is full, or the answer is on the wire.
+fn router_serve_conn(st: []u64, mem: []u8, c: usize) -> bool {
+    const off : usize = O_RTRD + c * RT_CAP;
+    const fd : i32 = @as(i32, @intCast(st[G_RCFD + c] - 1));
+    const clen : usize = @as(usize, @intCast(st[G_RCLEN + c]));
+    const room : usize = RT_CAP - clen;
+    if (room == 0) { return false; }
+    const n : i64 = sys_read(fd, mem[off + clen .. off + RT_CAP], @as(u64, room));
+    if (n <= 0) { return false; }
+    st[G_RCLEN + c] = st[G_RCLEN + c] + @as(u64, @intCast(n));
+    const have : usize = @as(usize, @intCast(st[G_RCLEN + c]));
+    const head : usize = http_head_end(mem[off .. off + have]);
+    if (head == 0) { return true; }
+    const llen : usize = request_line_len(mem[off .. off + head]);
+    var body : [512]u8 = undefined;
+    const bn : usize = router_walk_body(body[0..512]);
+    var out : [1024]u8 = undefined;
+    const tn : usize = serve_answer(mem[off .. off + llen], body[0..bn], out[0..1024]);
+    _ = sys_write(fd, out[0..tn], @as(u64, @intCast(tn)));
+    return false;
+}
+
 fn serve_loop(st: []u64, mem: []u8) -> void {
     var kind : [64]u8 = undefined;
     var idx : [64]u8 = undefined;
@@ -1534,6 +1646,22 @@ fn serve_loop(st: []u64, mem: []u8) -> void {
             }
             i = i + 1;
         }
+        if (st[G_RTL] != 0) {
+            put_pollfd(mem[O_POLL .. O_POLL + 512], k, @as(u32, @intCast(st[G_RTL] - 1)));
+            kind[k] = 3;
+            idx[k] = 0;
+            k = k + 1;
+            var rc : usize = 0;
+            while (rc < RT_CONNS) {
+                if (st[G_RCFD + rc] != 0) {
+                    put_pollfd(mem[O_POLL .. O_POLL + 512], k, @as(u32, @intCast(st[G_RCFD + rc] - 1)));
+                    kind[k] = 4;
+                    idx[k] = @as(u8, @intCast(rc));
+                    k = k + 1;
+                }
+                rc = rc + 1;
+            }
+        }
         const r : i32 = sys_poll(mem[O_POLL .. O_POLL + 512], @as(u64, k), TICK_MS);
         if (r > 0) {
             var e : usize = 0;
@@ -1562,6 +1690,26 @@ fn serve_loop(st: []u64, mem: []u8) -> void {
                             st[G_CFD + cc] = 0;
                             st[G_CLEN + cc] = 0;
                         }
+                    } else if (kind[e] == 3) {
+                        if (tick_decision(@as(u32, @intCast(st[G_RFAULTS])), @as(u32, @intCast(st[G_RBACKOFF]))) == 1) {
+                            router_accept(st, mem);
+                        }
+                    } else if (kind[e] == 4) {
+                        if (tick_decision(@as(u32, @intCast(st[G_RFAULTS])), @as(u32, @intCast(st[G_RBACKOFF]))) == 1) {
+                            const rcc : usize = @as(usize, idx[e]);
+                            if (!router_serve_conn(st, mem, rcc)) {
+                                sys_close(@as(i32, @intCast(st[G_RCFD + rcc] - 1)));
+                                st[G_RCFD + rcc] = 0;
+                                st[G_RCLEN + rcc] = 0;
+                                st[G_RFAULTS] = st[G_RFAULTS] + 1;
+                                if (st[G_RFAULTS] >= @as(u64, FAULT_LIMIT)) {
+                                    st[G_RBACKOFF] = @as(u64, BACKOFF_TICKS);
+                                    st[G_RFAULTS] = 0;
+                                }
+                            } else {
+                                st[G_RFAULTS] = 0;
+                            }
+                        }
                     } else {
                         serve_pane(st, mem, @as(usize, idx[e]));
                     }
@@ -1569,6 +1717,7 @@ fn serve_loop(st: []u64, mem: []u8) -> void {
                 e = e + 1;
             }
         }
+        if (st[G_RBACKOFF] > 0) { st[G_RBACKOFF] = st[G_RBACKOFF] - 1; }
         quiet_tick(st, mem);
         wait_tick(st, mem);
         sup_tick(st, mem, sup[0..16]);
@@ -1586,6 +1735,8 @@ fn run_server(st: []u64, mem: []u8) -> void {
         say("t27os-server: cannot open the socket\n");
         return;
     }
+    // the stage-2 router listens beside the pty socket (issue 12797); a refusal serves panes only
+    router_open(st, mem);
     // the server reads the Keychain itself before it restores a pane, so a restored pane sees its key at once
     // and does not wait for a window that may not be there (a number only is printed, never a key)
     const loaded : u32 = load_keys(st, mem, load_all_mask());
@@ -1769,8 +1920,8 @@ fn run_install(st: []u64, mem: []u8) -> void {
 }
 
 pub fn main() -> void {
-    var st : [512]u64 = undefined;
-    var mem : [1171712]u8 = undefined;
+    var st : [ST_SIZE]u64 = undefined;
+    var mem : [MEM_SIZE]u8 = undefined;
     var z : usize = 0;
     while (z < ST_SIZE) {
         st[z] = 0;
@@ -1814,8 +1965,8 @@ test the_arena_regions_do_not_overlap {
     assert O_KEYS + @as(usize, PROVIDER_COUNT) * @as(usize, MAX_KEYS) * KEY_CAP <= O_CARRY;
     assert O_CARRY + 16 * CARRY_SLOT <= O_SCAN;
     assert O_SCAN + SCAN_CAP <= MEM_SIZE;
-    assert MEM_SIZE == 1171712;
-    assert ST_SIZE == 512;
+    assert MEM_SIZE == 1190088;
+    assert ST_SIZE == 544;
     assert CARRY_SLOT == CARRY_CAP + 4;
 }
 
@@ -2067,4 +2218,39 @@ test the_supervisor_numbers_agree_with_each_other {
     // the supervisor's slots fit its array and do not overlap
     assert SX_TIMES + 3 <= SX_SIZE;
     assert SX_OPEN < SX_TIMES;
+}
+
+test "the_router_mailbox_matches_the_actor_law" {
+    assert RT_CONNS == CONN_MAILBOX;
+    assert G_RCLEN + RT_CONNS <= ST_SIZE;
+    assert O_RTRD + RT_CONNS * RT_CAP <= MEM_SIZE;
+    assert O_RTRD >= O_SCAN + SCAN_CAP;
+}
+
+test "the_head_end_and_the_request_line" {
+    // the wire bytes, laid out numerically: a request line, a Host head, the empty line, one body byte
+    var b : [40]u8 = undefined;
+    var n : usize = 0;
+    n = put_bytes(b[0..40], n, "POST /v1/messages HTTP/1.1");
+    b[n] = 13; n = n + 1; b[n] = 10; n = n + 1;
+    n = put_bytes(b[0..40], n, "Host: h");
+    b[n] = 13; n = n + 1; b[n] = 10; n = n + 1;
+    b[n] = 13; n = n + 1; b[n] = 10; n = n + 1;
+    b[n] = 66; n = n + 1;
+    assert n == 40;
+    assert http_head_end(b[0..n]) == 39;
+    assert request_line_len(b[0..n]) == 26;
+    const t : []const u8 = "GET /x";
+    assert http_head_end(t) == 0;
+    assert request_line_len(t) == 6;
+}
+
+test "the_walk_body_is_an_honest_error_object" {
+    var b : [256]u8 = undefined;
+    const n : usize = router_walk_body(b[0..256]);
+    assert n > 40;
+    assert b[0] == 123;
+    assert b[n - 1] == 125;
+    // {"error":{"type":"router_walk_not_wired",... -- the 'r' of the type value at 18
+    assert b[17] == 34 and b[18] == 114;
 }
