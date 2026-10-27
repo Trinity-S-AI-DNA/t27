@@ -3787,7 +3787,6 @@ async fn run_server(port_arg: &str) -> anyhow::Result<()> {
 // ============================================================================
 
 /// Top-level items of a module body, as (label, first line, last line).
-///
 /// Line-based, and it says so: the suite's own phase is the authority on the
 /// COUNT, and this only has to point at the construct. An item starts at a line
 /// whose indentation is one level in and whose first word is a keyword, and ends
@@ -4215,7 +4214,6 @@ fn run_parse_conform() -> anyhow::Result<()> {
 }
 
 /// Name the top-level items the parser stops on, by removing one at a time.
-///
 /// `--show` prints WHAT was dropped and is the direct answer; this is for the
 /// case where the dropped tokens alone do not say which construct owns them.
 /// It exists because a command that answered this did not, and I built a whole
@@ -4264,7 +4262,6 @@ fn run_bisect(path: &str) -> anyhow::Result<()> {
 }
 
 /// Contiguous runs of dropped tokens, as `(head lexeme, token count)`.
-///
 /// A run breaks at a line gap: the spans carry a line but no column, so two
 /// dropped regions on the same line are indistinguishable from one, and a blank
 /// or surviving line between them is the only separator available. That is a
@@ -5022,10 +5019,8 @@ fn extract_module_name_from_verilog(verilog: &str) -> String {
 }
 
 /// Wave 32 (R-TS-1): emit the balanced-ternary HW primitive library.
-///
 /// Writes the full trit stdlib (7 modules) to `output` if provided, otherwise
 /// to stdout. Pure additive surface -- does not parse or touch any .t27 spec.
-///
 /// See bootstrap/src/trit_stdlib.rs for the emitter and per-module truth tables.
 fn run_gen_trit_stdlib(output: Option<&str>) -> anyhow::Result<()> {
     let verilog = trit_stdlib::build_trit_stdlib_verilog();
@@ -5522,11 +5517,9 @@ fn run_gen_rust(input_path: &str) -> anyhow::Result<()> {
 
 /// Get a spec into an AST the declaration backends can walk, and hand back the
 /// display name they put in the generated file's header.
-///
 /// `use` resolution runs first, as it does for gen-c and gen-rust: it is
 /// backend-agnostic, and a backend that skips it silently drops every imported
 /// declaration.
-///
 /// It is one function because `gen-js` and `gen-ts` must fail on the same
 /// inputs. Two copies of this would be two answers to "did the imports land?"
 /// for one spec, and the second copy is where the fallback below gets forgotten.
@@ -5563,7 +5556,6 @@ fn ast_for_codegen(input_path: &str) -> anyhow::Result<(compiler::Node, String)>
 }
 
 /// `gen-js`: print the spec's declarations as a JavaScript ES module.
-///
 /// Our MCP servers run on JavaScript, and until this existed a .t27 spec that
 /// described one had no way to reach them -- so each such spec grew a
 /// hand-written generator in a foreign language beside it, and that generator,
@@ -5580,7 +5572,6 @@ fn run_gen_js(input_path: &str) -> anyhow::Result<()> {
 }
 
 /// `gen-ts`: the same declarations, with the types the spec declared for them.
-///
 /// `gen-js` closed the hole where a hand-written generator decided what the
 /// artifact said. It left a smaller one: a `.t27` declaration carries a type,
 /// an ES module has nowhere to put it, and a `.d.ts` written by hand beside the
@@ -5786,7 +5777,6 @@ fn compute_seal_hashes(input_path: &str) -> anyhow::Result<SealHashes> {
 
 /// The `spec_path` a seal records: relative to the working directory, which is
 /// the directory `.trinity/seals` resolves against, with `/` separators.
-///
 /// #6913: the path used to be recorded as typed. `t27c seal --save` given an
 /// absolute path committed three seals (#6789) naming the sealing agent's own
 /// worktree, which every checker then found dangling; and the twin refresh in
@@ -6892,13 +6882,11 @@ fn run_validate_phi_identity() -> Result<(), anyhow::Error> {
 }
 
 /// Synthesis-in-the-loop gate.
-///
 /// `synth-readiness` scans specs statically (parse / typecheck / gen succeeded).
 /// That is exactly the measurement the literature warns is optimistic: Fu et al.,
 /// "Synthesis-in-the-Loop Evaluation of LLMs for RTL Generation" (arXiv:2603.11287),
 /// report that simulation-level pass rates materially overstate true hardware
 /// readiness, because code can simulate and still fail to synthesize.
-///
 /// This gate closes that gap for t27's own backend: it emits Verilog for each
 /// spec and then actually invokes yosys `synth_xilinx`, reporting the fraction
 /// that survives to a gate-level netlist along with the cell count.
@@ -7173,13 +7161,11 @@ fn scan_vacuity(src: &str) -> VacuityCounts {
 }
 
 /// Audit the seal store.
-///
 /// A seal whose every `gen_hash_*` is "none" records that no backend produced
 /// output. Such a seal VERIFIES GREEN (none matches none) while certifying
 /// nothing -- it converts the integrity gate from a mismatch alarm into a
 /// rubber stamp. Wave 551 found 30 seals degraded that way, and the wave-loop
 /// that found them had caused all 30 itself by resealing unparseable specs.
-///
 /// This also reports seals whose spec file has gone missing, and seals whose
 /// spec no longer generates any backend output (the live version of the same
 /// problem).
