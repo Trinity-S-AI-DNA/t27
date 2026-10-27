@@ -4743,6 +4743,23 @@
 - `./scripts/tri test --fast` reports pre-existing Gen Verilog Yosys Smoke
   failures unrelated to the packed-AoS ladder; those warnings are not a blocker.
 
+### The foreign budget: two different caps
+- The own-language gate enforces TWO independent limits and a PR can pass one
+  and fail the other: at most 40 hand-written foreign lines ADDED per file
+  (80 per PR), and separately added <= deleted overall (shrink-only). A
+  net-negative diff with 96 added lines still fails; a 74/74 diff still fails
+  the per-file cap. Measure `git diff --cached --numstat` per file before
+  committing.
+- When a legitimate fix exceeds the caps, compress the additions you
+  themselves made (docs to fewer lines, branches folded to one line, concat
+  pieces merged with identical emitted text) and delete blank doc separators
+  in the SAME files: honest debt shrink that brings both numbers under the
+  caps without a label and without touching semantics.
+- Counting-build lesson (#5980/#12751): a counter that reports 0 for a
+  compile-time check is honest, but the LABEL must say which kind of check
+  ran; conflate "checked nothing" with "checked at compile time" and every
+  downstream reader inherits the lie.
+
 ### Anti-patterns to avoid
 - Do not omit inner dimensions in array-literal annotations (e.g. `[265][][][][][][]Pt`);
   even if the parser accepts the shorthand, it changes the layout/stride.
