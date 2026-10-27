@@ -107,6 +107,7 @@ One concept, two definitions. These are the ones with a repair.
 | `Route` | 3 | 3 files | Reconcile RouteMethod and HttpMethod (fix the DELETE/PATCH discriminants) and keep one Route ... |
 | `SacredConstants` | 2 | 2 files | Delete the 21-line stub in specs/sacred/sacred_constants.t27 or rename it (e.g. SacredConstan... |
 | `SacredRule` | 2 | 2 files | Pick one governance spec as the owner of SacredRule (sacred_governance.t27 has the richer rul... |
+| `Sample` | 2 | 2 files | Rename codegen_conformance's to CaptureSample and float_as's to CastSample; both are file-local conformance records, nothing imports the bare name (DISTINCT). |
 | `SearchResult` | 4 | 4 files | Have specs/vsa/similarity_search.t27 use `vsa::core::SearchResult` and decide once whether th... |
 | `Session` | 3 | 3 files | Extract the sandbox Session (plus Timestamp and SessionStatus) into one module both sandbox s... |
 | `SkillMeta` | 2 | 2 files | Keep loader.t27's record as the owner and rename catalog.t27's projection to CatalogSkillMeta -- it only ever renders name/description/location; the two halves are one ported crate. |
