@@ -664,15 +664,27 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
         .chain(module_level_names(source))
         .collect();
 
-    // Basenames of the modules this spec imports whole, for the
-    // qualified-reference rewrite (`use_target`: an item's module is not one).
-    let modules: Vec<String> = source
-        .lines()
-        .filter_map(use_path_expr)
-        .filter_map(|e| use_target(&specs_root, e))
-        .filter(|(_, whole)| *whole)
-        .filter_map(|(p, _)| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .collect();
+    // One walk over the use lines feeds both rewrites: a whole-module import
+    // gives its stem; an item import records the module holding the item
+    // (#12664) -- the first line naming the item wins.
+    let mut modules: Vec<String> = Vec::new();
+    let mut named_origin: HashMap<String, String> = HashMap::new();
+    for line in source.lines() {
+        let Some(expr) = use_path_expr(line) else { continue };
+        let Some((target, whole)) = use_target(&specs_root, expr) else { continue };
+        if whole {
+            if let Some(stem) = target.file_stem() { modules.push(stem.to_string_lossy().to_string()); }
+            continue;
+        }
+        let origin = target.strip_prefix(&specs_root).unwrap_or(&target).to_string_lossy().to_string();
+        let items: Vec<String> = match expr.find('{') {
+            Some(i) => expr[i + 1..].trim_end_matches('}').split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            None => vec![expr.rsplit(|c: char| c == ':' || c == '.').next().unwrap_or(expr).to_string()],
+        };
+        for item in items {
+            named_origin.entry(item).or_insert(origin.clone());
+        }
+    }
     let qualified = qualified_refs(source, &modules);
 
     // Fixpoint: pull a needed declaration, then look at what IT references.
@@ -686,12 +698,8 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     }
     while !frontier.is_empty() {
         let mut next: HashSet<(String, String)> = HashSet::new();
-        // The frontier is walked in HashSet order, which Rust randomises per
-        // process. Sorting it here was tried and REMOVED: with the `distinct`
-        // sort below in place and this one gone, 0 of the 492 importing specs
-        // are non-deterministic over four runs each. A guard whose removal
-        // changes nothing measurable is decoration, and the comment justifying
-        // it would outlive the reason for it.
+        // HashSet order is randomised per process; the sorted `distinct`
+        // below is what keeps the emitted order deterministic.
         for (name, ctx) in frontier {
             if local.contains(&name) || pulled_names.contains(&name) {
                 continue;
@@ -700,20 +708,18 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
                 Some(c) => c,
                 None => continue,
             };
-            let distinct: Vec<&Decl> = {
+            let mut distinct: Vec<&Decl> = {
                 let mut by_origin: HashMap<&str, &Decl> = HashMap::new();
                 for d in candidates {
                     by_origin.entry(d.origin.as_str()).or_insert(d);
                 }
-                // Same reason as the frontier above: `into_values()` on a
-                // HashMap is randomised, and `distinct[0]` below is the
-                // declaration that actually gets emitted whenever the
-                // candidates agree. Agreement is judged on NORMALISED text, so
-                // two agreeing declarations can still differ byte for byte.
+                // The values are sorted so `distinct[0]` is deterministic.
                 let mut v: Vec<&Decl> = by_origin.into_values().collect();
                 v.sort_by(|a, b| (&a.origin, &a.name).cmp(&(&b.origin, &b.name)));
                 v
             };
+            let at = use_splice::scoped_pick(distinct.iter().map(|d| d.origin.as_str()).collect::<Vec<_>>().join("\n").as_bytes(), named_origin.get(&name).map_or("", |o| o.as_str()).as_bytes());
+            if at >= 0 { distinct = vec![distinct[at as usize]]; }
             let chosen: Option<&Decl> = if distinct.len() == 1 || all_agree(&distinct) {
                 Some(distinct[0])
             } else {
@@ -759,34 +765,11 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
     // Rewrite `module::name` / `module.name` to the bare name the splice
     // declares. Longest first, so `a::bc` is not damaged by rewriting `a::b`.
     let mut out = consume_spliced_uses(source, &specs_root, &pulled_names);
-    // W606: `|| local.contains(name)`.
-    //
-    // The filter used to accept only names the splice PULLED, so a qualified
-    // reference to something the importing file also declares itself was left
-    // spelled `eval::has_substring` -- and codegen lowers `::` to `.`, which is
-    // an undeclared namespace in the flat output.
-    //
-    // `specs/igla/coder/dataset.t27` is exactly that shape: it declares its own
-    // `has_substring` (its header says "inline copies of eval.t27 templates to
-    // avoid circular imports") AND calls `eval::has_substring(...)`. The
-    // fixpoint skips local names by design, so the name never entered
-    // `pulled_names`, so the rewrite never fired -- while three OTHER qualified
-    // references in the same file, whose declarations were pulled, rewrote
-    // correctly. One file, two outcomes, from one missing disjunct.
-    //
-    // #5574: the W606 rewrite flattens a qualified reference to the bare name
-    // the splice declares. For a name that is local as well, the bare spelling
-    // binds to the LOCAL declaration -- correct only when the two declarations
-    // are the same function (specs/igla/coder/dataset.t27 keeps inline copies
-    // of eval.t27), and wrong when the local is a namesake of a DIFFERENT
-    // arity (specs/ml/transformer/mha_block.t27's own `forward` vs
-    // `multi_head_attn::forward`). A wrong flattening makes the typechecker
-    // report the imported call against the local namesake. So a qualified CALL
-    // whose bare name collides with a local declaration is flattened only when
-    // some imported declaration of that name agrees (normalised text) with the
-    // local one; otherwise the qualifier stays, the call binds to no local
-    // function, and the arity check is skipped by non-match rather than run
-    // against a namesake. Non-call spellings keep the old flattening.
+    // W606 + #5574: a qualified reference is flattened to the bare name the
+    // splice declares; when the bare name is also local, only a qualified CALL
+    // whose local namesake agrees with (or faithfully inlines) the imported
+    // declaration may flatten -- `flatten_qualified` decides. The story of the
+    // missing `|| local.contains(name)` disjunct lives in git history.
     let flat = |q: &String, n: &String| scoped.get(&(format!("={}", q), n.clone())).map(|o| sized(|b, c| use_splice::flat_name(o.as_bytes(), n.as_bytes(), b, c)));
     let mut rewrites: Vec<&(String, String, bool)> = qualified
         .iter()
@@ -1250,24 +1233,21 @@ mod missing_use_tests {
         assert!(out.contains("return K;") && !out.contains("b::K"), "{}", out);
     }
 
-    /// Listing a name does not pick between two modules that declare it: it
-    /// stays UNRESOLVED, as with whole-module imports. Rust's rule (an explicit
-    /// import outranks a glob) was tried and measured on the corpus: in
-    /// `specs/base/ring_32.t27` it chose math/sacred_physics' TRINITY, whose
-    /// closure declares `PHI` as `constants::PHI`, and the splice rewrites
-    /// qualifiers in the importer only, so zig failed on `constants` where the
-    /// unspliced output passed its test.
+    /// An item import names the module that holds the item (R6, #12664): the
+    /// named module's declaration splices even when another closure module
+    /// declares the name; a whole-module import still refuses (R4).
     #[test]
-    fn a_listed_item_two_modules_declare_stays_unresolved() {
+    fn an_item_import_takes_the_name_from_the_module_it_names() {
         let root = specs_with_a_b("listed");
         std::fs::write(root.join("a/c.t27"), "module c;\npub const K : u8 = 4;\n").expect("write");
         let input = root.join("m.t27");
         let body = "\n\npub fn k() -> u8 {\n    return K;\n}\n";
-        for line in ["use a::b::{ K };", "use a::b::K;", "use a::b;"] {
+        for line in ["use a::b::{ K };", "use a::b::K;"] {
             let out = resolve(&input, &format!("module m;\nuse a::c;\n{}{}", line, body));
-            assert!(out.contains("UNRESOLVED K"), "{}: {}", line, out);
-            assert!(!out.contains("= 3;") && !out.contains("= 4;"), "{}: {}", line, out);
+            assert!(out.contains("pub const K : u8 = 3;") && !out.contains("UNRESOLVED K") && !out.contains("= 4;"), "{}: {}", line, out);
         }
+        let whole = resolve(&input, &format!("module m;\nuse a::c;\nuse a::b;{}", body));
+        assert!(whole.contains("UNRESOLVED K") && !whole.contains("= 3;") && !whole.contains("= 4;"), "{}", whole);
     }
 
     /// `specs/fpga/testbench/spi_tb.t27`'s shape: a module body at four spaces
