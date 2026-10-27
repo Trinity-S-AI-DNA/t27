@@ -23633,24 +23633,10 @@ impl Compiler {
         Ok(codegen.into_string())
     }
 
-    /// #11182: `S{ .f = p }` or `s.f = p` with `f` a `[]T` field (`Vec<T>` here) and `p` a `[]T` parameter or `&x` moves the caller's storage; a borrow needs a lifetime on the struct and every constructor, so refuse.
-    fn rust_slice_field_capture(structs: &std::collections::HashMap<String, Vec<(String, String)>>, n: &Node, params: &[String]) -> Option<String> {
-        let params: Vec<String> = if n.kind == NodeKind::FnDecl { n.params.iter().filter(|(_, t)| t.trim_start().starts_with("[]") && t.trim() != "[]const u8").map(|p| p.0.clone()).collect() } else { params.to_vec() };
-        let taken = |v: &Node| (v.kind == NodeKind::ExprUnary && v.extra_op == "&") || (v.kind == NodeKind::ExprIdentifier && params.contains(&v.name));
-        let slice = |s: &str, f: &str| structs.iter().any(|(k, fs)| (s.is_empty() || k == s) && fs.iter().any(|(n, t)| n == f && t.trim_start_matches('?').starts_with("[]") && t.trim() != "[]const u8"));
-        let hit = match n.kind {
-            NodeKind::ExprStructLit => n.children.iter().find(|f| f.children.first().is_some_and(taken) && slice(&n.name, &f.name)).map(|f| (n.name.as_str(), f.name.as_str())),
-            NodeKind::StmtAssign if n.children.len() == 2 && n.children[0].kind == NodeKind::ExprFieldAccess && taken(&n.children[1]) && slice("", &n.children[0].name) => Some(("", n.children[0].name.as_str())),
-            _ => None,
-        };
-        hit.map(|(s, f)| format!("`{s}.{f}` is a `[]T` field filled from borrowed storage: gen-rust writes it `Vec<T>` and takes the storage by value, so the caller's storage is moved; a borrow needs a lifetime on the struct and on every constructor (#11182)")).or_else(|| n.children.iter().find_map(|c| Self::rust_slice_field_capture(structs, c, &params)))
-    }
-
     pub fn compile_rust(source: &str) -> Result<String, String> {
         let lexer = Lexer::new(source);
         let mut parser = Parser::new(lexer);
         let ast = parser.parse()?;
-        Self::rust_slice_field_capture(&Self::collect_struct_decls(&ast), &ast, &[]).map_or(Ok(()), Err)?;
         // Emit FAITHFUL Rust from the AST. Do NOT run t27c's own optimizer on the
         // Rust backend: several of its passes (const-propagation and the
         // unconditional copy-propagation / dead-store passes) corrupt a
@@ -23660,6 +23646,8 @@ impl Compiler {
         // and sufficient here. Verilog/Zig/C backends keep their own pipelines.
         // Fixes gHashTag/t27#1455.
         let mut codegen = RustCodegen::new();
+        // #11182: field names whose type is `[]T` (never `[]const u8`); the assign path knows only the name.
+        codegen.slice_fields = Self::collect_struct_decls(&ast).values().flatten().filter(|(_, t)| (t.trim_start().starts_with("[]") || t.trim_start().starts_with("Vec<")) && t.trim() != "[]const u8").map(|(n, _)| n.clone()).collect();
         codegen.collect_static_muts(&ast);
         codegen.gen_rust(&ast);
         Ok(codegen.into_string())
@@ -27055,6 +27043,9 @@ pub struct RustCodegen {
     /// emitted before the declaration it reads.
     static_mut_names: std::collections::HashSet<String>,
     decl_types: std::collections::HashMap<String, String>,
+    /// Field NAMES whose declared type is `[]T` in any struct of the module;
+    /// the assign path knows only the name, so the name set is the lookup. #11182.
+    slice_fields: std::collections::HashSet<String>,
 }
 
 #[allow(dead_code)]
@@ -27083,6 +27074,7 @@ impl RustCodegen {
             type_params: std::collections::HashSet::new(),
             static_mut_names: std::collections::HashSet::new(),
             decl_types: std::collections::HashMap::new(),
+            slice_fields: std::collections::HashSet::new(),
         }
     }
 
@@ -27410,6 +27402,13 @@ impl RustCodegen {
     }
 
     /// Record every module-level `var` before anything is emitted.
+    /// #11182: the COPY lowering for a value captured into a `[]T` field:
+    /// `x.to_vec()` covers a `[]T` parameter (`Vec<T>`), a fixed array local and a `&x` borrow alike.
+    fn slice_copy_of(&self, v: &Node) -> Option<String> {
+        let inner = if v.kind == NodeKind::ExprUnary && v.extra_op == "&" { v.children.first()? } else { v };
+        (inner.kind == NodeKind::ExprIdentifier && !inner.name.is_empty()).then(|| format!("{}.to_vec()", rust_ident(&inner.name)))
+    }
+
     fn collect_static_muts(&mut self, node: &Node) {
         if node.kind == NodeKind::ConstDecl && node.extra_mutable && !node.name.is_empty() {
             self.static_mut_names.insert(node.name.clone());
@@ -28116,7 +28115,8 @@ impl RustCodegen {
             NodeKind::StmtAssign => {
                 if stmt.children.len() >= 2 {
                     let target = self.expr_to_rust(&stmt.children[0]);
-                    let val = self.expr_to_rust(&stmt.children[1]);
+                    // #11182: `s.f = p` into a `[]T` field takes a COPY; the caller keeps its storage.
+                    let val = if stmt.children[0].kind == NodeKind::ExprFieldAccess && self.slice_fields.contains(&stmt.children[0].name) { self.slice_copy_of(&stmt.children[1]).unwrap_or_else(|| self.expr_to_rust(&stmt.children[1])) } else { self.expr_to_rust(&stmt.children[1]) };
                     self.write_line(&format!(
                         "{}{}{};",
                         target,
@@ -29298,7 +29298,7 @@ impl RustCodegen {
                         let val = if c.children.is_empty() {
                             "{}".to_string()
                         } else if let Some(t) = self.decl_types.get(&format!("{}.{}", node.name, c.name)) {
-                            self.expr_to_rust_as(&c.children[0], t) // #8891: a usize into a u64 field is cast
+                            if (t.trim_start().starts_with("[]") || t.trim_start().starts_with("Vec<")) && t.trim() != "[]const u8" { self.slice_copy_of(&c.children[0]).unwrap_or_else(|| self.expr_to_rust_as(&c.children[0], t)) } else { self.expr_to_rust_as(&c.children[0], t) } // #8891 cast; #11182: a []T field takes a COPY (decl_types stores the RUST type here)
                         } else {
                             self.expr_to_rust(&c.children[0])
                         };
