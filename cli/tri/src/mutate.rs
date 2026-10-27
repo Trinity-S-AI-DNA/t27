@@ -37,8 +37,6 @@ mod lab; // of specs/tri/mutate/lab.t27 (#7050): zig_j and the exit codes of a r
 #[path = "../../../gen/rust/tri/mutate/plant.rs"] #[allow(dead_code, unused_parens)]
 mod plant; // of specs/tri/mutate/plant.t27 (#7369): every decision of `mutate plant`
 #[path = "../../../gen/rust/tri/mutate/clock.rs"] #[allow(dead_code, unused_parens)] mod clock; // of specs/tri/mutate/clock.t27 (#12345): first-pass clock, reruns
-#[path = "../../../gen/rust/tri/mutate/answer.rs"] #[allow(dead_code, unused_parens)] mod answer; // of specs/tri/mutate/answer.t27 (#12539): how a failed compile is read, which answers are asked again
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
 #[derive(Subcommand)]
 pub enum MutateCmd {
@@ -1149,7 +1147,7 @@ fn zig_fate(zig: &Path, zig_j: u32, compile_secs: u64, run_secs: u64) -> Result<
 /// clock over both made a cold compile on a loaded machine read as a hang, and
 /// `zig test` exits 1 on a compile error as on a failing test (#7148; the same
 /// defect is unclebob/mutator issue 1).
-fn zig_fate_once(zig: &Path, zig_j: u32, compile_secs: u64, run_secs: u64) -> Result<Fate> {
+fn zig_fate(zig: &Path, zig_j: u32, compile_secs: u64, run_secs: u64) -> Result<Fate> {
     let bin = zig.with_extension("bin");
     let err = zig.with_extension("err");
     let compiled = run_with_timeout(
@@ -1638,11 +1636,6 @@ fn mutate_spec(
     print!("{}", spec_report(file, &ran));
     let (h, a) = hung.into_inner().map(|v| (v.len() as u32, v.iter().filter(|n| **n).count() as u32)).unwrap();
     println!("First-pass clock {first_s} s of --timeout {secs} s: {} rerun(s), {} job-s saved (arithmetic on counts, specs/tri/mutate/clock.t27, not a measurement).", clock::rerun_at_cap(h, a), clock::job_s_saved(h, a, u32::try_from(secs).unwrap_or(u32::MAX), first_s));
-    let others: Vec<_> = ran.iter().filter(|(_, f)| matches!(f, Fate::Unviable(w) if w.ends_with(answer::REPEATED))).collect();
-    let u = ran.iter().filter(|(_, f)| matches!(f, Fate::Unviable(_))).count() as u32;
-    println!("Compile answers (specs/tri/mutate/answer.t27, #12539): {} mutant(s) retried; of {u} unviable, {} settled (refusals, located errors, t27c gen refusals) and {} other answers that repeated.", RETRIED.load(SeqCst), answer::settled_unviable(u, others.len() as u32), others.len());
-    if !others.is_empty() { println!("{} OTHER ANSWERS -- unviable, neither an emitter refusal nor a located error, and the same answer came twice:", others.len()); }
-    for (m, f) in &others { if let Fate::Unviable(w) = f { println!("  {}:{} [{}]: {w}", file.display(), m.line, m.kind); } }
     if !not_run.is_empty() {
         println!("{} NOT RUN -- counted nowhere above:", not_run.len());
         for (m, e) in &not_run {
