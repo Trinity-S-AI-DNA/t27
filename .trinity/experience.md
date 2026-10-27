@@ -20125,3 +20125,11 @@ Sources:
 - Implemented a verification-gated payment gateway to ensure $TRI is only distributed upon a "GREEN" seal.
 - Added safeguards against double-claiming and treasury insolvency.
 - Result: Created a trustless economic layer for autonomous actor coordination.
+## Learning: Actor Hand-off in T27OS
+- Implemented the T27-HANDSHAKE protocol to ensure atomic task transfer between decentralized actors.
+- Integrated with the state_graph to verify receiver availability.
+- Result: Enabled a seamless, conflict-free relay of development tasks across a distributed swarm.
+## Learning: Parallel Spec Generation
+- Implemented a fragment-based submission system for decentralized spec authorship.
+- Used a coordinator pattern to merge fragments into a final .t27 module.
+- Result: Reduced the time-to-spec for large modules by enabling parallel actor work.
