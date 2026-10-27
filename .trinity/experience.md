@@ -4760,6 +4760,21 @@
   ran; conflate "checked nothing" with "checked at compile time" and every
   downstream reader inherits the lie.
 
+### Recovering a deleted PR branch (2026-10-27, incident-free ending)
+- Deleting a PR's head branch auto-CLOSES the PR; `gh pr reopen` refuses until
+  the branch exists again. The commit is not lost: the local repo that pushed
+  it still holds the SHA (`git rev-parse <local-branch>` for the FULL 40-char
+  form -- a truncated SHA fails the push with a confusing refspec error).
+- Restore with a BRANCH refspec, not `SHA:refs/...`: in zsh the SHA and the
+  refspec can concatenate into one broken token ("...a78ccdefs/heads/..." --
+  the literal lesson). `git push origin <local-branch>:refs/heads/<pr-branch>`
+  then `gh pr reopen N` reopens with the fix intact.
+- Trust `headRefOid`, never `headRefName`, when scripting against a PR: the
+  NAME can belong to a different branch than you assume (this session nearly
+  force-pushed master's tip over a PR branch because of that).
+- `--force-with-lease` failing is the guard working. Read it as a stop sign,
+  not as an obstacle to a different spelling of the same push.
+
 ### Anti-patterns to avoid
 - Do not omit inner dimensions in array-literal annotations (e.g. `[265][][][][][][]Pt`);
   even if the parser accepts the shorthand, it changes the layout/stride.
