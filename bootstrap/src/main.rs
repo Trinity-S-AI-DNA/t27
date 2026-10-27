@@ -3873,16 +3873,9 @@ fn run_catalog_gate(catalog: &str, specs_dir: &str, verbose: bool) -> anyhow::Re
             println!("    [{}] {}: {}", f.check, f.id, f.detail);
         }
     }
-    // W702: this command printed `FINDINGS 3` and returned 0.
-    //
-    // Measured before the change: `t27c catalog-gate; echo $?` gives EXIT=0 with
-    // three findings on screen. Its only terminator was `Ok(())`. A verdict a
-    // caller cannot read is decoration, and the CLI is where a human runs this
-    // gate by hand -- the suite counts the same findings and is the only reason
-    // any of them reach a build.
-    //
-    // `ALLOWED` is shared with the suite so the two cannot drift into
-    // disagreeing about which findings are debt.
+    // W702: this command printed `FINDINGS 3` and returned 0 (`t27c
+    // catalog-gate; echo $?` -> EXIT=0). A verdict a caller cannot read is
+    // decoration; `ALLOWED` is shared with the suite so the two cannot drift.
     let unexpected = r
         .findings
         .iter()
@@ -4309,11 +4302,9 @@ fn run_parse_complete(
     // instrument that stops one step short.
     //
     // W702: this arm was moved above the `--show` handler so it could win when
-    // BOTH flags are given, and its `if fallbacks` guard was left behind. Plain
-    // `--show` then printed the fallback view instead of the token view it is
-    // documented to print, and the token view became unreachable. Nothing
-    // failed: both outputs are plausible, and the flag that selects between
-    // them was the one that stopped being read.
+    // BOTH flags given, `if fallbacks` left behind: plain `--show` printed the
+    // fallback view, and the token view became unreachable -- nothing failed,
+    // the selecting flag just stopped being read.
     if fallbacks {
         if let Some(path) = show {
             let src = std::fs::read_to_string(path)?;
@@ -4384,10 +4375,8 @@ fn run_parse_complete(
     // W699: what the parser STOPPED ON, corpus-wide.
     //
     // The classification this replaces was a keyword match over the printed
-    // traces, run from outside the compiler -- it guessed `forall` from the
-    // presence of the word. This asks the record: the head of each contiguous
-    // dropped run IS the token recovery began at. `forall` is not the answer it
-    // gives, and the answer it gives is better.
+    // It guessed `forall` from the word's presence; the record shows the head
+    // of each dropped run IS where recovery began -- and that answer is better.
     if fallbacks {
         let mut by: std::collections::BTreeMap<(&'static str, String), (usize, std::collections::BTreeSet<String>)> =
             std::collections::BTreeMap::new();
