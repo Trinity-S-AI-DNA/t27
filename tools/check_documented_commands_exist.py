@@ -254,7 +254,7 @@ MUST_NOT_EXIST = ("gen-zig",)
 MAX_DEAD_TRI = 86
 
 TRI_MUST_EXIST = ("now", "wave", "gen", "skill", "seal")
-TRI_MUST_NOT_EXIST = ("gen-zig", "gen-dir", "spec")
+TRI_MUST_NOT_EXIST = ("gen-zig", "gen-dir", "spec", "git")
 
 
 def refuse(msg: str) -> None:
