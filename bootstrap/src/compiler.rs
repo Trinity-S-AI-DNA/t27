@@ -1200,8 +1200,216 @@ impl Parser {
                 self.parse_struct_body(&mut decl)?;
                 self.expect(TokenKind::RBrace)?;
             } else if self.current.kind == TokenKind::LBracket {
+                // 2026-10-26: a declared `[1]T` annotation pins the arity, so a
+                // bracketed single element in the value position is a ONE-ELEMENT
+                // LIST, not a dimension -- `[42]` is otherwise indistinguishable
+                // from the dimension of a `[42]T` spelling, which is why
+                // parse_bare_array_literal refuses single integer elements. The
+                // declared annotation settles that ambiguity: parse the one
+                // element directly (epic_progress.t27 DATE is the case that
+                // reached the legacy text collector as an ExprIdentifier).
+                let declared_arity_one = decl.extra_type.starts_with("[1]");
+                let mut one_element_handled = false;
+                if declared_arity_one {
+                    let save = self.save_state();
+                    self.advance(); // consume [
+                    if let Ok(elem) = self.parse_expr() {
+                        if self.current.kind == TokenKind::RBracket {
+                            self.advance(); // consume ]
+                            let mut lit = Node::new(NodeKind::ExprArrayLiteral);
+                            lit.children.push(elem);
+                            decl.children.push(lit);
+                            one_element_handled = true;
+                        }
+                    }
+                    if !one_element_handled {
+                        self.restore_state(save);
+                    }
+                }
+                if !one_element_handled {
                 // pub const TernaryWord = [WORD_BYTES]u8; or [_]u8{...} ** N
-                // Collect the full expression as value text
+                // W383: try to parse the bracket expression as an array literal.
+                // If it carries element children (e.g. [4]u16{...}), it is a ROM
+                // initializer and should be emitted as a Verilog memory. If it
+                // has no children (e.g. [WORD_BYTES]u8), it is a type alias and
+                // we restore the parser state and preserve the legacy text form.
+                // If parse_array_literal cannot handle the shape (e.g. ['T','R']),
+                // fall back to the legacy text collection so old specs keep parsing.
+                let save = self.save_state();
+                let array_literal_result = self.parse_array_literal();
+                let use_literal = match &array_literal_result {
+                    Ok(lit) => !lit.children.is_empty(),
+                    Err(_) => false,
+                };
+                if use_literal {
+                    decl.children.push(array_literal_result.unwrap());
+                } else if let Some(bare) = {
+                    self.restore_state(save.clone());
+                    self.parse_bare_array_literal()
+                } {
+                    // W568: a BARE bracketed list -- `const A: [3]u32 = [1, 2, 3]`.
+                    // `parse_array_literal` only understands the Zig-ish
+                    // `[N]T{ ... }` spelling, so it returned a childless node
+                    // here and control fell through to the text collector
+                    // below, which runs to the next SEMICOLON. t27 top-level
+                    // declarations are newline-terminated, so one such const
+                    // swallowed every declaration after it -- an entire spec
+                    // collapsed into a single unparsable string.
+                    decl.children.push(bare);
+                } else {
+                    self.restore_state(save);
+                    // The collector runs to the next SEMICOLON, and t27's
+                    // top-level declarations are newline-terminated, so an
+                    // unrecognised bracket value used to consume the rest of
+                    // the file. Stop as well at a declaration keyword that
+                    // OPENS ITS OWN LINE -- the same-line test is what keeps
+                    // `[]const u8` (whose `const` follows `[]` on one line)
+                    // intact.
+                    let mut val_text = String::new();
+                    let mut last_line = self.current.line;
+                    while self.current.kind != TokenKind::Semicolon
+                        && self.current.kind != TokenKind::Eof
+                    {
+                        if self.current.line > last_line
+                            && Self::opens_declaration(self.current.kind)
+                        {
+                            break;
+                        }
+                        last_line = self.current.line;
+                        val_text.push_str(&self.current.lexeme);
+                        self.advance();
+                    }
+                    let mut val_node = Node::new(NodeKind::ExprIdentifier);
+                    val_node.name = val_text;
+                    decl.children.push(val_node);
+                }
+                if self.current.kind == TokenKind::Semicolon {
+                    self.advance();
+                }
+                return Ok(decl);                }
+            } else if self.current.kind == TokenKind::LParen {
+
+                // W652: a PARENTHESISED initialiser -- `const P : u32 = (A + 1) * 2;`
+                // reached none of the branches below and fell through to the
+                // trailing default, which pushed no child at all. Verilog then
+                // emitted `localparam P = 0` and Zig emitted `const P: u32;`
+                // with no initialiser -- not even valid Zig.
+                let lit = self.parse_expr()?;
+                decl.children.push(lit);
+            } else if self.current.kind == TokenKind::Minus {
+                // [BUG 10 FIX] Negative number: -1 or expression
+                // W652: `-<Number>` with nothing after it keeps the cheap path.
+                // Anything else -- `-A`, `-A - 1` -- must go through parse_expr.
+                // Previously `-A` consumed the `-`, found no Number, and pushed
+                // NOTHING: an initialiser silently vanished.
+                let simple_negative_literal = self.peek.kind == TokenKind::Number;
+                if simple_negative_literal {
+                    let save = self.save_state();
+                    self.advance(); // consume -
+                    let lexeme = self.current.lexeme.clone();
+                    self.advance(); // consume the number
+                    if Self::const_value_continues(&self.current) {
+                        self.restore_state(save);
+                        let lit = self.parse_expr()?;
+                        decl.children.push(lit);
+                    } else {
+                        let mut val_node = Node::new(NodeKind::ExprLiteral);
+                        val_node.value = format!("-{}", lexeme);
+                        decl.children.push(val_node);
+                    }
+                } else {
+                    let lit = self.parse_expr()?;
+                    decl.children.push(lit);
+                }
+            } else if self.current.kind == TokenKind::Number {
+                // W652: `const LIT : u32 = 100 / 7;` used to emit `LIT = 100`.
+                if Self::const_value_continues(&self.peek) {
+                    let lit = self.parse_expr()?;
+                    decl.children.push(lit);
+                } else {
+                    let mut val_node = Node::new(NodeKind::ExprLiteral);
+                    val_node.value = self.current.lexeme.clone();
+                    decl.children.push(val_node);
+                    self.advance();
+                }
+            } else if self.current.kind == TokenKind::Ident {
+                // W533/W543: a scalar struct literal initializer `const x : T = T{...}`
+                // or a function-call initializer `const x : T = make(5)` is parsed as
+                // a full expression so the AST preserves arguments and field values.
+                // Plain identifiers stay as `ExprIdentifier` for type aliases and
+                // cross-const references.
+                let name = self.current.lexeme.clone();
+                // W651: a QUALIFIED path must go through `parse_expr` too.
+                // `parse_expr_primary` concatenates `a::b` into one flat name
+                // (compiler.rs ~3620); this branch took only
+                // `self.current.lexeme` and advanced ONE token, so
+                // `const A : u8 = constants::COMPLEXITY_HIGH;` became
+                // `A = constants` -- a silently WRONG VALUE, in all four
+                // backends, with no error and no warning. 98 such initialisers
+                // across 29 specs.
+                //
+                // The asymmetry is T60's shape exactly: `constants::make(5)`
+                // already worked, because `(` routed it through `parse_expr`.
+                // Only the bare-path spelling took the truncating branch.
+                //
+                // W652: the same hole, one operator wider. `const DIV : u32 =
+                // A / B;` emitted `DIV = A` -- the divisor was DISCARDED, in
+                // all five backends, silently. `A > 5` emitted `A`; `Cfg.width`
+                // emitted `Cfg`. The C backend turned each into a `typedef`,
+                // so a constant became a TYPE. `f(A) + 1` was correct all
+                // along, because `(` routed it through `parse_expr` -- the
+                // delimiter, not the meaning, decided correctness.
+                let qualified =
+                    self.peek.kind == TokenKind::Colon;
+                if self.peek.kind == TokenKind::LBrace
+                    || self.peek.kind == TokenKind::LParen
+                    || qualified
+                    || Self::const_value_continues(&self.peek)
+                {
+                    let lit = self.parse_expr()?;
+                    decl.children.push(lit);
+                } else {
+                    let mut val_node = Node::new(NodeKind::ExprIdentifier);
+                    val_node.name = name;
+                    decl.children.push(val_node);
+                    self.advance();
+                }
+            } else if (self.current.kind == TokenKind::KwTrue
+                || self.current.kind == TokenKind::KwFalse)
+                && Self::const_value_continues(&self.peek)
+            {
+                // #6048: `true and false` kept only `true`.
+                let lit = self.parse_expr()?;
+                decl.children.push(lit);
+            } else if matches!(
+                self.current.kind,
+                TokenKind::Tilde | TokenKind::Bang | TokenKind::CharLiteral
+            ) {
+                // #6048/#6049: `~5`, `!true` and `'a'` reached the default
+                // below, which skipped to `;` and pushed no child, so the
+                // constant was never emitted and every use of it was an
+                // undeclared name. They are expressions like any other.
+                let lit = self.parse_expr()?;
+                decl.children.push(lit);
+            } else if self.current.kind == TokenKind::KwTrue
+                || self.current.kind == TokenKind::KwFalse
+            {
+                let mut val_node = Node::new(NodeKind::ExprLiteral);
+                val_node.value = self.current.lexeme.clone();
+                decl.children.push(val_node);
+                self.advance();
+            } else if self.current.kind == TokenKind::String {
+                let mut val_node = Node::new(NodeKind::ExprLiteral);
+                // W458: mark string literals so the Verilog backend can escape
+                // newlines/tabs/quotes before emitting them.
+                val_node.value = self.current.lexeme.clone();
+                val_node.extra_kind = "string".to_string();
+                decl.children.push(val_node);
+                self.advance();
+            } else if self.current.kind == TokenKind::KwFn {
+                // W914: `pub const Middleware = fn(Ctx) bool;` -- a function
+                // TYPE alias. The counted skip charged it as a discard; the
+                // text collector preserves it as the value, uncounted.
                 let mut val_text = String::new();
                 while self.current.kind != TokenKind::Semicolon
                     && self.current.kind != TokenKind::Eof
