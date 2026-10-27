@@ -11080,24 +11080,17 @@ fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
     println!("  Benchmarks: {}", bench_names.len());
 
     if verbose {
-        if !test_names.is_empty() {
-            println!("\n  Test blocks:");
-            for name in &test_names {
-                println!("    {}", name);
+        let list = |title: &str, names: &Vec<String>| {
+            if !names.is_empty() {
+                println!("\n  {}:", title);
+                for name in names {
+                    println!("    {}", name);
+                }
             }
-        }
-        if !inv_names.is_empty() {
-            println!("\n  Invariants:");
-            for name in &inv_names {
-                println!("    {}", name);
-            }
-        }
-        if !bench_names.is_empty() {
-            println!("\n  Benchmarks:");
-            for name in &bench_names {
-                println!("    {}", name);
-            }
-        }
+        };
+        list("Test blocks", &test_names);
+        list("Invariants", &inv_names);
+        list("Benchmarks", &bench_names);
     }
 
     let total = test_names.len() + inv_names.len() + bench_names.len();
@@ -11109,21 +11102,13 @@ fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
     if let Ok(ast) = compiler::Compiler::parse_ast(&src) {
         let mut codegen = compiler::Codegen::new();
         codegen.gen_zig(&ast);
-        let zig = codegen.into_string();
         let tmp = std::env::temp_dir().join("t27_test.zig");
-        if fs::write(&tmp, &zig).is_ok() {
-            let comp = std::process::Command::new("zig")
-                .args(["test", "--test-no-exec", tmp.to_str().unwrap_or("")])
-                .status();
-            if comp.map(|s| s.success()).unwrap_or(false) {
-                let st = std::process::Command::new("zig")
-                    .args(["test", tmp.to_str().unwrap_or("")])
-                    .status();
-                if let Ok(s) = st {
-                    if !s.success() {
-                        anyhow::bail!("zig test failed");
-                    }
-                }
+        if fs::write(&tmp, codegen.into_string()).is_ok() {
+            let zig = |flags: &[&str]| std::process::Command::new("zig")
+                .args(flags).arg(tmp.to_str().unwrap_or("")).status()
+                .map(|s| s.success()).unwrap_or(false);
+            if zig(&["test", "--test-no-exec"]) && !zig(&["test"]) {
+                anyhow::bail!("zig test failed");
             }
         }
     }
