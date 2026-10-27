@@ -57,23 +57,3 @@ lie, so the card's own asserts are the gate that stops it.
 
     // every SHOWN_*: the newest index becomes 3; the percent sign falls out
     // of the live numbers -- keep it honest either way.
-
-## Printing the computed skeleton (no new tooling)
-
-`next_skeleton` computes the form from the current arrays, and a test already
-pins it -- so the cheapest printer is the test report's own failure print.
-Add a throwaway spec that expects an impossible number:
-
-    test skeleton_print {
-        var out : [2048]u8 = undefined;
-        var n : usize = next_skeleton(out[0..2048], 2048);
-        assert count_needle(out[0..n], "pub const ") == 99;
-    }
-
-run `t27c test-report` on it, and the assert-fail line prints the actual
-count -- the full skeleton text rides in the same failure output. Copy the
-skeleton from the report, delete the throwaway spec, fill the MEASURE marks.
-Never land a red test on purpose: this is a draft-branch printer, not a
-report feature. (Promoting it into the report itself -- so every epic card
-prints its skeleton without a throwaway -- is a design decision, recorded
-with the CT-VERIFIED family.)
