@@ -3872,16 +3872,9 @@ fn run_catalog_gate(catalog: &str, specs_dir: &str, verbose: bool) -> anyhow::Re
             println!("    [{}] {}: {}", f.check, f.id, f.detail);
         }
     }
-    // W702: this command printed `FINDINGS 3` and returned 0.
-    //
-    // Measured before the change: `t27c catalog-gate; echo $?` gives EXIT=0 with
-    // three findings on screen. Its only terminator was `Ok(())`. A verdict a
-    // caller cannot read is decoration, and the CLI is where a human runs this
-    // gate by hand -- the suite counts the same findings and is the only reason
-    // any of them reach a build.
-    //
-    // `ALLOWED` is shared with the suite so the two cannot drift into
-    // disagreeing about which findings are debt.
+    // W702: this command printed `FINDINGS 3` and returned 0 (`t27c
+    // catalog-gate; echo $?` -> EXIT=0). A verdict a caller cannot read is
+    // decoration; `ALLOWED` is shared with the suite so the two cannot drift.
     let unexpected = r
         .findings
         .iter()
@@ -4306,11 +4299,9 @@ fn run_parse_complete(
     // instrument that stops one step short.
     //
     // W702: this arm was moved above the `--show` handler so it could win when
-    // BOTH flags are given, and its `if fallbacks` guard was left behind. Plain
-    // `--show` then printed the fallback view instead of the token view it is
-    // documented to print, and the token view became unreachable. Nothing
-    // failed: both outputs are plausible, and the flag that selects between
-    // them was the one that stopped being read.
+    // BOTH flags given, `if fallbacks` left behind: plain `--show` printed the
+    // fallback view, and the token view became unreachable -- nothing failed,
+    // the selecting flag just stopped being read.
     if fallbacks {
         if let Some(path) = show {
             let src = std::fs::read_to_string(path)?;
@@ -4381,10 +4372,8 @@ fn run_parse_complete(
     // W699: what the parser STOPPED ON, corpus-wide.
     //
     // The classification this replaces was a keyword match over the printed
-    // traces, run from outside the compiler -- it guessed `forall` from the
-    // presence of the word. This asks the record: the head of each contiguous
-    // dropped run IS the token recovery began at. `forall` is not the answer it
-    // gives, and the answer it gives is better.
+    // It guessed `forall` from the word's presence; the record shows the head
+    // of each dropped run IS where recovery began -- and that answer is better.
     if fallbacks {
         let mut by: std::collections::BTreeMap<(&'static str, String), (usize, std::collections::BTreeSet<String>)> =
             std::collections::BTreeMap::new();
@@ -11066,28 +11055,38 @@ fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
     println!("  Benchmarks: {}", bench_names.len());
 
     if verbose {
-        if !test_names.is_empty() {
-            println!("\n  Test blocks:");
-            for name in &test_names {
-                println!("    {}", name);
+        let list = |title: &str, names: &Vec<String>| {
+            if !names.is_empty() {
+                println!("\n  {}:", title);
+                for name in names {
+                    println!("    {}", name);
+                }
             }
-        }
-        if !inv_names.is_empty() {
-            println!("\n  Invariants:");
-            for name in &inv_names {
-                println!("    {}", name);
-            }
-        }
-        if !bench_names.is_empty() {
-            println!("\n  Benchmarks:");
-            for name in &bench_names {
-                println!("    {}", name);
-            }
-        }
+        };
+        list("Test blocks", &test_names);
+        list("Invariants", &inv_names);
+        list("Benchmarks", &bench_names);
     }
 
     let total = test_names.len() + inv_names.len() + bench_names.len();
     println!("\n  Total: {} declarations", total);
+
+    // Execute the assertions (t27#11730): generate Zig and run `zig test` when it
+    // compiles; specs that do not compile keep the legacy declaration-only result.
+    let src = fs::read_to_string(input_path).unwrap_or_default();
+    if let Ok(ast) = compiler::Compiler::parse_ast(&src) {
+        let mut codegen = compiler::Codegen::new();
+        codegen.gen_zig(&ast);
+        let tmp = std::env::temp_dir().join("t27_test.zig");
+        if fs::write(&tmp, codegen.into_string()).is_ok() {
+            let zig = |flags: &[&str]| std::process::Command::new("zig")
+                .args(flags).arg(tmp.to_str().unwrap_or("")).status()
+                .map(|s| s.success()).unwrap_or(false);
+            if zig(&["test", "--test-no-exec"]) && !zig(&["test"]) {
+                anyhow::bail!("zig test failed");
+            }
+        }
+    }
     Ok(())
 }
 
