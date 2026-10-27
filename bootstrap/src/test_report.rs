@@ -38,13 +38,10 @@ use std::time::{Duration, Instant};
 pub struct Outcome {
     pub name: String,
     pub passed: bool,
-    /// #6509: runtime asserts this test executed, callees included, when the
-    /// test passed and the counting build ran. `Some(0)` is a VACUOUS pass:
-    /// the trivial backend that compiles every test to "return" passes it too,
-    /// so it certifies nothing (T730, specs/compiler/theory/toolchain.t27).
-    /// `None` for a failed test (the runner stops at the failure) and when the
-    /// counting build did not compile (`Report::uncounted` says why).
+    /// #6509: runtime asserts on a passing counted run; `Some(0)` = a trivial pass (T730); `None` = failed/uncounted.
     pub asserts: Option<u64>,
+    /// #12751: this test's checks the compiler FOLDED: 0 asserts with ct > 0 is CT-VERIFIED.
+    pub ct: u64,
     /// #7255: the limit in seconds this test outran. It was stopped there and
     /// is counted as failed; `None` for a test that ended by itself.
     pub timed_out: Option<u64>,
@@ -93,9 +90,12 @@ impl Report {
         }
     }
 
-    /// Passing tests that executed no runtime assert (#6509, T730).
     pub fn vacuous(&self) -> usize {
-        self.outcomes.iter().filter(|o| o.passed && o.asserts == Some(0)).count()
+        self.outcomes.iter().filter(|o| o.passed && o.asserts == Some(0) && o.ct == 0).count()
+    }
+
+    pub fn ct_verified(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.passed && o.asserts == Some(0) && o.ct > 0).count()
     }
 
     /// Passing tests that executed at least one runtime assert.
@@ -121,9 +121,10 @@ impl Report {
         if self.blocked.is_some() || self.outcomes.is_empty() {
             return out;
         }
-        out.push("  runtime asserts executed, per test (#6509; a pass with 0 is vacuous, T730):".into());
+        out.push("  runtime asserts per test (#6509; 0 with a folded check is CT-VERIFIED, 0 with neither is vacuous, T730):".into());
         for o in &self.outcomes {
             out.push(match (o.passed, o.asserts) {
+                (true, Some(0)) if o.ct > 0 => format!("  {:>6}  {}   CT-VERIFIED", 0, o.name),
                 (true, Some(0)) => format!("  {:>6}  {}   VACUOUS", 0, o.name),
                 (true, Some(n)) => format!("  {:>6}  {}", n, o.name),
                 (true, None) => format!("  {:>6}  {}   (passed, not counted)", "?", o.name),
@@ -139,9 +140,8 @@ impl Report {
                 why.lines().next().unwrap_or("")
             )),
             None => out.push(format!(
-                "  vacuous passes  {} of {}  (passed with 0 runtime asserts executed)",
-                self.vacuous(),
-                self.passed
+                "  vacuous passes  {} of {}  ({} comptime-verified)",
+                self.vacuous(), self.passed, self.ct_verified()
             )),
         }
         out
@@ -186,7 +186,7 @@ fn counting_runner() -> String {
     RUNNER
         .replace(
             "const std = @import(\"std\");\n",
-            "const std = @import(\"std\");\nextern var __t27_asserts: u64;\n",
+            "const std = @import(\"std\");\nextern var __t27_asserts: u64;\nextern var __t27_ctverified: u64;\n",
         )
         .replace(
             "    tests[i].func() catch std.process.exit(1);\n",
@@ -198,7 +198,7 @@ fn counting_runner() -> String {
                 "        std.Io.Threaded.global_single_threaded.io(),\n",
                 "        &obuf,\n",
                 "    );\n",
-                "    o.interface.print(\"asserts\\t{d}\\n\", .{__t27_asserts}) catch {};\n",
+                "    o.interface.print(\"asserts\\t{d}\\nct\\t{d}\\n\", .{ __t27_asserts, __t27_ctverified }) catch {};\n",
                 "    o.interface.flush() catch {};\n",
             ),
         )
@@ -219,6 +219,7 @@ fn counting_runner() -> String {
 const COUNTER: &str = r#"
 // ---- appended by `t27c test-report` (#6509): counts the runtime asserts a test executes ----
 export var __t27_asserts: u64 = 0;
+export var __t27_ctverified: u64 = 0;
 inline fn __t27_tally(__t27_args: anytype) void {
     const __t27_folded = comptime __t27_blk: {
         for (@typeInfo(@TypeOf(__t27_args)).@"struct".fields) |__t27_f| {
@@ -226,7 +227,7 @@ inline fn __t27_tally(__t27_args: anytype) void {
         }
         break :__t27_blk true;
     };
-    if (!__t27_folded and !@inComptime()) __t27_asserts += 1;
+    if (!@inComptime()) { if (__t27_folded) __t27_ctverified += 1 else __t27_asserts += 1; }
 }
 inline fn __t27_counted(__t27_c: anytype) bool {
     __t27_tally(__t27_c);
@@ -391,11 +392,11 @@ pub fn instrument(code: &str) -> Option<String> {
 }
 
 /// The count the counting runner printed after a passing test.
-fn parse_asserts(stdout: &[u8]) -> Option<u64> {
+fn parse_tag(stdout: &[u8], tag: &str) -> Option<u64> {
     String::from_utf8_lossy(stdout)
         .lines()
         .rev()
-        .find_map(|l| l.strip_prefix("asserts\t")?.trim().parse().ok())
+        .find_map(|l| l.strip_prefix(tag)?.strip_prefix('\t')?.trim().parse().ok())
 }
 
 /// Why a report is BLOCKED on a machine with no zig. A fact about the
@@ -587,16 +588,15 @@ fn run_limited(spec: &Path, specs_root: &Path, limit: Duration) -> Report {
             (Some(i), Some(n)) => (i, n),
             _ => continue,
         };
-        let (passed, asserts, timed_out) = match run_bounded(&bin, &[idx], limit) {
-            Ran::Exited(status, out) if status.success() => {
-                (true, if counting { parse_asserts(&out) } else { None }, None)
-            }
-            Ran::TimedOut => (false, None, Some(limit.as_secs())),
-            _ => (false, None, None),
+        let (passed, asserts, ct, timed_out) = match run_bounded(&bin, &[idx], limit) {
+            Ran::Exited(status, out) if status.success() => (true, if counting { parse_tag(&out, "asserts") } else { None },
+                if counting { parse_tag(&out, "ct").unwrap_or(0) } else { 0 }, None),
+            Ran::TimedOut => (false, None, 0, Some(limit.as_secs())),
+            _ => (false, None, 0, None),
         };
         // Strip the `spec.test.` prefix the runner reports.
         let name = name.rsplit(".test.").next().unwrap_or(name).to_string();
-        outcomes.push(Outcome { name, passed, asserts, timed_out });
+        outcomes.push(Outcome { name, passed, asserts, ct, timed_out });
     }
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -912,6 +912,7 @@ mod tests {
                 name: n.to_string(),
                 passed: *p,
                 asserts: if *p { Some(1) } else { None },
+                ct: 0,
                 timed_out: None,
             })
             .collect();
@@ -1115,12 +1116,22 @@ test \"returns\" {\n    assert spin(0) == 0;\n}\n";
     #[test]
     fn the_counting_runner_prints_the_count_after_a_pass() {
         let r = counting_runner();
-        assert!(r.contains("extern var __t27_asserts: u64;"));
+        assert!(r.contains("extern var __t27_asserts: u64;
+extern var __t27_ctverified: u64;"));
         let run = r.find("tests[i].func() catch std.process.exit(1);").unwrap();
         let print = r.find("asserts\\t{d}\\n").unwrap();
         assert!(run < print);
-        assert_eq!(parse_asserts(b"asserts\t7\n"), Some(7));
-        assert_eq!(parse_asserts(b"noise\n"), None);
+        assert_eq!(parse_tag(b"asserts\t7\n", "asserts"), Some(7));
+        assert_eq!(parse_tag(b"ct\t3\n", "ct"), Some(3));
+    }
+
+    #[test]
+    fn a_folded_check_is_ct_verified_not_vacuous() {
+        let mut r = measured(&[("local", true), ("folded", true)]);
+        r.outcomes[1].asserts = Some(0);
+        r.outcomes[1].ct = 1;
+        assert_eq!((r.vacuous(), r.ct_verified()), (0, 1));
+        assert!(r.assert_lines().iter().any(|l| l.ends_with("folded   CT-VERIFIED")));
     }
 
     #[test]
@@ -1139,7 +1150,7 @@ test \"returns\" {\n    assert spin(0) == 0;\n}\n";
         }
         assert!(lines.iter().any(|l| l.ends_with("b   VACUOUS")));
         assert!(lines.iter().any(|l| l.contains("-  c   (failed, not counted)")));
-        assert_eq!(lines.last().unwrap().trim(), "vacuous passes  1 of 2  (passed with 0 runtime asserts executed)");
+        assert_eq!(lines.last().unwrap().trim(), "vacuous passes  1 of 2  (0 comptime-verified)");
     }
 
     #[test]
@@ -1158,6 +1169,6 @@ test \"returns\" {\n    assert spin(0) == 0;\n}\n";
         assert_eq!(count("folded_only"), Some(0));
         assert_eq!(count("checked"), Some(2));
         assert_eq!(count("loop_checked"), Some(4));
-        assert_eq!((r.passed, r.vacuous(), r.checked()), (4, 2, 2));
+        assert_eq!((r.passed, r.vacuous(), r.ct_verified(), r.checked()), (4, 1, 1, 2));
     }
 }

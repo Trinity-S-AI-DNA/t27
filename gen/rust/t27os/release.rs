@@ -6,9 +6,9 @@
 
 pub const VERSION_MAJOR: u32 = 0;
 
-pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_MINOR: u32 = 2;
 
-pub const VERSION_PATCH: u32 = 3;
+pub const VERSION_PATCH: u32 = 0;
 
 pub const NO_VERSION: u64 = 18446744073709551615;
 

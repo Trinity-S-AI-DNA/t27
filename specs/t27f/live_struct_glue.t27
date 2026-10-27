@@ -1,0 +1,866 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/live_struct_glue.t27 -- the struct-path export glue v2 of /t27f/live/: the gx_-buffer
+// contract as law, written BEFORE the emitter (contract before code). Refs gHashTag/t27#10262,
+// gHashTag/t27#11781; the page and its PROVENANCE are Trinity-S-AI-DNA/trinity#1717 and #1731.
+//
+// WHY A CONTRACT CARD. The scalar plane of the live page already runs (live_scalar_closure, the
+// M-B cut); the struct path does not, because live_frame takes *WorkGraph and *Batch and a wasm
+// export cannot take a struct. The proven answer is the gx_ buffer pattern of gHashTag/t27-mcp
+// wasm/export.zig, the 92-line section at its lines 48-139 (read from the GitHub contents API on
+// 2026-10-24): the host writes bytes at gx_*_ptr()..+len, commits with a setter, calls one action,
+// and reads results back through ptr/len pairs over the same linear memory. This card is that
+// pattern as LAW for the two structs of live_mode: the byte layout of Event and Batch, the export
+// surface (33 names), the refusal discipline, and the round-trip proofs. The emitter PR writes
+// against THIS card; nothing here emits wasm.
+//
+// THE MODEL IS THE BOUNDARY. LiveGlue is one modeled linear memory (mem) plus the module state a
+// wasm glue holds: the one WorkGraph, the one Stream, the two committed lengths. Every gx_ fn
+// below has the name and the semantics the emitted export must have; ptr exports answer u32
+// offsets in the model where the real build answers usize addresses of the same regions in
+// wasm32 linear memory. The host side is modeled by record_write/batch_write (the serialization
+// law: the exact bytes the loader's writer must put down) and host_read (the copy-out the page's
+// JS does with its DataView). The graph image region is byte-for-byte work_graph's own
+// digest_bytes order, so any consumer of gx_graph_ptr can verify what it read against graph_digest.
+//
+// THE THREE LAWS A GX_ EXPORT MUST HOLD.
+//   1. IN BOUNDS. Every ptr/len pair stays inside the memory: off + len <= MEM_CAP, regions never
+//      overlap. Reads never fabricate: a fixed column answers its full extent, a live region
+//      (stream, digest) answers the law's own live count, and the bytes past that count are the
+//      law's own leftover bytes, never invented ones.
+//   2. REFUSALS NAME THEIR CARD (live_mode's GRAPH_REFUSED_BASE discipline). A code the LAW
+//      returned passes through VERBATIM -- the glue never rebases, swallows or rewrites one. A
+//      refusal the GLUE itself makes (a bad length, a count column that disagrees with the
+//      committed length, an action before its input landed, a nonzero reserved byte) carries this
+//      card's band, GLUE_REFUSED_BASE = 64, chosen so it cannot collide with live_mode's 0..5 or
+//      the graph band 33..35. A decode refusal is all-or-nothing: nothing applied, nothing
+//      written (the epic's whole-batch-first rule, measure_frame's own discipline).
+//   3. READS ARE IDEMPOTENT. With no action between them, two reads of any pair answer identical
+//      bytes; a refused action changes no byte the host can read. The module is TOTAL: it
+//      initializes to a fresh empty state -- never `undefined`, the hole the v1 pattern's
+//      `var eg: X.SpecGraph = undefined` left -- so no call order can read uninitialized memory.
+//
+// NOT CLAIMED: no Zig, no wasm and no emitter live here (the emitter is the next PR; what gen
+// cannot express is a #5980 defect, never a hand-written file); the pointers are model offsets,
+// and the real build's memory is page-rounded ABOVE MEM_CAP, never below it; no perf claim of any
+// kind (no measurement was made); the recorded-log page, the loader JS and the SSE wire are
+// Trinity's repo (t27#10262 caps its side at ~40 lines) and live_stream.t27; multi-instance,
+// multi-graph slots, SharedArrayBuffer and threads are out (wasm single-thread, one page, one
+// module instance); no endianness choice is offered -- little-endian everywhere, which is
+// digest_bytes' own order and wasm32's native order.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module live_struct_glue;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::Event;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::ERR_WG_BAD_EVENT;
+use t27f::work_graph::EV_SPAWN;
+use t27f::work_graph::NK_AGENT;
+use t27f::work_graph::nodes;
+use t27f::work_graph::edges;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::node_label_at;
+use t27f::work_graph::digest_bytes;
+use t27f::work_graph::digest_len;
+use t27f::work_graph::graph_digest;
+use t27f::live_mode::Batch;
+use t27f::live_mode::batch_empty;
+use t27f::live_mode::batch_push;
+use t27f::live_mode::batch_event;
+use t27f::live_mode::feed_event;
+use t27f::live_mode::live_frame;
+use t27f::live_mode::replay_frame;
+use t27f::live_mode::LIVE_OK;
+use t27f::live_mode::E_BATCH_FULL;
+use t27f::live_mode::GRAPH_REFUSED_BASE;
+use t27f::live_mode::BATCH_CAP;
+use t27f::display_list::Stream;
+use t27f::display_list::stream_empty;
+use t27f::display_list::STREAM_CAP;
+
+// ---- this card's refusal band ---------------------------------------------------------------------
+//
+// live_mode's own codes are 0..5; a work_graph refusal through live_frame/replay_frame arrives as
+// GRAPH_REFUSED_BASE + the law's code, 33..35. This card's refusals start at 64: three bands,
+// no overlap, and a fourth band (36..63) left empty on purpose so a future card can take it
+// without renumbering anyone.
+
+pub const GLUE_REFUSED_BASE : u8 = 64;
+pub const E_LEN : u8 = 65;        // a setter refused the length: past the region cap, or not the fixed width
+pub const E_COUNT : u8 = 66;      // the batch region's count column disagrees with its length or its cap
+pub const E_STATE : u8 = 67;      // an action ran before its input landed
+pub const E_LAYOUT : u8 = 68;     // a reserved byte the layout does not define is nonzero: refused, never guessed
+pub const GLUE_RESULT_NAMES : [5]str = ["ok", "len", "count", "state", "layout"];
+
+// display_list's paint refusal, restated as a local faithful copy: the splice refuses the NAME
+// here because live_mode.t27 also declares an E_BUDGET (4, its p99 budget refusal -- a different
+// card's different code), and this card's import closure holds both, so the name is ambiguous and
+// is not spliced. The value is display_list's own (7, its comment: "scene.t27's refusal codes end
+// at 6"). NOT REACHED through this boundary: fixture_scene caps at its SCENE_AGENT_CAP (20) agents
+// and 20 agents flatten to 100 ops, under the 128-op budget, so no input this contract accepts can
+// force flatten_into to refuse -- display_list's own cap test reaches it for real, and its own
+// pinning stays in its own tests.
+; QUESTION transcription drift: this copy cannot be checked against display_list's original from
+; here (the ambiguity that forces the copy also blocks the import), and no input through this
+; boundary can reach the refusal it names, so a future value change in display_list breaks neither
+; this card's compile nor its tests. The emitter's build test compares the emitted wasm's refusal
+; constants against the source cards and would catch it; flag
+; any E_BUDGET change in display_list for a same-PR update here (live_mode's MAX_NODES precedent).
+pub const E_BUDGET : u8 = 7;
+
+// ---- the widths ------------------------------------------------------------------------------------
+
+/// One bus record across the boundary: kind@0, deliver@1, reason@2, rsvd@3 (must be 0), task_no@4,
+/// seq@8, spec_id@12 (u32, little-endian), from_pid@16, to_pid@24 (u64, little-endian). 32 bytes.
+pub const EVENT_BYTES : u32 = 32;
+
+/// One batch row: the record plus emitted_at@32 (u32), the frame whose window took the row.
+pub const ROW_BYTES : u32 = 36;
+
+; QUESTION batch capacity across the boundary: BATCH_ROWS is live_mode's BATCH_CAP (64) restated
+; by pointer, not a new number -- but the region is a FIXED 2308-byte window, so a future BATCH_CAP
+; bump in live_mode changes the region size and every host buffer with it. Should the emitter ship
+; a gx_layout_version() export (this card's live_mode VERSION is 1) so a page can refuse a module
+; it was not built for, instead of reading a shifted layout? Deferred: one cap, one layout, today.
+
+pub const BATCH_ROWS : u32 = 64;
+pub const BATCH_BYTES : u32 = 2308;      // 4 + BATCH_ROWS * ROW_BYTES
+
+// ---- the layout: one memory, six regions, no overlap ----------------------------------------------
+//
+// THE IMAGE REGION is work_graph's digest_bytes output VERBATIM, and digest_bytes writes
+// RECORD-MAJOR, not column-major: u32 node_count, u32 edge_count, then one 10-byte record per
+// node slot (kind, label, id as 8 LE bytes), then one 6-byte record per edge slot (kind, from as
+// 2 LE bytes, to as 2 LE bytes, label). gx_graph_ptr exposes that whole image as one pair, and
+// anything reading it can verify with graph_digest -- that is the region's point.
+//
+// THE COLUMN REGION is separate: the law's own struct arrays as contiguous columns (the WorkGraph
+// declaration is columnar -- node_kind[2048], node_label[2048], node_id[2048]u64, then the edge
+// columns), exposed one pair per field. In the real emitter these pairs alias the law's own
+// storage (&g.node_kind and friends, the v1 pattern); in this model they are regions the sync
+; QUESTION alignment of the u64 and u16 columns: NODE_ID_OFF is 8-aligned (73736 = 8 * 9217) and
+; the u16 columns start even, but the real emitter's pairs may alias the Zig struct's own arrays,
+; whose placement Zig chooses. Hosts must read via DataView (alignment-agnostic) either way;
+; should the contract PIN the alignment of every column pair as a hard rule, or leave placement to
+; the emitter provided the bytes equal the law's arrays for the live prefix? Left to the emitter.
+// copies, and the tests prove the copy equals the law's arrays byte for byte. Column-major reads
+// are the structured view; the image is the verifiable one; neither is derived from the other.
+
+pub const GRAPH_OFF : u32 = 0;
+pub const GRAPH_LEN : u32 = 69640;       // == work_graph::digest_len(), asserted in the invariant
+pub const NODE_KIND_OFF : u32 = 69640;   // the column region begins after the image
+pub const NODE_LABEL_OFF : u32 = 71688;
+pub const NODE_ID_OFF : u32 = 73736;     // 8-aligned: 73736 = 8 * 9217
+pub const EDGE_KIND_OFF : u32 = 90120;
+pub const EDGE_FROM_OFF : u32 = 98312;
+pub const EDGE_TO_OFF : u32 = 114696;
+pub const EDGE_LABEL_OFF : u32 = 131080;
+pub const DIGEST_OFF : u32 = 139272;     // GRAPH's digest: 32 bytes of graph_digest output
+pub const EV_OFF : u32 = 139304;         // the record region
+pub const BATCH_OFF : u32 = 139336;      // count@0 (u32), then BATCH_ROWS rows of ROW_BYTES
+pub const STREAM_OFF : u32 = 141644;     // the law's own Stream.bytes, STREAM_CAP wide
+pub const MEM_CAP : u32 = 143692;        // STREAM_OFF + STREAM_CAP: the layout's exact extent
+
+; QUESTION memory growth policy: the contract pins ONE fixed image -- no memory.grow, no paging.
+; A graph past NODE_CAP/EDGE_CAP is the LAW's refusal (33/34 through live_frame), never a
+; reallocation by the glue. If a real feed ever outgrows 2048 nodes, is the answer a bigger cap in
+; work_graph (and a new layout here), or a paged image export (gx_graph_page(i))? Deferred: the
+; fixture's 24 events are two orders of magnitude under the cap.
+
+// ---- the model: one module instance ----------------------------------------------------------------
+//
+; QUESTION single instance: the v1 pattern and this model hold ONE WorkGraph and ONE Stream as
+; module globals; the page needs exactly one. A second live surface reusing one module (an iframe,
+; a picture-in-picture) would need slot-indexed exports. Deferred until a second consumer exists.
+
+pub struct LiveGlue {
+    mem : [143692]u8,                    // MEM_CAP; the literal is pinned by the invariant
+    g : WorkGraph,                       // the one graph, the law's own struct
+    st : Stream,                         // the one stream the law paints into
+    ev_len : u32,                        // 0 until a record commits; EVENT_BYTES after
+    batch_len : u32,                     // 0 until a batch commits; 4 + count * ROW_BYTES after
+}
+
+/// The module's only constructor: total initialization, never undefined (law 3). sync runs once
+/// so every getter already answers the empty state's truth.
+pub fn glue_fresh() -> LiveGlue {
+    var gl : LiveGlue = undefined;
+    gl.ev_len = 0;
+    gl.batch_len = 0;
+    gl.g = new_graph();
+    gl.st = stream_empty();
+    var i : u32 = 0;
+    while (i < MEM_CAP) {
+        gl.mem[i as usize] = 0;
+        i = i + 1;
+    }
+    sync(&gl);
+    return gl;
+}
+
+/// Refresh the readable regions from the law's own state: the image through the LAW's digest_bytes
+/// (this is the transcription -- the region's bytes are not re-encoded here, they are the law's),
+/// the columns as straight copies of the law's own arrays (u64 and u16 columns little-endian, the
+/// same order digest_bytes uses inside its records), the digest through the LAW's graph_digest,
+/// the stream by copying the law's own byte array in full, stale tail included, so the host never
+/// sees a byte the law does not hold.
+fn sync(gl: *LiveGlue) {
+    const w = digest_bytes(&gl.g, gl.mem[GRAPH_OFF..GRAPH_OFF + GRAPH_LEN]);
+    assert(w == GRAPH_LEN);
+    var i : u32 = 0;
+    while (i < 2048) {
+        gl.mem[(NODE_KIND_OFF + i) as usize] = gl.g.node_kind[i as usize];
+        gl.mem[(NODE_LABEL_OFF + i) as usize] = gl.g.node_label[i as usize];
+        put_u64_at(gl, NODE_ID_OFF + i * 8, gl.g.node_id[i as usize]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 8192) {
+        gl.mem[(EDGE_KIND_OFF + i) as usize] = gl.g.edge_kind[i as usize];
+        put_u16_at(gl, EDGE_FROM_OFF + i * 2, gl.g.edge_from[i as usize]);
+        put_u16_at(gl, EDGE_TO_OFF + i * 2, gl.g.edge_to[i as usize]);
+        gl.mem[(EDGE_LABEL_OFF + i) as usize] = gl.g.edge_label[i as usize];
+        i = i + 1;
+    }
+    var d = graph_digest(&gl.g);
+    i = 0;
+    while (i < 32) {
+        gl.mem[(DIGEST_OFF + i) as usize] = d[i as usize];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < STREAM_CAP) {
+        gl.mem[(STREAM_OFF + i) as usize] = gl.st.bytes[i as usize];
+        i = i + 1;
+    }
+}
+
+// ---- little-endian byte helpers (new: reads from mem; work_graph has no getters) --------------------
+
+fn get_u32(gl: *LiveGlue, off: u32) -> u32 {
+    var v : u32 = 0;
+    var i : u32 = 0;
+    while (i < 4) {
+        v = v + ((gl.mem[(off + i) as usize] as u32) << (i * 8));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn get_u64(gl: *LiveGlue, off: u32) -> u64 {
+    var v : u64 = 0;
+    var i : u32 = 0;
+    while (i < 8) {
+        v = v + ((gl.mem[(off + i) as usize] as u64) << (i * 8));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn put_u16_at(gl: *LiveGlue, off: u32, v: u16) {
+    gl.mem[off as usize] = (v & 255) as u8;
+    gl.mem[(off + 1) as usize] = ((v >> 8) & 255) as u8;
+}
+
+fn put_u32_at(gl: *LiveGlue, off: u32, v: u32) {
+    gl.mem[off as usize] = (v & 255) as u8;
+    gl.mem[(off + 1) as usize] = ((v >> 8) & 255) as u8;
+    gl.mem[(off + 2) as usize] = ((v >> 16) & 255) as u8;
+    gl.mem[(off + 3) as usize] = ((v >> 24) & 255) as u8;
+}
+
+fn put_u64_at(gl: *LiveGlue, off: u32, v: u64) {
+    var i : u32 = 0;
+    while (i < 8) {
+        gl.mem[(off + i) as usize] = ((v >> (i * 8)) & 255) as u8;
+        i = i + 1;
+    }
+}
+
+// ---- the host side: the serialization law ----------------------------------------------------------
+//
+// record_write and batch_write are the loader-writer side of the boundary: the exact bytes the
+// page's JS must put at gx_ev_ptr()/gx_batch_ptr() before committing. They are also what the
+// round-trip tests serialize with, so the tested bytes ARE the contract's bytes.
+
+/// Write one Event as its 32-byte record. The reserved byte at +3 is written 0 on every write; a
+/// host that puts anything else there is refused at decode (E_LAYOUT), never misread.
+pub fn record_write(gl: *LiveGlue, ev: Event) {
+    gl.mem[EV_OFF as usize] = ev.kind;
+    gl.mem[(EV_OFF + 1) as usize] = ev.deliver;
+    gl.mem[(EV_OFF + 2) as usize] = ev.reason;
+    gl.mem[(EV_OFF + 3) as usize] = 0;
+    put_u32_at(gl, EV_OFF + 4, ev.task_no);
+    put_u32_at(gl, EV_OFF + 8, ev.seq);
+    put_u32_at(gl, EV_OFF + 12, ev.spec_id);
+    put_u64_at(gl, EV_OFF + 16, ev.from_pid);
+    put_u64_at(gl, EV_OFF + 24, ev.to_pid);
+}
+
+/// Write a whole Batch as its region: count@0, then one row per event in the queue's order, the
+/// row holding the event's record plus emitted_at. Only b.count rows are written; bytes of unwritten
+/// rows keep whatever the memory held (the decode reads count rows, never more).
+pub fn batch_write(gl: *LiveGlue, b: *Batch) {
+    put_u32_at(gl, BATCH_OFF, b.count);
+    var i : u32 = 0;
+    while (i < b.count) {
+        const row = BATCH_OFF + 4 + i * ROW_BYTES;
+        const ev = batch_event(b, i);
+        gl.mem[row as usize] = ev.kind;
+        gl.mem[(row + 1) as usize] = ev.deliver;
+        gl.mem[(row + 2) as usize] = ev.reason;
+        gl.mem[(row + 3) as usize] = 0;
+        put_u32_at(gl, row + 4, ev.task_no);
+        put_u32_at(gl, row + 8, ev.seq);
+        put_u32_at(gl, row + 12, ev.spec_id);
+        put_u64_at(gl, row + 16, ev.from_pid);
+        put_u64_at(gl, row + 24, ev.to_pid);
+        put_u32_at(gl, row + 32, b.emitted_at[i as usize]);
+        i = i + 1;
+    }
+}
+
+/// The page's copy-out: read n bytes at off into the host buffer. The pairs' ptr/len and this read
+/// are the whole buffer-out story -- no struct crosses, ever.
+pub fn host_read(gl: *LiveGlue, off: u32, out: []u8, n: u32) {
+    var i : u32 = 0;
+    while (i < n) {
+        out[i as usize] = gl.mem[(off + i) as usize];
+        i = i + 1;
+    }
+}
+
+// ---- the decode: strict, all-or-nothing ------------------------------------------------------------
+
+/// Decode the committed record into ev. Layout only: the reserved byte must be 0. Every other
+/// value check belongs to the law (a bad kind is ERR_WG_BAD_EVENT through replay_frame, not a
+/// glue code -- the glue does not shadow the law's refusals with its own).
+fn decode_event(gl: *LiveGlue, ev: *Event) -> u8 {
+    if (gl.mem[(EV_OFF + 3) as usize] != 0) { return E_LAYOUT; }
+    ev.kind = gl.mem[EV_OFF as usize];
+    ev.deliver = gl.mem[(EV_OFF + 1) as usize];
+    ev.reason = gl.mem[(EV_OFF + 2) as usize];
+    ev.task_no = get_u32(gl, EV_OFF + 4);
+    ev.seq = get_u32(gl, EV_OFF + 8);
+    ev.spec_id = get_u32(gl, EV_OFF + 12);
+    ev.from_pid = get_u64(gl, EV_OFF + 16);
+    ev.to_pid = get_u64(gl, EV_OFF + 24);
+    return LIVE_OK;
+}
+
+/// Decode the committed batch region into b. The count column must fit the cap AND agree exactly
+/// with the committed length (no slack -- a host that writes slack is refused, not guessed for);
+/// every row's reserved byte is checked BEFORE any column is written, so a bad row refuses the
+/// whole batch and b stays what it was (all-or-nothing, measure_frame's discipline).
+fn decode_batch(gl: *LiveGlue, b: *Batch) -> u8 {
+    const count = get_u32(gl, BATCH_OFF);
+    if (count > BATCH_ROWS) { return E_COUNT; }
+    if (gl.batch_len != 4 + count * ROW_BYTES) { return E_COUNT; }
+    var i : u32 = 0;
+    while (i < count) {
+        const row = BATCH_OFF + 4 + i * ROW_BYTES;
+        if (gl.mem[(row + 3) as usize] != 0) { return E_LAYOUT; }
+        i = i + 1;
+    }
+    b.count = count;
+    i = 0;
+    while (i < count) {
+        const row = BATCH_OFF + 4 + i * ROW_BYTES;
+        b.kind[i as usize] = gl.mem[row as usize];
+        b.deliver[i as usize] = gl.mem[(row + 1) as usize];
+        b.reason[i as usize] = gl.mem[(row + 2) as usize];
+        b.task_no[i as usize] = get_u32(gl, row + 4);
+        b.seq[i as usize] = get_u32(gl, row + 8);
+        b.spec_id[i as usize] = get_u32(gl, row + 12);
+        b.from_pid[i as usize] = get_u64(gl, row + 16);
+        b.to_pid[i as usize] = get_u64(gl, row + 24);
+        b.emitted_at[i as usize] = get_u32(gl, row + 32);
+        i = i + 1;
+    }
+    return LIVE_OK;
+}
+
+// ---- the export surface: buffer-in ------------------------------------------------------------------
+
+pub fn gx_ev_ptr(gl: *LiveGlue) -> u32 { return EV_OFF; }
+pub fn gx_ev_cap(gl: *LiveGlue) -> u32 { return EVENT_BYTES; }
+
+/// Commit the record. A FIXED record has one honest length, so any n != EVENT_BYTES is refused
+/// and the previous state stands. Returns bool the way the v1 setters do: false is the refusal.
+pub fn gx_ev_set_len(gl: *LiveGlue, n: u32) -> bool {
+    if (n != EVENT_BYTES) { return false; }
+    gl.ev_len = n;
+    return true;
+}
+
+; QUESTION commit-barrier semantics: wasm cannot see host writes, so gx_ev_set_len is the only
+; commit signal -- a host that commits without writing sends the all-zero record, which decodes
+; as a REAL event (spawn of pid 0 to pid 0) and lands two agent nodes. Should kind 255 be
+; reserved as a canary the writer must clear, making the empty record a refusal? Accepted today:
+; the loss is visible (two bogus nodes in the digest), not silent corruption of a good graph.
+
+pub fn gx_batch_ptr(gl: *LiveGlue) -> u32 { return BATCH_OFF; }
+pub fn gx_batch_cap(gl: *LiveGlue) -> u32 { return BATCH_BYTES; }
+
+/// Commit the batch region. Variable-length (the count column names the rows), so any n up to the
+/// cap commits; whether n AGREES with the count column is decode's question (E_COUNT), not the
+/// setter's -- the v1 pattern's split, kept.
+pub fn gx_batch_set_len(gl: *LiveGlue, n: u32) -> bool {
+    if (n > BATCH_BYTES) { return false; }
+    gl.batch_len = n;
+    return true;
+}
+
+// ---- the export surface: actions (the law, verbatim) ------------------------------------------------
+
+/// The replay path: decode the committed record, then replay_frame -- the same law the M3 loop
+/// calls. A law refusal passes through with live_mode's own rebase already on it (33..35); the
+/// glue never touches a law code. On any return the readable regions reflect exactly the state
+/// the law left (sync runs after the law ran; a decode refusal returns before anything ran).
+pub fn gx_replay(gl: *LiveGlue, frame: u32) -> u8 {
+    if (gl.ev_len == 0) { return E_STATE; }
+    var ev : Event = undefined;
+    const d = decode_event(gl, &ev);
+    if (d != LIVE_OK) { return d; }
+    const r = replay_frame(&gl.g, ev, frame, &gl.st);
+    sync(gl);
+    return r;
+}
+
+/// The live path: decode the committed batch, then live_frame -- ALL of the batch through the
+/// law, whatever the pressure did to the schedule.
+pub fn gx_live(gl: *LiveGlue, frame: u32) -> u8 {
+    if (gl.batch_len == 0) { return E_STATE; }
+    var b = batch_empty();
+    const d = decode_batch(gl, &b);
+    if (d != LIVE_OK) { return d; }
+    const r = live_frame(&gl.g, &b, frame, &gl.st);
+    sync(gl);
+    return r;
+}
+
+; QUESTION mid-batch partial semantics: live_frame applies rows in order and stops at the law's
+; refusal, so a batch whose row 2 is bad leaves rows 0..1 APPLIED (the test below pins this
+; honestly). The glue could pre-validate decodable evils only; semantic evils (node caps) it
+; cannot pre-check without running the law. Should live_mode itself adopt the whole-batch-first
+; rule for semantic checks too (apply to a shadow, commit on success)? That is the law card's
+; question, filed here so it is not lost; this contract passes the law's semantics through.
+
+/// Return the module to the fresh state: graph, stream and both commits. The digest after reset
+/// is the EMPTY graph's digest -- asserted in the test, so reset cannot leave a stale byte.
+; QUESTION reset scope: reset clears the module state and the readable regions (via sync) but
+; leaves the two INPUT regions' bytes as the host wrote them (only the commit lengths drop). A
+; byte-scrubbing reset would cost 2.3 KiB of writes to defend against a host that reads its own
+; input back. Left unscrubbed; flag it if a page ever reads input regions after reset.
+pub fn gx_reset(gl: *LiveGlue) -> u8 {
+    gl.g = new_graph();
+    gl.st = stream_empty();
+    gl.ev_len = 0;
+    gl.batch_len = 0;
+    sync(gl);
+    return LIVE_OK;
+}
+
+// ---- the export surface: buffer-out -----------------------------------------------------------------
+//
+; QUESTION column len semantics: fixed columns answer their FULL extent (2048/16384-byte lens)
+; and the count getters bound the meaningful prefix; only live regions (stream n, digest 32,
+; image GRAPH_LEN) answer live lengths. If the page's JS prefers live-count lens on columns too,
+; it is a one-line emitter change -- but then a count change between ptr and len reads would make
+; a pair disagree mid-frame, which full extents never do. Left as specified.
+
+pub fn gx_node_count(gl: *LiveGlue) -> u32 { return nodes(&gl.g); }
+pub fn gx_edge_count(gl: *LiveGlue) -> u32 { return edges(&gl.g); }
+pub fn gx_stream_n(gl: *LiveGlue) -> u32 { return gl.st.n; }
+pub fn gx_stream_ops(gl: *LiveGlue) -> u32 { return gl.st.ops; }
+
+pub fn gx_graph_ptr(gl: *LiveGlue) -> u32 { return GRAPH_OFF; }
+pub fn gx_graph_len(gl: *LiveGlue) -> u32 { return GRAPH_LEN; }
+pub fn gx_digest_ptr(gl: *LiveGlue) -> u32 { return DIGEST_OFF; }
+pub fn gx_digest_len(gl: *LiveGlue) -> u32 { return 32; }
+pub fn gx_stream_ptr(gl: *LiveGlue) -> u32 { return STREAM_OFF; }
+pub fn gx_stream_len(gl: *LiveGlue) -> u32 { return gl.st.n; }
+
+pub fn gx_node_kind_ptr(gl: *LiveGlue) -> u32 { return NODE_KIND_OFF; }
+pub fn gx_node_kind_len(gl: *LiveGlue) -> u32 { return 2048; }
+pub fn gx_node_label_ptr(gl: *LiveGlue) -> u32 { return NODE_LABEL_OFF; }
+pub fn gx_node_label_len(gl: *LiveGlue) -> u32 { return 2048; }
+pub fn gx_node_id_ptr(gl: *LiveGlue) -> u32 { return NODE_ID_OFF; }
+pub fn gx_node_id_len(gl: *LiveGlue) -> u32 { return 16384; }
+pub fn gx_edge_kind_ptr(gl: *LiveGlue) -> u32 { return EDGE_KIND_OFF; }
+pub fn gx_edge_kind_len(gl: *LiveGlue) -> u32 { return 8192; }
+pub fn gx_edge_from_ptr(gl: *LiveGlue) -> u32 { return EDGE_FROM_OFF; }
+pub fn gx_edge_from_len(gl: *LiveGlue) -> u32 { return 16384; }
+pub fn gx_edge_to_ptr(gl: *LiveGlue) -> u32 { return EDGE_TO_OFF; }
+pub fn gx_edge_to_len(gl: *LiveGlue) -> u32 { return 16384; }
+pub fn gx_edge_label_ptr(gl: *LiveGlue) -> u32 { return EDGE_LABEL_OFF; }
+pub fn gx_edge_label_len(gl: *LiveGlue) -> u32 { return 8192; }
+
+// ---- the export name table --------------------------------------------------------------------------
+//
+// The 33 names the struct-path emitter must emit, in one table, so the emitter's build test can
+// diff its export list against this card. Every entry is a pub fn above. No str equality is
+// asserted in the tests: gen-c lowers `==` on str as a pointer compare (the trap
+// specs/claw/gates_pins.t27 exists for), so the byte-level name pinning lives where str == is a
+// byte compare -- the emitter's Zig-side build test -- and this card pins the COUNT.
+; QUESTION provenance mirror: the 92-line gx_ section of gHashTag/t27-mcp wasm/export.zig (the
+; proven pattern, named by PROVENANCE.txt on trinity branch lane/t27f-live-glue, trinity#1731)
+; lives in another repository. Should a verbatim copy be vendored here as data (like the recorded
+; log is) so this contract's provenance is repo-local and cannot drift? Deferred until the emitter
+; PR; the PROVENANCE names the file and the read date.
+
+pub const EXPORT_NAMES : [33]str = [
+    "gx_ev_ptr", "gx_ev_cap", "gx_ev_set_len",
+    "gx_batch_ptr", "gx_batch_cap", "gx_batch_set_len",
+    "gx_replay", "gx_live", "gx_reset",
+    "gx_node_count", "gx_edge_count", "gx_stream_n", "gx_stream_ops",
+    "gx_graph_ptr", "gx_graph_len", "gx_digest_ptr", "gx_digest_len",
+    "gx_stream_ptr", "gx_stream_len",
+    "gx_node_kind_ptr", "gx_node_kind_len",
+    "gx_node_label_ptr", "gx_node_label_len",
+    "gx_node_id_ptr", "gx_node_id_len",
+    "gx_edge_kind_ptr", "gx_edge_kind_len",
+    "gx_edge_from_ptr", "gx_edge_from_len",
+    "gx_edge_to_ptr", "gx_edge_to_len",
+    "gx_edge_label_ptr", "gx_edge_label_len",
+];
+
+// ---- tests ------------------------------------------------------------------------------------------
+
+test "fresh module: total getters, refused actions, no undefined byte" {
+    var gl = glue_fresh();
+    assert(gx_node_count(&gl) == 0);
+    assert(gx_edge_count(&gl) == 0);
+    assert(gx_stream_n(&gl) == 0);
+    assert(gx_stream_ops(&gl) == 0);
+    // an action before its input landed is the glue's own refusal, and the state stands
+    assert(gx_replay(&gl, 1) == E_STATE);
+    assert(gx_live(&gl, 1) == E_STATE);
+    // every pair is in bounds already on a fresh module (law 1)
+    assert(gx_graph_ptr(&gl) + gx_graph_len(&gl) <= MEM_CAP);
+    assert(gx_digest_ptr(&gl) + gx_digest_len(&gl) <= MEM_CAP);
+    assert(gx_stream_ptr(&gl) + gx_stream_len(&gl) <= MEM_CAP);
+    assert(gx_node_id_ptr(&gl) + gx_node_id_len(&gl) <= MEM_CAP);
+    assert(gx_edge_label_ptr(&gl) + gx_edge_label_len(&gl) <= MEM_CAP);
+    // the digest region answers the EMPTY graph's digest: sync ran at construction
+    var fr = new_graph();
+    var want = graph_digest(&fr);
+    var i : u32 = 0;
+    while (i < 32) {
+        assert(gl.mem[(DIGEST_OFF + i) as usize] == want[i as usize]);
+        i = i + 1;
+    }
+    // and no byte of the memory is undefined: the last byte is a written zero
+    assert(gl.mem[(MEM_CAP - 1) as usize] == 0);
+}
+
+test "a two-node graph round-trips through the record, byte for byte" {
+    // the fixture: one spawn, two agent nodes, no edges -- the smallest graph that joins anything
+    const ev = Event { kind: EV_SPAWN, from_pid: 7, to_pid: 9, task_no: 0, deliver: 0, reason: 99, seq: 1, spec_id: 0 };
+    // the direct path: the law, no boundary
+    var gd = new_graph();
+    var sd = stream_empty();
+    assert(replay_frame(&gd, ev, 1, &sd) == LIVE_OK);
+    // the boundary: the host writes the record, commits, acts
+    var gl = glue_fresh();
+    record_write(&gl, ev);
+    assert(gx_ev_set_len(&gl, EVENT_BYTES) == true);
+    assert(gx_replay(&gl, 1) == LIVE_OK);
+    // the counts answer through the getters and agree with the direct graph
+    assert(gx_node_count(&gl) == 2);
+    assert(gx_node_count(&gl) == nodes(&gd));
+    assert(gx_edge_count(&gl) == 0);
+    assert(gx_edge_count(&gl) == edges(&gd));
+    // transcription, node by node: every live column byte equals the LAW's own accessor on BOTH
+    // graphs -- the boundary's bytes are the law's bytes, not a second encoding
+    var i : u32 = 0;
+    while (i < 2) {
+        assert(gl.mem[(NODE_KIND_OFF + i) as usize] == node_kind_at_pub(&gl.g, i));
+        assert(gl.mem[(NODE_KIND_OFF + i) as usize] == node_kind_at_pub(&gd, i));
+        assert(gl.mem[(NODE_LABEL_OFF + i) as usize] == node_label_at(&gl.g, i));
+        assert(gl.mem[(NODE_LABEL_OFF + i) as usize] == node_label_at(&gd, i));
+        var k : u32 = 0;
+        while (k < 8) {
+            const law_byte = ((gd.node_id[i as usize] >> (k * 8)) & 255) as u8;
+            assert(gl.mem[(NODE_ID_OFF + i * 8 + k) as usize] == law_byte);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    assert(gl.mem[NODE_KIND_OFF as usize] == NK_AGENT);
+    assert(gl.mem[(NODE_KIND_OFF + 1) as usize] == NK_AGENT);
+    // the whole image region, read out as the host would, is byte-equal to the law's own
+    // digest_bytes of the DIRECT graph -- the transcription at full scale
+    var img : [70000]u8 = [0] ** 70000;
+    assert(digest_bytes(&gd, img[0..digest_len()]) == digest_len());
+    var host : [69640]u8 = [0] ** 69640;
+    host_read(&gl, GRAPH_OFF, host[0..GRAPH_LEN], GRAPH_LEN);
+    i = 0;
+    while (i < GRAPH_LEN) {
+        assert(host[i as usize] == img[i as usize]);
+        i = i + 1;
+    }
+    // the digests agree and the digest region answers them
+    var da = graph_digest(&gl.g);
+    var db = graph_digest(&gd);
+    i = 0;
+    while (i < 32) {
+        assert(da[i as usize] == db[i as usize]);
+        assert(gl.mem[(DIGEST_OFF + i) as usize] == da[i as usize]);
+        i = i + 1;
+    }
+    // the painted frame agrees: same length, same op count, same bytes
+    assert(gx_stream_n(&gl) == sd.n);
+    assert(gx_stream_ops(&gl) == sd.ops);
+    var frame : [2048]u8 = [0] ** 2048;
+    host_read(&gl, gx_stream_ptr(&gl), frame[0..2048], gx_stream_len(&gl));
+    i = 0;
+    while (i < sd.n) {
+        assert(frame[i as usize] == sd.bytes[i as usize]);
+        i = i + 1;
+    }
+    assert(sd.n > 0);
+}
+
+test "a batch built by the law's own queue round-trips and paints the same frame" {
+    // five events over two windows, from live_mode's own feed_event -- the law's fixture fn
+    var b = batch_empty();
+    var i : u32 = 1;
+    while (i <= 5) {
+        var w : u32 = 1;
+        if (i > 3) { w = 2; }
+        assert(batch_push(&b, feed_event(i), w) == LIVE_OK);
+        i = i + 1;
+    }
+    assert(b.count == 5);
+    // the direct path
+    var gd = new_graph();
+    var sd = stream_empty();
+    assert(live_frame(&gd, &b, 3, &sd) == LIVE_OK);
+    // the boundary: the queue serialized through the region, committed, run live
+    var gl = glue_fresh();
+    batch_write(&gl, &b);
+    assert(gx_batch_set_len(&gl, 4 + 5 * ROW_BYTES) == true);
+    assert(gx_live(&gl, 3) == LIVE_OK);
+    // serialization transcription, row by row: the region's bytes decode back to exactly the
+    // event batch_event answers, and emitted_at with them
+    i = 0;
+    while (i < 5) {
+        const row = BATCH_OFF + 4 + i * ROW_BYTES;
+        const ev = batch_event(&b, i);
+        assert(gl.mem[row as usize] == ev.kind);
+        assert(gl.mem[(row + 1) as usize] == ev.deliver);
+        assert(gl.mem[(row + 2) as usize] == ev.reason);
+        assert(gl.mem[(row + 3) as usize] == 0);
+        assert(get_u32(&gl, row + 4) == ev.task_no);
+        assert(get_u32(&gl, row + 8) == ev.seq);
+        assert(get_u32(&gl, row + 12) == ev.spec_id);
+        assert(get_u64(&gl, row + 16) == ev.from_pid);
+        assert(get_u64(&gl, row + 24) == ev.to_pid);
+        assert(get_u32(&gl, row + 32) == b.emitted_at[i as usize]);
+        i = i + 1;
+    }
+    // graphs, counts and painted bytes agree with the direct call
+    var da = graph_digest(&gl.g);
+    var db = graph_digest(&gd);
+    i = 0;
+    while (i < 32) {
+        assert(da[i as usize] == db[i as usize]);
+        i = i + 1;
+    }
+    assert(gx_node_count(&gl) == nodes(&gd));
+    assert(gx_edge_count(&gl) == edges(&gd));
+    assert(gx_stream_n(&gl) == sd.n);
+    assert(gx_stream_ops(&gl) == sd.ops);
+    var frame : [2048]u8 = [0] ** 2048;
+    host_read(&gl, STREAM_OFF, frame[0..2048], gx_stream_len(&gl));
+    i = 0;
+    while (i < sd.n) {
+        assert(frame[i as usize] == sd.bytes[i as usize]);
+        i = i + 1;
+    }
+    assert(sd.n > 0);
+    assert(gx_node_count(&gl) > 5);        // five events joined more than five nodes
+}
+
+test "a refusal names its card: the setter's, the layout's, the count's, or the law's verbatim" {
+    // the setter refuses wrong lengths for a FIXED record and the state does not move
+    var gl = glue_fresh();
+    assert(gx_ev_set_len(&gl, 31) == false);
+    assert(gx_ev_set_len(&gl, 33) == false);
+    assert(gx_replay(&gl, 1) == E_STATE);
+    // a nonzero reserved byte is refused before anything is applied, whole
+    var gl2 = glue_fresh();
+    const ev = Event { kind: EV_SPAWN, from_pid: 1, to_pid: 2, task_no: 0, deliver: 0, reason: 0, seq: 1, spec_id: 0 };
+    record_write(&gl2, ev);
+    gl2.mem[(EV_OFF + 3) as usize] = 1;
+    assert(gx_ev_set_len(&gl2, EVENT_BYTES) == true);
+    assert(gx_replay(&gl2, 1) == E_LAYOUT);
+    assert(gx_node_count(&gl2) == 0);
+    // a bad event KIND is the LAW's refusal: live_mode's base, the law's code, VERBATIM (33 + 3),
+    // never rebased into this card's band
+    var gl3 = glue_fresh();
+    const bad = Event { kind: 9, from_pid: 1, to_pid: 2, task_no: 0, deliver: 0, reason: 0, seq: 1, spec_id: 0 };
+    record_write(&gl3, bad);
+    assert(gx_ev_set_len(&gl3, EVENT_BYTES) == true);
+    assert(gx_replay(&gl3, 1) == GRAPH_REFUSED_BASE + ERR_WG_BAD_EVENT);
+    assert(gx_node_count(&gl3) == 0);      // the law refused before mutating
+    // the batch: a committed length that disagrees with the count column is E_COUNT
+    var gl4 = glue_fresh();
+    var b1 = batch_empty();
+    assert(batch_push(&b1, feed_event(1), 1) == LIVE_OK);
+    batch_write(&gl4, &b1);                 // one row written, count column says 1
+    assert(gx_batch_set_len(&gl4, 4 + 5 * ROW_BYTES) == true);   // but the host committed 5 rows
+    assert(gx_live(&gl4, 1) == E_COUNT);
+    assert(gx_node_count(&gl4) == 0);
+    // and a count column past the cap is E_COUNT, matched by an honest length for it or not
+    var gl5 = glue_fresh();
+    put_u32_at(&gl5, BATCH_OFF, BATCH_ROWS + 1);
+    assert(gx_batch_set_len(&gl5, BATCH_BYTES) == true);
+    assert(gx_live(&gl5, 1) == E_COUNT);
+    assert(gx_batch_set_len(&gl, BATCH_BYTES + 1) == false);     // the cap itself is the setter's
+    // a mid-batch law refusal passes the law's code and keeps the law's own partial semantics:
+    // row 0 applied, row 1 refused -- passed through, never rolled back by the glue
+    var gl6 = glue_fresh();
+    var b2 = batch_empty();
+    assert(batch_push(&b2, ev, 1) == LIVE_OK);
+    assert(batch_push(&b2, bad, 1) == LIVE_OK);
+    batch_write(&gl6, &b2);
+    assert(gx_batch_set_len(&gl6, 4 + 2 * ROW_BYTES) == true);
+    assert(gx_live(&gl6, 1) == GRAPH_REFUSED_BASE + ERR_WG_BAD_EVENT);
+    assert(gx_node_count(&gl6) == 2);      // the spawn of row 0 stands: live_frame's semantics
+    // and the cap the law itself owns is reachable through the boundary under its own name
+    assert(E_BATCH_FULL == 1);             // live_mode's code, quoted to keep the bands honest
+    assert(E_BUDGET == 7);                 // display_list's paint refusal crosses verbatim too
+}
+
+test "reads are idempotent; a refused action changes no byte the host can read" {
+    var gl = glue_fresh();
+    const ev = Event { kind: EV_SPAWN, from_pid: 3, to_pid: 4, task_no: 0, deliver: 0, reason: 0, seq: 1, spec_id: 0 };
+    record_write(&gl, ev);
+    assert(gx_ev_set_len(&gl, EVENT_BYTES) == true);
+    assert(gx_replay(&gl, 1) == LIVE_OK);
+    // read every OUTPUT byte (image, columns, digest: the span ends where the record region
+    // begins) twice with no action between: identical (law 3)
+    var a : [139304]u8 = [0] ** 139304;
+    var c : [139304]u8 = [0] ** 139304;
+    host_read(&gl, GRAPH_OFF, a[0..EV_OFF], EV_OFF);
+    host_read(&gl, GRAPH_OFF, c[0..EV_OFF], EV_OFF);
+    var i : u32 = 0;
+    while (i < EV_OFF) {
+        assert(a[i as usize] == c[i as usize]);
+        i = i + 1;
+    }
+    // a refused action leaves every readable byte identical (the input regions are host-writable
+    // memory and MAY change -- the outputs may not)
+    const bad = Event { kind: 9, from_pid: 1, to_pid: 2, task_no: 0, deliver: 0, reason: 0, seq: 2, spec_id: 0 };
+    record_write(&gl, bad);
+    assert(gx_replay(&gl, 2) == GRAPH_REFUSED_BASE + ERR_WG_BAD_EVENT);
+    host_read(&gl, GRAPH_OFF, c[0..EV_OFF], EV_OFF);
+    i = 0;
+    while (i < EV_OFF) {
+        assert(a[i as usize] == c[i as usize]);
+        i = i + 1;
+    }
+    // the pairs still answer the same numbers, and the stream region -- an output that lives
+    // past the input regions -- is idempotent on its own too
+    assert(gx_node_count(&gl) == 2);
+    assert(gx_stream_len(&gl) == gl.st.n);
+    var s1 : [2048]u8 = [0] ** 2048;
+    var s2 : [2048]u8 = [0] ** 2048;
+    host_read(&gl, STREAM_OFF, s1[0..2048], STREAM_CAP);
+    host_read(&gl, STREAM_OFF, s2[0..2048], STREAM_CAP);
+    i = 0;
+    while (i < STREAM_CAP) {
+        assert(s1[i as usize] == s2[i as usize]);
+        i = i + 1;
+    }
+}
+
+test "gx_reset returns the module to the fresh digest" {
+    var gl = glue_fresh();
+    const ev = Event { kind: EV_SPAWN, from_pid: 5, to_pid: 6, task_no: 0, deliver: 0, reason: 0, seq: 1, spec_id: 0 };
+    record_write(&gl, ev);
+    assert(gx_ev_set_len(&gl, EVENT_BYTES) == true);
+    assert(gx_replay(&gl, 1) == LIVE_OK);
+    assert(gx_node_count(&gl) == 2);
+    assert(gx_reset(&gl) == LIVE_OK);
+    assert(gx_node_count(&gl) == 0);
+    assert(gx_edge_count(&gl) == 0);
+    assert(gx_stream_n(&gl) == 0);
+    assert(gx_stream_ops(&gl) == 0);
+    assert(gx_replay(&gl, 1) == E_STATE);   // the commit state reset too
+    var fr = new_graph();
+    var want = graph_digest(&fr);
+    var i : u32 = 0;
+    while (i < 32) {
+        assert(gl.mem[(DIGEST_OFF + i) as usize] == want[i as usize]);
+        i = i + 1;
+    }
+}
+
+// ---- invariants -------------------------------------------------------------------------------------
+
+invariant the_refusal_bands_are_disjoint {
+    // the codes that can cross this boundary: live_mode's own 0..5, display_list's E_BUDGET 7
+    // (paint_frame returns flatten_into's verdict verbatim through live_frame), and the graph
+    // band 32..35. This card's band is 64..68: a refusal names one card, no code means two.
+    assert(GRAPH_REFUSED_BASE == 32);
+    assert(GRAPH_REFUSED_BASE > 5);
+    assert(E_BUDGET == 7);
+    assert(E_BUDGET > 5);
+    assert(GLUE_REFUSED_BASE == 64);
+    assert(GLUE_REFUSED_BASE > GRAPH_REFUSED_BASE + 3);
+    assert(GLUE_REFUSED_BASE > E_BUDGET);
+    assert(E_LEN == GLUE_REFUSED_BASE + 1);
+    assert(E_COUNT == GLUE_REFUSED_BASE + 2);
+    assert(E_STATE == GLUE_REFUSED_BASE + 3);
+    assert(E_LAYOUT == GLUE_REFUSED_BASE + 4);
+    assert(GLUE_REFUSED_BASE + 4 < 255);
+}
+
+invariant the_widths_transcribe_the_law {
+    // the caps this card uses are the law cards' own numbers, restated by import, never invented
+    assert(BATCH_ROWS == BATCH_CAP);
+    assert(BATCH_CAP == 64);
+    assert(ROW_BYTES == EVENT_BYTES + 4);
+    assert(BATCH_BYTES == 4 + BATCH_ROWS * ROW_BYTES);
+    assert(EVENT_BYTES == 32);
+    assert(GRAPH_LEN == digest_len());     // THE overlap: the image region IS the law's own order
+}
+
+invariant the_layout_fits_the_memory_and_walks_the_law_order {
+    // the image region is the law's own serialization: RECORD-major (10 bytes per node slot,
+    // 6 per edge slot), the exact bytes digest_bytes writes, and exactly as long
+    assert(GRAPH_OFF == 0);
+    assert(GRAPH_LEN == digest_len());
+    // the column region follows the image, one contiguous column per struct field, in the
+    // WorkGraph declaration's own order: kind, label, id, then the four edge columns
+    assert(NODE_KIND_OFF == GRAPH_OFF + GRAPH_LEN);
+    assert(NODE_LABEL_OFF == NODE_KIND_OFF + 2048);
+    assert(NODE_ID_OFF == NODE_LABEL_OFF + 2048);
+    assert(EDGE_KIND_OFF == NODE_ID_OFF + 16384);
+    assert(EDGE_FROM_OFF == EDGE_KIND_OFF + 8192);
+    assert(EDGE_TO_OFF == EDGE_FROM_OFF + 16384);
+    assert(EDGE_LABEL_OFF == EDGE_TO_OFF + 16384);
+    assert(NODE_ID_OFF == 73736);           // 8-aligned: 73736 = 8 * 9217
+    // the six regions do not overlap and end exactly at the memory's cap
+    assert(DIGEST_OFF == EDGE_LABEL_OFF + 8192);
+    assert(EV_OFF == DIGEST_OFF + 32);
+    assert(BATCH_OFF == EV_OFF + EVENT_BYTES);
+    assert(STREAM_OFF == BATCH_OFF + BATCH_BYTES);
+    assert(MEM_CAP == STREAM_OFF + STREAM_CAP);
+    assert(STREAM_CAP == 2048);
+    // and every pair's extent, const-checked, is inside
+    assert(NODE_KIND_OFF + 2048 <= MEM_CAP);
+    assert(NODE_LABEL_OFF + 2048 <= MEM_CAP);
+    assert(NODE_ID_OFF + 16384 <= MEM_CAP);
+    assert(EDGE_KIND_OFF + 8192 <= MEM_CAP);
+    assert(EDGE_FROM_OFF + 16384 <= MEM_CAP);
+    assert(EDGE_TO_OFF + 16384 <= MEM_CAP);
+    assert(EDGE_LABEL_OFF + 8192 <= MEM_CAP);
+    // the export surface is one table: 33 names, the emitter emits exactly these (see the
+    // table's comment for why the names themselves are pinned on the Zig side, not here)
+    assert(EXPORT_NAMES.len == 33);
+}

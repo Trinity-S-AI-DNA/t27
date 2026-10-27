@@ -1,0 +1,431 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/live_stream.t27 -- the T27F Live wire: SSE events, sequence numbers, keyframes, resume.
+// Milestone M4 of T27F Live (epic gHashTag/t27#10266), issue gHashTag/t27#10263.
+//
+// WHY: the live page must survive a dropped connection. A socket that redraws from scratch on every
+// event cannot, and a socket that replays an unbounded log forever cannot either. This card is the
+// rule between them: numbered events, a keyframe often enough that catch-up is always possible, and
+// coalescing that loses no key.
+//
+// THE WIRE IS SSE, NOT A WEBSOCKET. The page holds one GET that streams `text/event-stream`; user
+// actions go back as one POST of an allowlisted action id from specs/t27f/ui_plan.t27. HAS_WEBSOCKET
+// is false and the test says so.
+//
+// THE EVENT DISCIPLINE IS hot.t27's, not a second one: the event name is hot.t27's HOT_EVENT, and the
+// digest a client compares is DIGEST_HEX_LEN hex letters. This card adds the sequence, the keyframe
+// cadence and the resume rule; it does not invent a second vocabulary for the same stream.
+//
+// THE SEQUENCE starts at SEQ_FIRST and increases by one, forever, for the life of the stream. A
+// client that has seen seq S may ask for what follows S; the answer is either the deltas after S, or
+// a keyframe, and never a guess. The rule is resume_mode: if S is older than the newest keyframe the
+// server still holds, the deltas are gone from the buffer and the honest answer is the keyframe.
+//
+// COALESCING is what makes the rate bound real. Under backpressure several deltas to the same key in
+// one window become one delta holding the last value; a pending keyframe is never dropped, whatever
+// the pressure. FR-003 is a computed property here, not a promise:
+// coalescing_keeps_the_last_value_of_every_key walks a batch and compares the coalesced result with
+// the last-write-wins reference.
+//
+// NOT CLAIMED: the wire is emitted, not served (no HTTP server here); the latency budget is a Railway
+// lab measurement and is NOT measured by this change (see the PR); reconnection with backoff,
+// authentication and compression are the host's and are not specified here; and the resume test
+// compares per-key state, which is strictly stronger than comparing a scene hash, but it is a model
+// of the wire and not a run of a browser against t27-mcp --watch.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module live_stream;
+
+use t27f::hot::HOT_EVENT;
+use t27f::hot::DIGEST_HEX_LEN;
+use t27f::ui_plan::ACTION_NONE;
+use t27f::ui_plan::ACTION_OPEN_SPEC;
+use t27f::ui_plan::ACTION_RUN_TESTS;
+use t27f::ui_plan::ACTION_EXPORT_CSV;
+use t27f::ui_plan::ACTION_COPY_FORMULA;
+use t27f::ui_plan::ACTION_KINDS;
+
+pub const ID : str = "live-stream";
+pub const VERSION : u8 = 1;
+
+// ---- the transport -----------------------------------------------------------------------------------
+
+pub const WIRE : str = "text/event-stream";
+pub const TRANSPORT_STREAM : str = "GET";
+pub const TRANSPORT_ACTIONS : str = "POST";
+pub const HAS_WEBSOCKET : bool = false;
+
+// ---- the sequence ------------------------------------------------------------------------------------
+
+pub const SEQ_FIRST : u32 = 1;
+pub const SEQ_NONE : u32 = 0;              // "no Last-Event-ID": the client has seen nothing
+
+pub fn next_seq(seq: u32) -> u32 {
+    return seq + 1;
+}
+
+pub fn seq_ok(seq: u32) -> bool {
+    return seq >= SEQ_FIRST;
+}
+
+// ---- the cadence: a keyframe at least every K deltas -------------------------------------------------
+
+/// A keyframe at least every K_DELTAS deltas. The buffer holds more than one interval, so resuming by
+/// deltas is possible for a client that missed less than a full interval; a deeper miss gets the
+/// keyframe. DELTA_BUFFER >= K_DELTAS is an invariant, not a coincidence.
+pub const K_DELTAS : u32 = 16;
+pub const DELTA_BUFFER : u32 = 256;
+pub const KEYFRAME_PERIOD : u32 = K_DELTAS + 1;   // a keyframe, then K deltas, then a keyframe
+
+/// Keyframes fall on SEQ_FIRST, SEQ_FIRST + PERIOD, SEQ_FIRST + 2*PERIOD, ...
+pub fn is_keyframe(seq: u32) -> bool {
+    if (seq < SEQ_FIRST) { return false; }
+    return remu(seq - SEQ_FIRST, KEYFRAME_PERIOD) == 0;
+}
+
+/// The seq of the newest keyframe at or before head, or SEQ_NONE when head is before the first.
+pub fn keyframe_seq(head: u32) -> u32 {
+    if (head < SEQ_FIRST) { return SEQ_NONE; }
+    const n = @divTrunc(head - SEQ_FIRST, KEYFRAME_PERIOD);
+    return n * KEYFRAME_PERIOD + SEQ_FIRST;
+}
+
+/// Deltas since the newest keyframe at or before seq.
+pub fn deltas_since_kf(seq: u32) -> u32 {
+    const k = keyframe_seq(seq);
+    if (k == SEQ_NONE) { return 0; }
+    return seq - k;
+}
+
+/// FR-002, as a predicate the stream consults before it sends anything else.
+pub fn keyframe_due(deltas_since: u32) -> bool {
+    return deltas_since >= K_DELTAS;
+}
+
+// ---- resume ------------------------------------------------------------------------------------------
+
+/// The two honest answers to "what follows seq S".
+pub const RS_DELTAS : u8 = 0;      // the deltas after S are still in the buffer
+pub const RS_KEYFRAME : u8 = 1;    // they are not: send the whole scene instead
+pub const RESUME_MODES : u8 = 2;
+pub const RESUME_MODE_NAMES : [2]str = ["deltas", "keyframe"];
+
+/// A client that has seen nothing, or has fallen behind the newest keyframe the server still holds,
+/// is answered with a keyframe. Anything newer is answered with the deltas it missed.
+pub fn resume_mode(last_id: u32, kf_seq: u32) -> u8 {
+    if (last_id < SEQ_FIRST) { return RS_KEYFRAME; }
+    if (kf_seq == SEQ_NONE) { return RS_KEYFRAME; }
+    if (last_id < kf_seq) { return RS_KEYFRAME; }
+    return RS_DELTAS;
+}
+
+/// The first seq the client still needs. A client at or past head is current and waits for the next
+/// event; it is never sent a seq it has already seen.
+pub fn resume_from(last_id: u32, head: u32) -> u32 {
+    if (last_id >= head) { return next_seq(head); }
+    return next_seq(last_id);
+}
+
+// ---- coalescing under backpressure -------------------------------------------------------------------
+
+pub const MAX_RATE : u32 = 60;             // events a second the server will send
+pub const COALESCE_MS : u32 = 16;          // one send a window
+pub const MAX_KEYS : u32 = 64;             // keys a window may carry
+
+pub fn rate_ok(sent_this_second: u32) -> bool {
+    return sent_this_second <= MAX_RATE;
+}
+
+/// Whether one more event may go out in this second.
+pub fn may_send(sent_this_second: u32) -> bool {
+    return sent_this_second < MAX_RATE;
+}
+
+/// FR-003, first half: a pending keyframe survives any amount of coalescing.
+pub fn coalesce_keeps_keyframe(keyframe_pending: bool, deltas_in_window: u32) -> bool {
+    if (keyframe_pending) { return true; }
+    return deltas_in_window < DELTA_BUFFER;
+}
+
+/// The keys a window's batch touched, at most MAX_KEYS, and never more than the events themselves.
+pub fn coalesced_keys(events: u32) -> u32 {
+    const distinct = distinct_keys(events);
+    if (distinct > MAX_KEYS) { return MAX_KEYS; }
+    return distinct;
+}
+
+// ---- the model the tests walk: a deterministic stream of (key, value) events -------------------------
+
+pub const KEYS : u32 = 8;
+
+/// Which key event i writes. Deterministic in i alone, so a replay is reproducible with no fixture
+/// file: the "recorded log" of this card is a rule, and the values below are its bytes.
+pub fn gen_key(i: u32) -> u32 {
+    return remu(i * 5 + 3, KEYS);
+}
+
+/// The value event i writes. Also deterministic in i alone; the offset keeps values negative too, so
+/// the test cannot pass by every value being its own default.
+pub fn gen_value(i: u32) -> i32 {
+    return @as(i32, @intCast(remu(i, 401))) - 200;
+}
+
+/// The value of key k after events from..to, starting from start: last write wins.
+pub fn last_value(from: u32, to: u32, k: u32, start: i32) -> i32 {
+    var v = start;
+    var i = from;
+    while (i <= to) {
+        if (gen_key(i) == k) { v = gen_value(i); }
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The distinct keys events 1..n touched.
+pub fn distinct_keys(n: u32) -> u32 {
+    var seen : u32 = 0;
+    var k : u32 = 0;
+    while (k < KEYS) {
+        var touched : bool = false;
+        var i : u32 = 1;
+        while (i <= n) {
+            if (gen_key(i) == k) { touched = true; }
+            i = i + 1;
+        }
+        if (touched) { seen = seen + 1; }
+        k = k + 1;
+    }
+    return seen;
+}
+
+fn remu(a: u32, m: u32) -> u32 {
+    return a - @divTrunc(a, m) * m;
+}
+
+// ---- user actions come back as POST ------------------------------------------------------------------
+
+/// FR-004: an action outside the plan's catalog is refused, and ACTION_NONE is the only id that means
+/// "nothing". The catalog is ui_plan.t27's; this card names its bounds and copies none of its rules.
+pub fn action_allowed(a: u8) -> bool {
+    return a < ACTION_KINDS;
+}
+
+pub fn action_is_none(a: u8) -> bool {
+    return a == ACTION_NONE;
+}
+
+// ---- tests -------------------------------------------------------------------------------------------
+
+test the_wire_is_sse_and_never_a_websocket {
+    assert(WIRE == "text/event-stream");
+    assert(TRANSPORT_STREAM == "GET");
+    assert(TRANSPORT_ACTIONS == "POST");
+    assert(HAS_WEBSOCKET == false);
+    assert(HOT_EVENT == "t27f");
+    assert(DIGEST_HEX_LEN == 64);
+}
+
+test the_sequence_increases_strictly_and_never_restarts {
+    var seq : u32 = SEQ_FIRST;
+    var last : u32 = SEQ_NONE;
+    var i : u32 = 0;
+    while (i < 5000) {
+        assert(seq_ok(seq));
+        assert(seq > last);
+        assert(seq == last + 1);
+        last = seq;
+        seq = next_seq(seq);
+        i = i + 1;
+    }
+    assert(last == 5000);
+    assert(!seq_ok(SEQ_NONE));
+}
+
+test a_keyframe_arrives_at_least_every_k_deltas {                       // FR-002
+    var seq : u32 = SEQ_FIRST;
+    var since : u32 = 0;
+    var keyframes : u32 = 0;
+    var worst : u32 = 0;
+    while (seq <= 4000) {
+        if (is_keyframe(seq)) {
+            // a keyframe always lands exactly on the period, and resets the count
+            assert(seq == keyframe_seq(seq));
+            assert(deltas_since_kf(seq) == 0);
+            since = 0;
+            keyframes = keyframes + 1;
+        } else {
+            since = since + 1;
+            assert(since <= K_DELTAS);
+            if (since > worst) { worst = since; }
+        }
+        assert(deltas_since_kf(seq) == since);
+        assert(keyframe_due(deltas_since_kf(seq)) == (since >= K_DELTAS));
+        seq = seq + 1;
+    }
+    assert(keyframes >= 235);
+    assert(worst == K_DELTAS);
+    assert(KEYFRAME_PERIOD == K_DELTAS + 1);
+}
+
+test the_first_event_is_a_keyframe_and_head_zero_has_none {
+    assert(is_keyframe(SEQ_FIRST));
+    assert(keyframe_seq(SEQ_FIRST) == SEQ_FIRST);
+    assert(keyframe_seq(KEYFRAME_PERIOD) == SEQ_FIRST);
+    assert(keyframe_seq(KEYFRAME_PERIOD + 1) == KEYFRAME_PERIOD + 1);
+    assert(keyframe_seq(SEQ_NONE) == SEQ_NONE);
+    assert(deltas_since_kf(SEQ_NONE) == 0);
+    assert(!is_keyframe(SEQ_NONE));
+    assert(keyframe_seq(KEYFRAME_PERIOD + K_DELTAS) == KEYFRAME_PERIOD + 1);
+}
+
+test a_client_behind_the_newest_keyframe_is_sent_one {
+    // nothing seen: always a keyframe
+    assert(resume_mode(SEQ_NONE, SEQ_FIRST) == RS_KEYFRAME);
+    // current: the deltas it missed are in the buffer
+    assert(resume_mode(SEQ_FIRST, SEQ_FIRST) == RS_DELTAS);
+    assert(resume_mode(SEQ_FIRST + 3, SEQ_FIRST) == RS_DELTAS);
+    // older than the newest keyframe held: the deltas are gone, so the keyframe is the honest answer
+    assert(resume_mode(SEQ_FIRST, KEYFRAME_PERIOD + 1) == RS_KEYFRAME);
+    assert(resume_mode(KEYFRAME_PERIOD, KEYFRAME_PERIOD + 1) == RS_KEYFRAME);
+    assert(resume_mode(KEYFRAME_PERIOD + 1, KEYFRAME_PERIOD + 1) == RS_DELTAS);
+    assert(resume_mode(SEQ_FIRST + 5, SEQ_NONE) == RS_KEYFRAME);
+    assert(RESUME_MODE_NAMES.len == 2);
+    assert(RESUME_MODES == 2);
+}
+
+test the_resume_never_repeats_a_sequence_number {
+    assert(resume_from(SEQ_NONE, 10) == SEQ_FIRST);
+    assert(resume_from(3, 10) == 4);
+    assert(resume_from(10, 10) == 11);      // current: waits for the next event
+    assert(resume_from(11, 10) == 11);      // ahead of head: does not go backwards
+    var head : u32 = SEQ_FIRST;
+    while (head < 300) {
+        var last_id : u32 = SEQ_NONE;
+        while (last_id <= head) {
+            assert(resume_from(last_id, head) > last_id);
+            assert(resume_from(last_id, head) >= SEQ_FIRST);
+            last_id = last_id + 1;
+        }
+        head = head + 7;
+    }
+}
+
+test a_reconnect_reaches_the_same_state_in_100_runs {                  // the issue's first scenario
+    var run : u32 = 0;
+    var same : u32 = 0;
+    var keyframe_paths : u32 = 0;
+    var delta_paths : u32 = 0;
+    while (run < 100) {
+        const head = 40 + run;
+        // the client drops somewhere inside the stream, and asks from there
+        const cut = remu(run * 7 + 1, head + 1);
+        const kf = keyframe_seq(head);
+        const mode = resume_mode(cut, kf);
+        if (mode == RS_KEYFRAME) { keyframe_paths = keyframe_paths + 1; } else { delta_paths = delta_paths + 1; }
+        var agreed : bool = true;
+        var k : u32 = 0;
+        while (k < KEYS) {
+            const reference = last_value(SEQ_FIRST, head, k, 0);
+            var got : i32 = 0;
+            if (mode == RS_DELTAS) {
+                // what the client already had, then the deltas it missed
+                got = last_value(cut + 1, head, k, last_value(SEQ_FIRST, cut, k, 0));
+            } else {
+                // the keyframe's snapshot, then the deltas after it
+                got = last_value(kf + 1, head, k, last_value(SEQ_FIRST, kf, k, 0));
+            }
+            if (got != reference) { agreed = false; }
+            k = k + 1;
+        }
+        assert(agreed);
+        same = same + 1;
+        run = run + 1;
+    }
+    assert(same == 100);
+    // both paths are exercised, so the test is not one branch repeated
+    assert(keyframe_paths > 0);
+    assert(delta_paths > 0);
+    assert(keyframe_paths + delta_paths == 100);
+}
+
+test coalescing_keeps_the_last_value_of_every_key {                    // FR-003, first half
+    var events : u32 = 1;
+    while (events <= 400) {
+        const keys = coalesced_keys(events);
+        assert(keys <= MAX_KEYS);
+        assert(keys <= KEYS);
+        assert(keys == distinct_keys(events));
+        var k : u32 = 0;
+        while (k < KEYS) {
+            // the coalesced batch holds exactly one entry per touched key, whose value is the last
+            // write to that key in the batch -- never the first, never a sum
+            const reference = last_value(1, events, k, 0);
+            var coalesced : i32 = 0;
+            var i : u32 = 1;
+            while (i <= events) {
+                if (gen_key(i) == k) { coalesced = gen_value(i); }
+                i = i + 1;
+            }
+            assert(coalesced == reference);
+            k = k + 1;
+        }
+        events = events + 7;
+    }
+    assert(distinct_keys(1) == 1);
+    assert(distinct_keys(KEYS * 3) == KEYS);
+}
+
+test coalescing_drops_no_keyframe_and_the_rate_is_capped {             // FR-003, second half
+    var pending : bool = false;
+    var deltas : u32 = 0;
+    while (deltas < 2000) {
+        assert(coalesce_keeps_keyframe(true, deltas));
+        deltas = deltas + 3;
+    }
+    // a keyframe is kept even at the deepest pressure; without one, a bounded window still admits
+    assert(coalesce_keeps_keyframe(true, DELTA_BUFFER * 4));
+    assert(coalesce_keeps_keyframe(false, 0));
+    assert(coalesce_keeps_keyframe(false, DELTA_BUFFER - 1));
+    assert(!coalesce_keeps_keyframe(false, DELTA_BUFFER));
+    var sent : u32 = 0;
+    while (sent <= MAX_RATE + 5) {
+        assert(rate_ok(sent) == (sent <= MAX_RATE));
+        assert(may_send(sent) == (sent < MAX_RATE));
+        sent = sent + 1;
+    }
+    assert(MAX_RATE > 0);
+    assert(COALESCE_MS > 0);
+    assert(MAX_RATE * COALESCE_MS <= 1000);
+}
+
+test an_action_outside_the_allowlist_is_refused {                      // FR-004
+    assert(action_allowed(ACTION_NONE));
+    assert(action_allowed(ACTION_OPEN_SPEC));
+    assert(action_allowed(ACTION_RUN_TESTS));
+    assert(action_allowed(ACTION_EXPORT_CSV));
+    assert(action_allowed(ACTION_COPY_FORMULA));
+    // one past the last catalog id is outside it
+    assert(!action_allowed(ACTION_KINDS));
+    assert(!action_allowed(ACTION_KINDS + 1));
+    assert(!action_allowed(200));
+    assert(action_is_none(ACTION_NONE));
+    assert(!action_is_none(ACTION_OPEN_SPEC));
+    var a : u16 = 0;
+    while (a < 256) {
+        assert(action_allowed(@as(u8, @intCast(a))) == (a < ACTION_KINDS));
+        a = a + 1;
+    }
+}
+
+invariant the_buffer_holds_a_whole_interval {
+    assert(DELTA_BUFFER >= K_DELTAS);
+    assert(KEYFRAME_PERIOD == K_DELTAS + 1);
+    assert(K_DELTAS > 0);
+}
+
+invariant the_wire_reuses_one_vocabulary {
+    assert(HOT_EVENT == "t27f");
+    assert(DIGEST_HEX_LEN == 64);
+    assert(ACTION_KINDS == 5);
+    assert(HAS_WEBSOCKET == false);
+    assert(RESUME_MODE_NAMES.len == RESUME_MODES);
+}

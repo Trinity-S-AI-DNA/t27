@@ -46,6 +46,14 @@ It writes `measures.json`; the orchestrator uploads it to the Mission Control da
    worktrees first (skill self-cleanup).
 5. End the tick with one line: state, numbers, action taken, `Requests out:`.
 
+## Claiming an issue (pointer, epic #12490)
+
+Before a lane takes an issue it claims it: three words, `claim`, `heartbeat` (or `beat`) and `release`.
+The rules (the ref, the comment, the six-hour stale bound, who may take over) are the law in
+`specs/queen/claim_msg.t27`; the words and what each message ends in are
+`specs/tri/actors/claim_verbs.t27`; the trigit verbs are `specs/tri/trigit/verbs.t27`. Read those, do
+not copy their numbers here. The comment on the issue stays "In work: <what>, done so far: <x>".
+
 ## Traps
 
 - A cron fire is itself a Claude turn: keep the tick to the collector + at most one action.

@@ -1,0 +1,823 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/live_mode.t27 -- live mode over SSE: one event, the next painted frame (M4 of T27F
+// Live). Issue gHashTag/t27#11778 (epic #10266). Design: docs/nona-02-organism/t27f/genui-research.md,
+// section 5.5, row M4.
+//
+// WHY THE SAME PATH (FR-001). M3 renders a recorded log; M4 renders the actual stream. The claim
+// "live and replay are the same picture" is only true if a live frame is BUILT the way a replay
+// frame is built, so this card defines no second renderer and cannot have one: every painted byte
+// it can produce comes from paint_frame, whose only statement is display_list::flatten_into of the
+// scene -- the function the browser loader executes -- and every event reaches the graph through
+// work_graph::apply_event, the same entry the M3 replay loop calls. live_frame (the stream side)
+// and replay_frame (the log side) share that one path and differ only in how events arrive. The
+// scene is the HUD's job (hud.t27 is the M3 scene builder of record, its construction landing), so
+// fixture_scene stands in for it the same way export_video.t27's fixture_scene stands in for the
+// recorded log's scene: deterministic in (graph, frame) alone, one rect per agent node the graph
+// holds, the card advancing with the frame.
+//
+// WHY THE MEASUREMENT (FR-002). "p50 under 50 ms" proves nothing by itself. The evidence is the
+// record: per event, the stream seq, the frame whose window took it, the frame whose paint first
+// showed it, and the latency between them -- machine-readable columns, not prose. The record
+// refuses to lie: a row whose seq is not the stream's next is E_SEQ (live_stream's sequence rule);
+// a paint before the arrival window is E_ORDER; a latency past the p99 budget is E_BUDGET and
+// nothing is written. That per-row gate is stricter than the milestone's -- a single slow event
+// cannot hide behind the 99th percentile -- and run_within_budget computes the p50/p99 the M4 row
+// actually states, over the same columns.
+//
+// WHY COALESCING DROPS NOTHING. Under backpressure several events arrive inside one frame window;
+// a paint per event would redraw per event, and a drop per window would lose graph state. The rule
+// is: the PAINT coalesces, the GRAPH does not. One paint is due per window however many events
+// arrived (paints_due), and the frame's batch is applied in full, in seq order, through apply_event
+// -- so the graph every paint reads contains every event, whatever the pressure did to the
+// schedule. The burst test holds exactly that: a burst painted by ONE frame leaves the graph
+// byte-identical (same sha256) to replaying the same events one by one, and every event of the
+// burst has its row in the record.
+//
+// WHAT THE CLOCK IS. This card has no wall clock and refuses to pretend it has one:
+// arrival_frame places an event's arrival in the window [(f-1)*FRAME_MS, f*FRAME_MS), latency_ms
+// counts whole windows from the event's window to the paint, and FRAME_MS is live_stream's
+// COALESCE_MS -- the same 16 ms window at 60 fps. These columns are the contract the lab report
+// fills; the headless browser's own timestamps refine them on the lab.
+//
+// NOT CLAIMED: the M4 measurement has NOT happened -- LAB_RUN_DONE is false and asserted, and the
+// headless-browser run against t27-mcp --watch on the Railway lab is out of scope here (the lab is
+// not reachable from the machine this card was written on: it has no drive-in, the ssh alias for
+// the lab does not exist on it), so no number in this file is a measurement and none may be quoted
+// as one; no SSE server or client lives here (live_stream.t27 carries the wire, and its NOT
+// CLAIMED says the same of it); the loader page /t27f/live/ switching from replay to the stream is
+// Trinity's repo (at most 40 lines, per #10262), not this card; the fixture scene is a stand-in
+// for hud.t27's construction and is defined only for graphs of at most SCENE_AGENT_CAP agent
+// nodes -- asserted, never truncated; no reconnection, authentication or compression (the host's,
+// as in live_stream); the p50/p99 here are computed over the recorded rows, not over a browser
+// trace.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module live_mode;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::Event;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::apply_event;
+use t27f::work_graph::WG_OK;
+use t27f::work_graph::ERR_WG_BAD_EVENT;
+use t27f::work_graph::EV_DELIVER;
+use t27f::work_graph::D_OFFER;
+use t27f::work_graph::D_RESULT;
+use t27f::work_graph::NK_AGENT;
+use t27f::work_graph::NK_ACTION;
+use t27f::work_graph::NODE_CAP;
+use t27f::work_graph::nodes;
+use t27f::work_graph::edges;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::graph_digest;
+use t27f::live_stream::SEQ_FIRST;
+use t27f::live_stream::COALESCE_MS;
+use t27f::display_list::Stream;
+use t27f::display_list::stream_empty;
+use t27f::display_list::flatten_into;
+use t27f::display_list::MAX_OPS_PER_FRAME;
+use t27f::scene::Scene;
+use t27f::scene::Op;
+use t27f::scene::scene_empty;
+use t27f::scene::apply_op;
+use t27f::scene::validate_scene;
+use t27f::scene::SCENE_OK;
+use t27f::scene::OP_ADD;
+use t27f::scene::OP_SET;
+use t27f::scene::PRIM_RECT;
+use t27f::scene::NO_PARENT;
+use t27f::scene::F_X;
+use tri::crypto::sha256;
+use queen::actors::pid_of;
+
+// ---- the scene cap this file runs with ---------------------------------------------------------------
+
+// scene.t27's node cap, restated as a local faithful copy: the splice refuses the NAME here
+// because spec_graph.t27 declares a different MAX_NODES (1024 -- spec-graph nodes, not scene
+// slots), and this card is the first spec whose import closure holds both (work_graph ->
+// spec_graph, display_list -> scene). The value is scene.t27's; the generated code of the spliced
+// scene and display_list functions runs on this copy, and the budget test below pins the refusal
+// that copy must produce (a 33rd node refused, never taken). scene.t27's own cap stays pinned by
+// scene.t27's tests, not by this line.
+pub const MAX_NODES : u32 = 32;
+
+pub const ID : str = "live-mode";
+pub const VERSION : u8 = 1;
+
+// ---- the cadence --------------------------------------------------------------------------------------
+
+/// One frame every FRAME_MS -- live_stream's COALESCE_MS window, 60 fps. Latency is counted in
+/// these windows and never in a wall clock this card does not have.
+pub const FRAME_MS : u32 = 16;
+
+/// The budgets the M4 row states: event -> painted frame p50 under 50 ms, p99 under 150 ms.
+pub const P50_BUDGET_MS : u32 = 50;
+pub const P99_BUDGET_MS : u32 = 150;
+
+/// The frame whose window takes an event emitted at wall instant t_ms: frame 1 covers
+/// [0, FRAME_MS), frame 2 [FRAME_MS, 2*FRAME_MS), and so on. The painter only ever sees frames,
+/// never instants, so a latency is a whole number of windows by construction.
+pub fn arrival_frame(t_ms: u32) -> u32 {
+    return @divTrunc(t_ms, FRAME_MS) + 1;
+}
+
+/// The latency an event carries in the record, in ms: whole FRAME_MS windows from the end of its
+/// own window (the worst instant inside it) to the paint that first shows it. Same-window paint:
+/// 16 ms; one slipped window: 32 ms; and so on in steps of the frame.
+pub fn latency_ms(emitted_at: u32, painted_at: u32) -> u32 {
+    return (painted_at - emitted_at + 1) * FRAME_MS;
+}
+
+/// The coalescing rule's first half: a window owes ONE paint however many events arrived in it --
+/// never one per event. The second half (nothing dropped) is live_frame's, and the burst test
+/// holds it on a real graph: coalescing changes the paint schedule, never the graph bytes.
+pub fn paints_due(pending: u32) -> u32 {
+    if (pending == 0) { return 0; }
+    return 1;
+}
+
+// ---- what the functions answer ------------------------------------------------------------------------
+
+pub const LIVE_OK : u8 = 0;
+pub const E_BATCH_FULL : u8 = 1;           // the window holds more than BATCH_CAP events: refused
+pub const E_SEQ : u8 = 2;                  // not the stream's next seq, or a first_seq before it
+pub const E_ORDER : u8 = 3;                // painted before the arrival window, or window 0: refused
+pub const E_BUDGET : u8 = 4;               // past the p99 budget: refused, nothing recorded
+pub const E_FULL : u8 = 5;                 // the record already holds its cap: refused
+pub const RESULT_NAMES : [6]str = ["ok", "batch-full", "seq", "order", "budget", "full"];
+
+/// A work_graph refusal passed through live_frame or replay_frame names itself:
+/// GRAPH_REFUSED_BASE + work_graph's code. Without the base, work_graph's ERR_WG_NODE_CAP (1)
+/// would be indistinguishable from this card's E_BATCH_FULL (1) -- a refusal must name its card.
+pub const GRAPH_REFUSED_BASE : u8 = 32;
+
+// ---- the lab gate, stated so a test can hold it (export_video.t27's pattern) ---------------------------
+
+pub const MEASURED_ON : str = "railway-lab";  // the only place an M4 number may come from
+pub const MEASURE_HARNESS : str = "headless browser vs t27-mcp --watch";
+pub const HAS_LOCAL_MEASURE : bool = false;   // never measured on the owner's Mac
+pub const LAB_RUN_DONE : bool = false;        // no lab run yet; flips only in the PR that has one
+
+// ---- the batch: the events one frame window holds ------------------------------------------------------
+
+/// A window's worth of events. BATCH_CAP bounds it the way live_stream's MAX_KEYS bounds a send:
+/// growing past the cap is a refusal, never a silent truncation.
+pub const BATCH_CAP : u32 = 64;
+
+pub struct Batch {
+    count : u32,
+    kind : [64]u8,
+    from_pid : [64]u64,
+    to_pid : [64]u64,
+    task_no : [64]u32,
+    deliver : [64]u8,
+    reason : [64]u8,
+    seq : [64]u32,
+    spec_id : [64]u32,
+    emitted_at : [64]u32,                  // the frame whose window took the row
+}
+
+pub fn batch_empty() -> Batch {
+    return Batch {
+        count: 0,
+        kind: [0] ** 64,
+        from_pid: [0] ** 64,
+        to_pid: [0] ** 64,
+        task_no: [0] ** 64,
+        deliver: [0] ** 64,
+        reason: [0] ** 64,
+        seq: [0] ** 64,
+        spec_id: [0] ** 64,
+        emitted_at: [0] ** 64,
+    };
+}
+
+/// Queue one event into its window's batch. An arrival frame below 1 is refused (frames start at
+/// 1; arrival_frame never returns 0) -- an event with no window has no honest latency.
+pub fn batch_push(b: *Batch, ev: Event, emitted_at: u32) -> u8 {
+    if (b.count >= BATCH_CAP) { return E_BATCH_FULL; }
+    if (emitted_at == 0) { return E_ORDER; }
+    const i = b.count;
+    b.kind[i as usize] = ev.kind;
+    b.from_pid[i as usize] = ev.from_pid;
+    b.to_pid[i as usize] = ev.to_pid;
+    b.task_no[i as usize] = ev.task_no;
+    b.deliver[i as usize] = ev.deliver;
+    b.reason[i as usize] = ev.reason;
+    b.seq[i as usize] = ev.seq;
+    b.spec_id[i as usize] = ev.spec_id;
+    b.emitted_at[i as usize] = emitted_at;
+    b.count = i + 1;
+    return LIVE_OK;
+}
+
+/// Read row i back as the bus record it came from: the batch is a queue, not a re-encoder, and
+/// the FR-001 test holds the round-trip field by field.
+pub fn batch_event(b: *Batch, i: u32) -> Event {
+    return Event {
+        kind: b.kind[i as usize],
+        from_pid: b.from_pid[i as usize],
+        to_pid: b.to_pid[i as usize],
+        task_no: b.task_no[i as usize],
+        deliver: b.deliver[i as usize],
+        reason: b.reason[i as usize],
+        seq: b.seq[i as usize],
+        spec_id: b.spec_id[i as usize],
+    };
+}
+
+// ---- the one path to a painted byte (FR-001) ----------------------------------------------------------
+
+/// The scene of a live frame, as the HUD builds it. hud.t27 is the M3 scene builder of record and
+/// its construction is landing, so this fixture stands in for it the same way export_video.t27's
+/// fixture_scene stands in for the recorded log's scene: one rect per agent node the graph holds,
+/// the card advancing with the frame. Deterministic in (graph, frame) alone -- the same graph at
+/// the same frame gives the same bytes on the lab, in the browser and here, which is the
+/// determinism the M4 success criterion replays. Defined for graphs of at most SCENE_AGENT_CAP
+/// agent nodes (asserted, never truncated); the HUD it stands in for carries its own budget.
+pub const SCENE_AGENT_CAP : u32 = 20;
+
+pub fn fixture_scene(g: *WorkGraph, frame: u32) -> Scene {
+    var agents : u32 = 0;
+    var i : u32 = 0;
+    while (i < nodes(g)) {
+        if (node_kind_at_pub(g, i) == NK_AGENT) { agents = agents + 1; }
+        i = i + 1;
+    }
+    assert(agents <= SCENE_AGENT_CAP);      // the fixture is defined up to the cap, never truncated;
+    var s = scene_empty();                  // past the scene's own cap apply_op refuses (E_FULL)
+    i = 0;
+    var placed : u32 = 0;
+    while (i < nodes(g)) {
+        if (node_kind_at_pub(g, i) == NK_AGENT) {
+            const x : u32 = 8 + remu(frame * 3 + placed * 7, 240);
+            const add = Op{ .op = OP_ADD, .seq = placed * 2 + 1, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+            assert(apply_op(&s, add) == SCENE_OK);
+            const move = Op{ .op = OP_SET, .seq = placed * 2 + 2, .prim = 0, .parent = 0, .node = placed, .field = F_X, .value = @as(i32, @intCast(x)) };
+            assert(apply_op(&s, move) == SCENE_OK);
+            placed = placed + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The ONE statement this card makes about painting: flatten the graph's scene into the stream.
+/// live_frame and replay_frame both get their bytes here and nowhere else, so a second renderer is
+/// not merely forbidden -- there is no place for one to stand (FR-001). The stream is reset first,
+/// so a painted frame's bytes read only what its own flatten wrote; a refusal before this point
+/// leaves the caller's stream byte-identical to what it passed in.
+fn paint_frame(g: *WorkGraph, frame: u32, st: *Stream) -> u8 {
+    var s = fixture_scene(g, frame);
+    st.n = 0;
+    st.ops = 0;
+    return flatten_into(&s, st);
+}
+
+/// One live frame, the whole M4 path in one function: apply the frame's batch to the graph with
+/// work_graph::apply_event -- the same entry the M3 replay loop calls, in seq order, ALL of the
+/// batch whatever the pressure (the paint coalesces, the graph does not) -- then paint through
+/// paint_frame. A graph refusal names its card (GRAPH_REFUSED_BASE + work_graph's code) and leaves
+/// the stream untouched.
+pub fn live_frame(g: *WorkGraph, b: *Batch, frame: u32, st: *Stream) -> u8 {
+    var i : u32 = 0;
+    while (i < b.count) {
+        const r = apply_event(g, batch_event(b, i));
+        if (r != WG_OK) { return GRAPH_REFUSED_BASE + r; }
+        i = i + 1;
+    }
+    return paint_frame(g, frame, st);
+}
+
+/// The replay side of FR-001's comparison: the M3 loop, one log row per call, then the same
+/// paint_frame. It exists so the tests compare LIVE against REPLAY rather than live against
+/// itself; it shares paint_frame with live_frame and adds nothing else.
+pub fn replay_frame(g: *WorkGraph, ev: Event, frame: u32, st: *Stream) -> u8 {
+    const r = apply_event(g, ev);
+    if (r != WG_OK) { return GRAPH_REFUSED_BASE + r; }
+    return paint_frame(g, frame, st);
+}
+
+// ---- the measurement record (FR-002) ------------------------------------------------------------------
+
+/// One row per measured event, flat columns indexed by row, as work_graph's columns are indexed by
+/// node. The lab's headless browser fills these; this card defines what a row may claim.
+pub const MEASURE_CAP : u32 = 256;
+
+pub struct MeasureRecord {
+    first_seq : u32,                       // the seq the record started at (live_stream's resume_from)
+    count : u32,                           // rows recorded so far
+    seq : [256]u32,                        // the event's stream seq
+    emitted_at : [256]u32,                 // the frame whose window took the event
+    painted_at : [256]u32,                 // the frame whose paint first showed the event
+    latency : [256]u32,                    // latency_ms(emitted_at, painted_at), in ms
+}
+
+/// Zero the record and commit it to a resume point. A first_seq before the stream's first is
+/// refused (E_SEQ): live_stream's resume_from never returns one, and a record that started before
+/// its stream would accept a seq no event can carry.
+pub fn measure_init(rec: *MeasureRecord, first_seq: u32) -> u8 {
+    if (first_seq < SEQ_FIRST) { return E_SEQ; }
+    rec.first_seq = first_seq;
+    rec.count = 0;
+    var i : u32 = 0;
+    while (i < MEASURE_CAP) {
+        rec.seq[i as usize] = 0;
+        rec.emitted_at[i as usize] = 0;
+        rec.painted_at[i as usize] = 0;
+        rec.latency[i as usize] = 0;
+        i = i + 1;
+    }
+    return LIVE_OK;
+}
+
+/// Record one event's latency, or refuse the row before anything is written. The seq must be the
+/// stream's next (live_stream's rule: strictly increasing by one, forever); the paint must not
+/// precede the arrival window; the latency must sit inside the p99 budget -- the record's gate is
+/// stricter than the milestone's, so an accepted record cannot contain a lying green summary.
+pub fn measure_event(rec: *MeasureRecord, seq: u32, emitted_at: u32, painted_at: u32) -> u8 {
+    if (rec.count >= MEASURE_CAP) { return E_FULL; }
+    if (seq != rec.first_seq + rec.count) { return E_SEQ; }
+    if (emitted_at == 0 or painted_at < emitted_at) { return E_ORDER; }
+    const lat = latency_ms(emitted_at, painted_at);
+    if (lat > P99_BUDGET_MS) { return E_BUDGET; }
+    const i = rec.count;
+    rec.seq[i as usize] = seq;
+    rec.emitted_at[i as usize] = emitted_at;
+    rec.painted_at[i as usize] = painted_at;
+    rec.latency[i as usize] = lat;
+    rec.count = i + 1;
+    return LIVE_OK;
+}
+
+/// Record every event of one painted frame's batch: one paint, one row per event it applied. The
+/// checks run over the WHOLE batch before the first write, in the epic's discipline -- a frame
+/// with one row past the budget is refused whole (E_BUDGET), never partially recorded.
+pub fn measure_frame(rec: *MeasureRecord, b: *Batch, painted_at: u32) -> u8 {
+    if (rec.count + b.count > MEASURE_CAP) { return E_FULL; }
+    var i : u32 = 0;
+    while (i < b.count) {
+        if (b.seq[i as usize] != rec.first_seq + rec.count + i) { return E_SEQ; }
+        if (b.emitted_at[i as usize] == 0 or painted_at < b.emitted_at[i as usize]) { return E_ORDER; }
+        if (latency_ms(b.emitted_at[i as usize], painted_at) > P99_BUDGET_MS) { return E_BUDGET; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < b.count) {
+        const row = rec.count + i;
+        rec.seq[row as usize] = b.seq[i as usize];
+        rec.emitted_at[row as usize] = b.emitted_at[i as usize];
+        rec.painted_at[row as usize] = painted_at;
+        rec.latency[row as usize] = latency_ms(b.emitted_at[i as usize], painted_at);
+        i = i + 1;
+    }
+    rec.count = rec.count + b.count;
+    return LIVE_OK;
+}
+
+/// The p-th percentile (0..100) of the first n entries of a, ascending. The index is
+/// @divTrunc(n * p, 100), clamped into the array: over a short run the 99th percentile of the
+/// latencies is honestly the maximum, and this says so by construction.
+pub fn percentile(a: []u32, n: u32, p: u32) -> u32 {
+    if (n == 0) { return 0; }
+    sort_u32(a, n);
+    var idx = @divTrunc(n * p, 100);
+    if (idx >= n) { idx = n - 1; }
+    return a[idx as usize];
+}
+
+/// The M4 gate over a whole run: p50 < P50_BUDGET_MS and p99 < P99_BUDGET_MS over the recorded
+/// latencies. An empty record measures nothing and refuses to answer green.
+pub fn run_within_budget(rec: *MeasureRecord) -> bool {
+    if (rec.count == 0) { return false; }
+    var buf : [256]u32 = [0] ** 256;
+    var i : u32 = 0;
+    while (i < rec.count) {
+        buf[i as usize] = rec.latency[i as usize];
+        i = i + 1;
+    }
+    const p50 = percentile(buf[0..rec.count], rec.count, 50);
+    const p99 = percentile(buf[0..rec.count], rec.count, 99);
+    return p50 < P50_BUDGET_MS and p99 < P99_BUDGET_MS;
+}
+
+// ---- helpers ------------------------------------------------------------------------------------------
+
+// work_graph.t27's private node lookup, restated as a local faithful copy: the splice refuses the
+// NAME because queen/actors.t27 declares a different node_of(pid) -> u64 and this card's import
+// closure holds both, so pulling work_graph's apply_event otherwise lands its ensure_node here
+// with its callee missing. Same signature, same scan, and the FR-001 test holds the live graph's
+// bytes against the replay graph's, which nothing survives if this copy disagreed.
+fn node_of(g: *WorkGraph, kind: u8, id: u64) -> u32 {
+    var i : u32 = 0;
+    while (i < g.node_count) {
+        if (g.node_kind[i] == kind && g.node_id[i] == id) { return i; }
+        i = i + 1;
+    }
+    return NODE_CAP;
+}
+
+fn remu(a: u32, m: u32) -> u32 {
+    var r = a;
+    while (r >= m) { r = r - m; }
+    return r;
+}
+
+pub fn sort_u32(a: []u32, n: u32) {
+    var i : u32 = 1;
+    while (i < n) {
+        var j = i;
+        while (j > 0 and a[(j - 1) as usize] > a[j as usize]) {
+            const t = a[(j - 1) as usize];
+            a[(j - 1) as usize] = a[j as usize];
+            a[j as usize] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// The graph's action nodes: one per deliver the feed has applied, since every deliver's seq
+/// names one. The burst test reads this as "nothing dropped": one action node per event, however
+/// the paint schedule coalesced.
+pub fn action_nodes(g: *WorkGraph) -> u32 {
+    return count_kind(g, NK_ACTION);
+}
+
+fn count_kind(g: *WorkGraph, kind: u8) -> u32 {
+    var n : u32 = 0;
+    var i : u32 = 0;
+    while (i < nodes(g)) {
+        if (node_kind_at_pub(g, i) == kind) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn digests_equal(a: [32]u8, b: [32]u8) -> bool {
+    var i : u32 = 0;
+    while (i < 32) {
+        if (a[i as usize] != b[i as usize]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The feed stands in for the Queen's actor bus the way work_graph_fixture.t27's columns stand in
+/// for a recorded log: deterministic in i alone, no fixture file. Every event is a deliver (the
+/// one kind that joins), an offer on even i, a result on odd ones; pids come from two three-slot
+/// pools so the fixture scene stays inside display_list's budget; seqs are 1, 2, 3, ... --
+/// live_stream's discipline, which the record's E_SEQ test leans on.
+pub fn feed_event(i: u32) -> Event {
+    var d : u8 = D_OFFER;
+    if (remu(i, 2) == 1) { d = D_RESULT; }
+    return Event {
+        kind: EV_DELIVER,
+        from_pid: pid_of(remu(i, 3) + 1, 1),
+        to_pid: pid_of(remu(i * 7 + 1, 3) + 1, 1),
+        task_no: remu(i, 4) + 1,
+        deliver: d,
+        reason: 99,
+        seq: i,
+        spec_id: remu(i, 4) + 1,
+    };
+}
+
+// ---- tests --------------------------------------------------------------------------------------------
+
+test "the budgets, the cadence and the lab gate are stated" {
+    assert(P50_BUDGET_MS == 50);
+    assert(P99_BUDGET_MS == 150);
+    assert(P50_BUDGET_MS < P99_BUDGET_MS);
+    var wire_window : u32 = COALESCE_MS;
+    assert(FRAME_MS == wire_window);       // the paint window is the wire's coalescing window
+    assert(FRAME_MS == 16);
+    // the fixture's budget, inherited from display_list, pinned in plain code
+    var ops_cap : u32 = MAX_OPS_PER_FRAME;
+    assert(ops_cap == 128);
+    assert(SCENE_AGENT_CAP * 5 <= ops_cap);
+    // the local scene cap is the faithful copy the splice needs: the spliced apply_op refuses a
+    // node past it, exactly scene.t27's own refusal, and never truncates
+    var sc = scene_empty();
+    var ri : u32 = 0;
+    while (ri < MAX_NODES) {
+        const ra = Op{ .op = OP_ADD, .seq = ri + 1, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+        assert(apply_op(&sc, ra) == SCENE_OK);
+        ri = ri + 1;
+    }
+    assert(sc.count == MAX_NODES);
+    const r33 = Op{ .op = OP_ADD, .seq = MAX_NODES + 1, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    assert(apply_op(&sc, r33) != SCENE_OK);   // refused, and the scene is still 32, not 33
+    assert(sc.count == MAX_NODES);
+    // the window arithmetic: frame 1 owns [0, 16), frame 2 [16, 32), and 1000 ms lands in frame 63
+    assert(arrival_frame(0) == 1);
+    assert(arrival_frame(FRAME_MS - 1) == 1);
+    assert(arrival_frame(FRAME_MS) == 2);
+    assert(arrival_frame(1000) == 63);
+    // the latency is whole windows: same-window paint 16, one slip 32, and the record's edge
+    assert(latency_ms(3, 3) == FRAME_MS);
+    assert(latency_ms(3, 4) == 2 * FRAME_MS);
+    assert(latency_ms(1, 9) == 144);       // the deepest paint the p99 budget still accepts
+    assert(latency_ms(1, 10) == 160);      // the first whole-window latency past it
+    // one paint per window, never one per event, however many events arrived
+    assert(paints_due(0) == 0);
+    assert(paints_due(1) == 1);
+    assert(paints_due(BATCH_CAP) == 1);
+    // the lab gate, export_video.t27's pattern: stated, asserted, and false until a run exists
+    assert(LIVE_OK == 0);
+    assert(MEASURED_ON == "railway-lab");
+    assert(MEASURE_HARNESS == "headless browser vs t27-mcp --watch");
+    assert(LAB_RUN_DONE == false);         // no lab run yet; flips only in the PR that has one
+    assert(RESULT_NAMES.len == 6);
+}
+
+test "a feed applied live frame by frame paints what batch replay paints (FR-001)" {
+    // the fixture's shape is pinned first: one deliver joins two agents, so the scene is two
+    // rects -- 10 opcodes in 50 bytes -- and it validates, because the loader only paints
+    // validated scenes
+    var g1 = new_graph();
+    assert(apply_event(&g1, feed_event(1)) == WG_OK);
+    var s1 = fixture_scene(&g1, 1);
+    assert(validate_scene(&s1) == SCENE_OK);
+    var st_check = stream_empty();
+    assert(flatten_into(&s1, &st_check) == SCENE_OK);
+    assert(st_check.ops == 10);
+    assert(st_check.n == 50);
+    // the live path: 24 events over 6 windows of 4, one paint per window
+    var ga = new_graph();                  // live
+    var gc = new_graph();                  // replay, the M3 loop, one event per call
+    var st = stream_empty();
+    var st2 = stream_empty();
+    var f : u32 = 1;
+    while (f <= 6) {
+        var b = batch_empty();
+        var j : u32 = 4 * (f - 1) + 1;
+        while (j <= 4 * f) {
+            assert(batch_push(&b, feed_event(j), f) == LIVE_OK);
+            j = j + 1;
+        }
+        assert(live_frame(&ga, &b, f, &st) == LIVE_OK);
+        // the replay path: the same four events through the same apply_event, then the same
+        // paint_frame -- every painted byte must agree, frame for frame
+        j = 4 * (f - 1) + 1;
+        while (j <= 4 * f) {
+            assert(replay_frame(&gc, feed_event(j), f, &st2) == LIVE_OK);
+            j = j + 1;
+        }
+        assert(st.n == st2.n);
+        assert(st.ops == st2.ops);
+        var k : u32 = 0;
+        while (k < st.n) {
+            assert(st.bytes[k as usize] == st2.bytes[k as usize]);
+            k = k + 1;
+        }
+        f = f + 1;
+    }
+    // the graphs agree letter by letter, and the frame-6 stream hashes to the same sha256
+    assert(digests_equal(graph_digest(&ga), graph_digest(&gc)));
+    var hex_a : [64]u8 = sha256::hash_hex(st.bytes[0..st.n]);
+    var hex_c : [64]u8 = sha256::hash_hex(st2.bytes[0..st.n]);
+    var h : u32 = 0;
+    while (h < 64) {
+        assert(hex_a[h as usize] == hex_c[h as usize]);
+        h = h + 1;
+    }
+    // and a pure batch replay -- all 24 events, no frames at all -- lands on the same graph bytes
+    var gb = new_graph();
+    var i : u32 = 1;
+    while (i <= 24) {
+        assert(apply_event(&gb, feed_event(i)) == WG_OK);
+        i = i + 1;
+    }
+    assert(digests_equal(graph_digest(&ga), graph_digest(&gb)));
+    assert(nodes(&ga) == nodes(&gb));
+    assert(edges(&ga) == edges(&gb));
+    // the feed was real: 24 action nodes (one per seq) and more edges than events
+    assert(count_kind(&ga, NK_AGENT) > 0);
+    assert(action_nodes(&ga) == 24);
+    assert(edges(&ga) > 24);
+    assert(nodes(&ga) > 24);
+}
+
+test "a burst between two frames coalesces into one paint and drops no event" {
+    var g = new_graph();
+    var b = batch_empty();
+    var st_burst = stream_empty();
+    // six events arrive inside window 3, four more inside window 4, and the painter skips window
+    // 3's boundary entirely: ONE paint at frame 5 carries the whole burst
+    var i : u32 = 1;
+    while (i <= 10) {
+        var w : u32 = 3;
+        if (i > 6) { w = 4; }
+        assert(batch_push(&b, feed_event(i), w) == LIVE_OK);
+        i = i + 1;
+    }
+    assert(live_frame(&g, &b, 5, &st_burst) == LIVE_OK);
+    // nothing dropped: the burst graph is byte-identical to replaying the ten events one by one
+    var g2 = new_graph();
+    i = 1;
+    while (i <= 10) {
+        assert(apply_event(&g2, feed_event(i)) == WG_OK);
+        i = i + 1;
+    }
+    assert(digests_equal(graph_digest(&g), graph_digest(&g2)));
+    assert(action_nodes(&g) == 10);   // one action node per seq: all ten landed
+    // the record: one row per event, every row painted by the SAME frame -- that is the coalesce
+    var rec : MeasureRecord = undefined;
+    assert(measure_init(&rec, SEQ_FIRST) == LIVE_OK);
+    assert(measure_frame(&rec, &b, 5) == LIVE_OK);
+    assert(rec.count == 10);
+    i = 0;
+    while (i < 10) {
+        assert(rec.seq[i as usize] == SEQ_FIRST + i);
+        assert(rec.painted_at[i as usize] == 5);
+        assert(rec.emitted_at[i as usize] == 3 or rec.emitted_at[i as usize] == 4);
+        assert(rec.latency[i as usize] == latency_ms(rec.emitted_at[i as usize], 5));
+        assert(rec.latency[i as usize] <= P99_BUDGET_MS);
+        i = i + 1;
+    }
+    // window 3's six rows wait two windows: (5-3+1)*16 = 48; window 4's four wait one: 32
+    assert(rec.emitted_at[0] == 3);
+    assert(rec.latency[0] == 48);
+    assert(rec.emitted_at[6] == 4);
+    assert(rec.latency[6] == 32);
+    assert(rec.seq[9] == 10);
+    assert(run_within_budget(&rec));
+}
+
+test "every recorded event carries a full row, and the p50/p99 answer over the columns (FR-002)" {
+    var rec : MeasureRecord = undefined;
+    assert(measure_init(&rec, SEQ_FIRST) == LIVE_OK);
+    assert(measure_event(&rec, 1, 1, 1) == LIVE_OK);   // latency 16
+    assert(measure_event(&rec, 2, 1, 1) == LIVE_OK);   // 16
+    assert(measure_event(&rec, 3, 2, 3) == LIVE_OK);   // 32
+    assert(measure_event(&rec, 4, 2, 4) == LIVE_OK);   // 48
+    assert(measure_event(&rec, 5, 3, 5) == LIVE_OK);   // 48
+    assert(rec.count == 5);
+    // every row is full: seq contiguous from the resume point, painted never before arrival,
+    // latency exactly the stated function of its two frames, nothing over the budget
+    var i : u32 = 0;
+    while (i < rec.count) {
+        assert(rec.seq[i as usize] == SEQ_FIRST + i);
+        assert(rec.emitted_at[i as usize] >= 1);
+        assert(rec.painted_at[i as usize] >= rec.emitted_at[i as usize]);
+        assert(rec.latency[i as usize] == latency_ms(rec.emitted_at[i as usize], rec.painted_at[i as usize]));
+        assert(rec.latency[i as usize] <= P99_BUDGET_MS);
+        i = i + 1;
+    }
+    assert(rec.latency[0] == FRAME_MS);
+    assert(rec.latency[2] == 2 * FRAME_MS);
+    assert(rec.latency[4] == 3 * FRAME_MS);
+    // the p50 and the p99 of {16,16,32,48,48} are 32 and 48: both inside their budgets
+    var buf : [5]u32 = [16, 16, 32, 48, 48];
+    assert(percentile(buf[0..5], 5, 50) == 32);
+    assert(percentile(buf[0..5], 5, 99) == 48);
+    assert(percentile(buf[0..5], 5, 0) == 16);
+    assert(percentile(buf[0..5], 5, 100) == 48);       // clamped into the array, not out of it
+    assert(run_within_budget(&rec));
+    // an empty record measures nothing and refuses to answer green
+    var empty : MeasureRecord = undefined;
+    assert(measure_init(&empty, SEQ_FIRST) == LIVE_OK);
+    assert(run_within_budget(&empty) == false);
+    // growing past the record's cap is refused, never truncated
+    var full : MeasureRecord = undefined;
+    assert(measure_init(&full, SEQ_FIRST) == LIVE_OK);
+    var j : u32 = 0;
+    var r : u8 = LIVE_OK;
+    while (j <= MEASURE_CAP) {
+        r = measure_event(&full, SEQ_FIRST + j, 1, 1);
+        if (r != LIVE_OK) { break; }
+        j = j + 1;
+    }
+    assert(r == E_FULL);
+    assert(full.count == MEASURE_CAP);
+}
+
+test "a frame past the p99 budget is refused, never silently recorded" {
+    var rec : MeasureRecord = undefined;
+    assert(measure_init(&rec, SEQ_FIRST) == LIVE_OK);
+    // nine windows deep: 9 * 16 = 144 ms, the deepest latency the budget accepts
+    assert(measure_event(&rec, 1, 1, 9) == LIVE_OK);
+    assert(rec.count == 1);
+    assert(rec.latency[0] == 144);
+    // one window more: 160 ms, past the budget: refused, and the refusal consumes no seq
+    assert(measure_event(&rec, 2, 1, 10) == E_BUDGET);
+    assert(rec.count == 1);
+    assert(measure_event(&rec, 2, 2, 2) == LIVE_OK);   // the expected seq is still 2
+    assert(rec.count == 2);
+    // a batch with one row over the budget is refused WHOLE, before the first write
+    var b = batch_empty();
+    assert(batch_push(&b, feed_event(3), 1) == LIVE_OK);
+    assert(batch_push(&b, feed_event(4), 1) == LIVE_OK);
+    assert(batch_push(&b, feed_event(5), 1) == LIVE_OK);
+    assert(measure_frame(&rec, &b, 12) == E_BUDGET);   // (12-1+1)*16 = 176 for every row
+    assert(rec.count == 2);                            // nothing of the batch was written
+    // a shallower paint is fine for the same batch, and the rows land in order
+    assert(measure_frame(&rec, &b, 3) == LIVE_OK);     // (3-1+1)*16 = 48
+    assert(rec.count == 5);
+    assert(rec.seq[2] == 3);
+    assert(rec.latency[2] == 48);
+    // a paint before the arrival window, and window 0, are refused as lies about time
+    assert(measure_event(&rec, 6, 5, 4) == E_ORDER);
+    assert(measure_event(&rec, 6, 0, 5) == E_ORDER);
+    assert(rec.count == 5);
+}
+
+test "an out-of-order or repeated seq is refused (live_stream's rule)" {
+    var bad : MeasureRecord = undefined;
+    assert(measure_init(&bad, 0) == E_SEQ);            // no record may start before the stream
+    var rec : MeasureRecord = undefined;
+    assert(measure_init(&rec, SEQ_FIRST) == LIVE_OK);
+    assert(measure_event(&rec, 1, 1, 1) == LIVE_OK);
+    // a gap: 3 when 2 is due
+    assert(measure_event(&rec, 3, 1, 1) == E_SEQ);
+    assert(rec.count == 1);
+    // a repeat: 1 again
+    assert(measure_event(&rec, 1, 1, 1) == E_SEQ);
+    assert(rec.count == 1);
+    // the missing seq fills, and the stream continues contiguously
+    assert(measure_event(&rec, 2, 1, 2) == LIVE_OK);
+    assert(measure_event(&rec, 3, 1, 2) == LIVE_OK);
+    assert(rec.count == 3);
+    // a mid-stream record starts at its resume point and holds the same rule
+    var mid : MeasureRecord = undefined;
+    assert(measure_init(&mid, 41) == LIVE_OK);
+    assert(measure_event(&mid, 41, 1, 1) == LIVE_OK);
+    assert(measure_event(&mid, 43, 1, 1) == E_SEQ);
+    assert(measure_event(&mid, 40, 1, 1) == E_SEQ);
+    assert(measure_event(&mid, 42, 1, 1) == LIVE_OK);
+    assert(mid.count == 2);
+}
+
+test "a batch past its cap is refused, and its columns round-trip the bus record" {
+    var b = batch_empty();
+    var i : u32 = 1;
+    var r : u8 = LIVE_OK;
+    while (i <= BATCH_CAP + 1) {
+        r = batch_push(&b, feed_event(i), 1);
+        if (r != LIVE_OK) { break; }
+        i = i + 1;
+    }
+    assert(r == E_BATCH_FULL);
+    assert(b.count == BATCH_CAP);          // refused, not truncated into the batch
+    // the queue, not a re-encoder: every field of the event comes back exactly as it went in
+    var b2 = batch_empty();
+    var ev = feed_event(5);
+    assert(batch_push(&b2, ev, 7) == LIVE_OK);
+    var back = batch_event(&b2, 0);
+    assert(back.kind == ev.kind);
+    assert(back.from_pid == ev.from_pid);
+    assert(back.to_pid == ev.to_pid);
+    assert(back.task_no == ev.task_no);
+    assert(back.deliver == ev.deliver);
+    assert(back.reason == ev.reason);
+    assert(back.seq == ev.seq);
+    assert(back.spec_id == ev.spec_id);
+    assert(b2.emitted_at[0] == 7);
+    // an event with no window is refused: frames start at 1
+    assert(batch_push(&b2, ev, 0) == E_ORDER);
+    assert(b2.count == 1);
+}
+
+test "a graph refusal passed through the live path names its card" {
+    var g = new_graph();
+    var b = batch_empty();
+    var bad = feed_event(1);
+    bad.deliver = 7;                       // not a deliver kind work_graph knows
+    assert(batch_push(&b, bad, 1) == LIVE_OK);
+    var st = stream_empty();
+    // work_graph's ERR_WG_BAD_EVENT is 3; the live path hands it back as 32 + 3, so a caller can
+    // never read a graph refusal as one of this card's own codes
+    var want : u8 = GRAPH_REFUSED_BASE + ERR_WG_BAD_EVENT;
+    assert(live_frame(&g, &b, 1, &st) == want);
+    // the refusal left nothing behind: no bytes, no opcodes, no graph growth
+    assert(st.n == 0);
+    assert(st.ops == 0);
+    assert(nodes(&g) == 0);
+    assert(edges(&g) == 0);
+}
+
+// ---- invariants ---------------------------------------------------------------------------------------
+
+invariant the_budgets_are_the_m4_row {
+    assert(P50_BUDGET_MS == 50);
+    assert(P99_BUDGET_MS == 150);
+    assert(P50_BUDGET_MS < P99_BUDGET_MS);
+    assert(FRAME_MS == COALESCE_MS);       // the paint window is the wire's coalescing window
+    assert(FRAME_MS > 0);
+    assert(SEQ_FIRST == 1);
+    assert(MEASURED_ON == "railway-lab");
+    assert(LAB_RUN_DONE == false);         // no lab run yet; flips only in the PR that has one
+    assert(HAS_LOCAL_MEASURE == false);    // never measured on the owner's Mac
+}
+
+invariant the_record_and_the_batch_are_the_stated_caps {
+    assert(BATCH_CAP == 64);
+    assert(MEASURE_CAP == 256);
+    assert(SCENE_AGENT_CAP * 5 <= MAX_OPS_PER_FRAME);   // the fixture scene always fits the budget
+    assert(SCENE_AGENT_CAP < MAX_NODES);   // the fixture's cap fits inside the scene's own
+    assert(LIVE_OK == 0);
+    assert(RESULT_NAMES.len == 6);
+    assert(GRAPH_REFUSED_BASE > E_FULL);   // a graph refusal can never read as this card's own
+    assert(MAX_OPS_PER_FRAME == 128);      // the frame budget this card inherits, display_list's own
+}

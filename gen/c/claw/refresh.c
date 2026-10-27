@@ -729,7 +729,7 @@ uint8_t digit_byte(uint32_t d) {
 }
 
 size_t put_count(uint8_t* dst, size_t cap, size_t w, uint32_t v) {
-    uint8_t tmp[16] = {0};
+    uint8_t tmp[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     size_t n = 0;
     uint32_t x = v;
     if ((x == 0)) {

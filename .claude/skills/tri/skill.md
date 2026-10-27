@@ -70,7 +70,7 @@ Before starting any task, query NotebookLM for existing work to prevent duplicat
 
 ```bash
 # Check if work already done (avoids session amnesia)
-tri notebook query "What is the current status of <task/topic>?"
+tri notebook query "What is the current status of <task/topic>?" <!-- not built as a t27c subcommand -->
 
 # This returns:
 # - Task completion status
@@ -128,13 +128,13 @@ Source 3: "Session 2026-04-08 18:30 — PR merged"
 
 ```bash
 # Auto-detect issue from .trinity/state/issue-binding.json
-tri wrapup --summary "Completed Phi Loop iterations for Ring-071"
+tri wrapup --summary "Completed Phi Loop iterations for Ring-071" <!-- not built as a t27c subcommand -->
 
 # Specify issue explicitly
-tri wrapup --issue 343 --summary "Fixed CI pipeline"
+tri wrapup --issue 343 --summary "Fixed CI pipeline" <!-- not built as a t27c subcommand -->
 
 # Full wrap-up with all details
-tri wrapup --summary "Implemented NotebookLM backend" \
+tri wrapup --summary "Implemented NotebookLM backend" \ <!-- not built as a t27c subcommand -->
            --decisions "Used notebooklm-py SDK with cookie auth" \
            --files "contrib/backend/notebooklm/*.py" \
            --steps "Run integration tests"
@@ -151,7 +151,7 @@ tri wrapup --summary "Implemented NotebookLM backend" \
 2. **Finds or creates issue-specific notebook**:
    - Searches for notebook named `"t27 #NNN — <title>"`
    - Creates if not found
-   - Each `/tri wrapup` adds a new source to the same notebook
+   - Each `/tri wrapup` adds a new source to the same notebook <!-- not built as a t27c subcommand -->
 
 3. **Formats Markdown** with metadata:
    ```markdown
@@ -404,21 +404,21 @@ Standard PHI LOOP execution:
 
 ```bash
 # Step 1: Check NotebookLM (pre-work) — AVOID duplication
-tri notebook query "<task/topic> status"  # Returns if already done
+tri notebook query "<task/topic> status"  # Returns if already done <!-- not built as a t27c subcommand -->
 
 # Step 2: Start skill if new work
 tri skill begin --issue N --description "task description"
 
 # Step 3: Execute PHI LOOP
-tri spec edit <module>
+tri spec edit <module> <!-- not built as a t27c subcommand -->
 tri cell checkpoint --step "description"
-tri skill seal --hash
+tri skill seal --hash <!-- not built as a t27c subcommand -->
 tri gen
 tri test
 tri verdict --toxic
 tri experience save
-tri skill commit
-tri git commit
+tri skill commit <!-- not built as a t27c subcommand -->
+tri git commit <!-- not built as a t27c subcommand -->
 
 # Step 4: Upload wrap-up (post-work) — ENABLE future agents
 tri wrapup --summary "completed <task>" \
@@ -430,7 +430,7 @@ tri wrapup --summary "completed <task>" \
 **Example with NotebookLM:**
 ```bash
 # Before starting
-tri notebook query "What is the status of GoldenFloat ternary float format?"
+tri notebook query "What is the status of GoldenFloat ternary float format?" <!-- not built as a t27c subcommand -->
 
 # Response: "GoldenFloat Ring-050 complete, 7 formats defined, PR #317 merged"
 # → Skip work, move to next task
@@ -453,7 +453,7 @@ cat .trinity/state/queen-health.json
 
 # 3. Acquire exclusive claim on target
 # Creates claim with TTL and heartbeat
-tri claim acquire <spec_path>
+tri claim acquire <spec_path> <!-- not built as a t27c subcommand -->
 
 # 4. Record intent event
 # Append-only: immutable history
@@ -583,9 +583,9 @@ tri doctor anomalies
 
 Recovery uses **replay** instead of full restart:
 ```bash
-tri replay-step --last-clean  # Replay from last clean seal
-tri recovery domain --affected <domain>  # Domain-specific recovery
-tri self-heal --max-iterations 5  # Automated recovery loop
+tri replay-step --last-clean  # Replay from last clean seal <!-- not built as a t27c subcommand -->
+tri recovery domain --affected <domain>  # Domain-specific recovery <!-- not built as a t27c subcommand -->
+tri self-heal --max-iterations 5  # Automated recovery loop <!-- not built as a t27c subcommand -->
 ```
 
 See **`references/recovery-policy.md`** for complete recovery procedures.

@@ -55,6 +55,7 @@ ROOT = os.environ.get("T27_DUP_ROOT") or os.path.dirname(
 # type and adding `tp` as a dep brings all 13 in -- and the 13-spec digest is
 # byte-identical to the 9-spec one it replaces, which is the proof that the
 # "9" was an artefact of the regex and never a signature boundary.
+_DOT27_WIRE = 'for(unsigned k=0;k<200000;k++){uint64_t x=k*2654435761ULL,y=k*40503ULL+12009599006321322ULL;unsigned v=(unsigned)((long long)dot27(x,y)&0xFFFFFFFF);h=(h^v)*16777619u;}'
 CASES = {
     "tmul": ("tmul", r"int8_t\s+tmul\s*\([^)]*\)\s*\{", [],
              'for(int a=0;a<256;a++)for(int b=0;b<256;b++){'
@@ -66,11 +67,8 @@ CASES = {
     "quantize1": ("quantize", r"uint8_t\s+quantize\s*\(\s*int8_t\s+\w+\s*\)\s*\{", [],
                   'for(int a=-128;a<128;a++){'
                   'unsigned v=(unsigned)quantize((int8_t)a);h=(h^v)*16777619u;}'),
-    "dot27": ("dot27", r"int(?:8|16|32)_t\s+dot27\s*\([^)]*\)\s*\{",
-              [r"int8_t\s+tmul\s*\([^)]*\)\s*\{", r"int8_t\s+tp\s*\([^)]*\)\s*\{"],
-              'for(unsigned k=0;k<200000;k++){uint64_t x=k*2654435761ULL,'
-              'y=k*40503ULL+12009599006321322ULL;'
-              'unsigned v=(unsigned)((long long)dot27(x,y)&0xFFFFFFFF);h=(h^v)*16777619u;}'),
+    "dot27": ("dot27", r"int(?:8|16|32)_t\s+dot27\s*\([^)]*\)\s*\{", [r"int8_t\s+tmul\s*\([^)]*\)\s*\{", r"int8_t\s+tp\s*\([^)]*\)\s*\{"], _DOT27_WIRE),
+    "dot27_value": ("dot27", r"int(?:8|16|32)_t\s+dot27\s*\([^)]*\)\s*\{", [r"int32_t\s+pmul\s*\([^)]*\)\s*\{", r"int32_t\s+tv\s*\([^)]*\)\s*\{"], _DOT27_WIRE),
 }
 
 # A function DEFINED in the .t27 source, read before gen-c runs, so a spec that

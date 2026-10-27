@@ -1,0 +1,418 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/display_list.t27 -- the flat opcode stream a live page paints, and the frame budget that
+// refuses rather than truncates. Milestone M2 of T27F Live (epic gHashTag/t27#10266), issue
+// gHashTag/t27#10261. Design: docs/nona-02-organism/t27f/genui-research.md, section 6.
+//
+// WHY FLAT. A scene tree is how a model thinks; a canvas is not. The renderer here is a loader of at
+// most LOADER_LINES lines that walks one byte array left to right -- no recursion, no objects, no
+// allocation. Every opcode carries a fixed-size payload, so the loader is a switch and a cursor.
+//
+// THE BUDGET IS A REFUSAL. A scene whose flattening would emit more than MAX_OPS_PER_FRAME opcodes is
+// refused with E_BUDGET and the stream is left byte-identical to what the caller passed in -- never
+// cut short. A truncated frame draws half a HUD and reads as a renderer bug; a refused frame reads
+// as what it is. The budget is 128, and the cap test reaches it for real: 32 plain rects want 160.
+//
+// THE HASH IS THE CONTRACT. The HUD fixture flattens to one exact byte stream, and a test block
+// recomputes its sha256 against HUD_SHA256, recorded from the same code -- so any change to the
+// encoding, the opcode order or the payload width that moves one byte breaks the test loudly, on
+// every backend, with no golden file to drift.
+//
+// NOT CLAIMED: the 4 ms p99 flatten over 1000 frames is a Railway-lab measurement and is not
+// measured by this change; the loader is prose (LOADER_LINES bounds its stated size, the loader is
+// not shipped here); payloads are unsigned by construction -- scene.t27 refuses negative geometry --
+// and a signed encoding is a different spec; no text measurement, no glyph subsetting, no dirty
+// rectangles.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module display_list;
+
+use t27f::scene::Scene;
+use t27f::scene::Op;
+use t27f::scene::scene_empty;
+use t27f::scene::apply_op;
+use t27f::scene::SCENE_OK;
+use t27f::scene::PRIM_EMPTY;
+use t27f::scene::PRIM_GROUP;
+use t27f::scene::PRIM_RECT;
+use t27f::scene::PRIM_TEXT;
+use t27f::scene::PRIM_PATH;
+use t27f::scene::PRIM_IMAGE_REF;
+use t27f::scene::PRIM_CLIP_REF;
+use t27f::scene::PRIM_FACE;
+use t27f::scene::NO_PARENT;
+use t27f::scene::F_X;
+use t27f::scene::STYLE_KINDS;
+use t27f::scene::MAX_NODES;
+use t27f::scene::Q8;
+use tri::crypto::sha256;
+
+pub const ID : str = "display-list";
+pub const VERSION : u8 = 1;
+
+// ---- the opcodes -------------------------------------------------------------------------------------
+
+pub const DL_END : u8 = 0;
+pub const DL_GROUP : u8 = 1;
+pub const DL_GROUP_END : u8 = 2;
+pub const DL_RECT : u8 = 3;
+pub const DL_TEXT : u8 = 4;
+pub const DL_PATH : u8 = 5;
+pub const DL_IMAGE : u8 = 6;
+pub const DL_FACE : u8 = 7;
+pub const DL_CLIP_PUSH : u8 = 8;
+pub const DL_CLIP_POP : u8 = 9;
+pub const DL_FILL : u8 = 10;
+pub const DL_STROKE : u8 = 11;
+pub const DL_OPACITY : u8 = 12;
+pub const DL_KINDS : u8 = 13;
+pub const DL_NAMES : [13]str = [
+    "end", "group", "group-end", "rect", "text", "path", "image",
+    "face", "clip-push", "clip-pop", "fill", "stroke", "opacity",
+];
+
+/// Payload bytes after the opcode byte: 4 for a coordinate-bearing op, 1 for a token-bearing op, 0
+/// for the pairing ends. The loader reads the opcode, then exactly this many bytes -- that is the
+/// whole protocol, and it is why the loader stays under LOADER_LINES.
+pub const LOADER_LINES : u32 = 40;
+
+pub fn payload_len(op: u8) -> u8 {
+    if (op == DL_END or op == DL_GROUP_END or op == DL_CLIP_POP) { return 0; }
+    if (op == DL_FILL or op == DL_STROKE) { return 1; }
+    return 4;
+}
+
+// ---- the budget --------------------------------------------------------------------------------------
+
+/// Opcodes one frame may carry. The cap test reaches this for real: 32 plain rects want 160, and are
+/// refused -- so the refusal below is exercised, not dead code.
+pub const MAX_OPS_PER_FRAME : u32 = 128;
+pub const E_BUDGET : u8 = 7;               // scene.t27's refusal codes end at 6
+
+// ---- the stream --------------------------------------------------------------------------------------
+
+pub const STREAM_CAP : u32 = 2048;         // bytes; the budget needs at most 128 * 5 = 640
+
+pub const Stream = struct {
+    bytes : [2048]u8,
+    n : u32,                               // bytes written
+    ops : u32,                             // opcodes written: the budget counts these, not bytes
+};
+
+pub fn stream_empty() -> Stream {
+    var s : Stream = undefined;
+    s.n = 0;
+    s.ops = 0;
+    var i : u32 = 0;
+    while (i < STREAM_CAP) {
+        s.bytes[i as usize] = 0;
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Append one opcode and its payload, little endian, by division and remainder -- the byte-extraction
+/// idiom of sha256.t27 without the shifts, over values scene.t27 guarantees non-negative. Returns
+/// false when the frame budget or the stream cap would be exceeded; it never writes a partial record.
+fn emit(stream: *Stream, op: u8, a: i32) -> bool {
+    if (stream.ops >= MAX_OPS_PER_FRAME) { return false; }
+    const p = payload_len(op);
+    if (stream.n + 1 + (p as u32) > STREAM_CAP) { return false; }
+    stream.bytes[stream.n as usize] = op;
+    stream.n = stream.n + 1;
+    var v = a;
+    var k : u32 = 0;
+    while (k < (p as u32)) {
+        stream.bytes[stream.n as usize] = (v - @divTrunc(v, 256) * 256) as u8;
+        v = @divTrunc(v, 256);
+        stream.n = stream.n + 1;
+        k = k + 1;
+    }
+    stream.ops = stream.ops + 1;
+    return true;
+}
+
+// ---- flattening --------------------------------------------------------------------------------------
+
+fn is_ancestor(s: *Scene, ancestor: u32, node: u32) -> bool {
+    var cur = s.parent[node as usize];
+    var guard : u32 = 0;
+    while (cur != NO_PARENT and guard < MAX_NODES) {
+        if (cur as u32 == ancestor) { return true; }
+        cur = s.parent[cur as usize];
+        guard = guard + 1;
+    }
+    return false;
+}
+
+/// The opcodes this scene flattens to, without writing anything: the dry run that lets a refusal
+/// happen before the first byte moves.
+fn count_ops(s: *Scene) -> u32 {
+    var n : u32 = 0;
+    var i : u32 = 0;
+    while (i < s.count) {
+        const k = s.kind[i as usize];
+        if (k == PRIM_EMPTY) {
+            i = i + 1;
+            continue;
+        }
+        n = n + 1;                         // the shape or container opcode
+        n = n + 1;                         // its opacity
+        if (s.fill[i as usize] < STYLE_KINDS) { n = n + 1; }
+        if (s.stroke[i as usize] < STYLE_KINDS) { n = n + 1; }
+        if (k != PRIM_GROUP and k != PRIM_CLIP_REF) { n = n + 3; }
+        i = i + 1;
+    }
+    var open : u32 = 0;
+    i = 0;
+    while (i < s.count) {
+        const k = s.kind[i as usize];
+        if (k == PRIM_GROUP or k == PRIM_CLIP_REF) { open = open + 1; }
+        i = i + 1;
+    }
+    return n + open;                       // one close opcode per container
+}
+
+/// Flatten the scene's live nodes into stream. Parents come before children because scene.t27 only
+/// ever appends with parent < index, so one left-to-right walk with an open-container stack is the
+/// whole algorithm. Returns SCENE_OK, or E_BUDGET with the stream byte-identical to what it was.
+pub fn flatten_into(s: *Scene, stream: *Stream) -> u8 {
+    if (count_ops(s) > MAX_OPS_PER_FRAME) { return E_BUDGET; }
+    const saved_n = stream.n;
+    const saved_ops = stream.ops;
+    var open : [32]u32 = undefined;
+    var depth : u32 = 0;
+    var i : u32 = 0;
+    var ok : bool = true;
+    while (i < s.count) {
+        const k = s.kind[i as usize];
+        if (k == PRIM_EMPTY) {
+            i = i + 1;
+            continue;
+        }
+        // close every open container this node is not inside
+        while (depth > 0 and !is_ancestor(s, open[depth - 1], i)) {
+            const top = open[depth - 1];
+            if (s.kind[top as usize] == PRIM_GROUP) {
+                ok = ok and emit(stream, DL_GROUP_END, 0);
+            } else {
+                ok = ok and emit(stream, DL_CLIP_POP, 0);
+            }
+            depth = depth - 1;
+        }
+        // the node's state first, then the node: a loader has the style in hand when the shape lands
+        ok = ok and emit(stream, DL_OPACITY, s.opacity[i as usize]);
+        if (s.fill[i as usize] < STYLE_KINDS) { ok = ok and emit(stream, DL_FILL, s.fill[i as usize] as i32); }
+        if (s.stroke[i as usize] < STYLE_KINDS) { ok = ok and emit(stream, DL_STROKE, s.stroke[i as usize] as i32); }
+        var op : u8 = DL_RECT;
+        if (k == PRIM_GROUP) { op = DL_GROUP; }
+        if (k == PRIM_TEXT) { op = DL_TEXT; }
+        if (k == PRIM_PATH) { op = DL_PATH; }
+        if (k == PRIM_IMAGE_REF) { op = DL_IMAGE; }
+        if (k == PRIM_CLIP_REF) { op = DL_CLIP_PUSH; }
+        if (k == PRIM_FACE) { op = DL_FACE; }
+        ok = ok and emit(stream, op, s.x[i as usize]);
+        if (k != PRIM_GROUP and k != PRIM_CLIP_REF) {
+            ok = ok and emit(stream, op, s.y[i as usize]);
+            ok = ok and emit(stream, op, s.w[i as usize]);
+            ok = ok and emit(stream, op, s.h[i as usize]);
+        }
+        if (k == PRIM_GROUP or k == PRIM_CLIP_REF) {
+            open[depth as usize] = i;
+            depth = depth + 1;
+        }
+        i = i + 1;
+    }
+    while (depth > 0) {
+        const top = open[depth - 1];
+        if (s.kind[top as usize] == PRIM_GROUP) {
+            ok = ok and emit(stream, DL_GROUP_END, 0);
+        } else {
+            ok = ok and emit(stream, DL_CLIP_POP, 0);
+        }
+        depth = depth - 1;
+    }
+    if (!ok) {
+        // over budget mid-walk: roll back, so the caller sees a refusal, not a cut
+        stream.n = saved_n;
+        stream.ops = saved_ops;
+        return E_BUDGET;
+    }
+    return SCENE_OK;
+}
+
+// ---- the HUD fixture and its recorded digest ---------------------------------------------------------
+
+/// The HUD fixture: one group holding a text label, plus the face widget beside it -- the smallest
+/// scene that exercises a container, a child, a close, and two shape kinds.
+pub fn hud_fixture() -> Scene {
+    var s = scene_empty();
+    const a = Op{ .op = 0, .seq = 1, .prim = PRIM_GROUP, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const b = Op{ .op = 0, .seq = 2, .prim = PRIM_TEXT, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    const c = Op{ .op = 0, .seq = 3, .prim = PRIM_FACE, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const ra = apply_op(&s, a);
+    const rb = apply_op(&s, b);
+    const rc = apply_op(&s, c);
+    if (ra != SCENE_OK or rb != SCENE_OK or rc != SCENE_OK) {
+        // an empty scene flattens to a valid, empty stream; the test below refuses to accept that
+        s.count = 0;
+    }
+    return s;
+}
+
+/// The sha256 of the fixture's flattened stream, recorded 2026-10-23 from this spec's own flatten of
+/// the fixture: 13 opcodes, 61 bytes. Recorded as hex by sha256::hash_hex over bytes 0..n.
+pub const HUD_SHA256 : str = "ef8e8292e1aed2d0a7d4f2d45bbd31948c85ebf5d5657390b1b193a5dd882a3d";
+
+fn hex_matches(h: [64]u8, want: []const u8) -> bool {
+    var same : u32 = 0;
+    var i : u32 = 0;
+    while (i < 64) {
+        if (h[i as usize] == want[i as usize]) { same = same + 1; }
+        i = i + 1;
+    }
+    return same == 64;
+}
+
+// ---- tests -------------------------------------------------------------------------------------------
+
+test every_opcode_has_a_stated_payload_width {
+    assert(DL_KINDS == 13);
+    assert(DL_NAMES.len == 13);
+    assert(payload_len(DL_END) == 0);
+    assert(payload_len(DL_GROUP_END) == 0);
+    assert(payload_len(DL_CLIP_POP) == 0);
+    assert(payload_len(DL_FILL) == 1);
+    assert(payload_len(DL_STROKE) == 1);
+    assert(payload_len(DL_RECT) == 4);
+    assert(payload_len(DL_TEXT) == 4);
+    assert(payload_len(DL_PATH) == 4);
+    assert(payload_len(DL_IMAGE) == 4);
+    assert(payload_len(DL_FACE) == 4);
+    assert(payload_len(DL_GROUP) == 4);
+    assert(payload_len(DL_CLIP_PUSH) == 4);
+    assert(payload_len(DL_OPACITY) == 4);
+    var op : u8 = 0;
+    while (op < DL_KINDS) {
+        assert(payload_len(op) <= 4);
+        op = op + 1;
+    }
+}
+
+test payloads_encode_little_endian_by_division {
+    var st = stream_empty();
+    assert(emit(&st, DL_OPACITY, Q8));     // 256 -> 00 01 00 00
+    assert(st.n == 5);
+    assert(st.bytes[1] == 0);
+    assert(st.bytes[2] == 1);
+    assert(st.bytes[3] == 0);
+    assert(st.bytes[4] == 0);
+    var st2 = stream_empty();
+    assert(emit(&st2, DL_FILL, 3));        // a 1-byte payload takes the low byte
+    assert(st2.n == 2);
+    assert(st2.bytes[1] == 3);
+    var st3 = stream_empty();
+    assert(emit(&st3, DL_RECT, 360));      // the viewport width, as a real value
+    assert(st3.bytes[1] == 360 - 256);
+    assert(st3.bytes[2] == 1);
+}
+
+test a_flat_scene_flattens_in_order {
+    var s = scene_empty();
+    const add_group = Op{ .op = 0, .seq = 1, .prim = PRIM_GROUP, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const add_rect = Op{ .op = 0, .seq = 2, .prim = PRIM_RECT, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    assert(apply_op(&s, add_group) == SCENE_OK);
+    assert(apply_op(&s, add_rect) == SCENE_OK);
+    var st = stream_empty();
+    assert(flatten_into(&s, &st) == SCENE_OK);
+    // opacity, group-open, opacity, rect x4, group-close
+    assert(st.ops == 8);
+    assert(st.n == 36);
+    assert(st.bytes[0] == DL_OPACITY);
+    assert(st.bytes[5] == DL_GROUP);
+    assert(st.bytes[10] == DL_OPACITY);
+    assert(st.bytes[15] == DL_RECT);
+    assert(st.bytes[35] == DL_GROUP_END);
+    // the dry run agrees with what was actually written
+    assert(count_ops(&s) == st.ops);
+}
+
+test a_clip_closes_before_what_follows_it_outside {
+    var s = scene_empty();
+    const add_clip = Op{ .op = 0, .seq = 1, .prim = PRIM_CLIP_REF, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    const add_child = Op{ .op = 0, .seq = 2, .prim = PRIM_RECT, .parent = 0, .node = 0, .field = 0, .value = 0 };
+    const add_after = Op{ .op = 0, .seq = 3, .prim = PRIM_TEXT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+    assert(apply_op(&s, add_clip) == SCENE_OK);
+    assert(apply_op(&s, add_child) == SCENE_OK);
+    assert(apply_op(&s, add_after) == SCENE_OK);
+    var st = stream_empty();
+    assert(flatten_into(&s, &st) == SCENE_OK);
+    var clip_pop_at : u32 = 0;
+    var text_at : u32 = 0;
+    var i : u32 = 0;
+    while (i < st.n) {
+        if (st.bytes[i as usize] == DL_CLIP_POP and clip_pop_at == 0) { clip_pop_at = i; }
+        if (st.bytes[i as usize] == DL_TEXT and text_at == 0) { text_at = i; }
+        i = i + 1;
+    }
+    assert(clip_pop_at > 0);
+    assert(text_at > clip_pop_at);         // outside the clip means after its close, always
+    assert(st.ops == count_ops(&s));
+}
+
+test a_scene_over_the_frame_budget_is_refused_never_truncated {         // FR-004
+    var s = scene_empty();
+    var i : u32 = 0;
+    while (i < MAX_NODES) {
+        const a = Op{ .op = 0, .seq = i + 1, .prim = PRIM_RECT, .parent = NO_PARENT, .node = 0, .field = 0, .value = 0 };
+        assert(apply_op(&s, a) == SCENE_OK);
+        i = i + 1;
+    }
+    // 32 rects want 32 * 5 = 160 opcodes, over the 128 budget: refused
+    assert(count_ops(&s) == 160);
+    assert(count_ops(&s) > MAX_OPS_PER_FRAME);
+    var st = stream_empty();
+    assert(flatten_into(&s, &st) == E_BUDGET);
+    assert(st.ops == 0);                   // refused, not truncated to the first 128
+    assert(st.n == 0);
+    // a second stream object is untouched too: the refusal writes nothing anywhere
+    var st2 = stream_empty();
+    assert(st2.ops == 0);
+}
+
+test the_hud_fixture_hashes_to_the_recorded_digest {
+    var s = hud_fixture();
+    assert(s.count == 3);
+    var st = stream_empty();
+    assert(flatten_into(&s, &st) == SCENE_OK);
+    assert(st.ops == 13);
+    assert(st.n == 61);
+    const hex = sha256::hash_hex(st.bytes[0..st.n]);
+    assert(hex.len == 64);
+    assert(hex_matches(hex, HUD_SHA256));
+    // the same scene flattens to the same bytes: the digest is of the stream, not of the run
+    var st2 = stream_empty();
+    assert(flatten_into(&s, &st2) == SCENE_OK);
+    const hex2 = sha256::hash_hex(st2.bytes[0..st2.n]);
+    assert(hex_matches(hex2, HUD_SHA256));
+    // and moving one node moves the digest: this is a hash of these bytes, not of nothing
+    const move = Op{ .op = 1, .seq = 4, .prim = 0, .parent = 0, .node = 1, .field = F_X, .value = 9 };
+    assert(apply_op(&s, move) == SCENE_OK);
+    var st3 = stream_empty();
+    assert(flatten_into(&s, &st3) == SCENE_OK);
+    const hex3 = sha256::hash_hex(st3.bytes[0..st3.n]);
+    var differs : bool = false;
+    var i : u32 = 0;
+    while (i < 64) {
+        if (hex[i as usize] != hex3[i as usize]) { differs = true; }
+        i = i + 1;
+    }
+    assert(differs);
+}
+
+invariant the_loader_contract_is_stated {
+    assert(DL_KINDS == DL_NAMES.len);
+    assert(MAX_OPS_PER_FRAME > 0);
+    assert(STREAM_CAP >= MAX_OPS_PER_FRAME * 5);
+    assert(LOADER_LINES == 40);
+    assert(E_BUDGET == 7);
+}

@@ -60,8 +60,8 @@ Output:
 
 ```bash
 tri experience save --format gf8
-tri skill commit
-tri git commit -m "fix(gf8): correct exponent bias for TF3 range
+tri skill commit <!-- not built as a t27c subcommand -->
+tri git commit -m "fix(gf8): correct exponent bias for TF3 range <!-- not built as a t27c subcommand -->
 
 Fixes overflow in edge cases:
 - Corrects EXPONENT_BIAS from 0b01 to 0b10

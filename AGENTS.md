@@ -54,6 +54,7 @@ Use **domain directories**, not “one folder per agent.” Primary contact for 
 5. **Issue gate** — PRs should link issues (`Closes #N`) where project policy requires it.
    **Issue shape** -- a new issue stays open only if [`specs/policy/issue_shape.t27`](specs/policy/issue_shape.t27) (#7498) passes; otherwise `needs-boundary.yml` closes it seconds after filing, labelled `shape-refused`. That spec is the rule. Before `gh issue create`, load the skill [`.claude/skills/issue-shape/SKILL.md`](.claude/skills/issue-shape/SKILL.md): it explains the sections, the Boundary path trap, checking a body on the Railway lab, and recovery with `gh issue edit`.
 6. **Ring / gold work** — follow [`docs/nona-01-foundation/GOLDEN-RINGS-CANON.md`](docs/nona-01-foundation/GOLDEN-RINGS-CANON.md) for parser/compiler/spec changes; compiler seal path: `bootstrap/stage0/FROZEN_HASH`.
+7. **No litter** -- all t27 work lives in `~/t27` and its worktrees; no clones, worktrees or scratch in `~`, `/tmp` or `/private/tmp`, and 5.4 GiB must be free before a new worktree. The rules are in [`CLAUDE.md`](CLAUDE.md) "Where t27 work lives"; the T27 OS DOCTOR watches them.
 
 ---
 
@@ -315,6 +316,7 @@ Each gate is a spec. Read the spec, not a summary of it.
 - **Heavy runs do not go on a laptop.** Builds, corpus sweeps and mutation runs
   go to the Railway lab. A local Mac run has panicked the machine
   (2026-10-09).
+- **An edited import serves its sealed snapshot.** Cross-module consumers build against the import's seal, not the working tree: after editing an imported spec, `seal --save` it before rebuilding consumers -- and a consumer of a pub fn that calls a private helper needs that helper nameable, or the merged build fails on it (2026-10-23, #11777: identical error lines across different source texts were the tell).
 - **A merge is not a deploy.** A trinity merge is live on t27.ai only after the
   `gHashTag/ghashtag.github.io` publish workflow runs and its Pages build is
   `built`.
@@ -404,16 +406,11 @@ with two signed corpus receipts, not a pasted table of lab numbers.
 - Base: `git merge-base origin/master HEAD`. Head: the PR's head, pushed to a
   branch on origin. Take both receipts from the SAME lab: per-file timeouts differ
   between the two machines, so a cross-lab pair shows changes no commit made.
-  Use t27b-lab-2 (`https://t27b-lab-2-production.up.railway.app`): it runs an
-  admitted request before a moved master, up to 4 in a row (#9026), where
-  t27b-lab runs master first. Use `<lab>/runs/<sha>.receipt.json` when it exists;
-  otherwise request it with a fresh challenge you keep, and request the base too
-  when that lab has no receipt for it:
-  `c=$(openssl rand -hex 32); ssh -o BatchMode=yes 805f6f82-71d1-40d2-88bd-004e271be5ef@ssh.railway.com "mkdir -p /srv/requests && printf %s $c > /srv/requests/<sha>"`
-  (the user is t27b-lab-2's Railway service instance; `ssh t27b-lab` reaches lab 1).
-  On a host-key mismatch, retry up to 10 times; never edit known_hosts. At most 8
-  requests wait, dropped after 6 hours; a run takes about 15 minutes and publishes
-  `/runs/<sha>.json` and the receipt.
+  RETIRED (2026-10-27, owner's word): the Railway labs and the ssh receipts
+  corridor are retired as a carrier -- specs/hosting/railway_retired.t27 is the
+  law, the corridor is WAITING for its next carrier. The corpus-receipt compare
+  command itself stays the standard; the lab side re-arms when a carrier is
+  chosen (epic: the Railway retirement sweep).
 - From a master checkout's root: `t27c corpus-receipt compare BASE.json HEAD.json
   --challenge <base's> --challenge-head <head's>` (omit a challenge you did not
   write). Paste its output and exit code: `lane` lines name each changed file.
@@ -455,6 +452,44 @@ Every spec is a running cost: a seal, a ledger row, CI minutes on every pull req
 - **Extend before creating.** Prefer extending an existing plan or conformance spec over a new file. Keep one conformance spec per area, not one per feature.
 - **t27o (the converter) reuses.** It reuses an existing t27 function with the same input/output contract instead of emitting a new body, and reports how many it reused.
 - **Duplicates only go down.** `tools/duplicate_bodies_baseline.txt` only moves down. A pull request that adds a duplicate body is wrong even where the check is not required (#8963).
+
+## trigit is the standard: our own git (owner rules, 2026-10-20; standard 2026-10-22)
+
+Owner, 2026-10-22: trigit is the standard, and the swarm uses it to go faster.
+trigit is our own git -- the golden chain, the swarm refs and notes, and the
+trigit verbs -- while GitHub is a mirror and a window, not the truth (name and
+principle, owner 2026-10-20, epic #11385). Every spec, skill, doc and UI calls
+it trigit.
+
+- **How work lands now (the accelerating path; use it):** verify locally, land
+  on the local golden head `refs/golden/head` by compare-and-swap, reach GitHub
+  as one batch PR per 15-minute window. The law is `specs/queen/golden_chain.t27`
+  section 6; the operating manual is `.claude/skills/own-git-landing/SKILL.md`;
+  the verbs are `tri golden land | push | status`, hosted by
+  `specs/tri/land/golden_land.t27`. Read those; this section does not restate them.
+- **Why it accelerates:** a plain push restarts every required check at the back
+  of an Actions queue of 800-900 runs (#10644, #10588, #6595). trigit judges a
+  change by its verdicts locally and talks to GitHub once per batch, not once
+  per push.
+- **Running today (measured 2026-10-22):** the golden chain and its batch push;
+  the verdict cache in `refs/notes/verdicts` (`specs/verified/verdict_notes.t27`);
+  heartbeats and claims as refs (`refs/swarm/alive/*`, `refs/swarm/claims/*`,
+  written by `specs/t27os/devices.t27`); the T27 OS readers (`statusbar.t27`,
+  `queen_dash.t27` `trigit.txt`, `glass_window.t27` flow strip); `tri worktrees`
+  for what a checkout holds.
+- **The gaps, named so nobody mistakes the standard for the whole:** the
+  one-command `trigit claim|hold|release|beat|send|recv|join|board|verdict|status`
+  verbs and their TRI CLAW MCP twins (#11385 items 24-26); holds as refs (item 7,
+  today disk-based); the mailbox and event refs (items 9-10); the own remote, so
+  swarm refs stop riding on GitHub (Layer 0); rerere, co-change prediction,
+  speculative lanes, auto-bisect, range-diff review (P2); the `.t27` git core and
+  the hardware spikes (P3). Epic #11385 is closed; a gap found under it is filed
+  as a Queen-shaped child issue, never papered over with a second coordination
+  channel (no new `setInterval`, no second registry).
+- **Acceleration is the reason every rule above exists:** trigit was built to
+  remove waiting -- 190 tasks blocked by whole-file holds, a personal token
+  throttled to about 5 minutes per call, 135 PRs queued for CI (#11385). Do not
+  reintroduce a per-push or per-comment coordination path it already replaced.
 
 ## Actors, not threads (owner rule, 2026-10-08)
 
@@ -590,3 +625,15 @@ The signature image of the project, on every home surface (t27.ai main page, the
 3. **The motion is a .t27 law, one for every platform.** Spiral radius, angular speed, drift, the pointer push and the limits live in one spec (extend `specs/t27f/petal_menu.t27`, which owns the 27-petal geometry) with tests; the site, T27 OS and the FPGA draw from it. No hand-written animation logic in TS, Swift or Verilog.
 4. **Calm and legible.** Formulas never cover the logo or the petals' hit areas, never overlap each other, and slow down near the pointer instead of fleeing; respect reduced-motion settings (static orbit). Black ground, matte glass, formulas in white at reading size.
 5. **Science first.** Clicking a formula opens its card: the expression, the predicted and measured value, the deviation, the source (CODATA or PDG) and the paper. The visual invites a check; it never claims more than the registry proves.
+
+## Epic progress posts
+
+Owner, 2026-10-26: every epic and every initiative (issue -> epic -> initiative, the label
+`initiative`; the three most prioritized initiatives are pinned on the issues page) carries
+public progress posts in one house format: a `.t27` card with the percent, the breakthroughs
+and the blockers, redrawn after every iteration. Claude drafts, the owner approves.
+
+This is a pointer, not the rule. The rule lives in the skill `epic-progress-posts`; the
+publication path in the skill `tri-blog` (a `blog` subcommand of the built `tri` does not exist
+yet: #12630); the card spec is the one those skills name; the first dashboard run this way is
+#12387; #12629 filed this section.

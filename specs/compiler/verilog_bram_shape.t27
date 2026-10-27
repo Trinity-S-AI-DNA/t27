@@ -1,0 +1,596 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/compiler/verilog_bram_shape.t27 -- when `t27c gen-verilog` writes a big module-level array as a
+; memory process of its own, so that yosys and Vivado can map it to block RAM (Closes #12297, Refs #9367).
+; --
+; The problem. A module-level `var mem : [65536]u8` with one read site and one write site was emitted as
+; `reg [7:0] mem[0:65535];` read and written inline in the asynchronous-reset `always` block of the cell.
+; yosys answers `Replacing memory \mem with list of registers`: 65536 flip-flops and a 64K-way read mux,
+; and `read_verilog` + `hierarchy` on the cell ran for more than ten minutes against 5.7 s without the page.
+; A memory with a reset in its own process, and a combinational read, cannot be inferred as block RAM.
+; --
+; The shape. `bram_text` reads the Verilog text the backend has just written and, for the first array
+; that has all of these, rewrites it (anything else comes back untouched: the answer is 0):
+; B1 (size). `reg [H:0] NAME[0:M];` with at least BRAM_MIN_WORDS words.
+; B2 (two sites). Outside the declaration and its `initial` block, NAME is indexed exactly twice: the read
+;    `R = NAME[A];` and the write `NAME[A2] = EXPR;`, each a line of its own, A and A2 plain names.
+; B3 (a state machine). Both sites sit in a `task` or in `always @(posedge ..)`, under no `for`, `while`,
+;    `repeat` or `forever`; the module has a clock and all its `always @(posedge ..)` blocks agree on it.
+; B4 (a read one step later). R is not named again in the rest of the block that holds the read, and every
+;    other line that starts with R is `R <= 0;` (the reset line) or `R = 0;` in an `initial` block.
+; B5 (an address set before the step). A is not assigned in the lines above the read, in its own block.
+; --
+; The rewrite.
+; - The read site becomes a comment, and the write site loads three registers, with `<=` so that the memory
+;   process, which runs on the same edge, sees what they held before it (a write on each of two clocks in a
+;   row, as the cell's four-byte store does, lands byte by byte, in the simulator as in the fabric):
+;   `NAME__wa <= A2;  NAME__wd <= EXPR;  NAME__wt <= ~NAME__wt;` (a toggle: the machine asks for a write).
+; - `NAME__wa`, `NAME__wd`, `NAME__wt` and `NAME__ws` are declared under the array, under a one-line comment
+;   that says which shape was chosen (FR-002).
+; - Before `endmodule` comes the memory process, the one template block RAM is inferred from:
+;   `always @(posedge CLK)` writes `NAME[NAME__wa] <= NAME__wd` when `NAME__wt != NAME__ws`, then
+;   `NAME__ws <= NAME__wt`, and loads `R <= NAME[A]` on every edge, without a reset.
+; - `R <= 0;` is dropped from the reset block: R now has one driver, the memory process.
+; Timing, in the open: the write lands one clock after the state that asks for it, and R holds the byte
+; the address named on the previous clock. A state machine that reads R at least one step after the read
+; state (the cell's `mem_run` microsequence does: state 3 asks, state 4 uses), and does not read a byte in
+; the step after the step that wrote it, sees what it saw before. B4 and B5 pin the part a text pass can see;
+; the rest is the contract of the shape.
+; Not touched: the simulation backend (`gen-verilog-for-simulation` runs its tests with no clock edges, so a
+; clocked memory process would never move), the HIR backend (it has its own `HirMemory`), and every array
+; that does not have the shape: its text is byte for byte what it was, so no seal changes.
+; --
+; The text is the backend's own output, one statement to a line, indented in fours. This pass reads that,
+; not Verilog in general. `t27c gen-rust` lowers this spec to bootstrap/gen/rust/compiler/verilog_bram_shape.rs,
+; which bootstrap/src/compiler.rs mounts by #[path] and calls from `gen_verilog`. Never hand-edit the
+; generated copy.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VerilogBramShape;
+
+use tri::t27b::type_text;
+use compiler::use_splice;
+
+pub const B_NL : u8 = 10;
+
+/// B1: below this many words an array stays registers; a block RAM is 18 Kbit and a smaller table is cheaper
+/// as logic.
+pub const BRAM_MIN_WORDS : i64 = 1024;
+
+/// The backend indents the members of a module by four. A site's outermost enclosing line is at this indent.
+pub const MODULE_INDENT : usize = 4;
+
+/// No such place.
+pub const NO : i64 = -1;
+
+/// Appends one byte; the count goes on past `cap` so the caller learns the size it needs.
+fn put(out: []u8, cap: usize, w: usize, b: u8) -> usize {
+    if (w < cap) { out[w] = b; }
+    return w + 1;
+}
+
+fn put_str(out: []u8, cap: usize, at: usize, s: str) -> usize {
+    var w : usize = at;
+    var k : usize = 0;
+    while (k < s.len) {
+        w = put(out, cap, w, s[k]);
+        k += 1;
+    }
+    return w;
+}
+
+fn put_span(t: []const u8, lo: usize, hi: usize, out: []u8, cap: usize, at: usize) -> usize {
+    var w : usize = at;
+    var k : usize = lo;
+    while (k < hi) {
+        w = put(out, cap, w, t[k]);
+        k += 1;
+    }
+    return w;
+}
+
+fn put_nl(out: []u8, cap: usize, at: usize) -> usize {
+    return put(out, cap, at, B_NL);
+}
+
+/// The start of the line that holds byte p.
+fn line_start(t: []const u8, p: usize) -> usize {
+    var i : usize = p;
+    while (i > 0 and t[i - 1] != B_NL) { i -= 1; }
+    return i;
+}
+
+/// The offset just after the line that ends at e: past its newline, or e at the end of the text.
+fn after(t: []const u8, e: usize) -> usize {
+    if (e < t.len) { return e + 1; }
+    return e;
+}
+
+fn indent_of(t: []const u8, s: usize) -> usize {
+    return use_splice::skip_blank(t, s) - s;
+}
+
+/// Is the line t[p .. e] (its code starts at p) exactly `w`?
+fn line_is(t: []const u8, p: usize, e: usize, w: str) -> bool {
+    return type_text::same(t[p .. e], w);
+}
+
+/// Is the line t[p .. e] the word t[nlo .. nhi] and then exactly `rest`?
+fn line_is_word_then(t: []const u8, p: usize, e: usize, nlo: usize, nhi: usize, rest: str) -> bool {
+    const n : usize = nhi - nlo;
+    if (e - p != n + rest.len) { return false; }
+    if (!use_splice::same_span(t, p, p + n, t, nlo, nhi)) { return false; }
+    return type_text::starts(t, p + n, e, rest);
+}
+
+/// Does the word t[nlo .. nhi] occur, as a whole word, in t[lo .. hi]?
+fn mentions(t: []const u8, lo: usize, hi: usize, nlo: usize, nhi: usize) -> bool {
+    var i : usize = lo;
+    while (i < hi) {
+        if (type_text::word(t[i])) {
+            const j : usize = use_splice::word_end(t, i);
+            if (use_splice::same_span(t, i, j, t, nlo, nhi)) { return true; }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    return false;
+}
+
+/// `reg [H:0] NAME[0:M];` -- where the name starts, or NO. p is the first code byte of the line t[p .. e].
+fn decl_name(t: []const u8, p: usize, e: usize) -> i64 {
+    if (!type_text::starts(t, p, e, "reg [")) { return NO; }
+    var i : usize = p + 5;
+    while (i < e and type_text::digit(t[i])) { i += 1; }
+    if (i == p + 5) { return NO; }
+    if (!type_text::starts(t, i, e, ":0] ")) { return NO; }
+    return @intCast(i + 4);
+}
+
+/// The word count M + 1 of the `[0:M];` that follows the name, which ends at nhi, or NO.
+fn decl_depth(t: []const u8, nhi: usize, e: usize) -> i64 {
+    if (!type_text::starts(t, nhi, e, "[0:")) { return NO; }
+    var i : usize = nhi + 3;
+    var m : i64 = 0;
+    while (i < e and type_text::digit(t[i]) and m < 100000000) {
+        const dv : i64 = @intCast(t[i] - 48);
+        m = m * 10 + dv;
+        i += 1;
+    }
+    if (i == nhi + 3) { return NO; }
+    if (i + 2 != e or !type_text::starts(t, i, e, "];")) { return NO; }
+    return m + 1;
+}
+
+/// Where the `initial` block that follows the declaration line (which ends at de) ends: the end of its `end`
+/// line; de when the declaration is not followed by one. B2 does not count the lines in it: that is where
+/// an array gets its start values.
+fn init_end(t: []const u8, de: usize) -> usize {
+    if (de >= t.len) { return de; }
+    const s : usize = de + 1;
+    const p : usize = use_splice::skip_blank(t, s);
+    const e : usize = use_splice::line_end(t, s);
+    if (!line_is(t, p, e, "initial begin")) { return de; }
+    const ind : usize = p - s;
+    var cur : usize = e + 1;
+    while (cur < t.len) {
+        const q : usize = use_splice::skip_blank(t, cur);
+        const f : usize = use_splice::line_end(t, cur);
+        if (q - cur == ind and line_is(t, q, f, "end")) { return f; }
+        cur = f + 1;
+    }
+    return de;
+}
+
+/// The next place at or after `from` where the word t[nlo .. nhi] is indexed (`NAME[`), outside the bytes
+/// skip_lo .. skip_hi, or NO. A word that follows a dot is a member of something else.
+fn next_ref(t: []const u8, from: usize, nlo: usize, nhi: usize, skip_lo: usize, skip_hi: usize) -> i64 {
+    var i : usize = from;
+    while (i < t.len) {
+        if (i >= skip_lo and i < skip_hi) {
+            i = skip_hi;
+        } else if (type_text::word(t[i])) {
+            const j : usize = use_splice::word_end(t, i);
+            if (j < t.len and t[j] == type_text::B_LBRACK and use_splice::same_span(t, i, j, t, nlo, nhi) and (i == 0 or t[i - 1] != type_text::B_DOT)) {
+                return @intCast(i);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    return NO;
+}
+
+/// B2, the write: `NAME[A] = EXPR;` on a line of its own. q is where NAME starts, nlen its length.
+fn is_write(t: []const u8, q: usize, nlen: usize) -> bool {
+    const s : usize = line_start(t, q);
+    if (use_splice::skip_blank(t, s) != q) { return false; }
+    const e : usize = use_splice::line_end(t, s);
+    const a0 : usize = q + nlen + 1;
+    const a1 : usize = use_splice::word_end(t, a0);
+    if (a1 == a0) { return false; }
+    if (!type_text::starts(t, a1, e, "] = ")) { return false; }
+    return e > a1 + 5 and t[e - 1] == type_text::B_SEMI;
+}
+
+/// B2, the read: `R = NAME[A];` on a line of its own.
+fn is_read(t: []const u8, q: usize, nlen: usize) -> bool {
+    const s : usize = line_start(t, q);
+    const p : usize = use_splice::skip_blank(t, s);
+    const e : usize = use_splice::line_end(t, s);
+    const r1 : usize = use_splice::word_end(t, p);
+    if (r1 == p or r1 + 3 != q) { return false; }
+    if (!type_text::starts(t, r1, e, " = ")) { return false; }
+    const a0 : usize = q + nlen + 1;
+    const a1 : usize = use_splice::word_end(t, a0);
+    if (a1 == a0) { return false; }
+    return a1 + 2 == e and type_text::starts(t, a1, e, "];");
+}
+
+/// Does the line t[p .. e] open a loop?
+fn loop_header(t: []const u8, p: usize, e: usize) -> bool {
+    return type_text::starts(t, p, e, "for (") or type_text::starts(t, p, e, "for(") or type_text::starts(t, p, e, "while (") or type_text::starts(t, p, e, "while(") or type_text::starts(t, p, e, "repeat") or type_text::starts(t, p, e, "forever");
+}
+
+/// B3: the lines above the line that starts at s, the ones of smaller indent each time, are the blocks the
+/// line sits in. None of them opens a loop, and the outermost, at the module's indent, is a `task` or an
+/// `always @(posedge ..)`.
+fn context_ok(t: []const u8, s: usize) -> bool {
+    var ind : usize = indent_of(t, s);
+    var cur : usize = s;
+    var outer_lo : usize = 0;
+    var outer_hi : usize = 0;
+    while (cur > 0 and ind > MODULE_INDENT) {
+        cur = line_start(t, cur - 1);
+        const p : usize = use_splice::skip_blank(t, cur);
+        const e : usize = use_splice::line_end(t, cur);
+        if (p < e and p - cur < ind) {
+            if (loop_header(t, p, e)) { return false; }
+            ind = p - cur;
+            outer_lo = p;
+            outer_hi = e;
+        }
+    }
+    if (ind != MODULE_INDENT or outer_hi == 0) { return false; }
+    return type_text::starts(t, outer_lo, outer_hi, "task ") or type_text::starts(t, outer_lo, outer_hi, "always @(posedge ");
+}
+
+/// B4: is the word t[nlo .. nhi] named in the rest of the block of the line that starts at s: the lines after
+/// it that are not indented less than it is?
+fn used_after(t: []const u8, s: usize, nlo: usize, nhi: usize) -> bool {
+    const ind : usize = indent_of(t, s);
+    var cur : usize = use_splice::line_end(t, s) + 1;
+    while (cur < t.len) {
+        const p : usize = use_splice::skip_blank(t, cur);
+        const e : usize = use_splice::line_end(t, cur);
+        if (p < e) {
+            if (p - cur < ind) { return false; }
+            if (mentions(t, p, e, nlo, nhi)) { return true; }
+        }
+        cur = e + 1;
+    }
+    return false;
+}
+
+/// B5: is the word t[nlo .. nhi] assigned (`A = ..;` or `A <= ..;`) in the lines above the line that starts
+/// at s, in its own block: the lines before it that are not indented less than it is? The registered read
+/// sees the address as it stood before the clock edge, so an address set in the step that reads would differ.
+fn assigned_above(t: []const u8, s: usize, nlo: usize, nhi: usize) -> bool {
+    const ind : usize = indent_of(t, s);
+    var cur : usize = s;
+    while (cur > 0) {
+        cur = line_start(t, cur - 1);
+        const p : usize = use_splice::skip_blank(t, cur);
+        const e : usize = use_splice::line_end(t, cur);
+        if (p < e) {
+            if (p - cur < ind) { return false; }
+            const j : usize = use_splice::word_end(t, p);
+            if (j > p and use_splice::same_span(t, p, j, t, nlo, nhi) and (type_text::starts(t, j, e, " = ") or type_text::starts(t, j, e, " <= "))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// B4: every line that starts with the word t[rlo .. rhi] is the read line (starting at rs), the reset line
+/// `R <= 0;`, or `R = 0;` under an `initial begin`.
+fn r_only_read_here(t: []const u8, rlo: usize, rhi: usize, rs: usize) -> bool {
+    var s : usize = 0;
+    while (s < t.len) {
+        const p : usize = use_splice::skip_blank(t, s);
+        const e : usize = use_splice::line_end(t, s);
+        if (p < e) {
+            const j : usize = use_splice::word_end(t, p);
+            if (j > p and use_splice::same_span(t, p, j, t, rlo, rhi) and s != rs) {
+                var ok : bool = line_is_word_then(t, p, e, rlo, rhi, " <= 0;");
+                if (!ok and s > 0 and line_is_word_then(t, p, e, rlo, rhi, " = 0;")) {
+                    const ps : usize = line_start(t, s - 1);
+                    ok = line_is(t, use_splice::skip_blank(t, ps), s - 1, "initial begin");
+                }
+                if (!ok) { return false; }
+            }
+        }
+        s = e + 1;
+    }
+    return true;
+}
+
+/// The start of the clock name of the first `always @(posedge CLK`, or NO; NO too when two of them name
+/// different clocks.
+fn clock_of(t: []const u8) -> i64 {
+    var found : i64 = NO;
+    var clo : usize = 0;
+    var chi : usize = 0;
+    var s : usize = 0;
+    while (s < t.len) {
+        const p : usize = use_splice::skip_blank(t, s);
+        const e : usize = use_splice::line_end(t, s);
+        if (type_text::starts(t, p, e, "always @(posedge ")) {
+            const c0 : usize = p + 17;
+            const c1 : usize = use_splice::word_end(t, c0);
+            if (c1 == c0) { return NO; }
+            if (found == NO) {
+                found = @intCast(c0);
+                clo = c0;
+                chi = c1;
+            } else if (!use_splice::same_span(t, clo, chi, t, c0, c1)) {
+                return NO;
+            }
+        }
+        s = e + 1;
+    }
+    return found;
+}
+
+/// The start of the line that is `endmodule`, or NO; NO too when the text holds more than one module.
+fn module_end(t: []const u8) -> i64 {
+    var found : i64 = NO;
+    var seen : usize = 0;
+    var s : usize = 0;
+    while (s < t.len) {
+        const p : usize = use_splice::skip_blank(t, s);
+        const e : usize = use_splice::line_end(t, s);
+        if (line_is(t, p, e, "endmodule")) {
+            found = @intCast(s);
+            seen += 1;
+        }
+        s = e + 1;
+    }
+    if (seen != 1) { return NO; }
+    return found;
+}
+
+fn put_name(t: []const u8, lo: usize, hi: usize, suffix: str, out: []u8, cap: usize, at: usize) -> usize {
+    const named : usize = put_span(t, lo, hi, out, cap, at);
+    return put_str(out, cap, named, suffix);
+}
+
+/// The array declared on the line that starts at ds, rewritten (B2, B3 and B4 are checked here), or 0. Nothing
+/// is written to out unless all of them hold.
+fn try_array(t: []const u8, ds: usize, out: []u8, cap: usize) -> usize {
+    const de : usize = use_splice::line_end(t, ds);
+    const dp : usize = use_splice::skip_blank(t, ds);
+    const nlo : usize = @intCast(decl_name(t, dp, de));
+    const nhi : usize = use_splice::word_end(t, nlo);
+    const nlen : usize = nhi - nlo;
+    const ie : usize = init_end(t, de);
+    const a : i64 = next_ref(t, 0, nlo, nhi, ds, ie);
+    if (a == NO) { return 0; }
+    const au : usize = @intCast(a);
+    const b : i64 = next_ref(t, au + nlen, nlo, nhi, ds, ie);
+    if (b == NO) { return 0; }
+    const bu : usize = @intCast(b);
+    if (next_ref(t, bu + nlen, nlo, nhi, ds, ie) != NO) { return 0; }
+    var rq : usize = 0;
+    var wq : usize = 0;
+    if (is_read(t, au, nlen) and is_write(t, bu, nlen)) {
+        rq = au;
+        wq = bu;
+    } else if (is_write(t, au, nlen) and is_read(t, bu, nlen)) {
+        rq = bu;
+        wq = au;
+    } else {
+        return 0;
+    }
+    const rs : usize = line_start(t, rq);
+    const ws : usize = line_start(t, wq);
+    const rlo : usize = use_splice::skip_blank(t, rs);
+    const rhi : usize = use_splice::word_end(t, rlo);
+    const ra0 : usize = rq + nlen + 1;
+    const ra1 : usize = use_splice::word_end(t, ra0);
+    const wa0 : usize = wq + nlen + 1;
+    const wa1 : usize = use_splice::word_end(t, wa0);
+    const we : usize = use_splice::line_end(t, ws);
+    if (!context_ok(t, rs) or !context_ok(t, ws)) { return 0; }
+    if (used_after(t, rs, rlo, rhi) or !r_only_read_here(t, rlo, rhi, rs)) { return 0; }
+    if (assigned_above(t, rs, ra0, ra1)) { return 0; }
+    const c : i64 = clock_of(t);
+    const me : i64 = module_end(t);
+    if (c == NO or me == NO) { return 0; }
+    const clo : usize = @intCast(c);
+    const chi : usize = use_splice::word_end(t, clo);
+    const hlo : usize = dp + 4;
+    const hhi : usize = nlo - 1;
+    var w : usize = 0;
+    var s : usize = 0;
+    while (s < t.len) {
+        const e : usize = use_splice::line_end(t, s);
+        const p : usize = use_splice::skip_blank(t, s);
+        if (s == ds) {
+            w = put_span(t, s, dp, out, cap, w);
+            w = put_str(out, cap, w, "// t27c BRAM shape (#12297): one read site, one write site; ");
+            w = put_name(t, nlo, nhi, " is written and read by the memory process at the end of the module", out, cap, w);
+            w = put_nl(out, cap, w);
+            w = put_span(t, s, after(t, e), out, cap, w);
+            w = put_span(t, s, dp, out, cap, w);
+            w = put_str(out, cap, w, "reg [31:0] ");
+            w = put_name(t, nlo, nhi, "__wa;\n", out, cap, w);
+            w = put_span(t, s, dp, out, cap, w);
+            w = put_str(out, cap, w, "reg ");
+            w = put_span(t, hlo, hhi, out, cap, w);
+            w = put_str(out, cap, w, " ");
+            w = put_name(t, nlo, nhi, "__wd;\n", out, cap, w);
+            w = put_span(t, s, dp, out, cap, w);
+            w = put_str(out, cap, w, "reg ");
+            w = put_name(t, nlo, nhi, "__wt = 1'b0;\n", out, cap, w);
+            w = put_span(t, s, dp, out, cap, w);
+            w = put_str(out, cap, w, "reg ");
+            w = put_name(t, nlo, nhi, "__ws = 1'b0;\n", out, cap, w);
+        } else if (s == rs) {
+            w = put_span(t, s, p, out, cap, w);
+            w = put_str(out, cap, w, "// ");
+            w = put_span(t, rlo, rhi, out, cap, w);
+            w = put_str(out, cap, w, " is loaded from ");
+            w = put_name(t, nlo, nhi, " by the memory process, one clock after this state\n", out, cap, w);
+        } else if (s == ws) {
+            w = put_span(t, s, p, out, cap, w);
+            w = put_name(t, nlo, nhi, "__wa <= ", out, cap, w);
+            w = put_span(t, wa0, wa1, out, cap, w);
+            w = put_str(out, cap, w, ";\n");
+            w = put_span(t, s, p, out, cap, w);
+            w = put_name(t, nlo, nhi, "__wd <= ", out, cap, w);
+            w = put_span(t, wa1 + 4, we - 1, out, cap, w);
+            w = put_str(out, cap, w, ";\n");
+            w = put_span(t, s, p, out, cap, w);
+            w = put_name(t, nlo, nhi, "__wt <= ~", out, cap, w);
+            w = put_name(t, nlo, nhi, "__wt;\n", out, cap, w);
+        } else if (s == me) {
+            w = put_str(out, cap, w, "    // t27c memory process of ");
+            w = put_name(t, nlo, nhi, " (BRAM shape, #12297): the write lands one clock after the state that asks for it, the read is registered\n", out, cap, w);
+            w = put_str(out, cap, w, "    always @(posedge ");
+            w = put_name(t, clo, chi, ") begin\n        if (", out, cap, w);
+            w = put_name(t, nlo, nhi, "__wt != ", out, cap, w);
+            w = put_name(t, nlo, nhi, "__ws) begin\n            ", out, cap, w);
+            w = put_name(t, nlo, nhi, "[", out, cap, w);
+            w = put_name(t, nlo, nhi, "__wa] <= ", out, cap, w);
+            w = put_name(t, nlo, nhi, "__wd;\n            ", out, cap, w);
+            w = put_name(t, nlo, nhi, "__ws <= ", out, cap, w);
+            w = put_name(t, nlo, nhi, "__wt;\n        end\n        ", out, cap, w);
+            w = put_name(t, rlo, rhi, " <= ", out, cap, w);
+            w = put_name(t, nlo, nhi, "[", out, cap, w);
+            w = put_span(t, ra0, ra1, out, cap, w);
+            w = put_str(out, cap, w, "];\n    end\n");
+            w = put_span(t, s, after(t, e), out, cap, w);
+        } else if (p == e or !line_is_word_then(t, p, e, rlo, rhi, " <= 0;")) {
+            w = put_span(t, s, after(t, e), out, cap, w);
+        }
+        s = after(t, e);
+    }
+    return w;
+}
+
+/// The Verilog text t with its first array of the BRAM shape rewritten into the registers and the memory
+/// process above, written to out[0 .. cap]; the result is the length it needs. 0 when no array of t has the
+/// shape: t is then to be kept as it is.
+pub fn bram_text(t: []const u8, out: []u8, cap: usize) -> usize {
+    var s : usize = 0;
+    while (s < t.len) {
+        const e : usize = use_splice::line_end(t, s);
+        const n : i64 = decl_name(t, use_splice::skip_blank(t, s), e);
+        if (n >= 0) {
+            const nhi : usize = use_splice::word_end(t, @intCast(n));
+            if (decl_depth(t, nhi, e) >= BRAM_MIN_WORDS) {
+                const m : usize = try_array(t, s, out, cap);
+                if (m != 0) { return m; }
+            }
+        }
+        s = after(t, e);
+    }
+    return 0;
+}
+
+test the_cell_shape_becomes_a_memory_process {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    initial begin\n        rd = 0;\n    end\n    task step;\n        begin\n            if ((s == 3)) begin\n                rd = mem[ad];\n                s = 4;\n            end else begin\n                mem[ad] = (v & 255);\n                ad = (ad + 1);\n            end\n        end\n    endtask\n    always @(posedge clk or negedge rst_n) begin\n        if (!rst_n) begin\n            rd <= 0;\n        end else begin\n            step;\n        end\n    end\nendmodule\n";
+    const want : str = "module m;\n    reg [7:0] rd;\n        // t27c BRAM shape (#12297): one read site, one write site; mem is written and read by the memory process at the end of the module\n        reg [7:0] mem[0:1023];\n        reg [31:0] mem__wa;\n        reg [7:0] mem__wd;\n        reg mem__wt = 1'b0;\n        reg mem__ws = 1'b0;\n    initial begin\n    end\n    initial begin\n        rd = 0;\n    end\n    task step;\n        begin\n            if ((s == 3)) begin\n                // rd is loaded from mem by the memory process, one clock after this state\n                s = 4;\n            end else begin\n                mem__wa <= ad;\n                mem__wd <= (v & 255);\n                mem__wt <= ~mem__wt;\n                ad = (ad + 1);\n            end\n        end\n    endtask\n    always @(posedge clk or negedge rst_n) begin\n        if (!rst_n) begin\n        end else begin\n            step;\n        end\n    end\n    // t27c memory process of mem (BRAM shape, #12297): the write lands one clock after the state that asks for it, the read is registered\n    always @(posedge clk) begin\n        if (mem__wt != mem__ws) begin\n            mem[mem__wa] <= mem__wd;\n            mem__ws <= mem__wt;\n        end\n        rd <= mem[ad];\n    end\nendmodule\n";
+    const n : usize = bram_text(src, out[0 .. 2048], 2048);
+    assert n == want.len;
+    assert use_splice::same_span(out[0 .. 2048], 0, n, want, 0, want.len);
+}
+
+test the_size_is_reported_when_the_buffer_is_empty {
+    var out : [8]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 0], 0) > src.len;
+}
+
+test the_start_values_of_the_array_are_not_a_site {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n        integer i;\n        for (i = 0; i < 1024; i = i + 1) mem[i] = 0;\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) > src.len;
+}
+
+test an_array_below_the_size_threshold_stays_registers {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1022];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test a_second_read_site_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            rd = mem[ad2];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test a_second_write_site_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n            mem[ad2] = 7;\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test a_site_that_is_not_a_plain_index_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[(ad + 1)];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test a_site_in_a_loop_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            while ((n < 4)) begin\n                rd = mem[ad];\n                n = (n + 1);\n            end\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test a_value_used_in_the_step_that_reads_it_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            acc = (acc + rd);\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test a_value_assigned_somewhere_else_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    task other;\n        begin\n            rd = 5;\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test a_module_with_no_clock_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n        end\n    endtask\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test two_clocks_keep_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\n    always @(posedge clk2) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test text_without_an_array_comes_back_as_nothing_to_do {
+    var out : [64]u8 = undefined;
+    assert bram_text("module m;\nendmodule\n", out[0 .. 64], 64) == 0;
+    assert bram_text("", out[0 .. 64], 64) == 0;
+}
+
+test an_address_set_in_the_step_that_reads_keeps_the_array_as_it_was {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            ad = (ad + 1);\n            rd = mem[ad];\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) == 0;
+}
+
+test an_address_set_in_another_branch_is_not_in_the_way {
+    var out : [2048]u8 = undefined;
+    const src : str = "module m;\n    reg [7:0] rd;\n        reg [7:0] mem[0:1023];\n    initial begin\n    end\n    task step;\n        begin\n            if ((s == 2)) begin\n                ad = (ad + 1);\n            end else begin\n                rd = mem[ad];\n            end\n            mem[ad] = (v & 255);\n        end\n    endtask\n    always @(posedge clk) begin\n        step;\n    end\nendmodule\n";
+    assert bram_text(src, out[0 .. 2048], 2048) > src.len;
+}

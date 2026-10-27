@@ -605,10 +605,17 @@ fn lower_mode<'a>(
     static LIBM: std::sync::OnceLock<Node> = std::sync::OnceLock::new();
     let mut named = HashSet::new();
     names_in(std::slice::from_ref(ast), &mut named);
-    if xp::BUILTINS.split(' ').any(|b| named.contains(b)) {
+    // #9065: a bare name the reference rewrites names its builtin too -- `exp(` needs `@exp`'s routine in the
+    // program as surely as a written `@exp(` does (bare_target, libm_plan.t27).
+    let bare_libm = named.iter().any(|k| {
+        let t = xp::bare_target(k.as_bytes());
+        !t.is_empty() && xp::BUILTINS.split(' ').any(|b| b == t)
+    });
+    if bare_libm || xp::BUILTINS.split(' ').any(|b| named.contains(b)) {
         let libm = || include_str!("../../../specs/tri/t27b/libm.t27").replace(xp::PORT, xp::HELPER);
         let m = LIBM.get_or_init(|| crate::compiler::Compiler::parse_ast(&libm()).unwrap_or_default());
-        items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
+        // Include all HELPER-prefixed items (functions and constants), like original master
+    items.extend(m.children.iter().filter(|c| c.name.starts_with(xp::HELPER)));
     }
     static I128: std::sync::OnceLock<Node> = std::sync::OnceLock::new(); // i128_plan.t27's routines, for `@divTrunc` and `@rem`
     if ip::BUILTINS.split(' ').any(|b| named.contains(b)) {
@@ -1636,7 +1643,7 @@ impl<'a> Lower<'a> {
             let vars = params.iter().zip(&n.params).map(|(t, p)| Var { name: p.0.clone(), ty: ty(t) }).collect();
             if ret.as_ref().is_some_and(is_agg) { return self.reject("FnDecl(extern)", format!("`{}` returns an aggregate; an import returns a scalar (#8972)", n.name)); }
             let noreturn_site = if ret.is_some() { self.site(TrapKind::NoReturn, format!("import {} run outside an object", n.name), Ty::Bool) } else { 0 };
-            return Ok(Func { name, nparams: params.len(), ret: ret.map(|t| ty(&t)), vars, body: Vec::new(), slots: Vec::new(), line: n.line, is_test: false, is_invariant: false, noreturn_site });
+            return Ok(Func { name, nparams: params.len(), ret: ret.map(|t| ty(&t)), vars, body: Vec::new(), slots: Vec::new(), line: n.line, is_pub: n.extra_pub, is_test: false, is_invariant: false, noreturn_site });
         }
         // Parameters first (vars 0..), then the hidden result pointer, so
         // that they are exactly the first `nparams` variables.
@@ -1709,6 +1716,7 @@ impl<'a> Lower<'a> {
             slots: std::mem::take(&mut self.slots),
             body,
             line: n.line,
+            is_pub: n.extra_pub,
             is_test: false,
             is_invariant: false,
             noreturn_site,
@@ -1828,6 +1836,7 @@ impl<'a> Lower<'a> {
             slots: std::mem::take(&mut self.slots),
             body,
             line: n.line,
+            is_pub: false,
             is_test: true,
             is_invariant: invariant,
             noreturn_site: 0,
@@ -3199,11 +3208,10 @@ impl<'a> Lower<'a> {
             Val::E(e) => self.reject("condition", format!("expected bool, found {}", e.ty.name())),
             Val::Ct(_) => self.reject("condition", "expected bool, found an integer literal".into()),
             Val::Cf(..) => self.reject("condition", "expected bool, found a float literal".into()),
-            Val::P(_, ref t @ LTy::Enum(..)) => {
-                let d = self.type_name(t);
-                self.reject("condition", format!("expected bool, found {}", d))
-            }
-            Val::P(..) => self.reject("condition", "expected bool, found a pointer".into()),
+            Val::P(_, ref t) => self.reject(
+                "condition",
+                format!("expected bool, found a pointer to {}", self.type_name(t)),
+            ),
             Val::M(ref p) if matches!(p.ty, LTy::Arr(..)) => self.reject("condition", "expected bool, found an array".into()),
             Val::A(..) => self.reject("condition", "expected bool, found an array".into()),
             Val::M(_) => self.reject("condition", "expected bool, found a struct".into()),
@@ -3273,11 +3281,12 @@ impl<'a> Lower<'a> {
                     format!("expected {}, found {}", to.name(), e.ty.name()),
                 )
             }
-            Val::P(_, ref t @ LTy::Enum(..)) => {
-                let d = self.type_name(t);
-                self.reject("type mismatch", format!("expected {}, found {}", to.name(), d))
-            }
-            Val::P(..) => self.reject("type mismatch", format!("expected {}, found a pointer", to.name())),
+            Val::P(_, ref t) => self.reject(
+                "type mismatch",
+                // #11788: the pointee names the construct -- a bare "found a pointer" at a merged
+                // line did not; the two conflicting types are both in the message now.
+                format!("expected {}, found a pointer to {}", to.name(), self.type_name(t)),
+            ),
             Val::M(ref p) if matches!(p.ty, LTy::Arr(..)) => {
                 self.reject("type mismatch", format!("expected {}, found an array", to.name()))
             }
@@ -3536,6 +3545,9 @@ impl<'a> Lower<'a> {
                     return Ok(v);
                 }
                 if let Some(v) = self.len_call(n)? {
+                    return Ok(v);
+                }
+                if let Some(v) = self.bare_builtin(n)? {
                     return Ok(v);
                 }
                 if let Some(v) = self.bare_abs(n)? {
@@ -7485,6 +7497,7 @@ fn str_eql_func(noreturn_site: SiteId) -> Func {
         vars: vec![v("a", Ty::Ptr), v("b", Ty::Ptr), v("n", Ty::U64), v("i", Ty::U64)],
         body,
         line: 0,
+        is_pub: false,
         is_test: false,
         is_invariant: false,
         noreturn_site,

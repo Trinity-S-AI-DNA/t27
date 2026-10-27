@@ -4743,6 +4743,38 @@
 - `./scripts/tri test --fast` reports pre-existing Gen Verilog Yosys Smoke
   failures unrelated to the packed-AoS ladder; those warnings are not a blocker.
 
+### The foreign budget: two different caps
+- The own-language gate enforces TWO independent limits and a PR can pass one
+  and fail the other: at most 40 hand-written foreign lines ADDED per file
+  (80 per PR), and separately added <= deleted overall (shrink-only). A
+  net-negative diff with 96 added lines still fails; a 74/74 diff still fails
+  the per-file cap. Measure `git diff --cached --numstat` per file before
+  committing.
+- When a legitimate fix exceeds the caps, compress the additions you
+  themselves made (docs to fewer lines, branches folded to one line, concat
+  pieces merged with identical emitted text) and delete blank doc separators
+  in the SAME files: honest debt shrink that brings both numbers under the
+  caps without a label and without touching semantics.
+- Counting-build lesson (#5980/#12751): a counter that reports 0 for a
+  compile-time check is honest, but the LABEL must say which kind of check
+  ran; conflate "checked nothing" with "checked at compile time" and every
+  downstream reader inherits the lie.
+
+### Recovering a deleted PR branch (2026-10-27, incident-free ending)
+- Deleting a PR's head branch auto-CLOSES the PR; `gh pr reopen` refuses until
+  the branch exists again. The commit is not lost: the local repo that pushed
+  it still holds the SHA (`git rev-parse <local-branch>` for the FULL 40-char
+  form -- a truncated SHA fails the push with a confusing refspec error).
+- Restore with a BRANCH refspec, not `SHA:refs/...`: in zsh the SHA and the
+  refspec can concatenate into one broken token ("...a78ccdefs/heads/..." --
+  the literal lesson). `git push origin <local-branch>:refs/heads/<pr-branch>`
+  then `gh pr reopen N` reopens with the fix intact.
+- Trust `headRefOid`, never `headRefName`, when scripting against a PR: the
+  NAME can belong to a different branch than you assume (this session nearly
+  force-pushed master's tip over a PR branch because of that).
+- `--force-with-lease` failing is the guard working. Read it as a stop sign,
+  not as an obstacle to a different spelling of the same push.
+
 ### Anti-patterns to avoid
 - Do not omit inner dimensions in array-literal annotations (e.g. `[265][][][][][][]Pt`);
   even if the parser accepts the shorthand, it changes the layout/stride.

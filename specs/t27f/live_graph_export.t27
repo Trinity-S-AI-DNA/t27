@@ -1,0 +1,805 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/live_graph_export.t27 -- the GRAPH-DATA plane of the /t27f/live/ export glue: the
+// per-node and per-edge accessors, the node NAME region, and the two event paths (one staged
+// record, one whole recorded log), as LAW over the same WorkGraph the contract card binds.
+// Companion to specs/t27f/live_struct_glue.t27 (the contract, PR #12005) and
+// specs/t27f/live_glue_layout.t27 (the constant plane, PR #12040); this card modifies neither.
+// Refs Trinity-S-AI-DNA/t27#12005, advances #10262; the page is Trinity-S-AI-DNA/trinity#1717.
+//
+// WHY A SECOND PLANE. The contract exposes the graph as one 69,640-byte image and seven whole
+// columns -- verifiable, but the page's JS then walks raw columns with a DataView per frame.
+// What the page asks for per node is SMALL: a count, a kind, a NAME. This card is that surface:
+// gx_node_count/gx_node_kind/gx_node_name_ptr/gx_node_name_len per node,
+// gx_edge_count/gx_edge_kind/gx_edge_from/gx_edge_to per edge, plus the two ways events enter:
+// gx_apply_event (one staged record, the live path) and gx_replay (a whole recorded log, the
+// load path). Every accessor reads the ONE WorkGraph through work_graph.t27's own pub fns --
+// this card holds no second copy of the graph, so it cannot drift from the law.
+//
+// THE REGIONS THIS CARD ADDS. The contract's memory ends at MEM_CAP (143,692); its own header
+// states the real build's memory is page-rounded ABOVE that, never below. This card's two
+// regions live in that room, tiled in the contract's own order-after style: the NAME region at
+// NAME_OFF = MEM_CAP (one fixed 32-byte row per node slot, 65,536 bytes), the LOG region above
+// it (64 rows of the contract's own 32-byte Event record, 2,048 bytes). A log row IS a #12005
+// record -- same field offsets, same little-endian order -- so the page writes the loader's own
+// serialization twice, once for the contract's record region, once here, and never a third form.
+//
+// THE REFUSAL BAND. The contract left 36..63 empty on purpose ("a future card can take it
+// without renumbering anyone"); this card is that card and claims its base, GX_REFUSED_BASE =
+// 36, with two codes so far (a log length that is not whole records or is past the cap; a
+// pointer that is not this card's own region base). Disciplines the contract already owns keep
+// its codes by import: an action before its input landed is E_STATE, a nonzero reserved byte is
+// E_LAYOUT. A work_graph refusal crosses VERBATIM (the law's own 1..3, never rebased) -- this
+// card applies the law directly, not through live_mode's frame path, so there is no rebase to
+// apply. WG_OK == LIVE_OK == 0: one ok, three bands, no overlap.
+//
+// NOT CLAIMED: no wasm, no Zig and no emitter live here (the stateful floors -- memory, data
+// segments, calls, loops -- are open on the self-host epic #5980; what gen cannot express is a
+// defect there, never a hand-written file); the ptr answers are the MODEL's offsets in the
+// module's one linear memory, and the model's name/log bytes are the regions themselves; no
+// decimal rendering of a pid or task number exists anywhere (names are ASCII tags, colons, the
+// fixture's own spec paths and raw little-endian id bytes -- the page renders numbers, the
+// module does not); SPEC names exist only where the feed's join names one (a SPEC node with id
+// outside 1..SPEC_COUNT gets the tagged form, never an invented path); no perf claim of any
+// kind. The transcription direction is one-way: this card reads live_struct_glue, work_graph
+// and work_graph_fixture, never the reverse.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module live_graph_export;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::Event;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::apply_event;
+use t27f::work_graph::nodes;
+use t27f::work_graph::edges;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::edge_kind_at;
+use t27f::work_graph::edge_from_at;
+use t27f::work_graph::edge_to_at;
+use t27f::work_graph::digest_bytes;
+use t27f::work_graph::digest_len;
+use t27f::work_graph::graph_digest;
+use t27f::work_graph::NK_SPEC;
+use t27f::work_graph::NK_AGENT;
+use t27f::work_graph::NK_COUNT;
+use t27f::work_graph::EK_COUNT;
+use t27f::work_graph::EV_SPAWN;
+use t27f::work_graph::WG_OK;
+use t27f::work_graph::ERR_WG_BAD_EVENT;
+use t27f::work_graph::NODE_CAP;
+use t27f::work_graph_fixture::SPEC_COUNT;
+use t27f::work_graph_fixture::event_at;
+use t27f::live_struct_glue::GRAPH_OFF;
+use t27f::live_struct_glue::GRAPH_LEN;
+use t27f::live_struct_glue::MEM_CAP;
+use t27f::live_struct_glue::EVENT_BYTES;
+use t27f::live_struct_glue::E_STATE;
+use t27f::live_struct_glue::E_LAYOUT;
+
+// ---- this card's refusal band: the one the contract left empty --------------------------------------
+
+pub const GX_REFUSED_BASE : u8 = 36;   // live_struct_glue's own reserved band 36..63
+pub const E_GX_LEN : u8 = 37;          // a log length that is not whole records, or past the cap
+pub const E_GX_PTR : u8 = 38;          // a replay pointer that is not this card's log region base
+pub const GX_RESULT_NAMES : [3]str = ["ok", "len", "ptr"];
+
+// ---- the widths -------------------------------------------------------------------------------------
+
+/// One name row: wide enough for the fixture's longest spec path (29 bytes) with room to round.
+pub const NAME_ROW : u32 = 32;
+
+/// The name region: one row per node slot, the whole NODE_CAP of them, fixed.
+pub const NAME_OFF : u32 = MEM_CAP;             // 143692: the contract's cap is this card's floor
+pub const NAME_CAP : u32 = 2048 * 32;           // NODE_CAP rows of NAME_ROW bytes
+
+/// The recorded-log region: whole #12005 records, back to back, nothing between.
+pub const LOG_ROWS : u32 = 64;
+pub const LOG_OFF : u32 = NAME_OFF + NAME_CAP;  // 209228
+pub const LOG_BYTES : u32 = 2048;               // LOG_ROWS * EVENT_BYTES
+
+/// The image pair, routed through this card's own names so no body restates the layout plane's
+/// (live_glue_layout owns the constant transcription; this card points the page at the same
+/// region from the graph-data surface).
+pub const IMAGE_OFF : u32 = GRAPH_OFF;
+pub const IMAGE_LEN : u32 = GRAPH_LEN;
+
+// ---- the model: one module instance -----------------------------------------------------------------
+
+pub struct GraphExport {
+    g : WorkGraph,                  // the one graph, the law's own struct
+    log : [2048]u8,                 // the staged recorded log (the LOG region's own bytes)
+    log_len : u32,                  // 0 until the log commits; a whole number of records after
+    names : [65536]u8,              // the name region's own bytes, NAME_ROW per node slot
+    names_len : u32,                // rows written by the last materialization
+}
+
+/// The module's only constructor: total initialization, never undefined.
+pub fn gx_fresh() -> GraphExport {
+    var gx : GraphExport = undefined;
+    gx.g = new_graph();
+    gx.log = [0] ** 2048;
+    gx.log_len = 0;
+    gx.names = [0] ** 65536;
+    gx.names_len = 0;
+    return gx;
+}
+
+// ---- the host side: the serialization law (a log row IS a #12005 record) ----------------------------
+
+fn log_put_u32(gx: *GraphExport, off: u32, v: u32) {
+    gx.log[off as usize] = (v & 255) as u8;
+    gx.log[(off + 1) as usize] = ((v >> 8) & 255) as u8;
+    gx.log[(off + 2) as usize] = ((v >> 16) & 255) as u8;
+    gx.log[(off + 3) as usize] = ((v >> 24) & 255) as u8;
+}
+
+fn log_put_u64(gx: *GraphExport, off: u32, v: u64) {
+    gx.log[off as usize] = (v & 255) as u8;
+    gx.log[(off + 1) as usize] = ((v >> 8) & 255) as u8;
+    gx.log[(off + 2) as usize] = ((v >> 16) & 255) as u8;
+    gx.log[(off + 3) as usize] = ((v >> 24) & 255) as u8;
+    gx.log[(off + 4) as usize] = ((v >> 32) & 255) as u8;
+    gx.log[(off + 5) as usize] = ((v >> 40) & 255) as u8;
+    gx.log[(off + 6) as usize] = ((v >> 48) & 255) as u8;
+    gx.log[(off + 7) as usize] = ((v >> 56) & 255) as u8;
+}
+
+/// Write one Event as its 32-byte record at log row r. The reserved byte at +3 is written 0 on
+/// every write; a host that puts anything else there is refused at decode, never misread.
+pub fn row_write(gx: *GraphExport, r: u32, ev: Event) {
+    const row = r * EVENT_BYTES;
+    gx.log[row as usize] = ev.kind;
+    gx.log[(row + 1) as usize] = ev.deliver;
+    gx.log[(row + 2) as usize] = ev.reason;
+    gx.log[(row + 3) as usize] = 0;
+    log_put_u32(gx, row + 4, ev.task_no);
+    log_put_u32(gx, row + 8, ev.seq);
+    log_put_u32(gx, row + 12, ev.spec_id);
+    log_put_u64(gx, row + 16, ev.from_pid);
+    log_put_u64(gx, row + 24, ev.to_pid);
+}
+
+// ---- the decode: strict, the contract's own discipline ----------------------------------------------
+
+fn log_get_u32(gx: *GraphExport, off: u32) -> u32 {
+    var v : u32 = 0;
+    v = (gx.log[(off + 1) as usize] as u32) << 8;
+    v = v + (gx.log[(off + 2) as usize] as u32) << 16;
+    v = v + (gx.log[(off + 3) as usize] as u32) << 24;
+    return v + (gx.log[off as usize] as u32);
+}
+
+fn log_get_u64(gx: *GraphExport, off: u32) -> u64 {
+    var v : u64 = 0;
+    var i : u32 = 0;
+    while (i < 8) {
+        v = v + ((gx.log[(off + i) as usize] as u64) << (i * 8));
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Decode log row r into ev. Layout only: the reserved byte must be 0. Every value check
+/// belongs to the law (a bad kind is ERR_WG_BAD_EVENT from apply_event, not a glue code).
+fn decode_row(gx: *GraphExport, r: u32, ev: *Event) -> u8 {
+    const row = r * EVENT_BYTES;
+    if (gx.log[(row + 3) as usize] != 0) { return E_LAYOUT; }
+    ev.kind = gx.log[row as usize];
+    ev.deliver = gx.log[(row + 1) as usize];
+    ev.reason = gx.log[(row + 2) as usize];
+    ev.task_no = log_get_u32(gx, row + 4);
+    ev.seq = log_get_u32(gx, row + 8);
+    ev.spec_id = log_get_u32(gx, row + 12);
+    ev.from_pid = log_get_u64(gx, row + 16);
+    ev.to_pid = log_get_u64(gx, row + 24);
+    return WG_OK;
+}
+
+// ---- the name region ---------------------------------------------------------------------------------
+//
+// THE NAME LAW. A SPEC node whose id the fixture's join names (1..SPEC_COUNT) carries that
+// spec's own path. Every other node -- agent, task, action, artifact, and a spec outside the
+// join -- carries the tagged form: two ASCII kind letters, a colon, then the node's own id as
+// 8 little-endian bytes (11 bytes). No decimal conversion exists (the law's pieces are
+// compares and adds); the page renders the numbers it reads.
+//
+// THE PATH TABLE IS A LOCAL FAITHFUL COPY of work_graph_fixture's SPEC_NAMES, as bytes. The
+; QUESTION why a copy: str constants are not runtime-readable in the current gen (measured
+; 2026-10-25: an [8]str const indexed at runtime answers wrong bytes both cross-module AND in
+; the declaring module's own importers -- the emitter gap behind #5980, same family as the
+; str-equality pointer compare the contract card records), while u8 const tables are proven at
+; runtime (the fixture's own columns run green through event_at). The copy is pinned by the
+; transcription test below -- offsets, per-path lens, the shared "specs/" head, the shared
+; ".t27" tail and the whole-table byte sum -- so a fixture rename that misses this card fails
+; that test, the E_BUDGET precedent's discipline. When the str floor lands (#5980), this table
+; can splice the fixture's own const and delete the copy.
+
+/// The eight spec paths, concatenated, 196 bytes: the fixture's SPEC_NAMES as bytes.
+pub const SPEC_PATH_BYTES : [196]u8 = [
+    // specs/t27f/frontend.t27 (23)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 102, 114, 111, 110, 116,
+    101, 110, 100, 46, 116, 50, 55,
+    // specs/t27f/idea_factory.t27 (27)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 105, 100, 101, 97, 95,
+    102, 97, 99, 116, 111, 114, 121, 46, 116, 50, 55,
+    // specs/t27f/lesson_reel.t27 (26)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 108, 101, 115, 115, 111,
+    110, 95, 114, 101, 101, 108, 46, 116, 50, 55,
+    // specs/t27f/spec_graph.t27 (25)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 115, 112, 101, 99, 95,
+    103, 114, 97, 112, 104, 46, 116, 50, 55,
+    // specs/t27f/particle_engine.t27 (30)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 112, 97, 114, 116, 105,
+    99, 108, 101, 95, 101, 110, 103, 105, 110, 101, 46, 116, 50, 55,
+    // specs/t27f/hud.t27 (18)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 104, 117, 100, 46, 116,
+    50, 55,
+    // specs/t27f/display_list.t27 (27)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 100, 105, 115, 112, 108,
+    97, 121, 95, 108, 105, 115, 116, 46, 116, 50, 55,
+    // specs/t27f/scene.t27 (20)
+    115, 112, 101, 99, 115, 47, 116, 50, 55, 102, 47, 115, 99, 101, 110, 101,
+    46, 116, 50, 55,
+];
+
+/// Path i's extent in SPEC_PATH_BYTES: SPEC_PATH_OFF[i] .. SPEC_PATH_OFF[i + 1].
+pub const SPEC_PATH_OFF : [9]u32 = [0, 23, 50, 76, 101, 131, 149, 176, 196];
+
+pub const KIND_TAG : [10]u8 = [
+    115, 112,   // "sp" SPEC
+    97, 103,    // "ag" AGENT
+    116, 107,   // "tk" TASK
+    97, 120,    // "ax" ACTION
+    97, 114,    // "ar" ARTIFACT
+];
+
+/// The tagged form's fixed width: two letters, a colon, eight id bytes.
+pub const TAGGED_LEN : u32 = 11;
+
+/// A node's name length, from the node's own kind and id -- the ONE law both the row writer
+/// and the length getter evaluate, so the bytes and the length cannot disagree.
+pub fn name_len_of(kind: u8, id: u64) -> u32 {
+    if (kind == NK_SPEC && id >= 1 && id <= SPEC_COUNT) {
+        return SPEC_PATH_OFF[id as usize] - SPEC_PATH_OFF[(id - 1) as usize];
+    }
+    return TAGGED_LEN;
+}
+
+/// Write node i's name into its own row. Returns the row's live length.
+fn name_row_write(gx: *GraphExport, i: u32) -> u32 {
+    const base = i * NAME_ROW;
+    const kind = node_kind_at_pub(&gx.g, i);
+    const id = gx.g.node_id[i as usize];
+    if (kind == NK_SPEC && id >= 1 && id <= SPEC_COUNT) {
+        const from = SPEC_PATH_OFF[(id - 1) as usize];
+        const to = SPEC_PATH_OFF[id as usize];
+        var k : u32 = from;
+        while (k < to) {
+            gx.names[(base + k - from) as usize] = SPEC_PATH_BYTES[k as usize];
+            k = k + 1;
+        }
+        return to - from;
+    }
+    gx.names[base as usize] = KIND_TAG[(kind * 2) as usize];
+    gx.names[(base + 1) as usize] = KIND_TAG[(kind * 2 + 1) as usize];
+    gx.names[(base + 2) as usize] = 58;              // ':'
+    var b : u32 = 0;
+    while (b < 8) {
+        gx.names[(base + 3 + b) as usize] = ((id >> (b * 8)) & 255) as u8;
+        b = b + 1;
+    }
+    return TAGGED_LEN;
+}
+
+/// Rebuild the name rows for every live node. Runs after every action that moved the graph, so
+/// a name read never outruns the graph it names; rows past the live count keep their bytes
+/// (zeros at fresh, the last graph's own leftovers after growth -- never invented ones).
+fn remat_names(gx: *GraphExport) {
+    gx.names_len = 0;
+    var i : u32 = 0;
+    while (i < nodes(&gx.g)) {
+        gx.names_len = gx.names_len + name_row_write(gx, i);
+        i = i + 1;
+    }
+}
+
+// ---- the export surface: the log region in ------------------------------------------------------------
+
+pub fn gx_log_ptr(gx: *GraphExport) -> u32 {
+    _ = gx;
+    return LOG_OFF;
+}
+
+pub fn gx_log_cap(gx: *GraphExport) -> u32 {
+    _ = gx;
+    return LOG_BYTES;
+}
+
+/// Commit the log. Variable-length (whole records only), so any nonzero multiple of
+/// EVENT_BYTES up to the cap commits; a length with a partial row in it is refused.
+pub fn gx_log_set_len(gx: *GraphExport, n: u32) -> bool {
+    if (n == 0) { return false; }
+    if (n > LOG_BYTES) { return false; }
+    if ((n & 31) != 0) { return false; }          // EVENT_BYTES is 32: the remainder is a mask
+    gx.log_len = n;
+    return true;
+}
+
+// ---- the export surface: actions ---------------------------------------------------------------------
+
+/// The LIVE path: apply one staged record. The host writes the full 32-byte record at the log
+/// base (row 0), commits with gx_log_set_len, then calls this with the three fields the live
+/// wire carries per event -- the kind, the tick (the record's seq) and the task -- which the
+/// call refreshes INTO row 0 before applying it, so the record the page staged and the event
+/// the law sees cannot disagree on the fields the page itself names. The record's other five
+/// fields (deliver, reason, spec_id, from_pid, to_pid) are the host's staged bytes, decoded
+/// under the contract's own layout law. Returns the law's code VERBATIM.
+pub fn gx_apply_event(gx: *GraphExport, kind: u8, tick: u32, task: u32) -> u8 {
+    if (gx.log_len == 0) { return E_STATE; }
+    gx.log[0] = kind;
+    log_put_u32(gx, 4, task);
+    log_put_u32(gx, 8, tick);
+    var ev : Event = undefined;
+    const d = decode_row(gx, 0, &ev);
+    if (d != WG_OK) { return d; }
+    const r = apply_event(&gx.g, ev);
+    remat_names(gx);
+    return r;
+}
+
+/// The LOAD path: apply a whole recorded log. ptr must be this card's own log region base and
+/// len a committed whole number of records; rows are applied in order through the law, and the
+/// FIRST law refusal stops the walk with the law's own code -- rows before it stand (the
+/// contract's mid-batch semantics, passed through, never rolled back here).
+pub fn gx_replay(gx: *GraphExport, ptr: u32, len: u32) -> u8 {
+    if (gx.log_len == 0) { return E_STATE; }
+    if (ptr != LOG_OFF) { return E_GX_PTR; }
+    if (len != gx.log_len) { return E_GX_LEN; }
+    var r : u32 = 0;
+    while (r < gx.log_len / EVENT_BYTES) {
+        var ev : Event = undefined;
+        const d = decode_row(gx, r, &ev);
+        if (d != WG_OK) { return d; }
+        const v = apply_event(&gx.g, ev);
+        if (v != WG_OK) {
+            remat_names(gx);
+            return v;
+        }
+        r = r + 1;
+    }
+    remat_names(gx);
+    return WG_OK;
+}
+
+/// Return the module to the fresh state: graph, names, and the log commit. The staged log
+/// BYTES stay as the host wrote them (only the commit drops), the contract's own reset scope.
+pub fn gx_reset(gx: *GraphExport) -> u8 {
+    gx.g = new_graph();
+    gx.log_len = 0;
+    gx.names = [0] ** 65536;
+    gx.names_len = 0;
+    return WG_OK;
+}
+
+// ---- the export surface: the graph out ----------------------------------------------------------------
+
+/// The image region: work_graph's digest_bytes order, the contract's own bytes at GRAPH_OFF.
+/// The page verifies what it read here against the contract's digest pair, as its header asks.
+pub fn gx_graph_ptr(gx: *GraphExport) -> u32 {
+    _ = gx;
+    return IMAGE_OFF;
+}
+
+pub fn gx_graph_len(gx: *GraphExport) -> u32 {
+    _ = gx;
+    return IMAGE_LEN;
+}
+
+pub fn gx_node_count(gx: *GraphExport) -> u32 {
+    return nodes(&gx.g);
+}
+
+pub fn gx_edge_count(gx: *GraphExport) -> u32 {
+    return edges(&gx.g);
+}
+
+/// Node i's kind. An index at or past the live count answers NK_COUNT (5), the law's own
+/// one-past-the-end -- the page checks kind < NK_COUNT and never draws the answer.
+pub fn gx_node_kind(gx: *GraphExport, i: u32) -> u8 {
+    if (i >= nodes(&gx.g)) { return NK_COUNT; }
+    return node_kind_at_pub(&gx.g, i);
+}
+
+/// Node i's name pair. A live node answers its row inside the name region; an index at or past
+/// the live count answers the EMPTY pair (the region base, length 0) -- never another node's
+/// bytes, never garbage.
+pub fn gx_node_name_ptr(gx: *GraphExport, i: u32) -> u32 {
+    if (i >= nodes(&gx.g)) { return NAME_OFF; }
+    return NAME_OFF + i * NAME_ROW;
+}
+
+pub fn gx_node_name_len(gx: *GraphExport, i: u32) -> u32 {
+    if (i >= nodes(&gx.g)) { return 0; }
+    return name_len_of(node_kind_at_pub(&gx.g, i), gx.g.node_id[i as usize]);
+}
+
+/// Edge j's kind. Past the live count: EK_COUNT (6), the same one-past-the-end discipline.
+pub fn gx_edge_kind(gx: *GraphExport, j: u32) -> u8 {
+    if (j >= edges(&gx.g)) { return EK_COUNT; }
+    return edge_kind_at(&gx.g, j);
+}
+
+/// Edge j's endpoints. Past the live count: NODE_CAP (2048), the law's own impossible node
+/// (node_of's own not-found answer) -- an edge that points nowhere, never a fabricated index.
+pub fn gx_edge_from(gx: *GraphExport, j: u32) -> u32 {
+    if (j >= edges(&gx.g)) { return NODE_CAP; }
+    return edge_from_at(&gx.g, j);
+}
+
+pub fn gx_edge_to(gx: *GraphExport, j: u32) -> u32 {
+    if (j >= edges(&gx.g)) { return NODE_CAP; }
+    return edge_to_at(&gx.g, j);
+}
+
+/// The name region's own pair: base and live extent (the bytes the last materialization wrote).
+pub fn gx_names_ptr(gx: *GraphExport) -> u32 {
+    _ = gx;
+    return NAME_OFF;
+}
+
+pub fn gx_names_len(gx: *GraphExport) -> u32 {
+    return gx.names_len;
+}
+
+// ---- the export name table -----------------------------------------------------------------------------
+
+pub const EXPORT_NAMES : [18]str = [
+    "gx_log_ptr", "gx_log_cap", "gx_log_set_len",
+    "gx_apply_event", "gx_replay", "gx_reset",
+    "gx_graph_ptr", "gx_graph_len",
+    "gx_node_count", "gx_node_kind", "gx_node_name_ptr", "gx_node_name_len",
+    "gx_edge_count", "gx_edge_kind", "gx_edge_from", "gx_edge_to",
+    "gx_names_ptr", "gx_names_len",
+];
+
+// ---- tests ---------------------------------------------------------------------------------------------
+
+test "fresh module: empty graph, refused actions, regions in bounds" {
+    var gx = gx_fresh();
+    assert(gx_node_count(&gx) == 0);
+    assert(gx_edge_count(&gx) == 0);
+    assert(gx_names_len(&gx) == 0);
+    // an action before its input landed is the contract's own refusal, and the state stands
+    assert(gx_apply_event(&gx, EV_SPAWN, 1, 0) == E_STATE);
+    assert(gx_replay(&gx, LOG_OFF, EVENT_BYTES) == E_STATE);
+    // the region pairs are inside the module's extent, on a fresh module too
+    assert(gx_graph_ptr(&gx) + gx_graph_len(&gx) <= NAME_OFF);
+    assert(gx_names_ptr(&gx) + NAME_CAP <= LOG_OFF);
+    assert(gx_log_ptr(&gx) + gx_log_cap(&gx) <= LOG_OFF + LOG_BYTES);
+    // the image pair answers the contract's own layout, by import, never restated
+    assert(gx_graph_ptr(&gx) == GRAPH_OFF);
+    assert(gx_graph_len(&gx) == GRAPH_LEN);
+    assert(gx_graph_len(&gx) == digest_len());
+    // past-the-count getters answer each type's own one-past-the-end, never a byte of state
+    assert(gx_node_kind(&gx, 0) == NK_COUNT);
+    assert(gx_edge_kind(&gx, 0) == EK_COUNT);
+    assert(gx_edge_from(&gx, 0) == NODE_CAP);
+    assert(gx_node_name_ptr(&gx, 0) == NAME_OFF);
+    assert(gx_node_name_len(&gx, 0) == 0);
+}
+
+test "the contract's two-node round-trip through gx_apply_event" {
+    // the fixture of the contract's own round-trip test: one spawn, two agent nodes, no edges
+    const ev = Event { kind: EV_SPAWN, from_pid: 7, to_pid: 9, task_no: 0, deliver: 0, reason: 99, seq: 1, spec_id: 0 };
+    // the direct path: the law, no boundary
+    var gd = new_graph();
+    assert(apply_event(&gd, ev) == WG_OK);
+    // the boundary: the host stages the full record, commits, applies through the live triple
+    var gx = gx_fresh();
+    row_write(&gx, 0, ev);
+    assert(gx_log_set_len(&gx, EVENT_BYTES) == true);
+    assert(gx_apply_event(&gx, EV_SPAWN, 1, 0) == WG_OK);
+    // the counts answer through the getters and agree with the direct graph
+    assert(gx_node_count(&gx) == 2);
+    assert(gx_node_count(&gx) == nodes(&gd));
+    assert(gx_edge_count(&gx) == 0);
+    assert(gx_edge_kind(&gx, 0) == EK_COUNT);
+    // both nodes are agents, and their kinds read identically through the law's own accessor
+    assert(gx_node_kind(&gx, 0) == NK_AGENT);
+    assert(gx_node_kind(&gx, 1) == NK_AGENT);
+    var i : u32 = 0;
+    while (i < 2) {
+        assert(gx_node_kind(&gx, i) == node_kind_at_pub(&gd, i));
+        i = i + 1;
+    }
+    // the names: the tagged form, two letters, a colon, then the pid's own LE bytes
+    assert(gx_node_name_len(&gx, 0) == 11);
+    assert(gx_node_name_len(&gx, 1) == 11);
+    assert(gx.names[0] == 97);          // 'a'
+    assert(gx.names[1] == 103);         // 'g'
+    assert(gx.names[2] == 58);          // ':'
+    assert(gx.names[3] == 7);           // node 0 is pid 7, LE byte 0
+    assert(gx.names[(32 + 3) as usize] == 9);   // node 1 is pid 9, LE byte 0
+    // the image agreement at full scale: this card's graph serializes to the law's own bytes
+    var img_direct : [70000]u8 = [0] ** 70000;
+    assert(digest_bytes(&gd, img_direct[0..digest_len()]) == digest_len());
+    var img_gx : [70000]u8 = [0] ** 70000;
+    assert(digest_bytes(&gx.g, img_gx[0..digest_len()]) == digest_len());
+    i = 0;
+    while (i < digest_len()) {
+        assert(img_gx[i as usize] == img_direct[i as usize]);
+        i = i + 1;
+    }
+    // and the digests agree: the boundary's graph IS the direct graph
+    var da = graph_digest(&gx.g);
+    var db = graph_digest(&gd);
+    i = 0;
+    while (i < 32) {
+        assert(da[i as usize] == db[i as usize]);
+        i = i + 1;
+    }
+}
+
+test "the 24-event fixture log replays to the graph the direct law builds" {
+    // the recorded log: the fixture's first 24 events, serialized as #12005 records
+    var gx = gx_fresh();
+    var r : u32 = 0;
+    while (r < 24) {
+        row_write(&gx, r, event_at(r));
+        r = r + 1;
+    }
+    assert(gx_log_set_len(&gx, 24 * EVENT_BYTES) == true);
+    // the direct path: the same 24 events, straight through the law
+    var gd = new_graph();
+    r = 0;
+    while (r < 24) {
+        assert(apply_event(&gd, event_at(r)) == WG_OK);
+        r = r + 1;
+    }
+    // the load path
+    assert(gx_replay(&gx, LOG_OFF, 24 * EVENT_BYTES) == WG_OK);
+    // the counts are REAL: equal to the direct law's, and a real graph's shape, not a stub's
+    assert(gx_node_count(&gx) == nodes(&gd));
+    assert(gx_edge_count(&gx) == edges(&gd));
+    assert(gx_node_count(&gx) >= 10);
+    assert(gx_edge_count(&gx) > 0);
+    // every node's kind and every edge's kind/endpoints read identically through the getters
+    var i : u32 = 0;
+    while (i < nodes(&gd)) {
+        assert(gx_node_kind(&gx, i) == node_kind_at_pub(&gd, i));
+        i = i + 1;
+    }
+    var j : u32 = 0;
+    while (j < edges(&gd)) {
+        assert(gx_edge_kind(&gx, j) == edge_kind_at(&gd, j));
+        assert(gx_edge_from(&gx, j) == edge_from_at(&gd, j));
+        assert(gx_edge_to(&gx, j) == edge_to_at(&gd, j));
+        assert(gx_edge_from(&gx, j) < gx_node_count(&gx));   // a real edge points at a real node
+        assert(gx_edge_to(&gx, j) < gx_node_count(&gx));
+        j = j + 1;
+    }
+    // the digest agreement: byte for byte, the direct law's own answer
+    var da = graph_digest(&gx.g);
+    var db = graph_digest(&gd);
+    i = 0;
+    while (i < 32) {
+        assert(da[i as usize] == db[i as usize]);
+        i = i + 1;
+    }
+}
+
+test "names: every spec node carries its own fixture path, every pair stays in bounds" {
+    var gx = gx_fresh();
+    var r : u32 = 0;
+    while (r < 24) {
+        row_write(&gx, r, event_at(r));
+        r = r + 1;
+    }
+    assert(gx_log_set_len(&gx, 24 * EVENT_BYTES) == true);
+    assert(gx_replay(&gx, LOG_OFF, 24 * EVENT_BYTES) == WG_OK);
+    // the direct twin: the same 24 events through the law, so node i's own id is readable
+    var gd = new_graph();
+    r = 0;
+    while (r < 24) {
+        assert(apply_event(&gd, event_at(r)) == WG_OK);
+        r = r + 1;
+    }
+    assert(gx_node_count(&gx) == nodes(&gd));
+    // at least one named node, the hard way: find each SPEC node by kind, read its name pair
+    var spec_seen : u32 = 0;
+    var i : u32 = 0;
+    while (i < gx_node_count(&gx)) {
+        const p = gx_node_name_ptr(&gx, i);
+        const n = gx_node_name_len(&gx, i);
+        // every live node's pair is inside the name region and answers a positive length
+        assert(p >= NAME_OFF);
+        assert(p + n <= NAME_OFF + NAME_CAP);
+        assert(n > 0);
+        assert(n <= NAME_ROW);
+        if (gx_node_kind(&gx, i) == NK_SPEC) {
+            spec_seen = spec_seen + 1;
+            // the expected bytes come from the DIRECT graph's own id for the same node, and
+            // the table row that id selects -- frontend for id 1, idea_factory for id 2
+            const sid = gd.node_id[i as usize];
+            const from = SPEC_PATH_OFF[(sid - 1) as usize];
+            const to = SPEC_PATH_OFF[sid as usize];
+            assert(sid >= 1);
+            assert(sid <= SPEC_COUNT);
+            assert(n == to - from);
+            var k : u32 = 0;
+            while (k < n) {
+                assert(gx.names[(i * NAME_ROW + k) as usize] == SPEC_PATH_BYTES[(from + k) as usize]);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // the fixture's join names more than one spec through the 24 events (ids 1 and 2)
+    assert(spec_seen >= 2);
+    // the names the region holds are exactly what remat wrote: no row past the live count
+    assert(gx_names_len(&gx) > 0);
+    assert(gx_names_len(&gx) <= nodes(&gx.g) * NAME_ROW);
+}
+
+test "refusals: this card's band, the law's codes verbatim, and the decode's all-or-nothing" {
+    // a bad event KIND is the LAW's refusal, verbatim, and the law refused before mutating
+    var gx = gx_fresh();
+    const bad = Event { kind: 9, from_pid: 1, to_pid: 2, task_no: 0, deliver: 0, reason: 0, seq: 1, spec_id: 0 };
+    row_write(&gx, 0, bad);
+    assert(gx_log_set_len(&gx, EVENT_BYTES) == true);
+    assert(gx_apply_event(&gx, 9, 1, 0) == ERR_WG_BAD_EVENT);
+    assert(gx_node_count(&gx) == 0);
+    assert(gx_replay(&gx, LOG_OFF, EVENT_BYTES) == ERR_WG_BAD_EVENT);
+    assert(gx_node_count(&gx) == 0);
+    // a nonzero reserved byte is refused before anything is applied, whole
+    var gx2 = gx_fresh();
+    const ev = Event { kind: EV_SPAWN, from_pid: 1, to_pid: 2, task_no: 0, deliver: 0, reason: 0, seq: 1, spec_id: 0 };
+    row_write(&gx2, 0, ev);
+    gx2.log[3] = 1;
+    assert(gx_log_set_len(&gx2, EVENT_BYTES) == true);
+    assert(gx_apply_event(&gx2, EV_SPAWN, 1, 0) == E_LAYOUT);
+    assert(gx_node_count(&gx2) == 0);
+    // a replay pointer that is not this card's log base is this card's own refusal
+    var gx3 = gx_fresh();
+    row_write(&gx3, 0, ev);
+    assert(gx_log_set_len(&gx3, EVENT_BYTES) == true);
+    assert(gx_replay(&gx3, LOG_OFF + 4, EVENT_BYTES) == E_GX_PTR);
+    assert(gx_node_count(&gx3) == 0);
+    // a length with a partial row in it never commits, and a committed length must match
+    assert(gx_log_set_len(&gx3, EVENT_BYTES + 1) == false);
+    assert(gx_log_set_len(&gx3, 0) == false);
+    assert(gx_log_set_len(&gx3, LOG_BYTES + EVENT_BYTES) == false);
+    assert(gx_replay(&gx3, LOG_OFF, 2 * EVENT_BYTES) == E_GX_LEN);
+    assert(gx_node_count(&gx3) == 0);
+    // a mid-log law refusal passes the law's code and keeps the law's own partial semantics:
+    // row 0 stands, row 1 refused -- passed through, never rolled back here
+    var gx4 = gx_fresh();
+    row_write(&gx4, 0, ev);
+    row_write(&gx4, 1, bad);
+    assert(gx_log_set_len(&gx4, 2 * EVENT_BYTES) == true);
+    assert(gx_replay(&gx4, LOG_OFF, 2 * EVENT_BYTES) == ERR_WG_BAD_EVENT);
+    assert(gx_node_count(&gx4) == 2);   // the spawn of row 0 stands
+    // gx_reset returns the module to the fresh state, commit included
+    assert(gx_reset(&gx4) == WG_OK);
+    assert(gx_node_count(&gx4) == 0);
+    assert(gx_names_len(&gx4) == 0);
+    assert(gx_apply_event(&gx4, EV_SPAWN, 1, 0) == E_STATE);
+}
+
+test "reads are idempotent: no action between them, every pair answers twice the same" {
+    var gx = gx_fresh();
+    var r : u32 = 0;
+    while (r < 24) {
+        row_write(&gx, r, event_at(r));
+        r = r + 1;
+    }
+    assert(gx_log_set_len(&gx, 24 * EVENT_BYTES) == true);
+    assert(gx_replay(&gx, LOG_OFF, 24 * EVENT_BYTES) == WG_OK);
+    // every name pair read twice with no action between answers identical numbers and bytes
+    var i : u32 = 0;
+    while (i < gx_node_count(&gx)) {
+        const p1 = gx_node_name_ptr(&gx, i);
+        const p2 = gx_node_name_ptr(&gx, i);
+        const n1 = gx_node_name_len(&gx, i);
+        const n2 = gx_node_name_len(&gx, i);
+        assert(p1 == p2);
+        assert(n1 == n2);
+        var k : u32 = 0;
+        while (k < n1) {
+            const a = gx.names[(i * NAME_ROW + k) as usize];
+            const b = gx.names[(i * NAME_ROW + k) as usize];
+            assert(a == b);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    // and the counts are stable across reads
+    assert(gx_node_count(&gx) == gx_node_count(&gx));
+    assert(gx_edge_count(&gx) == gx_edge_count(&gx));
+    assert(gx_names_len(&gx) == gx_names_len(&gx));
+}
+
+test "the path table is the fixture's own eight paths" {
+    // the local faithful copy is pinned the hard way: offsets, lens, the shared head, the
+    // shared tail and the whole-table byte sum (the E_BUDGET precedent's discipline)
+    assert(SPEC_PATH_OFF[0] == 0);
+    assert(SPEC_PATH_OFF[SPEC_COUNT] == 196);
+    assert(SPEC_PATH_BYTES.len == 196);
+    // per-path lens, from the fixture's own SPEC_NAMES order: frontend 23, idea_factory 27,
+    // lesson_reel 26, spec_graph 25, particle_engine 30, hud 18, display_list 27, scene 20
+    assert(name_len_of(NK_SPEC, 1) == 23);
+    assert(name_len_of(NK_SPEC, 2) == 27);
+    assert(name_len_of(NK_SPEC, 3) == 26);
+    assert(name_len_of(NK_SPEC, 4) == 25);
+    assert(name_len_of(NK_SPEC, 5) == 30);
+    assert(name_len_of(NK_SPEC, 6) == 18);
+    assert(name_len_of(NK_SPEC, 7) == 27);
+    assert(name_len_of(NK_SPEC, 8) == 20);
+    var i : u32 = 0;
+    var sum : u32 = 0;
+    while (i < 196) {
+        sum = sum + SPEC_PATH_BYTES[i as usize];
+        i = i + 1;
+    }
+    assert(sum == 17882);             // the whole-table checksum: any drifted byte fails
+    // every path starts "specs/" and ends ".t27"
+    i = 0;
+    while (i < SPEC_COUNT) {
+        const from = SPEC_PATH_OFF[i as usize];
+        const to = SPEC_PATH_OFF[(i + 1) as usize];
+        assert(SPEC_PATH_BYTES[from as usize] == 115);                       // 's'
+        assert(SPEC_PATH_BYTES[(from + 1) as usize] == 112);                 // 'p'
+        assert(SPEC_PATH_BYTES[(to - 1) as usize] == 55);                    // '7'
+        assert(SPEC_PATH_BYTES[(to - 2) as usize] == 50);                    // '2'
+        assert(SPEC_PATH_BYTES[(to - 3) as usize] == 116);                   // 't'
+        assert(SPEC_PATH_BYTES[(to - 4) as usize] == 46);                    // '.'
+        i = i + 1;
+    }
+    // a spec id outside the join and every other kind answer the tagged width, never a path
+    assert(name_len_of(NK_SPEC, 0) == TAGGED_LEN);
+    assert(name_len_of(NK_SPEC, SPEC_COUNT + 1) == TAGGED_LEN);
+    assert(name_len_of(NK_AGENT, 1) == TAGGED_LEN);
+    assert(TAGGED_LEN == 11);
+}
+
+// ---- invariants ----------------------------------------------------------------------------------------
+
+invariant the_band_is_the_one_the_contract_left_empty {
+    // live_struct_glue's own header: 36..63 was left empty so a future card could take it
+    // without renumbering anyone. This card is that card: its base sits strictly between the
+    // graph band's top (35) and the glue band's base (64), and its codes are base + 1, + 2.
+    assert(GX_REFUSED_BASE == 36);
+    assert(GX_REFUSED_BASE > 35);
+    assert(GX_REFUSED_BASE < 64);
+    assert(E_GX_LEN == GX_REFUSED_BASE + 1);
+    assert(E_GX_PTR == GX_REFUSED_BASE + 2);
+    assert(GX_REFUSED_BASE + 2 < 64);
+    // the disciplines the contract already owns keep the contract's codes by import
+    assert(E_STATE == 67);
+    assert(E_LAYOUT == 68);
+}
+
+invariant the_regions_tile_above_the_contract_without_overlap {
+    // the contract's memory ends at MEM_CAP; this card's two regions tile the room above it,
+    // in the contract's own order-after style, and end exactly at the log region's top
+    assert(NAME_OFF == MEM_CAP);
+    assert(NAME_CAP == NODE_CAP * NAME_ROW);
+    assert(LOG_OFF == NAME_OFF + NAME_CAP);
+    assert(LOG_BYTES == LOG_ROWS * EVENT_BYTES);
+    assert(EVENT_BYTES == 32);
+    assert(NAME_ROW == 32);
+    assert(LOG_ROWS == 64);
+    // the image pair answers the contract's own region, by import, never a restated literal
+    assert(IMAGE_OFF == GRAPH_OFF);
+    assert(IMAGE_LEN == GRAPH_LEN);
+    assert(IMAGE_LEN == digest_len());
+}
+
+invariant the_surface_is_one_table {
+    // the 18 names the struct-path emitter must emit for this plane, counted here so the
+    // emitter's build test can diff its export list against this card (the names themselves
+    // are pinned on the Zig side, the contract's own str-equality caveat)
+    assert(EXPORT_NAMES.len == 18);
+    assert(KIND_TAG.len == 10);
+    assert(SPEC_COUNT == 8);
+}

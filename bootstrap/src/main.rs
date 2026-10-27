@@ -76,6 +76,13 @@ use corpus_receipt as cr;
 #[path = "../gen/rust/verified/ddc_receipt.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod ddc_receipt;
+// #10457: specs/verified/gen_file_check.t27 (seal --verify) and specs/compiler/compile_output.t27 (compile).
+#[path = "../gen/rust/verified/gen_file_check.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod gen_file_check;
+#[path = "../gen/rust/compiler/compile_output.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod compile_output;
 fn cr_sha(parts: &[&[u8]]) -> [u8; 32] { use sha2::Digest; parts.iter().fold(sha2::Sha256::new(), |h, p| h.chain_update(p)).finalize().into() }
 fn cr_root(l: &[String]) -> [u8; 32] { let k = cr::split_point(l.len() as u32) as usize;
     if l.len() < 2 { l.first().map_or(cr_sha(&[]), |x| cr_sha(&[&[cr::LEAF_PREFIX], x.as_bytes()])) } else { cr_sha(&[&[cr::NODE_PREFIX], &cr_root(&l[..k]), &cr_root(&l[k..])]) } }
@@ -3662,18 +3669,17 @@ async fn coverage_handler(Json(req): Json<CompileRequest>) -> impl IntoResponse 
         Ok(ast) => {
             let mut fn_names = Vec::new();
             let mut tested_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
-            fn collect_calls(node: &compiler::Node, calls: &mut std::collections::HashSet<String>) {
-                if node.kind == compiler::NodeKind::ExprCall && !node.name.is_empty() {
-                    calls.insert(node.name.clone());
+            // one walk: every FnDecl anywhere, and the bare name of every call inside a
+            // test block at any depth (#11808: qualified calls and nested blocks were unread).
+            fn walk(n: &compiler::Node, fns: &mut Vec<String>, calls: &mut std::collections::HashSet<String>, in_test: bool) {
+                if n.kind == compiler::NodeKind::FnDecl { fns.push(n.name.clone()); }
+                if in_test && n.kind == compiler::NodeKind::ExprCall && !n.name.is_empty() {
+                    calls.insert(n.name.rsplit('.').next().unwrap_or(&n.name).to_string());
                 }
-                for child in &node.children { collect_calls(child, calls); }
+                let t = in_test || matches!(n.kind, compiler::NodeKind::TestBlock | compiler::NodeKind::InvariantBlock | compiler::NodeKind::BenchBlock);
+                for child in &n.children { walk(child, fns, calls, t); }
             }
-            for child in &ast.children {
-                if child.kind == compiler::NodeKind::FnDecl { fn_names.push(child.name.clone()); }
-                if matches!(child.kind, compiler::NodeKind::TestBlock | compiler::NodeKind::InvariantBlock | compiler::NodeKind::BenchBlock) {
-                    collect_calls(child, &mut tested_fns);
-                }
-            }
+            walk(&ast, &mut fn_names, &mut tested_fns, false);
             let covered: Vec<&String> = fn_names.iter().filter(|f| tested_fns.contains(*f)).collect();
             let uncovered: Vec<&String> = fn_names.iter().filter(|f| !tested_fns.contains(*f)).collect();
             let pct = if !fn_names.is_empty() { 100.0 * covered.len() as f64 / fn_names.len() as f64 } else { 0.0 };
@@ -3781,7 +3787,6 @@ async fn run_server(port_arg: &str) -> anyhow::Result<()> {
 // ============================================================================
 
 /// Top-level items of a module body, as (label, first line, last line).
-///
 /// Line-based, and it says so: the suite's own phase is the authority on the
 /// COUNT, and this only has to point at the construct. An item starts at a line
 /// whose indentation is one level in and whose first word is a keyword, and ends
@@ -3867,16 +3872,9 @@ fn run_catalog_gate(catalog: &str, specs_dir: &str, verbose: bool) -> anyhow::Re
             println!("    [{}] {}: {}", f.check, f.id, f.detail);
         }
     }
-    // W702: this command printed `FINDINGS 3` and returned 0.
-    //
-    // Measured before the change: `t27c catalog-gate; echo $?` gives EXIT=0 with
-    // three findings on screen. Its only terminator was `Ok(())`. A verdict a
-    // caller cannot read is decoration, and the CLI is where a human runs this
-    // gate by hand -- the suite counts the same findings and is the only reason
-    // any of them reach a build.
-    //
-    // `ALLOWED` is shared with the suite so the two cannot drift into
-    // disagreeing about which findings are debt.
+    // W702: this command printed `FINDINGS 3` and returned 0 (`t27c
+    // catalog-gate; echo $?` -> EXIT=0). A verdict a caller cannot read is
+    // decoration; `ALLOWED` is shared with the suite so the two cannot drift.
     let unexpected = r
         .findings
         .iter()
@@ -4209,7 +4207,6 @@ fn run_parse_conform() -> anyhow::Result<()> {
 }
 
 /// Name the top-level items the parser stops on, by removing one at a time.
-///
 /// `--show` prints WHAT was dropped and is the direct answer; this is for the
 /// case where the dropped tokens alone do not say which construct owns them.
 /// It exists because a command that answered this did not, and I built a whole
@@ -4258,7 +4255,6 @@ fn run_bisect(path: &str) -> anyhow::Result<()> {
 }
 
 /// Contiguous runs of dropped tokens, as `(head lexeme, token count)`.
-///
 /// A run breaks at a line gap: the spans carry a line but no column, so two
 /// dropped regions on the same line are indistinguishable from one, and a blank
 /// or surviving line between them is the only separator available. That is a
@@ -4303,11 +4299,9 @@ fn run_parse_complete(
     // instrument that stops one step short.
     //
     // W702: this arm was moved above the `--show` handler so it could win when
-    // BOTH flags are given, and its `if fallbacks` guard was left behind. Plain
-    // `--show` then printed the fallback view instead of the token view it is
-    // documented to print, and the token view became unreachable. Nothing
-    // failed: both outputs are plausible, and the flag that selects between
-    // them was the one that stopped being read.
+    // BOTH flags given, `if fallbacks` left behind: plain `--show` printed the
+    // fallback view, and the token view became unreachable -- nothing failed,
+    // the selecting flag just stopped being read.
     if fallbacks {
         if let Some(path) = show {
             let src = std::fs::read_to_string(path)?;
@@ -4378,10 +4372,8 @@ fn run_parse_complete(
     // W699: what the parser STOPPED ON, corpus-wide.
     //
     // The classification this replaces was a keyword match over the printed
-    // traces, run from outside the compiler -- it guessed `forall` from the
-    // presence of the word. This asks the record: the head of each contiguous
-    // dropped run IS the token recovery began at. `forall` is not the answer it
-    // gives, and the answer it gives is better.
+    // It guessed `forall` from the word's presence; the record shows the head
+    // of each dropped run IS where recovery began -- and that answer is better.
     if fallbacks {
         let mut by: std::collections::BTreeMap<(&'static str, String), (usize, std::collections::BTreeSet<String>)> =
             std::collections::BTreeMap::new();
@@ -4658,7 +4650,8 @@ fn gated_backend(
     }
 }
 
-fn run_gen(input_path: &str) -> anyhow::Result<()> {
+/// What gen, gen-c and gen-rust emit (W584: `use` resolution is backend-agnostic) and seal --verify reads.
+fn gen_resolved(input_path: &str, compile: fn(&str) -> Result<String, String>) -> anyhow::Result<String> {
     let path = Path::new(input_path);
     let raw = fs::read_to_string(path)?;
     typecheck_gate(path, &raw)?;
@@ -4674,9 +4667,9 @@ fn run_gen(input_path: &str) -> anyhow::Result<()> {
     for note in use_resolve::unresolved_notes(&resolved) {
         eprintln!("{}", note);
     }
-    let zig_code = match compiler::Compiler::compile(&resolved) {
+    let code = match compile(&resolved) {
         Ok(code) => code,
-        Err(spliced_err) => match compiler::Compiler::compile(&raw) {
+        Err(spliced_err) => match compile(&raw) {
             Ok(code) => {
                 // The splice is discarded here and the unresolved source used
                 // instead. Without this line that is invisible: the command
@@ -4690,7 +4683,11 @@ fn run_gen(input_path: &str) -> anyhow::Result<()> {
             Err(_) => anyhow::bail!("Compile error: {}", spliced_err),
         },
     };
-    print!("{}", zig_code);
+    Ok(code)
+}
+
+fn run_gen(input_path: &str) -> anyhow::Result<()> {
+    print!("{}", gen_resolved(input_path, compiler::Compiler::compile)?);
     Ok(())
 }
 
@@ -5011,10 +5008,8 @@ fn extract_module_name_from_verilog(verilog: &str) -> String {
 }
 
 /// Wave 32 (R-TS-1): emit the balanced-ternary HW primitive library.
-///
 /// Writes the full trit stdlib (7 modules) to `output` if provided, otherwise
 /// to stdout. Pure additive surface -- does not parse or touch any .t27 spec.
-///
 /// See bootstrap/src/trit_stdlib.rs for the emitter and per-module truth tables.
 fn run_gen_trit_stdlib(output: Option<&str>) -> anyhow::Result<()> {
     let verilog = trit_stdlib::build_trit_stdlib_verilog();
@@ -5500,74 +5495,20 @@ fn run_gen_testbench(input_path: &str, period_ns: u32, max_cycles: u32, output: 
 }
 
 fn run_gen_c(input_path: &str) -> anyhow::Result<()> {
-    let path = Path::new(input_path);
-    let raw = fs::read_to_string(path)?;
-    typecheck_gate(path, &raw)?;
-    // W584: `use` resolution is a source-to-source pass (W569), so it is
-    // backend-agnostic -- only `gen` was calling it, which is why the C headers
-    // failed on types declared in modules they import. Same safety contract:
-    // if the spliced source stops compiling, the original is used.
-    let resolved = use_resolve::resolve(path, &raw);
-    for note in use_resolve::unresolved_notes(&resolved) {
-        eprintln!("{}", note);
-    }
-    let c_code = match compiler::Compiler::compile_c(&resolved) {
-        Ok(code) => code,
-        Err(spliced_err) => match compiler::Compiler::compile_c(&raw) {
-            Ok(code) => {
-                // The splice is discarded here and the unresolved source used
-                // instead. Without this line that is invisible: the command
-                // succeeds, and every import it resolved is silently gone.
-                eprintln!(
-                    "note: spliced source did not compile, falling back to the \
-            unresolved original -- imported declarations are NOT in this output"
-                );
-                code
-            }
-            Err(_) => anyhow::bail!("Compile error: {}", spliced_err),
-        },
-    };
-    print!("{}", c_code);
+    print!("{}", gen_resolved(input_path, compiler::Compiler::compile_c)?);
     Ok(())
 }
 
 fn run_gen_rust(input_path: &str) -> anyhow::Result<()> {
-    let path = Path::new(input_path);
-    let raw = fs::read_to_string(path)?;
-    typecheck_gate(path, &raw)?;
-    // W584: same as gen-c -- `use` resolution is backend-agnostic and only
-    // `gen` was calling it.
-    let resolved = use_resolve::resolve(path, &raw);
-    for note in use_resolve::unresolved_notes(&resolved) {
-        eprintln!("{}", note);
-    }
-    let rust_code = match compiler::Compiler::compile_rust(&resolved) {
-        Ok(code) => code,
-        Err(spliced_err) => match compiler::Compiler::compile_rust(&raw) {
-            Ok(code) => {
-                // The splice is discarded here and the unresolved source used
-                // instead. Without this line that is invisible: the command
-                // succeeds, and every import it resolved is silently gone.
-                eprintln!(
-                    "note: spliced source did not compile, falling back to the \
-            unresolved original -- imported declarations are NOT in this output"
-                );
-                code
-            }
-            Err(_) => anyhow::bail!("Compile error: {}", spliced_err),
-        },
-    };
-    print!("{}", rust_code);
+    print!("{}", gen_resolved(input_path, compiler::Compiler::compile_rust)?);
     Ok(())
 }
 
 /// Get a spec into an AST the declaration backends can walk, and hand back the
 /// display name they put in the generated file's header.
-///
 /// `use` resolution runs first, as it does for gen-c and gen-rust: it is
 /// backend-agnostic, and a backend that skips it silently drops every imported
 /// declaration.
-///
 /// It is one function because `gen-js` and `gen-ts` must fail on the same
 /// inputs. Two copies of this would be two answers to "did the imports land?"
 /// for one spec, and the second copy is where the fallback below gets forgotten.
@@ -5604,7 +5545,6 @@ fn ast_for_codegen(input_path: &str) -> anyhow::Result<(compiler::Node, String)>
 }
 
 /// `gen-js`: print the spec's declarations as a JavaScript ES module.
-///
 /// Our MCP servers run on JavaScript, and until this existed a .t27 spec that
 /// described one had no way to reach them -- so each such spec grew a
 /// hand-written generator in a foreign language beside it, and that generator,
@@ -5621,7 +5561,6 @@ fn run_gen_js(input_path: &str) -> anyhow::Result<()> {
 }
 
 /// `gen-ts`: the same declarations, with the types the spec declared for them.
-///
 /// `gen-js` closed the hole where a hand-written generator decided what the
 /// artifact said. It left a smaller one: a `.t27` declaration carries a type,
 /// an ES module has nowhere to put it, and a `.d.ts` written by hand beside the
@@ -5827,7 +5766,6 @@ fn compute_seal_hashes(input_path: &str) -> anyhow::Result<SealHashes> {
 
 /// The `spec_path` a seal records: relative to the working directory, which is
 /// the directory `.trinity/seals` resolves against, with `/` separators.
-///
 /// #6913: the path used to be recorded as typed. `t27c seal --save` given an
 /// absolute path committed three seals (#6789) naming the sealing agent's own
 /// worktree, which every checker then found dangling; and the twin refresh in
@@ -6002,10 +5940,23 @@ fn run_seal(input_path: &str, save: bool, verify: bool, force: bool) -> anyhow::
             std::process::exit(1);
         }
 
-        if all_match {
+        // specs/verified/gen_file_check.t27: a committed gen file is what its generator emits today.
+        // gen/json is not read yet: gen-json renders a spec-specific shape, with no in-memory producer.
+        let (rel, h) = (hashes.spec_path.trim_start_matches("specs/").trim_end_matches(".t27"), |b: &[u8]| u64::from_str_radix(&sha256_hex(b)[..16], 16).unwrap_or(0));
+        let check = |file: String, made: Option<&str>| {
+            let read = fs::read(&file);
+            let code = gen_file_check::gen_file_check(Path::new(&file).exists(), read.is_ok(), read.as_deref().map_or(0, h), made.is_some(), made.map_or(0, |m| h(m.as_bytes())));
+            if !gen_file_check::gen_file_passes(code) { println!("{}: {}", file, ["", "", "DRIFT (not what its generator emits today)", "UNREADABLE", "ORPHAN (its backend no longer generates this spec)"][code as usize]); }
+            code
+        };
+        let rust = gen_resolved(input_path, compiler::Compiler::compile_rust).ok();
+        let (r1, r2) = (check(format!("bootstrap/gen/rust/{rel}.rs"), rust.as_deref()), check(format!("gen/rust/{rel}.rs"), rust.as_deref()));
+        let c = check(format!("gen/c/{rel}.c"), gen_resolved(input_path, compiler::Compiler::compile_c).ok().as_deref());
+        let v = check(format!("gen/verilog/{rel}.v"), compiler::Compiler::compile_verilog_at_reporting(&fs::read_to_string(input_path)?, Path::new(input_path)).ok().map(|r| r.0).as_deref());
+        if gen_file_check::verify_passes(all_match, if gen_file_check::gen_file_passes(r1) { r2 } else { r1 }, c, v, gen_file_check::GEN_ABSENT) {
             println!("\nall hashes MATCH");
         } else {
-            println!("\nVERIFICATION FAILED — hashes differ from saved seal");
+            println!("\nVERIFICATION FAILED — {}", if all_match { "a committed gen file is not its generator's output" } else { "hashes differ from saved seal" });
             std::process::exit(1);
         }
     } else if save {
@@ -6272,6 +6223,13 @@ fn run_compile(input_path: &str, backend: &str, output: Option<&str>) -> anyhow:
         }
     };
 
+    // specs/compiler/compile_output.t27: never the spec itself, never a hand-written file unless -o names it.
+    let existing = fs::read(&out_path);
+    let marker = existing.as_deref().map_or(0, |b| String::from_utf8_lossy(b).lines().position(|l| l.contains("generated by t27c")).map_or(0, |i| i as u32 + 1));
+    match compile_output::output_check(fs::canonicalize(&out_path).ok() == fs::canonicalize(path).ok(), out_path.exists(), existing.is_ok(), marker, output.is_some()) {
+        compile_output::OUT_WRITE => {}
+        r => anyhow::bail!("refusing to write {}: {}", out_path.display(), ["", "it has no \"generated by t27c\" header; name it with -o to replace it", "it cannot be read", "it is the input spec"][r as usize]),
+    }
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -6913,13 +6871,11 @@ fn run_validate_phi_identity() -> Result<(), anyhow::Error> {
 }
 
 /// Synthesis-in-the-loop gate.
-///
 /// `synth-readiness` scans specs statically (parse / typecheck / gen succeeded).
 /// That is exactly the measurement the literature warns is optimistic: Fu et al.,
 /// "Synthesis-in-the-Loop Evaluation of LLMs for RTL Generation" (arXiv:2603.11287),
 /// report that simulation-level pass rates materially overstate true hardware
 /// readiness, because code can simulate and still fail to synthesize.
-///
 /// This gate closes that gap for t27's own backend: it emits Verilog for each
 /// spec and then actually invokes yosys `synth_xilinx`, reporting the fraction
 /// that survives to a gate-level netlist along with the cell count.
@@ -7194,13 +7150,11 @@ fn scan_vacuity(src: &str) -> VacuityCounts {
 }
 
 /// Audit the seal store.
-///
 /// A seal whose every `gen_hash_*` is "none" records that no backend produced
 /// output. Such a seal VERIFIES GREEN (none matches none) while certifying
 /// nothing -- it converts the integrity gate from a mismatch alarm into a
 /// rubber stamp. Wave 551 found 30 seals degraded that way, and the wave-loop
 /// that found them had caused all 30 itself by resealing unparseable specs.
-///
 /// This also reports seals whose spec file has gone missing, and seals whose
 /// spec no longer generates any backend output (the live version of the same
 /// problem).
@@ -11101,28 +11055,38 @@ fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
     println!("  Benchmarks: {}", bench_names.len());
 
     if verbose {
-        if !test_names.is_empty() {
-            println!("\n  Test blocks:");
-            for name in &test_names {
-                println!("    {}", name);
+        let list = |title: &str, names: &Vec<String>| {
+            if !names.is_empty() {
+                println!("\n  {}:", title);
+                for name in names {
+                    println!("    {}", name);
+                }
             }
-        }
-        if !inv_names.is_empty() {
-            println!("\n  Invariants:");
-            for name in &inv_names {
-                println!("    {}", name);
-            }
-        }
-        if !bench_names.is_empty() {
-            println!("\n  Benchmarks:");
-            for name in &bench_names {
-                println!("    {}", name);
-            }
-        }
+        };
+        list("Test blocks", &test_names);
+        list("Invariants", &inv_names);
+        list("Benchmarks", &bench_names);
     }
 
     let total = test_names.len() + inv_names.len() + bench_names.len();
     println!("\n  Total: {} declarations", total);
+
+    // Execute the assertions (t27#11730): generate Zig and run `zig test` when it
+    // compiles; specs that do not compile keep the legacy declaration-only result.
+    let src = fs::read_to_string(input_path).unwrap_or_default();
+    if let Ok(ast) = compiler::Compiler::parse_ast(&src) {
+        let mut codegen = compiler::Codegen::new();
+        codegen.gen_zig(&ast);
+        let tmp = std::env::temp_dir().join("t27_test.zig");
+        if fs::write(&tmp, codegen.into_string()).is_ok() {
+            let zig = |flags: &[&str]| std::process::Command::new("zig")
+                .args(flags).arg(tmp.to_str().unwrap_or("")).status()
+                .map(|s| s.success()).unwrap_or(false);
+            if zig(&["test", "--test-no-exec"]) && !zig(&["test"]) {
+                anyhow::bail!("zig test failed");
+            }
+        }
+    }
     Ok(())
 }
 

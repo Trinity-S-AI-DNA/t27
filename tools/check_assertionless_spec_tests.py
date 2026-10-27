@@ -89,11 +89,9 @@ COMMENT_ONLY = re.compile(r"^\s*(?://.*|/\*[^*]*\*/)?\s*$")
 # are a different problem; they are the same problem spelled differently, and a
 # file that swaps one shape for the other has not improved.
 #
-# Measured three ways because the first two disagreed: `git grep -cE '^\s*assert
-# true\s*$'` returns **0** -- `-E` is POSIX ERE and does not know `\s` --
-# while `-E '^[[:space:]]*assert true$'` and `-P '^\s*assert true\s*$'` both
-# return 2247 lines. Two independent walkers then agree on 2241 tests.
-CANNOT_FAIL = re.compile(r"^\s*(?://.*|/\*[^*]*\*/|assert\s+true\s*;?)?\s*$")
+# Measured three ways (git grep -E, git grep -P, two body walkers); the walkers
+# agree and the baseline pins the count per file: 2178 cannot-fail today.
+CANNOT_FAIL = re.compile(r"^\s*(?://.*|;.*|/\*[^*]*\*/|assert\s+true\s*;?)?\s*$")
 
 
 def refuse(msg: str) -> None:
@@ -195,6 +193,8 @@ def self_check() -> int:
          "test a_b { /* verify baseline */ }\n", 1),
         ("multi-line comment body is assertionless",
          "test a_b {\n  // nothing here\n  /* nor here */\n}\n", 1),
+        ("a ; comment body is assertionless too",
+         "test a_b {\n  ; nothing here\n}\n", 1),
         ("a real assertion is NOT",
          "test a_b { assert x == 1 }\n", 0),
         ("a multi-line real body is NOT",

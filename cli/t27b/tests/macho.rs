@@ -47,6 +47,7 @@ fn func(name: &str, params: &[Ty], ret: Ty, body: Vec<Stmt>, slots: Vec<SlotInfo
         vars: params.iter().enumerate().map(|(i, &t)| Var { name: format!("p{}", i), ty: t }).collect(),
         body,
         line: 1,
+        is_pub: false,
         is_test: false,
         is_invariant: false,
         noreturn_site: 1,

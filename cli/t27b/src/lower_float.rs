@@ -85,6 +85,21 @@ impl<'a> Lower<'a> {
         self.builtin_plan(n).map(Some)
     }
 
+    /// A bare callee the reference's Zig backend rewrites to a builtin (`exp(`, `log(`, `sin(`, `tanh(`,
+    /// ...): the same call the written name makes, when the spec declares no fn of that name (libm_plan.t27's
+    /// `bare_target`, the reference's `declared_fns` guard). `abs` and `sqrt` are `bare_abs`'s. `None`: not a
+    /// bare builtin, or a declared fn of that name wins.
+    pub(super) fn bare_builtin(&mut self, n: &Node) -> R<Option<Val>> {
+        let target = xp::bare_target(n.name.as_bytes());
+        if target.is_empty() || target == "@abs" || target == "@sqrt"
+            || self.sigs.contains_key(n.name.as_str()) || self.poison_names.contains(n.name.as_str())
+            || self.unresolved.contains(&n.name)
+        {
+            return Ok(None);
+        }
+        self.expr(&Node { name: target.into(), ..n.clone() }).map(Some)
+    }
+
     /// `@abs`, `@max`, `@min`, `@divTrunc` and a bare `abs`: operands, result type and select chain/operator are specs/tri/t27b/builtin_plan.t27.
     pub(super) fn builtin_plan(&mut self, n: &Node) -> R<Val> {
         let b = match n.name.as_str() { "@abs" => bp::ABS, "@max" => bp::MAX, "@min" => bp::MIN, "@divTrunc" => bp::DIV_TRUNC, _ => bp::BARE_ABS };

@@ -1,7 +1,6 @@
-//! `pass_vacuous` (#6115): a test that passes having executed no runtime
-//! assert. The count is the reference interpreter's, which `t27b test --check`
-//! runs beside the JIT for every test; `corpus` labels a pass with a count of 0
-//! `pass_vacuous`.
+//! `pass_vacuous` (#6115): a pass having executed no runtime assert, per the
+//! reference interpreter `t27b test --check` runs beside the JIT; #12751 adds
+//! the CT-VERIFIED count, so a folded-only pass is no longer called vacuous.
 
 use std::path::Path;
 
@@ -9,17 +8,19 @@ use t27b::eval::Interp;
 use t27b::ir::OverflowMode;
 use t27b::{front, lower};
 
-/// Runtime asserts executed by every test of `src`, summed.
-fn runtime_asserts(name: &str, src: &str) -> u64 {
+/// (runtime asserts, compile-time-verified checks) over every test, summed.
+fn parsed_ct(name: &str, src: &str) -> (u64, u64) {
     let parsed = front::parse(Path::new(name), src).expect("fixture parses");
     let prog = lower::lower(&parsed.ast, OverflowMode::Trap).expect("fixture lowers");
     let mut total = 0;
+    let mut ct = 0;
     for (id, _) in prog.tests() {
         let mut it = Interp::new(&prog);
         it.call(id, &[]).expect("fixture test passes");
         total += it.asserts;
+        ct += it.ct_verified;
     }
-    total
+    (total, ct)
 }
 
 /// Every assert folds to a constant: nothing is checked at run time.
@@ -57,16 +58,17 @@ test loops {
 "#;
 
 #[test]
-fn constant_only_asserts_are_vacuous() {
-    assert_eq!(runtime_asserts("vacuous_fixture.t27", CONSTANT_ONLY), 0);
+fn constant_only_asserts_are_ct_verified_not_vacuous() {
+    // #12751 parity: folded checks count as CT-VERIFIED, not vacuous.
+    assert_eq!(parsed_ct("vacuous_fixture.t27", CONSTANT_ONLY), (0, 3));
 }
 
 #[test]
 fn runtime_asserts_are_counted() {
-    assert_eq!(runtime_asserts("runtime_fixture.t27", RUNTIME), 2);
+    assert_eq!(parsed_ct("runtime_fixture.t27", RUNTIME), (2, 0));
 }
 
 #[test]
 fn asserts_are_counted_per_execution() {
-    assert_eq!(runtime_asserts("loop_fixture.t27", LOOP), 4);
+    assert_eq!(parsed_ct("loop_fixture.t27", LOOP), (4, 0));
 }

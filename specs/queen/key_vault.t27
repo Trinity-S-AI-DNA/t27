@@ -1,0 +1,351 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/key_vault.t27 -- every provider key lives in the Queen's one store; every consumer leases from it
+; Owner, 2026-10-18 (translated): all API keys -- the Queen's pools and every contributor's key -- live
+; safely in ONE place and are redistributed among everyone who uses them. The Mac reviewer must not run
+; on its own keys outside the shared pool.
+; Measured 2026-10-19 (names only, no value read):
+; - the Queen's pools are Railway variables: pool 1 (TRIOS_QUEEN_WORKER_API_KEY and _1.._24) and pool 2
+;   (TRIOS_QUEEN_WORKER_POOL_2_API_KEY and _1.._9), copied to trios-agent-server, trios-bee-runner-1
+;   and trios-bee-runner-2 -- three copies of each key, all inside the Queen's own services;
+; - contributor keys are rows in the Queen's Postgres, sealed with AES-256-GCM (trios
+;   queen-contributor-keys.ts);
+; - the Mac reviewer (tools/bees/reviewer.py, launchd ai.t27.reviewer-bees) reads five more z.ai keys,
+;   ZAI_KEY_1, _2, _3, _5, _6, from ~/.claude/.env: a second home the Queen cannot see. Its reviews and
+;   the Queen's bees can hit one key at once, and neither side knows the other holds it;
+; - at the same time the Queen ran 70 bees with 354 unreviewed dispatches and about 5 reviews an hour:
+;   review, not lanes, is the bottleneck.
+; The rule here:
+;   1. a key the Queen holds (a service variable or a sealed contributor row) is in the store; a key one
+;      consumer holds alone is private, and nothing serves from it (may_serve);
+;   2. a consumer leases from the store. One that holds private keys while a lease is configured is
+;      refused: two homes for one key. One with no lease yet runs on its own keys and says so, only
+;      until the lease exists (consumer_start);
+;   3. the lanes are shared by demand. A z.ai key carries ZAI_REQUESTS_PER_KEY requests
+;      (reviewer_sizing.t27). Reviews that hold or wait for a lane get the lanes first, never fewer than
+;      one key's worth; bees get the rest (review_share, worker_share). A free lane goes to a waiting
+;      review before a bee. Inside review, no holder takes more than its share of the holders, except
+;      lanes nobody else is asking for, which are lent (holder_cap, lease_answer);
+;   4. a lease covers one request. The consumer never sees a key's value: the store makes the request on
+;      a lane and fails over to the next lane on a refusal (lease_step, after key_failover.t27
+;      error_kind). A held lease is never taken back; the share moves when leases end.
+; The admission of new bees while reviews wait is a sibling card, not this one. Not here: the wiring
+; (trios: an authenticated lease route on the Queen; the Mac: one switch). ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenKeyVault;
+
+use queen::key_failover::error_kind;
+use queen::key_failover::KE_OK;
+use queen::key_failover::KE_TRANSIENT;
+use queen::key_failover::KE_QUOTA;
+use queen::key_failover::KE_AUTH;
+use queen::key_failover::KE_REQUEST;
+use queen::key_failover::COOL_BASE_SECONDS;
+use queen::reviewer_sizing::ZAI_REQUESTS_PER_KEY;
+use queen::reviewer_sizing::U32_MAX;
+
+; --- 1. Where a key lives ----------------------------------------------------------------------------
+
+/// SRC_STORE: a key the Queen holds -- a variable of her own services or a sealed contributor row.
+/// SRC_PRIVATE: a key one consumer holds alone, outside the store (a dotenv file on a Mac, another
+/// repository's Actions secret). Any other source is unknown.
+pub const SRC_STORE : u8 = 0;
+pub const SRC_PRIVATE : u8 = 1;
+
+/// Only the store serves a lease. A private key is never leased, never pooled, never read as the
+/// store's: the Queen cannot see who else holds it, so she cannot share it.
+pub fn may_serve(src: u8) -> bool {
+    return src == SRC_STORE;
+}
+
+; --- 2. Who may start --------------------------------------------------------------------------------
+
+/// START_LEASE: the consumer leases from the store. START_OWN_KEYS: no lease is configured yet; it runs
+/// on its own keys and says so on every start, until the lease exists. START_REFUSE: it may not start.
+pub const START_LEASE : u8 = 0;
+pub const START_OWN_KEYS : u8 = 1;
+pub const START_REFUSE : u8 = 2;
+
+/// `private_keys` is the count of provider keys the consumer holds itself, `lease_on` whether a lease
+/// from the store is configured. Both at once is two homes for one key: refused, so moving the keys
+/// into the store is the only way on. Neither is a consumer with no key at all.
+pub fn consumer_start(private_keys: u32, lease_on: bool) -> u8 {
+    if (lease_on) {
+        if (private_keys > 0) { return START_REFUSE; }
+        return START_LEASE;
+    }
+    if (private_keys > 0) { return START_OWN_KEYS; }
+    return START_REFUSE;
+}
+
+/// Whether the start is logged as running outside the store.
+pub fn start_warns(answer: u8) -> bool {
+    return answer == START_OWN_KEYS;
+}
+
+; --- 3. How the lanes are shared ---------------------------------------------------------------------
+
+/// LEASE_REVIEW: a review's model call (the round reviewer, the Queen app's review, the Mac reviewer).
+/// LEASE_WORKER: a bee's turn.
+pub const LEASE_REVIEW : u8 = 0;
+pub const LEASE_WORKER : u8 = 1;
+
+/// Reviews never get fewer lanes than one key carries, even while none is asking: the next review
+/// finds a lane without waiting for a bee to end. Written as a literal and pinned to
+/// ZAI_REQUESTS_PER_KEY by an invariant: gen-c emits a const set from an imported const before the
+/// import, and that C does not compile.
+pub const REVIEW_FLOOR_LANES : u32 = 2;
+
+/// The review holders that ask the store for lanes: the round reviewer, the Queen app's review (with
+/// the shaper, through the free lane), and the Mac reviewer through the lease route. Chosen, not
+/// measured: one share each.
+pub const REVIEW_HOLDERS : u32 = 3;
+
+/// The lanes `keys` z.ai keys carry. Saturates rather than wraps.
+pub fn lanes_of(keys: u32) -> u32 {
+    if (keys > U32_MAX / ZAI_REQUESTS_PER_KEY) { return U32_MAX; }
+    return keys * ZAI_REQUESTS_PER_KEY;
+}
+
+/// The lanes reviews may hold: what they ask for -- the reviews holding a lane and the ones waiting
+/// for one (`review_demand`) -- never below REVIEW_FLOOR_LANES, never above all the lanes. Demand is
+/// lanes asked for now, not the backlog of unreviewed work: a backlog of 354 rows that 8 reviewers
+/// serve wants 8 lanes, and giving it 68 would leave 60 idle while bees wait.
+/// (Mutation: `<` to `<=` and `>` to `>=` below are equivalent -- at equality both branches give the
+/// same number.)
+pub fn review_share(total: u32, review_demand: u32) -> u32 {
+    var want : u32 = review_demand;
+    if (want < REVIEW_FLOOR_LANES) { want = REVIEW_FLOOR_LANES; }
+    if (want > total) { return total; }
+    return want;
+}
+
+/// The lanes bees may hold: all the rest.
+pub fn worker_share(total: u32, review_demand: u32) -> u32 {
+    return total - review_share(total, review_demand);
+}
+
+/// One review holder's part of the review share: the share split over the holders, rounded up, so a
+/// share of one lane still lets one holder in. 0 when the share is 0 (0 / holders, no guard needed).
+/// No holders is one holder: the whole share.
+pub fn holder_cap(share: u32, holders: u32) -> u32 {
+    if (holders == 0) { return share; }
+    var part : u32 = share / holders;
+    if (share % holders != 0) { part = part + 1; }
+    return part;
+}
+
+/// LA_GRANT: take a lane now. LA_WAIT: none for this asker now; ask again after retry_after_seconds.
+/// LA_REFUSE: never, whatever the lanes.
+pub const LA_GRANT : u8 = 0;
+pub const LA_WAIT : u8 = 1;
+pub const LA_REFUSE : u8 = 2;
+
+/// One ask for a lease. `held` is the lanes this asker already holds: one review holder's, or all the
+/// bees' together for LEASE_WORKER. `free_lanes` is the lanes no request holds now, `total` all the
+/// lanes. `review_holding` and `review_waiting` are the reviews holding and waiting for a lane; a
+/// review's own ask counts as waiting. (Mutation: `>` to `>=` in the saturating sum is equivalent --
+/// at equality the sum is U32_MAX either way.)
+/// - an unknown kind, or a source other than the store, is refused;
+/// - a review takes a lane while its holder is under holder_cap. Over it, it still takes a lane when
+///   more than holder_cap lanes are free: nobody else is asking for those, so they are lent, and
+///   holder_cap lanes stay free for the other holders;
+/// - a bee waits while every free lane is a waiting review's, and while the bees hold their share.
+pub fn lease_answer(kind: u8, src: u8, held: u32, free_lanes: u32, total: u32, review_holding: u32, review_waiting: u32) -> u8 {
+    if (kind > LEASE_WORKER) { return LA_REFUSE; }
+    if (may_serve(src) == false) { return LA_REFUSE; }
+    if (free_lanes == 0) { return LA_WAIT; }
+    var demand : u32 = review_holding;
+    if (demand > U32_MAX - review_waiting) { demand = U32_MAX; } else { demand = demand + review_waiting; }
+    if (kind == LEASE_REVIEW) {
+        var cap : u32 = holder_cap(review_share(total, demand), REVIEW_HOLDERS);
+        if (held < cap) { return LA_GRANT; }
+        if (free_lanes > cap) { return LA_GRANT; }
+        return LA_WAIT;
+    }
+    if (free_lanes <= review_waiting) { return LA_WAIT; }
+    if (held >= worker_share(total, demand)) { return LA_WAIT; }
+    return LA_GRANT;
+}
+
+/// Seconds a waiting asker waits before it asks again: the short rest key_failover.t27 gives a
+/// transient refusal, so a wait never outlasts a lane's own rest. 0 for any other answer.
+pub fn retry_after_seconds(answer: u8) -> u32 {
+    if (answer == LA_WAIT) { return COOL_BASE_SECONDS; }
+    return 0;
+}
+
+; --- 4. One leased request ---------------------------------------------------------------------------
+
+/// The store makes the request on a lane; the consumer gets the answer, never the key. A lease covers
+/// one request and lasts at most LEASE_SECONDS: the Mac reviewer's own request timeout (API_TIMEOUT_MS
+/// 600000 in tools/bees/reviewer.py), so the store never cuts a request the consumer still waits for.
+pub const LEASE_SECONDS : u32 = 600;
+
+/// A refused request tries at most LEASE_TRIES lanes, each once: the free lane's MAX_LANES in trios
+/// queen-free-lane.ts.
+pub const LEASE_TRIES : u32 = 3;
+
+/// LS_ANSWER: hand this answer to the consumer. LS_NEXT_LANE: try the request on the next lane.
+pub const LS_ANSWER : u8 = 0;
+pub const LS_NEXT_LANE : u8 = 1;
+
+/// `status` and `zai_code` are the lane's answer (key_failover.t27 error_kind), `tries` the lanes tried
+/// so far, this one included. A refusal of the lane (transient, quota, auth) moves to the next lane
+/// while tries are left; an answer or a wrong request goes back as it is, because every lane would
+/// answer a wrong request the same.
+pub fn lease_step(status: u32, zai_code: u32, tries: u32) -> u8 {
+    var kind : u8 = error_kind(status, zai_code);
+    if (kind == KE_OK) { return LS_ANSWER; }
+    if (kind == KE_REQUEST) { return LS_ANSWER; }
+    if (tries >= LEASE_TRIES) { return LS_ANSWER; }
+    return LS_NEXT_LANE;
+}
+
+; --- 5. Tests -----------------------------------------------------------------------------------------
+
+test only_the_store_serves {
+    assert may_serve(SRC_STORE) == true;
+    // negative controls: a private key, an unknown source
+    assert may_serve(SRC_PRIVATE) == false;
+    assert may_serve(7) == false;
+}
+
+test a_consumer_with_two_homes_is_refused {
+    // the Mac reviewer after the move: the lease, no key of its own
+    assert consumer_start(0, true) == START_LEASE;
+    // the Mac reviewer today: five keys in ~/.claude/.env, no lease yet
+    assert consumer_start(5, false) == START_OWN_KEYS;
+    assert start_warns(consumer_start(5, false)) == true;
+    // negative control: the lease configured while the five keys stay in the dotenv
+    assert consumer_start(5, true) == START_REFUSE;
+    assert consumer_start(1, true) == START_REFUSE;
+    // no key and no lease: nothing to run on
+    assert consumer_start(0, false) == START_REFUSE;
+    assert start_warns(START_LEASE) == false;
+    assert start_warns(START_REFUSE) == false;
+}
+
+test lanes_follow_the_keys {
+    // pools 1 and 2: 24 + 10 keys
+    assert lanes_of(34) == 68;
+    assert lanes_of(0) == 0;
+    assert lanes_of(1) == REVIEW_FLOOR_LANES;
+    assert lanes_of(2147483647) == 4294967294;
+    assert lanes_of(2147483648) == U32_MAX;
+}
+
+test reviews_get_the_lanes_they_ask_for_first {
+    // idle: one key's worth stays with review, bees get the rest
+    assert review_share(68, 0) == 2;
+    assert worker_share(68, 0) == 66;
+    // 8 reviewers busy, 4 waiting: 12 lanes, not the 354-row backlog
+    assert review_share(68, 12) == 12;
+    assert worker_share(68, 12) == 56;
+    // more demand than lanes: review takes them all, bees none
+    assert review_share(68, 354) == 68;
+    assert worker_share(68, 354) == 0;
+    // fewer lanes than the floor
+    assert review_share(1, 0) == 1;
+    assert worker_share(1, 0) == 0;
+    assert review_share(0, 5) == 0;
+    assert worker_share(0, 5) == 0;
+}
+
+test a_holder_takes_its_part_of_the_share {
+    assert holder_cap(12, 3) == 4;
+    assert holder_cap(13, 3) == 5;
+    assert holder_cap(2, 3) == 1;
+    assert holder_cap(1, 3) == 1;
+    assert holder_cap(0, 3) == 0;
+    assert holder_cap(68, 1) == 68;
+    assert holder_cap(68, 0) == 68;
+    assert holder_cap(U32_MAX, 2) == 2147483648;
+}
+
+/// The conformance table: one assert per row. Columns: kind, source, held, free lanes, total lanes,
+/// reviews holding, reviews waiting.
+test conformance_rows {
+    // r01 the Mac's first review, the pool idle: granted
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 0, 60, 68, 0, 1) == LA_GRANT;
+    // r02 negative control: a private source is refused, lanes or not
+    assert lease_answer(LEASE_REVIEW, SRC_PRIVATE, 0, 60, 68, 0, 1) == LA_REFUSE;
+    // r03 negative control: an unknown kind is refused
+    assert lease_answer(2, SRC_STORE, 0, 60, 68, 0, 1) == LA_REFUSE;
+    assert lease_answer(9, SRC_STORE, 0, 60, 68, 0, 1) == LA_REFUSE;
+    // r04 no lane free: wait, review or bee
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 0, 0, 68, 10, 1) == LA_WAIT;
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 0, 0, 68, 0, 0) == LA_WAIT;
+    // r05 a holder at its cap (share 12, cap 4) with 3 lanes free: the rest are the others', wait
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 4, 3, 68, 11, 1) == LA_WAIT;
+    // r06 the same holder with 10 lanes free: nobody else asks for them, lent
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 4, 10, 68, 11, 1) == LA_GRANT;
+    // r07 the cap boundary: free lanes equal to the cap are kept for the others
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 4, 4, 68, 11, 1) == LA_WAIT;
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 4, 5, 68, 11, 1) == LA_GRANT;
+    // r08 a holder under its cap takes the last free lane
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 3, 1, 68, 11, 1) == LA_GRANT;
+    // r09 negative control: a bee asks for the one free lane while a review waits: the review's
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 50, 1, 68, 8, 1) == LA_WAIT;
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 50, 3, 68, 8, 3) == LA_WAIT;
+    // r10 more free lanes than waiting reviews: a bee under its share gets one
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 50, 4, 68, 8, 3) == LA_GRANT;
+    // r11 the bees at their share (68 - 11 = 57): wait
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 57, 4, 68, 8, 3) == LA_WAIT;
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 56, 4, 68, 8, 3) == LA_GRANT;
+    // r12 review idle: bees may fill all but one key's lanes
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 65, 3, 68, 0, 0) == LA_GRANT;
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 66, 2, 68, 0, 0) == LA_WAIT;
+    // r13 demand past every lane: no bee lease at all
+    assert lease_answer(LEASE_WORKER, SRC_STORE, 0, 10, 68, 60, 300) == LA_WAIT;
+    // r14 a review with a saturating count still gets an answer, not a wrap
+    assert lease_answer(LEASE_REVIEW, SRC_STORE, 0, 5, 68, U32_MAX, U32_MAX) == LA_GRANT;
+}
+
+test a_wait_says_when_to_ask_again {
+    assert retry_after_seconds(LA_WAIT) == COOL_BASE_SECONDS;
+    assert retry_after_seconds(LA_GRANT) == 0;
+    assert retry_after_seconds(LA_REFUSE) == 0;
+}
+
+test a_refused_lane_hands_the_request_to_the_next {
+    // answered
+    assert lease_step(200, 0, 1) == LS_ANSWER;
+    // 1305 overload, 1302 rate limit, a spent quota, a refused key: next lane
+    assert lease_step(429, 1305, 1) == LS_NEXT_LANE;
+    assert lease_step(429, 1302, 2) == LS_NEXT_LANE;
+    assert lease_step(429, 1113, 1) == LS_NEXT_LANE;
+    assert lease_step(401, 0, 1) == LS_NEXT_LANE;
+    assert lease_step(0, 0, 1) == LS_NEXT_LANE;
+    assert lease_step(503, 0, 2) == LS_NEXT_LANE;
+    // the bound: the third lane's refusal goes back to the consumer
+    assert lease_step(429, 1305, LEASE_TRIES) == LS_ANSWER;
+    assert lease_step(429, 1305, LEASE_TRIES + 1) == LS_ANSWER;
+    // negative control: a wrong request is the consumer's, never retried on another lane
+    assert lease_step(400, 0, 1) == LS_ANSWER;
+    assert lease_step(404, 0, 1) == LS_ANSWER;
+}
+
+; --- 6. Invariants -----------------------------------------------------------------------------------
+
+invariant the_codes_are_distinct {
+    assert SRC_STORE == 0 and SRC_PRIVATE == 1;
+    assert START_LEASE == 0 and START_OWN_KEYS == 1 and START_REFUSE == 2;
+    assert LEASE_REVIEW == 0 and LEASE_WORKER == 1;
+    assert LA_GRANT == 0 and LA_WAIT == 1 and LA_REFUSE == 2;
+    assert LS_ANSWER == 0 and LS_NEXT_LANE == 1;
+}
+
+/// The review floor is one key's lanes, and a holder's part of it is never 0.
+invariant the_floor_is_one_key {
+    assert REVIEW_FLOOR_LANES == ZAI_REQUESTS_PER_KEY and REVIEW_FLOOR_LANES >= 1;
+    assert REVIEW_HOLDERS == 3 and holder_cap(REVIEW_FLOOR_LANES, REVIEW_HOLDERS) >= 1;
+}
+
+/// A lease outlasts a review's model call and a wait is shorter than a lease; the tries leave room for
+/// a second and a third lane.
+invariant the_bounds_fit {
+    assert LEASE_SECONDS == 600 and COOL_BASE_SECONDS < LEASE_SECONDS;
+    assert LEASE_TRIES == 3 and LEASE_TRIES > 1;
+    assert KE_TRANSIENT != KE_OK and KE_QUOTA != KE_REQUEST and KE_AUTH != KE_REQUEST;
+}

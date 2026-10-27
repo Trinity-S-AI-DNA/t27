@@ -3,8 +3,7 @@
 `specs/tri/t27b/steward.t27` decides what a lab run means: which per-spec
 transition is a regression, the honest percentage, and what each ledger
 entry's ratchet finding is. This module holds no
-decision of its own. It compiles `gen/c/tri/t27b/steward.c` (written by
-`t27c gen-c` from that spec, never by hand -- L2) with the system C compiler
+decision of its own. It compiles `gen/c/tri/t27b/steward.c` (written by `t27c gen-c` from that spec, never by hand -- L2) with the system C compiler
 into a cache and calls it through ctypes.
 
 What stays here is plumbing: the lab's JSON verdict strings map to the
@@ -26,7 +25,8 @@ GEN = ROOT / "gen" / "c" / "tri" / "t27b" / "steward.c"
 
 # The lab's verdict strings, in the order of the spec's verdict codes.
 VERDICTS = ("pass", "pass_vacuous", "blocked", "frontend", "codegen",
-            "fail", "mismatch", "crash", "timeout", "not run", "missing", "lab_error")
+            "fail", "mismatch", "crash", "timeout", "not run", "missing", "lab_error",
+            "pass_ct")
 DELTAS = (None, "REF-MOVED", "REGRESSED", "NEW-MISMATCH", "GAINED", "CHECK-LOST")
 RATCHETS = (None, "VACUITY MEASURED", "UNEXPECTED FAILURE", "UNEXPECTED PASS", "MOVED",
             "STALE", "UNJUDGED", "UNLISTED", "OVER CAP", "BAD REASON")
@@ -94,8 +94,8 @@ def _build():
     so.unlisted.restype = ctypes.c_bool
     so.over_cap.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_bool]
     so.over_cap.restype = ctypes.c_bool
-    so.ratchet_is_red.argtypes = [ctypes.c_uint8]
-    so.ratchet_is_red.restype = ctypes.c_bool
+    so.ratchet_red.argtypes = [ctypes.c_uint8, ctypes.c_uint8, ctypes.c_bool]
+    so.ratchet_red.restype = ctypes.c_bool
     so.bless_reason.argtypes = [ctypes.c_uint8, ctypes.c_uint8]
     so.bless_reason.restype = ctypes.c_uint8
     so.cap_rises.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_bool]
@@ -189,8 +189,8 @@ def over_cap(not_pass, cap):
     return bool(lib().over_cap(not_pass, cap if has else 0, has))
 
 
-def ratchet_is_red(kind):
-    return bool(lib().ratchet_is_red(RATCHETS.index(kind)))
+def ratchet_is_red(kind, t27b="pass", pr=False):
+    return bool(lib().ratchet_red(RATCHETS.index(kind), verdict(t27b), bool(pr)))
 
 
 def bless_reason(got, kept):

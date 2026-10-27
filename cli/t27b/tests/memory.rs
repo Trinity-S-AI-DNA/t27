@@ -29,6 +29,7 @@ fn func(ret: Option<Ty>, body: Vec<Stmt>, slots: &[u32]) -> Func {
         vars: vec![],
         body,
         line: 1,
+        is_pub: false,
         is_test: false,
         is_invariant: false,
         noreturn_site: 1,

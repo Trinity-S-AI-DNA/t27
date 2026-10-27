@@ -427,7 +427,6 @@ def reference_one(worker, file, tests=None):
 
 
 # ------------------------------------------------------------ reference cache
-#
 # #6443: a t27c reference verdict is a function of the spec's bytes, the bytes
 # of every spec it imports with `use` (t27c splices them in), the t27c binary
 # and the zig that compiles its output. The cache lives on the volume
@@ -778,13 +777,14 @@ def lab_run(sha, log, challenge=SRV / "challenge", master=True):
             "reference_pass": len(ref_pass) if reference else None,
             # Files the lab could not judge (fork/thread exhaustion): never folded into pass or fail.
             "reference_lab_error": sum(1 for r in results if r["reference"] == "lab_error") if reference else None,
-            # `pass_vacuous` (#6115): passes, but its tests executed 0 runtime
-            # asserts. Never folded into t27b_pass.
+            # pass_vacuous/pass_ct (#6115, #12751): pass with 0 runtime checks / ct-only; never folded into t27b_pass.
             "t27b_pass": sum(1 for r in results if r["t27b"] == "pass"),
             "t27b_pass_vacuous": sum(1 for r in results if r["t27b"] == "pass_vacuous"),
+            "t27b_pass_ct": sum(1 for r in results if r["t27b"] == "pass_ct"),
             "t27b_pass_where_reference_passes": sum(1 for r in ref_pass if r["t27b"] == "pass") if reference else None,
             "t27b_pass_vacuous_where_reference_passes": sum(1 for r in ref_pass if r["t27b"] == "pass_vacuous")
             if reference else None,
+            "t27b_pass_ct_where_reference_passes": sum(1 for r in ref_pass if r["t27b"] == "pass_ct") if reference else None,
             "t27b_pass_where_reference_does_not": sum(1 for r in results if r["t27b"] == "pass" and r["reference"] != "pass")
             if reference else None,
             # `mismatch` is t27b's JIT against t27b's own interpreter (same IR),

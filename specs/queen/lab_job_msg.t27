@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/lab_job_msg.t27 -- the lab leg (build, test, seal) as a supervised actor (gHashTag/t27#12602,
+; P3 of epic #12490). Only the MESSAGE and SUPERVISION layer lives here: three messages (JOB asks the lab
+; to run one step on one spec, DONE reports how it ended, ABORT cancels it), three actor states, the
+; admission answer of a lab that is overloaded, and the order of the three job kinds.
+; The messages carry a spec INDEX, a job kind and small codes, never a path, a command line or a seal
+; hash: no function below takes or returns a string or a byte array, so none of those can ride a message
+; by construction.
+; This file restates no decision rule. The leg verdict is decided by leg_state in specs/t27os/lab_legs.t27
+; (it counts the failed, vacuous and passed tests); the step list is the business of specs/t27os/labs.t27;
+; the low-disk rule stays in specs/t27os/doctor.t27. The functions here take those OUTCOMES as inputs (u8,
+; u32, u64, bool) and map them to a state, a lane, an admission code or the next job kind. Nothing here
+; calls those specs, and nothing here uses actors.t27: the one number it shares with it is checked by a
+; literal in the tests, not by a `use`. Counts and codes only.
+; Not here: the wiring, the mailbox, the lab host and the commands it runs. This is the decision table
+; with tests, a contract for the code that sends and receives the messages. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenLabJobMsg;
+
+; --- 1. Tags and lanes ------------------------------------------------------------------------------
+
+/// The three message tags of the lab actor. They sit above the claim_msg.t27 tags (16..18) and the
+/// rotation tags (19..21), so a mailbox that carries all three protocols never confuses them, and all
+/// stay under the 64 tags one control lane word holds.
+pub const LJ_TAG_JOB : u64 = 22;
+pub const LJ_TAG_DONE : u64 = 23;
+pub const LJ_TAG_ABORT : u64 = 24;
+
+/// Whether a tag is one of the three lab tags. Anything else, including 0 and the tags of the other
+/// protocols, is not: a receiver of this protocol drops what it does not know.
+pub fn lj_known_tag(tag : u64) -> bool {
+    if (tag == LJ_TAG_JOB) { return true; }
+    if (tag == LJ_TAG_DONE) { return true; }
+    if (tag == LJ_TAG_ABORT) { return true; }
+    return false;
+}
+
+/// The lane of a tag, with the numbers of actors.t27 (0 is the data lane, 1 the control lane). A JOB is
+/// work and rides the data lane. A DONE and an ABORT ride the control lane: a full mailbox of jobs must
+/// not hide a failure report or a cancel, because a report that arrives late keeps a dead build busy.
+/// Any other tag is data.
+pub fn lj_lane_of(tag : u64) -> u8 {
+    if (tag == LJ_TAG_DONE) { return 1; }
+    if (tag == LJ_TAG_ABORT) { return 1; }
+    return 0;
+}
+
+; --- 2. Job kinds -----------------------------------------------------------------------------------
+
+/// The job kinds, in the order the lab runs them: BUILD, then TEST, then SEAL. NONE is not a job: it
+/// is the answer "nothing follows", and it is the only code outside the three real kinds that this file
+/// ever returns.
+pub const LJ_KIND_BUILD : u8 = 0;
+pub const LJ_KIND_TEST : u8 = 1;
+pub const LJ_KIND_SEAL : u8 = 2;
+pub const LJ_KIND_NONE : u8 = 3;
+
+/// Whether a kind is one of the three real job kinds (0..2). NONE and every larger code are not.
+pub fn lj_kind_valid(k : u8) -> bool {
+    if (k == LJ_KIND_BUILD) { return true; }
+    if (k == LJ_KIND_TEST) { return true; }
+    if (k == LJ_KIND_SEAL) { return true; }
+    return false;
+}
+
+; --- 3. States of the lab actor ---------------------------------------------------------------------
+
+/// The state of the lab actor: waiting for a job, running one, or parked (its supervisor has given it
+/// up).
+pub const LJ_IDLE : u8 = 0;
+pub const LJ_BUSY : u8 = 1;
+pub const LJ_PARKED : u8 = 2;
+
+/// The next state after one message. intensity_gone is lj_gives_up of this file for the restarts in the
+/// period.
+/// - intensity_gone: PARKED from any state, whatever the tag (the supervisor gave the actor up).
+/// - PARKED: stays PARKED for every tag. There is no wake message here: the supervisor clears a parked
+///   lab by restarting the actor, and that act is outside this file.
+/// - JOB in IDLE: BUSY.
+/// - DONE in BUSY: IDLE. ABORT in BUSY: IDLE. ABORT in IDLE: IDLE (a cancel of nothing is harmless).
+/// - anything else (an unknown tag, a JOB while BUSY, a DONE while IDLE): no change.
+pub fn lj_next_state(state : u8, tag : u64, intensity_gone : bool) -> u8 {
+    if (intensity_gone) { return LJ_PARKED; }
+    if (state == LJ_PARKED) { return LJ_PARKED; }
+    if (state == LJ_IDLE) {
+        if (tag == LJ_TAG_JOB) { return LJ_BUSY; }
+        return LJ_IDLE;
+    }
+    if (state == LJ_BUSY) {
+        if (tag == LJ_TAG_DONE) { return LJ_IDLE; }
+        if (tag == LJ_TAG_ABORT) { return LJ_IDLE; }
+        return LJ_BUSY;
+    }
+    return state;
+}
+
+; --- 4. Admission -----------------------------------------------------------------------------------
+
+/// The four answers to a JOB. OK: the lab takes it. QUEUE_FULL: too many jobs wait already. LOAD: the
+/// host load is too high for a heavy step. DISK: too little free disk for a build.
+pub const LJ_ADMIT_OK : u8 = 0;
+pub const LJ_ADMIT_QUEUE_FULL : u8 = 1;
+pub const LJ_ADMIT_LOAD : u8 = 2;
+pub const LJ_ADMIT_DISK : u8 = 3;
+
+/// The load average, as a whole number, from which the lab refuses a job: refuse at load >= 40.
+pub const LJ_MAX_LOAD : u32 = 40;
+
+/// The free disk, in GiB, below which the lab refuses a job: refuse when free_gb < 4.
+pub const LJ_MIN_FREE_GB : u64 = 4;
+
+/// The number of queued jobs from which the lab refuses another: refuse when queued >= 8.
+pub const LJ_MAX_QUEUED : u32 = 8;
+
+/// The admission answer for a JOB. The Mac rule of the repo (load below 40 and more than 4 GiB free) is
+/// the source of the two host numbers; this function only encodes them and decides nothing about what a
+/// heavy step is. When several causes hold at once the first in this order is reported: the queue is
+/// full, then the load is too high, then the disk is too low, else OK. The queue comes first because a
+/// full queue is a cheap local fact and needs no look at the host.
+pub fn lj_admit(queued : u32, load : u32, free_gb : u64) -> u8 {
+    if (queued >= LJ_MAX_QUEUED) { return LJ_ADMIT_QUEUE_FULL; }
+    if (load >= LJ_MAX_LOAD) { return LJ_ADMIT_LOAD; }
+    if (free_gb < LJ_MIN_FREE_GB) { return LJ_ADMIT_DISK; }
+    return LJ_ADMIT_OK;
+}
+
+; --- 5. Order of the job kinds ----------------------------------------------------------------------
+
+/// The verdict code of a finished leg that lets the next step follow. It is LEG_PASS of
+/// specs/t27os/lab_legs.t27, taken here as a plain number. That file's leg_state decides the verdict
+/// (what counts as failed, vacuous or passed); this file only takes its code and compares it with PASS.
+pub const LJ_VERDICT_PASS : u8 = 1;
+
+/// The kind that follows a finished job. done_kind is the kind that just ended, verdict the leg verdict
+/// code of that run.
+/// - BUILD with PASS: TEST. TEST with PASS: SEAL. SEAL with PASS: NONE (the leg is complete).
+/// - any kind with a verdict other than PASS: NONE (a failed or vacuous step ends the leg).
+/// - an invalid done_kind: NONE.
+pub fn lj_next_kind(done_kind : u8, verdict : u8) -> u8 {
+    if (verdict != LJ_VERDICT_PASS) { return LJ_KIND_NONE; }
+    if (done_kind == LJ_KIND_BUILD) { return LJ_KIND_TEST; }
+    if (done_kind == LJ_KIND_TEST) { return LJ_KIND_SEAL; }
+    return LJ_KIND_NONE;
+}
+
+/// Whether a seal may run after a test with this verdict: only after PASS. A vacuous or a failed test
+/// report, and any code this file does not know, forbid the seal.
+pub fn lj_seal_allowed(test_verdict : u8) -> bool {
+    return test_verdict == LJ_VERDICT_PASS;
+}
+
+/// Whether the lab accepts a job of this kind. last_test_verdict is the verdict code of the latest TEST
+/// run on the same spec. An invalid kind (NONE included) is refused. A SEAL needs lj_seal_allowed of
+/// last_test_verdict. A BUILD and a TEST are always accepted: they are how a spec gets its first report.
+pub fn lj_job_accepted(kind : u8, last_test_verdict : u8) -> bool {
+    if (lj_kind_valid(kind) == false) { return false; }
+    if (kind == LJ_KIND_SEAL) { return lj_seal_allowed(last_test_verdict); }
+    return true;
+}
+
+; --- 6. Restart intensity ---------------------------------------------------------------------------
+
+/// How many restarts in one period the supervisor allows the lab actor. It equals DOMAIN_MAX_RESTARTS
+/// of specs/queen/actors.t27 (3); the cross-check is a literal-3 test below, because a `use` of
+/// actors.t27 would splice that whole spec into this one.
+pub const LJ_MAX_RESTARTS : u32 = 3;
+
+/// True when the restarts in the period, the latest included, exceed LJ_MAX_RESTARTS: the same meaning
+/// as intensity_exceeded in actors.t27 (strictly greater, so 3 restarts are allowed and the 4th gives
+/// up). The result feeds the intensity_gone input of lj_next_state.
+pub fn lj_gives_up(restarts_in_period : u32) -> bool {
+    return restarts_in_period > LJ_MAX_RESTARTS;
+}
+
+; --- 7. Tests ---------------------------------------------------------------------------------------
+
+test only_the_three_lab_tags_are_known {
+    assert lj_known_tag(LJ_TAG_JOB) == true;
+    assert lj_known_tag(LJ_TAG_DONE) == true;
+    assert lj_known_tag(LJ_TAG_ABORT) == true;
+    assert lj_known_tag(0) == false;
+    assert lj_known_tag(15) == false;
+    assert lj_known_tag(16) == false;
+    assert lj_known_tag(19) == false;
+    assert lj_known_tag(21) == false;
+    assert lj_known_tag(25) == false;
+    assert lj_known_tag(99) == false;
+}
+
+test a_job_rides_the_data_lane_and_so_does_any_unknown_tag {
+    assert lj_lane_of(LJ_TAG_JOB) == 0;
+    assert lj_lane_of(0) == 0;
+    assert lj_lane_of(21) == 0;
+    assert lj_lane_of(25) == 0;
+    assert lj_lane_of(99) == 0;
+}
+
+test a_done_and_an_abort_ride_the_control_lane {
+    assert lj_lane_of(LJ_TAG_DONE) == 1;
+    assert lj_lane_of(LJ_TAG_ABORT) == 1;
+    assert lj_lane_of(LJ_TAG_DONE) != lj_lane_of(LJ_TAG_JOB);
+    assert lj_lane_of(LJ_TAG_ABORT) != lj_lane_of(LJ_TAG_JOB);
+}
+
+test only_build_test_and_seal_are_valid_kinds {
+    assert lj_kind_valid(LJ_KIND_BUILD) == true;
+    assert lj_kind_valid(LJ_KIND_TEST) == true;
+    assert lj_kind_valid(LJ_KIND_SEAL) == true;
+    assert lj_kind_valid(LJ_KIND_NONE) == false;
+    assert lj_kind_valid(4) == false;
+    assert lj_kind_valid(255) == false;
+}
+
+test a_job_in_idle_starts_a_busy_lab {
+    assert lj_next_state(LJ_IDLE, LJ_TAG_JOB, false) == LJ_BUSY;
+}
+
+test a_done_or_an_abort_in_busy_returns_to_idle {
+    assert lj_next_state(LJ_BUSY, LJ_TAG_DONE, false) == LJ_IDLE;
+    assert lj_next_state(LJ_BUSY, LJ_TAG_ABORT, false) == LJ_IDLE;
+}
+
+test messages_that_do_not_apply_leave_the_state_alone {
+    assert lj_next_state(LJ_IDLE, LJ_TAG_ABORT, false) == LJ_IDLE;
+    assert lj_next_state(LJ_IDLE, LJ_TAG_DONE, false) == LJ_IDLE;
+    assert lj_next_state(LJ_IDLE, 99, false) == LJ_IDLE;
+    assert lj_next_state(LJ_BUSY, LJ_TAG_JOB, false) == LJ_BUSY;
+    assert lj_next_state(LJ_BUSY, 0, false) == LJ_BUSY;
+    assert lj_next_state(LJ_BUSY, 99, false) == LJ_BUSY;
+}
+
+test a_parked_lab_stays_parked_for_every_tag {
+    assert lj_next_state(LJ_PARKED, LJ_TAG_JOB, false) == LJ_PARKED;
+    assert lj_next_state(LJ_PARKED, LJ_TAG_DONE, false) == LJ_PARKED;
+    assert lj_next_state(LJ_PARKED, LJ_TAG_ABORT, false) == LJ_PARKED;
+    assert lj_next_state(LJ_PARKED, 99, false) == LJ_PARKED;
+}
+
+test a_gone_intensity_parks_the_lab_from_any_state {
+    assert lj_next_state(LJ_IDLE, LJ_TAG_JOB, true) == LJ_PARKED;
+    assert lj_next_state(LJ_IDLE, 0, true) == LJ_PARKED;
+    assert lj_next_state(LJ_BUSY, LJ_TAG_DONE, true) == LJ_PARKED;
+    assert lj_next_state(LJ_BUSY, LJ_TAG_JOB, true) == LJ_PARKED;
+    assert lj_next_state(LJ_PARKED, LJ_TAG_ABORT, true) == LJ_PARKED;
+}
+
+test the_give_up_check_feeds_the_state_machine {
+    assert lj_next_state(LJ_IDLE, LJ_TAG_JOB, lj_gives_up(3)) == LJ_BUSY;
+    assert lj_next_state(LJ_IDLE, LJ_TAG_JOB, lj_gives_up(4)) == LJ_PARKED;
+    assert lj_next_state(LJ_BUSY, LJ_TAG_DONE, lj_gives_up(3)) == LJ_IDLE;
+    assert lj_next_state(LJ_BUSY, LJ_TAG_DONE, lj_gives_up(4)) == LJ_PARKED;
+}
+
+test a_calm_host_with_room_admits_the_job {
+    assert lj_admit(0, 0, 100) == LJ_ADMIT_OK;
+    assert lj_admit(7, 39, 4) == LJ_ADMIT_OK;
+    assert lj_admit(3, 12, 50) == LJ_ADMIT_OK;
+}
+
+test the_queue_is_full_from_eight_jobs {
+    assert lj_admit(7, 0, 100) == LJ_ADMIT_OK;
+    assert lj_admit(8, 0, 100) == LJ_ADMIT_QUEUE_FULL;
+    assert lj_admit(9, 0, 100) == LJ_ADMIT_QUEUE_FULL;
+}
+
+test the_load_is_too_high_from_forty {
+    assert lj_admit(0, 39, 100) == LJ_ADMIT_OK;
+    assert lj_admit(0, 40, 100) == LJ_ADMIT_LOAD;
+    assert lj_admit(0, 41, 100) == LJ_ADMIT_LOAD;
+}
+
+test the_disk_is_too_low_below_four_gib {
+    assert lj_admit(0, 0, 4) == LJ_ADMIT_OK;
+    assert lj_admit(0, 0, 3) == LJ_ADMIT_DISK;
+    assert lj_admit(0, 0, 0) == LJ_ADMIT_DISK;
+}
+
+test combined_causes_report_the_first_in_priority_order {
+    assert lj_admit(8, 40, 3) == LJ_ADMIT_QUEUE_FULL;
+    assert lj_admit(8, 40, 100) == LJ_ADMIT_QUEUE_FULL;
+    assert lj_admit(8, 0, 3) == LJ_ADMIT_QUEUE_FULL;
+    assert lj_admit(0, 40, 3) == LJ_ADMIT_LOAD;
+    assert lj_admit(7, 40, 3) == LJ_ADMIT_LOAD;
+}
+
+test the_next_kind_after_a_pass_runs_build_then_test_then_seal {
+    assert lj_next_kind(LJ_KIND_BUILD, LJ_VERDICT_PASS) == LJ_KIND_TEST;
+    assert lj_next_kind(LJ_KIND_TEST, LJ_VERDICT_PASS) == LJ_KIND_SEAL;
+    assert lj_next_kind(LJ_KIND_SEAL, LJ_VERDICT_PASS) == LJ_KIND_NONE;
+}
+
+test a_verdict_other_than_pass_ends_the_leg_for_every_kind {
+    assert lj_next_kind(LJ_KIND_BUILD, 0) == LJ_KIND_NONE;
+    assert lj_next_kind(LJ_KIND_BUILD, 2) == LJ_KIND_NONE;
+    assert lj_next_kind(LJ_KIND_TEST, 0) == LJ_KIND_NONE;
+    assert lj_next_kind(LJ_KIND_TEST, 3) == LJ_KIND_NONE;
+    assert lj_next_kind(LJ_KIND_SEAL, 0) == LJ_KIND_NONE;
+    assert lj_next_kind(LJ_KIND_SEAL, 4) == LJ_KIND_NONE;
+}
+
+test an_invalid_done_kind_is_followed_by_nothing {
+    assert lj_next_kind(LJ_KIND_NONE, LJ_VERDICT_PASS) == LJ_KIND_NONE;
+    assert lj_next_kind(4, LJ_VERDICT_PASS) == LJ_KIND_NONE;
+    assert lj_next_kind(255, LJ_VERDICT_PASS) == LJ_KIND_NONE;
+}
+
+test a_test_is_followed_by_a_seal_only_for_the_pass_verdict {
+    assert lj_next_kind(LJ_KIND_TEST, 0) != LJ_KIND_SEAL;
+    assert lj_next_kind(LJ_KIND_TEST, 1) == LJ_KIND_SEAL;
+    assert lj_next_kind(LJ_KIND_TEST, 2) != LJ_KIND_SEAL;
+    assert lj_next_kind(LJ_KIND_TEST, 3) != LJ_KIND_SEAL;
+    assert lj_next_kind(LJ_KIND_TEST, 4) != LJ_KIND_SEAL;
+}
+
+test the_seal_is_allowed_only_for_the_pass_verdict {
+    assert lj_seal_allowed(LJ_VERDICT_PASS) == true;
+    assert lj_seal_allowed(0) == false;
+    assert lj_seal_allowed(2) == false;
+    assert lj_seal_allowed(255) == false;
+}
+
+test a_build_and_a_test_are_accepted_whatever_the_last_test_said {
+    assert lj_job_accepted(LJ_KIND_BUILD, 0) == true;
+    assert lj_job_accepted(LJ_KIND_BUILD, 1) == true;
+    assert lj_job_accepted(LJ_KIND_BUILD, 4) == true;
+    assert lj_job_accepted(LJ_KIND_TEST, 0) == true;
+    assert lj_job_accepted(LJ_KIND_TEST, 1) == true;
+    assert lj_job_accepted(LJ_KIND_TEST, 3) == true;
+}
+
+test an_invalid_kind_is_never_accepted {
+    assert lj_job_accepted(LJ_KIND_NONE, LJ_VERDICT_PASS) == false;
+    assert lj_job_accepted(4, LJ_VERDICT_PASS) == false;
+    assert lj_job_accepted(255, 0) == false;
+}
+
+test a_seal_job_is_accepted_only_after_the_pass_verdict_for_every_code {
+    assert lj_job_accepted(LJ_KIND_SEAL, 0) == false;
+    assert lj_job_accepted(LJ_KIND_SEAL, 1) == true;
+    assert lj_job_accepted(LJ_KIND_SEAL, 2) == false;
+    assert lj_job_accepted(LJ_KIND_SEAL, 3) == false;
+    assert lj_job_accepted(LJ_KIND_SEAL, 4) == false;
+}
+
+test the_next_kind_of_a_leg_is_accepted_only_when_the_verdict_allows_it {
+    assert lj_job_accepted(lj_next_kind(LJ_KIND_BUILD, 1), 0) == true;
+    assert lj_job_accepted(lj_next_kind(LJ_KIND_TEST, 1), 1) == true;
+    assert lj_job_accepted(lj_next_kind(LJ_KIND_TEST, 2), 2) == false;
+    assert lj_job_accepted(lj_next_kind(LJ_KIND_SEAL, 1), 1) == false;
+}
+
+test three_restarts_are_allowed_and_the_fourth_gives_up {
+    assert lj_gives_up(0) == false;
+    assert lj_gives_up(2) == false;
+    assert lj_gives_up(3) == false;
+    assert lj_gives_up(4) == true;
+    assert lj_gives_up(100) == true;
+}
+
+test the_restart_bound_agrees_with_the_actors_domain_bound_of_three {
+    var domain_max : u32 = 3;
+    assert lj_gives_up(domain_max) == false;
+    assert lj_gives_up(domain_max + 1) == true;
+}
+
+; --- 8. Invariants ----------------------------------------------------------------------------------
+
+invariant lj_job_rides_data_and_done_and_abort_ride_control { assert lj_lane_of(LJ_TAG_JOB) == 0 and lj_lane_of(LJ_TAG_DONE) == 1 and lj_lane_of(LJ_TAG_ABORT) == 1; }
+invariant lj_tags_distinct_and_under_one_control_word { assert LJ_TAG_JOB != LJ_TAG_DONE and LJ_TAG_DONE != LJ_TAG_ABORT and LJ_TAG_JOB != LJ_TAG_ABORT and LJ_TAG_JOB < 64 and LJ_TAG_DONE < 64 and LJ_TAG_ABORT < 64; }
+invariant lj_restart_bound_is_three { assert LJ_MAX_RESTARTS == 3; }

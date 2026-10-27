@@ -63,8 +63,8 @@ Output:
 ```bash
 tri experience save
 # Records: diff, hashes, verdict, bench_delta
-tri skill commit
-tri git commit -m "feat(ops): add tritRotate operation
+tri skill commit <!-- not built as a t27c subcommand -->
+tri git commit -m "feat(ops): add tritRotate operation <!-- not built as a t27c subcommand -->
 
 Adds rotation operation:
 - neg -> pos

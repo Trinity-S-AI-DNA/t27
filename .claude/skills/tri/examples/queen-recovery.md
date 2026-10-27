@@ -135,14 +135,14 @@ After queen health returns to GREEN:
 ```bash
 # Feature mutations allowed again
 tri skill begin "new-feature-task"
-tri spec edit <module>
-tri skill seal --hash
+tri spec edit <module> <!-- not built as a t27c subcommand -->
+tri skill seal --hash <!-- not built as a t27c subcommand -->
 tri gen
 tri test
 tri verdict --toxic
 tri experience save
-tri skill commit
-tri git commit -m "feat(...): ..."
+tri skill commit <!-- not built as a t27c subcommand -->
+tri git commit -m "feat(...): ..." <!-- not built as a t27c subcommand -->
 
 # Queen health tracked automatically:
 # queen_health_before: 0.98
@@ -161,7 +161,7 @@ tri git commit -m "feat(...): ..."
 
 ```bash
 # Automated recovery for repeated failures
-tri self-heal --max-iterations 5
+tri self-heal --max-iterations 5 <!-- not built as a t27c subcommand -->
 
 # Executes:
 # 1. Check queen health

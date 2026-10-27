@@ -736,3 +736,11 @@ fn rust_lowers_log2_to_a_method() {
     };
     assert_eq!(out, "3");
 }
+
+#[test] // #11182: a `[]T` field filled from borrowed storage lowers as a COPY (`to_vec`): every fixture generates
+fn gen_rust_lowers_a_slice_field_capture_to_a_copy() {
+    for f in std::fs::read_dir(gate_fixture("../rust_slice_fields")).unwrap().flatten() {
+        let out = t27c_on(&["gen-rust"], &f.path());
+        assert!(out.status.success() && !out.stdout.is_empty(), "{:?} gen failed: {:?}", f.path(), String::from_utf8_lossy(&out.stderr));
+    }
+}

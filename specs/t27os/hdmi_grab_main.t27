@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/hdmi_grab_main.t27 -- the host program of the HDMI checker specs/fpga/hdmi_grab.t27 (Refs gHashTag/t27#10782,
+; T27 OS on the FPGA). It finds the capture device through ffmpeg (`ffmpeg -f avfoundation -list_devices`), grabs
+; HG_FRAMES frames (default 3), runs hg_check on each and writes /tmp/hdmi_grab_N.ppm and /tmp/hdmi_grab_N.png. It looks
+; for the device HG_TRIES times (default 12), 5 s apart, then stops with a message and exits with 2; one failed frame
+; exits with 1.
+; --
+; WHY A FILE OF ITS OWN. t27c gen-verilog emits EVERY function of a specs/fpga/*.t27 spec into Verilog (no host-code
+; exclusion exists), and the CI job fpga-lint runs yosys over every generated file. std.c.getenv, fork, execve and
+; fopen, @intFromPtr and std.debug.print cannot be Verilog, so the generated hdmi_grab.v failed to parse at the first
+; host line. The libc part therefore lives here, in a spec no Verilog backend reads (Refs gHashTag/t27#12171 for the
+; compiler side).
+; --
+; It is glue and nothing else. Every decision -- which listed device is the capture one, whether a grabbed frame is the
+; expected frame -- lives in fpga::hdmi_grab and is tested there, so the names below are imported, not copied. The two
+; tests at the end cover the two helpers this file adds (the frame path and the byte copy); neither touches libc.
+; --
+; BUILD (on the lab; the Mac runs only the binary): `t27c gen specs/t27os/hdmi_grab_main.t27 > hdmi_grab.zig`, then
+; `zig build-exe hdmi_grab.zig -lc`, then ./hdmi_grab. t27c gen splices the declarations this file imports, and the ones
+; those need (down to vga_text_core's pixel_at), into that one self-contained .zig (bootstrap/src/use_resolve.rs);
+; specs/t27f/deps_card.t27 and why_card.t27 are built the same way.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osHdmiGrabMain;
+
+use fpga::hdmi_grab::hg_is_digit;
+use fpga::hdmi_grab::hg_pick;
+use fpga::hdmi_grab::hg_video_count;
+use fpga::hdmi_grab::hg_check;
+use fpga::hdmi_grab::hg_width;
+use fpga::hdmi_grab::hg_height;
+use fpga::hdmi_grab::hg_put_num;
+use fpga::hdmi_grab::V_PASS;
+use fpga::hdmi_grab::CH_0;
+
+// ---- main: the libc part. The tests below never link libc; only main reaches it. ----
+
+pub var HG_BUF : [8388608]u8 = undefined;
+pub var HG_LIST : [65536]u8 = undefined;
+pub var HG_CMD : [512]u8 = undefined;
+pub var HG_PATH : [64]u8 = undefined;
+
+/// Copy the fixed text s into out at w; the new write position.
+pub fn hg_cat(out: []u8, w: usize, s: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        out[w + i] = s[i];
+        i += 1;
+    }
+    return w + s.len;
+}
+
+/// The number the environment variable name holds; dflt when it is unset or not a number.
+fn hg_env(name: [*:0]const u8, dflt: usize) -> usize {
+    const p = std.c.getenv(name);
+    if (p == null) { return dflt; }
+    const s = p.?;
+    var v : usize = 0;
+    var i : usize = 0;
+    while (s[i] != 0) {
+        if (hg_is_digit(s[i]) == false) { return dflt; }
+        v = v * 10 + @as(usize, @intCast(s[i] - CH_0));
+        i += 1;
+    }
+    if (i == 0) { return dflt; }
+    return v;
+}
+
+/// Run the shell command in HG_CMD[0..w]; true when it exited with 0.
+fn hg_sh(w: usize) -> bool {
+    HG_CMD[w] = 0;
+    var av : [4]usize = undefined;
+    av[0] = @intFromPtr("sh");
+    av[1] = @intFromPtr("-c");
+    av[2] = @intFromPtr(&HG_CMD);
+    av[3] = 0;
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.c.execve("/bin/sh", @ptrCast(&av), std.c.environ);
+        std.c._exit(127);
+    }
+    if (pid < 0) { return false; }
+    var st : c_int = 0;
+    _ = std.c.waitpid(pid, &st, 0);
+    return st == 0;
+}
+
+/// Read the file named by the NUL-terminated HG_PATH into out; the byte count, 0 when it cannot be read.
+fn hg_slurp(out: []u8) -> usize {
+    const fp = std.c.fopen(@ptrCast(&HG_PATH), "rb");
+    if (fp == null) { return 0; }
+    var n : usize = 0;
+    var r : usize = 1;
+    while (r > 0 and n < out.len) {
+        r = std.c.fread(out[n..out.len].ptr, 1, out.len - n, fp.?);
+        n += r;
+    }
+    _ = std.c.fclose(fp.?);
+    return n;
+}
+
+fn hg_path(name: []const u8, k: usize, ext: []const u8) -> void {
+    var w : usize = hg_cat(&HG_PATH, 0, name);
+    w = hg_put_num(&HG_PATH, w, k);
+    w = hg_cat(&HG_PATH, w, ext);
+    HG_PATH[w] = 0;
+}
+
+pub fn main() void {
+    const frames : usize = hg_env("HG_FRAMES", 3);
+    const tries : usize = hg_env("HG_TRIES", 12);
+    var dev : i32 = -1;
+    var t : usize = 0;
+    while (t < tries and dev < 0) {
+        var w : usize = hg_cat(&HG_CMD, 0, "ffmpeg -hide_banner -f avfoundation -list_devices true -i \"\" 2> /tmp/hdmi_grab_list.txt");
+        _ = hg_sh(w);
+        w = hg_cat(&HG_PATH, 0, "/tmp/hdmi_grab_list.txt");
+        HG_PATH[w] = 0;
+        const n : usize = hg_slurp(&HG_LIST);
+        dev = hg_pick(&HG_LIST, n);
+        if (dev < 0) {
+            const v : usize = hg_video_count(&HG_LIST, n);
+            std.debug.print("hdmi_grab: NO CAPTURE DEVICE. macOS lists {d} video device(s), none a capture device (FaceTime, OBS Virtual, Capture screen and iPhone are skipped). The dongle is not UVC or not enumerated: replug it, check the port, and look in System Information under USB. Try {d}/{d}, again in 5 s.\n", .{ v, t + 1, tries });
+            w = hg_cat(&HG_CMD, 0, "sleep 5");
+            _ = hg_sh(w);
+        }
+        t += 1;
+    }
+    if (dev < 0) {
+        std.debug.print("hdmi_grab: gave up after {d} looks. Nothing was grabbed and nothing is claimed about the board.\n", .{tries});
+        std.c.exit(2);
+    }
+    std.debug.print("hdmi_grab: capture device index {d}\n", .{dev});
+    var fails : usize = 0;
+    var k : usize = 0;
+    while (k < frames) {
+        var w : usize = hg_cat(&HG_CMD, 0, "ffmpeg -hide_banner -loglevel error -y -f avfoundation -i \"");
+        w = hg_put_num(&HG_CMD, w, @as(usize, @intCast(dev)));
+        w = hg_cat(&HG_CMD, w, ":none\" -frames:v 5 -update 1 /tmp/hdmi_grab_");
+        w = hg_put_num(&HG_CMD, w, k);
+        w = hg_cat(&HG_CMD, w, ".ppm");
+        if (hg_sh(w) == false) {
+            std.debug.print("frame {d}: FAIL ffmpeg could not grab from device {d}\n", .{ k, dev });
+            fails += 1;
+        } else {
+            hg_path("/tmp/hdmi_grab_", k, ".ppm");
+            const n : usize = hg_slurp(&HG_BUF);
+            const v : usize = hg_check(&HG_BUF, n);
+            if (v == V_PASS) {
+                std.debug.print("frame {d}: PASS {d}x{d}, the T27 OS title on black\n", .{ k, hg_width(&HG_BUF, n), hg_height(&HG_BUF, n) });
+            } else {
+                std.debug.print("frame {d}: FAIL verdict {d} (1 not a PPM, 2 short, 3 title wrong, 4 background lit) in /tmp/hdmi_grab_{d}.ppm\n", .{ k, v, k });
+                fails += 1;
+            }
+            w = hg_cat(&HG_CMD, 0, "ffmpeg -hide_banner -loglevel error -y -i /tmp/hdmi_grab_");
+            w = hg_put_num(&HG_CMD, w, k);
+            w = hg_cat(&HG_CMD, w, ".ppm /tmp/hdmi_grab_");
+            w = hg_put_num(&HG_CMD, w, k);
+            w = hg_cat(&HG_CMD, w, ".png");
+            _ = hg_sh(w);
+        }
+        k += 1;
+    }
+    std.debug.print("hdmi_grab: {d} of {d} frames pass\n", .{ frames - fails, frames });
+    if (fails > 0) { std.c.exit(1); }
+}
+
+test the_frame_path_is_the_prefix_the_index_and_the_extension {
+    hg_path("/tmp/hdmi_grab_", 3, ".ppm");
+    const want : []const u8 = "/tmp/hdmi_grab_3.ppm";
+    var i : usize = 0;
+    while (i < want.len) {
+        assert HG_PATH[i] == want[i];
+        i += 1;
+    }
+    assert HG_PATH[want.len] == 0;
+}
+
+test hg_cat_appends_and_returns_the_new_write_position {
+    var out : [16]u8 = undefined;
+    const w : usize = hg_cat(&out, 2, "abc");
+    assert w == 5;
+    const want : []const u8 = "abc";
+    var i : usize = 0;
+    while (i < want.len) {
+        assert out[2 + i] == want[i];
+        i += 1;
+    }
+}

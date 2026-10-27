@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/live_fleet.t27 -- the fleet panel of t27.ai/t27f/live/: which source it reads, how the
+// events fold into "in flight / finished / refused / reviews / last update", how often it polls, and
+// how it presents a reading. Refs gHashTag/t27#10266 (the T27F Live epic); the page is
+// Trinity-S-AI-DNA/trinity#1717 and its Queen-feed glue #1743.
+//
+// WHY THIS CARD. Measured 2026-10-25 10:20..10:34Z from a browser on t27.ai, the page shows no live
+// fleet. Its three data paths:
+//   1. the Queen feed of #1743 at the legacy trios host, /queen/public-feed, polled every 15 s:
+//      404 (the route was merged on a branch and never deployed; the redeploy step is void, there is
+//      no Railway -- deployment is T27 OS). api.t27.ai/queen/public-feed is 404 as well.
+//   2. the fallback ./logs/recorded_log.json every 5 min: a 24-event fixture, not live.
+//   3. the "fleet" panel: anonymous GitHub REST from the visitor's browser, 3 requests per 150 s,
+//      which is 72 an hour against the 60 an hour GitHub gives one IP (see budget_fits below). On a
+//      shared egress IP the budget is already spent: 403 "API rate limit exceeded", the panel
+//      stays on "loading..." for good.
+// The live data exists one host over: api.t27.ai/queen/public-activity, public, no credential,
+// CORS open to t27.ai. This card is the law the page's host glue follows when it reads it.
+//
+// THE FEED, MEASURED. One reply is {"cursor": <server ms>, "events": [ ... ]}, newest first. An event
+// is {"id", "kind": "dispatch"|"finished"|"review", "issue": <number>, "title", "at": <ISO>,
+// "state": null|"refused"|"wait"}. Two events of one issue can carry the same second; the list
+// order, not the time, says which came later. 2026-10-25 10:29:27Z: 120 events, 35 dispatch, 69
+// finished, 16 review, 86 issues, spanning 567 s, newest 1 s old. 10:33:38Z: newest 1 s old again.
+//
+// THE GLUE. The page's glue (t27f_live.js) is hand-written JS. The owner approved one foreign edit
+// of it on 2026-10-25, and that edit follows this card: Trinity-S-AI-DNA/trinity#1750. It reaches
+// t27.ai only after that PR merges and the publish run passes. The glue does not call these fns:
+// t27c gen-js lowers declarations, not fn bodies (gHashTag/t27#10993), and the page would still
+// need a fetch and DOM surface the generator does not have. It repeats the rules, so this card's
+// tests are the check on what it should do.
+//
+// NOT CLAIMED. The rate limit of api.t27.ai is not measured. Every finished event in the sample said
+// "refused"; that is the Queen's state, reported, not a defect of this card.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27fLiveFleet;
+
+// The presentation rules come from queen/views.t27 and are used here, not copied. The Queen page
+// and this panel share one law, so a change there is meant to reach this panel. The tests below
+// that call presentation are how such a change shows up here.
+use queen::views::SRC_LIVE;
+use queen::views::SRC_SNAPSHOT;
+use queen::views::P_LOADING;
+use queen::views::P_LIVE;
+use queen::views::P_STALE;
+use queen::views::P_OFFLINE;
+use queen::views::P_SNAPSHOT;
+use queen::views::P_UNAVAILABLE;
+use queen::views::presentation;
+use queen::views::stale_age_s;
+use queen::views::live_badge_allowed;
+
+pub const KIND : str = "t27f-live-fleet";
+pub const ID : str = "t27f/live_fleet";
+pub const PAGE : str = "https://t27.ai/t27f/live/";
+pub const PAGE_SOURCE : str = "gHashTag/trinity apps/website/public/t27f/live/ (t27f_live.js mountFleet, the feed poll of #1743)";
+pub const MEASURED_ON : str = "2026-10-25";
+
+// --- The source ------------------------------------------------------------------------------------
+pub const SOURCE : str = "https://api.t27.ai/queen/public-activity";
+pub const SOURCE_CREDENTIAL : str = "none";
+pub const SOURCE_ORDER : str = "newest first; the list order decides between two events of one second";
+pub const DEAD_FEED : str = "/queen/public-feed (404 at api.t27.ai and at the legacy trios host)";
+pub const FIXTURE : str = "./logs/recorded_log.json (t27f-live-recorded-log-v1, 24 events)";
+
+// Event kinds and states, as the host maps the feed's strings.
+pub const K_DISPATCH : u32 = 0;
+pub const K_FINISHED : u32 = 1;
+pub const K_REVIEW : u32 = 2;
+pub const K_UNKNOWN : u32 = 3;
+pub const S_NONE : u32 = 0;
+pub const S_REFUSED : u32 = 1;
+pub const S_WAIT : u32 = 2;
+pub const S_UNKNOWN : u32 = 3;
+pub const KIND_NAMES : [3]str = ["dispatch", "finished", "review"];
+pub const STATE_NAMES : [3]str = ["null", "refused", "wait"];
+
+// --- Cadence and budget ------------------------------------------------------------------------------
+// The page polls the source every POLL_S. A failed request doubles the wait up to BACKOFF_MAX_S; a
+// success sets it back to POLL_S. The Queen page of the site polls the same endpoint every 2 s
+// (queen/views.t27 LIVE_ENDPOINTS); the fleet panel is a summary and asks less often.
+pub const POLL_S : u32 = 15;
+pub const BACKOFF_MAX_S : u32 = 120;
+// A reading whose newest event is older than QUIET_S is live but quiet: the fleet did nothing.
+pub const QUIET_S : i64 = 600;
+// What the GitHub path costs, measured from the glue: 3 calls per 150 s cycle, 60 calls an hour
+// per IP for an anonymous client.
+pub const GH_CALLS_PER_CYCLE : u32 = 3;
+pub const GH_CYCLE_S : u32 = 150;
+pub const GH_ANON_LIMIT_PER_H : u32 = 60;
+
+// The sample of 10:29:27Z.
+pub const SAMPLE_EVENTS : u32 = 120;
+pub const SAMPLE_DISPATCH : u32 = 35;
+pub const SAMPLE_FINISHED : u32 = 69;
+pub const SAMPLE_REVIEW : u32 = 16;
+pub const SAMPLE_ISSUES : u32 = 86;
+pub const SAMPLE_SPAN_S : u32 = 567;
+pub const SAMPLE_NEWEST_AGE_S : u32 = 1;
+
+// What the glue does, in order. Each line is one host step; every decision in it is a fn below.
+pub const GLUE_STEPS : [6]str = [
+    "fetch SOURCE every next_wait_s(...) seconds, no credential, no cookie",
+    "map each event's kind and state strings with the KIND_NAMES and STATE_NAMES tables (anything else is K_UNKNOWN or S_UNKNOWN)",
+    "fold the events in list order with in_flight_count, kind_count (finished, review) and refused_count",
+    "take the newest event's time as last update; age is cursor - at, in seconds",
+    "present with presentation(SRC_LIVE, ...) from queen/views.t27; show the age with freshness; the LIVE badge only where live_badge_allowed",
+    "keep the GitHub panel as a second reading only, never the source of the LIVE badge"
+];
+
+// --- Decisions ----------------------------------------------------------------------------------------
+
+// THE WINDOW. A t27 array has a fixed width, so the fold fns below take at most FOLD_WINDOW events
+// per call. That width is a limit of these fns, not of the feed: the rules do not depend on the
+// length. A host folds every event of a reply with the same rules in one pass; the glue of
+// trinity#1750 does that over all 120 events of a measured reply. A host that can only pass a
+// window passes the newest events, a prefix of the list. On a prefix the counts are the counts of
+// those events, never more than the whole reply's. An issue decided inside the window keeps that
+// decision in every longer window. An issue whose only events in the window are reviews reads as
+// not in flight, so a window can only undercount the issues in flight (test
+// a_window_of_the_newest_events_never_overcounts).
+pub const FOLD_WINDOW : usize = 16;
+
+/// Whether one event, the first of its issue met in list order (newest first), says the issue is in
+/// flight. A review neither starts nor ends a flight.
+pub fn decides_flight(kind: u32) -> bool {
+    return kind == K_DISPATCH or kind == K_FINISHED;
+}
+
+/// Whether the issue at index i of the first n events (newest first) is in flight: its newest
+/// dispatch or finished event is a dispatch. Unknown kinds are skipped like reviews.
+pub fn in_flight(kinds: [FOLD_WINDOW]u32, issues: [FOLD_WINDOW]u32, n: u32, issue: u32) -> bool {
+    var i : u32 = 0;
+    while (i < n) {
+        if (issues[i] == issue and decides_flight(kinds[i])) {
+            return kinds[i] == K_DISPATCH;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// How many distinct issues of the first n events are in flight.
+pub fn in_flight_count(kinds: [FOLD_WINDOW]u32, issues: [FOLD_WINDOW]u32, n: u32) -> u32 {
+    var count : u32 = 0;
+    var i : u32 = 0;
+    while (i < n) {
+        var seen : bool = false;
+        var j : u32 = 0;
+        while (j < i) {
+            if (issues[j] == issues[i]) { seen = true; }
+            j = j + 1;
+        }
+        if (seen == false and in_flight(kinds, issues, n, issues[i])) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// How many of the first n events are of one kind.
+pub fn kind_count(kinds: [FOLD_WINDOW]u32, n: u32, kind: u32) -> u32 {
+    var count : u32 = 0;
+    var i : u32 = 0;
+    while (i < n) {
+        if (kinds[i] == kind) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// How many finished events said "refused".
+pub fn refused_count(kinds: [FOLD_WINDOW]u32, states: [FOLD_WINDOW]u32, n: u32) -> u32 {
+    var count : u32 = 0;
+    var i : u32 = 0;
+    while (i < n) {
+        if (kinds[i] == K_FINISHED and states[i] == S_REFUSED) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// Seconds between the server's cursor and the newest event; -1 when there is no event.
+/// newest_at_ms is the `at` of events[0], the first event in list order (SOURCE_ORDER). It is not
+/// the latest `at` anywhere in the list: two events can share a second, and the list order decides.
+/// The glue parses events[0].at and nothing else.
+pub fn newest_age_s(cursor_ms: i64, newest_at_ms: i64, n: u32) -> i64 {
+    if (n == 0) { return -1; }
+    if (newest_at_ms > cursor_ms) { return 0; }
+    return (cursor_ms - newest_at_ms) / 1000;
+}
+
+pub const F_NONE : u32 = 0;
+pub const F_FRESH : u32 = 1;
+pub const F_QUIET : u32 = 2;
+
+/// Whether a live reading is fresh or quiet; F_NONE when it holds no event.
+/// Freshness is about the fleet, P_STALE is about the feed, so there are not two thresholds to keep
+/// in step. P_STALE (queen/views.t27 presentation) has no time threshold: it means a request failed
+/// after a success. stale_age_s counts the seconds since that success. F_QUIET means the feed
+/// answered but its newest event is over QUIET_S old. A reading can be P_LIVE and F_QUIET at once
+/// (test live_and_quiet_are_independent).
+pub fn freshness(age_s: i64) -> u32 {
+    if (age_s < 0) { return F_NONE; }
+    if (age_s > QUIET_S) { return F_QUIET; }
+    return F_FRESH;
+}
+
+/// The wait before the next request: POLL_S after a success, doubled per failure up to BACKOFF_MAX_S.
+pub fn next_wait_s(failures: u32) -> u32 {
+    var wait : u32 = POLL_S;
+    var k : u32 = 0;
+    while (k < failures and wait < BACKOFF_MAX_S) {
+        wait = wait * 2;
+        k = k + 1;
+    }
+    if (wait > BACKOFF_MAX_S) { return BACKOFF_MAX_S; }
+    return wait;
+}
+
+/// Requests an hour that a poll of calls per cycle_s seconds makes.
+pub fn requests_per_hour(calls: u32, cycle_s: u32) -> u32 {
+    if (cycle_s == 0) { return 0; }
+    return calls * 3600 / cycle_s;
+}
+
+/// Whether a poll fits a per-hour budget.
+pub fn budget_fits(calls: u32, cycle_s: u32, limit_per_h: u32) -> bool {
+    return requests_per_hour(calls, cycle_s) <= limit_per_h;
+}
+
+/// Which source the panel's headline and badge come from: the activity feed when its last request
+/// succeeded, the fixture otherwise. The GitHub reading is never the headline.
+pub fn headline_source(activity_ok: bool) -> u32 {
+    if (activity_ok) { return SRC_LIVE; }
+    return SRC_SNAPSHOT;
+}
+
+// --- Tests --------------------------------------------------------------------------------------------
+
+test a_dispatch_after_a_finish_is_in_flight {
+    // newest first: 12343 dispatched at :37; 12345 finished at :36 after its dispatch of :36
+    const kinds : [FOLD_WINDOW]u32 = [K_DISPATCH, K_FINISHED, K_DISPATCH, K_REVIEW, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const issues : [FOLD_WINDOW]u32 = [12343, 12345, 12345, 12343, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert in_flight(kinds, issues, 4, 12343);
+    assert in_flight(kinds, issues, 4, 12345) == false;
+    assert in_flight(kinds, issues, 4, 99) == false;
+    assert in_flight_count(kinds, issues, 4) == 1;
+}
+
+test a_review_neither_starts_nor_ends_a_flight {
+    const kinds : [FOLD_WINDOW]u32 = [K_REVIEW, K_DISPATCH, K_REVIEW, K_UNKNOWN, K_FINISHED, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const issues : [FOLD_WINDOW]u32 = [7, 7, 8, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert decides_flight(K_REVIEW) == false;
+    assert decides_flight(K_UNKNOWN) == false;
+    assert decides_flight(K_DISPATCH);
+    assert decides_flight(K_FINISHED);
+    assert in_flight(kinds, issues, 5, 7);
+    assert in_flight(kinds, issues, 5, 8) == false;
+    assert in_flight(kinds, issues, 5, 9) == false;
+    assert in_flight_count(kinds, issues, 5) == 1;
+}
+
+test only_the_first_n_events_count {
+    const kinds : [FOLD_WINDOW]u32 = [K_FINISHED, K_DISPATCH, K_DISPATCH, K_DISPATCH, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const issues : [FOLD_WINDOW]u32 = [1, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert in_flight_count(kinds, issues, 4) == 2;
+    assert in_flight_count(kinds, issues, 2) == 0;
+    assert in_flight_count(kinds, issues, 0) == 0;
+    assert in_flight(kinds, issues, 2, 2) == false;
+}
+
+test the_counts_add_up {
+    const kinds : [FOLD_WINDOW]u32 = [K_DISPATCH, K_FINISHED, K_FINISHED, K_REVIEW, K_FINISHED, K_DISPATCH, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const states : [FOLD_WINDOW]u32 = [S_NONE, S_REFUSED, S_NONE, S_NONE, S_REFUSED, S_WAIT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert kind_count(kinds, 6, K_DISPATCH) == 2;
+    assert kind_count(kinds, 6, K_FINISHED) == 3;
+    assert kind_count(kinds, 6, K_REVIEW) == 1;
+    assert refused_count(kinds, states, 6) == 2;
+    // a refused state on a dispatch is not a refused finish
+    assert refused_count(kinds, states, 1) == 0;
+}
+
+test the_age_comes_from_the_server_clock {
+    // 10:33:37.845Z cursor, newest event at 10:33:37.000Z
+    assert newest_age_s(1792924417845, 1792924417000, 1) == 0;
+    assert newest_age_s(1792924418845, 1792924417000, 1) == 1;
+    assert newest_age_s(1792924417845, 1792924417000, 0) == -1;
+    // a client clock ahead of the server never gives a negative age
+    assert newest_age_s(1792924417000, 1792924417845, 1) == 0;
+    assert freshness(-1) == F_NONE;
+    assert freshness(1) == F_FRESH;
+    assert freshness(600) == F_FRESH;
+    assert freshness(601) == F_QUIET;
+}
+
+test a_failure_backs_off_and_a_success_resets {
+    assert next_wait_s(0) == 15;
+    assert next_wait_s(1) == 30;
+    assert next_wait_s(2) == 60;
+    assert next_wait_s(3) == 120;
+    assert next_wait_s(4) == 120;
+    assert next_wait_s(40) == 120;
+}
+
+test the_github_path_cannot_carry_the_panel {
+    assert requests_per_hour(GH_CALLS_PER_CYCLE, GH_CYCLE_S) == 72;
+    assert budget_fits(GH_CALLS_PER_CYCLE, GH_CYCLE_S, GH_ANON_LIMIT_PER_H) == false;
+    // one call every 60 s would fit; one call per POLL_S is the activity feed's cost
+    assert budget_fits(1, 60, GH_ANON_LIMIT_PER_H);
+    assert requests_per_hour(1, POLL_S) == 240;
+    assert requests_per_hour(1, 0) == 0;
+}
+
+test the_badge_follows_the_activity_feed {
+    assert headline_source(true) == SRC_LIVE;
+    assert headline_source(false) == SRC_SNAPSHOT;
+    assert live_badge_allowed(headline_source(true));
+    assert live_badge_allowed(headline_source(false)) == false;
+    // the feed answered: live; it failed after a success: stale with its age; never read: loading
+    assert presentation(headline_source(true), true, false, false, true) == P_LIVE;
+    assert presentation(SRC_LIVE, true, false, true, true) == P_STALE;
+    assert stale_age_s(1000, 985, true, true) == 15;
+    assert presentation(SRC_LIVE, false, true, false, true) == P_LOADING;
+    assert presentation(SRC_LIVE, false, false, false, false) == P_OFFLINE;
+    assert presentation(headline_source(false), true, false, false, true) == P_SNAPSHOT;
+    assert presentation(SRC_LIVE, false, false, true, true) == P_UNAVAILABLE;
+}
+
+test a_window_of_the_newest_events_never_overcounts {
+    // newest first: issue 5 has a review, then (older) its dispatch; issue 6 finished after its
+    // dispatch; issue 7 dispatched last of all (oldest)
+    const kinds : [FOLD_WINDOW]u32 = [K_REVIEW, K_FINISHED, K_DISPATCH, K_DISPATCH, K_DISPATCH, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const issues : [FOLD_WINDOW]u32 = [5, 6, 6, 5, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // the count only grows as the window grows
+    assert in_flight_count(kinds, issues, 1) == 0;
+    assert in_flight_count(kinds, issues, 3) == 0;
+    assert in_flight_count(kinds, issues, 4) == 1;
+    assert in_flight_count(kinds, issues, 5) == 2;
+    // a review-only window reads as not in flight: an undercount, never an overcount
+    assert in_flight(kinds, issues, 1, 5) == false;
+    assert in_flight(kinds, issues, 4, 5);
+    // an issue decided inside the window keeps its decision in every longer window
+    assert in_flight(kinds, issues, 2, 6) == false;
+    assert in_flight(kinds, issues, 5, 6) == false;
+    // kind counts on a prefix never exceed the longer window's
+    assert kind_count(kinds, 3, K_DISPATCH) == 1;
+    assert kind_count(kinds, 5, K_DISPATCH) == 3;
+}
+
+test live_and_quiet_are_independent {
+    // the feed answered (P_LIVE) while the fleet was idle for 601 s (F_QUIET)
+    assert presentation(SRC_LIVE, true, false, false, true) == P_LIVE;
+    assert freshness(601) == F_QUIET;
+    // the feed failed after a success (P_STALE) while the last reading was fresh (F_FRESH)
+    assert presentation(SRC_LIVE, true, false, true, true) == P_STALE;
+    assert freshness(1) == F_FRESH;
+}
+
+invariant the_sample_holds_together {
+    assert SAMPLE_DISPATCH + SAMPLE_FINISHED + SAMPLE_REVIEW == SAMPLE_EVENTS;
+    assert SAMPLE_ISSUES <= SAMPLE_EVENTS;
+    assert SAMPLE_NEWEST_AGE_S < POLL_S;
+    assert POLL_S < BACKOFF_MAX_S;
+}
+
+invariant codes_are_distinct {
+    assert K_DISPATCH != K_FINISHED and K_FINISHED != K_REVIEW and K_REVIEW != K_UNKNOWN;
+    assert S_NONE != S_REFUSED and S_REFUSED != S_WAIT and S_WAIT != S_UNKNOWN;
+    assert F_NONE != F_FRESH and F_FRESH != F_QUIET;
+}

@@ -197,12 +197,12 @@ pub struct Interp<'p> {
     pub prog: &'p Program,
     pub fuel: u64,
     pub max_depth: u32,
-    /// Runtime asserts executed so far (#6115): every `assert` / `assert_eq`
-    /// statement reached whose operands are not all compile-time constants.
-    /// An assert the lowering folded to a constant is not counted: the code
-    /// generator emits nothing for `assert(true)`, so it checks nothing at
-    /// run time. A test that passes with this at 0 is a vacuous pass.
+    /// Runtime asserts so far (#6115): every `assert` / `assert_eq` reached
+    /// whose operands are not all compile-time constants -- a folded one
+    /// emits nothing, so it checks nothing at run time and is not counted.
     pub asserts: u64,
+    /// #12751: checks over all-constant operands -- CT-VERIFIED, not vacuous.
+    pub ct_verified: u64,
     depth: u32,
     mem: Mem,
 }
@@ -231,6 +231,7 @@ impl<'p> Interp<'p> {
             fuel: 50_000_000,
             max_depth: 2000,
             asserts: 0,
+            ct_verified: 0,
             depth: 0,
             mem: Mem::new(prog),
         }
@@ -334,18 +335,14 @@ impl<'p> Interp<'p> {
                 Ok(Flow::Next)
             }
             Stmt::Assert { cond, site } => {
-                if !is_const(cond) {
-                    self.asserts += 1;
-                }
+                if is_const(cond) { self.ct_verified += 1 } else { self.asserts += 1 };
                 if self.expr(cond, env)? == 0 {
                     return Err(Stop::Trap { site: *site, a: 0, b: 0 });
                 }
                 Ok(Flow::Next)
             }
             Stmt::AssertEq { lhs, rhs, site } => {
-                if !(is_const(lhs) && is_const(rhs)) {
-                    self.asserts += 1;
-                }
+                if is_const(lhs) && is_const(rhs) { self.ct_verified += 1 } else { self.asserts += 1 };
                 let a = self.expr(lhs, env)?;
                 let b = self.expr(rhs, env)?;
                 // Floats compare as IEEE values: NaN never equals, -0.0 == 0.0.

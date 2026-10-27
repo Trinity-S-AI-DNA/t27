@@ -30,11 +30,9 @@
 //!   jump to the shared `trap_common` routine of the JIT image; object-file
 //!   stubs are `brk #kind`.
 //! * Calls inside the module are `bl` with the offset filled in by `link`.
-
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
 use std::collections::HashMap;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -44,7 +42,6 @@ pub enum TrapStyle {
     /// ELF object file (specs/tri/t27b/elf.t27): `brk` stubs, and module-level vars in .data.
     Elf,
 }
-
 /// Machine code of one function before linking.
 #[derive(Clone, Debug)]
 pub struct FuncCode {
@@ -57,9 +54,7 @@ pub struct FuncCode {
     /// Word index of every `adrp` (followed by its `add`), with the blob.
     pub data_refs: Vec<(usize, u32)>,
 }
-
 const GLOBAL_IN_OBJECT: &str = "module-level var in an object file";
-
 /// A function the generator cannot encode (frame or branch range limits).
 #[derive(Clone, Debug)]
 pub struct CodegenError {
@@ -68,7 +63,6 @@ pub struct CodegenError {
     pub construct: &'static str,
     pub detail: String,
 }
-
 const X0: Reg = 0;
 const X8: Reg = 8;
 const X16: Reg = 16;
@@ -87,7 +81,6 @@ const MAX_UNPROBED_FRAME: usize = 16384;
 const PROBE_STEP: usize = 4096;
 const LR: Reg = 30;
 const FP: Reg = 29;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Home {
     None,
@@ -95,7 +88,6 @@ enum Home {
     /// Byte offset from sp.
     Slot(u32),
 }
-
 /// Where an evaluated value is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum V {
@@ -107,15 +99,12 @@ enum V {
     /// A constant not yet materialised.
     Const(i128),
 }
-
 type Label = usize;
-
 enum Stub {
     Site(SiteId),
     AssertEq(SiteId, Reg, Reg),
     Brk(TrapKind),
 }
-
 /// Register image of a constant of type `ty` (see canonical form above).
 pub fn canon(c: i128, ty: Ty) -> u64 {
     if ty.is64() {
@@ -124,13 +113,11 @@ pub fn canon(c: i128, ty: Ty) -> u64 {
         (c as i64 as u64) & 0xffff_ffff
     }
 }
-
 /// Float `ty` from general register `rn` to FP register `rd`, from FP register `rn` to general register `rd`
 /// in canonical form, and a double-precision FP instruction `w` in `ty`'s precision: a64.t27's choices.
 fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_in(ty == Ty::F32, rd, rn) }
 fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_out(ty == Ty::F32, rd, rn) }
 fn fp_op(ty: Ty, w: u32) -> u32 { a64::fp_prec(ty == Ty::F32, w) }
-
 fn narrow_ext(ty: Ty) -> Option<Ext> {
     match ty {
         Ty::U8 | Ty::Bool => Some(Ext::Uxtb),
@@ -140,19 +127,15 @@ fn narrow_ext(ty: Ty) -> Option<Ext> {
         _ => None,
     }
 }
-
 /// The one instruction that puts the low `ty.bits()` bits of `n` into `d` in canonical form: a64.t27's `narrow_word`.
 fn narrow_word(sf: bool, d: Reg, n: Reg, ty: Ty) -> Option<u32> { Some(a64::narrow_word(sf, d, n, ty.bits(), ty.signed())).filter(|&w| w != 0) }
-
 /// The condition after `cmp` (`fcmp` for a float) that holds when `op` does: specs/tri/t27b/cmp_op.t27's `cond_bits`.
 fn cond_for(op: CmpOp, ty: Ty) -> Cond { Cond::from_bits(co::cond_bits(op as u8, ty.is_float(), ty.signed())) }
-
 /// d registers used as scratch for one floating point operation. Values
 /// live in X registers as bit patterns between operations; d8-d15 (callee
 /// saved) are never touched.
 const D16: Reg = 16;
 const D17: Reg = 17;
-
 struct Gen<'a> {
     prog: &'a Program,
     f: &'a Func,
@@ -186,7 +169,6 @@ struct Gen<'a> {
     stack_params: bool,
     data_refs: Vec<(usize, u32)>,
 }
-
 /// Compile every function of `prog` (tests too when `with_tests`).
 pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec<FuncCode>, CodegenError> {
     let mut out = Vec::with_capacity(prog.funcs.len());
@@ -198,7 +180,6 @@ pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec
     }
     Ok(out)
 }
-
 pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<FuncCode, CodegenError> {
     let f = &prog.funcs[id as usize];
     let mut g = Gen {
@@ -274,52 +255,41 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
     }
     Ok(code)
 }
-
 impl<'a> Gen<'a> {
     // ----------------------------------------------------------- emission
-
     fn emit(&mut self, w: u32) {
         self.code.push(w);
     }
-
     fn new_label(&mut self) -> Label {
         self.labels.push(None);
         self.labels.len() - 1
     }
-
     fn bind(&mut self, l: Label) {
         self.labels[l] = Some(self.code.len());
     }
-
     fn jump(&mut self, l: Label) {
         self.fixes.push((self.code.len(), l));
         self.emit(a64::b(0));
     }
-
     fn bcond(&mut self, c: Cond, l: Label) {
         self.fixes.push((self.code.len(), l));
         self.emit(a64::b_cond(c, 0));
     }
-
     fn cbz(&mut self, sf: bool, r: Reg, nz: bool, l: Label) {
         self.fixes.push((self.code.len(), l));
         self.emit(if nz { a64::cbnz(sf, r, 0) } else { a64::cbz(sf, r, 0) });
     }
-
     fn mov_imm(&mut self, sf: bool, rd: Reg, v: u64) {
         let mut buf = Vec::with_capacity(4);
         a64::mov_imm(sf, rd, v, &mut buf);
         self.code.extend_from_slice(&buf);
     }
-
     fn fail(&mut self, msg: String) {
         if self.error.is_none() {
             self.error = Some(msg);
         }
     }
-
     // ------------------------------------------------------- trap stubs
-
     fn stub_site(&mut self, site: SiteId) -> Label {
         match self.style {
             TrapStyle::Jit => {
@@ -337,7 +307,6 @@ impl<'a> Gen<'a> {
             }
         }
     }
-
     fn stub_brk(&mut self, kind: TrapKind) -> Label {
         let k = kind as u32;
         if let Some(&l) = self.brk_by_kind.get(&k) {
@@ -348,9 +317,7 @@ impl<'a> Gen<'a> {
         self.brk_by_kind.insert(k, l);
         l
     }
-
     // --------------------------------------------------- homes and frame
-
     fn assign_homes(&mut self) {
         let f = self.f;
         // w counts reads, wr writes; a variable that is never read gets no
@@ -421,7 +388,6 @@ impl<'a> Gen<'a> {
         }
         self.temp_base = 8 * (slots + self.used_callee.len() as u32);
     }
-
     fn slot_of_temp(&mut self, i: usize) -> u32 {
         if i + 1 > self.max_slot {
             self.max_slot = i + 1;
@@ -433,15 +399,12 @@ impl<'a> Gen<'a> {
         }
         off
     }
-
     fn ldr_slot(&mut self, rt: Reg, off: u32) {
         self.emit(a64::ldr_x(rt, SP, off));
     }
-
     fn str_slot(&mut self, rt: Reg, off: u32) {
         self.emit(a64::str_x(rt, SP, off));
     }
-
     /// Assemble prologue + body + epilogue + stubs, and resolve local branches.
     fn finish(&mut self, id: FuncId) -> FuncCode {
         let f = self.f;
@@ -639,14 +602,11 @@ impl<'a> Gen<'a> {
             data_refs: self.data_refs.iter().map(|&(p, k)| (p + shift, k)).collect(),
         }
     }
-
     // ------------------------------------------------------- temp stack
-
     fn alloc(&mut self) -> usize {
         self.depth += 1;
         self.depth - 1
     }
-
     fn release(&mut self, v: V) {
         if let V::Temp(i) = v {
             debug_assert_eq!(i + 1, self.depth, "temp stack is LIFO");

@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/claim_msg.t27 -- the swarm claim protocol as an actor message (gHashTag/t27#12582, P1 of
+; epic #12490). Three messages carry a claim: CLAIM takes an issue, BEAT renews it, RELEASE gives it up.
+; This file reads the idea of the tags and lanes of specs/queen/actors.t27 and edits nothing there: it
+; restates three tag numbers as new constants above the actors.t27 tags 1..3, so the two files never
+; collide, and it uses nothing from any other spec. Every function is pure, on u8, u32, u64 and bool.
+; A claim is THREE parts that must agree:
+;   1. the git ref refs/swarm/claims/<issue>, created with old value zero (so of two racing creators
+;      exactly one lands, as a fenced lease does in control.t27);
+;   2. one comment on the issue: "In work: <what>, done so far: <x>";
+;   3. a heartbeat that renews the claim (a commit or a BEAT message, whichever came later).
+; The ref is the strong half, the comment the weaker half, the heartbeat keeps both alive. A claim with
+; no commit and no beat for CM_STALE_MINUTES (six hours) is stale and anyone may take it over. A lone
+; part (a ref without its comment, a comment without its ref, a beat without either) is an anomaly the
+; reconciler heals: cm_parts_agree is the check it asks.
+; Not here: the wiring, the ref write and the comment post. This is the decision table with tests, a
+; contract for the code that sends and receives the messages. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenClaimMsg;
+
+; --- 1. Tags and lanes ------------------------------------------------------------------------------
+
+/// The three message tags of the claim protocol. They restate no tag of actors.t27 (M_TASK_OFFER 1,
+/// M_CANCEL 2, M_HEARTBEAT_DUE 3): they sit above those, 16..18, so a mailbox that carries both never
+/// confuses them, and all stay under the 64 tags one control lane word holds.
+pub const CM_TAG_CLAIM : u64 = 16;
+pub const CM_TAG_BEAT : u64 = 17;
+pub const CM_TAG_RELEASE : u64 = 18;
+
+/// Whether a tag is one of the three claim tags. Tags 0..3 (nobody and the actors.t27 tags) and any tag
+/// past RELEASE are not: a receiver of this protocol drops what it does not know.
+pub fn cm_known_tag(tag : u64) -> bool {
+    if (tag == CM_TAG_CLAIM) { return true; }
+    if (tag == CM_TAG_BEAT) { return true; }
+    if (tag == CM_TAG_RELEASE) { return true; }
+    return false;
+}
+
+/// The lane of a tag, with the same numbers as actors.t27 (0 is the data lane, 1 the control lane). A
+/// claim is work and rides the data lane. A beat and a release ride the control lane, so a mailbox full
+/// of claims can neither drop them nor put them behind the claims: a lost beat is a stale claim taken
+/// over under a live holder. Any other tag is data.
+pub fn cm_lane_of(tag : u64) -> u8 {
+    if (tag == CM_TAG_BEAT) { return 1; }
+    if (tag == CM_TAG_RELEASE) { return 1; }
+    return 0;
+}
+
+; --- 2. States, outcomes and the stale bound --------------------------------------------------------
+
+/// The state of one claim as the reconciler sees it: nobody holds it, somebody holds it and it is
+/// live, or somebody holds it and has gone quiet.
+pub const CM_FREE : u8 = 0;
+pub const CM_HELD : u8 = 1;
+pub const CM_STALE : u8 = 2;
+
+/// What a CLAIM message ends in: the claim is given to the sender, refused because another holds it
+/// live, or taken over from a holder that has gone quiet.
+pub const CM_GRANTED : u8 = 0;
+pub const CM_REFUSED : u8 = 1;
+pub const CM_TAKEOVER : u8 = 2;
+
+/// Six hours with no commit and no beat. The bound is chosen, not measured.
+pub const CM_STALE_MINUTES : u32 = 360;
+
+/// The largest idle time cm_idle_minutes returns: u32 max, 4294967295 minutes.
+pub const CM_IDLE_MAX : u32 = 4294967295;
+
+/// Minutes since the later of the last commit and the last beat, given as one minute stamp (the caller
+/// takes the maximum of the two). A clock that reads backwards (now before the last signal) gives 0, so
+/// it keeps the claim alive and never ages it. A gap larger than a u32 saturates at CM_IDLE_MAX.
+pub fn cm_idle_minutes(now_min : u64, last_signal_min : u64) -> u32 {
+    if (now_min < last_signal_min) { return 0; }
+    var gap : u64 = now_min - last_signal_min;
+    if (gap > 4294967295) { return CM_IDLE_MAX; }
+    return gap as u32;
+}
+
+/// The state of a claim. Not held: free, whatever the idle time. Held with idle time at or above
+/// CM_STALE_MINUTES: stale (exactly 360 is stale, 359 is not). Held below that: held.
+pub fn cm_state(held : bool, idle_minutes : u32) -> u8 {
+    if (held == false) { return CM_FREE; }
+    if (idle_minutes >= CM_STALE_MINUTES) { return CM_STALE; }
+    return CM_HELD;
+}
+
+; --- 3. The three messages --------------------------------------------------------------------------
+
+/// The outcome of a CLAIM message. The claim counts as held when the ref exists or the comment exists:
+/// the comment is the weaker half, but a visible claim is never granted over.
+/// - nothing visible (no ref, no comment): GRANTED, the ref is created with old value zero.
+/// - held by the same holder (a re-claim, for instance after a restart): GRANTED, nothing changes.
+/// - held by another and stale: TAKEOVER, the new holder replaces the ref and says so in its comment.
+/// - held by another and not stale: REFUSED, the sender picks another issue.
+pub fn cm_decide(ref_exists : bool, comment_exists : bool, idle_minutes : u32, same_holder : bool) -> u8 {
+    var held : bool = false;
+    if (ref_exists) { held = true; }
+    if (comment_exists) { held = true; }
+    if (held == false) { return CM_GRANTED; }
+    if (same_holder) { return CM_GRANTED; }
+    if (cm_state(held, idle_minutes) == CM_STALE) { return CM_TAKEOVER; }
+    return CM_REFUSED;
+}
+
+/// A BEAT renews only an existing claim held by its sender. A beat for a free claim (no ref) renews
+/// nothing, and a beat for a claim another holds is not the holder's to give: both are dropped.
+pub fn cm_beat_renews(ref_exists : bool, same_holder : bool) -> bool {
+    if (ref_exists == false) { return false; }
+    return same_holder;
+}
+
+/// Whether a RELEASE takes effect. With a ref: the holder may always release, and anyone may release
+/// once the claim is stale. Without a ref there is nothing to release but a lone comment, which only
+/// its own holder cleans up; a stranger's release is dropped.
+pub fn cm_release_valid(ref_exists : bool, same_holder : bool, stale : bool) -> bool {
+    if (ref_exists == false) { return same_holder; }
+    if (same_holder) { return true; }
+    return stale;
+}
+
+; --- 4. The three parts agree -----------------------------------------------------------------------
+
+/// True when the ref, the comment and a recent beat are all present or all absent. Any mix is a lone
+/// part and an anomaly the reconciler heals (post the missing comment, renew the beat, or drop the
+/// orphan).
+pub fn cm_parts_agree(ref_exists : bool, comment_exists : bool, beat_recent : bool) -> bool {
+    if (ref_exists) {
+        if (comment_exists) { return beat_recent; }
+        return false;
+    }
+    if (comment_exists) { return false; }
+    return beat_recent == false;
+}
+
+; --- 5. Tests ---------------------------------------------------------------------------------------
+
+test a_claim_is_stale_at_exactly_360_minutes_and_not_at_359 {
+    assert cm_state(true, 359) == CM_HELD;
+    assert cm_state(true, 360) == CM_STALE;
+    assert cm_state(true, 361) == CM_STALE;
+    assert cm_decide(true, true, 359, false) == CM_REFUSED;
+    assert cm_decide(true, true, 360, false) == CM_TAKEOVER;
+}
+
+test a_claim_nobody_holds_is_free_whatever_the_idle_time {
+    assert cm_state(false, 0) == CM_FREE;
+    assert cm_state(false, 360) == CM_FREE;
+    assert cm_state(false, CM_IDLE_MAX) == CM_FREE;
+}
+
+test two_lanes_race_first_is_granted_second_is_refused_while_fresh {
+    assert cm_decide(false, false, 0, false) == CM_GRANTED;
+    assert cm_decide(true, true, 0, false) == CM_REFUSED;
+    assert cm_decide(true, true, 5, false) == CM_REFUSED;
+}
+
+test the_same_holder_re_claims_and_is_granted {
+    assert cm_decide(true, true, 0, true) == CM_GRANTED;
+    assert cm_decide(true, true, 359, true) == CM_GRANTED;
+    assert cm_decide(true, true, 500, true) == CM_GRANTED;
+}
+
+test a_clock_that_reads_backwards_keeps_the_claim {
+    assert cm_idle_minutes(100, 200) == 0;
+    assert cm_idle_minutes(0, 1) == 0;
+    assert cm_state(true, cm_idle_minutes(100, 200)) == CM_HELD;
+    assert cm_decide(true, true, cm_idle_minutes(100, 200), false) == CM_REFUSED;
+}
+
+test idle_minutes_is_the_gap_since_the_last_signal {
+    assert cm_idle_minutes(500, 200) == 300;
+    assert cm_idle_minutes(200, 200) == 0;
+    assert cm_idle_minutes(1000, 640) == 360;
+    assert cm_idle_minutes(1000, 641) == 359;
+}
+
+test a_gap_larger_than_a_u32_saturates {
+    var big : u64 = 10000000000;
+    assert cm_idle_minutes(big, 0) == CM_IDLE_MAX;
+    assert cm_idle_minutes(4294967295, 0) == 4294967295;
+    assert cm_idle_minutes(4294967294, 0) == 4294967294;
+    assert cm_idle_minutes(4294967296, 0) == CM_IDLE_MAX;
+}
+
+test the_idle_gap_decides_a_takeover_end_to_end {
+    assert cm_decide(true, true, cm_idle_minutes(1000, 640), false) == CM_TAKEOVER;
+    assert cm_decide(true, true, cm_idle_minutes(1000, 641), false) == CM_REFUSED;
+}
+
+test a_beat_and_a_release_ride_the_control_lane_a_claim_rides_data {
+    assert cm_lane_of(CM_TAG_BEAT) == 1;
+    assert cm_lane_of(CM_TAG_RELEASE) == 1;
+    assert cm_lane_of(CM_TAG_CLAIM) == 0;
+    assert cm_lane_of(0) == 0;
+    assert cm_lane_of(99) == 0;
+}
+
+test only_the_three_claim_tags_are_known_and_none_is_an_actor_tag {
+    assert cm_known_tag(CM_TAG_CLAIM) == true;
+    assert cm_known_tag(CM_TAG_BEAT) == true;
+    assert cm_known_tag(CM_TAG_RELEASE) == true;
+    assert cm_known_tag(0) == false;
+    assert cm_known_tag(1) == false;
+    assert cm_known_tag(2) == false;
+    assert cm_known_tag(3) == false;
+    assert cm_known_tag(19) == false;
+}
+
+test a_beat_renews_only_a_claim_its_sender_holds {
+    assert cm_beat_renews(true, true) == true;
+    assert cm_beat_renews(true, false) == false;
+    assert cm_beat_renews(false, true) == false;
+    assert cm_beat_renews(false, false) == false;
+}
+
+test a_release_by_a_stranger_is_refused_while_fresh_and_valid_once_stale {
+    assert cm_release_valid(true, false, false) == false;
+    assert cm_release_valid(true, false, true) == true;
+    assert cm_release_valid(true, true, false) == true;
+    assert cm_release_valid(true, true, true) == true;
+}
+
+test a_release_without_a_ref_is_the_holders_cleanup_only {
+    assert cm_release_valid(false, true, false) == true;
+    assert cm_release_valid(false, false, false) == false;
+    assert cm_release_valid(false, false, true) == false;
+}
+
+test a_lone_comment_counts_as_held {
+    assert cm_decide(false, true, 0, false) == CM_REFUSED;
+    assert cm_decide(false, true, 359, false) == CM_REFUSED;
+    assert cm_decide(false, true, 360, false) == CM_TAKEOVER;
+    assert cm_decide(false, true, 0, true) == CM_GRANTED;
+}
+
+test a_lone_ref_counts_as_held {
+    assert cm_decide(true, false, 0, false) == CM_REFUSED;
+    assert cm_decide(true, false, 360, false) == CM_TAKEOVER;
+}
+
+test the_three_parts_agree_only_when_all_are_present_or_all_absent {
+    assert cm_parts_agree(true, true, true) == true;
+    assert cm_parts_agree(false, false, false) == true;
+    assert cm_parts_agree(true, false, true) == false;
+    assert cm_parts_agree(true, true, false) == false;
+    assert cm_parts_agree(false, true, false) == false;
+    assert cm_parts_agree(false, false, true) == false;
+    assert cm_parts_agree(true, false, false) == false;
+    assert cm_parts_agree(false, true, true) == false;
+}
+
+test the_three_states_and_the_three_outcomes_come_out_distinct {
+    assert cm_state(false, 0) != cm_state(true, 0);
+    assert cm_state(true, 0) != cm_state(true, 360);
+    assert cm_state(false, 0) != cm_state(true, 360);
+    assert cm_decide(false, false, 0, false) != cm_decide(true, true, 0, false);
+    assert cm_decide(true, true, 0, false) != cm_decide(true, true, 360, false);
+    assert cm_decide(false, false, 0, false) != cm_decide(true, true, 360, false);
+}
+
+; --- 6. Invariants ----------------------------------------------------------------------------------
+
+invariant cm_tags_distinct { assert CM_TAG_CLAIM != CM_TAG_BEAT and CM_TAG_BEAT != CM_TAG_RELEASE and CM_TAG_CLAIM != CM_TAG_RELEASE; }
+invariant cm_stale_is_six_hours { assert CM_STALE_MINUTES == 360; }
+invariant cm_tags_sit_above_the_actor_tags { assert CM_TAG_CLAIM > 3 and CM_TAG_BEAT > 3 and CM_TAG_RELEASE > 3; }
+invariant cm_states_are_distinct { assert CM_FREE != CM_HELD and CM_HELD != CM_STALE and CM_FREE != CM_STALE; }

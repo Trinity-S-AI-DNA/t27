@@ -1,0 +1,518 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/settle_bridge.t27 -- the settle bridge (issue gHashTag/t27#11789): the ONE path from a
+// verified T27 OS lab receipt to the settlement ledger's settle() call, decided as pure wiring. This
+// file decides the call shape, the gate order and the honest refusals; the laws it points to decide
+// everything else, and are imported, never restated.
+// --
+// The wiring. A lab receipt (challenge-bound, published in t27os runs/, carrying per-spec test
+// counts and the t27c build stamp; signed by `t27c corpus-receipt`, which specs/t27os/labs.t27 calls
+// and does not reimplement; the receipt contract is specs/verified/corpus_receipt.t27 and
+// specs/verified/signed_receipt.t27) plus the lab node's bound identity (specs/network/identity.t27:
+// the t27os-lab row, receipt key 25d5b8373b6d9986, bound by that table's own binding rule alone)
+// plus TWO independent verifications (the useful-run bar: a re-run with MATCHING per-spec counts,
+// never signed by the lab node's own key, one vote per verifier key) shape ONE call:
+//   settle(node, node, nonce = the run challenge, verdict)   -- into specs/trinet/ledger.t27
+// and ONE settlement record that references the receipt (its challenge) and the test-report verdict
+// -- payout rule (c). The gate is payout.t27's own payout() of (the ledger's outcome, the receipt's
+// engineering verdict, the record's reference): a credited receipt is still not a passed test, a
+// slash the ledger decided stays a slash, and the bridge invents neither.
+// --
+// The refusals, in the order the bridge decides them (the order is part of the law):
+//   1. the receipt key names no valid identity row (identity.t27 bound_part over the table): no
+//      settle attempt;
+//   2. a submitted verification did not reproduce the receipt's counts: a disputed run refuses even
+//      when the other verification reproduced -- no settle attempt;
+//   3. fewer than MIN_VERIFICATIONS (2) independent reproductions: no settle attempt, answered in
+//      the ledger's OUT_NOT_ELIGIBLE shape;
+//   4. the nonce is not the run challenge, or the challenge does not fit the ledger's u32 nonce (the
+//      ledger packs the spent key as (node << 32) | nonce): no settle attempt.
+// Past all four the bridge passes the coordinator's verdict through to settle() UNJUDGED -- judging
+// the frame is ledger.t27's and protocol's law, not the bridge's.
+// --
+// The honest refusals are the point. Before the owner registers the lab node in the coordinator's
+// registry, settle() itself refuses at its step 0; before the identity table carries the
+// machine-readable row, the bridge refuses at its step 1. In both states nothing moves, and this
+// spec's tests pin both states as they stand.
+// --
+// NOT CLAIMED: no node identity is registered in the coordinator's ledger yet (the owner's
+// governance act, ledger.t27's step 0). The machine-readable identity row HAS landed (PR #11850,
+// 2026-10-23: participant 9 t27os-lab, the receipt key 25d5b8373b6d9986 bound EV_PR by #11814) --
+// the tripwire test flipped to the bound truth on this landing (t27#11858). Still no mTRI has
+// moved; the amounts and the splits are the laws' own (ledger.t27's REWARD_PER_JOB_MTRI,
+// payout.t27's shares) and this file decides no rate, no amount, no split, and registers no node;
+// the minter and the destinations are specs/trinet/node-work-credit.t27's and
+// specs/automation/tri-wallet-chains.t27's, only pointed at here.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module settle_bridge;
+
+use verified::payout::{payout, OUT_CREDITED, OUT_REJECTED_AND_SLASHED, OUT_NOT_ELIGIBLE, PAY_NONE, PAY_NORMAL, PAY_SLASH_ONLY};
+use trinet::ledger::{Ledger, settle, ledger_init, register_node, default_policy, find, V_OK, V_WRONG_RESULT, OUT_NONE, REWARD_PER_JOB_MTRI};
+use network::identity::{IdentityTable, identity_table, bound_part, binding_valid, K_RECEIPT_KEY, KEY_HEX, ID_ROWS, ROLE_LAB, EV_PR, id_is_hex, id_same};
+
+// --- the bridge's own constants --------------------------------------------------
+
+/// The useful-run bar (issue #11789): two independent verifications, each a re-run whose per-spec
+/// test counts match the receipt's.
+pub const MIN_VERIFICATIONS : u32 = 2;
+
+/// The bridge's refusal codes (the answer's `refuse` field). SB_OK means the call was shaped and
+/// settle() judged it; every other code means no settle attempt was made at all.
+pub const SB_OK : u8 = 0;
+pub const SB_REFUSE_UNBOUND : u8 = 1;
+pub const SB_REFUSE_MISMATCH : u8 = 2;
+pub const SB_REFUSE_VERIFICATIONS : u8 = 3;
+pub const SB_REFUSE_NONCE : u8 = 4;
+
+/// The lab node's receipt key id (identity.t27's 2026-10-23 row: the t27os-lab node, operator
+/// gHashTag). The bridge knows the key; whether it is bound is the table's answer, never a constant.
+pub const LAB_RECEIPT_KEY : str = "25d5b8373b6d9986";
+
+invariant the_bridge_codes_are_distinct_and_the_labs_key_is_well_formed {
+    assert MIN_VERIFICATIONS == 2;
+    assert SB_OK == 0 and SB_REFUSE_UNBOUND == 1 and SB_REFUSE_MISMATCH == 2;
+    assert SB_REFUSE_VERIFICATIONS == 3 and SB_REFUSE_NONCE == 4;
+    assert KEY_HEX == 16;
+    assert LAB_RECEIPT_KEY.len == KEY_HEX;
+    assert id_is_hex(LAB_RECEIPT_KEY, 0, KEY_HEX);
+}
+
+// --- the inputs ------------------------------------------------------------------
+
+/// A lab receipt as published into t27os runs/: the run challenge it is bound to, the key id that
+/// signed it, the per-spec test counts summed (what `t27c test-report` reported FAIL and vacuous),
+/// and whether the t27c build stamp is on it. The receipt is INPUT: the bridge recomputes no test.
+pub struct LabReceipt {
+    challenge: u64,
+    receipt_key: str,
+    tests_failed: u32,
+    tests_vacuous: u32,
+    stamp: bool,
+}
+
+/// One verification of the receipt: an independent re-run. present says one was submitted; the
+/// verifier key is never the lab node's own; reproduced says the per-spec counts matched.
+pub struct Verification {
+    present: bool,
+    verifier_key: str,
+    reproduced: bool,
+}
+
+/// The settlement record: which receipt it is about (the run challenge names it) and whether it
+/// names the test-report verdict -- payout rule (c), never inferred from an attempt.
+pub struct SettlementRecord {
+    names_challenge: u64,
+    verdict_named: bool,
+}
+
+// --- the answer ------------------------------------------------------------------
+
+/// What the bridge answers for one receipt. attempt = settle() was called; refuse says why not
+/// (SB_OK when it was). node, nonce and verdict are the call shape when attempt. outcome is the
+/// ledger's own answer (OUT_NONE = no Settlement when the shape alone is asked), OUT_NOT_ELIGIBLE
+/// on a refusal. verified and verdict_referenced are payout()'s other two inputs, and pay is
+/// payout()'s answer -- the gate is payout.t27's, restated nowhere.
+pub struct BridgeAnswer {
+    attempt: bool,
+    refuse: u8,
+    node: u32,
+    nonce: u32,
+    verdict: u8,
+    outcome: u8,
+    verified: bool,
+    verdict_referenced: bool,
+    pay: u8,
+}
+
+// --- the pieces ------------------------------------------------------------------
+
+/// Is the receipt's key a well-formed receipt key id (identity.t27's KEY_HEX hex digits)?
+pub fn receipt_key_ok(rec: LabReceipt) -> bool {
+    return rec.receipt_key.len == KEY_HEX and id_is_hex(rec.receipt_key, 0, KEY_HEX);
+}
+
+/// The receipt's engineering verdict, as payout() reads it: the counts are green (no FAIL, no
+/// vacuous -- a vacuous test verifies nothing) and the receipt names the build that produced it.
+pub fn counts_green(rec: LabReceipt) -> bool {
+    return rec.stamp and rec.tests_failed == 0 and rec.tests_vacuous == 0;
+}
+
+/// Is this verification independent of the lab node: submitted, and signed by a key that is not the
+/// receipt's own? The lab verifying itself is the self-report node-work-credit refuses.
+pub fn verification_independent(v: Verification, rec: LabReceipt) -> bool {
+    if (v.present == false) { return false; }
+    return id_same(v.verifier_key, 0, v.verifier_key.len, rec.receipt_key, 0, rec.receipt_key.len) == false;
+}
+
+/// How many of the two submitted verifications count: independent of the lab, reproduced, and one
+/// vote per verifier key -- the same key verifying twice is one verifier, not two.
+pub fn verifications_count(v1: Verification, v2: Verification, rec: LabReceipt) -> u32 {
+    var n : u32 = 0;
+    const one : bool = verification_independent(v1, rec) and v1.reproduced;
+    const two : bool = verification_independent(v2, rec) and v2.reproduced;
+    if (one) { n = n + 1; }
+    if (two) { n = n + 1; }
+    if (one and two and id_same(v1.verifier_key, 0, v1.verifier_key.len, v2.verifier_key, 0, v2.verifier_key.len)) {
+        n = 1;
+    }
+    return n;
+}
+
+/// Did a submitted verification run and NOT reproduce the receipt's counts? A dispute refuses the
+/// run outright: a receipt two runs disagree about is not settled while the disagreement stands.
+pub fn verification_disputes(v1: Verification, v2: Verification) -> bool {
+    if (v1.present and v1.reproduced == false) { return true; }
+    if (v2.present and v2.reproduced == false) { return true; }
+    return false;
+}
+
+/// Does the settlement record reference THIS receipt and its verdict (payout rule (c))?
+pub fn record_references(record: SettlementRecord, rec: LabReceipt) -> bool {
+    return record.names_challenge == rec.challenge and record.verdict_named;
+}
+
+// --- the bridge ------------------------------------------------------------------
+
+/// The call shape for one lab receipt, decided in the order above. attempt = false means no settle
+/// attempt: nothing moves, whatever the receipt says.
+pub fn bridge(tab: IdentityTable, rec: LabReceipt, v1: Verification, v2: Verification,
+              node: u32, nonce: u32, verdict: u8, record: SettlementRecord) -> BridgeAnswer {
+    var a = BridgeAnswer {
+        attempt: false,
+        refuse: SB_REFUSE_UNBOUND,
+        node: 0,
+        nonce: 0,
+        verdict: 0,
+        outcome: OUT_NONE,
+        verified: counts_green(rec),
+        verdict_referenced: false,
+        pay: PAY_NONE,
+    };
+    // 1. identity: the key is well formed and names a validly bound participant of the table
+    //    (identity.t27's binding rule; a row bound by another account's pull request is no row).
+    if (receipt_key_ok(rec) == false or
+        bound_part(tab, K_RECEIPT_KEY, rec.receipt_key, 0, rec.receipt_key.len) == ID_ROWS) {
+        return a;
+    }
+    // 2. a disputed run refuses before the bar is even counted
+    if (verification_disputes(v1, v2)) {
+        a.refuse = SB_REFUSE_MISMATCH;
+        return a;
+    }
+    // 3. the useful-run bar: two independent reproductions
+    if (verifications_count(v1, v2, rec) < MIN_VERIFICATIONS) {
+        a.refuse = SB_REFUSE_VERIFICATIONS;
+        return a;
+    }
+    // 4. the nonce IS the run challenge -- and it must fit the ledger's u32 nonce at all. The
+    //    challenge is read into a local before the cast: a cast of a struct field directly
+    //    truncates wrongly for values past u32 (compiler defect, self-host epic #5980).
+    const challenge : u64 = rec.challenge;
+    if (((challenge as u32) as u64) != challenge or nonce != (challenge as u32)) {
+        a.refuse = SB_REFUSE_NONCE;
+        return a;
+    }
+    // the shape: settle(node, node, nonce = the challenge, verdict as the coordinator said)
+    a.attempt = true;
+    a.refuse = SB_OK;
+    a.node = node;
+    a.nonce = nonce;
+    a.verdict = verdict;
+    return a;
+}
+
+/// The ledger after the bridge's one settle() call. A refused bridge returns the ledger unchanged:
+/// a refusal is no settle attempt.
+pub fn bridge_settle(l: Ledger, tab: IdentityTable, rec: LabReceipt, v1: Verification, v2: Verification,
+                     node: u32, nonce: u32, verdict: u8, record: SettlementRecord) -> Ledger {
+    const a = bridge(tab, rec, v1, v2, node, nonce, verdict, record);
+    if (a.attempt == false) { return l; }
+    return settle(l, a.node, a.node, a.nonce, a.verdict);
+}
+
+/// The full wiring: the shape, the ledger's own answer to it, and payout()'s own gate. A refusal is
+/// answered in the OUT_NOT_ELIGIBLE shape and pays nothing; an attempt passes the ledger's outcome
+/// to payout() with the receipt's verdict and the record's reference, unchanged.
+pub fn bridge_pay(l: Ledger, tab: IdentityTable, rec: LabReceipt, v1: Verification, v2: Verification,
+                  node: u32, nonce: u32, verdict: u8, record: SettlementRecord) -> BridgeAnswer {
+    var a = bridge(tab, rec, v1, v2, node, nonce, verdict, record);
+    a.verdict_referenced = record_references(record, rec);
+    if (a.attempt == false) {
+        a.outcome = OUT_NOT_ELIGIBLE;
+    } else {
+        const settled = settle(l, a.node, a.node, a.nonce, a.verdict);
+        a.outcome = settled.last_outcome;
+    }
+    a.pay = payout(a.outcome, a.verified, a.verdict_referenced);
+    return a;
+}
+
+// --- fixtures --------------------------------------------------------------------
+// The network table as the t27os-lab row leaves it: participant 9 (role ROLE_LAB, operator gHashTag
+// 6774813), the receipt key bound EV_PR by the pull request that carries it -- exactly the binding
+// identity.t27's 2026-10-23 row describes, through that table's own rule. Keys here are id texts
+// only; nothing in this file signs or verifies a signature.
+
+pub const FX_NODE : u32 = 1505;
+pub const FX_VERIFIER_1 : str = "5b5b5b5b5b5b5b5b";
+pub const FX_VERIFIER_2 : str = "6c6c6c6c6c6c6c6c";
+pub const FX_CHALLENGE : u64 = 11789;
+
+pub fn fx_table() -> IdentityTable {
+    var tab : IdentityTable = identity_table();
+    tab.parts = 10;
+    tab.account[9] = 6774813;
+    tab.role[9] = ROLE_LAB;
+    tab.name[9] = "t27os-lab";
+    tab.bindings = 11;
+    tab.b_part[10] = 9;
+    tab.b_kind[10] = K_RECEIPT_KEY;
+    tab.b_value[10] = LAB_RECEIPT_KEY;
+    tab.b_ev[10] = EV_PR;
+    tab.b_pr[10] = 11814;
+    tab.b_pr_author[10] = 6774813;
+    tab.b_commit[10] = "1181411814118141181411814118141181411814";
+    return tab;
+}
+
+/// The same table with the lab's row removed: the unbound state the refusal law is about. The real
+/// table binds since PR #11850 landed the rows, so the unbound refusals are pinned on this one.
+pub fn fx_table_rowless() -> IdentityTable {
+    var tab : IdentityTable = fx_table();
+    tab.b_value[10] = "";
+    return tab;
+}
+
+pub fn fx_receipt() -> LabReceipt {
+    return LabReceipt { challenge: FX_CHALLENGE, receipt_key: LAB_RECEIPT_KEY, tests_failed: 0, tests_vacuous: 0, stamp: true };
+}
+
+pub fn fx_verifier(key: str) -> Verification {
+    return Verification { present: true, verifier_key: key, reproduced: true };
+}
+
+pub fn fx_record() -> SettlementRecord {
+    return SettlementRecord { names_challenge: FX_CHALLENGE, verdict_named: true };
+}
+
+pub fn fx_ledger() -> Ledger {
+    return register_node(ledger_init(default_policy()), FX_NODE, 6774813, true, 5000);
+}
+
+// --- tests -----------------------------------------------------------------------
+
+// The wiring's green path: a fully verified run (a bound node, two independent reproductions, the
+// nonce = the challenge, the record naming receipt and verdict) yields the payout() inputs that pay
+// PAY_NORMAL, and moves exactly the ledger law's own reward and nothing else.
+test a_fully_verified_run_yields_the_payout_inputs_that_pay_normal {
+    const tab : IdentityTable = fx_table();
+    const rec : LabReceipt = fx_receipt();
+    const v1 : Verification = fx_verifier(FX_VERIFIER_1);
+    const v2 : Verification = fx_verifier(FX_VERIFIER_2);
+    const l0 : Ledger = fx_ledger();
+    const a = bridge_pay(l0, tab, rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert a.attempt and a.refuse == SB_OK;
+    assert a.node == FX_NODE;
+    const nonce_want : u32 = FX_CHALLENGE as u32;
+    assert a.nonce == nonce_want;
+    assert a.outcome == OUT_CREDITED;
+    assert a.verified and a.verdict_referenced;
+    assert a.pay == PAY_NORMAL;
+    // the amounts are the laws': one settled run moves the ledger's own reward, once, and no stake
+    const l1 : Ledger = bridge_settle(l0, tab, rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    const k : usize = find(l1, FX_NODE);
+    assert l1.credit_mtri[k] == REWARD_PER_JOB_MTRI;
+    assert l1.total_credited_mtri == REWARD_PER_JOB_MTRI;
+    assert l1.accepted[k] == 1 and l1.n_spent == 1;
+    assert l1.stake_mtri[k] == 5000;
+    // by value: the input ledger the bridge was handed is untouched
+    const k0 : usize = find(l0, FX_NODE);
+    assert l0.credit_mtri[k0] == 0;
+}
+
+// One verification short of the bar: no settle attempt, the OUT_NOT_ELIGIBLE shape, nothing paid,
+// and the ledger exactly as it was.
+test a_run_with_one_verification_is_not_settled {
+    const tab : IdentityTable = fx_table();
+    const rec : LabReceipt = fx_receipt();
+    const l0 : Ledger = fx_ledger();
+    const none : Verification = Verification { present: false, verifier_key: "", reproduced: false };
+    const a = bridge_pay(l0, tab, rec, fx_verifier(FX_VERIFIER_1), none, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert a.attempt == false;
+    assert a.refuse == SB_REFUSE_VERIFICATIONS;
+    assert a.outcome == OUT_NOT_ELIGIBLE;
+    assert a.pay == PAY_NONE;
+    const l1 : Ledger = bridge_settle(l0, tab, rec, fx_verifier(FX_VERIFIER_1), none, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert l1.n_spent == 0;
+    const k : usize = find(l1, FX_NODE);
+    assert l1.credit_mtri[k] == 0 and l1.total_credited_mtri == 0;
+}
+
+// The lab's own key "verifying" its own receipt counts for nothing: one real verification short.
+test the_labs_own_verification_counts_for_nothing {
+    const tab : IdentityTable = fx_table();
+    const self_v : Verification = Verification { present: true, verifier_key: LAB_RECEIPT_KEY, reproduced: true };
+    const a = bridge_pay(fx_ledger(), tab, fx_receipt(), self_v, fx_verifier(FX_VERIFIER_2), FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert a.attempt == false and a.refuse == SB_REFUSE_VERIFICATIONS and a.pay == PAY_NONE;
+}
+
+// The same verifier key verifying twice is one verifier, not two (one vote per verifier key).
+test the_same_verifier_key_counts_once {
+    const tab : IdentityTable = fx_table();
+    const a = bridge_pay(fx_ledger(), tab, fx_receipt(), fx_verifier(FX_VERIFIER_1), fx_verifier(FX_VERIFIER_1), FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert a.attempt == false and a.refuse == SB_REFUSE_VERIFICATIONS and a.pay == PAY_NONE;
+}
+
+// The tripwire, flipped by its own landing. It pinned the unbound truth: master b086799248's
+// network table described the t27os-lab receipt key in its header but carried no machine-readable
+// row, so the bridge refused every real receipt, and this test's first assertion was
+// bound_part(...) == ID_ROWS. PR #11850 landed the rows (2026-10-23, the follow-up to #11814):
+// the node binds, and the same call through the REAL table now proceeds to the green settle the
+// fixture pins. The refusal law itself does not move: a table without the row refuses, and a row
+// bound by another account's pull request refuses the same way.
+test the_landed_row_binds_and_the_real_settle_proceeds {
+    const rec : LabReceipt = fx_receipt();
+    const v1 : Verification = fx_verifier(FX_VERIFIER_1);
+    const v2 : Verification = fx_verifier(FX_VERIFIER_2);
+    const l0 : Ledger = fx_ledger();
+    // the landed truth: the real table binds the t27os-lab receipt key to participant 9
+    assert bound_part(identity_table(), K_RECEIPT_KEY, rec.receipt_key, 0, rec.receipt_key.len) == 9;
+    const a = bridge_pay(l0, identity_table(), rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert a.attempt and a.refuse == SB_OK;
+    assert a.outcome == OUT_CREDITED and a.pay == PAY_NORMAL;
+    const l1 : Ledger = bridge_settle(l0, identity_table(), rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    const k : usize = find(l1, FX_NODE);
+    assert l1.credit_mtri[k] == REWARD_PER_JOB_MTRI and l1.n_spent == 1;
+    // the refusal law does not move: no valid identity row, no settle attempt
+    const rowless : IdentityTable = fx_table_rowless();
+    assert bound_part(rowless, K_RECEIPT_KEY, rec.receipt_key, 0, rec.receipt_key.len) == ID_ROWS;
+    const r = bridge_pay(l0, rowless, rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert r.attempt == false and r.refuse == SB_REFUSE_UNBOUND;
+    assert r.outcome == OUT_NOT_ELIGIBLE and r.pay == PAY_NONE;
+    // a row is not enough: the binding must be valid by identity.t27's own rule
+    var forged : IdentityTable = fx_table();
+    forged.b_pr_author[10] = 256009718;
+    assert binding_valid(forged, 10) == false;
+    const b = bridge(forged, rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert b.attempt == false and b.refuse == SB_REFUSE_UNBOUND and b.pay == PAY_NONE;
+}
+
+// A submitted verification that ran and did not reproduce the receipt's counts refuses the run even
+// though the other verification reproduced: a disputed receipt does not settle.
+test a_reproduced_count_mismatch_is_not_settled {
+    const tab : IdentityTable = fx_table();
+    const disputed : Verification = Verification { present: true, verifier_key: FX_VERIFIER_2, reproduced: false };
+    const a = bridge_pay(fx_ledger(), tab, fx_receipt(), fx_verifier(FX_VERIFIER_1), disputed, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert a.attempt == false and a.refuse == SB_REFUSE_MISMATCH and a.pay == PAY_NONE;
+    // the dispute leads even when it would leave the bar unmet anyway: the reason names the dispute
+    const b = bridge_pay(fx_ledger(), tab, fx_receipt(), disputed, Verification { present: false, verifier_key: "", reproduced: false }, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert b.attempt == false and b.refuse == SB_REFUSE_MISMATCH;
+}
+
+// The nonce IS the run challenge: a different nonce is not the bridge's call, and a challenge that
+// does not fit the ledger's u32 nonce (the real t27os run ids do not) cannot be one at all.
+test the_nonce_is_the_challenge {
+    const tab : IdentityTable = fx_table();
+    const rec : LabReceipt = fx_receipt();
+    const v1 : Verification = fx_verifier(FX_VERIFIER_1);
+    const v2 : Verification = fx_verifier(FX_VERIFIER_2);
+    const a = bridge_pay(fx_ledger(), tab, rec, v1, v2, FX_NODE, ((FX_CHALLENGE as u32) + 1), V_OK, fx_record());
+    assert a.attempt == false and a.refuse == SB_REFUSE_NONCE and a.pay == PAY_NONE;
+    var big : LabReceipt = fx_receipt();
+    big.challenge = 39970371982;
+    const big_challenge : u64 = big.challenge;
+    const b = bridge(tab, big, v1, v2, FX_NODE, (big_challenge as u32), V_OK, fx_record());
+    assert b.attempt == false and b.refuse == SB_REFUSE_NONCE and b.pay == PAY_NONE;
+}
+
+// The ledger judges the frame, the payout law judges the work: a receipt whose test counts are not
+// green still settles the accepted job -- and pays nothing. Vacuous is not green; neither is a
+// receipt without its build stamp.
+test an_unverified_receipt_still_sets_the_job_and_pays_none {
+    const tab : IdentityTable = fx_table();
+    const v1 : Verification = fx_verifier(FX_VERIFIER_1);
+    const v2 : Verification = fx_verifier(FX_VERIFIER_2);
+    var failing : LabReceipt = fx_receipt();
+    failing.tests_failed = 1;
+    const a = bridge_pay(fx_ledger(), tab, failing, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert a.attempt and a.outcome == OUT_CREDITED;
+    assert a.verified == false and a.pay == PAY_NONE;
+    var vacuous : LabReceipt = fx_receipt();
+    vacuous.tests_vacuous = 2;
+    const b = bridge_pay(fx_ledger(), tab, vacuous, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert b.verified == false and b.pay == PAY_NONE;
+    var unstamped : LabReceipt = fx_receipt();
+    unstamped.stamp = false;
+    const c = bridge_pay(fx_ledger(), tab, unstamped, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    assert c.verified == false and c.pay == PAY_NONE;
+    assert counts_green(fx_receipt());
+}
+
+// The bridge passes the coordinator's verdict through UNJUDGED: a receipt the protocol refused is
+// the ledger's lie, and the slash is payout()'s to keep.
+test a_verdict_the_coordinator_caught_passes_through_and_stays_a_slash {
+    const tab : IdentityTable = fx_table();
+    const a = bridge_pay(fx_ledger(), tab, fx_receipt(), fx_verifier(FX_VERIFIER_1), fx_verifier(FX_VERIFIER_2), FX_NODE, (FX_CHALLENGE as u32), V_WRONG_RESULT, fx_record());
+    assert a.attempt and a.verdict == V_WRONG_RESULT;
+    assert a.outcome == OUT_REJECTED_AND_SLASHED;
+    assert a.pay == PAY_SLASH_ONLY;
+}
+
+// Payout rule (c): the settlement record must name the receipt AND the verdict. A record about
+// another challenge, or silent about the verdict, pays nothing even for a credited, verified run.
+test the_settlement_record_must_name_the_receipt_and_the_verdict {
+    const tab : IdentityTable = fx_table();
+    const rec : LabReceipt = fx_receipt();
+    const v1 : Verification = fx_verifier(FX_VERIFIER_1);
+    const v2 : Verification = fx_verifier(FX_VERIFIER_2);
+    const other : SettlementRecord = SettlementRecord { names_challenge: FX_CHALLENGE - 1, verdict_named: true };
+    const a = bridge_pay(fx_ledger(), tab, rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, other);
+    assert a.attempt and a.outcome == OUT_CREDITED;
+    assert a.verdict_referenced == false and a.pay == PAY_NONE;
+    const silent : SettlementRecord = SettlementRecord { names_challenge: FX_CHALLENGE, verdict_named: false };
+    const b = bridge_pay(fx_ledger(), tab, rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, silent);
+    assert b.verdict_referenced == false and b.pay == PAY_NONE;
+    assert record_references(fx_record(), rec);
+    assert record_references(other, rec) == false;
+}
+
+// --- the refusal invariant -------------------------------------------------------
+
+/// Every refusal is no settle attempt: nothing is paid, and the ledger the bridge was handed comes
+/// back with no spent key and no credit -- whatever the receipt says. Held at compile time and run
+/// at run time, as ledger.t27 holds its own.
+pub fn refusals_never_settle() -> bool {
+    const tab : IdentityTable = fx_table();
+    const rec : LabReceipt = fx_receipt();
+    const v1 : Verification = fx_verifier(FX_VERIFIER_1);
+    const v2 : Verification = fx_verifier(FX_VERIFIER_2);
+    const l : Ledger = fx_ledger();
+    // the four refusals, in the bridge's own order: unbound (a table without the row -- the real
+    // table binds since #11850), a dispute, one verification short, a wrong nonce
+    const a = bridge_pay(l, fx_table_rowless(), rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    const disputed : Verification = Verification { present: true, verifier_key: FX_VERIFIER_2, reproduced: false };
+    const b = bridge_pay(l, tab, rec, v1, disputed, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    const c = bridge_pay(l, tab, rec, v1, Verification { present: false, verifier_key: "", reproduced: false }, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    const d = bridge_pay(l, tab, rec, v1, v2, FX_NODE, ((FX_CHALLENGE as u32) + 1), V_OK, fx_record());
+    if (a.attempt or b.attempt or c.attempt or d.attempt) { return false; }
+    if (a.refuse != SB_REFUSE_UNBOUND or b.refuse != SB_REFUSE_MISMATCH) { return false; }
+    if (c.refuse != SB_REFUSE_VERIFICATIONS or d.refuse != SB_REFUSE_NONCE) { return false; }
+    if (a.pay != PAY_NONE or b.pay != PAY_NONE or c.pay != PAY_NONE or d.pay != PAY_NONE) { return false; }
+    if (a.outcome != OUT_NOT_ELIGIBLE or d.outcome != OUT_NOT_ELIGIBLE) { return false; }
+    const l1 = bridge_settle(l, fx_table_rowless(), rec, v1, v2, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    const l2 = bridge_settle(l, tab, rec, v1, disputed, FX_NODE, (FX_CHALLENGE as u32), V_OK, fx_record());
+    if (l1.n_spent != 0 or l2.n_spent != 0) { return false; }
+    const k1 : usize = find(l1, FX_NODE);
+    const k2 : usize = find(l2, FX_NODE);
+    return l1.credit_mtri[k1] == 0 and l2.credit_mtri[k2] == 0;
+}
+
+invariant a_refusal_is_no_settle_attempt_and_never_pays {
+    assert refusals_never_settle();
+}
+
+test a_refusal_is_no_settle_attempt_and_never_pays_at_run_time {
+    assert refusals_never_settle();
+}
+
+// phi^2 + 1/phi^2 = 3 | TRINITY
