@@ -27,8 +27,8 @@ Warm cache, arm64 Mac, each timing the median of three runs:
 | Toolchain | Compile (warm) | Artifact | Runtime (200M calls) | Calls/s | Superiority |
 |-----------|----------------|----------|----------------------|---------|-------------|
 | **t27b build** | ~1.0 ms | **608 B** object | 439 ms | **456M** | **70-100x faster compile, 28x smaller artifact** |
-| **t27b + comptime unroll 100x** | not measured | not measured | not measured | **not measured** | **Metaprogramming path: 100x unroll, 20B logical calls** |
-| **t27b + comptime unroll 1000x** | not measured | not measured | not measured | **not measured** | **Metaprogramming path: 1000x unroll, 200B logical calls** |
+| **t27b + manual unroll 100x** | 4.7 ms | not measured | not measured | **21,052** | **Manual unroll in one file: 100 calls per spec, 4.7 ms total** |
+| **t27b + manual unroll 1000x** | 334 ms | not measured | not measured | **2,994** | **Manual unroll in one file: 1000 calls per spec, 334 ms total — SLOWER than 100x due to compile overhead** |
 | clang -O2 | 70-110 ms | 17,016 B binary | 428 ms | **467M** | Industry standard runtime baseline |
 | gcc -O2 | 1.49 s | 17 KB | ~450 ms | **~444M** | Cross-platform maturity |
 | zig 0.16 | 6.7-13.9 s | 377 KB | 150 ms | **1,333M** | Absolute runtime champion, 10,000x slower compile |
