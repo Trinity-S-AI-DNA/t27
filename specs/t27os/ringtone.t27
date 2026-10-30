@@ -1,0 +1,549 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/ringtone.t27 -- the call signal, made in .t27 with no sound file (owner, 2026-10-22; Refs gHashTag/t27#11560).
+//   incoming (the call is RINGING here): 440 Hz + 480 Hz together, 0.4 s on, 0.6 s off, repeated;
+//   outgoing (the call is CALLING, waiting for the other side): 425 Hz, 1 s on, 3 s off, repeated;
+//   in a conversation (ACTIVE) and in every other state: nothing.
+// The signal has an AudioQueue of its own (16-bit mono, 48 kHz, no run loop, so the system calls rt_out on its own
+// thread as part D of callback_probe.t27 proved), opened when the call starts to ring or to wait and disposed the
+// moment the call leaves that state -- before the conversation's own queues (call_session.t27, cs_audio_start) are
+// opened by the window's next look at the call, and never while the state is ACTIVE: rt_follow sets the ACTIVE flag
+// first, and a callback that sees the flag writes silence and counts the tone it held back (it should stay 0).
+//
+// What is counted (the block at `blk`, 20 u64 slots, RT_BLOCK bytes): callbacks, tone samples and silent samples
+// written, bursts started and finished, the length of the last burst in samples, the longest gap between two
+// callbacks, callbacks later than RT_LATE_US (the queue holds RT_BUFS * 10 ms; a gap past that is a place where it can
+// have run dry -- the AudioQueue itself does not say), failed enqueues, tone held back in ACTIVE.
+// Counters show that the device took the buffers at the rate of the clock. They do not show that anyone heard it.
+//
+// Flat namespace (the window build splices imported modules): every name here starts with rt_ / RT_.
+module T27osRingtone;
+
+use t27os::pty_sys::sys_peek;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::call_core::CK_CALLING;
+use t27os::call_core::CK_RINGING;
+use t27os::call_core::CK_ACTIVE;
+use t27os::callback_probe::cbp_dlsym;
+use t27os::callback_probe::cbp_poke;
+use t27os::callback_probe::cbp_pcm48k;
+use t27os::callback_probe::cbp_aq_new_output;
+use t27os::callback_probe::cbp_aq_alloc;
+use t27os::callback_probe::cbp_aq_enqueue;
+use t27os::callback_probe::cbp_aq_start;
+use t27os::callback_probe::cbp_aq_dispose;
+use t27os::callback_probe::cbp_aq_set_param;
+use t27os::callback_probe::cbp_get;
+use t27os::callback_probe::cbp_put;
+use t27os::callback_probe::CBP_RTLD_DEFAULT;
+use t27os::callback_probe::CBP_VOLUME;
+
+fn rt_clock() -> f64 { return @extern("CFAbsoluteTimeGetCurrent"); }
+fn rt_at(p: []const u8, q: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+
+// ---------------------------------------------------------------- 1. the pattern
+
+pub const RT_RATE : u64 = 48000;
+pub const RT_OFF : u64 = 0;
+pub const RT_INCOMING : u64 = 1;
+pub const RT_OUTGOING : u64 = 2;
+/// 0.4 s on in 1 s; 1 s on in 4 s.
+pub const RT_IN_ON : u64 = 19200;
+pub const RT_IN_PERIOD : u64 = 48000;
+pub const RT_OUT_ON : u64 = 48000;
+pub const RT_OUT_PERIOD : u64 = 192000;
+/// The peak of a sample (of 32767) and the length of the fade at each end of a burst (5 ms).
+pub const RT_AMP : f64 = 9000.0;
+pub const RT_RAMP : u64 = 240;
+/// A buffer is 480 samples = 10 ms; the queue holds RT_BUFS of them.
+pub const RT_BUF_SAMPLES : usize = 480;
+pub const RT_BUF_BYTES : usize = 960;
+pub const RT_BUFS : u32 = 6;
+pub const RT_LATE_US : u64 = 60000;
+pub const RT_VOLUME : f32 = 0.25;
+
+pub fn rt_period(mode: u64) -> u64 {
+    if (mode == RT_OUTGOING) { return RT_OUT_PERIOD; }
+    return RT_IN_PERIOD;
+}
+
+pub fn rt_on_len(mode: u64) -> u64 {
+    if (mode == RT_OUTGOING) { return RT_OUT_ON; }
+    if (mode == RT_INCOMING) { return RT_IN_ON; }
+    return 0;
+}
+
+/// Is sample `pos` of the pattern inside a burst?
+pub fn rt_on(mode: u64, pos: u64) -> bool {
+    return mode != RT_OFF and pos < rt_on_len(mode);
+}
+
+/// 0..1: the fade at both ends of a burst, so a burst starts and stops without a click.
+pub fn rt_env(mode: u64, pos: u64) -> f64 {
+    if (!rt_on(mode, pos)) { return 0.0; }
+    const len : u64 = rt_on_len(mode);
+    var d : u64 = pos;
+    if (len - 1 - pos < d) { d = len - 1 - pos; }
+    if (d >= RT_RAMP) { return 1.0; }
+    return @as(f64, @floatFromInt(d)) / @as(f64, @floatFromInt(RT_RAMP));
+}
+
+/// sin of a phase given as `cycles` whole turns of 48000 steps: m = (pos * hz) mod 48000 is the exact place on the circle,
+/// folded to -pi..pi and summed as a Taylor series to x^13 (error below 3e-5 of the peak). No libm: the callback runs on a
+/// system thread and the whole signal is made here.
+pub fn rt_wave(pos: u64, hz: u64) -> f64 {
+    const m : u64 = ((pos % RT_RATE) * hz) % RT_RATE;
+    var a : f64 = 6.283185307179586 * @as(f64, @floatFromInt(m)) / 48000.0;
+    if (a > 3.141592653589793) { a = a - 6.283185307179586; }
+    const a2 : f64 = a * a;
+    var term : f64 = a;
+    var sum : f64 = a;
+    var k : u32 = 1;
+    while (k <= 6) {
+        term = 0.0 - term * a2 / @as(f64, @floatFromInt((2 * k) * (2 * k + 1)));
+        sum = sum + term;
+        k = k + 1;
+    }
+    return sum;
+}
+
+/// The signed 16-bit value of sample `pos`.
+pub fn rt_sample(mode: u64, pos: u64) -> i32 {
+    if (!rt_on(mode, pos)) { return 0; }
+    var x : f64 = 0.0;
+    if (mode == RT_INCOMING) {
+        x = 0.5 * (rt_wave(pos, 440) + rt_wave(pos, 480));
+    } else {
+        x = rt_wave(pos, 425);
+    }
+    return @as(i32, @intFromFloat(x * rt_env(mode, pos) * RT_AMP));
+}
+
+/// The call state that asks for a signal: CALLING waits for an answer (outgoing), RINGING is an incoming call.
+pub fn rt_mode_for(state: u32) -> u64 {
+    if (state == CK_CALLING) { return RT_OUTGOING; }
+    if (state == CK_RINGING) { return RT_INCOMING; }
+    return RT_OFF;
+}
+
+// ---------------------------------------------------------------- 2. the state and one buffer
+
+pub const RT_MAGIC_V : u64 = 5404646590160511571;
+pub const RT_SLOTS : usize = 24;
+pub const RT_BLOCK : usize = 192;
+pub const RT_S_MAGIC : usize = 0;
+pub const RT_S_SELF : usize = 1;
+pub const RT_S_MODE : usize = 2;
+pub const RT_S_POS : usize = 3;
+pub const RT_S_CB : usize = 4;
+pub const RT_S_TONE : usize = 5;
+pub const RT_S_SILENT : usize = 6;
+pub const RT_S_BURSTS : usize = 7;
+pub const RT_S_CUR : usize = 8;
+pub const RT_S_LAST : usize = 9;
+pub const RT_S_DONE : usize = 10;
+pub const RT_S_LASTUS : usize = 11;
+pub const RT_S_MAXGAP : usize = 12;
+pub const RT_S_LATE : usize = 13;
+pub const RT_S_FAIL : usize = 14;
+pub const RT_S_HELD : usize = 15;
+pub const RT_S_ACTIVE : usize = 16;
+pub const RT_S_QUEUE : usize = 17;
+pub const RT_S_STARTS : usize = 18;
+pub const RT_S_STOPS : usize = 19;
+pub const RT_S_REFUSED : usize = 20;
+pub const RT_S_NAT : usize = 21;
+
+/// Write n samples (n <= RT_BUF_SAMPLES) of the pattern into out as 16-bit little endian and advance the state: the
+/// position (mod the period), the tone / silent counts, the bursts. While the ACTIVE flag is set the buffer is silence
+/// and the tone that would have sounded is counted in RT_S_HELD.
+pub fn rt_gen(st: []u64, out: []u8, n: usize) -> void {
+    var mode : u64 = st[RT_S_MODE];
+    var pos : u64 = st[RT_S_POS];
+    const quiet : bool = st[RT_S_ACTIVE] != 0;
+    var i : usize = 0;
+    while (i < n) {
+        const on : bool = rt_on(mode, pos);
+        var v : i32 = 0;
+        if (on and quiet) {
+            st[RT_S_HELD] = st[RT_S_HELD] + 1;
+        } else if (on) {
+            v = rt_sample(mode, pos);
+        }
+        const u : i32 = v + 32768;
+        out[i * 2] = @as(u8, @intCast(u & 255));
+        out[i * 2 + 1] = @as(u8, @intCast((u >> 8) & 255)) ^ 128;
+        if (on and !quiet) {
+            if (st[RT_S_CUR] == 0) { st[RT_S_BURSTS] = st[RT_S_BURSTS] + 1; }
+            st[RT_S_CUR] = st[RT_S_CUR] + 1;
+            st[RT_S_TONE] = st[RT_S_TONE] + 1;
+        } else {
+            if (st[RT_S_CUR] != 0) {
+                st[RT_S_LAST] = st[RT_S_CUR];
+                st[RT_S_DONE] = st[RT_S_DONE] + 1;
+                st[RT_S_CUR] = 0;
+            }
+            st[RT_S_SILENT] = st[RT_S_SILENT] + 1;
+        }
+        if (mode != RT_OFF) {
+            pos = pos + 1;
+            if (pos >= rt_period(mode)) { pos = 0; }
+        }
+        i = i + 1;
+    }
+    st[RT_S_POS] = pos;
+}
+
+fn rt_load(p: u64, st: []u64) -> void {
+    var i : usize = 0;
+    while (i < RT_SLOTS) {
+        st[i] = cbp_get(p + @as(u64, i) * 8);
+        i = i + 1;
+    }
+}
+
+fn rt_store(p: u64, st: []const u64) -> void {
+    var i : usize = 0;
+    while (i < RT_SLOTS) {
+        cbp_put(p + @as(u64, i) * 8, st[i]);
+        i = i + 1;
+    }
+}
+
+fn rt_us() -> u64 { return @as(u64, @intFromFloat(rt_clock() * 1000000.0)); }
+
+/// One buffer of the queue: the next 10 ms of the pattern, enqueued again. Used by the callback and by the first fill.
+fn rt_fill(p: u64, aq: u64, buf: u64) -> i32 {
+    var st : [24]u64 = undefined;
+    rt_load(p, st[0..24]);
+    var pcm : [960]u8 = undefined;
+    rt_gen(st[0..24], pcm[0..960], RT_BUF_SAMPLES);
+    cbp_poke(cbp_get(buf + 8), pcm[0..960], 960);
+    var sz : [4]u8 = undefined;
+    sz[0] = 192;
+    sz[1] = 3;
+    sz[2] = 0;
+    sz[3] = 0;
+    cbp_poke(buf + 16, sz[0..4], 4);
+    const r : i32 = cbp_aq_enqueue(aq, buf, 0, 0);
+    if (r != 0) { st[RT_S_FAIL] = st[RT_S_FAIL] + 1; }
+    rt_store(p, st[0..24]);
+    return r;
+}
+
+/// AudioQueue output callback (user, queue, buffer): user is the address of the state block. Runs on a system thread.
+pub fn rt_out(user: u64, aq: u64, buf: u64) -> u64 {
+    if (cbp_get(user + 8) != user or cbp_get(user) != RT_MAGIC_V) { return 0; }
+    var st : [24]u64 = undefined;
+    rt_load(user, st[0..24]);
+    const now : u64 = rt_us();
+    if (st[RT_S_LASTUS] != 0 and now > st[RT_S_LASTUS]) {
+        const gap : u64 = now - st[RT_S_LASTUS];
+        if (gap > st[RT_S_MAXGAP]) { st[RT_S_MAXGAP] = gap; }
+        if (gap > RT_LATE_US) { st[RT_S_LATE] = st[RT_S_LATE] + 1; }
+    }
+    st[RT_S_LASTUS] = now;
+    st[RT_S_CB] = st[RT_S_CB] + 1;
+    rt_store(user, st[0..24]);
+    rt_fill(user, aq, buf);
+    return st[RT_S_CB];
+}
+
+// ---------------------------------------------------------------- 3. the queue
+
+fn rt_slot(p: u64, k: usize) -> u64 { return cbp_get(p + @as(u64, k) * 8); }
+fn rt_set(p: u64, k: usize, v: u64) -> void { cbp_put(p + @as(u64, k) * 8, v); }
+
+/// The address of the block.
+pub fn rt_addr(blk: []u8) -> u64 { return rt_at(blk, blk, 0); }
+
+/// Make the block ready (once, at launch): zero, magic, its own address.
+pub fn rt_init(blk: []u8) -> void {
+    var i : usize = 0;
+    while (i < RT_BLOCK) {
+        blk[i] = 0;
+        i = i + 1;
+    }
+    const p : u64 = rt_addr(blk);
+    rt_set(p, RT_S_MAGIC, RT_MAGIC_V);
+    rt_set(p, RT_S_SELF, p);
+}
+
+/// Open the signal's queue in `mode` (RT_INCOMING / RT_OUTGOING) and start it. False when the system refuses; the
+/// refusal is counted in RT_S_REFUSED and the call goes on without a signal.
+pub fn rt_start(blk: []u8, mode: u64) -> bool {
+    const p : u64 = rt_addr(blk);
+    if (rt_slot(p, RT_S_MAGIC) != RT_MAGIC_V) { return false; }
+    if (rt_slot(p, RT_S_QUEUE) != 0) {
+        rt_set(p, RT_S_MODE, mode);
+        rt_set(p, RT_S_POS, 0);
+        return true;
+    }
+    const cb : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "rt_out");
+    if (cb == 0) {
+        rt_set(p, RT_S_NAT, 1);
+        rt_set(p, RT_S_REFUSED, rt_slot(p, RT_S_REFUSED) + 1);
+        return false;
+    }
+    rt_set(p, RT_S_MODE, mode);
+    rt_set(p, RT_S_POS, 0);
+    rt_set(p, RT_S_CUR, 0);
+    rt_set(p, RT_S_LASTUS, 0);
+    var fmt : [40]u8 = undefined;
+    cbp_pcm48k(fmt[0..40]);
+    var aqo : [8]u8 = undefined;
+    put_u64(aqo[0..8], 0, 0);
+    const so : i32 = cbp_aq_new_output(fmt[0..40], cb, p, 0, 0, 0, aqo[0..8]);
+    const q : u64 = get_u64(aqo[0..8], 0);
+    if (so != 0 or q == 0) {
+        rt_set(p, RT_S_NAT, 2);
+        rt_set(p, RT_S_MODE, RT_OFF);
+        rt_set(p, RT_S_REFUSED, rt_slot(p, RT_S_REFUSED) + 1);
+        return false;
+    }
+    cbp_aq_set_param(q, CBP_VOLUME, RT_VOLUME);
+    var k : u32 = 0;
+    var ok : u32 = 0;
+    while (k < RT_BUFS) {
+        var b : [8]u8 = undefined;
+        put_u64(b[0..8], 0, 0);
+        if (cbp_aq_alloc(q, 960, b[0..8]) == 0) {
+            if (rt_fill(p, q, get_u64(b[0..8], 0)) == 0) { ok = ok + 1; }
+        }
+        k = k + 1;
+    }
+    if (ok != RT_BUFS or cbp_aq_start(q, 0) != 0) {
+        cbp_aq_dispose(q, true);
+        rt_set(p, RT_S_NAT, 3);
+        rt_set(p, RT_S_MODE, RT_OFF);
+        rt_set(p, RT_S_REFUSED, rt_slot(p, RT_S_REFUSED) + 1);
+        return false;
+    }
+    rt_set(p, RT_S_QUEUE, q);
+    rt_set(p, RT_S_STARTS, rt_slot(p, RT_S_STARTS) + 1);
+    return true;
+}
+
+/// Silence first (mode off), then dispose the queue now. Safe when no queue is open.
+pub fn rt_stop(blk: []u8) -> void {
+    const p : u64 = rt_addr(blk);
+    if (rt_slot(p, RT_S_MAGIC) != RT_MAGIC_V) { return; }
+    rt_set(p, RT_S_MODE, RT_OFF);
+    const q : u64 = rt_slot(p, RT_S_QUEUE);
+    if (q != 0) {
+        cbp_aq_dispose(q, true);
+        rt_set(p, RT_S_QUEUE, 0);
+        rt_set(p, RT_S_STOPS, rt_slot(p, RT_S_STOPS) + 1);
+    }
+}
+
+/// Follow the call: the ACTIVE flag first, then the queue to what the state asks for. The window calls it right after
+/// every look at the call (cs_poll, a button), so the signal's queue is gone within that pass of the loop.
+pub fn rt_follow(blk: []u8, state: u32) -> void {
+    const p : u64 = rt_addr(blk);
+    if (rt_slot(p, RT_S_MAGIC) != RT_MAGIC_V) { return; }
+    if (state == CK_ACTIVE) { rt_set(p, RT_S_ACTIVE, 1); } else { rt_set(p, RT_S_ACTIVE, 0); }
+    const want : u64 = rt_mode_for(state);
+    const have : u64 = rt_slot(p, RT_S_MODE);
+    if (want == have and (want == RT_OFF or rt_slot(p, RT_S_QUEUE) != 0)) { return; }
+    if (want == RT_OFF) {
+        rt_stop(blk);
+    } else {
+        rt_start(blk, want);
+    }
+}
+
+/// The counters as a line for a log or a test: "RING cb=.. tone=.. silent=.. bursts=.. done=.. last=.. maxgap_us=..
+/// late=.. fail=.. held=.. starts=.. stops=.. refused=..".
+pub fn rt_stat_line(blk: []u8, out: []u8) -> usize {
+    const p : u64 = rt_addr(blk);
+    var n : usize = put_bytes(out, 0, "RING cb=");
+    n = put_dec(out, n, rt_slot(p, RT_S_CB));
+    n = put_bytes(out, n, " tone=");
+    n = put_dec(out, n, rt_slot(p, RT_S_TONE));
+    n = put_bytes(out, n, " silent=");
+    n = put_dec(out, n, rt_slot(p, RT_S_SILENT));
+    n = put_bytes(out, n, " bursts=");
+    n = put_dec(out, n, rt_slot(p, RT_S_BURSTS));
+    n = put_bytes(out, n, " done=");
+    n = put_dec(out, n, rt_slot(p, RT_S_DONE));
+    n = put_bytes(out, n, " last=");
+    n = put_dec(out, n, rt_slot(p, RT_S_LAST));
+    n = put_bytes(out, n, " maxgap_us=");
+    n = put_dec(out, n, rt_slot(p, RT_S_MAXGAP));
+    n = put_bytes(out, n, " late=");
+    n = put_dec(out, n, rt_slot(p, RT_S_LATE));
+    n = put_bytes(out, n, " fail=");
+    n = put_dec(out, n, rt_slot(p, RT_S_FAIL));
+    n = put_bytes(out, n, " held=");
+    n = put_dec(out, n, rt_slot(p, RT_S_HELD));
+    n = put_bytes(out, n, " starts=");
+    n = put_dec(out, n, rt_slot(p, RT_S_STARTS));
+    n = put_bytes(out, n, " stops=");
+    n = put_dec(out, n, rt_slot(p, RT_S_STOPS));
+    n = put_bytes(out, n, " refused=");
+    n = put_dec(out, n, rt_slot(p, RT_S_REFUSED));
+    return n;
+}
+
+/// One counter of the block by slot number (for a test or a log).
+pub fn rt_stat(blk: []u8, k: usize) -> u64 {
+    if (k >= RT_SLOTS) { return 0; }
+    return rt_slot(rt_addr(blk), k);
+}
+
+// ---------------------------------------------------------------- tests
+
+fn rt_zero_st(st: []u64) -> void {
+    var i : usize = 0;
+    while (i < st.len) {
+        st[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn rt_pcm_at(pcm: []const u8, i: usize) -> i32 {
+    const lo : i32 = @as(i32, pcm[i * 2]);
+    const hi : i32 = @as(i32, pcm[i * 2 + 1] ^ 128);
+    return (hi * 256 + lo) - 32768;
+}
+
+test rt_the_incoming_pattern_is_04_s_on_in_1_s {
+    assert RT_IN_ON * 10 == RT_IN_PERIOD * 4 and RT_IN_PERIOD == RT_RATE;
+    assert rt_on(RT_INCOMING, 0) and rt_on(RT_INCOMING, 19199);
+    assert rt_on(RT_INCOMING, 19200) == false and rt_on(RT_INCOMING, 47999) == false;
+    assert rt_period(RT_INCOMING) == 48000;
+    assert rt_on(RT_OFF, 0) == false;
+    var on : u64 = 0;
+    var pos : u64 = 0;
+    while (pos < RT_IN_PERIOD) {
+        if (rt_on(RT_INCOMING, pos)) { on = on + 1; }
+        pos = pos + 1;
+    }
+    assert on == 19200;
+}
+
+test rt_the_outgoing_pattern_is_1_s_on_in_4_s {
+    assert RT_OUT_ON * 4 == RT_OUT_PERIOD and RT_OUT_ON == RT_RATE;
+    assert rt_on(RT_OUTGOING, 47999) and rt_on(RT_OUTGOING, 48000) == false;
+    assert rt_period(RT_OUTGOING) == 192000;
+    assert rt_on_len(RT_OUTGOING) == 48000 and rt_on_len(RT_INCOMING) == 19200 and rt_on_len(RT_OFF) == 0;
+}
+
+test rt_the_sine_is_a_sine_to_four_places {
+    assert rt_wave(0, 440) == 0.0;
+    // 12000 steps of 48000 at 1 Hz is a quarter turn: sin = 1
+    assert rt_wave(12000, 1) > 0.99999 and rt_wave(12000, 1) < 1.00001;
+    assert rt_wave(36000, 1) < -0.99999 and rt_wave(36000, 1) > -1.00001;
+    assert rt_wave(24000, 1) > -0.0001 and rt_wave(24000, 1) < 0.0001;
+    // a twelfth of a turn: sin = 0.5; a sixth: 0.8660; five sixths (folded below -pi.. past pi): -0.8660
+    assert rt_wave(4000, 1) > 0.49999 and rt_wave(4000, 1) < 0.50001;
+    assert rt_wave(8000, 1) > 0.86600 and rt_wave(8000, 1) < 0.86606;
+    assert rt_wave(40000, 1) < -0.86600 and rt_wave(40000, 1) > -0.86606;
+    // 440 Hz: step 24000 / 440 is not whole; 109 steps are 0.99917 of a turn: sin is just under zero
+    assert rt_wave(109, 440) < 0.0 and rt_wave(109, 440) > -0.006;
+    assert rt_wave(48000, 440) == 0.0;
+}
+
+test rt_a_burst_fades_in_and_out_and_stays_inside_its_peak {
+    assert rt_env(RT_INCOMING, 0) == 0.0;
+    assert rt_env(RT_INCOMING, 19199) == 0.0;
+    assert rt_env(RT_INCOMING, 120) == 0.5;
+    assert rt_env(RT_INCOMING, 9000) == 1.0;
+    assert rt_env(RT_INCOMING, 30000) == 0.0;
+    var pos : u64 = 0;
+    var peak : i32 = 0;
+    while (pos < RT_IN_PERIOD) {
+        var v : i32 = rt_sample(RT_INCOMING, pos);
+        if (v < 0) { v = 0 - v; }
+        if (v > peak) { peak = v; }
+        pos = pos + 1;
+    }
+    assert peak > 8000 and peak <= 9000;
+    assert rt_sample(RT_INCOMING, 0) == 0;
+    assert rt_sample(RT_INCOMING, 30000) == 0;
+    assert rt_sample(RT_OFF, 5) == 0;
+    // the 425 Hz tone of the outgoing signal: 425 cycles in a second, so a quarter cycle in is near the peak
+    var peak2 : i32 = 0;
+    pos = 0;
+    while (pos < RT_OUT_ON) {
+        var w : i32 = rt_sample(RT_OUTGOING, pos);
+        if (w < 0) { w = 0 - w; }
+        if (w > peak2) { peak2 = w; }
+        pos = pos + 1;
+    }
+    assert peak2 > 8900 and peak2 <= 9000;
+}
+
+test rt_only_ringing_and_calling_ask_for_a_signal {
+    assert rt_mode_for(CK_RINGING) == RT_INCOMING;
+    assert rt_mode_for(CK_CALLING) == RT_OUTGOING;
+    assert rt_mode_for(CK_ACTIVE) == RT_OFF;
+    assert rt_mode_for(0) == RT_OFF;
+    assert rt_mode_for(4) == RT_OFF;
+    assert rt_mode_for(99) == RT_OFF;
+}
+
+test rt_generated_buffers_count_bursts_tone_and_silence_exactly {
+    var st : [24]u64 = undefined;
+    rt_zero_st(st[0..24]);
+    st[RT_S_MODE] = RT_INCOMING;
+    var pcm : [960]u8 = undefined;
+    var b : u32 = 0;
+    // 3 s of the incoming pattern = 300 buffers of 10 ms
+    while (b < 300) {
+        rt_gen(st[0..24], pcm[0..960], RT_BUF_SAMPLES);
+        b = b + 1;
+    }
+    assert st[RT_S_TONE] == 3 * 19200;
+    assert st[RT_S_SILENT] == 3 * 48000 - 3 * 19200;
+    assert st[RT_S_BURSTS] == 3;
+    assert st[RT_S_DONE] == 3;
+    assert st[RT_S_LAST] == 19200;
+    assert st[RT_S_POS] == 0;
+    assert st[RT_S_HELD] == 0;
+}
+
+test rt_a_buffer_encodes_signed_16_bit_samples_like_the_conversation_does {
+    var st : [24]u64 = undefined;
+    rt_zero_st(st[0..24]);
+    st[RT_S_MODE] = RT_OUTGOING;
+    st[RT_S_POS] = 6000;
+    var pcm : [960]u8 = undefined;
+    rt_gen(st[0..24], pcm[0..960], RT_BUF_SAMPLES);
+    var i : usize = 0;
+    var ok : bool = true;
+    while (i < RT_BUF_SAMPLES) {
+        if (rt_pcm_at(pcm[0..960], i) != rt_sample(RT_OUTGOING, 6000 + @as(u64, i))) { ok = false; }
+        i = i + 1;
+    }
+    assert ok;
+    assert st[RT_S_POS] == 6480;
+    // silence is the mid value of the sign-flipped encoding: 0x00 low, 0x00 high after the flip back
+    var q : [24]u64 = undefined;
+    rt_zero_st(q[0..24]);
+    rt_gen(q[0..24], pcm[0..960], RT_BUF_SAMPLES);
+    assert rt_pcm_at(pcm[0..960], 0) == 0 and rt_pcm_at(pcm[0..960], 479) == 0;
+    assert q[RT_S_TONE] == 0 and q[RT_S_SILENT] == 480 and q[RT_S_POS] == 0;
+}
+
+test rt_while_active_the_buffer_is_silence_and_the_held_back_tone_is_counted {
+    var st : [24]u64 = undefined;
+    rt_zero_st(st[0..24]);
+    st[RT_S_MODE] = RT_INCOMING;
+    st[RT_S_ACTIVE] = 1;
+    st[RT_S_POS] = 5000;
+    var pcm : [960]u8 = undefined;
+    rt_gen(st[0..24], pcm[0..960], RT_BUF_SAMPLES);
+    var i : usize = 0;
+    var loud : u32 = 0;
+    while (i < RT_BUF_SAMPLES) {
+        if (rt_pcm_at(pcm[0..960], i) != 0) { loud = loud + 1; }
+        i = i + 1;
+    }
+    assert loud == 0;
+    assert st[RT_S_TONE] == 0 and st[RT_S_BURSTS] == 0;
+    assert st[RT_S_HELD] == 480;
+}

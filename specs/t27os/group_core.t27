@@ -1,0 +1,1989 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/group_core.t27 -- the core of group chat in T27 OS (2 to 8 people): pure decisions, no @extern, no
+// crypto. A group message travels as one more kind of payload inside the person to person message session of each
+// member (chat_core.t27, call_session.t27): no new transport. The disk and the session driving are chat_host.t27.
+// Owner, 2026-10-23. Refs gHashTag/t27#11560. ASCII only (L3), English only (LANG-EN).
+//
+// GROUP  2..GR_MEMBERS (8) people. Its id is the first 8 bytes of SHA-256 over the members' fingerprints sorted
+//   ascending and joined (gr_roster gives those n * 10 bytes, the host hashes, gr_id_from_digest cuts): the same
+//   people always give the same id, whatever order they were picked in. The creator picks only friends of its own
+//   friends table (gr_plan); someone else's group is kept only when its creator is a friend and this device is in it
+//   (gr_known).
+// TABLE  ~/.t27os/groups.t27, v1, the bytes in memory are the file's first GT_HDR + count * GR_REC bytes:
+//   magic "T27OSGR\n" (8) | version u32 | count u32 (<= GT_MAX, 32) | count records of GR_REC (132) bytes: id (8) |
+//   time u64 (ms since 1970, made) | members n u8 | creator index u8 | name length u8 | 0 | name (32, UTF-8, no
+//   control byte, zero after its length) | n fingerprints of 10, sorted ascending, zero after them (80) | CRC-32
+//   (peer_identity.crc32) of all before (4). Written whole and atomically by the host, mode 0600.
+// FRAME  a payload of a sealed CK_T_TEXT frame, GM_HDR (38) bytes then the bytes of one part:
+//   kind u8 (GM_K_TEXT 4, GM_K_ACK 5; chat_core's are 1..3) | 0 | group id (8) | sender fingerprint (10) | msg u32 LE
+//   (1, 2, .. per sender and group, below 2^24) | part u16 | parts u16 | time u64 (the sender's ms) | len u16 | len
+//   bytes. A message is 1..2000 bytes of UTF-8 in parts of 700 (chat_core's limits), so a payload is at most 738
+//   bytes and a sealed frame 52 + 738 + 16 = 806. An ACK names the message's author in the sender field: len 0,
+//   parts 0, time 0.
+// ROSTER  GROUP_INFO (GM_K_INFO 6), a payload of the same sealed frames: kind | flag (GI_ANNOUNCE 0, GI_HAVE 1) | id (8)
+//   | creator fingerprint (10) | members n u8 | n fingerprints sorted (10 each) | name length u8 | name | time u64; 51 to
+//   142 bytes. The creator announces a new group to each member over its message session (repeated while that member
+//   has not answered, and at the start of every session with it). A member keeps it only when the creator is the
+//   proven peer of that session and a friend with a stored key, the member is in the roster, and the id is the SHA-256
+//   of the roster (gi_apply); else it is dropped with the reason. A member that has the group answers GI_HAVE; the
+//   creator then sends every line still owed to that member again, a FAILED one too (gl_session_start).
+// DELIVERY  fan-out: the author sends every part to each member, over the message session with that member. Who
+//   is a recipient is fixed when the line is made (gr_fanout): a member that is a friend is sent to now when
+//   reachable, queued otherwise; a member that is not a friend of the author cannot be reached (no session) and is
+//   skipped. The line is DELIVERED once every recipient acknowledged every part. A receiver keeps a GROUP payload
+//   only when the group is in its table, it is in the group, the sender is a member, the sender is the proven peer
+//   of the session it came over (no relaying), and that peer's key is stored (gr_gate); else it is dropped with the
+//   reason, and not acknowledged.
+// LOG  a chat_core log (same layout in memory, same file) whose "peer" is the group id and two zero bytes. Its file
+//   is ~/.t27os/chat/g-<16 hex of the id>.t27. An incoming line's number is the sender's member index (sorted
+//   order) times 2^24 plus the sender's number, so chat_core's dedup by (direction, number) is dedup by (sender,
+//   number); an outgoing line keeps this device's own number. Lines stand in the order of (time, sender
+//   fingerprint, number): equal times never swap. The log's single floor is kept at 0; the floor per sender sits in
+//   an 8 x u32 block of the driver (gl_floors_*). The 5 spare bytes of a line (chat_core CL_EXT) hold, for an
+//   outgoing line: the members already sent to in this round (1) | ACK bits, 3 per member index (3) | recipients (1).
+//   Unread is per group: chat_core cl_unread of the group's log.
+module T27osGroupCore;
+
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::peer_identity::crc32;
+use t27os::peer_identity::ft_find;
+use t27os::peer_identity::FT_MAX;
+use t27os::chat_core::CH_PART_MAX;
+use t27os::chat_core::CH_MSG_MAX;
+use t27os::chat_core::CH_PARTS_MAX;
+use t27os::chat_core::CH_PAYLOAD_MAX;
+use t27os::chat_core::CH_DIR_OUT;
+use t27os::chat_core::CH_DIR_IN;
+use t27os::chat_core::CH_S_PENDING;
+use t27os::chat_core::CH_S_SENT;
+use t27os::chat_core::CH_S_DELIVERED;
+use t27os::chat_core::CH_S_READ;
+use t27os::chat_core::CH_S_FAILED;
+use t27os::chat_core::CH_R_WAIT;
+use t27os::chat_core::CH_R_SEND;
+use t27os::chat_core::CH_R_GIVEUP;
+use t27os::chat_core::CH_RX_BAD;
+use t27os::chat_core::CH_RX_DUP;
+use t27os::chat_core::CH_RX_NEW;
+use t27os::chat_core::CL_HDR;
+use t27os::chat_core::CL_LINE;
+use t27os::chat_core::CL_EXT;
+use t27os::chat_core::CL_NONE;
+use t27os::chat_core::ch_utf8_ok;
+use t27os::chat_core::ch_plain;
+use t27os::chat_core::ch_parts_for;
+use t27os::chat_core::ch_put_part;
+use t27os::chat_core::ch_rx_text;
+use t27os::chat_core::ch_retry;
+use t27os::chat_core::cl_count;
+use t27os::chat_core::cl_cap;
+use t27os::chat_core::cl_dir;
+use t27os::chat_core::cl_state;
+use t27os::chat_core::cl_msg;
+use t27os::chat_core::cl_time;
+use t27os::chat_core::cl_parts;
+use t27os::chat_core::cl_tries;
+use t27os::chat_core::cl_last_send;
+use t27os::chat_core::cl_line_at;
+use t27os::chat_core::cl_find;
+use t27os::chat_core::cl_floor;
+use t27os::chat_core::cl_set_floor;
+use t27os::chat_core::cl_drop_oldest;
+use t27os::chat_core::cl_out_add;
+use t27os::chat_core::cl_open_out;
+use t27os::chat_core::cl_mark_sent;
+use t27os::chat_core::cl_restart;
+use t27os::chat_core::cf_name;
+use t27os::chat_core::put16;
+use t27os::chat_core::get16;
+use t27os::chat_core::put32;
+use t27os::chat_core::get32;
+use t27os::chat_core::copy;
+use t27os::call_core::ck_wipe;
+use t27os::peer_identity::ft_init;
+use t27os::peer_identity::ft_add;
+use t27os::peer_identity::invite_make;
+use t27os::peer_identity::FT_LEN;
+use t27os::peer_identity::FA_OK;
+use t27os::chat_core::cl_init;
+use t27os::chat_core::cl_bytes;
+use t27os::chat_core::cl_text;
+use t27os::chat_core::cl_unread;
+use t27os::chat_core::cl_open_read;
+use t27os::chat_core::cf_encode;
+use t27os::chat_core::cf_decode;
+use t27os::chat_core::CF_OK;
+use t27os::chat_core::CF_BAD;
+use t27os::chat_core::CF_HDR;
+use t27os::chat_core::CA_LEN;
+use t27os::chat_core::CH_RX_PART;
+use t27os::chat_core::CH_RETRY_MS;
+use t27os::chat_core::CH_TRIES;
+
+// ---------------------------------------------------------------- bytes
+
+/// -1, 0 or 1 as fingerprint a[ao..ao+10] is below, equal to or above b[bo..bo+10].
+pub fn gr_fp_cmp(a: []const u8, ao: usize, b: []const u8, bo: usize) -> i32 {
+    var i : usize = 0;
+    while (i < 10) {
+        if (a[ao + i] < b[bo + i]) { return -1; }
+        if (a[ao + i] > b[bo + i]) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- the group
+
+pub const GR_MIN : u32 = 2;
+pub const GR_MEMBERS : u32 = 8;
+/// No such member.
+pub const GR_NOBODY : u32 = 8;
+pub const GR_ID : usize = 8;
+pub const GR_NAME_MAX : usize = 32;
+
+/// Why a roster or a frame is refused (gr_plan, gr_known, gr_gate).
+pub const GR_OK : u32 = 0;
+pub const GR_BAD : u32 = 1;
+pub const GR_SIZE : u32 = 2;
+pub const GR_DUP : u32 = 3;
+pub const GR_SELF : u32 = 4;
+pub const GR_NOT_FRIEND : u32 = 5;
+pub const GR_UNKNOWN : u32 = 6;
+pub const GR_NOT_ME : u32 = 7;
+pub const GR_NOT_MEMBER : u32 = 8;
+pub const GR_SPOOF : u32 = 9;
+pub const GR_UNTRUSTED : u32 = 10;
+
+/// Sort n fingerprints (n * 10 bytes of fps) ascending into out; false when two are the same.
+pub fn gr_sort(fps: []const u8, n: usize, out: []u8) -> bool {
+    if (fps.len < n * 10 or out.len < n * 10) { return false; }
+    copy(out, 0, fps, 0, n * 10);
+    var i : usize = 1;
+    while (i < n) {
+        var j : usize = i;
+        while (j > 0 and gr_fp_cmp(out, (j - 1) * 10, out, j * 10) > 0) {
+            var k : usize = 0;
+            while (k < 10) {
+                const t : u8 = out[(j - 1) * 10 + k];
+                out[(j - 1) * 10 + k] = out[j * 10 + k];
+                out[j * 10 + k] = t;
+                k = k + 1;
+            }
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    i = 1;
+    while (i < n) {
+        if (gr_fp_cmp(out, (i - 1) * 10, out, i * 10) == 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The id: the first GR_ID bytes of SHA-256 over the sorted roster (gr_plan's out, n * 10 bytes).
+pub fn gr_id_from_digest(digest: []const u8, out: []u8) -> bool {
+    if (digest.len != 32 or out.len < GR_ID) { return false; }
+    copy(out, 0, digest, 0, GR_ID);
+    return true;
+}
+
+fn g_in_list(fps: []const u8, n: usize, fp: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < n) {
+        if (gr_fp_cmp(fps, i * 10, fp, 0) == 0) { return i; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// A group this device makes with the k people picked (others, k * 10 bytes): itself and them, sorted, into out
+/// ((k + 1) * 10 bytes). GR_OK, or why not: 2..8 people in all, nobody twice, not itself among the picked, every one
+/// picked a friend in its friends table.
+pub fn gr_plan(friends: []const u8, me_fp: []const u8, others: []const u8, k: usize, out: []u8) -> u32 {
+    const n : usize = k + 1;
+    if (n < @as(usize, GR_MIN) or n > @as(usize, GR_MEMBERS) or others.len < k * 10 or out.len < n * 10) { return GR_SIZE; }
+    if (g_in_list(others, k, me_fp) != k) { return GR_SELF; }
+    var all : [80]u8 = undefined;
+    copy(all[0..80], 0, others, 0, k * 10);
+    copy(all[0..80], k * 10, me_fp, 0, 10);
+    if (!gr_sort(all[0..80], n, out)) { return GR_DUP; }
+    var i : usize = 0;
+    while (i < k) {
+        if (ft_find(friends, others[i * 10..i * 10 + 10]) == FT_MAX) { return GR_NOT_FRIEND; }
+        i = i + 1;
+    }
+    return GR_OK;
+}
+
+/// A group someone else made (a sorted roster of n and its creator's index): kept only when this device is in it
+/// and the creator is a friend. GR_OK or why not.
+pub fn gr_known(friends: []const u8, me_fp: []const u8, roster: []const u8, n: usize, creator: usize) -> u32 {
+    if (n < @as(usize, GR_MIN) or n > @as(usize, GR_MEMBERS) or creator >= n or roster.len < n * 10) { return GR_SIZE; }
+    var i : usize = 1;
+    while (i < n) {
+        if (gr_fp_cmp(roster, (i - 1) * 10, roster, i * 10) >= 0) { return GR_DUP; }
+        i = i + 1;
+    }
+    if (g_in_list(roster, n, me_fp) == n) { return GR_NOT_ME; }
+    if (gr_fp_cmp(roster, creator * 10, me_fp, 0) == 0) { return GR_OK; }
+    if (ft_find(friends, roster[creator * 10..creator * 10 + 10]) == FT_MAX) { return GR_NOT_FRIEND; }
+    return GR_OK;
+}
+
+/// A new group name (typed, or in a list from a member): gr_name_bytes_ok and no mark that hides or reorders text
+/// (ch_plain). A name already in groups.t27 is read with gr_name_bytes_ok, so the file of an older build still reads.
+pub fn gr_name_ok(name: []const u8) -> bool { return gr_name_bytes_ok(name) and ch_plain(name); }
+
+/// 1..32 bytes of UTF-8 with no control byte.
+fn gr_name_bytes_ok(name: []const u8) -> bool {
+    if (name.len == 0 or name.len > GR_NAME_MAX or !ch_utf8_ok(name)) { return false; }
+    var i : usize = 0;
+    while (i < name.len) {
+        if (name[i] < 32 or name[i] == 127) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- the table
+
+pub const GT_MAX : u32 = 32;
+pub const GT_HDR : usize = 16;
+pub const GR_REC : usize = 132;
+/// The table in memory (GT_MAX records), and the largest file (with its CRC).
+pub const GT_LEN : usize = 4240;
+pub const GT_FILE_MAX : usize = 4244;
+pub const GT_NONE : usize = 32;
+const GT_VERSION : u32 = 1;
+
+const R_ID : usize = 0;
+const R_TIME : usize = 8;
+const R_N : usize = 16;
+const R_CREATOR : usize = 17;
+const R_NAMELEN : usize = 18;
+const R_NAME : usize = 20;
+const R_FPS : usize = 52;
+
+pub const GT_OK : u32 = 0;
+pub const GT_SHORT : u32 = 1;
+pub const GT_MAGIC : u32 = 2;
+pub const GT_VERSION_BAD : u32 = 3;
+pub const GT_COUNT : u32 = 4;
+pub const GT_CRC : u32 = 5;
+pub const GT_REC_BAD : u32 = 6;
+pub const GT_DUP : u32 = 7;
+pub const GT_FULL : u32 = 8;
+
+fn g_rec(gi: usize) -> usize { return GT_HDR + gi * GR_REC; }
+
+fn gt_magic(b: []u8) -> void {
+    // "T27OSGR\n"
+    b[0] = 84; b[1] = 50; b[2] = 55; b[3] = 79; b[4] = 83; b[5] = 71; b[6] = 82; b[7] = 10;
+}
+
+fn gt_magic_ok(b: []const u8) -> bool {
+    return b[0] == 84 and b[1] == 50 and b[2] == 55 and b[3] == 79 and b[4] == 83 and b[5] == 71 and b[6] == 82 and b[7] == 10;
+}
+
+pub fn gt_init(t: []u8) -> bool {
+    if (t.len < GT_LEN) { return false; }
+    ck_wipe(t[0..GT_LEN]);
+    gt_magic(t);
+    put32(t, 8, GT_VERSION);
+    return true;
+}
+
+pub fn gt_count(t: []const u8) -> u32 { return get32(t, 12); }
+pub fn gt_id(t: []const u8, gi: usize) -> []const u8 { return t[g_rec(gi) + R_ID..g_rec(gi) + R_ID + GR_ID]; }
+pub fn gt_n(t: []const u8, gi: usize) -> usize { return @as(usize, t[g_rec(gi) + R_N]); }
+pub fn gt_creator(t: []const u8, gi: usize) -> usize { return @as(usize, t[g_rec(gi) + R_CREATOR]); }
+pub fn gt_time(t: []const u8, gi: usize) -> u64 { return get_u64(t, g_rec(gi) + R_TIME); }
+pub fn gt_name(t: []const u8, gi: usize) -> []const u8 { return t[g_rec(gi) + R_NAME..g_rec(gi) + R_NAME + @as(usize, t[g_rec(gi) + R_NAMELEN])]; }
+/// The roster (n * 10 bytes, sorted).
+pub fn gt_roster(t: []const u8, gi: usize) -> []const u8 { return t[g_rec(gi) + R_FPS..g_rec(gi) + R_FPS + gt_n(t, gi) * 10]; }
+pub fn gt_member(t: []const u8, gi: usize, k: usize) -> []const u8 { return t[g_rec(gi) + R_FPS + k * 10..g_rec(gi) + R_FPS + k * 10 + 10]; }
+
+/// The group with this id, GT_NONE when there is none.
+pub fn gt_find(t: []const u8, id: []const u8) -> usize {
+    const n : usize = @as(usize, gt_count(t));
+    var i : usize = 0;
+    while (i < n) {
+        var k : usize = 0;
+        var same : bool = true;
+        while (k < GR_ID) {
+            if (t[g_rec(i) + R_ID + k] != id[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return GT_NONE;
+}
+
+/// The member index of fp in group gi (its place in the sorted roster), GR_NOBODY when it is not a member.
+pub fn gt_idx(t: []const u8, gi: usize, fp: []const u8) -> u32 {
+    const n : usize = gt_n(t, gi);
+    var k : usize = 0;
+    while (k < n) {
+        if (gr_fp_cmp(t, g_rec(gi) + R_FPS + k * 10, fp, 0) == 0) { return @as(u32, @intCast(k)); }
+        k = k + 1;
+    }
+    return GR_NOBODY;
+}
+
+/// Does record gi check (size, sorted roster with nobody twice, creator, name)?
+fn g_rec_ok(t: []const u8, gi: usize) -> bool {
+    const o : usize = g_rec(gi);
+    const n : usize = @as(usize, t[o + R_N]);
+    const nl : usize = @as(usize, t[o + R_NAMELEN]);
+    if (n < @as(usize, GR_MIN) or n > @as(usize, GR_MEMBERS) or @as(usize, t[o + R_CREATOR]) >= n or t[o + 19] != 0) { return false; }
+    if (nl > GR_NAME_MAX or !gr_name_bytes_ok(t[o + R_NAME..o + R_NAME + nl])) { return false; }
+    var i : usize = nl;
+    while (i < GR_NAME_MAX) {
+        if (t[o + R_NAME + i] != 0) { return false; }
+        i = i + 1;
+    }
+    i = 1;
+    while (i < n) {
+        if (gr_fp_cmp(t, o + R_FPS + (i - 1) * 10, t, o + R_FPS + i * 10) >= 0) { return false; }
+        i = i + 1;
+    }
+    i = n * 10;
+    while (i < 80) {
+        if (t[o + R_FPS + i] != 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Add a group: its id (the host's SHA-256 of the roster), name, sorted roster of n, creator index, time made.
+/// GT_OK, GT_DUP when the id is there, GT_FULL at GT_MAX, GT_REC_BAD when the record would not check.
+pub fn gt_add(t: []u8, id: []const u8, name: []const u8, roster: []const u8, n: usize, creator: usize, time: u64) -> u32 {
+    if (id.len != GR_ID or n < @as(usize, GR_MIN) or n > @as(usize, GR_MEMBERS) or roster.len < n * 10 or !gr_name_ok(name)) { return GT_REC_BAD; }
+    if (gt_find(t, id) != GT_NONE) { return GT_DUP; }
+    const c : usize = @as(usize, gt_count(t));
+    if (c >= @as(usize, GT_MAX)) { return GT_FULL; }
+    const o : usize = g_rec(c);
+    ck_wipe(t[o..o + GR_REC]);
+    copy(t, o + R_ID, id, 0, GR_ID);
+    put_u64(t, o + R_TIME, time);
+    t[o + R_N] = @as(u8, @intCast(n));
+    t[o + R_CREATOR] = @as(u8, @intCast(creator));
+    t[o + R_NAMELEN] = @as(u8, @intCast(name.len));
+    copy(t, o + R_NAME, name, 0, name.len);
+    copy(t, o + R_FPS, roster, 0, n * 10);
+    if (!g_rec_ok(t, c)) {
+        ck_wipe(t[o..o + GR_REC]);
+        return GT_REC_BAD;
+    }
+    put32(t, 12, @as(u32, @intCast(c + 1)));
+    return GT_OK;
+}
+
+/// Leave a group: its record goes, the ones after move up. False when there is none.
+pub fn gt_remove(t: []u8, id: []const u8) -> bool {
+    const gi : usize = gt_find(t, id);
+    if (gi == GT_NONE) { return false; }
+    const c : usize = @as(usize, gt_count(t));
+    var b : usize = g_rec(gi);
+    while (b < g_rec(c - 1)) {
+        t[b] = t[b + GR_REC];
+        b = b + 1;
+    }
+    ck_wipe(t[g_rec(c - 1)..g_rec(c - 1) + GR_REC]);
+    put32(t, 12, @as(u32, @intCast(c - 1)));
+    return true;
+}
+
+/// The file length of a table of c groups.
+pub fn gt_file_len(c: u32) -> usize { return GT_HDR + @as(usize, c) * GR_REC + 4; }
+
+/// The file of a table into out; its length, 0 when out is short.
+pub fn gt_encode(t: []const u8, out: []u8) -> usize {
+    const n : usize = gt_file_len(gt_count(t));
+    if (out.len < n) { return 0; }
+    copy(out, 0, t, 0, n - 4);
+    put32(out, n - 4, crc32(out, n - 4));
+    return n;
+}
+
+/// Read a file of b.len bytes into t: GT_OK, or the first thing wrong (t is then an empty table).
+pub fn gt_decode(b: []const u8, t: []u8) -> u32 {
+    gt_init(t);
+    if (b.len < GT_HDR + 4) { return GT_SHORT; }
+    if (!gt_magic_ok(b)) { return GT_MAGIC; }
+    if (get32(b, 8) != GT_VERSION) { return GT_VERSION_BAD; }
+    const c : u32 = get32(b, 12);
+    if (c > GT_MAX or b.len != gt_file_len(c)) { return GT_COUNT; }
+    if (get32(b, b.len - 4) != crc32(b, b.len - 4)) { return GT_CRC; }
+    copy(t, 0, b, 0, b.len - 4);
+    var i : usize = 0;
+    while (i < @as(usize, c)) {
+        if (!g_rec_ok(t, i)) {
+            gt_init(t);
+            return GT_REC_BAD;
+        }
+        var j : usize = 0;
+        while (j < i) {
+            var k : usize = 0;
+            var same : bool = true;
+            while (k < GR_ID) {
+                if (t[g_rec(j) + k] != t[g_rec(i) + k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) {
+                gt_init(t);
+                return GT_DUP;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return GT_OK;
+}
+
+// ---------------------------------------------------------------- the frame
+
+pub const GM_K_TEXT : u32 = 4;
+pub const GM_K_ACK : u32 = 5;
+pub const GM_HDR : usize = 38;
+pub const GM_PAYLOAD_MAX : usize = 738;
+/// A sender's numbers stay below this (an incoming line's number is index * GM_SEQ + number).
+pub const GM_SEQ : u32 = 16777216;
+
+fn put_ghdr(out: []u8, kind: u32, gid: []const u8, sender: []const u8, msg: u32, part: u32, parts: u32, time: u64, len: usize) -> void {
+    out[0] = @as(u8, @intCast(kind));
+    out[1] = 0;
+    copy(out, 2, gid, 0, GR_ID);
+    copy(out, 10, sender, 0, 10);
+    put32(out, 20, msg);
+    put16(out, 24, part);
+    put16(out, 26, parts);
+    put_u64(out, 28, time);
+    put16(out, 36, @as(u32, @intCast(len)));
+}
+
+/// Part `part` of group message `msg` (whole text) into out: GM_HDR + its bytes, 0 when it cannot be.
+pub fn gm_put_text(out: []u8, gid: []const u8, sender: []const u8, msg: u32, part: u32, time: u64, text: []const u8) -> usize {
+    const parts : u32 = ch_parts_for(text.len);
+    if (parts == 0 or msg == 0 or msg >= GM_SEQ or part >= parts or gid.len != GR_ID or sender.len != 10) { return 0; }
+    const from : usize = @as(usize, part) * CH_PART_MAX;
+    var n : usize = text.len - from;
+    if (n > CH_PART_MAX) { n = CH_PART_MAX; }
+    if (out.len < GM_HDR + n) { return 0; }
+    put_ghdr(out, GM_K_TEXT, gid, sender, msg, part, parts, time, n);
+    copy(out, GM_HDR, text, from, n);
+    return GM_HDR + n;
+}
+
+/// "part `part` of the message `msg` of `author` in group gid is here".
+pub fn gm_put_ack(out: []u8, gid: []const u8, author: []const u8, msg: u32, part: u32) -> usize {
+    if (out.len < GM_HDR or msg == 0 or msg >= GM_SEQ or part >= CH_PARTS_MAX or gid.len != GR_ID or author.len != 10) { return 0; }
+    put_ghdr(out, GM_K_ACK, gid, author, msg, part, 0, 0, 0);
+    return GM_HDR;
+}
+
+/// The kind of a group payload that checks (GM_K_TEXT, GM_K_ACK), 0 for anything else.
+pub fn gm_kind(p: []const u8) -> u32 {
+    if (p.len < GM_HDR or p.len > GM_PAYLOAD_MAX or p[1] != 0) { return 0; }
+    const kind : u32 = @as(u32, p[0]);
+    const msg : u32 = get32(p, 20);
+    const part : u32 = get16(p, 24);
+    const parts : u32 = get16(p, 26);
+    const len : usize = @as(usize, get16(p, 36));
+    if (msg == 0 or msg >= GM_SEQ or len != p.len - GM_HDR) { return 0; }
+    if (kind == GM_K_TEXT) {
+        if (parts == 0 or parts > CH_PARTS_MAX or part >= parts or len == 0 or len > CH_PART_MAX) { return 0; }
+        if (part + 1 < parts and len != CH_PART_MAX) { return 0; }
+        if (@as(usize, part) * CH_PART_MAX + len > CH_MSG_MAX) { return 0; }
+        return kind;
+    }
+    if (kind == GM_K_ACK) {
+        if (len != 0 or parts != 0 or part >= CH_PARTS_MAX or get_u64(p, 28) != 0) { return 0; }
+        return kind;
+    }
+    return 0;
+}
+
+pub fn gm_gid(p: []const u8) -> []const u8 { return p[2..10]; }
+pub fn gm_sender(p: []const u8) -> []const u8 { return p[10..20]; }
+pub fn gm_msg(p: []const u8) -> u32 { return get32(p, 20); }
+pub fn gm_part(p: []const u8) -> u32 { return get16(p, 24); }
+pub fn gm_parts(p: []const u8) -> u32 { return get16(p, 26); }
+pub fn gm_time(p: []const u8) -> u64 { return get_u64(p, 28); }
+
+/// Is this payload a group one (the session driver hands it here rather than to chat_core)?
+pub fn gm_is_group(p: []const u8) -> bool {
+    return p.len > 0 and (@as(u32, p[0]) == GM_K_TEXT or @as(u32, p[0]) == GM_K_ACK);
+}
+
+/// May this payload, which came over the message session with peer (its proven fingerprint; pinned: its key is
+/// stored), be taken? GR_OK or the reason it is dropped. A TEXT's sender is the peer itself; an ACK names its author,
+/// which is this device, and the peer that acknowledges must be a member.
+pub fn gr_gate(t: []const u8, p: []const u8, me_fp: []const u8, peer: []const u8, pinned: bool) -> u32 {
+    const kind : u32 = gm_kind(p);
+    if (kind == 0) { return GR_BAD; }
+    const gi : usize = gt_find(t, gm_gid(p));
+    if (gi == GT_NONE) { return GR_UNKNOWN; }
+    if (gt_idx(t, gi, me_fp) == GR_NOBODY) { return GR_NOT_ME; }
+    if (gt_idx(t, gi, peer) == GR_NOBODY) { return GR_NOT_MEMBER; }
+    if (kind == GM_K_TEXT) {
+        if (gr_fp_cmp(gm_sender(p), 0, peer, 0) != 0) { return GR_SPOOF; }
+    } else {
+        if (gr_fp_cmp(gm_sender(p), 0, me_fp, 0) != 0) { return GR_SPOOF; }
+    }
+    if (!pinned) { return GR_UNTRUSTED; }
+    return GR_OK;
+}
+
+// ---------------------------------------------------------------- the roster frame (GROUP_INFO)
+
+pub const GM_K_INFO : u32 = 6;
+/// Flag byte 1 of a GROUP_INFO: the creator announces its group (0); a member answers that it has it (1).
+pub const GI_ANNOUNCE : u32 = 0;
+pub const GI_HAVE : u32 = 1;
+/// Its smallest (2 members, a name of 1 byte) and largest (8 members, 32 bytes) length.
+pub const GI_MIN : usize = 51;
+pub const GI_MAX : usize = 142;
+const I_CREATOR : usize = 10;
+const I_N : usize = 20;
+const I_FPS : usize = 21;
+
+/// What gi_apply did (low 8 bits; a refusal is a GR_* reason below 16): a new group kept, an ANNOUNCE of a group
+/// already here, a HAVE taken (its lines owed to that member restarted: their count in bits 8..15).
+pub const GI_KEPT : u32 = 16;
+pub const GI_ALREADY : u32 = 17;
+pub const GI_JOINED : u32 = 18;
+/// Refusals only GROUP_INFO has: its id is not the SHA-256 of its roster; the table is full.
+pub const GR_ID_BAD : u32 = 11;
+pub const GR_FULL : u32 = 12;
+
+/// The length of a GROUP_INFO of n members and a name of nl bytes.
+pub fn gi_len(n: usize, nl: usize) -> usize { return 30 + n * 10 + nl; }
+
+fn g_sorted(r: []const u8, ro: usize, n: usize) -> bool {
+    var i : usize = 1;
+    while (i < n) {
+        if (gr_fp_cmp(r, ro + (i - 1) * 10, r, ro + i * 10) >= 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A GROUP_INFO into out: kind 6 | flag (GI_ANNOUNCE or GI_HAVE) | group id (8) | creator fingerprint (10) | members n
+/// u8 | the n fingerprints sorted (10 each) | name length u8 | name | time u64 (ms, made). Its length, 0 when it cannot
+/// be (2..8 members sorted with nobody twice, the creator one of them, a good name, out long enough).
+pub fn gi_put(out: []u8, flag: u32, gid: []const u8, creator: []const u8, roster: []const u8, n: usize, name: []const u8, time: u64) -> usize {
+    if (flag > GI_HAVE or gid.len != GR_ID or creator.len != 10 or n < @as(usize, GR_MIN) or n > @as(usize, GR_MEMBERS)) { return 0; }
+    if (roster.len < n * 10 or !gr_name_ok(name) or out.len < gi_len(n, name.len)) { return 0; }
+    if (!g_sorted(roster, 0, n) or g_in_list(roster, n, creator) == n) { return 0; }
+    out[0] = @as(u8, @intCast(GM_K_INFO));
+    out[1] = @as(u8, @intCast(flag));
+    copy(out, 2, gid, 0, GR_ID);
+    copy(out, I_CREATOR, creator, 0, 10);
+    out[I_N] = @as(u8, @intCast(n));
+    copy(out, I_FPS, roster, 0, n * 10);
+    const o : usize = I_FPS + n * 10;
+    out[o] = @as(u8, @intCast(name.len));
+    copy(out, o + 1, name, 0, name.len);
+    put_u64(out, o + 1 + name.len, time);
+    return gi_len(n, name.len);
+}
+
+/// The GROUP_INFO of group gi of table t.
+pub fn gi_put_rec(out: []u8, flag: u32, t: []const u8, gi: usize) -> usize {
+    return gi_put(out, flag, gt_id(t, gi), gt_member(t, gi, gt_creator(t, gi)), gt_roster(t, gi), gt_n(t, gi), gt_name(t, gi), gt_time(t, gi));
+}
+
+/// Is p a GROUP_INFO (the session driver hands it to gi_apply)?
+pub fn gi_is(p: []const u8) -> bool { return p.len > 0 and @as(u32, p[0]) == GM_K_INFO; }
+
+/// Does p check as a GROUP_INFO: its length, flag, 2..8 members sorted with nobody twice, the creator one of them,
+/// a good name?
+pub fn gi_ok(p: []const u8) -> bool {
+    if (p.len < GI_MIN or p.len > GI_MAX or !gi_is(p) or @as(u32, p[1]) > GI_HAVE) { return false; }
+    const n : usize = @as(usize, p[I_N]);
+    if (n < @as(usize, GR_MIN) or n > @as(usize, GR_MEMBERS) or p.len < gi_len(n, 0)) { return false; }
+    const nl : usize = @as(usize, p[I_FPS + n * 10]);
+    if (p.len != gi_len(n, nl)) { return false; }
+    if (!g_sorted(p, I_FPS, n) or g_in_list(p[I_FPS..I_FPS + n * 10], n, p[I_CREATOR..I_CREATOR + 10]) == n) { return false; }
+    return gr_name_ok(p[I_FPS + n * 10 + 1..I_FPS + n * 10 + 1 + nl]);
+}
+
+pub fn gi_flag(p: []const u8) -> u32 { return @as(u32, p[1]); }
+pub fn gi_gid(p: []const u8) -> []const u8 { return p[2..10]; }
+pub fn gi_creator(p: []const u8) -> []const u8 { return p[I_CREATOR..I_CREATOR + 10]; }
+pub fn gi_n(p: []const u8) -> usize { return @as(usize, p[I_N]); }
+pub fn gi_roster(p: []const u8) -> []const u8 { return p[I_FPS..I_FPS + gi_n(p) * 10]; }
+pub fn gi_name(p: []const u8) -> []const u8 {
+    const o : usize = I_FPS + gi_n(p) * 10;
+    return p[o + 1..o + 1 + @as(usize, p[o])];
+}
+pub fn gi_time(p: []const u8) -> u64 { return get_u64(p, p.len - 8); }
+
+/// One GROUP_INFO (it passed gi_ok? checked here first) that came over the message session with peer (its proven
+/// fingerprint; pinned: its key is stored). idc is the id this device hashed from the frame's roster (the host's
+/// SHA-256, gr_id_from_digest). An ANNOUNCE is kept only from its creator, who must be the peer and a trusted friend,
+/// for a roster this device is in, under the id of that roster; a HAVE only from a member of a group in the table,
+/// and then every line of the open group's log (glog, its table index open_gi; an empty glog: none open) still owed
+/// to that member starts again, a FAILED one too (gl_session_start). GI_* (with the restarted count) or a GR_* reason.
+pub fn gi_apply(t: []u8, friends: []const u8, me_fp: []const u8, peer: []const u8, pinned: bool, p: []const u8, idc: []const u8, glog: []u8, open_gi: usize) -> u32 {
+    if (!gi_ok(p)) { return GR_BAD; }
+    if (idc.len != GR_ID or gr_fp_cmp8(gi_gid(p), idc) == false) { return GR_ID_BAD; }
+    const n : usize = gi_n(p);
+    const roster : []const u8 = gi_roster(p);
+    if (gi_flag(p) == GI_ANNOUNCE) {
+        if (gr_fp_cmp(gi_creator(p), 0, peer, 0) != 0) { return GR_SPOOF; }
+        const ci : usize = g_in_list(roster, n, gi_creator(p));
+        const why : u32 = gr_known(friends, me_fp, roster, n, ci);
+        if (why != GR_OK) { return why; }
+        if (!pinned) { return GR_UNTRUSTED; }
+        if (gt_find(t, gi_gid(p)) != GT_NONE) { return GI_ALREADY; }
+        const st : u32 = gt_add(t, gi_gid(p), gi_name(p), roster, n, ci, gi_time(p));
+        if (st == GT_FULL) { return GR_FULL; }
+        if (st != GT_OK) { return GR_BAD; }
+        return GI_KEPT;
+    }
+    const gi : usize = gt_find(t, gi_gid(p));
+    if (gi == GT_NONE) { return GR_UNKNOWN; }
+    if (gt_idx(t, gi, me_fp) == GR_NOBODY) { return GR_NOT_ME; }
+    const pidx : u32 = gt_idx(t, gi, peer);
+    if (pidx == GR_NOBODY) { return GR_NOT_MEMBER; }
+    if (!pinned) { return GR_UNTRUSTED; }
+    var c : u32 = 0;
+    if (open_gi == gi and glog.len >= CL_HDR) { c = gl_session_start(glog, pidx); }
+    return GI_JOINED | (c << 8);
+}
+
+fn gr_fp_cmp8(a: []const u8, b: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < GR_ID) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The members of group gi a new group of this device owes its ANNOUNCE (every member but this device), by index.
+pub fn gi_owe_new(t: []const u8, gi: usize, me_fp: []const u8) -> u32 {
+    const n : usize = gt_n(t, gi);
+    const me : u32 = gt_idx(t, gi, me_fp);
+    var m : u32 = 0;
+    var k : u32 = 0;
+    while (@as(usize, k) < n) {
+        if (k != me) { m = m | (@as(u32, 1) << k); }
+        k = k + 1;
+    }
+    return m;
+}
+
+/// Does this device announce group gi (it made it)?
+pub fn gi_mine(t: []const u8, gi: usize, me_fp: []const u8) -> bool {
+    return gt_idx(t, gi, me_fp) == @as(u32, @intCast(gt_creator(t, gi)));
+}
+
+// ---------------------------------------------------------------- fan-out
+
+/// The members of group gi that are in the friends table, as a mask by member index (this device never is).
+pub fn gr_reach_mask(t: []const u8, gi: usize, friends: []const u8) -> u32 {
+    const n : usize = gt_n(t, gi);
+    var m : u32 = 0;
+    var k : usize = 0;
+    while (k < n) {
+        if (ft_find(friends, gt_member(t, gi, k)) != FT_MAX) { m = m | (@as(u32, 1) << @as(u32, @intCast(k))); }
+        k = k + 1;
+    }
+    return m;
+}
+
+/// Who gets a new message of this device in group gi: bits 0..7 send now (a friend, reachable: online), 8..15 queue
+/// (a friend not reachable now: it goes when a session with it comes up), 16..23 skipped (not a friend: no session
+/// can carry it). This device is in none. Masks are by member index.
+pub fn gr_fanout(t: []const u8, gi: usize, me_fp: []const u8, online: u32, reach: u32) -> u32 {
+    const n : usize = gt_n(t, gi);
+    const me : u32 = gt_idx(t, gi, me_fp);
+    var send : u32 = 0;
+    var queue : u32 = 0;
+    var skip : u32 = 0;
+    var k : u32 = 0;
+    while (@as(usize, k) < n) {
+        const bit : u32 = @as(u32, 1) << k;
+        if (k != me) {
+            if ((reach & bit) == 0) { skip = skip | bit; }
+            else if ((online & bit) != 0) { send = send | bit; }
+            else { queue = queue | bit; }
+        }
+        k = k + 1;
+    }
+    return send | (queue << 8) | (skip << 16);
+}
+
+/// The recipients of a fan-out plan (sent now or queued).
+pub fn gr_recipients(plan: u32) -> u32 { return (plan & 255) | ((plan >> 8) & 255); }
+
+// ---------------------------------------------------------------- the group log
+
+const X_ROUND : usize = 0;
+const X_ACK : usize = 1;
+const X_RCPT : usize = 4;
+
+fn g_xo(i: usize) -> usize { return cl_line_at(i) + CL_EXT; }
+
+/// The number an incoming line of member `idx`'s message `msg` has in the log.
+pub fn gl_key(idx: u32, msg: u32) -> u32 { return idx * GM_SEQ + msg; }
+
+/// The log's "peer" for group gid: the id and two zero bytes (10 bytes into out).
+pub fn gl_peer(gid: []const u8, out: []u8) -> void {
+    copy(out, 0, gid, 0, GR_ID);
+    out[8] = 0;
+    out[9] = 0;
+}
+
+/// "g-<16 lowercase hex of the id>.t27" into out: its length (22), 0 when out is short.
+pub fn gl_name(gid: []const u8, out: []u8) -> usize {
+    if (gid.len != GR_ID or out.len < 22) { return 0; }
+    var p : [10]u8 = undefined;
+    gl_peer(gid, p[0..10]);
+    var h : [24]u8 = undefined;
+    cf_name(p[0..10], h[0..24]);
+    out[0] = 103;
+    out[1] = 45;
+    copy(out, 2, h[0..24], 0, 16);
+    copy(out, 18, h[0..24], 20, 4);
+    return 22;
+}
+
+pub fn gl_rcpt(log: []const u8, i: usize) -> u32 { return @as(u32, log[g_xo(i) + X_RCPT]); }
+pub fn gl_round(log: []const u8, i: usize) -> u32 { return @as(u32, log[g_xo(i) + X_ROUND]); }
+fn gl_acks(log: []const u8, i: usize) -> u32 {
+    const o : usize = g_xo(i) + X_ACK;
+    return @as(u32, log[o]) | (@as(u32, log[o + 1]) << 8) | (@as(u32, log[o + 2]) << 16);
+}
+fn gl_set_acks(log: []u8, i: usize, v: u32) -> void {
+    const o : usize = g_xo(i) + X_ACK;
+    log[o] = @as(u8, @intCast(v & 255));
+    log[o + 1] = @as(u8, @intCast((v >> 8) & 255));
+    log[o + 2] = @as(u8, @intCast((v >> 16) & 255));
+}
+
+/// The sender's member index of line i (me for an outgoing one) and its number.
+pub fn gl_sender(log: []const u8, i: usize, me: u32) -> u32 {
+    if (cl_dir(log, i) == CH_DIR_OUT) { return me; }
+    return cl_msg(log, i) / GM_SEQ;
+}
+
+pub fn gl_seq(log: []const u8, i: usize) -> u32 {
+    if (cl_dir(log, i) == CH_DIR_OUT) { return cl_msg(log, i); }
+    return cl_msg(log, i) % GM_SEQ;
+}
+
+/// Does line a stand after line b: by time, then sender (index order is fingerprint order), then number?
+pub fn gl_after(log: []const u8, a: usize, b: usize, me: u32) -> bool {
+    const ta : u64 = cl_time(log, a);
+    const tb : u64 = cl_time(log, b);
+    if (ta != tb) { return ta > tb; }
+    const sa : u32 = gl_sender(log, a, me);
+    const sb : u32 = gl_sender(log, b, me);
+    if (sa != sb) { return sa > sb; }
+    return gl_seq(log, a) > gl_seq(log, b);
+}
+
+fn g_swap_lines(log: []u8, a: usize, b: usize) -> void {
+    const oa : usize = cl_line_at(a);
+    const ob : usize = cl_line_at(b);
+    var k : usize = 0;
+    while (k < CL_LINE) {
+        const t : u8 = log[oa + k];
+        log[oa + k] = log[ob + k];
+        log[ob + k] = t;
+        k = k + 1;
+    }
+}
+
+/// Move line i to its place among the others (which are in order); the index it ends at.
+pub fn gl_place(log: []u8, i: usize, me: u32) -> usize {
+    const n : usize = @as(usize, cl_count(log));
+    var j : usize = i;
+    while (j > 0 and gl_after(log, j - 1, j, me)) {
+        g_swap_lines(log, j - 1, j);
+        j = j - 1;
+    }
+    while (j + 1 < n and gl_after(log, j, j + 1, me)) {
+        g_swap_lines(log, j, j + 1);
+        j = j + 1;
+    }
+    return j;
+}
+
+/// The floors per sender: 8 x u32 (the highest number of that member trimmed away).
+pub const GL_FLOORS : usize = 32;
+
+pub fn gl_floor_of(floors: []const u8, idx: u32) -> u32 { return get32(floors, @as(usize, idx) * 4); }
+
+/// A full log drops its oldest line; the floor chat_core raised for it moves to its sender's floor.
+fn gl_make_room(log: []u8, floors: []u8) -> void {
+    if (cl_count(log) < cl_cap(log)) { return; }
+    cl_drop_oldest(log);
+    const f : u32 = cl_floor(log);
+    if (f != 0) {
+        const s : u32 = f / GM_SEQ;
+        const m : u32 = f % GM_SEQ;
+        if (s < GR_MEMBERS and m > gl_floor_of(floors, s)) { put32(floors, @as(usize, s) * 4, m); }
+        cl_set_floor(log, 0);
+    }
+}
+
+/// A group log read from its file checks when no incoming line of a member has sequence 0 (a sender counts from 1,
+/// and gl_after_load takes the floor just below the oldest line). False sends the file to its .bad (chat_host).
+pub fn gl_log_ok(log: []const u8) -> bool {
+    const n : usize = @as(usize, cl_count(log));
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == CH_DIR_IN and cl_msg(log, i) / GM_SEQ < GR_MEMBERS and cl_msg(log, i) % GM_SEQ == 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// After a log was read from its file: the floors per sender (a log that was full may have lost its oldest lines:
+/// each sender's floor is just below its oldest line kept; a log that was not full lost nothing), and every outgoing
+/// line not yet DELIVERED goes to `rcpt` from the start (the ACKs are not in the file).
+pub fn gl_after_load(log: []u8, floors: []u8, rcpt: u32) -> void {
+    ck_wipe(floors[0..GL_FLOORS]);
+    var seen : u32 = 0;
+    const n : usize = @as(usize, cl_count(log));
+    const full : bool = cl_count(log) >= cl_cap(log);
+    cl_set_floor(log, 0);
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == CH_DIR_IN and full) {
+            const s : u32 = cl_msg(log, i) / GM_SEQ;
+            const m : u32 = cl_msg(log, i) % GM_SEQ;
+            if (s < GR_MEMBERS and m > 0) {
+                const bit : u32 = @as(u32, 1) << s;
+                if ((seen & bit) == 0 or m - 1 < gl_floor_of(floors, s)) { put32(floors, @as(usize, s) * 4, m - 1); }
+                seen = seen | bit;
+            }
+        }
+        if (cl_dir(log, i) == CH_DIR_OUT) {
+            const st : u32 = cl_state(log, i);
+            if (st != CH_S_DELIVERED and st != CH_S_READ) {
+                ck_wipe(log[g_xo(i)..g_xo(i) + 5]);
+                log[g_xo(i) + X_RCPT] = @as(u8, @intCast(rcpt & 255));
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn cl_last_out_fits(log: []const u8) -> bool { return get32(log, 16) + 1 < GM_SEQ; }
+
+/// A message typed by the person, for the recipients `rcpt` (gr_recipients of the fan-out plan): PENDING in its
+/// place. Its number, 0 when the text is refused or nobody would get it.
+pub fn gl_out_add(log: []u8, floors: []u8, me: u32, text: []const u8, now: u64, rcpt: u32) -> u32 {
+    if ((rcpt & 255) == 0 or cl_last_out_fits(log) == false) { return 0; }
+    gl_make_room(log, floors);
+    const msg : u32 = cl_out_add(log, text, now);
+    if (msg == 0) { return 0; }
+    const i : usize = @as(usize, cl_count(log)) - 1;
+    ck_wipe(log[g_xo(i)..g_xo(i) + 5]);
+    log[g_xo(i) + X_RCPT] = @as(u8, @intCast(rcpt & 255));
+    gl_place(log, i, me);
+    return msg;
+}
+
+/// One group TEXT payload (it passed gr_gate) from member sidx: chat_core's assembly, dedup and UTF-8 check on the
+/// line's number gl_key(sidx, msg), then the new line moves to its place. CH_RX_* as chat_core's ch_rx_text.
+pub fn gl_rx_text(log: []u8, asm: []u8, floors: []u8, me: u32, sidx: u32, p: []const u8) -> u32 {
+    if (gm_kind(p) != GM_K_TEXT or sidx >= GR_MEMBERS or sidx == me) { return CH_RX_BAD; }
+    const msg : u32 = gm_msg(p);
+    if (msg <= gl_floor_of(floors, sidx)) { return CH_RX_DUP; }
+    const key : u32 = gl_key(sidx, msg);
+    if (cl_find(log, CH_DIR_IN, key) != CL_NONE) { return CH_RX_DUP; }
+    gl_make_room(log, floors);
+    var q : [720]u8 = undefined;
+    const qn : usize = ch_put_part(q[0..CH_PAYLOAD_MAX], key, gm_part(p), gm_parts(p), gm_time(p), p[GM_HDR..p.len]);
+    if (qn == 0) { return CH_RX_BAD; }
+    const r : u32 = ch_rx_text(log, asm, q[0..qn]);
+    ck_wipe(q[0..720]);
+    if (r == CH_RX_NEW) {
+        const i : usize = cl_find(log, CH_DIR_IN, key);
+        if (i != CL_NONE) { gl_place(log, i, me); }
+    }
+    return r;
+}
+
+/// Has member pidx acknowledged every part of line i?
+pub fn gl_done(log: []const u8, i: usize, pidx: u32) -> bool {
+    const all : u32 = (@as(u32, 1) << cl_parts(log, i)) - 1;
+    return ((gl_acks(log, i) >> (pidx * 3)) & all) == all;
+}
+
+/// Does line i still owe something to member pidx (an outgoing line not finished, pidx a recipient that has not
+/// acknowledged every part)?
+pub fn gl_owes(log: []const u8, i: usize, pidx: u32) -> bool {
+    if (pidx >= GR_MEMBERS or cl_dir(log, i) != CH_DIR_OUT) { return false; }
+    const st : u32 = cl_state(log, i);
+    if (st == CH_S_DELIVERED or st == CH_S_READ) { return false; }
+    if ((gl_rcpt(log, i) & (@as(u32, 1) << pidx)) == 0) { return false; }
+    return !gl_done(log, i, pidx);
+}
+
+/// An ACK (it passed gr_gate) from member pidx: the part is marked for it; the line is DELIVERED once every
+/// recipient has every part. True when something changed.
+pub fn gl_rx_ack(log: []u8, pidx: u32, p: []const u8) -> bool {
+    if (gm_kind(p) != GM_K_ACK or pidx >= GR_MEMBERS) { return false; }
+    const i : usize = cl_find(log, CH_DIR_OUT, gm_msg(p));
+    if (i == CL_NONE) { return false; }
+    const part : u32 = gm_part(p);
+    if (part >= cl_parts(log, i) or (gl_rcpt(log, i) & (@as(u32, 1) << pidx)) == 0) { return false; }
+    const bit : u32 = @as(u32, 1) << (pidx * 3 + part);
+    const had : u32 = gl_acks(log, i);
+    if ((had & bit) != 0) { return false; }
+    gl_set_acks(log, i, had | bit);
+    const st : u32 = cl_state(log, i);
+    if (st == CH_S_DELIVERED or st == CH_S_READ) { return true; }
+    var k : u32 = 0;
+    var all : bool = true;
+    while (k < GR_MEMBERS) {
+        if ((gl_rcpt(log, i) & (@as(u32, 1) << k)) != 0 and !gl_done(log, i, k)) { all = false; }
+        k = k + 1;
+    }
+    if (all) { log[cl_line_at(i) + 1] = @as(u8, @intCast(CH_S_DELIVERED)); }
+    return true;
+}
+
+/// What to do with line i for member pidx over its session at time now (CH_R_*). Sends run in rounds: each member
+/// owed gets the line once per round; a round starts when a member already sent to in it is due again
+/// (chat_core ch_retry: CH_RETRY_MS after the round began), and after CH_TRIES rounds the line is FAILED.
+pub fn gl_due_for(log: []u8, i: usize, pidx: u32, now: u64) -> u32 {
+    if (!cl_open_out(log, i) or !gl_owes(log, i, pidx)) { return CH_R_WAIT; }
+    const bit : u32 = @as(u32, 1) << pidx;
+    const round : u32 = gl_round(log, i);
+    if (cl_tries(log, i) == 0) {
+        cl_mark_sent(log, i, now);
+        log[g_xo(i) + X_ROUND] = @as(u8, @intCast(bit));
+        return CH_R_SEND;
+    }
+    if ((round & bit) == 0) {
+        log[g_xo(i) + X_ROUND] = @as(u8, @intCast(round | bit));
+        if (cl_state(log, i) == CH_S_PENDING) { log[cl_line_at(i) + 1] = @as(u8, @intCast(CH_S_SENT)); }
+        return CH_R_SEND;
+    }
+    const r : u32 = ch_retry(now, cl_last_send(log, i), cl_tries(log, i));
+    if (r == CH_R_GIVEUP) {
+        log[cl_line_at(i) + 1] = @as(u8, @intCast(CH_S_FAILED));
+        return CH_R_GIVEUP;
+    }
+    if (r == CH_R_SEND) {
+        cl_mark_sent(log, i, now);
+        log[g_xo(i) + X_ROUND] = @as(u8, @intCast(bit));
+    }
+    return r;
+}
+
+/// Is part k of line i still owed to member pidx?
+pub fn gl_part_due(log: []const u8, i: usize, pidx: u32, k: u32) -> bool {
+    if (k >= cl_parts(log, i)) { return false; }
+    return (gl_acks(log, i) & (@as(u32, 1) << (pidx * 3 + k))) == 0;
+}
+
+/// A session with member pidx came up: every line owed to it (also a FAILED one) starts again. How many. A line
+/// restarts for every recipient still owed, so a part may reach another member twice: its dedup takes it.
+pub fn gl_session_start(log: []u8, pidx: u32) -> u32 {
+    const n : usize = @as(usize, cl_count(log));
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_dir(log, i) == CH_DIR_OUT and cl_state(log, i) == CH_S_FAILED) {
+            if ((gl_rcpt(log, i) & (@as(u32, 1) << pidx)) != 0 and !gl_done(log, i, pidx)) {
+                cl_restart(log, i);
+                log[g_xo(i) + X_ROUND] = 0;
+            }
+        }
+        if (gl_owes(log, i, pidx)) {
+            if (cl_state(log, i) == CH_S_SENT) {
+                cl_restart(log, i);
+                log[g_xo(i) + X_ROUND] = 0;
+            }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Lines still owed to member pidx.
+pub fn gl_pending_for(log: []const u8, pidx: u32) -> u32 {
+    const n : usize = @as(usize, cl_count(log));
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (cl_open_out(log, i) and gl_owes(log, i, pidx)) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------- tests
+
+
+const T_A : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const T_B : [10]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11];
+const T_C : [10]u8 = [200, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+const T_X : [10]u8 = [90, 90, 90, 90, 90, 90, 90, 90, 90, 90];
+/// SHA-256 of T_A | T_B | T_C (sorted), from Python's hashlib; its first 8 bytes are the id.
+const T_DIGEST : [32]u8 = [72, 40, 111, 183, 63, 186, 44, 71, 144, 89, 204, 238, 52, 125, 49, 97, 228, 120, 167, 242, 28, 198, 115, 183, 132, 119, 220, 223, 225, 234, 3, 126];
+const T_LOG : usize = 16296;
+
+fn t_friend(t: []u8, fp: []const u8, me: []const u8) -> bool {
+    var inv : [25]u8 = undefined;
+    invite_make(fp, inv[0..25]);
+    return ft_add(t, inv[0..25], me) == FA_OK;
+}
+
+/// A table holding the group {A, B, C} made by A; the roster sorted is A, B, C (indices 0, 1, 2).
+fn t_table(t: []u8) -> void {
+    gt_init(t);
+    var r : [30]u8 = undefined;
+    copy(r[0..30], 0, T_A[0..10], 0, 10);
+    copy(r[0..30], 10, T_B[0..10], 0, 10);
+    copy(r[0..30], 20, T_C[0..10], 0, 10);
+    gt_add(t, T_DIGEST[0..8], "trio", r[0..30], 3, 0, 1000);
+}
+
+fn t_log(log: []u8) -> void {
+    var p : [10]u8 = undefined;
+    gl_peer(T_DIGEST[0..8], p[0..10]);
+    cl_init(log, p[0..10], 8);
+}
+
+test the_frame_fits_one_sealed_text_and_the_kinds_are_new {
+    assert GM_PAYLOAD_MAX == GM_HDR + CH_PART_MAX;
+    assert 52 + GM_PAYLOAD_MAX + 16 <= 808;
+    assert GM_K_TEXT > 3 and GM_K_ACK > 3 and GM_K_TEXT != GM_K_ACK;
+    assert GT_LEN == GT_HDR + @as(usize, GT_MAX) * GR_REC;
+    assert GT_FILE_MAX == GT_LEN + 4;
+    assert R_FPS + 80 == GR_REC;
+    assert X_RCPT < 5;
+    assert GR_MEMBERS * 3 <= 24;
+    // the table the layout adds up to: gt_init takes exactly GT_LEN bytes, starts empty, and refuses one byte less
+    var t : [GT_LEN]u8 = undefined;
+    assert gt_init(t[0..GT_LEN]) and gt_count(t[0..GT_LEN]) == 0;
+    assert gt_init(t[0..GT_LEN - 1]) == false;
+}
+
+test the_id_is_the_same_for_the_same_people_in_any_order {
+    var fr : [1108]u8 = undefined;
+    ft_init(fr[0..FT_LEN]);
+    assert t_friend(fr[0..FT_LEN], T_B[0..10], T_A[0..10]);
+    assert t_friend(fr[0..FT_LEN], T_C[0..10], T_A[0..10]);
+    // A picks C then B, or B then C: the same sorted roster A, B, C
+    var cb : [20]u8 = undefined;
+    copy(cb[0..20], 0, T_C[0..10], 0, 10);
+    copy(cb[0..20], 10, T_B[0..10], 0, 10);
+    var bc : [20]u8 = undefined;
+    copy(bc[0..20], 0, T_B[0..10], 0, 10);
+    copy(bc[0..20], 10, T_C[0..10], 0, 10);
+    var r1 : [30]u8 = undefined;
+    var r2 : [30]u8 = undefined;
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], cb[0..20], 2, r1[0..30]) == GR_OK;
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], bc[0..20], 2, r2[0..30]) == GR_OK;
+    var i : usize = 0;
+    while (i < 30) {
+        assert r1[i] == r2[i];
+        i = i + 1;
+    }
+    assert r1[0] == 1 and r1[9] == 10 and r1[19] == 11 and r1[20] == 200;
+    // B sorts the same three the same way (C, A, B as given)
+    var cab : [30]u8 = undefined;
+    copy(cab[0..30], 0, T_C[0..10], 0, 10);
+    copy(cab[0..30], 10, T_A[0..10], 0, 10);
+    copy(cab[0..30], 20, T_B[0..10], 0, 10);
+    var r3 : [30]u8 = undefined;
+    assert gr_sort(cab[0..30], 3, r3[0..30]);
+    i = 0;
+    while (i < 30) {
+        assert r3[i] == r1[i];
+        i = i + 1;
+    }
+    var id : [8]u8 = undefined;
+    assert gr_id_from_digest(T_DIGEST[0..32], id[0..8]);
+    assert id[0] == 72 and id[7] == 71;
+    assert gr_id_from_digest(T_DIGEST[0..31], id[0..8]) == false;
+}
+
+test a_group_is_two_to_eight_friends_of_the_creator {
+    var fr : [1108]u8 = undefined;
+    ft_init(fr[0..FT_LEN]);
+    var others : [80]u8 = undefined;
+    var k : usize = 0;
+    while (k < 8) {
+        var f : [10]u8 = undefined;
+        var j : usize = 0;
+        while (j < 10) {
+            f[j] = @as(u8, @intCast(100 + k));
+            j = j + 1;
+        }
+        assert t_friend(fr[0..FT_LEN], f[0..10], T_A[0..10]);
+        copy(others[0..80], k * 10, f[0..10], 0, 10);
+        k = k + 1;
+    }
+    var out : [90]u8 = undefined;
+    // alone: 1 person; 1 friend: 2 people; 7 friends: 8 people; 8 friends: 9 people
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], others[0..80], 0, out[0..90]) == GR_SIZE;
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], others[0..80], 1, out[0..90]) == GR_OK;
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], others[0..80], 7, out[0..90]) == GR_OK;
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], others[0..80], 8, out[0..90]) == GR_SIZE;
+    // a stranger, itself, someone twice
+    var bad : [20]u8 = undefined;
+    copy(bad[0..20], 0, others[0..80], 0, 10);
+    copy(bad[0..20], 10, T_X[0..10], 0, 10);
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], bad[0..20], 2, out[0..90]) == GR_NOT_FRIEND;
+    copy(bad[0..20], 10, T_A[0..10], 0, 10);
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], bad[0..20], 2, out[0..90]) == GR_SELF;
+    copy(bad[0..20], 10, others[0..80], 0, 10);
+    assert gr_plan(fr[0..FT_LEN], T_A[0..10], bad[0..20], 2, out[0..90]) == GR_DUP;
+    // someone else's group: kept when this device is in it and its creator is a friend
+    var r : [30]u8 = undefined;
+    copy(r[0..30], 0, T_A[0..10], 0, 10);
+    copy(r[0..30], 10, T_B[0..10], 0, 10);
+    copy(r[0..30], 20, T_C[0..10], 0, 10);
+    var frb : [1108]u8 = undefined;
+    ft_init(frb[0..FT_LEN]);
+    assert t_friend(frb[0..FT_LEN], T_A[0..10], T_B[0..10]);
+    assert gr_known(frb[0..FT_LEN], T_B[0..10], r[0..30], 3, 0) == GR_OK;
+    assert gr_known(frb[0..FT_LEN], T_B[0..10], r[0..30], 3, 2) == GR_NOT_FRIEND;
+    assert gr_known(frb[0..FT_LEN], T_X[0..10], r[0..30], 3, 0) == GR_NOT_ME;
+    assert gr_known(frb[0..FT_LEN], T_B[0..10], r[0..30], 1, 0) == GR_SIZE;
+    assert gr_known(frb[0..FT_LEN], T_B[0..10], r[0..30], 3, 3) == GR_SIZE;
+    const nl : [3]u8 = [97, 10, 98];
+    assert gr_name_ok("trio") and gr_name_ok("") == false and gr_name_ok(nl[0..3]) == false;
+    assert gr_name_ok("0123456789012345678901234567890123") == false;
+    // a name with U+202E (shown backwards from there) or U+200B is refused; Cyrillic is a name
+    const rlo : [5]u8 = [97, 226, 128, 174, 98];
+    const zw : [5]u8 = [97, 226, 128, 139, 98];
+    const ru : [4]u8 = [208, 148, 208, 176];
+    assert gr_name_ok(rlo[0..5]) == false and gr_name_ok(zw[0..5]) == false and gr_name_ok(ru[0..4]);
+}
+
+test the_groups_file_reads_back_and_a_broken_one_is_refused {
+    var t : [4240]u8 = undefined;
+    t_table(t[0..GT_LEN]);
+    assert gt_count(t[0..GT_LEN]) == 1;
+    var r : [20]u8 = undefined;
+    copy(r[0..20], 0, T_A[0..10], 0, 10);
+    copy(r[0..20], 10, T_B[0..10], 0, 10);
+    const id2 : [8]u8 = [4, 23, 205, 1, 40, 87, 215, 222];
+    assert gt_add(t[0..GT_LEN], id2[0..8], "pair", r[0..20], 2, 1, 2000) == GT_OK;
+    assert gt_add(t[0..GT_LEN], id2[0..8], "pair", r[0..20], 2, 1, 2000) == GT_DUP;
+    var f : [4244]u8 = undefined;
+    const n : usize = gt_encode(t[0..GT_LEN], f[0..GT_FILE_MAX]);
+    assert n == GT_HDR + 2 * GR_REC + 4;
+    var u : [4240]u8 = undefined;
+    assert gt_decode(f[0..n], u[0..GT_LEN]) == GT_OK;
+    assert gt_count(u[0..GT_LEN]) == 2;
+    assert gt_find(u[0..GT_LEN], id2[0..8]) == 1 and gt_n(u[0..GT_LEN], 1) == 2 and gt_creator(u[0..GT_LEN], 1) == 1;
+    assert gt_time(u[0..GT_LEN], 0) == 1000 and gt_name(u[0..GT_LEN], 0).len == 4 and gt_name(u[0..GT_LEN], 0)[0] == 116;
+    assert gt_idx(u[0..GT_LEN], 0, T_C[0..10]) == 2 and gt_idx(u[0..GT_LEN], 1, T_C[0..10]) == GR_NOBODY;
+    // one flipped byte anywhere: the CRC; a cut file; another magic; a count that disagrees
+    f[100] = f[100] ^ 1;
+    assert gt_decode(f[0..n], u[0..GT_LEN]) == GT_CRC and gt_count(u[0..GT_LEN]) == 0;
+    f[100] = f[100] ^ 1;
+    assert gt_decode(f[0..n - 1], u[0..GT_LEN]) == GT_COUNT;
+    assert gt_decode(f[0..10], u[0..GT_LEN]) == GT_SHORT;
+    f[5] = 88;
+    assert gt_decode(f[0..n], u[0..GT_LEN]) == GT_MAGIC;
+    f[5] = 71;
+    // a record with an unsorted roster, its CRC made right: refused all the same
+    var g : [4244]u8 = undefined;
+    copy(g[0..GT_FILE_MAX], 0, f[0..GT_FILE_MAX], 0, n);
+    g[GT_HDR + R_FPS] = 250;
+    put32(g[0..GT_FILE_MAX], n - 4, crc32(g[0..GT_FILE_MAX], n - 4));
+    assert gt_decode(g[0..n], u[0..GT_LEN]) == GT_REC_BAD;
+    // removing the first group moves the second up
+    assert gt_remove(t[0..GT_LEN], T_DIGEST[0..8]);
+    assert gt_count(t[0..GT_LEN]) == 1 and gt_find(t[0..GT_LEN], id2[0..8]) == 0;
+    assert gt_remove(t[0..GT_LEN], T_DIGEST[0..8]) == false;
+    // full at 32
+    gt_init(t[0..GT_LEN]);
+    var k : u32 = 0;
+    while (k < GT_MAX) {
+        var id : [8]u8 = undefined;
+        ck_wipe(id[0..8]);
+        id[0] = @as(u8, @intCast(k + 1));
+        assert gt_add(t[0..GT_LEN], id[0..8], "g", r[0..20], 2, 0, 1) == GT_OK;
+        k = k + 1;
+    }
+    assert gt_add(t[0..GT_LEN], id2[0..8], "g", r[0..20], 2, 0, 1) == GT_FULL;
+    assert gt_encode(t[0..GT_LEN], f[0..GT_FILE_MAX]) == GT_FILE_MAX;
+    assert gt_decode(f[0..GT_FILE_MAX], u[0..GT_LEN]) == GT_OK and gt_count(u[0..GT_LEN]) == GT_MAX;
+}
+
+test a_group_message_from_someone_outside_the_group_is_dropped_with_its_reason {
+    var t : [4240]u8 = undefined;
+    t_table(t[0..GT_LEN]);
+    var p : [738]u8 = undefined;
+    const hi : [2]u8 = [104, 105];
+    // B writes to the group; C receives it over its session with B
+    const n : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 1, 0, 50, hi[0..2]);
+    assert n == GM_HDR + 2 and gm_kind(p[0..n]) == GM_K_TEXT;
+    assert gr_gate(t[0..GT_LEN], p[0..n], T_C[0..10], T_B[0..10], true) == GR_OK;
+    // the key of B is not stored here
+    assert gr_gate(t[0..GT_LEN], p[0..n], T_C[0..10], T_B[0..10], false) == GR_UNTRUSTED;
+    // X (not a member) sends it over its own session
+    const nx : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_X[0..10], 1, 0, 50, hi[0..2]);
+    assert gr_gate(t[0..GT_LEN], p[0..nx], T_C[0..10], T_X[0..10], true) == GR_NOT_MEMBER;
+    // B's message relayed by A: the sender is not the peer
+    gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 1, 0, 50, hi[0..2]);
+    assert gr_gate(t[0..GT_LEN], p[0..n], T_C[0..10], T_A[0..10], true) == GR_SPOOF;
+    // a device that is not in the group, an unknown group
+    assert gr_gate(t[0..GT_LEN], p[0..n], T_X[0..10], T_B[0..10], true) == GR_NOT_ME;
+    const other : [8]u8 = [9, 9, 9, 9, 9, 9, 9, 9];
+    const no : usize = gm_put_text(p[0..738], other[0..8], T_B[0..10], 1, 0, 50, hi[0..2]);
+    assert gr_gate(t[0..GT_LEN], p[0..no], T_C[0..10], T_B[0..10], true) == GR_UNKNOWN;
+    // an ACK must name this device as the author
+    var a : [38]u8 = undefined;
+    assert gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 0) == GM_HDR;
+    assert gr_gate(t[0..GT_LEN], a[0..38], T_A[0..10], T_B[0..10], true) == GR_OK;
+    assert gr_gate(t[0..GT_LEN], a[0..38], T_C[0..10], T_B[0..10], true) == GR_SPOOF;
+    // malformed: a reserved byte, a number at 2^24, a short middle part, an ACK with a time
+    gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 1, 0, 50, hi[0..2]);
+    p[1] = 1;
+    assert gr_gate(t[0..GT_LEN], p[0..n], T_C[0..10], T_B[0..10], true) == GR_BAD;
+    assert gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], GM_SEQ, 0, 50, hi[0..2]) == 0;
+    put32(a[0..38], 20, GM_SEQ);
+    assert gm_kind(a[0..38]) == 0;
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 0);
+    put_u64(a[0..38], 28, 7);
+    assert gm_kind(a[0..38]) == 0;
+    assert gm_is_group(p[0..n]) and gm_is_group(hi[0..2]) == false;
+}
+
+fn t_deliver(log: []u8, asm: []u8, floors: []u8, me: u32, sender: []const u8, sidx: u32, msg: u32, time: u64, text: []const u8) -> u32 {
+    var r : u32 = CH_RX_BAD;
+    const parts : u32 = ch_parts_for(text.len);
+    var k : u32 = 0;
+    while (k < parts) {
+        var p : [738]u8 = undefined;
+        const n : usize = gm_put_text(p[0..738], T_DIGEST[0..8], sender, msg, k, time, text);
+        r = gl_rx_text(log, asm, floors, me, sidx, p[0..n]);
+        k = k + 1;
+    }
+    return r;
+}
+
+test a_group_message_resent_or_repeated_never_makes_a_second_line {
+    var log : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    const x : [1]u8 = [120];
+    // C (index 2) receives B's message 1 twice, and A's message 1 (another sender, same number): two lines
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 1, 10, x[0..1]) == CH_RX_NEW;
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 1, 10, x[0..1]) == CH_RX_DUP;
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_A[0..10], 0, 1, 10, x[0..1]) == CH_RX_NEW;
+    assert cl_count(log[0..T_LOG]) == 2;
+    assert cl_unread(log[0..T_LOG]) == 2;
+    // a 1500-byte message of B in 3 parts, then all of it again
+    var t : [1500]u8 = undefined;
+    var i : usize = 0;
+    while (i < 1500) {
+        t[i] = 97 + @as(u8, @intCast(i % 26));
+        i = i + 1;
+    }
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 2, 20, t[0..1500]) == CH_RX_NEW;
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 2, 20, t[0..1500]) == CH_RX_DUP;
+    assert cl_count(log[0..T_LOG]) == 3;
+    const j : usize = cl_find(log[0..T_LOG], CH_DIR_IN, gl_key(1, 2));
+    assert j == 2 and cl_text(log[0..T_LOG], j).len == 1500 and cl_text(log[0..T_LOG], j)[1499] == t[1499];
+    // a number at or below the sender's floor is a duplicate (it was trimmed away)
+    put32(fl[0..32], 4, 5);
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 5, 30, x[0..1]) == CH_RX_DUP;
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 6, 30, x[0..1]) == CH_RX_NEW;
+    // a frame claiming to be from this device itself is refused
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_C[0..10], 2, 9, 30, x[0..1]) == CH_RX_BAD;
+    // unread per group, read when opened
+    assert cl_unread(log[0..T_LOG]) == 4;
+    assert cl_open_read(log[0..T_LOG]) != 0 and cl_unread(log[0..T_LOG]) == 0;
+}
+
+test lines_with_the_same_time_stand_by_fingerprint_whatever_order_they_came_in {
+    // three devices receive the same three messages of equal time in different orders, and each writes one of its
+    // own at that time too: every log ends in the order A, B, C
+    var la : [16296]u8 = undefined;
+    var lb : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    t_log(la[0..T_LOG]);
+    t_log(lb[0..T_LOG]);
+    const a : [1]u8 = [97];
+    const b : [1]u8 = [98];
+    const c : [1]u8 = [99];
+    // A (index 0): its own line first, then C's, then B's
+    assert gl_out_add(la[0..T_LOG], fl[0..32], 0, a[0..1], 500, 6) == 1;
+    t_deliver(la[0..T_LOG], asm[0..CA_LEN], fl[0..32], 0, T_C[0..10], 2, 1, 500, c[0..1]);
+    t_deliver(la[0..T_LOG], asm[0..CA_LEN], fl[0..32], 0, T_B[0..10], 1, 1, 500, b[0..1]);
+    // B (index 1): C's, then its own, then A's
+    t_deliver(lb[0..T_LOG], asm[0..CA_LEN], fl[0..32], 1, T_C[0..10], 2, 1, 500, c[0..1]);
+    assert gl_out_add(lb[0..T_LOG], fl[0..32], 1, b[0..1], 500, 5) == 1;
+    t_deliver(lb[0..T_LOG], asm[0..CA_LEN], fl[0..32], 1, T_A[0..10], 0, 1, 500, a[0..1]);
+    var i : usize = 0;
+    while (i < 3) {
+        assert cl_text(la[0..T_LOG], i)[0] == 97 + @as(u8, @intCast(i));
+        assert cl_text(lb[0..T_LOG], i)[0] == 97 + @as(u8, @intCast(i));
+        i = i + 1;
+    }
+    // an earlier time still goes first, a later one last
+    const z : [1]u8 = [122];
+    t_deliver(la[0..T_LOG], asm[0..CA_LEN], fl[0..32], 0, T_C[0..10], 2, 2, 499, z[0..1]);
+    assert cl_text(la[0..T_LOG], 0)[0] == 122;
+    t_deliver(la[0..T_LOG], asm[0..CA_LEN], fl[0..32], 0, T_B[0..10], 1, 2, 501, z[0..1]);
+    assert cl_text(la[0..T_LOG], 4)[0] == 122 and gl_sender(la[0..T_LOG], 4, 0) == 1 and gl_seq(la[0..T_LOG], 4) == 2;
+    // the order survives the file
+    var f : [20000]u8 = undefined;
+    const n : usize = cf_encode(la[0..T_LOG], f[0..20000]);
+    t_log(lb[0..T_LOG]);
+    assert cf_decode(f[0..n], lb[0..T_LOG]) == CF_OK;
+    gl_after_load(lb[0..T_LOG], fl[0..32], 6);
+    i = 0;
+    while (i < 5) {
+        assert cl_msg(lb[0..T_LOG], i) == cl_msg(la[0..T_LOG], i) and cl_dir(lb[0..T_LOG], i) == cl_dir(la[0..T_LOG], i);
+        i = i + 1;
+    }
+    var nm : [22]u8 = undefined;
+    assert gl_name(T_DIGEST[0..8], nm[0..22]) == 22;
+    // "g-48286fb73fba2c47.t27"
+    assert nm[0] == 103 and nm[1] == 45 and nm[2] == 52 and nm[3] == 56 and nm[17] == 55 and nm[18] == 46 and nm[21] == 55;
+}
+
+test the_fan_out_sends_to_members_online_queues_the_rest_and_skips_strangers {
+    var t : [4240]u8 = undefined;
+    t_table(t[0..GT_LEN]);
+    // A has B as a friend, not C
+    var fr : [1108]u8 = undefined;
+    ft_init(fr[0..FT_LEN]);
+    assert t_friend(fr[0..FT_LEN], T_B[0..10], T_A[0..10]);
+    const reach : u32 = gr_reach_mask(t[0..GT_LEN], 0, fr[0..FT_LEN]);
+    assert reach == 2;
+    assert gr_fanout(t[0..GT_LEN], 0, T_A[0..10], 7, reach) == 2 | (4 << 16);
+    assert gr_fanout(t[0..GT_LEN], 0, T_A[0..10], 0, reach) == (2 << 8) | (4 << 16);
+    // both friends: C online, B offline
+    assert t_friend(fr[0..FT_LEN], T_C[0..10], T_A[0..10]);
+    assert gr_fanout(t[0..GT_LEN], 0, T_A[0..10], 4, 6) == 4 | (2 << 8);
+    assert gr_recipients(4 | (2 << 8)) == 6;
+    // B's plan never names B itself
+    assert (gr_fanout(t[0..GT_LEN], 0, T_B[0..10], 7, 7) & 131586) == 0;
+    // the line goes only over the sessions it is owed to, every part once per round
+    var log : [16296]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    const x : [1]u8 = [120];
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, x[0..1], 100, 0) == 0;
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, x[0..1], 100, 4) == 1;
+    assert gl_rcpt(log[0..T_LOG], 0) == 4;
+    assert gl_due_for(log[0..T_LOG], 0, 1, 100) == CH_R_WAIT;
+    assert gl_due_for(log[0..T_LOG], 0, 0, 100) == CH_R_WAIT;
+    assert gl_due_for(log[0..T_LOG], 0, 2, 100) == CH_R_SEND;
+    assert gl_due_for(log[0..T_LOG], 0, 2, 101) == CH_R_WAIT;
+    assert gl_pending_for(log[0..T_LOG], 2) == 1 and gl_pending_for(log[0..T_LOG], 1) == 0;
+}
+
+test every_recipient_acknowledges_every_part_before_a_line_is_delivered {
+    var log : [16296]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    var t : [800]u8 = undefined;
+    var i : usize = 0;
+    while (i < 800) {
+        t[i] = 65;
+        i = i + 1;
+    }
+    // A sends 800 bytes (2 parts) to B and C
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, t[0..800], 100, 6) == 1;
+    assert gl_due_for(log[0..T_LOG], 0, 1, 100) == CH_R_SEND;
+    assert gl_due_for(log[0..T_LOG], 0, 2, 101) == CH_R_SEND;
+    assert cl_state(log[0..T_LOG], 0) == CH_S_SENT and cl_tries(log[0..T_LOG], 0) == 1;
+    var a : [38]u8 = undefined;
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 0);
+    assert gl_rx_ack(log[0..T_LOG], 1, a[0..38]);
+    assert gl_rx_ack(log[0..T_LOG], 1, a[0..38]) == false;
+    assert gl_part_due(log[0..T_LOG], 0, 1, 0) == false and gl_part_due(log[0..T_LOG], 0, 1, 1);
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 1);
+    assert gl_rx_ack(log[0..T_LOG], 1, a[0..38]);
+    assert gl_done(log[0..T_LOG], 0, 1) and cl_state(log[0..T_LOG], 0) == CH_S_SENT;
+    assert gl_pending_for(log[0..T_LOG], 1) == 0 and gl_pending_for(log[0..T_LOG], 2) == 1;
+    // C's ACK of a part that does not exist changes nothing; its two parts deliver the line
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 2);
+    assert gl_rx_ack(log[0..T_LOG], 2, a[0..38]) == false;
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 0);
+    assert gl_rx_ack(log[0..T_LOG], 2, a[0..38]);
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 1);
+    assert gl_rx_ack(log[0..T_LOG], 2, a[0..38]);
+    assert cl_state(log[0..T_LOG], 0) == CH_S_DELIVERED;
+    assert gl_due_for(log[0..T_LOG], 0, 2, 99999) == CH_R_WAIT;
+}
+
+test unacknowledged_lines_go_again_by_rounds_fail_and_restart_with_a_session {
+    var log : [16296]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    const x : [1]u8 = [120];
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, x[0..1], 0, 6) == 1;
+    var now : u64 = 1000;
+    var sends : u32 = 0;
+    var k : u32 = 0;
+    while (k < 20) {
+        if (gl_due_for(log[0..T_LOG], 0, 1, now) == CH_R_SEND) { sends = sends + 1; }
+        if (gl_due_for(log[0..T_LOG], 0, 2, now + 1) == CH_R_SEND) { sends = sends + 1; }
+        now = now + CH_RETRY_MS;
+        k = k + 1;
+    }
+    // CH_TRIES rounds, each to both members, then FAILED
+    assert sends == CH_TRIES * 2;
+    assert cl_state(log[0..T_LOG], 0) == CH_S_FAILED;
+    // B comes back: the line is owed to it again
+    assert gl_session_start(log[0..T_LOG], 1) == 1;
+    assert cl_state(log[0..T_LOG], 0) == CH_S_PENDING and cl_tries(log[0..T_LOG], 0) == 0;
+    assert gl_due_for(log[0..T_LOG], 0, 1, now) == CH_R_SEND;
+}
+
+test a_full_group_log_moves_the_floor_to_the_sender_of_the_dropped_line {
+    var log : [4104]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    var p : [10]u8 = undefined;
+    gl_peer(T_DIGEST[0..8], p[0..10]);
+    assert cl_init(log[0..4104], p[0..10], 2);
+    assert cl_bytes(2) == 4104;
+    const x : [1]u8 = [120];
+    t_deliver(log[0..4104], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 1, 10, x[0..1]);
+    t_deliver(log[0..4104], asm[0..CA_LEN], fl[0..32], 2, T_A[0..10], 0, 1, 11, x[0..1]);
+    // the third drops B's line 1: B's floor is 1, A's message 1 is still here, the log floor stays 0
+    assert t_deliver(log[0..4104], asm[0..CA_LEN], fl[0..32], 2, T_A[0..10], 0, 2, 12, x[0..1]) == CH_RX_NEW;
+    assert gl_floor_of(fl[0..32], 1) == 1 and gl_floor_of(fl[0..32], 0) == 0 and cl_floor(log[0..4104]) == 0;
+    assert t_deliver(log[0..4104], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 1, 10, x[0..1]) == CH_RX_DUP;
+    // after a read from the file of a full log, each sender's floor is just below its oldest line kept
+    gl_after_load(log[0..4104], fl[0..32], 3);
+    assert gl_floor_of(fl[0..32], 0) == 0 and gl_floor_of(fl[0..32], 1) == 0;
+    assert cl_msg(log[0..4104], 0) == gl_key(0, 1);
+}
+
+test a_group_log_file_with_a_line_of_sequence_0_is_refused_and_does_not_crash_the_floors {
+    var log : [4104]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    var p : [10]u8 = undefined;
+    gl_peer(T_DIGEST[0..8], p[0..10]);
+    assert cl_init(log[0..4104], p[0..10], 2);
+    const x : [1]u8 = [120];
+    t_deliver(log[0..4104], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 1, 10, x[0..1]);
+    t_deliver(log[0..4104], asm[0..CA_LEN], fl[0..32], 2, T_A[0..10], 0, 1, 11, x[0..1]);
+    assert gl_log_ok(log[0..4104]);
+    // the file of this full log, its first line renumbered to member 1, sequence 0 (the CRC made right)
+    var f : [200]u8 = undefined;
+    const n : usize = cf_encode(log[0..4104], f[0..200]);
+    assert n > 0;
+    put32(f[0..200], CF_HDR + 4, gl_key(1, 0));
+    put32(f[0..200], n - 4, crc32(f[0..200], n - 4));
+    var lb : [4104]u8 = undefined;
+    assert cl_init(lb[0..4104], p[0..10], 2) and cf_decode(f[0..n], lb[0..4104]) == CF_OK;
+    assert cl_count(lb[0..4104]) == 2 and cl_msg(lb[0..4104], 0) == GM_SEQ;
+    // the lines do not check: chat_host moves such a file to its .bad
+    assert gl_log_ok(lb[0..4104]) == false;
+    // and the floors come out without m - 1 at 0: that member's floor stays 0, the other's is below its line
+    gl_after_load(lb[0..4104], fl[0..32], 3);
+    assert gl_floor_of(fl[0..32], 1) == 0 and gl_floor_of(fl[0..32], 0) == 0;
+    // member 0, sequence 0 is msg 0, refused by the file reader already; an outgoing line is not looked at
+    put32(f[0..200], CF_HDR + 4, 0);
+    put32(f[0..200], n - 4, crc32(f[0..200], n - 4));
+    assert cl_init(lb[0..4104], p[0..10], 2) and cf_decode(f[0..n], lb[0..4104]) == CF_BAD;
+}
+
+test the_group_info_frame_carries_the_roster_and_its_bounds_are_checked {
+    var r : [30]u8 = undefined;
+    copy(r[0..30], 0, T_A[0..10], 0, 10);
+    copy(r[0..30], 10, T_B[0..10], 0, 10);
+    copy(r[0..30], 20, T_C[0..10], 0, 10);
+    var p : [160]u8 = undefined;
+    const n : usize = gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r[0..30], 3, "trio", 1234);
+    assert n == gi_len(3, 4) and n == 64;
+    assert gi_ok(p[0..n]) and gi_is(p[0..n]) and gi_flag(p[0..n]) == GI_ANNOUNCE and gi_n(p[0..n]) == 3;
+    assert gi_gid(p[0..n])[0] == 72 and gi_creator(p[0..n])[9] == 10 and gi_roster(p[0..n])[20] == 200;
+    assert gi_name(p[0..n]).len == 4 and gi_name(p[0..n])[0] == 116 and gi_time(p[0..n]) == 1234;
+    // the largest (8 members, a name of 32 bytes) and the smallest (2 members, a name of 1 byte)
+    var f8 : [80]u8 = undefined;
+    var i : usize = 0;
+    while (i < 80) {
+        f8[i] = @as(u8, @intCast(10 + i / 10));
+        i = i + 1;
+    }
+    assert gi_put(p[0..160], GI_HAVE, T_DIGEST[0..8], f8[70..80], f8[0..80], 8, "01234567890123456789012345678901", 1) == GI_MAX;
+    assert gi_ok(p[0..GI_MAX]) and gi_flag(p[0..GI_MAX]) == GI_HAVE and gi_name(p[0..GI_MAX]).len == 32;
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r[0..30], 2, "x", 0) == GI_MIN;
+    assert gi_ok(p[0..GI_MIN]);
+    assert 52 + GI_MAX + 16 <= 808;
+    // refused when built: one member, nine, the creator not a member, unsorted, no name, a third flag, out too short
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r[0..30], 1, "trio", 0) == 0;
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], f8[0..10], f8[0..80], 9, "trio", 0) == 0;
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_X[0..10], r[0..30], 3, "trio", 0) == 0;
+    var u : [30]u8 = undefined;
+    copy(u[0..30], 0, T_B[0..10], 0, 10);
+    copy(u[0..30], 10, T_A[0..10], 0, 10);
+    copy(u[0..30], 20, T_C[0..10], 0, 10);
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], u[0..30], 3, "trio", 0) == 0;
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r[0..30], 3, "", 0) == 0;
+    assert gi_put(p[0..160], 2, T_DIGEST[0..8], T_A[0..10], r[0..30], 3, "trio", 0) == 0;
+    assert gi_put(p[0..63], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r[0..30], 3, "trio", 0) == 0;
+    // refused when read: cut, one byte long, a name length that disagrees, nine members, unsorted, a creator outside,
+    // a third flag, another kind
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r[0..30], 3, "trio", 1234) == 64;
+    assert gi_ok(p[0..63]) == false and gi_ok(p[0..65]) == false;
+    p[51] = 5;
+    assert gi_ok(p[0..64]) == false;
+    p[51] = 4;
+    p[20] = 9;
+    assert gi_ok(p[0..64]) == false;
+    p[20] = 3;
+    p[21] = 250;
+    assert gi_ok(p[0..64]) == false;
+    p[21] = 1;
+    p[10] = 90;
+    assert gi_ok(p[0..64]) == false;
+    p[10] = 1;
+    p[1] = 2;
+    assert gi_ok(p[0..64]) == false;
+    p[1] = 0;
+    p[0] = 4;
+    assert gi_ok(p[0..64]) == false;
+    p[0] = 6;
+    assert gi_ok(p[0..64]);
+    // the kinds stay apart: a GROUP_INFO is no TEXT or ACK
+    assert GM_K_INFO != GM_K_TEXT and GM_K_INFO != GM_K_ACK and GM_K_INFO > 3;
+    assert gm_is_group(p[0..64]) == false and gm_kind(p[0..64]) == 0;
+    // the frame of a table record: the same bytes
+    var t : [4240]u8 = undefined;
+    t_table(t[0..GT_LEN]);
+    var q : [160]u8 = undefined;
+    assert gi_put(p[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r[0..30], 3, "trio", 1000) == 64;
+    assert gi_put_rec(q[0..160], GI_ANNOUNCE, t[0..GT_LEN], 0) == 64;
+    i = 0;
+    while (i < 64) {
+        assert p[i] == q[i];
+        i = i + 1;
+    }
+}
+
+test a_group_info_is_kept_only_from_a_trusted_creator_with_this_device_in_it_under_its_own_id {
+    // A announces the group {A, B} to B over their message session
+    var r2 : [20]u8 = undefined;
+    copy(r2[0..20], 0, T_A[0..10], 0, 10);
+    copy(r2[0..20], 10, T_B[0..10], 0, 10);
+    const id2 : [8]u8 = [4, 23, 205, 1, 40, 87, 215, 222];
+    var p : [160]u8 = undefined;
+    const n : usize = gi_put(p[0..160], GI_ANNOUNCE, id2[0..8], T_A[0..10], r2[0..20], 2, "pair", 777);
+    var frb : [1108]u8 = undefined;
+    ft_init(frb[0..FT_LEN]);
+    assert t_friend(frb[0..FT_LEN], T_A[0..10], T_B[0..10]);
+    var fre : [1108]u8 = undefined;
+    ft_init(fre[0..FT_LEN]);
+    var frc : [1108]u8 = undefined;
+    ft_init(frc[0..FT_LEN]);
+    assert t_friend(frc[0..FT_LEN], T_A[0..10], T_C[0..10]);
+    var t : [4240]u8 = undefined;
+    gt_init(t[0..GT_LEN]);
+    var z : [1]u8 = undefined;
+    // A's key is not stored at B
+    assert gi_apply(t[0..GT_LEN], frb[0..FT_LEN], T_B[0..10], T_A[0..10], false, p[0..n], id2[0..8], z[0..0], GT_NONE) == GR_UNTRUSTED;
+    // A is not B's friend
+    assert gi_apply(t[0..GT_LEN], fre[0..FT_LEN], T_B[0..10], T_A[0..10], true, p[0..n], id2[0..8], z[0..0], GT_NONE) == GR_NOT_FRIEND;
+    // C is not in the group
+    assert gi_apply(t[0..GT_LEN], frc[0..FT_LEN], T_C[0..10], T_A[0..10], true, p[0..n], id2[0..8], z[0..0], GT_NONE) == GR_NOT_ME;
+    // the roster hashes to another id than the frame names
+    assert gi_apply(t[0..GT_LEN], frb[0..FT_LEN], T_B[0..10], T_A[0..10], true, p[0..n], T_DIGEST[0..8], z[0..0], GT_NONE) == GR_ID_BAD;
+    var p2 : [160]u8 = undefined;
+    const n2 : usize = gi_put(p2[0..160], GI_ANNOUNCE, T_DIGEST[0..8], T_A[0..10], r2[0..20], 2, "pair", 777);
+    assert gi_apply(t[0..GT_LEN], frb[0..FT_LEN], T_B[0..10], T_A[0..10], true, p2[0..n2], id2[0..8], z[0..0], GT_NONE) == GR_ID_BAD;
+    // relayed by someone else than its creator
+    assert gi_apply(t[0..GT_LEN], frb[0..FT_LEN], T_B[0..10], T_C[0..10], true, p[0..n], id2[0..8], z[0..0], GT_NONE) == GR_SPOOF;
+    // cut
+    assert gi_apply(t[0..GT_LEN], frb[0..FT_LEN], T_B[0..10], T_A[0..10], true, p[0..n - 1], id2[0..8], z[0..0], GT_NONE) == GR_BAD;
+    // none of these was kept
+    assert gt_count(t[0..GT_LEN]) == 0;
+    // from its trusted creator, B in it, its own id: kept with A its creator, the name and the time
+    assert gi_apply(t[0..GT_LEN], frb[0..FT_LEN], T_B[0..10], T_A[0..10], true, p[0..n], id2[0..8], z[0..0], GT_NONE) == GI_KEPT;
+    assert gt_count(t[0..GT_LEN]) == 1 and gt_find(t[0..GT_LEN], id2[0..8]) == 0 and gt_creator(t[0..GT_LEN], 0) == 0;
+    assert gt_n(t[0..GT_LEN], 0) == 2 and gt_name(t[0..GT_LEN], 0)[0] == 112 and gt_time(t[0..GT_LEN], 0) == 777 and gt_idx(t[0..GT_LEN], 0, T_B[0..10]) == 1;
+    // the same again: already here, nothing added
+    assert gi_apply(t[0..GT_LEN], frb[0..FT_LEN], T_B[0..10], T_A[0..10], true, p[0..n], id2[0..8], z[0..0], GT_NONE) == GI_ALREADY;
+    assert gt_count(t[0..GT_LEN]) == 1;
+    // a HAVE of a group not in a table
+    var t2 : [4240]u8 = undefined;
+    gt_init(t2[0..GT_LEN]);
+    var h : [160]u8 = undefined;
+    const hn : usize = gi_put(h[0..160], GI_HAVE, id2[0..8], T_A[0..10], r2[0..20], 2, "pair", 777);
+    assert gi_apply(t2[0..GT_LEN], frb[0..FT_LEN], T_A[0..10], T_B[0..10], true, h[0..hn], id2[0..8], z[0..0], GT_NONE) == GR_UNKNOWN;
+}
+
+test a_have_from_a_member_sends_its_unacknowledged_lines_again {
+    // A made {A, B, C}; its line to B and C failed while they did not know the group
+    var t : [4240]u8 = undefined;
+    t_table(t[0..GT_LEN]);
+    var log : [16296]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    const x : [1]u8 = [120];
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, x[0..1], 0, 6) == 1;
+    var now : u64 = 1000;
+    var k : u32 = 0;
+    while (k < 20) {
+        gl_due_for(log[0..T_LOG], 0, 1, now);
+        gl_due_for(log[0..T_LOG], 0, 2, now + 1);
+        now = now + CH_RETRY_MS;
+        k = k + 1;
+    }
+    assert cl_state(log[0..T_LOG], 0) == CH_S_FAILED and gl_pending_for(log[0..T_LOG], 1) == 0;
+    var fra : [1108]u8 = undefined;
+    ft_init(fra[0..FT_LEN]);
+    assert t_friend(fra[0..FT_LEN], T_B[0..10], T_A[0..10]);
+    var h : [160]u8 = undefined;
+    const hn : usize = gi_put_rec(h[0..160], GI_HAVE, t[0..GT_LEN], 0);
+    // B says it has the group while another group is open: nothing restarts here
+    var r : u32 = gi_apply(t[0..GT_LEN], fra[0..FT_LEN], T_A[0..10], T_B[0..10], true, h[0..hn], T_DIGEST[0..8], log[0..T_LOG], GT_NONE);
+    assert r == GI_JOINED and cl_state(log[0..T_LOG], 0) == CH_S_FAILED;
+    // not pinned, not a member: refused
+    assert gi_apply(t[0..GT_LEN], fra[0..FT_LEN], T_A[0..10], T_B[0..10], false, h[0..hn], T_DIGEST[0..8], log[0..T_LOG], 0) == GR_UNTRUSTED;
+    assert gi_apply(t[0..GT_LEN], fra[0..FT_LEN], T_A[0..10], T_X[0..10], true, h[0..hn], T_DIGEST[0..8], log[0..T_LOG], 0) == GR_NOT_MEMBER;
+    assert cl_state(log[0..T_LOG], 0) == CH_S_FAILED;
+    // with the group open: the failed line is owed to B again and goes out at once
+    r = gi_apply(t[0..GT_LEN], fra[0..FT_LEN], T_A[0..10], T_B[0..10], true, h[0..hn], T_DIGEST[0..8], log[0..T_LOG], 0);
+    assert (r & 255) == GI_JOINED and (r >> 8) == 1;
+    assert cl_state(log[0..T_LOG], 0) == CH_S_PENDING and cl_tries(log[0..T_LOG], 0) == 0;
+    assert gl_pending_for(log[0..T_LOG], 1) == 1;
+    assert gl_due_for(log[0..T_LOG], 0, 1, now) == CH_R_SEND;
+    // the announces a new group owes: every member but its creator
+    assert gi_owe_new(t[0..GT_LEN], 0, T_A[0..10]) == 6 and gi_owe_new(t[0..GT_LEN], 0, T_B[0..10]) == 5;
+    assert gi_mine(t[0..GT_LEN], 0, T_A[0..10]) and gi_mine(t[0..GT_LEN], 0, T_B[0..10]) == false;
+}
+
+test a_fingerprint_compares_byte_by_byte_from_the_first_unsigned_at_its_own_offsets {
+    assert gr_fp_cmp(T_A[0..10], 0, T_B[0..10], 0) == -1;
+    assert gr_fp_cmp(T_B[0..10], 0, T_A[0..10], 0) == 1;
+    assert gr_fp_cmp(T_A[0..10], 0, T_A[0..10], 0) == 0;
+    // the first byte that differs decides, whatever comes after it
+    assert gr_fp_cmp(T_C[0..10], 0, T_A[0..10], 0) == 1;
+    assert gr_fp_cmp(T_X[0..10], 0, T_C[0..10], 0) == -1;
+    // bytes are unsigned: 255 (and a UTF-8 lead byte 208) stands above 0 and 127
+    const hi : [10]u8 = [255, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const lo : [10]u8 = [127, 255, 255, 255, 255, 255, 255, 255, 255, 255];
+    const cy : [10]u8 = [208, 175, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert gr_fp_cmp(hi[0..10], 0, lo[0..10], 0) == 1 and gr_fp_cmp(cy[0..10], 0, lo[0..10], 0) == 1;
+    // only 10 bytes are read: a difference at byte 10 is not seen
+    var two : [20]u8 = undefined;
+    copy(two[0..20], 0, T_B[0..10], 0, 10);
+    copy(two[0..20], 10, T_A[0..10], 0, 10);
+    assert gr_fp_cmp(two[0..20], 10, T_A[0..10], 0) == 0;
+    assert gr_fp_cmp(two[0..20], 0, two[0..20], 10) == 1;
+    assert gr_fp_cmp(two[0..20], 1, two[0..20], 1) == 0;
+    var a11 : [11]u8 = undefined;
+    copy(a11[0..11], 0, T_A[0..10], 0, 10);
+    a11[10] = 99;
+    assert gr_fp_cmp(a11[0..11], 0, T_A[0..10], 0) == 0;
+}
+
+test the_table_hands_out_each_groups_id_roster_and_members_by_record {
+    var t : [4240]u8 = undefined;
+    t_table(t[0..GT_LEN]);
+    var r : [20]u8 = undefined;
+    copy(r[0..20], 0, T_B[0..10], 0, 10);
+    copy(r[0..20], 10, T_C[0..10], 0, 10);
+    const id2 : [8]u8 = [4, 23, 205, 1, 40, 87, 215, 222];
+    assert gt_add(t[0..GT_LEN], id2[0..8], "pair", r[0..20], 2, 1, 2000) == GT_OK;
+    // group 0: the id of 8 bytes and the roster A, B, C of 30
+    assert gt_id(t[0..GT_LEN], 0).len == GR_ID;
+    var k : usize = 0;
+    while (k < GR_ID) {
+        assert gt_id(t[0..GT_LEN], 0)[k] == T_DIGEST[k] and gt_id(t[0..GT_LEN], 1)[k] == id2[k];
+        k = k + 1;
+    }
+    assert gt_roster(t[0..GT_LEN], 0).len == 30 and gt_roster(t[0..GT_LEN], 1).len == 20;
+    assert gt_roster(t[0..GT_LEN], 0)[9] == 10 and gt_roster(t[0..GT_LEN], 0)[19] == 11 and gt_roster(t[0..GT_LEN], 0)[20] == 200;
+    // member k is the k-th 10 bytes of the roster; group 1's member 0 is B, not group 0's A
+    assert gt_member(t[0..GT_LEN], 0, 2).len == 10;
+    assert gr_fp_cmp(gt_member(t[0..GT_LEN], 0, 0), 0, T_A[0..10], 0) == 0;
+    assert gr_fp_cmp(gt_member(t[0..GT_LEN], 0, 2), 0, T_C[0..10], 0) == 0;
+    assert gr_fp_cmp(gt_member(t[0..GT_LEN], 1, 0), 0, T_B[0..10], 0) == 0;
+    assert gr_fp_cmp(gt_member(t[0..GT_LEN], 1, 1), 0, T_C[0..10], 0) == 0;
+    // the creator is a member: group 1 was made by C (index 1)
+    assert gr_fp_cmp(gt_member(t[0..GT_LEN], 1, gt_creator(t[0..GT_LEN], 1)), 0, T_C[0..10], 0) == 0;
+    // the last group goes up when the first leaves
+    assert gt_remove(t[0..GT_LEN], T_DIGEST[0..8]);
+    assert gt_id(t[0..GT_LEN], 0)[0] == 4 and gt_id(t[0..GT_LEN], 0)[7] == 222 and gt_roster(t[0..GT_LEN], 0).len == 20;
+    // a removed record is wiped: an empty roster, an id of zeros
+    assert gt_roster(t[0..GT_LEN], 1).len == 0 and gt_id(t[0..GT_LEN], 1)[0] == 0;
+}
+
+test the_file_length_is_the_header_the_records_and_the_crc {
+    assert gt_file_len(0) == GT_HDR + 4;
+    assert gt_file_len(1) == 152;
+    assert gt_file_len(GT_MAX) == GT_FILE_MAX;
+    // one more group than the table holds would not fit the largest file
+    assert gt_file_len(GT_MAX + 1) > GT_FILE_MAX;
+    var t : [4240]u8 = undefined;
+    gt_init(t[0..GT_LEN]);
+    var f : [4244]u8 = undefined;
+    assert gt_encode(t[0..GT_LEN], f[0..GT_FILE_MAX]) == gt_file_len(0);
+    var u : [4240]u8 = undefined;
+    assert gt_decode(f[0..gt_file_len(0)], u[0..GT_LEN]) == GT_OK and gt_count(u[0..GT_LEN]) == 0;
+    t_table(t[0..GT_LEN]);
+    assert gt_encode(t[0..GT_LEN], f[0..GT_FILE_MAX]) == gt_file_len(1);
+    // out one byte short of the file: nothing written
+    assert gt_encode(t[0..GT_LEN], f[0..gt_file_len(1) - 1]) == 0;
+    // a file of the length of 2 groups that says 1 does not read
+    assert gt_decode(f[0..gt_file_len(2)], u[0..GT_LEN]) == GT_COUNT;
+}
+
+test a_group_frame_hands_back_its_id_sender_number_parts_and_time {
+    // 1500 bytes of Cyrillic "Ya" (208 175): three parts, the last of 100 bytes
+    var text : [1500]u8 = undefined;
+    var i : usize = 0;
+    while (i < 1500) {
+        text[i] = 208;
+        text[i + 1] = 175;
+        i = i + 2;
+    }
+    var p : [738]u8 = undefined;
+    const n : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], GM_SEQ - 1, 2, 18446744073709551615, text[0..1500]);
+    assert n == GM_HDR + 100 and gm_kind(p[0..n]) == GM_K_TEXT;
+    assert gm_gid(p[0..n]).len == GR_ID and gm_gid(p[0..n])[0] == 72 and gm_gid(p[0..n])[7] == 71;
+    assert gm_sender(p[0..n]).len == 10 and gr_fp_cmp(gm_sender(p[0..n]), 0, T_B[0..10], 0) == 0;
+    assert gm_msg(p[0..n]) == GM_SEQ - 1;
+    assert gm_part(p[0..n]) == 2 and gm_parts(p[0..n]) == 3;
+    assert gm_time(p[0..n]) == 18446744073709551615;
+    // the numbers are little-endian at their places
+    assert gm_put_text(p[0..738], T_DIGEST[0..8], T_C[0..10], 258, 0, 513, text[0..2]) == GM_HDR + 2;
+    assert p[20] == 2 and p[21] == 1 and p[22] == 0 and gm_msg(p[0..40]) == 258;
+    assert p[28] == 1 and p[29] == 2 and gm_time(p[0..40]) == 513 and gm_part(p[0..40]) == 0 and gm_parts(p[0..40]) == 1;
+    assert gr_fp_cmp(gm_sender(p[0..40]), 0, T_C[0..10], 0) == 0;
+    // an ACK names the author in the sender's place, no parts and no time
+    var a : [38]u8 = undefined;
+    assert gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 7, 2) == GM_HDR;
+    assert gm_msg(a[0..38]) == 7 and gm_part(a[0..38]) == 2 and gm_parts(a[0..38]) == 0 and gm_time(a[0..38]) == 0;
+    assert gr_fp_cmp(gm_sender(a[0..38]), 0, T_A[0..10], 0) == 0;
+}
+
+test a_new_round_begins_with_the_member_due_again {
+    var log : [16296]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    const x : [1]u8 = [120];
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, x[0..1], 0, 6) == 1;
+    // nobody sent to yet
+    assert gl_round(log[0..T_LOG], 0) == 0;
+    assert gl_due_for(log[0..T_LOG], 0, 1, 1000) == CH_R_SEND and gl_round(log[0..T_LOG], 0) == 2;
+    assert gl_due_for(log[0..T_LOG], 0, 2, 1001) == CH_R_SEND and gl_round(log[0..T_LOG], 0) == 6;
+    // too early for B again: the round stays
+    assert gl_due_for(log[0..T_LOG], 0, 1, 1002) == CH_R_WAIT and gl_round(log[0..T_LOG], 0) == 6;
+    // B due again: a new round holding only B, then C joins it
+    assert gl_due_for(log[0..T_LOG], 0, 1, 1000 + CH_RETRY_MS) == CH_R_SEND and gl_round(log[0..T_LOG], 0) == 2;
+    assert gl_due_for(log[0..T_LOG], 0, 2, 1001 + CH_RETRY_MS) == CH_R_SEND and gl_round(log[0..T_LOG], 0) == 6;
+    // a member that is not a recipient never enters the round
+    assert gl_due_for(log[0..T_LOG], 0, 3, 99999) == CH_R_WAIT and gl_round(log[0..T_LOG], 0) == 6;
+    // a second line starts with an empty round of its own
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, x[0..1], 5, 6) == 2;
+    assert gl_round(log[0..T_LOG], 1) == 0 and gl_round(log[0..T_LOG], 0) == 6;
+}
+
+test lines_stand_by_time_then_sender_then_number_and_a_moved_line_finds_its_place {
+    var log : [16296]u8 = undefined;
+    t_log(log[0..T_LOG]);
+    const x : [1]u8 = [120];
+    // three own lines written out of order, without placing: times 300, 100, 200
+    assert cl_out_add(log[0..T_LOG], x[0..1], 300) == 1;
+    assert cl_out_add(log[0..T_LOG], x[0..1], 100) == 2;
+    assert cl_out_add(log[0..T_LOG], x[0..1], 200) == 3;
+    assert gl_after(log[0..T_LOG], 0, 1, 0) and gl_after(log[0..T_LOG], 1, 0, 0) == false;
+    // a line never stands after itself
+    assert gl_after(log[0..T_LOG], 2, 2, 0) == false;
+    // line 1 (100) moves back to 0; line 2 (200) then to 1; the order is 100, 200, 300
+    assert gl_place(log[0..T_LOG], 1, 0) == 0;
+    assert gl_place(log[0..T_LOG], 2, 0) == 1;
+    assert cl_time(log[0..T_LOG], 0) == 100 and cl_time(log[0..T_LOG], 1) == 200 and cl_time(log[0..T_LOG], 2) == 300;
+    assert cl_msg(log[0..T_LOG], 0) == 2 and cl_msg(log[0..T_LOG], 1) == 3 and cl_msg(log[0..T_LOG], 2) == 1;
+    // a line already in its place stays
+    assert gl_place(log[0..T_LOG], 1, 0) == 1 and cl_msg(log[0..T_LOG], 1) == 3;
+    // an own line written at 50 at the end moves to the front
+    assert cl_out_add(log[0..T_LOG], x[0..1], 50) == 4;
+    assert gl_place(log[0..T_LOG], 3, 0) == 0 and cl_msg(log[0..T_LOG], 0) == 4 and cl_msg(log[0..T_LOG], 3) == 1;
+    // a line at 900 in front of 100 and 200 moves forward to the end
+    var l3 : [16296]u8 = undefined;
+    t_log(l3[0..T_LOG]);
+    assert cl_out_add(l3[0..T_LOG], x[0..1], 900) == 1;
+    assert cl_out_add(l3[0..T_LOG], x[0..1], 100) == 2;
+    assert cl_out_add(l3[0..T_LOG], x[0..1], 200) == 3;
+    assert gl_place(l3[0..T_LOG], 0, 0) == 2;
+    assert cl_msg(l3[0..T_LOG], 0) == 2 and cl_msg(l3[0..T_LOG], 1) == 3 and cl_msg(l3[0..T_LOG], 2) == 1;
+    // equal times: the sender's index decides, and an own line counts as this device's index
+    var l2 : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    t_log(l2[0..T_LOG]);
+    assert cl_out_add(l2[0..T_LOG], x[0..1], 500) == 1;
+    assert t_deliver(l2[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 1, 500, x[0..1]) == CH_RX_NEW;
+    const own : usize = cl_find(l2[0..T_LOG], CH_DIR_OUT, 1);
+    const inb : usize = cl_find(l2[0..T_LOG], CH_DIR_IN, gl_key(1, 1));
+    // seen as member 0 the own line goes before B's; seen as member 2, after it
+    assert gl_after(l2[0..T_LOG], own, inb, 0) == false and gl_after(l2[0..T_LOG], inb, own, 0);
+    assert gl_after(l2[0..T_LOG], own, inb, 2) and gl_after(l2[0..T_LOG], inb, own, 2) == false;
+    // same time and sender: the number decides
+    assert t_deliver(l2[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, T_B[0..10], 1, 2, 500, x[0..1]) == CH_RX_NEW;
+    const inb2 : usize = cl_find(l2[0..T_LOG], CH_DIR_IN, gl_key(1, 2));
+    assert gl_after(l2[0..T_LOG], inb2, inb, 2) and gl_after(l2[0..T_LOG], inb, inb2, 2) == false;
+}
+
+test a_group_text_that_is_not_text_or_comes_from_a_wrong_index_or_is_broken_makes_no_line {
+    var log : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    var p : [738]u8 = undefined;
+    const ok : [4]u8 = [208, 175, 208, 175];
+    const n : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 1, 0, 10, ok[0..4]);
+    // a member index past the group, this device's own index, a cut frame, an ACK
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, GR_MEMBERS, p[0..n]) == CH_RX_BAD;
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 2, p[0..n]) == CH_RX_BAD;
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..n - 1]) == CH_RX_BAD;
+    var a : [38]u8 = undefined;
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_C[0..10], 1, 0);
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, a[0..38]) == CH_RX_BAD;
+    // broken UTF-8: a lone continuation byte, a Cyrillic letter cut in half
+    const bad1 : [2]u8 = [65, 175];
+    const bad2 : [3]u8 = [65, 66, 208];
+    const n1 : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 2, 0, 10, bad1[0..2]);
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..n1]) == CH_RX_BAD;
+    const n2 : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 3, 0, 10, bad2[0..3]);
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..n2]) == CH_RX_BAD;
+    assert cl_count(log[0..T_LOG]) == 0;
+    // the good one is taken byte for byte, once
+    gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 1, 0, 10, ok[0..4]);
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..n]) == CH_RX_NEW;
+    assert cl_count(log[0..T_LOG]) == 1 and cl_text(log[0..T_LOG], 0).len == 4 and cl_text(log[0..T_LOG], 0)[3] == 175;
+    assert cl_msg(log[0..T_LOG], 0) == gl_key(1, 1);
+    // a letter split across two parts (an ASCII byte first, so byte 700 is the middle of one) joins whole
+    var t : [801]u8 = undefined;
+    t[0] = 33;
+    var i : usize = 1;
+    while (i < 801) {
+        t[i] = 208;
+        t[i + 1] = 175;
+        i = i + 2;
+    }
+    const q0 : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_A[0..10], 9, 0, 20, t[0..801]);
+    assert q0 == GM_HDR + 700 and p[GM_HDR + 699] == 208;
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 0, p[0..q0]) == CH_RX_PART;
+    const q1 : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_A[0..10], 9, 1, 20, t[0..801]);
+    assert p[GM_HDR] == 175;
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 0, p[0..q1]) == CH_RX_NEW;
+    const j : usize = cl_find(log[0..T_LOG], CH_DIR_IN, gl_key(0, 9));
+    assert j != CL_NONE and cl_text(log[0..T_LOG], j).len == 801 and cl_text(log[0..T_LOG], j)[800] == 175;
+    // A's line (time 20) stands after B's (time 10)
+    assert j == 1;
+}
+
+test a_line_owes_a_member_only_while_it_is_an_open_own_line_to_that_recipient_with_a_part_unacknowledged {
+    var log : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    var t : [800]u8 = undefined;
+    var i : usize = 0;
+    while (i < 800) {
+        t[i] = 65;
+        i = i + 1;
+    }
+    // A's own line in 2 parts for C only (rcpt 4)
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, t[0..800], 100, 4) == 1;
+    assert gl_owes(log[0..T_LOG], 0, 2);
+    assert gl_owes(log[0..T_LOG], 0, 1) == false;
+    assert gl_owes(log[0..T_LOG], 0, 0) == false;
+    assert gl_owes(log[0..T_LOG], 0, GR_MEMBERS) == false and gl_owes(log[0..T_LOG], 0, 4294967295) == false;
+    // one part acknowledged: still owed; both: no longer
+    var a : [38]u8 = undefined;
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 0);
+    assert gl_rx_ack(log[0..T_LOG], 2, a[0..38]);
+    assert gl_owes(log[0..T_LOG], 0, 2);
+    gm_put_ack(a[0..38], T_DIGEST[0..8], T_A[0..10], 1, 1);
+    assert gl_rx_ack(log[0..T_LOG], 2, a[0..38]);
+    assert gl_owes(log[0..T_LOG], 0, 2) == false and cl_state(log[0..T_LOG], 0) == CH_S_DELIVERED;
+    // a FAILED line is still owed (a session restarts it)
+    const x : [1]u8 = [120];
+    assert gl_out_add(log[0..T_LOG], fl[0..32], 0, x[0..1], 200, 6) == 2;
+    log[cl_line_at(1) + 1] = @as(u8, @intCast(CH_S_FAILED));
+    assert gl_owes(log[0..T_LOG], 1, 1) and gl_owes(log[0..T_LOG], 1, 2);
+    log[cl_line_at(1) + 1] = @as(u8, @intCast(CH_S_READ));
+    assert gl_owes(log[0..T_LOG], 1, 1) == false;
+    // an incoming line owes nobody
+    assert t_deliver(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 0, T_B[0..10], 1, 1, 300, x[0..1]) == CH_RX_NEW;
+    const k : usize = cl_find(log[0..T_LOG], CH_DIR_IN, gl_key(1, 1));
+    assert gl_owes(log[0..T_LOG], k, 1) == false and gl_owes(log[0..T_LOG], k, 2) == false;
+    // even one read back from a file (cf_decode takes any state 1..5 for an incoming line) as FAILED with a
+    // recipient mask in its extension bytes
+    log[cl_line_at(k) + 1] = @as(u8, @intCast(CH_S_FAILED));
+    log[cl_line_at(k) + CL_EXT + X_RCPT] = 255;
+    assert gl_owes(log[0..T_LOG], k, 1) == false and gl_owes(log[0..T_LOG], k, 2) == false;
+}
+
+test a_group_third_part_that_would_make_the_message_longer_than_2000_bytes_is_refused {
+    var log : [16296]u8 = undefined;
+    var asm : [8064]u8 = undefined;
+    var fl : [32]u8 = undefined;
+    ck_wipe(asm[0..CA_LEN]);
+    ck_wipe(fl[0..32]);
+    t_log(log[0..T_LOG]);
+    var t : [2000]u8 = undefined;
+    var i : usize = 0;
+    while (i < 2000) {
+        t[i] = 97 + @as(u8, @intCast(i % 26));
+        i = i + 1;
+    }
+    var p : [738]u8 = undefined;
+    const a0 : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 4, 0, 10, t[0..2000]);
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..a0]) == CH_RX_PART;
+    const a1 : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 4, 1, 10, t[0..2000]);
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..a1]) == CH_RX_PART;
+    // an honest last part is 600 bytes; one of 700 would put the join 100 bytes past the slot
+    const a2 : usize = gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 4, 2, 10, t[0..2000]);
+    assert a2 == GM_HDR + 600 and gm_kind(p[0..a2]) == GM_K_TEXT;
+    put_ghdr(p[0..738], GM_K_TEXT, T_DIGEST[0..8], T_B[0..10], 4, 2, 3, 10, 601);
+    assert gm_kind(p[0..GM_HDR + 601]) == 0;
+    put_ghdr(p[0..738], GM_K_TEXT, T_DIGEST[0..8], T_B[0..10], 4, 2, 3, 10, 700);
+    assert gm_kind(p[0..GM_HDR + 700]) == 0;
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..GM_HDR + 700]) == CH_RX_BAD;
+    assert cl_count(log[0..T_LOG]) == 0;
+    // the honest one completes the 2000-byte message
+    gm_put_text(p[0..738], T_DIGEST[0..8], T_B[0..10], 4, 2, 10, t[0..2000]);
+    assert gl_rx_text(log[0..T_LOG], asm[0..CA_LEN], fl[0..32], 2, 1, p[0..a2]) == CH_RX_NEW;
+    assert cl_count(log[0..T_LOG]) == 1 and cl_text(log[0..T_LOG], 0).len == 2000;
+}

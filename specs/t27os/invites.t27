@@ -1,0 +1,724 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/invites.t27 -- someone added me by my key: the invitations I can accept or decline (owner, 2026-10-22;
+// Refs gHashTag/t27#11560). Pure decisions only: no @extern, no socket, no clock, no hash (the host,
+// peer_identity_host.t27, reads and writes the file; call_session.t27 checks the key against the fingerprint).
+// ASCII only (L3), English only (LANG-EN). Flat namespace (the window build splices imported modules): every name here
+// starts with iv_ / IV_.
+//
+// WHAT AN INVITATION IS  a message session from a fingerprint that is not in my friends table. Before this file such a
+//   session was declined while it rang and the person never learned that someone had added them. Now it is answered:
+//   the handshake runs, the peer proves its identity key (IDENT, call_core ck_ident_input; the key must hash to the
+//   fingerprint the frames name and the signature must verify over this session's transcript), and the session is
+//   then closed by this side with call_session CS_R_INVITE ("waits for you to accept"). It never opens: no message is
+//   taken, no call is answered. The proven key and the fingerprint are written here; nothing else can make a row, so
+//   only what really arrived over the network can be accepted.
+// ACCEPT  the fingerprint becomes a friend (friends file v2, unchanged format) and the row's key is stored for it
+//   (peer_identity_host ih_pin_put checks again that it hashes to the fingerprint): the next session of this person is
+//   TRUSTED (peer_identity pid_verdict) and the chat opens. No 6-digit code is asked: the key is the one the person's
+//   own signature proved, under the fingerprint the person clicked.
+// DECLINE  the row stays, marked declined, and is not shown. It does not block: a session from the same fingerprint more
+//   than IV_QUIET_MS after the decline brings the invitation back, marked "again"; one sooner is closed the same way
+//   and only counted (the inviter's app redials every few seconds while its messages wait).
+//
+// INVITES FILE  ~/.t27os/invites.t27, IV_LEN = 8212 bytes, written whole and atomically (mode 0600):
+//   magic "T27OSIV\n" (8) | version u32 LE (4, = 1) | count u32 LE (4, 0..64) | 64 rows of IV_ROW = 128 bytes |
+//   CRC-32 (IEEE, peer_identity crc32) of all bytes before it (4).
+//   ROW  fingerprint (10) | the proven P-256 public key (65, uncompressed, first byte 0x04) | nick length (1) | nick
+//   (24, zero padded, printable ASCII; the peer's own word for itself from mDNS, it proves nothing) | state (1:
+//   1 waiting, 2 declined) | again (1: 1 when it came back after a decline) | 2 zero bytes | last arrival, ms of the
+//   wall clock (u64 LE) | declined at, ms (u64 LE, 0 while waiting) | sessions seen (u32 LE) | 4 zero bytes.
+//   Rows 0..count-1 are used, newest arrival first; the rows after them are zero. A fingerprint is in at most one row.
+//   A file that does not check is moved aside by the host (invites.t27.bad) and the table starts empty: an invitation
+//   is not worth more than the person who sends it again.
+// LIMIT  64 rows. A new fingerprint on a full table pushes out the oldest row (the last one), whatever its state.
+module T27osInvites;
+
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::peer_identity::crc32;
+use t27os::peer_identity::nick_ok;
+use t27os::peer_identity::FP_BYTES;
+use t27os::peer_identity::PUB_BYTES;
+use t27os::peer_identity::NICK_MAX;
+use t27os::editors::same_bytes;
+use t27os::friends_view::fv_put32;
+use t27os::friends_view::fv_get32;
+
+pub const IV_MAX : usize = 64;
+pub const IV_ROW : usize = 128;
+pub const IV_HDR : usize = 16;
+pub const IV_OFF_CRC : usize = 8208;
+pub const IV_LEN : usize = 8212;
+pub const IV_VERSION : u32 = 1;
+
+pub const IR_FP : usize = 0;
+pub const IR_KEY : usize = 10;
+pub const IR_NICKLEN : usize = 75;
+pub const IR_NICK : usize = 76;
+pub const IR_STATE : usize = 100;
+pub const IR_AGAIN : usize = 101;
+pub const IR_TIME : usize = 104;
+pub const IR_DECL : usize = 112;
+pub const IR_SEEN : usize = 120;
+
+pub const IV_S_WAITING : u8 = 1;
+pub const IV_S_DECLINED : u8 = 2;
+
+/// A declined invitation comes back only for a session this long after the decline.
+pub const IV_QUIET_MS : u64 = 3600000;
+
+/// iv_check.
+pub const IV_OK : u32 = 0;
+pub const IV_SHORT : u32 = 1;
+pub const IV_LONG : u32 = 2;
+pub const IV_MAGIC : u32 = 3;
+pub const IV_VERSION_BAD : u32 = 4;
+pub const IV_COUNT : u32 = 5;
+pub const IV_CRC : u32 = 6;
+pub const IV_DUP : u32 = 7;
+pub const IV_ROW_BAD : u32 = 8;
+
+/// iv_arrive.
+pub const IV_A_NEW : u32 = 1;
+pub const IV_A_SAME : u32 = 2;
+pub const IV_A_AGAIN : u32 = 3;
+pub const IV_A_QUIET : u32 = 4;
+pub const IV_A_BAD : u32 = 5;
+pub const IV_A_CONFLICT : u32 = 6;
+
+fn iv_put32(b: []u8, at: usize, v: u32) -> void { fv_put32(b, at, @as(u64, v)); }
+
+fn iv_get32(b: []const u8, at: usize) -> u32 { return @as(u32, @intCast(fv_get32(b, at))); }
+
+fn iv_same(a: []const u8, ao: usize, b: []const u8, bo: usize, n: usize) -> bool { return same_bytes(a[ao .. ao + n], b[bo .. bo + n]); }
+
+/// Where row i starts.
+pub fn iv_at(i: usize) -> usize { return IV_HDR + i * IV_ROW; }
+
+pub fn iv_count(t: []const u8) -> usize {
+    const n : u32 = iv_get32(t, 12);
+    if (n > 64) { return 0; }
+    return @as(usize, n);
+}
+
+/// Recompute the trailing CRC-32 after any change.
+pub fn iv_seal(t: []u8) -> void { iv_put32(t, IV_OFF_CRC, crc32(t, IV_OFF_CRC)); }
+
+/// The CRC the table carries (the window folds it into its frame key: any change redraws).
+pub fn iv_crc(t: []const u8) -> u32 { return iv_get32(t, IV_OFF_CRC); }
+
+/// An empty table (count 0), sealed.
+pub fn iv_init(t: []u8) -> bool {
+    if (t.len < IV_LEN) { return false; }
+    var i : usize = 0;
+    while (i < IV_LEN) {
+        t[i] = 0;
+        i = i + 1;
+    }
+    const mg : [8]u8 = [84, 50, 55, 79, 83, 73, 86, 10];
+    i = 0;
+    while (i < 8) {
+        t[i] = mg[i];
+        i = i + 1;
+    }
+    iv_put32(t, 8, IV_VERSION);
+    iv_seal(t);
+    return true;
+}
+
+fn iv_row_ok(t: []const u8, i: usize) -> bool {
+    const a : usize = iv_at(i);
+    if (t[a + IR_KEY] != 4) { return false; }
+    if (t[a + IR_STATE] != IV_S_WAITING and t[a + IR_STATE] != IV_S_DECLINED) { return false; }
+    if (t[a + IR_AGAIN] > 1) { return false; }
+    const nn : usize = @as(usize, t[a + IR_NICKLEN]);
+    if (nn > NICK_MAX or nick_ok(t[a + IR_NICK .. a + IR_NICK + NICK_MAX], nn) == false) { return false; }
+    return true;
+}
+
+/// Does the buffer hold a whole, sane table: size, magic, version, count, CRC, every used row well formed, no
+/// fingerprint twice?
+pub fn iv_check(t: []const u8) -> u32 {
+    if (t.len < IV_LEN) { return IV_SHORT; }
+    if (t.len > IV_LEN) { return IV_LONG; }
+    const mg : [8]u8 = [84, 50, 55, 79, 83, 73, 86, 10];
+    if (iv_same(t, 0, mg[0..8], 0, 8) == false) { return IV_MAGIC; }
+    if (iv_get32(t, 8) != IV_VERSION) { return IV_VERSION_BAD; }
+    if (iv_get32(t, 12) > 64) { return IV_COUNT; }
+    if (iv_get32(t, IV_OFF_CRC) != crc32(t, IV_OFF_CRC)) { return IV_CRC; }
+    const n : usize = iv_count(t);
+    var i : usize = 0;
+    while (i < n) {
+        if (iv_row_ok(t, i) == false) { return IV_ROW_BAD; }
+        var k : usize = i + 1;
+        while (k < n) {
+            if (iv_same(t, iv_at(i), t, iv_at(k), FP_BYTES)) { return IV_DUP; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return IV_OK;
+}
+
+/// The row of this fingerprint, IV_MAX when there is none.
+pub fn iv_find(t: []const u8, fp: []const u8) -> usize {
+    if (t.len < IV_LEN or fp.len < FP_BYTES) { return IV_MAX; }
+    const n : usize = iv_count(t);
+    var i : usize = 0;
+    while (i < n) {
+        if (iv_same(t, iv_at(i), fp, 0, FP_BYTES)) { return i; }
+        i = i + 1;
+    }
+    return IV_MAX;
+}
+
+/// Row i goes to the top (index 0); the rows above it move down by one.
+fn iv_to_top(t: []u8, i: usize) -> void {
+    if (i == 0) { return; }
+    var keep : [128]u8 = undefined;
+    var b : usize = 0;
+    while (b < IV_ROW) {
+        keep[b] = t[iv_at(i) + b];
+        b = b + 1;
+    }
+    var j : usize = i;
+    while (j > 0) {
+        b = 0;
+        while (b < IV_ROW) {
+            t[iv_at(j) + b] = t[iv_at(j - 1) + b];
+            b = b + 1;
+        }
+        j = j - 1;
+    }
+    b = 0;
+    while (b < IV_ROW) {
+        t[iv_at(0) + b] = keep[b];
+        b = b + 1;
+    }
+}
+
+/// Row i goes; the rows after it move up, the freed last row is zeroed.
+fn iv_drop(t: []u8, i: usize) -> void {
+    const n : usize = iv_count(t);
+    var j : usize = i;
+    while (j + 1 < n) {
+        var b : usize = 0;
+        while (b < IV_ROW) {
+            t[iv_at(j) + b] = t[iv_at(j + 1) + b];
+            b = b + 1;
+        }
+        j = j + 1;
+    }
+    var b : usize = 0;
+    while (b < IV_ROW) {
+        t[iv_at(n - 1) + b] = 0;
+        b = b + 1;
+    }
+    iv_put32(t, 12, @as(u32, @intCast(n - 1)));
+}
+
+fn iv_set_nick(t: []u8, a: usize, nick: []const u8, nn: usize) -> void {
+    var i : usize = 0;
+    while (i < NICK_MAX) {
+        if (i < nn) { t[a + IR_NICK + i] = nick[i]; } else { t[a + IR_NICK + i] = 0; }
+        i = i + 1;
+    }
+    t[a + IR_NICKLEN] = @as(u8, @intCast(nn));
+}
+
+/// A session from fp (not a friend) proved the key pubk at now (ms): the invitation it makes or renews. The caller has
+/// checked that pubk hashes to fp (call_session does before it closes the session with CS_R_INVITE). A nick that is not
+/// printable ASCII up to 24 is taken as none; an empty nick keeps the one the row had.
+///   IV_A_NEW      a row was made (on a full table the oldest row went), at the top, waiting.
+///   IV_A_SAME     the row was waiting: its time, nick and count renewed, it moves to the top.
+///   IV_A_AGAIN    the row was declined more than IV_QUIET_MS ago: waiting again, marked again, at the top.
+///   IV_A_QUIET    the row was declined less than IV_QUIET_MS ago: only counted, still hidden, not moved.
+///   IV_A_CONFLICT the row holds another key for fp: nothing changes (a fingerprint is the hash of its key).
+///   IV_A_BAD      the table does not check, or fp / pubk is malformed: nothing changes.
+pub fn iv_arrive(t: []u8, fp: []const u8, pubk: []const u8, nick: []const u8, nn: usize, now: u64) -> u32 {
+    if (iv_check(t[0..IV_LEN]) != IV_OK) { return IV_A_BAD; }
+    if (fp.len < FP_BYTES or pubk.len != PUB_BYTES or pubk[0] != 4) { return IV_A_BAD; }
+    var m : usize = nn;
+    if (m > NICK_MAX or m > nick.len or nick_ok(nick, m) == false) { m = 0; }
+    var i : usize = iv_find(t, fp);
+    if (i != IV_MAX) {
+        const a : usize = iv_at(i);
+        if (iv_same(t, a + IR_KEY, pubk, 0, PUB_BYTES) == false) { return IV_A_CONFLICT; }
+        iv_put32(t, a + IR_SEEN, iv_get32(t, a + IR_SEEN) + 1);
+        var r : u32 = IV_A_SAME;
+        if (t[a + IR_STATE] == IV_S_DECLINED) {
+            if (now < get_u64(t, a + IR_DECL) + IV_QUIET_MS) {
+                iv_seal(t);
+                return IV_A_QUIET;
+            }
+            t[a + IR_STATE] = IV_S_WAITING;
+            t[a + IR_AGAIN] = 1;
+            put_u64(t, a + IR_DECL, 0);
+            r = IV_A_AGAIN;
+        }
+        put_u64(t, a + IR_TIME, now);
+        if (m > 0) { iv_set_nick(t, a, nick, m); }
+        iv_to_top(t, i);
+        iv_seal(t);
+        return r;
+    }
+    var n : usize = iv_count(t);
+    if (n >= IV_MAX) {
+        iv_drop(t, n - 1);
+        n = n - 1;
+    }
+    const a : usize = iv_at(n);
+    var b : usize = 0;
+    while (b < IV_ROW) {
+        t[a + b] = 0;
+        b = b + 1;
+    }
+    b = 0;
+    while (b < FP_BYTES) {
+        t[a + IR_FP + b] = fp[b];
+        b = b + 1;
+    }
+    b = 0;
+    while (b < PUB_BYTES) {
+        t[a + IR_KEY + b] = pubk[b];
+        b = b + 1;
+    }
+    iv_set_nick(t, a, nick, m);
+    t[a + IR_STATE] = IV_S_WAITING;
+    put_u64(t, a + IR_TIME, now);
+    iv_put32(t, a + IR_SEEN, 1);
+    iv_put32(t, 12, @as(u32, @intCast(n + 1)));
+    iv_to_top(t, n);
+    iv_seal(t);
+    return IV_A_NEW;
+}
+
+/// Should a session from fp be closed while it rings, without the handshake? Only for a row declined less than
+/// IV_QUIET_MS ago (it is counted as a quiet arrival by the caller through iv_arrive only when it proves itself).
+pub fn iv_quiet(t: []const u8, fp: []const u8, now: u64) -> bool {
+    const i : usize = iv_find(t, fp);
+    if (i == IV_MAX) { return false; }
+    const a : usize = iv_at(i);
+    return t[a + IR_STATE] == IV_S_DECLINED and now < get_u64(t, a + IR_DECL) + IV_QUIET_MS;
+}
+
+/// DECLINE: the row is kept, declined at now, hidden; false when fp has no waiting row.
+pub fn iv_decline(t: []u8, fp: []const u8, now: u64) -> bool {
+    const i : usize = iv_find(t, fp);
+    if (i == IV_MAX) { return false; }
+    const a : usize = iv_at(i);
+    if (t[a + IR_STATE] != IV_S_WAITING) { return false; }
+    t[a + IR_STATE] = IV_S_DECLINED;
+    t[a + IR_AGAIN] = 0;
+    put_u64(t, a + IR_DECL, now);
+    iv_seal(t);
+    return true;
+}
+
+/// The row of fp goes (after ACCEPT made it a friend). False when there is none.
+pub fn iv_remove(t: []u8, fp: []const u8) -> bool {
+    const i : usize = iv_find(t, fp);
+    if (i == IV_MAX) { return false; }
+    iv_drop(t, i);
+    iv_seal(t);
+    return true;
+}
+
+/// How many invitations wait for an answer (the number in the cabinet's head and in INVITATIONS N).
+pub fn iv_waiting(t: []const u8) -> usize {
+    const n : usize = iv_count(t);
+    var c : usize = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t[iv_at(i) + IR_STATE] == IV_S_WAITING) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// The row of the k-th waiting invitation, newest first; IV_MAX when there are not that many.
+pub fn iv_nth(t: []const u8, k: usize) -> usize {
+    const n : usize = iv_count(t);
+    var c : usize = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t[iv_at(i) + IR_STATE] == IV_S_WAITING) {
+            if (c == k) { return i; }
+            c = c + 1;
+        }
+        i = i + 1;
+    }
+    return IV_MAX;
+}
+
+/// Row i's fingerprint (10) / key (65) into out; false when i is not a row.
+pub fn iv_fp(t: []const u8, i: usize, out: []u8) -> bool {
+    if (i >= iv_count(t) or out.len < FP_BYTES) { return false; }
+    var b : usize = 0;
+    while (b < FP_BYTES) {
+        out[b] = t[iv_at(i) + IR_FP + b];
+        b = b + 1;
+    }
+    return true;
+}
+
+pub fn iv_key(t: []const u8, i: usize, out: []u8) -> bool {
+    if (i >= iv_count(t) or out.len < PUB_BYTES) { return false; }
+    var b : usize = 0;
+    while (b < PUB_BYTES) {
+        out[b] = t[iv_at(i) + IR_KEY + b];
+        b = b + 1;
+    }
+    return true;
+}
+
+pub fn iv_time(t: []const u8, i: usize) -> u64 { return get_u64(t, iv_at(i) + IR_TIME); }
+pub fn iv_again(t: []const u8, i: usize) -> bool { return t[iv_at(i) + IR_AGAIN] != 0; }
+pub fn iv_seen(t: []const u8, i: usize) -> u32 { return iv_get32(t, iv_at(i) + IR_SEEN); }
+pub fn iv_state(t: []const u8, i: usize) -> u8 { return t[iv_at(i) + IR_STATE]; }
+
+/// Read a file of n bytes into t: IV_OK and the table, or what is wrong (t is then an empty table).
+pub fn iv_load(f: []const u8, n: usize, t: []u8) -> u32 {
+    if (t.len < IV_LEN) { return IV_SHORT; }
+    var r : u32 = IV_SHORT;
+    if (n <= f.len) { r = iv_check(f[0..n]); }
+    if (r != IV_OK) {
+        iv_init(t);
+        return r;
+    }
+    var i : usize = 0;
+    while (i < IV_LEN) {
+        t[i] = f[i];
+        i = i + 1;
+    }
+    return IV_OK;
+}
+
+// ---------------------------------------------------------------- tests
+
+fn t_fp(seed: u8, out: []u8) -> void {
+    var i : usize = 0;
+    while (i < 10) {
+        out[i] = seed + @as(u8, @intCast(i)) * 3;
+        i = i + 1;
+    }
+}
+
+fn t_key(seed: u8, out: []u8) -> void {
+    out[0] = 4;
+    var i : usize = 1;
+    while (i < 65) {
+        out[i] = seed ^ @as(u8, @intCast(i));
+        i = i + 1;
+    }
+}
+
+test iv_an_empty_table_checks_and_has_the_published_layout {
+    var t : [8212]u8 = undefined;
+    assert iv_init(t[0..IV_LEN]);
+    assert iv_check(t[0..IV_LEN]) == IV_OK and iv_count(t[0..IV_LEN]) == 0 and iv_waiting(t[0..IV_LEN]) == 0;
+    assert t[0] == 84 and t[5] == 73 and t[6] == 86 and t[7] == 10 and t[8] == 1;
+    assert IV_OFF_CRC == IV_HDR + IV_MAX * IV_ROW and IV_LEN == IV_OFF_CRC + 4;
+    assert IR_SEEN + 4 <= IV_ROW and IR_NICK + NICK_MAX <= IR_STATE and IR_KEY + PUB_BYTES == IR_NICKLEN;
+    assert iv_init(t[0..100]) == false;
+}
+
+test iv_the_file_round_trips_and_every_damage_is_refused {
+    var t : [8212]u8 = undefined;
+    var u : [8212]u8 = undefined;
+    var f : [8213]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var k : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_fp(1, a[0..10]);
+    t_key(7, k[0..65]);
+    assert iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "nodeb", 5, 1000) == IV_A_NEW;
+    var i : usize = 0;
+    while (i < IV_LEN) {
+        f[i] = t[i];
+        i = i + 1;
+    }
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_OK and iv_find(u[0..IV_LEN], a[0..10]) == 0;
+    assert iv_crc(u[0..IV_LEN]) == iv_crc(t[0..IV_LEN]);
+    // a cut file, a long one, a flipped byte, a wrong magic, a wrong version: refused, the table starts empty
+    assert iv_load(f[0..8213], IV_LEN - 1, u[0..IV_LEN]) == IV_SHORT and iv_count(u[0..IV_LEN]) == 0;
+    assert iv_load(f[0..8213], IV_LEN + 1, u[0..IV_LEN]) == IV_LONG;
+    f[IV_HDR + 30] = f[IV_HDR + 30] ^ 1;
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_CRC and iv_count(u[0..IV_LEN]) == 0;
+    f[IV_HDR + 30] = f[IV_HDR + 30] ^ 1;
+    f[0] = 88;
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_MAGIC;
+    f[0] = 84;
+    f[8] = 2;
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_VERSION_BAD;
+    f[8] = 1;
+    // a row that names no key, or names a state that does not exist, is refused even with a good CRC
+    f[IV_HDR + IR_KEY] = 0;
+    iv_seal(f[0..IV_LEN]);
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_ROW_BAD;
+    f[IV_HDR + IR_KEY] = 4;
+    f[IV_HDR + IR_STATE] = 9;
+    iv_seal(f[0..IV_LEN]);
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_ROW_BAD;
+    f[IV_HDR + IR_STATE] = IV_S_WAITING;
+    // a count over 64
+    f[12] = 65;
+    iv_seal(f[0..IV_LEN]);
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_COUNT;
+    // the same fingerprint twice
+    f[12] = 2;
+    i = 0;
+    while (i < IV_ROW) {
+        f[iv_at(1) + i] = f[iv_at(0) + i];
+        i = i + 1;
+    }
+    iv_seal(f[0..IV_LEN]);
+    assert iv_load(f[0..8213], IV_LEN, u[0..IV_LEN]) == IV_DUP;
+    // a table that does not check takes no arrival
+    t[20] = t[20] ^ 255;
+    assert iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "", 0, 2000) == IV_A_BAD;
+}
+
+test iv_one_person_is_one_row_however_often_they_write {
+    var t : [8212]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    var ka : [65]u8 = undefined;
+    var kb : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_fp(1, a[0..10]);
+    t_fp(100, b[0..10]);
+    t_key(7, ka[0..65]);
+    t_key(9, kb[0..65]);
+    assert iv_arrive(t[0..IV_LEN], a[0..10], ka[0..65], "ann", 3, 1000) == IV_A_NEW;
+    assert iv_arrive(t[0..IV_LEN], a[0..10], ka[0..65], "", 0, 4000) == IV_A_SAME;
+    assert iv_arrive(t[0..IV_LEN], a[0..10], ka[0..65], "ann", 3, 7000) == IV_A_SAME;
+    assert iv_count(t[0..IV_LEN]) == 1 and iv_waiting(t[0..IV_LEN]) == 1 and iv_seen(t[0..IV_LEN], 0) == 3;
+    assert iv_time(t[0..IV_LEN], 0) == 7000 and t[iv_at(0) + IR_NICKLEN] == 3 and t[iv_at(0) + IR_NICK] == 97;
+    // another key under the same fingerprint changes nothing
+    assert iv_arrive(t[0..IV_LEN], a[0..10], kb[0..65], "eve", 3, 9000) == IV_A_CONFLICT;
+    var got : [65]u8 = undefined;
+    assert iv_key(t[0..IV_LEN], 0, got[0..65]) and got[1] == ka[1] and iv_time(t[0..IV_LEN], 0) == 7000;
+    // a second person is a second row, a bad key or a bad nick is not a row / not a nick
+    const nb : [2]u8 = [98, 1];
+    assert iv_arrive(t[0..IV_LEN], b[0..10], kb[0..65], nb[0..2], 2, 8000) == IV_A_NEW;
+    assert t[iv_at(0) + IR_NICKLEN] == 0;
+    var bad : [65]u8 = undefined;
+    t_key(3, bad[0..65]);
+    bad[0] = 2;
+    var c : [10]u8 = undefined;
+    t_fp(200, c[0..10]);
+    assert iv_arrive(t[0..IV_LEN], c[0..10], bad[0..65], "", 0, 9000) == IV_A_BAD;
+    assert iv_count(t[0..IV_LEN]) == 2 and iv_check(t[0..IV_LEN]) == IV_OK;
+}
+
+test iv_the_newest_invitation_stands_first {
+    var t : [8212]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    var c : [10]u8 = undefined;
+    var k : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_fp(1, a[0..10]);
+    t_fp(50, b[0..10]);
+    t_fp(100, c[0..10]);
+    t_key(7, k[0..65]);
+    iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "", 0, 1000);
+    iv_arrive(t[0..IV_LEN], b[0..10], k[0..65], "", 0, 2000);
+    iv_arrive(t[0..IV_LEN], c[0..10], k[0..65], "", 0, 3000);
+    var f : [10]u8 = undefined;
+    assert iv_fp(t[0..IV_LEN], iv_nth(t[0..IV_LEN], 0), f[0..10]) and f[0] == c[0];
+    assert iv_fp(t[0..IV_LEN], iv_nth(t[0..IV_LEN], 2), f[0..10]) and f[0] == a[0];
+    // a writes again: a comes first, the others keep their order
+    iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "", 0, 4000);
+    assert iv_fp(t[0..IV_LEN], iv_nth(t[0..IV_LEN], 0), f[0..10]) and f[0] == a[0];
+    assert iv_fp(t[0..IV_LEN], iv_nth(t[0..IV_LEN], 1), f[0..10]) and f[0] == c[0];
+    assert iv_fp(t[0..IV_LEN], iv_nth(t[0..IV_LEN], 2), f[0..10]) and f[0] == b[0];
+    assert iv_nth(t[0..IV_LEN], 3) == IV_MAX;
+    // a declined row is not shown; the order of the rest stays
+    assert iv_decline(t[0..IV_LEN], c[0..10], 5000);
+    assert iv_waiting(t[0..IV_LEN]) == 2;
+    assert iv_fp(t[0..IV_LEN], iv_nth(t[0..IV_LEN], 1), f[0..10]) and f[0] == b[0];
+}
+
+test iv_a_declined_invitation_comes_back_marked_again_only_after_the_quiet_hour {
+    var t : [8212]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var k : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_fp(1, a[0..10]);
+    t_key(7, k[0..65]);
+    iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "", 0, 1000);
+    assert iv_decline(t[0..IV_LEN], a[0..10], 10000);
+    assert iv_decline(t[0..IV_LEN], a[0..10], 10001) == false;
+    // remembered: the row is kept, hidden, and sessions in the quiet hour are only counted
+    assert iv_count(t[0..IV_LEN]) == 1 and iv_waiting(t[0..IV_LEN]) == 0;
+    assert iv_quiet(t[0..IV_LEN], a[0..10], 10000 + IV_QUIET_MS - 1);
+    assert iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "", 0, 10000 + IV_QUIET_MS - 1) == IV_A_QUIET;
+    assert iv_waiting(t[0..IV_LEN]) == 0 and iv_seen(t[0..IV_LEN], 0) == 2;
+    // not blocked for good: a session after the quiet hour brings it back, marked again
+    assert iv_quiet(t[0..IV_LEN], a[0..10], 10000 + IV_QUIET_MS) == false;
+    assert iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "", 0, 10000 + IV_QUIET_MS) == IV_A_AGAIN;
+    assert iv_waiting(t[0..IV_LEN]) == 1 and iv_again(t[0..IV_LEN], 0) and iv_state(t[0..IV_LEN], 0) == IV_S_WAITING;
+    // declined again: the mark goes with it
+    assert iv_decline(t[0..IV_LEN], a[0..10], 20000 + IV_QUIET_MS) and iv_again(t[0..IV_LEN], 0) == false;
+    assert iv_check(t[0..IV_LEN]) == IV_OK;
+}
+
+test iv_the_table_holds_64_and_then_the_oldest_goes {
+    var t : [8212]u8 = undefined;
+    var k : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_key(7, k[0..65]);
+    var f : [10]u8 = undefined;
+    var i : usize = 0;
+    while (i < 64) {
+        t_fp(@as(u8, @intCast(i)), f[0..10]);
+        f[9] = 200;
+        assert iv_arrive(t[0..IV_LEN], f[0..10], k[0..65], "", 0, 1000 + @as(u64, i)) == IV_A_NEW;
+        i = i + 1;
+    }
+    assert iv_count(t[0..IV_LEN]) == 64 and iv_waiting(t[0..IV_LEN]) == 64;
+    t_fp(99, f[0..10]);
+    assert iv_arrive(t[0..IV_LEN], f[0..10], k[0..65], "", 0, 9000) == IV_A_NEW;
+    assert iv_count(t[0..IV_LEN]) == 64 and iv_find(t[0..IV_LEN], f[0..10]) == 0;
+    // the first one (the oldest) went, the second stayed
+    t_fp(0, f[0..10]);
+    f[9] = 200;
+    assert iv_find(t[0..IV_LEN], f[0..10]) == IV_MAX;
+    t_fp(1, f[0..10]);
+    f[9] = 200;
+    assert iv_find(t[0..IV_LEN], f[0..10]) == 63;
+    assert iv_check(t[0..IV_LEN]) == IV_OK;
+}
+
+test iv_an_accepted_invitation_leaves_the_table {
+    var t : [8212]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    var k : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_fp(1, a[0..10]);
+    t_fp(50, b[0..10]);
+    t_key(7, k[0..65]);
+    iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "", 0, 1000);
+    iv_arrive(t[0..IV_LEN], b[0..10], k[0..65], "", 0, 2000);
+    assert iv_remove(t[0..IV_LEN], a[0..10]) and iv_count(t[0..IV_LEN]) == 1 and iv_find(t[0..IV_LEN], b[0..10]) == 0;
+    assert iv_remove(t[0..IV_LEN], a[0..10]) == false;
+    assert t[iv_at(1)] == 0 and t[iv_at(1) + IR_KEY] == 0 and iv_check(t[0..IV_LEN]) == IV_OK;
+}
+
+test iv_put32_and_iv_get32_are_little_endian_and_keep_the_neighbours {
+    var b : [8]u8 = [255, 255, 255, 255, 255, 255, 255, 255];
+    iv_put32(b[0..8], 2, 0x01020304);
+    assert b[0] == 255 and b[1] == 255 and b[2] == 4 and b[3] == 3 and b[4] == 2 and b[5] == 1 and b[6] == 255;
+    assert iv_get32(b[0..8], 2) == 0x01020304;
+    iv_put32(b[0..8], 0, 0);
+    assert iv_get32(b[0..8], 0) == 0 and b[4] == 2;
+    iv_put32(b[0..8], 4, 0xFFFFFFFF);
+    assert iv_get32(b[0..8], 4) == 0xFFFFFFFF and b[3] == 0;
+}
+
+test iv_same_compares_the_asked_range_only {
+    const x : [6]u8 = [1, 2, 3, 4, 5, 6];
+    const y : [6]u8 = [9, 3, 4, 5, 8, 8];
+    assert iv_same(x[0..6], 2, y[0..6], 1, 3);
+    assert iv_same(x[0..6], 2, y[0..6], 1, 4) == false;
+    assert iv_same(x[0..6], 0, y[0..6], 0, 1) == false;
+    assert iv_same(x[0..6], 0, y[0..6], 0, 0);
+}
+
+test iv_row_ok_refuses_each_malformed_field_of_a_row {
+    var t : [8212]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var k : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_fp(1, a[0..10]);
+    t_key(7, k[0..65]);
+    assert iv_arrive(t[0..IV_LEN], a[0..10], k[0..65], "nodeb", 5, 1000) == IV_A_NEW;
+    assert iv_row_ok(t[0..IV_LEN], 0);
+    const at : usize = iv_at(0);
+    t[at + IR_KEY] = 2;
+    assert iv_row_ok(t[0..IV_LEN], 0) == false;
+    t[at + IR_KEY] = 4;
+    t[at + IR_STATE] = 0;
+    assert iv_row_ok(t[0..IV_LEN], 0) == false;
+    t[at + IR_STATE] = 3;
+    assert iv_row_ok(t[0..IV_LEN], 0) == false;
+    t[at + IR_STATE] = IV_S_DECLINED;
+    assert iv_row_ok(t[0..IV_LEN], 0);
+    t[at + IR_AGAIN] = 2;
+    assert iv_row_ok(t[0..IV_LEN], 0) == false;
+    t[at + IR_AGAIN] = 1;
+    assert iv_row_ok(t[0..IV_LEN], 0);
+    t[at + IR_NICKLEN] = 25;
+    assert iv_row_ok(t[0..IV_LEN], 0) == false;
+    t[at + IR_NICKLEN] = 5;
+    t[at + IR_NICK + 1] = 200;
+    assert iv_row_ok(t[0..IV_LEN], 0) == false;
+    t[at + IR_NICK + 1] = 101;
+    t[at + IR_NICK + 2] = 10;
+    assert iv_row_ok(t[0..IV_LEN], 0) == false;
+    t[at + IR_NICK + 2] = 100;
+    assert iv_row_ok(t[0..IV_LEN], 0);
+}
+
+test iv_to_top_moves_a_row_up_and_shifts_the_ones_above {
+    var t : [8212]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    var i : usize = 0;
+    while (i < 4) {
+        t[iv_at(i)] = @as(u8, @intCast(10 + i));
+        t[iv_at(i) + IV_ROW - 1] = @as(u8, @intCast(20 + i));
+        i = i + 1;
+    }
+    iv_to_top(t[0..IV_LEN], 0);
+    assert t[iv_at(0)] == 10 and t[iv_at(1)] == 11 and t[iv_at(3)] == 13;
+    iv_to_top(t[0..IV_LEN], 3);
+    assert t[iv_at(0)] == 13 and t[iv_at(1)] == 10 and t[iv_at(2)] == 11 and t[iv_at(3)] == 12;
+    assert t[iv_at(0) + IV_ROW - 1] == 23 and t[iv_at(3) + IV_ROW - 1] == 22;
+    iv_to_top(t[0..IV_LEN], 1);
+    assert t[iv_at(0)] == 10 and t[iv_at(1)] == 13 and t[iv_at(2)] == 11;
+    assert t[iv_at(4)] == 0;
+}
+
+test iv_drop_removes_a_row_zeroes_the_freed_one_and_lowers_the_count {
+    var t : [8212]u8 = undefined;
+    var f : [10]u8 = undefined;
+    var k : [65]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    t_key(7, k[0..65]);
+    var i : usize = 0;
+    while (i < 3) {
+        t_fp(@as(u8, @intCast(i * 40)), f[0..10]);
+        iv_arrive(t[0..IV_LEN], f[0..10], k[0..65], "", 0, 1000 + @as(u64, i));
+        i = i + 1;
+    }
+    // newest first: rows are fp 80, 40, 0
+    iv_drop(t[0..IV_LEN], 1);
+    assert iv_count(t[0..IV_LEN]) == 2;
+    assert t[iv_at(0)] == 80 and t[iv_at(1)] == 0;
+    assert t[iv_at(2)] == 0 and t[iv_at(2) + IR_KEY] == 0 and t[iv_at(2) + IR_STATE] == 0;
+    iv_seal(t[0..IV_LEN]);
+    assert iv_check(t[0..IV_LEN]) == IV_OK;
+    iv_drop(t[0..IV_LEN], 1);
+    assert iv_count(t[0..IV_LEN]) == 1 and t[iv_at(1)] == 0 and t[iv_at(0)] == 80;
+}
+
+test iv_set_nick_pads_with_zeros_and_stores_the_length {
+    var t : [8212]u8 = undefined;
+    iv_init(t[0..IV_LEN]);
+    const a : usize = iv_at(0);
+    var i : usize = 0;
+    while (i < 24) {
+        t[a + IR_NICK + i] = 77;
+        i = i + 1;
+    }
+    iv_set_nick(t[0..IV_LEN], a, "abc", 3);
+    assert t[a + IR_NICKLEN] == 3 and t[a + IR_NICK] == 97 and t[a + IR_NICK + 2] == 99;
+    assert t[a + IR_NICK + 3] == 0 and t[a + IR_NICK + 23] == 0 and t[a + IR_STATE] == 0;
+    iv_set_nick(t[0..IV_LEN], a, "", 0);
+    assert t[a + IR_NICKLEN] == 0 and t[a + IR_NICK] == 0;
+    iv_set_nick(t[0..IV_LEN], a, "abcdefghijklmnopqrstuvwx", 24);
+    assert t[a + IR_NICKLEN] == 24 and t[a + IR_NICK + 23] == 120 and t[a + IR_STATE] == 0;
+}

@@ -1,0 +1,1190 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_crypto_probe.t27 -- the host side of call_core.t27: the operating system's own crypto behind
+// the call core's decisions, and a program that shows the behaviour. Not part of the app; nothing here decides.
+// Crypto comes from macOS, never from this file:
+//   * ephemeral P-256 keys and ECDH: Security.framework SecKeyCreateRandomKey (through keysync_host.ks_gen_pair)
+//     and SecKeyCopyKeyExchangeResult with kSecKeyAlgorithmECDHKeyExchangeStandard (the raw shared x);
+//   * SHA-256: CC_SHA256; HMAC-SHA256: CCHmac (CommonCrypto, libSystem); random bytes: SecRandomCopyBytes;
+//   * AEAD: AES-128-GCM from CommonCrypto's CCCryptorGCMOneshotEncrypt / CCCryptorGCMOneshotDecrypt. These take 12
+//     arguments, and t27b passes at most 8 (cli/t27b/README.md, "A function with more than 8 parameters"), so the
+//     call goes through the system libffi (ffi_prep_cif + ffi_call, /usr/lib/libffi.dylib, -lffi), which puts
+//     arguments 9-12 on the stack as AAPCS64 wants. The GCM fns are exported by libcommonCrypto but are SPI: the
+//     public CommonCryptor.h of this SDK declares no GCM at all. CCCryptorCreateWithMode (public) also takes 12
+//     arguments, so it would need the same route. The probe checks the GCM call against a published test vector
+//     (McGrew-Viega test case 2) before it trusts it, and HMAC against RFC 5869 A.1.
+// HKDF (RFC 5869) is two HMAC calls; the inputs are laid out by call_core.t27 and nothing else is computed here.
+//
+// Runs (print one line per check; exit 0 only when every check passed):
+//   (no env)              vectors, ECDH agreement, then two endpoints in this process: a call with matching codes
+//                         (session opens, frames accepted), a person who says "differ" (FAILED, frames refused),
+//                         a changed answer nonce in transit (codes differ; the peer's CONFIRM does not open),
+//                         a changed reveal (commitment fails), every byte of a frame flipped (AEAD refuses, the
+//                         replay window does not move), the same frame twice (replay refused).
+//   CK_ROLE=caller|callee two processes over UDP. CK_BIND / CK_PORT (default 127.0.0.1, caller 47741, callee
+//                         47742), CK_PEER / CK_PEER_PORT (default 127.0.0.1 and the other port), CK_FRAMES (500),
+//                         CK_PACE_US (2000), CK_SAY=match|differ (the person's verdict, given on the command line:
+//                         the probe has no screen), CK_ANSWER=1 (the callee's person consents to answer; without it
+//                         the call rings and ends unanswered). Each side prints CODE <6 digits>; the operator checks
+//                         both are equal. Each side sends CK_FRAMES sealed 960-byte frames and its middle frame a
+//                         second time (an injected replay), then BYE. Pass: every frame accepted once, 0 lost, the
+//                         one replay refused, 0 AEAD failures.
+// Test identities only: the fingerprints are fixed bytes, not keysync device keys (that binding is the next slice).
+// Build (Apple silicon):
+//   t27b build specs/t27os/call_crypto_probe.t27 -o ccp.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -o ccp ccp.o
+// Behaviour checks, not a security audit. Refs gHashTag/t27#11560.
+module T27osCallCryptoProbe;
+
+use t27os::pty_sys::sys_write;
+use t27os::call_view::cv_lan_ok;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_bind;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_gettimeofday;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::keysync::unhex;
+use t27os::keysync_host::ks_sha256;
+use t27os::keysync_host::ks_gen_pair;
+use t27os::keysync_host::konst;
+use t27os::keysync_host::dict;
+use t27os::keysync_host::take;
+use t27os::keysync_host::key_from;
+use t27os::keysync_host::cf_release;
+use t27os::call_core::ck_next;
+use t27os::call_core::ck_media_ok;
+use t27os::call_core::ck_keys_live;
+use t27os::call_core::ck_verdict;
+use t27os::call_core::ck_put_header;
+use t27os::call_core::ck_hdr_type;
+use t27os::call_core::ck_hdr_seq;
+use t27os::call_core::ck_hdr_admit;
+use t27os::call_core::ck_same;
+use t27os::call_core::ck_put;
+use t27os::call_core::ck_wipe;
+use t27os::call_core::ck_commit_input;
+use t27os::call_core::ck_transcript_add;
+use t27os::call_core::ck_sas_input;
+use t27os::call_core::ck_sas_digits;
+use t27os::call_core::ck_replay_accept;
+use t27os::call_core::ck_send_seq;
+use t27os::call_core::ck_expand_input;
+use t27os::call_core::ck_tx_dir;
+use t27os::call_core::ck_nonce;
+use t27os::call_core::CK_T_IDENT;
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::CK_CALLING;
+use t27os::call_core::CK_RINGING;
+use t27os::call_core::CK_VERIFY;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_core::CK_ENDED;
+use t27os::call_core::CK_FAILED;
+use t27os::call_core::CK_EV_CALL;
+use t27os::call_core::CK_EV_INVITE;
+use t27os::call_core::CK_EV_ANSWER;
+use t27os::call_core::CK_EV_ANSWERED;
+use t27os::call_core::CK_EV_CODE_OK;
+use t27os::call_core::CK_EV_CODE_BAD;
+use t27os::call_core::CK_EV_HANGUP;
+use t27os::call_core::CK_EV_BYE;
+use t27os::call_core::CK_EV_TIMEOUT;
+use t27os::call_core::CK_EV_ERROR;
+use t27os::call_core::CK_SAY_MATCH;
+use t27os::call_core::CK_SAY_DIFFER;
+use t27os::call_core::CK_V_OPEN;
+use t27os::call_core::CK_V_FAIL;
+use t27os::call_core::CK_HDR;
+use t27os::call_core::CK_TAG;
+use t27os::call_core::CK_KEY;
+use t27os::call_core::CK_IV;
+use t27os::call_core::CK_T_INVITE;
+use t27os::call_core::CK_T_ANSWER;
+use t27os::call_core::CK_T_REVEAL;
+use t27os::call_core::CK_T_CONFIRM;
+use t27os::call_core::CK_T_BYE;
+use t27os::call_core::CK_T_MEDIA;
+use t27os::call_core::CK_T_VIDEO;
+use t27os::call_core::CK_T_TEXT;
+use t27os::call_core::CK_T_H264;
+use t27os::call_core::CK_T_VCTL;
+use t27os::call_core::CK_INVITE_LEN;
+use t27os::call_core::CK_ANSWER_LEN;
+use t27os::call_core::CK_REVEAL_LEN;
+use t27os::call_core::CK_TRANSCRIPT_LEN;
+
+const CKH_RTLD_DEFAULT : u64 = 18446744073709551614;
+/// kCCHmacAlgSHA256.
+const CKH_HMAC_SHA256 : u32 = 2;
+/// libffi FFI_DEFAULT_ABI on arm64 (FFI_SYSV).
+const CKH_FFI_SYSV : u32 = 1;
+
+fn ckh_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+/// The address of a byte slice: memmove(p, p, 0) returns p.
+fn ckh_at(p: []const u8, q: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn ckh_hmac_raw(alg: u32, key: []const u8, klen: u64, data: []const u8, dlen: u64, out: []u8) -> void { @extern("CCHmac"); }
+fn ckh_rand_raw(rnd: u64, n: u64, b: []u8) -> i32 { return @extern("SecRandomCopyBytes"); }
+fn ckh_ffi_prep(cif: []u8, abi: u32, nargs: u32, rtype: u64, atypes: []const u8) -> i32 { return @extern("ffi_prep_cif"); }
+fn ckh_ffi_call(cif: []const u8, f: u64, rv: []u8, avals: []const u8) -> void { @extern("ffi_call"); }
+fn ckh_kx(priv: u64, alg: u64, pubk: u64, params: u64, err: u64) -> u64 { return @extern("SecKeyCopyKeyExchangeResult"); }
+fn ckh_sendto(fd: i32, b: []const u8, n: u64, flags: i32, to: []const u8, tolen: u32) -> i64 { return @extern("sendto"); }
+fn ckh_recvfrom(fd: i32, b: []u8, n: u64, flags: i32, from: u64, fromlen: u64) -> i64 { return @extern("recvfrom"); }
+fn ckh_fcntl(fd: i32, cmd: i32, arg: u64) -> i32 { return @extern("__fcntl"); }
+fn ckh_usleep(us: u32) -> i32 { return @extern("usleep"); }
+
+// ---------------------------------------------------------------- printing
+
+fn ckh_line(s: []const u8) -> void { sys_write(1, s, @as(u64, s.len)); }
+
+fn ckh_check(s: []const u8, ok: bool) -> bool {
+    if (ok) { ckh_line("ok   "); } else { ckh_line("FAIL "); }
+    ckh_line(s);
+    ckh_line("\n");
+    return ok;
+}
+
+fn ckh_num(label: []const u8, v: u64) -> void {
+    var d : [24]u8 = undefined;
+    var i : usize = 24;
+    var x : u64 = v;
+    while (true) {
+        i = i - 1;
+        d[i] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+        if (x == 0) { break; }
+    }
+    sys_write(1, label, @as(u64, label.len));
+    sys_write(1, d[i..24], @as(u64, 24 - i));
+    sys_write(1, "\n", 1);
+}
+
+// ---------------------------------------------------------------- the system primitives
+
+pub fn ckh_rand(b: []u8) -> bool { return ckh_rand_raw(0, @as(u64, b.len), b) == 0; }
+
+/// HMAC-SHA256(key, data) into out[0..32].
+fn ckh_hmac(key: []const u8, data: []const u8, out: []u8) -> void {
+    ckh_hmac_raw(CKH_HMAC_SHA256, key, @as(u64, key.len), data, @as(u64, data.len), out);
+}
+
+/// AES-128-GCM, 16-byte tag. enc: src -> out, tag written; else src -> out and the OS checks tag. 0 = kCCSuccess;
+/// the CCCryptorStatus as an unsigned 32-bit value otherwise; 1 when a size is wrong or libffi cannot be set up.
+pub fn ckh_gcm(enc: bool, key: []const u8, iv: []const u8, aad: []const u8, src: []const u8, out: []u8, tag: []u8) -> u64 {
+    if (key.len != CK_KEY or iv.len != CK_IV or tag.len != CK_TAG or src.len == 0 or out.len < src.len) { return 1; }
+    var f : u64 = 0;
+    if (enc) { f = ckh_dlsym(CKH_RTLD_DEFAULT, "CCCryptorGCMOneshotEncrypt"); } else { f = ckh_dlsym(CKH_RTLD_DEFAULT, "CCCryptorGCMOneshotDecrypt"); }
+    const tp : u64 = ckh_dlsym(CKH_RTLD_DEFAULT, "ffi_type_pointer");
+    const tu32 : u64 = ckh_dlsym(CKH_RTLD_DEFAULT, "ffi_type_uint32");
+    const tu64 : u64 = ckh_dlsym(CKH_RTLD_DEFAULT, "ffi_type_uint64");
+    const ts32 : u64 = ckh_dlsym(CKH_RTLD_DEFAULT, "ffi_type_sint32");
+    if (f == 0 or tp == 0 or tu32 == 0 or tu64 == 0 or ts32 == 0) { return 1; }
+    // (alg, key, keyLen, iv, ivLen, aad, aadLen, in, inLen, out, tag, tagLen)
+    var ty : [96]u8 = undefined;
+    put_u64(ty[0..96], 0, tu32);
+    var k : usize = 1;
+    while (k < 12) {
+        if (k % 2 == 1 or k == 10) { put_u64(ty[0..96], k * 8, tp); } else { put_u64(ty[0..96], k * 8, tu64); }
+        k = k + 1;
+    }
+    put_u64(ty[0..96], 88, tu64);
+    var va : [96]u8 = undefined;
+    put_u64(va[0..96], 0, 0);
+    put_u64(va[0..96], 8, ckh_at(key, key, 0));
+    put_u64(va[0..96], 16, @as(u64, key.len));
+    put_u64(va[0..96], 24, ckh_at(iv, iv, 0));
+    put_u64(va[0..96], 32, @as(u64, iv.len));
+    put_u64(va[0..96], 40, ckh_at(aad, aad, 0));
+    put_u64(va[0..96], 48, @as(u64, aad.len));
+    put_u64(va[0..96], 56, ckh_at(src, src, 0));
+    put_u64(va[0..96], 64, @as(u64, src.len));
+    put_u64(va[0..96], 72, sys_addr(out, out, 0));
+    put_u64(va[0..96], 80, sys_addr(tag, tag, 0));
+    put_u64(va[0..96], 88, @as(u64, tag.len));
+    const vb : u64 = sys_addr(va[0..96], va[0..96], 0);
+    var av : [96]u8 = undefined;
+    k = 0;
+    while (k < 12) {
+        put_u64(av[0..96], k * 8, vb + @as(u64, k) * 8);
+        k = k + 1;
+    }
+    var cif : [64]u8 = undefined;
+    ck_wipe(cif[0..64]);
+    if (ckh_ffi_prep(cif[0..64], CKH_FFI_SYSV, 12, ts32, ty[0..96]) != 0) { return 1; }
+    var rv : [8]u8 = undefined;
+    ck_wipe(rv[0..8]);
+    ckh_ffi_call(cif[0..64], f, rv[0..8], av[0..96]);
+    return get_u64(rv[0..8], 0) & 4294967295;
+}
+
+/// ECDH: the raw shared x of my private key (97 bytes X9.63) and the peer's public key (65), into out[0..32].
+fn ckh_ecdh(priv: []const u8, peer_pub: []const u8, out: []u8) -> bool {
+    const k : u64 = key_from(priv, true);
+    const p : u64 = key_from(peer_pub, false);
+    const alg : u64 = konst("kSecKeyAlgorithmECDHKeyExchangeStandard");
+    var dk : [4]u64 = undefined;
+    var dv : [4]u64 = undefined;
+    var i : usize = 0;
+    while (i < 4) {
+        dk[i] = 0;
+        dv[i] = 0;
+        i = i + 1;
+    }
+    const params : u64 = dict(dk, dv, 0);
+    var n : usize = 0;
+    if (k != 0 and p != 0 and alg != 0 and params != 0) { n = take(ckh_kx(k, alg, p, params, 0), out); }
+    if (params != 0) { cf_release(params); }
+    if (k != 0) { cf_release(k); }
+    if (p != 0) { cf_release(p); }
+    return n == 32;
+}
+
+// ---------------------------------------------------------------- one endpoint, in a byte block
+
+const EP_ROLE : usize = 0;
+const EP_STATE : usize = 1;
+const EP_LSAY : usize = 2;
+const EP_PSAY : usize = 3;
+const EP_HAVE_CODE : usize = 4;
+const EP_ME : usize = 8;
+const EP_PEER : usize = 18;
+const EP_SID : usize = 28;
+const EP_PRIV : usize = 44;
+const EP_PUB : usize = 144;
+const EP_PPUB : usize = 212;
+const EP_N : usize = 280;
+const EP_PN : usize = 296;
+const EP_C : usize = 312;
+const EP_TXK : usize = 344;
+const EP_TXIV : usize = 360;
+const EP_RXK : usize = 376;
+const EP_RXIV : usize = 392;
+const EP_CTR : usize = 408;
+const EP_WIN : usize = 416;
+const EP_T : usize = 488;
+const EP_TR : usize = 520;
+const EP_CODE : usize = 936;
+const EP_LEN : usize = 960;
+
+fn ckh_state(ep: []const u8) -> u32 { return @as(u32, ep[EP_STATE]); }
+
+fn ckh_caller(ep: []const u8) -> bool { return ep[EP_ROLE] == 1; }
+
+/// Wipe the ephemeral private key and both directions' keys and IVs (an end state, and call_session cs_close).
+pub fn ckh_wipe_keys(ep: []u8) -> void {
+    ck_wipe(ep[EP_PRIV..EP_PRIV + 97]);
+    ck_wipe(ep[EP_TXK..EP_CTR]);
+}
+
+/// Move the call; an end state wipes the private key and both directions' keys.
+fn ckh_go(ep: []u8, ev: u32) -> void {
+    const n : u32 = ck_next(ckh_state(ep), ev);
+    ep[EP_STATE] = @as(u8, @intCast(n));
+    if (n == CK_ENDED or n == CK_FAILED) { ckh_wipe_keys(ep); }
+}
+
+fn ckh_ep_init(ep: []u8, caller: bool, me: []const u8, peer: []const u8) -> void {
+    ck_wipe(ep[0..EP_LEN]);
+    if (caller) { ep[EP_ROLE] = 1; }
+    ck_put(ep, EP_ME, me);
+    ck_put(ep, EP_PEER, peer);
+    ep[EP_STATE] = @as(u8, @intCast(CK_IDLE));
+}
+
+/// Caller: dial. The INVITE (149 bytes) into out, 0 when the state or the OS refuses.
+fn ckh_invite(ep: []u8, out: []u8) -> usize {
+    const s : u32 = ckh_state(ep);
+    if (!ckh_caller(ep) or (s != CK_IDLE and s != CK_ENDED and s != CK_FAILED) or out.len < CK_INVITE_LEN) { return 0; }
+    ck_wipe(ep[EP_LSAY..EP_ME]);
+    ck_wipe(ep[EP_SID..EP_LEN]);
+    if (!ks_gen_pair(ep[EP_PRIV..EP_PRIV + 97], ep[EP_PUB..EP_PUB + 65])) { return 0; }
+    if (!ckh_rand(ep[EP_SID..EP_SID + 16]) or !ckh_rand(ep[EP_N..EP_N + 16])) { return 0; }
+    var ci : [160]u8 = undefined;
+    const n : usize = ck_commit_input(ep[EP_SID..EP_SID + 16], ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_PUB..EP_PUB + 65], ep[EP_N..EP_N + 16], ci[0..160]);
+    if (n == 0) { return 0; }
+    ks_sha256(ci[0..n], ep[EP_C..EP_C + 32]);
+    ck_put_header(out, CK_T_INVITE, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_SID..EP_SID + 16], 0);
+    ck_put(out, 52, ep[EP_PUB..EP_PUB + 65]);
+    ck_put(out, 117, ep[EP_C..EP_C + 32]);
+    ck_transcript_add(ep[EP_TR..EP_TR + CK_TRANSCRIPT_LEN], 0, out[0..CK_INVITE_LEN]);
+    ckh_go(ep, CK_EV_CALL);
+    return CK_INVITE_LEN;
+}
+
+/// Callee: an INVITE arrived. True when it rings (the person has not answered yet).
+fn ckh_on_invite(ep: []u8, m: []const u8) -> bool {
+    const s : u32 = ckh_state(ep);
+    if (ckh_caller(ep) or (s != CK_IDLE and s != CK_ENDED and s != CK_FAILED)) { return false; }
+    if (m.len != CK_INVITE_LEN or ck_hdr_type(m) != CK_T_INVITE or ck_hdr_seq(m) != 0) { return false; }
+    if (!ck_hdr_admit(m, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], m[0..0])) { return false; }
+    ck_wipe(ep[EP_LSAY..EP_ME]);
+    ck_wipe(ep[EP_SID..EP_LEN]);
+    ck_put(ep, EP_SID, m[28..44]);
+    ck_put(ep, EP_PPUB, m[52..117]);
+    ck_put(ep, EP_C, m[117..149]);
+    ck_transcript_add(ep[EP_TR..EP_TR + CK_TRANSCRIPT_LEN], 0, m);
+    ckh_go(ep, CK_EV_INVITE);
+    return true;
+}
+
+/// Callee: the person pressed Answer. The ANSWER (165 bytes) into out.
+fn ckh_answer(ep: []u8, out: []u8) -> usize {
+    if (ckh_caller(ep) or ckh_state(ep) != CK_RINGING or out.len < CK_ANSWER_LEN) { return 0; }
+    if (!ks_gen_pair(ep[EP_PRIV..EP_PRIV + 97], ep[EP_PUB..EP_PUB + 65]) or !ckh_rand(ep[EP_N..EP_N + 16])) {
+        ckh_go(ep, CK_EV_ERROR);
+        return 0;
+    }
+    ckh_go(ep, CK_EV_ANSWER);
+    ck_put_header(out, CK_T_ANSWER, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_SID..EP_SID + 16], 0);
+    ck_put(out, 52, ep[EP_PUB..EP_PUB + 65]);
+    ck_put(out, 117, ep[EP_N..EP_N + 16]);
+    ks_sha256(ep[EP_TR..EP_TR + CK_INVITE_LEN], out[133..165]);
+    ck_transcript_add(ep[EP_TR..EP_TR + CK_TRANSCRIPT_LEN], CK_INVITE_LEN, out[0..CK_ANSWER_LEN]);
+    return CK_ANSWER_LEN;
+}
+
+/// Both sides, once the transcript is whole: T, the code, ECDH, and the two directions' keys. The private key
+/// and every intermediate secret are wiped here.
+fn ckh_derive(ep: []u8) -> bool {
+    ks_sha256(ep[EP_TR..EP_TR + CK_TRANSCRIPT_LEN], ep[EP_T..EP_T + 32]);
+    var si : [64]u8 = undefined;
+    const sn : usize = ck_sas_input(ep[EP_T..EP_T + 32], si[0..64]);
+    var dg : [32]u8 = undefined;
+    ks_sha256(si[0..sn], dg[0..32]);
+    ck_sas_digits(dg[0..32], ep[EP_CODE..EP_CODE + 6]);
+    var sh : [32]u8 = undefined;
+    const ok : bool = ckh_ecdh(ep[EP_PRIV..EP_PRIV + 97], ep[EP_PPUB..EP_PPUB + 65], sh[0..32]);
+    ck_wipe(ep[EP_PRIV..EP_PRIV + 97]);
+    if (!ok) {
+        ckh_go(ep, CK_EV_ERROR);
+        return false;
+    }
+    var prk : [32]u8 = undefined;
+    ckh_hmac(ep[EP_T..EP_T + 32], sh[0..32], prk[0..32]);
+    ck_wipe(sh[0..32]);
+    var fc : [10]u8 = undefined;
+    var fe : [10]u8 = undefined;
+    if (ckh_caller(ep)) {
+        ck_put(fc[0..10], 0, ep[EP_ME..EP_ME + 10]);
+        ck_put(fe[0..10], 0, ep[EP_PEER..EP_PEER + 10]);
+    } else {
+        ck_put(fc[0..10], 0, ep[EP_PEER..EP_PEER + 10]);
+        ck_put(fe[0..10], 0, ep[EP_ME..EP_ME + 10]);
+    }
+    const tx : u32 = ck_tx_dir(ckh_caller(ep));
+    var dir : u32 = 0;
+    while (dir < 2) {
+        var ei : [64]u8 = undefined;
+        const en : usize = ck_expand_input(dir, fc[0..10], fe[0..10], ep[EP_SID..EP_SID + 16], ei[0..64]);
+        var okm : [32]u8 = undefined;
+        ckh_hmac(prk[0..32], ei[0..en], okm[0..32]);
+        if (dir == tx) {
+            ck_put(ep, EP_TXK, okm[0..16]);
+            ck_put(ep, EP_TXIV, okm[16..28]);
+        } else {
+            ck_put(ep, EP_RXK, okm[0..16]);
+            ck_put(ep, EP_RXIV, okm[16..28]);
+        }
+        ck_wipe(okm[0..32]);
+        dir = dir + 1;
+    }
+    ck_wipe(prk[0..32]);
+    ep[EP_HAVE_CODE] = 1;
+    return true;
+}
+
+/// Caller: the ANSWER arrived. The REVEAL (100 bytes) into out, keys derived; 0 when the message is not the answer
+/// to my INVITE.
+fn ckh_on_answer(ep: []u8, m: []const u8, out: []u8) -> usize {
+    if (!ckh_caller(ep) or ckh_state(ep) != CK_CALLING or out.len < CK_REVEAL_LEN) { return 0; }
+    if (m.len != CK_ANSWER_LEN or ck_hdr_type(m) != CK_T_ANSWER or ck_hdr_seq(m) != 0) { return 0; }
+    if (!ck_hdr_admit(m, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_SID..EP_SID + 16])) { return 0; }
+    var h : [32]u8 = undefined;
+    ks_sha256(ep[EP_TR..EP_TR + CK_INVITE_LEN], h[0..32]);
+    if (!ck_same(h[0..32], m[133..165])) { return 0; }
+    ck_put(ep, EP_PPUB, m[52..117]);
+    ck_put(ep, EP_PN, m[117..133]);
+    ck_transcript_add(ep[EP_TR..EP_TR + CK_TRANSCRIPT_LEN], CK_INVITE_LEN, m);
+    ckh_go(ep, CK_EV_ANSWERED);
+    ck_put_header(out, CK_T_REVEAL, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_SID..EP_SID + 16], 0);
+    ck_put(out, 52, ep[EP_N..EP_N + 16]);
+    ks_sha256(m, out[68..100]);
+    ck_transcript_add(ep[EP_TR..EP_TR + CK_TRANSCRIPT_LEN], CK_INVITE_LEN + CK_ANSWER_LEN, out[0..CK_REVEAL_LEN]);
+    if (!ckh_derive(ep)) { return 0; }
+    return CK_REVEAL_LEN;
+}
+
+/// Callee: the REVEAL arrived. The commitment is checked; a mismatch fails the call. True when the code is ready.
+fn ckh_on_reveal(ep: []u8, m: []const u8) -> bool {
+    if (ckh_caller(ep) or ckh_state(ep) != CK_VERIFY or ep[EP_HAVE_CODE] != 0) { return false; }
+    if (m.len != CK_REVEAL_LEN or ck_hdr_type(m) != CK_T_REVEAL or ck_hdr_seq(m) != 0) { return false; }
+    if (!ck_hdr_admit(m, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_SID..EP_SID + 16])) { return false; }
+    var h : [32]u8 = undefined;
+    ks_sha256(ep[EP_TR + CK_INVITE_LEN..EP_TR + CK_INVITE_LEN + CK_ANSWER_LEN], h[0..32]);
+    if (!ck_same(h[0..32], m[68..100])) { return false; }
+    var ci : [160]u8 = undefined;
+    const n : usize = ck_commit_input(ep[EP_SID..EP_SID + 16], ep[EP_PEER..EP_PEER + 10], ep[EP_ME..EP_ME + 10], ep[EP_PPUB..EP_PPUB + 65], m[52..68], ci[0..160]);
+    ks_sha256(ci[0..n], h[0..32]);
+    if (n == 0 or !ck_same(h[0..32], ep[EP_C..EP_C + 32])) {
+        ckh_go(ep, CK_EV_CODE_BAD);
+        return false;
+    }
+    ck_put(ep, EP_PN, m[52..68]);
+    ck_transcript_add(ep[EP_TR..EP_TR + CK_TRANSCRIPT_LEN], CK_INVITE_LEN + CK_ANSWER_LEN, m);
+    return ckh_derive(ep);
+}
+
+/// Seal one frame of type typ with my sending key into out: header || ciphertext || tag. 0 when the state does not
+/// allow this type, the counter is spent or the OS refuses.
+fn ckh_seal(ep: []u8, typ: u32, pt: []const u8, out: []u8) -> usize {
+    const s : u32 = ckh_state(ep);
+    if (typ == CK_T_CONFIRM or typ == CK_T_IDENT) {
+        if (s != CK_VERIFY or ep[EP_HAVE_CODE] == 0) { return 0; }
+    } else if (typ == CK_T_MEDIA or typ == CK_T_BYE or typ == CK_T_VIDEO or typ == CK_T_TEXT or typ == CK_T_H264 or typ == CK_T_VCTL) {
+        if (!ck_media_ok(s)) { return 0; }
+    } else {
+        return 0;
+    }
+    const n : usize = pt.len;
+    if (n == 0 or out.len < CK_HDR + n + CK_TAG) { return 0; }
+    const seq : u64 = ck_send_seq(ep[EP_CTR..EP_CTR + 8]);
+    if (seq == 0) { return 0; }
+    var hd : [52]u8 = undefined;
+    ck_put_header(hd[0..52], typ, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_SID..EP_SID + 16], seq);
+    var nc : [12]u8 = undefined;
+    ck_nonce(ep[EP_TXIV..EP_TXIV + 12], seq, nc[0..12]);
+    var tg : [16]u8 = undefined;
+    if (ckh_gcm(true, ep[EP_TXK..EP_TXK + 16], nc[0..12], hd[0..52], pt, out[52..52 + n], tg[0..16]) != 0) { return 0; }
+    ck_put(out, 0, hd[0..52]);
+    ck_put(out, 52 + n, tg[0..16]);
+    return CK_HDR + n + CK_TAG;
+}
+
+/// Open a sealed frame into out. The plaintext length, or: -1 not a frame for this call, -2 the state refuses
+/// this type, -3 the AEAD tag fails, -4 a replay. The order is parse, state, tag, then the replay window, so a
+/// forged frame never moves the window.
+fn ckh_open(ep: []u8, m: []const u8, out: []u8) -> i64 {
+    if (m.len <= CK_HDR + CK_TAG) { return -1; }
+    const typ : u32 = ck_hdr_type(m);
+    if (!ck_hdr_admit(m, ep[EP_ME..EP_ME + 10], ep[EP_PEER..EP_PEER + 10], ep[EP_SID..EP_SID + 16])) { return -1; }
+    const s : u32 = ckh_state(ep);
+    if (typ == CK_T_CONFIRM or typ == CK_T_IDENT) {
+        if (s != CK_VERIFY or ep[EP_HAVE_CODE] == 0) { return -2; }
+    } else if (typ == CK_T_MEDIA or typ == CK_T_BYE or typ == CK_T_VIDEO or typ == CK_T_TEXT or typ == CK_T_H264 or typ == CK_T_VCTL) {
+        if (!ck_media_ok(s)) { return -2; }
+    } else {
+        return -1;
+    }
+    const n : usize = m.len - CK_HDR - CK_TAG;
+    if (out.len < n) { return -1; }
+    const seq : u64 = ck_hdr_seq(m);
+    var nc : [12]u8 = undefined;
+    ck_nonce(ep[EP_RXIV..EP_RXIV + 12], seq, nc[0..12]);
+    var tg : [16]u8 = undefined;
+    ck_put(tg[0..16], 0, m[CK_HDR + n..m.len]);
+    if (ckh_gcm(false, ep[EP_RXK..EP_RXK + 16], nc[0..12], m[0..52], m[52..52 + n], out[0..n], tg[0..16]) != 0) {
+        ck_wipe(out[0..n]);
+        return -3;
+    }
+    if (!ck_replay_accept(ep[EP_WIN..EP_WIN + 72], seq)) {
+        ck_wipe(out[0..n]);
+        return -4;
+    }
+    return @as(i64, @intCast(n));
+}
+
+/// Both verdicts known: open the call or fail it.
+fn ckh_apply(ep: []u8) -> void {
+    const v : u32 = ck_verdict(@as(u32, ep[EP_LSAY]), @as(u32, ep[EP_PSAY]));
+    if (v == CK_V_OPEN) { ckh_go(ep, CK_EV_CODE_OK); }
+    if (v == CK_V_FAIL) { ckh_go(ep, CK_EV_CODE_BAD); }
+}
+
+/// The local person's verdict, sealed as CONFIRM (T || verdict) into out.
+fn ckh_confirm(ep: []u8, say: u32, out: []u8) -> usize {
+    if (ckh_state(ep) != CK_VERIFY or ep[EP_HAVE_CODE] == 0) { return 0; }
+    var pt : [33]u8 = undefined;
+    ck_put(pt[0..33], 0, ep[EP_T..EP_T + 32]);
+    pt[32] = @as(u8, @intCast(say & 255));
+    const n : usize = ckh_seal(ep, CK_T_CONFIRM, pt[0..33], out);
+    ep[EP_LSAY] = @as(u8, @intCast(say & 255));
+    ckh_apply(ep);
+    return n;
+}
+
+/// The peer's CONFIRM. A frame that does not open, or names another transcript, changes nothing: the call waits
+/// and ends by timeout, so a forged CONFIRM cannot end it either way.
+fn ckh_on_confirm(ep: []u8, m: []const u8) -> i64 {
+    var pt : [64]u8 = undefined;
+    const r : i64 = ckh_open(ep, m, pt[0..64]);
+    if (r != 33) { return r; }
+    if (!ck_same(pt[0..32], ep[EP_T..EP_T + 32])) { return -5; }
+    ep[EP_PSAY] = pt[32];
+    ckh_apply(ep);
+    return r;
+}
+
+// ---------------------------------------------------------------- frames with checkable content
+
+/// 960 bytes: frame index (u64 LE), role byte, then bytes that depend on both.
+fn ckh_frame(pt: []u8, idx: u64, role: u8) -> void {
+    put_u64(pt, 0, idx);
+    pt[8] = role;
+    var i : usize = 9;
+    while (i < 960) {
+        pt[i] = @as(u8, @intCast((idx * 7 + @as(u64, i) + @as(u64, role) * 101) & 255));
+        i = i + 1;
+    }
+}
+
+/// The index of a frame whose content is exactly what ckh_frame wrote for that role; 2^64 - 1 otherwise.
+fn ckh_frame_idx(pt: []const u8, n: i64, role: u8) -> u64 {
+    if (n != 960 or pt[8] != role) { return 18446744073709551615; }
+    const idx : u64 = get_u64(pt, 0);
+    var i : usize = 9;
+    while (i < 960) {
+        if (pt[i] != @as(u8, @intCast((idx * 7 + @as(u64, i) + @as(u64, role) * 101) & 255))) { return 18446744073709551615; }
+        i = i + 1;
+    }
+    return idx;
+}
+
+// ---------------------------------------------------------------- checks in one process
+
+fn ckh_vectors() -> bool {
+    var all : bool = true;
+    // AES-128-GCM, McGrew-Viega test case 2: K = 0^16, IV = 0^12, P = 0^16.
+    var k : [16]u8 = undefined;
+    var iv : [12]u8 = undefined;
+    var p : [16]u8 = undefined;
+    var z : [1]u8 = undefined;
+    ck_wipe(k[0..16]);
+    ck_wipe(iv[0..12]);
+    ck_wipe(p[0..16]);
+    var c : [16]u8 = undefined;
+    var t : [16]u8 = undefined;
+    const st : u64 = ckh_gcm(true, k[0..16], iv[0..12], z[0..0], p[0..16], c[0..16], t[0..16]);
+    ckh_num("  GCM encrypt status (0 = kCCSuccess): ", st);
+    var want : [16]u8 = undefined;
+    unhex("0388dace60b6a392f328c2b971b2fe78", want[0..16]);
+    all = ckh_check("AES-128-GCM via libffi -> CCCryptorGCMOneshotEncrypt: ciphertext of test case 2", st == 0 and ck_same(c[0..16], want[0..16])) and all;
+    unhex("ab6e47d42cec13bdf53a67b21257bddf", want[0..16]);
+    all = ckh_check("AES-128-GCM: tag of test case 2", ck_same(t[0..16], want[0..16])) and all;
+    var back : [16]u8 = undefined;
+    const sd : u64 = ckh_gcm(false, k[0..16], iv[0..12], z[0..0], c[0..16], back[0..16], t[0..16]);
+    all = ckh_check("AES-128-GCM: CCCryptorGCMOneshotDecrypt opens it to zeros", sd == 0 and ck_same(back[0..16], p[0..16])) and all;
+    t[5] = t[5] ^ 1;
+    const sb : u64 = ckh_gcm(false, k[0..16], iv[0..12], z[0..0], c[0..16], back[0..16], t[0..16]);
+    ckh_num("  GCM decrypt status with a changed tag: ", sb);
+    all = ckh_check("AES-128-GCM: a changed tag is refused by the OS", sb != 0) and all;
+    // HMAC-SHA256 / HKDF, RFC 5869 A.1.
+    var ikm : [22]u8 = undefined;
+    var i : usize = 0;
+    while (i < 22) {
+        ikm[i] = 11;
+        i = i + 1;
+    }
+    var salt : [13]u8 = undefined;
+    unhex("000102030405060708090a0b0c", salt[0..13]);
+    var info : [11]u8 = undefined;
+    unhex("f0f1f2f3f4f5f6f7f8f901", info[0..11]);
+    var prk : [32]u8 = undefined;
+    ckh_hmac(salt[0..13], ikm[0..22], prk[0..32]);
+    var w : [32]u8 = undefined;
+    unhex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5", w[0..32]);
+    all = ckh_check("HKDF-Extract via CCHmac: PRK of RFC 5869 A.1", ck_same(prk[0..32], w[0..32])) and all;
+    var okm : [32]u8 = undefined;
+    ckh_hmac(prk[0..32], info[0..11], okm[0..32]);
+    unhex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf", w[0..32]);
+    all = ckh_check("HKDF-Expand via CCHmac: first OKM block of RFC 5869 A.1", ck_same(okm[0..32], w[0..32])) and all;
+    // ECDH between two fresh P-256 pairs.
+    var pa : [97]u8 = undefined;
+    var qa : [65]u8 = undefined;
+    var pb : [97]u8 = undefined;
+    var qb : [65]u8 = undefined;
+    const g : bool = ks_gen_pair(pa[0..97], qa[0..65]) and ks_gen_pair(pb[0..97], qb[0..65]);
+    var s1 : [32]u8 = undefined;
+    var s2 : [32]u8 = undefined;
+    const e1 : bool = ckh_ecdh(pa[0..97], qb[0..65], s1[0..32]);
+    const e2 : bool = ckh_ecdh(pb[0..97], qa[0..65], s2[0..32]);
+    all = ckh_check("ECDH P-256 via SecKeyCopyKeyExchangeResult: both sides get the same 32 bytes", g and e1 and e2 and ck_same(s1[0..32], s2[0..32])) and all;
+    var s3 : [32]u8 = undefined;
+    const e3 : bool = ckh_ecdh(pa[0..97], qa[0..65], s3[0..32]);
+    all = ckh_check("ECDH: another public key gives another secret", e3 and !ck_same(s1[0..32], s3[0..32])) and all;
+    var r1 : [16]u8 = undefined;
+    var r2 : [16]u8 = undefined;
+    all = ckh_check("SecRandomCopyBytes gives two different 16-byte values", ckh_rand(r1[0..16]) and ckh_rand(r2[0..16]) and !ck_same(r1[0..16], r2[0..16])) and all;
+    ck_wipe(pa[0..97]);
+    ck_wipe(pb[0..97]);
+    ck_wipe(s1[0..32]);
+    ck_wipe(s2[0..32]);
+    ck_wipe(s3[0..32]);
+    return all;
+}
+
+fn ckh_fps(fa: []u8, fb: []u8) -> void {
+    var i : usize = 0;
+    while (i < 10) {
+        fa[i] = @as(u8, @intCast(161 + i));
+        fb[i] = @as(u8, @intCast(177 + i));
+        i = i + 1;
+    }
+}
+
+/// INVITE -> ANSWER -> REVEAL between a (caller) and b (callee), with an optional change in transit. 1: a man in
+/// the middle changes the answer nonce on its way to a and, so that b does not notice, puts the hash of the
+/// original ANSWER into the REVEAL on its way to b (the plain messages carry no signature in this slice).
+/// 2: a byte of the revealed nonce changes on its way to b. 3: the answer nonce changes and nothing else.
+fn ckh_handshake(a: []u8, b: []u8, tamper: u32) -> bool {
+    var inv : [149]u8 = undefined;
+    var ans : [165]u8 = undefined;
+    var rev : [100]u8 = undefined;
+    var h0 : [32]u8 = undefined;
+    if (ckh_invite(a, inv[0..149]) != CK_INVITE_LEN) { return false; }
+    if (!ckh_on_invite(b, inv[0..149])) { return false; }
+    if (ckh_answer(b, ans[0..165]) != CK_ANSWER_LEN) { return false; }
+    ks_sha256(ans[0..165], h0[0..32]);
+    if (tamper == 1 or tamper == 3) { ans[120] = ans[120] ^ 4; }
+    if (ckh_on_answer(a, ans[0..165], rev[0..100]) != CK_REVEAL_LEN) { return false; }
+    if (tamper == 1) { ck_put(rev[0..100], 68, h0[0..32]); }
+    if (tamper == 2) { rev[60] = rev[60] ^ 4; }
+    return ckh_on_reveal(b, rev[0..100]);
+}
+
+fn ckh_scenarios() -> bool {
+    var all : bool = true;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    ckh_fps(fa[0..10], fb[0..10]);
+    var a : [960]u8 = undefined;
+    var b : [960]u8 = undefined;
+    var ca : [128]u8 = undefined;
+    var cb : [128]u8 = undefined;
+    var pt : [960]u8 = undefined;
+    var got : [960]u8 = undefined;
+    var f1 : [1028]u8 = undefined;
+    var f2 : [1028]u8 = undefined;
+    var bad : [1028]u8 = undefined;
+
+    // 1. both codes equal, both people say match
+    ckh_ep_init(a[0..960], true, fa[0..10], fb[0..10]);
+    ckh_ep_init(b[0..960], false, fb[0..10], fa[0..10]);
+    const hs : bool = ckh_handshake(a[0..960], b[0..960], 0);
+    ckh_line("  code on the caller: ");
+    sys_write(1, a[EP_CODE..EP_CODE + 6], 6);
+    ckh_line("   code on the callee: ");
+    sys_write(1, b[EP_CODE..EP_CODE + 6], 6);
+    ckh_line("\n");
+    all = ckh_check("1 handshake done, both show the same 6 digits", hs and ck_same(a[EP_CODE..EP_CODE + 6], b[EP_CODE..EP_CODE + 6])) and all;
+    all = ckh_check("1 both sides derived the same keys, crosswise (my tx = your rx)", ck_same(a[EP_TXK..EP_TXIV + 12], b[EP_RXK..EP_RXIV + 12]) and ck_same(a[EP_RXK..EP_RXIV + 12], b[EP_TXK..EP_TXIV + 12]) and !ck_same(a[EP_TXK..EP_TXK + 16], a[EP_RXK..EP_RXK + 16])) and all;
+    all = ckh_check("1 no media before the codes are confirmed", ckh_seal(a[0..960], CK_T_MEDIA, pt[0..960], f1[0..1028]) == 0) and all;
+    const na : usize = ckh_confirm(a[0..960], CK_SAY_MATCH, ca[0..128]);
+    const nb : usize = ckh_confirm(b[0..960], CK_SAY_MATCH, cb[0..128]);
+    all = ckh_check("1 one side's match alone does not open the call", ckh_state(a[0..960]) == CK_VERIFY and ckh_state(b[0..960]) == CK_VERIFY) and all;
+    const oa : i64 = ckh_on_confirm(a[0..960], cb[0..nb]);
+    const ob : i64 = ckh_on_confirm(b[0..960], ca[0..na]);
+    all = ckh_check("1 both CONFIRMs open (AEAD) and name the same transcript: both ACTIVE", oa == 33 and ob == 33 and ckh_state(a[0..960]) == CK_ACTIVE and ckh_state(b[0..960]) == CK_ACTIVE) and all;
+    ckh_frame(pt[0..960], 1, 65);
+    const n1 : usize = ckh_seal(a[0..960], CK_T_MEDIA, pt[0..960], f1[0..1028]);
+    const r1 : i64 = ckh_open(b[0..960], f1[0..n1], got[0..960]);
+    all = ckh_check("1 a sealed frame caller -> callee is accepted with the same content", n1 == 1028 and r1 == 960 and ckh_frame_idx(got[0..960], r1, 65) == 1) and all;
+    all = ckh_check("1 the ciphertext is not the plaintext", !ck_same(f1[52..1012], pt[0..960])) and all;
+    ckh_frame(pt[0..960], 1, 66);
+    const n2 : usize = ckh_seal(b[0..960], CK_T_MEDIA, pt[0..960], f2[0..1028]);
+    const r2 : i64 = ckh_open(a[0..960], f2[0..n2], got[0..960]);
+    all = ckh_check("1 a sealed frame callee -> caller is accepted", r2 == 960 and ckh_frame_idx(got[0..960], r2, 66) == 1) and all;
+    all = ckh_check("1 a frame does not open in its own sender (one key per direction)", ckh_open(a[0..960], f1[0..n1], got[0..960]) < 0) and all;
+
+    // tamper: every byte of a fresh frame, one bit each
+    ckh_frame(pt[0..960], 2, 65);
+    const n3 : usize = ckh_seal(a[0..960], CK_T_MEDIA, pt[0..960], f1[0..1028]);
+    var hi_before : u64 = get_u64(b[EP_WIN..EP_WIN + 72], 0);
+    var rej_hdr : u64 = 0;
+    var rej_aead : u64 = 0;
+    var took : u64 = 0;
+    var i : usize = 0;
+    while (i < n3) {
+        ck_put(bad[0..1028], 0, f1[0..n3]);
+        bad[i] = bad[i] ^ 1;
+        const r : i64 = ckh_open(b[0..960], bad[0..n3], got[0..960]);
+        if (r == -1) { rej_hdr = rej_hdr + 1; }
+        if (r == -3) { rej_aead = rej_aead + 1; }
+        if (r >= 0) { took = took + 1; }
+        i = i + 1;
+    }
+    ckh_num("  flipped frames refused by the header check: ", rej_hdr);
+    ckh_num("  flipped frames refused by AEAD: ", rej_aead);
+    all = ckh_check("2 every one of 1028 one-bit changes is refused, 0 accepted", took == 0 and rej_hdr + rej_aead == 1028) and all;
+    all = ckh_check("2 the replay window did not move under the forged frames", get_u64(b[EP_WIN..EP_WIN + 72], 0) == hi_before) and all;
+    ck_put(bad[0..1028], 0, f1[0..n3]);
+    bad[n3 - 1] = bad[n3 - 1] ^ 128;
+    all = ckh_check("2 a changed tag byte: AEAD refuses (-3)", ckh_open(b[0..960], bad[0..n3], got[0..960]) == -3) and all;
+    ck_put(bad[0..1028], 0, f1[0..n3]);
+    bad[44] = bad[44] ^ 1;
+    all = ckh_check("2 a changed seq in the header: AEAD refuses (-3), the header is in the tag", ckh_open(b[0..960], bad[0..n3], got[0..960]) == -3) and all;
+    const r3 : i64 = ckh_open(b[0..960], f1[0..n3], got[0..960]);
+    all = ckh_check("2 the untouched frame is still accepted afterwards", r3 == 960 and ckh_frame_idx(got[0..960], r3, 65) == 2) and all;
+
+    // replay
+    const r4 : i64 = ckh_open(b[0..960], f1[0..n3], got[0..960]);
+    all = ckh_check("3 the same frame a second time: the replay window refuses (-4)", r4 == -4) and all;
+    const r5 : i64 = ckh_open(b[0..960], f1[0..n1], got[0..960]);
+    all = ckh_check("3 an older frame already taken: refused (-4)", r5 == -4) and all;
+
+    // hang up: keys wiped, further frames refused, and the next call works
+    var oldsid : [16]u8 = undefined;
+    ck_put(oldsid[0..16], 0, a[EP_SID..EP_SID + 16]);
+    var by : [1]u8 = undefined;
+    by[0] = 0;
+    var fb1 : [128]u8 = undefined;
+    const nby : usize = ckh_seal(a[0..960], CK_T_BYE, by[0..1], fb1[0..128]);
+    ckh_go(a[0..960], CK_EV_HANGUP);
+    const rby : i64 = ckh_open(b[0..960], fb1[0..nby], got[0..960]);
+    if (rby == 1) { ckh_go(b[0..960], CK_EV_BYE); }
+    var zk : [64]u8 = undefined;
+    ck_wipe(zk[0..64]);
+    all = ckh_check("4 BYE opens, both ENDED, both sides' keys wiped", rby == 1 and ckh_state(a[0..960]) == CK_ENDED and ckh_state(b[0..960]) == CK_ENDED and ck_same(a[EP_TXK..EP_CTR], zk[0..64]) and ck_same(b[EP_TXK..EP_CTR], zk[0..64])) and all;
+    ckh_frame(pt[0..960], 3, 66);
+    all = ckh_check("4 after the end nothing seals and nothing opens", ckh_seal(b[0..960], CK_T_MEDIA, pt[0..960], f2[0..1028]) == 0 and ckh_open(b[0..960], f1[0..n3], got[0..960]) == -2) and all;
+    const again : bool = ckh_handshake(a[0..960], b[0..960], 0);
+    all = ckh_check("4 a second call from ENDED: new session, new code, new keys", again and ckh_state(a[0..960]) == CK_VERIFY and !ck_same(a[EP_SID..EP_SID + 16], oldsid[0..16]) and ck_same(a[EP_CODE..EP_CODE + 6], b[EP_CODE..EP_CODE + 6])) and all;
+
+    // 5. one person says "differ" (the codes they saw did not match)
+    ckh_ep_init(a[0..960], true, fa[0..10], fb[0..10]);
+    ckh_ep_init(b[0..960], false, fb[0..10], fa[0..10]);
+    const h5 : bool = ckh_handshake(a[0..960], b[0..960], 0);
+    const c5a : usize = ckh_confirm(a[0..960], CK_SAY_MATCH, ca[0..128]);
+    const c5b : usize = ckh_confirm(b[0..960], CK_SAY_DIFFER, cb[0..128]);
+    all = ckh_check("5 the callee's person says differ: callee FAILED at once, keys wiped", h5 and c5b > 0 and ckh_state(b[0..960]) == CK_FAILED and ck_same(b[EP_TXK..EP_CTR], zk[0..64])) and all;
+    const o5 : i64 = ckh_on_confirm(a[0..960], cb[0..c5b]);
+    all = ckh_check("5 the caller reads the sealed 'differ': caller FAILED", o5 == 33 and ckh_state(a[0..960]) == CK_FAILED) and all;
+    ckh_frame(pt[0..960], 1, 65);
+    all = ckh_check("5 no side can seal media, and the callee refuses the caller's frames", ckh_seal(a[0..960], CK_T_MEDIA, pt[0..960], f1[0..1028]) == 0 and ckh_open(b[0..960], ca[0..c5a], got[0..960]) == -2) and all;
+
+    // 6. someone changed the answer nonce in transit: the two codes differ
+    ckh_ep_init(a[0..960], true, fa[0..10], fb[0..10]);
+    ckh_ep_init(b[0..960], false, fb[0..10], fa[0..10]);
+    const h6 : bool = ckh_handshake(a[0..960], b[0..960], 1);
+    ckh_line("  code on the caller: ");
+    sys_write(1, a[EP_CODE..EP_CODE + 6], 6);
+    ckh_line("   code on the callee: ");
+    sys_write(1, b[EP_CODE..EP_CODE + 6], 6);
+    ckh_line("\n");
+    all = ckh_check("6 a changed answer nonce: the two screens show different codes", h6 and !ck_same(a[EP_CODE..EP_CODE + 6], b[EP_CODE..EP_CODE + 6])) and all;
+    // the caller's person wrongly presses match anyway; the callee's person sees the mismatch
+    const c6a : usize = ckh_confirm(a[0..960], CK_SAY_MATCH, ca[0..128]);
+    const c6b : usize = ckh_confirm(b[0..960], CK_SAY_MATCH, cb[0..128]);
+    const o6a : i64 = ckh_on_confirm(a[0..960], cb[0..c6b]);
+    const o6b : i64 = ckh_on_confirm(b[0..960], ca[0..c6a]);
+    all = ckh_check("6 even if both press match, neither CONFIRM opens (different keys): no side ACTIVE", o6a == -3 and o6b == -3 and ckh_state(a[0..960]) == CK_VERIFY and ckh_state(b[0..960]) == CK_VERIFY) and all;
+    ckh_go(a[0..960], CK_EV_TIMEOUT);
+    ckh_go(b[0..960], CK_EV_TIMEOUT);
+    all = ckh_check("6 the verify timeout fails both", ckh_state(a[0..960]) == CK_FAILED and ckh_state(b[0..960]) == CK_FAILED) and all;
+
+    // 6b. the same change without fixing the REVEAL: the callee sees H(ANSWER) differ and shows no code
+    ckh_ep_init(a[0..960], true, fa[0..10], fb[0..10]);
+    ckh_ep_init(b[0..960], false, fb[0..10], fa[0..10]);
+    const h6b : bool = ckh_handshake(a[0..960], b[0..960], 3);
+    all = ckh_check("6b a changed answer nonce alone: the callee's H(ANSWER) check ignores the REVEAL, no code shown", !h6b and b[EP_HAVE_CODE] == 0 and ckh_state(b[0..960]) == CK_VERIFY) and all;
+
+    // 7. someone changed the revealed nonce: the commitment fails at the callee
+    ckh_ep_init(a[0..960], true, fa[0..10], fb[0..10]);
+    ckh_ep_init(b[0..960], false, fb[0..10], fa[0..10]);
+    const h7 : bool = ckh_handshake(a[0..960], b[0..960], 2);
+    all = ckh_check("7 a changed reveal: the commitment check fails, callee FAILED, no code shown", !h7 and ckh_state(b[0..960]) == CK_FAILED and b[EP_HAVE_CODE] == 0) and all;
+
+    // 8. a callee that is never answered never sends its key
+    ckh_ep_init(a[0..960], true, fa[0..10], fb[0..10]);
+    ckh_ep_init(b[0..960], false, fb[0..10], fa[0..10]);
+    var inv : [149]u8 = undefined;
+    ckh_invite(a[0..960], inv[0..149]);
+    ckh_on_invite(b[0..960], inv[0..149]);
+    var zp : [65]u8 = undefined;
+    ck_wipe(zp[0..65]);
+    all = ckh_check("8 an invite only rings: callee RINGING, no key made, nothing to send", ckh_state(b[0..960]) == CK_RINGING and ck_same(b[EP_PUB..EP_PUB + 65], zp[0..65])) and all;
+    ckh_frame(pt[0..960], 1, 65);
+    all = ckh_check("8 a second invite while ringing is not taken", !ckh_on_invite(b[0..960], inv[0..149])) and all;
+    return all;
+}
+
+// ---------------------------------------------------------------- two processes over UDP
+
+fn ckh_env(name: []const u8, out: []u8) -> usize {
+    const a : u64 = sys_getenv(name);
+    if (a == 0) { return 0; }
+    var n : u64 = sys_strlen(a);
+    if (n > 31) { n = 31; }
+    sys_peek(out[0..32], a, n);
+    return @as(usize, @intCast(n));
+}
+
+/// A decimal or dotted-quad value of an env var: each dot shifts by 8 bits, so "127.0.0.1" is 0x7F000001 and
+/// "500" is 500. dflt when unset; 2^40 when a character is neither a digit nor a dot or a part exceeds 255 in a
+/// dotted value.
+fn ckh_env_num(name: []const u8, dflt: u64) -> u64 {
+    var b : [32]u8 = undefined;
+    const n : usize = ckh_env(name, b[0..32]);
+    if (n == 0) { return dflt; }
+    var acc : u64 = 0;
+    var part : u64 = 0;
+    var dots : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        const c : u8 = b[i];
+        if (c == 46) {
+            if (part > 255) { return 1099511627776; }
+            acc = (acc << 8) | part;
+            part = 0;
+            dots = dots + 1;
+        } else if (c >= 48 and c <= 57) {
+            part = part * 10 + @as(u64, c - 48);
+            if (part > 4294967295) { return 1099511627776; }
+        } else {
+            return 1099511627776;
+        }
+        i = i + 1;
+    }
+    if (dots == 0) { return part; }
+    if (dots != 3 or part > 255) { return 1099511627776; }
+    return (acc << 8) | part;
+}
+
+fn ckh_addr4(out: []u8, ip: u64, port: u64) -> void {
+    ck_wipe(out[0..16]);
+    out[0] = 16;
+    out[1] = 2;
+    out[2] = @as(u8, @intCast((port >> 8) & 255));
+    out[3] = @as(u8, @intCast(port & 255));
+    out[4] = @as(u8, @intCast((ip >> 24) & 255));
+    out[5] = @as(u8, @intCast((ip >> 16) & 255));
+    out[6] = @as(u8, @intCast((ip >> 8) & 255));
+    out[7] = @as(u8, @intCast(ip & 255));
+}
+
+fn ckh_ms() -> u64 {
+    var tv : [16]u8 = undefined;
+    ck_wipe(tv[0..16]);
+    sys_gettimeofday(tv[0..16], 0);
+    return get_u64(tv[0..16], 0) * 1000 + (get_u64(tv[0..16], 8) & 4294967295) / 1000;
+}
+
+fn ckh_send(fd: i32, b: []const u8, to: []const u8) -> void { ckh_sendto(fd, b, @as(u64, b.len), 0, to, 16); }
+
+fn ckh_net(caller: bool) -> bool {
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    ckh_fps(fa[0..10], fb[0..10]);
+    var my_port : u64 = 47742;
+    var peer_port : u64 = 47741;
+    var role : u8 = 66;
+    var peer_role : u8 = 65;
+    if (caller) {
+        my_port = 47741;
+        peer_port = 47742;
+        role = 65;
+        peer_role = 66;
+    }
+    const bind_ip : u64 = ckh_env_num("CK_BIND", 2130706433);
+    my_port = ckh_env_num("CK_PORT", my_port);
+    const peer_ip : u64 = ckh_env_num("CK_PEER", 2130706433);
+    peer_port = ckh_env_num("CK_PEER_PORT", peer_port);
+    const frames : u64 = ckh_env_num("CK_FRAMES", 500);
+    const pace : u64 = ckh_env_num("CK_PACE_US", 2000);
+    var say : u32 = CK_SAY_MATCH;
+    var sb : [32]u8 = undefined;
+    const sn : usize = ckh_env("CK_SAY", sb[0..32]);
+    if (sn == 6 and ck_same(sb[0..6], "differ")) { say = CK_SAY_DIFFER; }
+    var consent : bool = false;
+    var cbuf : [32]u8 = undefined;
+    const cn : usize = ckh_env("CK_ANSWER", cbuf[0..32]);
+    if (cn == 1 and cbuf[0] == 49) { consent = true; }
+    if (bind_ip > 4294967295 or peer_ip > 4294967295 or my_port == 0 or my_port > 65535 or peer_port == 0 or peer_port > 65535 or frames == 0 or frames > 8192 or pace > 100000) {
+        ckh_line("NET NOT RUN: CK_BIND, CK_PORT, CK_PEER, CK_PEER_PORT, CK_FRAMES (1..8192) or CK_PACE_US is malformed\n");
+        return false;
+    }
+    if (!cv_lan_ok(peer_ip)) {
+        ckh_line("NET NOT RUN: CK_PEER must be a private network address (10.x, 172.16-31.x, 192.168.x or 127.x)\n");
+        return false;
+    }
+    ckh_num("role (1 caller, 0 callee): ", @as(u64, ep_flag(caller)));
+    ckh_num("bind IPv4: ", bind_ip);
+    ckh_num("port: ", my_port);
+    ckh_num("peer IPv4: ", peer_ip);
+    ckh_num("peer port: ", peer_port);
+    ckh_num("frames to send: ", frames);
+    ckh_num("verdict this person gives (1 match, 2 differ): ", @as(u64, say));
+    var me_a : [16]u8 = undefined;
+    var to_a : [16]u8 = undefined;
+    ckh_addr4(me_a[0..16], bind_ip, my_port);
+    ckh_addr4(to_a[0..16], peer_ip, peer_port);
+    const fd : i32 = sys_socket(2, 2, 0);
+    if (fd < 0) { ckh_line("NET NOT RUN: socket failed\n"); return false; }
+    if (sys_bind(fd, me_a[0..16], 16) != 0) { ckh_line("NET NOT RUN: bind failed\n"); sys_close(fd); return false; }
+    ckh_fcntl(fd, 4, 4);
+    var ep : [960]u8 = undefined;
+    if (caller) { ckh_ep_init(ep[0..960], true, fa[0..10], fb[0..10]); } else { ckh_ep_init(ep[0..960], false, fb[0..10], fa[0..10]); }
+    var last1 : [256]u8 = undefined;
+    var last2 : [128]u8 = undefined;
+    var l1 : usize = 0;
+    var l2 : usize = 0;
+    var rx : [2048]u8 = undefined;
+    var pt : [960]u8 = undefined;
+    var got : [960]u8 = undefined;
+    var fr : [1028]u8 = undefined;
+    var seen : [8192]u8 = undefined;
+    ck_wipe(seen[0..8192]);
+    var sent : u64 = 0;
+    var accepted : u64 = 0;
+    var distinct : u64 = 0;
+    var dup_taken : u64 = 0;
+    var bad_content : u64 = 0;
+    var out_of_order : u64 = 0;
+    var last_idx : u64 = 0;
+    var rej_hdr : u64 = 0;
+    var rej_state : u64 = 0;
+    var rej_aead : u64 = 0;
+    var rej_replay : u64 = 0;
+    var resends : u64 = 0;
+    var replay_sent : bool = false;
+    var bye_sent : bool = false;
+    var peer_bye : bool = false;
+    var code_shown : bool = false;
+    const t0 : u64 = ckh_ms();
+    var t_active : u64 = 0;
+    var t_resend : u64 = t0;
+    var t_last_rx : u64 = t0;
+    var t_next_frame : u64 = 0;
+    var t_finish : u64 = 0;
+    const deadline : u64 = t0 + 30000 + frames * (pace / 1000 + 1) * 2;
+    if (caller) {
+        l1 = ckh_invite(ep[0..960], last1[0..256]);
+        if (l1 == 0) { ckh_line("NET NOT RUN: invite failed\n"); sys_close(fd); return false; }
+        ckh_send(fd, last1[0..l1], to_a[0..16]);
+    }
+    var ok_exit : bool = false;
+    while (true) {
+        const now : u64 = ckh_ms();
+        if (now > deadline) { ckh_line("deadline reached\n"); break; }
+        // read everything waiting
+        while (true) {
+            const r : i64 = ckh_recvfrom(fd, rx[0..2048], 2048, 0, 0, 0);
+            if (r <= 0) { break; }
+            const n : usize = @as(usize, @intCast(r));
+            const m : []const u8 = rx[0..n];
+            t_last_rx = now;
+            const typ : u32 = ck_hdr_type(m);
+            const s : u32 = ckh_state(ep[0..960]);
+            if (caller and typ == CK_T_ANSWER) {
+                if (s == CK_CALLING) {
+                    l1 = ckh_on_answer(ep[0..960], m, last1[0..256]);
+                    if (l1 > 0) {
+                        ckh_send(fd, last1[0..l1], to_a[0..16]);
+                        l2 = ckh_confirm(ep[0..960], say, last2[0..128]);
+                        if (l2 > 0) { ckh_send(fd, last2[0..l2], to_a[0..16]); }
+                    }
+                } else if (l1 > 0) {
+                    ckh_send(fd, last1[0..l1], to_a[0..16]);
+                    if (l2 > 0) { ckh_send(fd, last2[0..l2], to_a[0..16]); }
+                    resends = resends + 1;
+                }
+            } else if (!caller and typ == CK_T_INVITE) {
+                if (s == CK_IDLE) {
+                    if (ckh_on_invite(ep[0..960], m)) {
+                        ckh_line("ringing: an invite arrived\n");
+                        if (consent) {
+                            ckh_line("the person answers (CK_ANSWER=1)\n");
+                            l1 = ckh_answer(ep[0..960], last1[0..256]);
+                            if (l1 > 0) { ckh_send(fd, last1[0..l1], to_a[0..16]); }
+                        }
+                    }
+                } else if (l1 > 0 and n == CK_INVITE_LEN and ck_same(m, ep[EP_TR..EP_TR + CK_INVITE_LEN])) {
+                    ckh_send(fd, last1[0..l1], to_a[0..16]);
+                    resends = resends + 1;
+                }
+            } else if (!caller and typ == CK_T_REVEAL) {
+                if (ep[EP_HAVE_CODE] == 0 and s == CK_VERIFY) {
+                    if (ckh_on_reveal(ep[0..960], m)) {
+                        l2 = ckh_confirm(ep[0..960], say, last2[0..128]);
+                        if (l2 > 0) { ckh_send(fd, last2[0..l2], to_a[0..16]); }
+                    }
+                } else if (l2 > 0 and n == CK_REVEAL_LEN and ck_same(m, ep[EP_TR + CK_INVITE_LEN + CK_ANSWER_LEN..EP_TR + CK_TRANSCRIPT_LEN])) {
+                    ckh_send(fd, last2[0..l2], to_a[0..16]);
+                    resends = resends + 1;
+                }
+            } else if (typ == CK_T_CONFIRM) {
+                const c : i64 = ckh_on_confirm(ep[0..960], m);
+                if (c == -3) { rej_aead = rej_aead + 1; }
+                if (ckh_state(ep[0..960]) == CK_ACTIVE and t_active == 0) { t_active = now; }
+            } else if (typ == CK_T_MEDIA or typ == CK_T_BYE) {
+                const o : i64 = ckh_open(ep[0..960], m, got[0..960]);
+                if (o == -1) { rej_hdr = rej_hdr + 1; }
+                if (o == -2) { rej_state = rej_state + 1; }
+                if (o == -3) { rej_aead = rej_aead + 1; }
+                if (o == -4) { rej_replay = rej_replay + 1; }
+                if (o > 0 and typ == CK_T_BYE) {
+                    peer_bye = true;
+                    ckh_go(ep[0..960], CK_EV_BYE);
+                }
+                if (o > 0 and typ == CK_T_MEDIA) {
+                    accepted = accepted + 1;
+                    const idx : u64 = ckh_frame_idx(got[0..960], o, peer_role);
+                    if (idx >= frames) {
+                        bad_content = bad_content + 1;
+                    } else {
+                        const k : usize = @as(usize, @intCast(idx));
+                        if (seen[k] != 0) { dup_taken = dup_taken + 1; } else { distinct = distinct + 1; }
+                        seen[k] = 1;
+                        if (distinct > 1 and idx < last_idx) { out_of_order = out_of_order + 1; }
+                        last_idx = idx;
+                    }
+                }
+            } else {
+                rej_hdr = rej_hdr + 1;
+            }
+        }
+        const st : u32 = ckh_state(ep[0..960]);
+        if (ep[EP_HAVE_CODE] != 0 and !code_shown) {
+            ckh_line("CODE ");
+            sys_write(1, ep[EP_CODE..EP_CODE + 6], 6);
+            ckh_line("\n");
+            code_shown = true;
+        }
+        if (st == CK_FAILED) { ckh_line("call FAILED\n"); break; }
+        if (st == CK_RINGING and now - t0 > 15000) {
+            ckh_go(ep[0..960], CK_EV_TIMEOUT);
+            ckh_line("call ENDED: rang 15 s without an answer\n");
+            break;
+        }
+        if (st == CK_CALLING and now - t0 > 20000) {
+            ckh_go(ep[0..960], CK_EV_TIMEOUT);
+            ckh_line("call ENDED: no answer within 20 s\n");
+            break;
+        }
+        if (st == CK_VERIFY and now - t0 > 20000) {
+            ckh_go(ep[0..960], CK_EV_TIMEOUT);
+            ckh_line("call FAILED: the codes were not confirmed by both sides within 20 s\n");
+            break;
+        }
+        // resend the last handshake message every 200 ms while it is unanswered
+        if (now - t_resend >= 200) {
+            t_resend = now;
+            if (caller and (st == CK_CALLING or st == CK_VERIFY) and l1 > 0) {
+                ckh_send(fd, last1[0..l1], to_a[0..16]);
+                if (st == CK_VERIFY and l2 > 0) { ckh_send(fd, last2[0..l2], to_a[0..16]); }
+                resends = resends + 1;
+            }
+        }
+        // media
+        if (st == CK_ACTIVE and t_active != 0 and now >= t_active + 100 and sent < frames) {
+            const us : u64 = now * 1000;
+            if (us >= t_next_frame) {
+                ckh_frame(pt[0..960], sent, role);
+                const fn1 : usize = ckh_seal(ep[0..960], CK_T_MEDIA, pt[0..960], fr[0..1028]);
+                if (fn1 > 0) {
+                    ckh_send(fd, fr[0..fn1], to_a[0..16]);
+                    if (sent == frames / 2 and !replay_sent) {
+                        ckh_send(fd, fr[0..fn1], to_a[0..16]);
+                        replay_sent = true;
+                    }
+                }
+                sent = sent + 1;
+                t_next_frame = us + pace;
+            }
+        }
+        // end: after my frames are out and the peer's have arrived (or it went quiet for 1.5 s), say BYE
+        if (st == CK_ACTIVE and sent == frames and !bye_sent and (distinct == frames or now - t_last_rx > 1500)) {
+            var by : [1]u8 = undefined;
+            by[0] = 0;
+            var fbye : [128]u8 = undefined;
+            const nb : usize = ckh_seal(ep[0..960], CK_T_BYE, by[0..1], fbye[0..128]);
+            var q : u32 = 0;
+            while (q < 3) {
+                if (nb > 0) { ckh_send(fd, fbye[0..nb], to_a[0..16]); }
+                q = q + 1;
+            }
+            bye_sent = true;
+            t_finish = now + 500;
+            ckh_go(ep[0..960], CK_EV_HANGUP);
+        }
+        if (bye_sent and now >= t_finish) { ok_exit = true; break; }
+        if (peer_bye and sent == frames and !bye_sent) {
+            bye_sent = true;
+            t_finish = now + 300;
+        }
+        if (!caller and st == CK_IDLE and !consent and now - t0 > 15000) { break; }
+        ckh_usleep(200);
+    }
+    sys_close(fd);
+    ckh_num("frames sent: ", sent);
+    ckh_num("frames accepted: ", accepted);
+    ckh_num("distinct frames received: ", distinct);
+    ckh_num("lost (sent by the peer and never accepted): ", frames - distinct);
+    ckh_num("duplicates accepted: ", dup_taken);
+    ckh_num("out of order: ", out_of_order);
+    ckh_num("frames with wrong content: ", bad_content);
+    ckh_num("refused, not for this call: ", rej_hdr);
+    ckh_num("refused, state (before ACTIVE or after the end): ", rej_state);
+    ckh_num("refused, AEAD: ", rej_aead);
+    ckh_num("refused, replay: ", rej_replay);
+    ckh_num("handshake resends: ", resends);
+    ckh_num("peer said BYE: ", @as(u64, ep_flag(peer_bye)));
+    if (t_active != 0) { ckh_num("ms from start to ACTIVE: ", t_active - t0); }
+    const pass : bool = ok_exit and distinct == frames and accepted == frames and dup_taken == 0 and bad_content == 0 and rej_aead == 0 and rej_replay == 1;
+    return ckh_check("NET: every frame accepted once, 0 lost, the injected replay refused, 0 AEAD failures", pass);
+}
+
+fn ep_flag(b: bool) -> u32 {
+    if (b) { return 1; }
+    return 0;
+}
+
+pub fn main() -> void {
+    var rb : [32]u8 = undefined;
+    const rn : usize = ckh_env("CK_ROLE", rb[0..32]);
+    if (rn > 0) {
+        var ok : bool = false;
+        if (rn == 6 and ck_same(rb[0..6], "caller")) { ok = ckh_net(true); } else if (rn == 6 and ck_same(rb[0..6], "callee")) { ok = ckh_net(false); } else { ckh_line("CK_ROLE must be caller or callee\n"); }
+        if (ok) { sys_exit(0); }
+        sys_exit(1);
+    }
+    ckh_line("T27 OS call core probe: system crypto, then two endpoints in one process\n");
+    const v : bool = ckh_vectors();
+    var s : bool = false;
+    if (v) { s = ckh_scenarios(); } else { ckh_line("scenarios NOT RUN: a system primitive failed its vector\n"); }
+    if (v and s) {
+        ckh_line("ALL CHECKS PASSED\n");
+        sys_exit(0);
+    }
+    ckh_line("SOME CHECKS FAILED\n");
+    sys_exit(1);
+}
+
+test the_endpoint_block_fits_and_its_fields_do_not_overlap {
+    assert EP_PRIV + 97 <= EP_PUB;
+    assert EP_PUB + 65 <= EP_PPUB;
+    assert EP_PPUB + 65 <= EP_N;
+    assert EP_RXIV + 12 <= EP_CTR;
+    assert EP_WIN + 72 <= EP_T;
+    assert EP_TR + CK_TRANSCRIPT_LEN <= EP_CODE;
+    assert EP_CODE + 6 <= EP_LEN;
+}
+
+test env_numbers_read_decimal_and_dotted_quads {
+    var a : [16]u8 = undefined;
+    ckh_addr4(a[0..16], 3232235787, 47741);
+    assert a[0] == 16 and a[1] == 2 and a[2] == 186 and a[3] == 125;
+    assert a[4] == 192 and a[5] == 168 and a[6] == 1 and a[7] == 11;
+}
+
+test a_frame_reads_back_its_index_and_a_changed_byte_does_not {
+    var p : [960]u8 = undefined;
+    ckh_frame(p[0..960], 77, 65);
+    assert ckh_frame_idx(p[0..960], 960, 65) == 77;
+    assert ckh_frame_idx(p[0..960], 960, 66) == 18446744073709551615;
+    p[500] = p[500] ^ 1;
+    assert ckh_frame_idx(p[0..960], 960, 65) == 18446744073709551615;
+}

@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_identity_probe.t27 -- the identity proof of call_session.t27 with the operating system's own keys
+// and signatures (Security.framework through keysync_host), the way two windows would drive it: only the cs_* API, a
+// "person" who answers and says match when a code is shown. Not part of the app. Refs gHashTag/t27#11560.
+// Two sessions in this process on 127.0.0.1:47771 / 47772 (test pattern, no devices), and two message sessions on
+// 47773 / 47774. Identities A, B (and C for the impostor) are fresh P-256 pairs made in memory; the friends file is
+// written under $HOME/.t27os, and the probe REFUSES to run unless HOME is under /tmp (it never touches a real
+// friends file). Checks, in order:
+//   1 A and B are friends with no stored key: both see the code, both say match, the call opens, each side stores the
+//     other's key (friends file v2 now holds both keys, the same keys the identities have);
+//   2 the same two again: no code is shown, nobody says anything, the call opens by itself (VERIFIED);
+//   3 a message session between them opens by itself, nobody confirms;
+//   4 an impostor answers as B with C's key: A refuses (CS_R_IDENTITY), nothing opens, nothing is stored;
+//   5 B's key with a signature made by C's private key: A refuses (CS_R_IDENTITY);
+//   6 B forgets A (friend removed and added again, its key dropped): a message session stores A's proven key on B's
+//     side (the fingerprint was pasted by the person, owner 2026-10-22) and opens by itself;
+//   7 a call then opens with no code on either side (both keys stored again);
+//   8 C, who is not a friend, starts a message session to B: B ends it as an invitation (CS_R_INVITE) with C's proven
+//     key, nothing opens, nothing is stored for C;
+//   9 B accepts: C becomes a friend with that key stored, and C's next message session opens by itself.
+// Along the way, the last verified endpoint (cs_verified_ep, the only address the window's chat may take from a call):
+// none before call 1; after it each side holds the other's fingerprint and call port; the refused impostor (4) and
+// the bad signature (5) leave it as call 2 left it.
+// Ports: 47775 for C's message session.
+// Build (Apple silicon):
+//   t27b build specs/t27os/call_identity_probe.t27 -o cip.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -lffi -framework CoreFoundation -framework Security -framework AudioToolbox \
+//      -framework CoreGraphics -framework ImageIO -framework CoreServices -o cip cip.o
+//   mkdir -p /tmp/cip-home && HOME=/tmp/cip-home ./cip
+// Behaviour checks, not a security audit.
+module T27osCallIdentityProbe;
+
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::keysync_host::ks_gen_pair;
+use t27os::call_core::ck_same;
+use t27os::call_core::ck_put;
+use t27os::call_core::CK_IDLE;
+use t27os::call_core::CK_ACTIVE;
+use t27os::call_crypto_probe::ckh_line;
+use t27os::call_crypto_probe::ckh_check;
+use t27os::call_crypto_probe::ckh_ms;
+use t27os::call_crypto_probe::ckh_usleep;
+use t27os::callback_probe::cbp_fin;
+use t27os::callback_probe::cbp_fout;
+use t27os::call_session::cs_open;
+use t27os::call_session::cs_identity;
+use t27os::call_session::cs_id_state;
+use t27os::call_session::cs_call;
+use t27os::call_session::cs_poll;
+use t27os::call_session::cs_state;
+use t27os::call_session::cs_answer;
+use t27os::call_session::cs_confirm;
+use t27os::call_session::cs_hangup;
+use t27os::call_session::cs_dismiss;
+use t27os::call_session::cs_reason;
+use t27os::call_session::cs_close;
+use t27os::call_session::cs_set;
+use t27os::call_session::CS_LEN;
+use t27os::call_session::CS_ID;
+use t27os::call_session::CI_PUB;
+use t27os::call_session::CI_PRIV;
+use t27os::call_session::CS_AUDIO_TEST;
+use t27os::call_session::CS_AUDIO_NONE;
+use t27os::call_session::CS_K_VERIFY_MS;
+use t27os::call_session::CS_EV_NONE;
+use t27os::call_session::CS_EV_RINGING;
+use t27os::call_session::CS_EV_CODE;
+use t27os::call_session::CS_EV_ACTIVE;
+use t27os::call_session::CS_EV_ENDED;
+use t27os::call_session::CS_EV_FAILED;
+use t27os::call_session::CS_R_IDENTITY;
+use t27os::call_session::CS_R_UNVERIFIED;
+use t27os::call_session::CS_R_INVITE;
+use t27os::call_session::cs_id_proven;
+use t27os::call_session::CS_ID_VERIFIED;
+use t27os::call_session::CS_ID_STORED;
+use t27os::call_session::cs_verified_ep;
+use t27os::call_ip6::ip6_v4of;
+use t27os::peer_identity::FT_LEN;
+use t27os::peer_identity::ft_init;
+use t27os::peer_identity::ft_add;
+use t27os::peer_identity::ft_remove;
+use t27os::peer_identity::invite_make;
+use t27os::peer_identity::FA_OK;
+use t27os::peer_identity_host::ih_fingerprint;
+use t27os::peer_identity_host::ih_friends_save;
+use t27os::peer_identity_host::ih_pin_get;
+use t27os::peer_identity_host::ih_pin_put;
+use t27os::peer_identity::PIN_NEW;
+
+/// One side's record of a call, u64 slots: 0 saw the code, 1 became ACTIVE, 2 ended or failed, 3 the reason,
+/// 4 answers RINGING, 5 says match on the code.
+fn rg(d: []const u8, k: usize) -> u64 { return get_u64(d, k * 8); }
+fn rp(d: []u8, k: usize, v: u64) -> void { put_u64(d, k * 8, v); }
+
+fn cip_react(s: []u8, d: []u8, ev: u32) -> void {
+    if (ev == CS_EV_RINGING and rg(d, 4) != 0) { cs_answer(s); }
+    if (ev == CS_EV_CODE) {
+        rp(d, 0, 1);
+        if (rg(d, 5) != 0) { cs_confirm(s, true); }
+    }
+    if (ev == CS_EV_ACTIVE) { rp(d, 1, 1); }
+    if (ev == CS_EV_ENDED or ev == CS_EV_FAILED) {
+        rp(d, 2, 1);
+        rp(d, 3, @as(u64, cs_reason(s)));
+        cs_dismiss(s);
+    }
+}
+
+/// Poll both until both are ACTIVE or both ended, at most ms; then hang up an active call and poll until both are
+/// IDLE again.
+fn cip_run(a: []u8, da: []u8, b: []u8, db: []u8, ms: u64) -> void {
+    const t0 : u64 = ckh_ms();
+    var hung : bool = false;
+    while (ckh_ms() - t0 < ms) {
+        var ev : u32 = cs_poll(a);
+        while (ev != CS_EV_NONE) { cip_react(a, da, ev); ev = cs_poll(a); }
+        ev = cs_poll(b);
+        while (ev != CS_EV_NONE) { cip_react(b, db, ev); ev = cs_poll(b); }
+        if (!hung and cs_state(a) == CK_ACTIVE and cs_state(b) == CK_ACTIVE) {
+            cs_hangup(a);
+            hung = true;
+        }
+        if (rg(da, 2) != 0 and rg(db, 2) != 0 and cs_state(a) == CK_IDLE and cs_state(b) == CK_IDLE) { return; }
+        ckh_usleep(1000);
+    }
+}
+
+fn cip_new(d: []u8, answer: bool, say: bool) -> void {
+    var i : usize = 0;
+    while (i < 64) {
+        d[i] = 0;
+        i = i + 1;
+    }
+    if (answer) { rp(d, 4, 1); }
+    if (say) { rp(d, 5, 1); }
+}
+
+/// HOME must be under /tmp (or /private/tmp): the probe writes a friends file there.
+fn cip_home_ok() -> bool {
+    const p : u64 = sys_getenv("HOME");
+    if (p == 0) { return false; }
+    var h : [13]u8 = undefined;
+    sys_peek(h[0..13], p, 13);
+    return ck_same(h[0..5], "/tmp/") or ck_same(h[0..13], "/private/tmp/");
+}
+
+/// A table holding A and B (and nobody's key), saved.
+fn cip_friends(t: []u8, fa: []const u8, fb: []const u8) -> bool {
+    var own : [10]u8 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+    ft_init(t);
+    var inv : [25]u8 = undefined;
+    invite_make(fa, inv[0..25]);
+    if (ft_add(t, inv[0..25], own[0..10]) != FA_OK) { return false; }
+    invite_make(fb, inv[0..25]);
+    if (ft_add(t, inv[0..25], own[0..10]) != FA_OK) { return false; }
+    return ih_friends_save(t);
+}
+
+fn cip_main() -> bool {
+    var all : bool = true;
+    if (!cip_home_ok()) { return ckh_check("HOME is under /tmp (the probe writes a friends file there)", false); }
+    var pa : [65]u8 = undefined;
+    var ka : [97]u8 = undefined;
+    var pb : [65]u8 = undefined;
+    var kb : [97]u8 = undefined;
+    var pc : [65]u8 = undefined;
+    var kc : [97]u8 = undefined;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    all = ckh_check("three P-256 identities made in memory, fingerprints derived", ks_gen_pair(ka[0..97], pa[0..65]) and ks_gen_pair(kb[0..97], pb[0..65]) and ks_gen_pair(kc[0..97], pc[0..65]) and ih_fingerprint(pa[0..65], fa[0..10]) and ih_fingerprint(pb[0..65], fb[0..10])) and all;
+    var t : [1108]u8 = undefined;
+    all = ckh_check("friends file: A and B, no stored key", cip_friends(t[0..FT_LEN], fa[0..10], fb[0..10])) and all;
+    var a : [299648]u8 = undefined;
+    var b : [299648]u8 = undefined;
+    var ma : [299648]u8 = undefined;
+    var mb : [299648]u8 = undefined;
+    var da : [64]u8 = undefined;
+    var db : [64]u8 = undefined;
+    const lo : u64 = 2130706433;
+    all = ckh_check("sessions open (calls 47771/47772, messages 47773/47774)", cs_open(a[0..CS_LEN], fa[0..10], lo, 47771, CS_AUDIO_TEST) and cs_open(b[0..CS_LEN], fb[0..10], lo, 47772, CS_AUDIO_TEST) and cs_open(ma[0..CS_LEN], fa[0..10], lo, 47773, CS_AUDIO_NONE) and cs_open(mb[0..CS_LEN], fb[0..10], lo, 47774, CS_AUDIO_NONE)) and all;
+    all = ckh_check("identities handed in; C's key refused for B's fingerprint", cs_identity(a[0..CS_LEN], pa[0..65], ka[0..97]) and cs_identity(b[0..CS_LEN], pb[0..65], kb[0..97]) and cs_identity(ma[0..CS_LEN], pa[0..65], ka[0..97]) and cs_identity(mb[0..CS_LEN], pb[0..65], kb[0..97]) and !cs_identity(b[0..CS_LEN], pc[0..65], kc[0..97])) and all;
+    cs_set(a[0..CS_LEN], CS_K_VERIFY_MS, 8000);
+    cs_set(b[0..CS_LEN], CS_K_VERIFY_MS, 8000);
+    cs_set(ma[0..CS_LEN], CS_K_VERIFY_MS, 8000);
+    cs_set(mb[0..CS_LEN], CS_K_VERIFY_MS, 8000);
+    var got : [65]u8 = undefined;
+    var vfp : [10]u8 = undefined;
+    var vep : [18]u8 = undefined;
+    all = ckh_check("0 no verified endpoint before any call", cs_verified_ep(a[0..CS_LEN], vfp[0..10], vep[0..18]) == 0 and cs_verified_ep(b[0..CS_LEN], vfp[0..10], vep[0..18]) == 0) and all;
+
+    // 1 first call: code on both sides, both say match, keys stored
+    cip_new(da[0..64], false, true);
+    cip_new(db[0..64], true, true);
+    cs_call(a[0..CS_LEN], lo, 47772, fb[0..10]);
+    cip_run(a[0..CS_LEN], da[0..64], b[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("1 strangers by key: both saw the code, both said match, the call opened", rg(da[0..64], 0) == 1 and rg(db[0..64], 0) == 1 and rg(da[0..64], 1) == 1 and rg(db[0..64], 1) == 1) and all;
+    all = ckh_check("1 each side stored the other's key", cs_id_state(a[0..CS_LEN]) == CS_ID_STORED and cs_id_state(b[0..CS_LEN]) == CS_ID_STORED) and all;
+    all = ckh_check("1 the friends file holds B's real key and A's real key", ih_pin_get(fb[0..10], got[0..65]) and ck_same(got[0..65], pb[0..65]) and ih_pin_get(fa[0..10], got[0..65]) and ck_same(got[0..65], pa[0..65])) and all;
+    var vok : bool = cs_verified_ep(a[0..CS_LEN], vfp[0..10], vep[0..18]) != 0 and ck_same(vfp[0..10], fb[0..10]) and ip6_v4of(vep[0..18]) == lo * 65536 + 47772;
+    vok = vok and cs_verified_ep(b[0..CS_LEN], vfp[0..10], vep[0..18]) != 0 and ck_same(vfp[0..10], fa[0..10]) and ip6_v4of(vep[0..18]) == lo * 65536 + 47771;
+    all = ckh_check("1 the call that opened with stored keys is each side's last verified endpoint", vok) and all;
+
+    // 2 second call: no code, nobody says anything
+    cip_new(da[0..64], false, false);
+    cip_new(db[0..64], true, false);
+    cs_call(a[0..CS_LEN], lo, 47772, fb[0..10]);
+    cip_run(a[0..CS_LEN], da[0..64], b[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("2 stored keys and good signatures: the call opened with no code and no person", rg(da[0..64], 0) == 0 and rg(db[0..64], 0) == 0 and rg(da[0..64], 1) == 1 and rg(db[0..64], 1) == 1) and all;
+    all = ckh_check("2 both sides say VERIFIED", cs_id_state(a[0..CS_LEN]) == CS_ID_VERIFIED and cs_id_state(b[0..CS_LEN]) == CS_ID_VERIFIED) and all;
+    const vat2 : u64 = cs_verified_ep(a[0..CS_LEN], vfp[0..10], vep[0..18]);
+
+    // 3 a message session opens by itself
+    cip_new(da[0..64], false, false);
+    cip_new(db[0..64], true, false);
+    cs_call(ma[0..CS_LEN], lo, 47774, fb[0..10]);
+    cip_run(ma[0..CS_LEN], da[0..64], mb[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("3 message session between trusted friends opened, nobody confirmed", rg(da[0..64], 1) == 1 and rg(db[0..64], 1) == 1 and rg(da[0..64], 0) == 0 and rg(db[0..64], 0) == 0) and all;
+
+    // 4 an impostor: B's block proves with C's key
+    ck_put(b[0..CS_LEN], CS_ID + CI_PUB, pc[0..65]);
+    ck_put(b[0..CS_LEN], CS_ID + CI_PRIV, kc[0..97]);
+    cip_new(da[0..64], false, true);
+    cip_new(db[0..64], true, true);
+    cs_call(a[0..CS_LEN], lo, 47772, fb[0..10]);
+    cip_run(a[0..CS_LEN], da[0..64], b[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("4 impostor with another key: A refused it (CS_R_IDENTITY), nothing opened", rg(da[0..64], 3) == @as(u64, CS_R_IDENTITY) and rg(da[0..64], 1) == 0 and rg(db[0..64], 1) == 0 and rg(da[0..64], 0) == 0) and all;
+    all = ckh_check("4 B's stored key is unchanged", ih_pin_get(fb[0..10], got[0..65]) and ck_same(got[0..65], pb[0..65])) and all;
+
+    // 5 B's key with C's signature
+    ck_put(b[0..CS_LEN], CS_ID + CI_PUB, pb[0..65]);
+    cip_new(da[0..64], false, true);
+    cip_new(db[0..64], true, true);
+    cs_call(a[0..CS_LEN], lo, 47772, fb[0..10]);
+    cip_run(a[0..CS_LEN], da[0..64], b[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("5 the right key with a signature that does not verify: refused (CS_R_IDENTITY)", rg(da[0..64], 3) == @as(u64, CS_R_IDENTITY) and rg(da[0..64], 1) == 0 and rg(db[0..64], 1) == 0) and all;
+    all = ckh_check("5 the refused calls left A's last verified endpoint as call 2 left it", vat2 != 0 and cs_verified_ep(a[0..CS_LEN], vfp[0..10], vep[0..18]) == vat2 and ck_same(vfp[0..10], fb[0..10]) and ip6_v4of(vep[0..18]) == lo * 65536 + 47772) and all;
+    ck_put(b[0..CS_LEN], CS_ID + CI_PRIV, kb[0..97]);
+
+    // 6 B forgets A's key: the next message session stores A's proven key on B's side and opens
+    all = ckh_check("6 A removed and added again: its key is gone, B's stays", ft_remove(t[0..FT_LEN], fa[0..10]) and ih_friends_save(t[0..FT_LEN]) and cip_friends(t[0..FT_LEN], fa[0..10], fb[0..10]) and !ih_pin_get(fa[0..10], got[0..65]) and ih_pin_get(fb[0..10], got[0..65])) and all;
+    cip_new(da[0..64], false, false);
+    cip_new(db[0..64], true, false);
+    cs_call(ma[0..CS_LEN], lo, 47774, fb[0..10]);
+    cip_run(ma[0..CS_LEN], da[0..64], mb[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("6 message session with a friend whose key was not stored: A's proven key stored, opened, no code", rg(da[0..64], 1) == 1 and rg(db[0..64], 1) == 1 and rg(db[0..64], 0) == 0 and ih_pin_get(fa[0..10], got[0..65]) and ck_same(got[0..65], pa[0..65])) and all;
+
+    // 7 a call: both keys are stored again, no code on either side
+    cip_new(da[0..64], false, false);
+    cip_new(db[0..64], true, false);
+    cs_call(a[0..CS_LEN], lo, 47772, fb[0..10]);
+    cip_run(a[0..CS_LEN], da[0..64], b[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("7 the call opened with no code and no person", rg(db[0..64], 0) == 0 and rg(da[0..64], 0) == 0 and rg(da[0..64], 1) == 1 and rg(db[0..64], 1) == 1) and all;
+
+    // 8 C is not a friend: its message session to B ends as an invitation on B's side
+    var fc : [10]u8 = undefined;
+    var mc : [299648]u8 = undefined;
+    var dc : [64]u8 = undefined;
+    all = ckh_check("8 C's message session opens on 47775", ih_fingerprint(pc[0..65], fc[0..10]) and cs_open(mc[0..CS_LEN], fc[0..10], lo, 47775, CS_AUDIO_NONE) and cs_identity(mc[0..CS_LEN], pc[0..65], kc[0..97])) and all;
+    cs_set(mc[0..CS_LEN], CS_K_VERIFY_MS, 8000);
+    cip_new(dc[0..64], false, false);
+    cip_new(db[0..64], true, false);
+    cs_call(mc[0..CS_LEN], lo, 47774, fb[0..10]);
+    cip_run(mc[0..CS_LEN], dc[0..64], mb[0..CS_LEN], db[0..64], 6000);
+    var pf : [10]u8 = undefined;
+    all = ckh_check("8 B ended it as an invitation (CS_R_INVITE): nothing opened on either side", rg(db[0..64], 3) == @as(u64, CS_R_INVITE) and rg(db[0..64], 1) == 0 and rg(dc[0..64], 1) == 0 and rg(db[0..64], 0) == 0) and all;
+    all = ckh_check("8 the invitation holds C's fingerprint and C's real key; no key stored for C", cs_id_proven(mb[0..CS_LEN], pf[0..10], got[0..65]) and ck_same(pf[0..10], fc[0..10]) and ck_same(got[0..65], pc[0..65]) and !ih_pin_get(fc[0..10], got[0..65])) and all;
+
+    // 9 ACCEPT: C becomes a friend with the proven key, and its next message session opens by itself
+    var inv : [25]u8 = undefined;
+    var own : [10]u8 = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+    invite_make(fc[0..10], inv[0..25]);
+    all = ckh_check("9 ACCEPT: C added, its proven key stored", ft_add(t[0..FT_LEN], inv[0..25], own[0..10]) == FA_OK and ih_friends_save(t[0..FT_LEN]) and ih_pin_put(fc[0..10], pc[0..65]) == PIN_NEW) and all;
+    cip_new(dc[0..64], false, false);
+    cip_new(db[0..64], true, false);
+    cs_call(mc[0..CS_LEN], lo, 47774, fb[0..10]);
+    cip_run(mc[0..CS_LEN], dc[0..64], mb[0..CS_LEN], db[0..64], 6000);
+    all = ckh_check("9 C's message session opened, nobody confirmed", rg(dc[0..64], 1) == 1 and rg(db[0..64], 1) == 1 and rg(db[0..64], 0) == 0) and all;
+    cs_close(mc[0..CS_LEN]);
+
+    cs_close(a[0..CS_LEN]);
+    cs_close(b[0..CS_LEN]);
+    cs_close(ma[0..CS_LEN]);
+    cs_close(mb[0..CS_LEN]);
+    return all;
+}
+
+pub fn main() -> void {
+    // Never true: makes sure the audio callbacks are emitted and so exported for dlsym.
+    var z : [8]u8 = undefined;
+    put_u64(z[0..8], 0, 0);
+    if (get_u64(z[0..8], 0) == 99) {
+        cbp_fin(0, 0, 0, 0, 0, 0);
+        cbp_fout(0, 0, 0);
+    }
+    ckh_line("T27 OS call identity probe: two sessions and two message sessions in this process, 127.0.0.1\n");
+    if (cip_main()) {
+        ckh_line("ALL CHECKS PASSED\n");
+        sys_exit(0);
+    }
+    ckh_line("SOME CHECKS FAILED\n");
+    sys_exit(1);
+}
+
+test the_side_record_reads_back_its_slots {
+    var d : [64]u8 = undefined;
+    cip_new(d[0..64], true, false);
+    assert rg(d[0..64], 4) == 1 and rg(d[0..64], 5) == 0 and rg(d[0..64], 0) == 0;
+    rp(d[0..64], 3, 14);
+    assert rg(d[0..64], 3) == 14;
+}
