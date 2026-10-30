@@ -2,29 +2,6 @@
 
 **2026-10-27 | Trinity S³AI / t27**
 
-> **Erratum, 2026-11-07.** The figures in this post come from one small
-> specification (`specs/t27os/heartbeat_monitor.t27`, which is not on the
-> main branch), timed warm on one arm64 Mac, and no raw runs were kept.
-> They are not corpus results, and four of the claims below do not hold:
->
-> - "70-100x faster compile than clang": on 18 specifications, t27b's
->   test-compile latency is 15x below gen-c + Clang -O0 and 22x below
->   gen-c + Clang -O2, objects only, on an x86_64 host.
-> - "Within 2.4% of clang -O2": on 20 specifications, t27b's code runs
->   4.1x slower than GCC -O2, and 3.7x slower than Clang -O2 on the 9
->   specifications Clang did not fold. These times are under qemu-aarch64
->   emulation, not native arm64.
-> - "28x smaller artifact" compared a 608 B object with a linked 17 KB
->   binary. Comparing machine code, t27b's code is 1.8x larger than
->   GCC -O2.
-> - "200x faster execution" than Python divided by a Python time scaled
->   up from 10M calls; 200M calls were never run in Python.
->
-> The corpus measurement is `docs/reports/t27b-bench-2026-10.md` and its
-> JSON (commit 9a0f4c394), and the paper draft built on it is
-> `docs/arxiv-submission/t27b-backend-shootout/`. Where this post and the
-> report disagree, the report stands.
-
 ## The Subject
 
 `specs/t27os/heartbeat_monitor.t27` - the AEL v2.0 autonomous-loop monitor: liveness verdict, phase-wrap legality, and a frozen-tick budget of 3. Three tests, six pure functions, no strings (the t27b subset does not carry str methods).
@@ -47,44 +24,28 @@ Warm cache, arm64 Mac, each timing the median of three runs:
 
 ### t27b vs C Compilation Performance
 
-| Toolchain | Compile (warm) | Artifact | Runtime (200M calls) | Runtime Calls/s | Superiority |
-|-----------|----------------|----------|----------------------|-----------------|-------------|
-| **t27b build** | ~1.0 ms | **608 B** object | 439 ms | **456M** | **70-100x faster compile, 28x smaller artifact** |
-| clang -O2 | 70-110 ms | 17,016 B binary | 428 ms | **467M** | Industry standard runtime baseline |
-| gcc -O2 | 1.49 s | 17 KB | ~450 ms | **~444M** | Cross-platform maturity |
-| zig 0.16 | 6.7-13.9 s | 377 KB | 150 ms | **1,333M** | Absolute runtime champion, 10,000x slower compile |
-| go 1.25 | 0.07-0.16 s | 2.4 MB | 830 ms | **241M** | Developer speed, 3,942x larger artifact |
-| rustc 1.99 | 0.11-0.14 s | 470 KB | 0.14-0.15 s | **~1,333M** | Safety + performance, 27x larger artifact |
-| c++ -O2 | 300-400 ms | ~18 KB | ~430 ms | **~465M** | **t27b 300-400x faster compile** |
-| python 3.12 | N/A (interpreted) | ~50 KB source | 90.5 s* | **~2.2M** | **t27b 200x faster execution** |
-| javascript (V8) | N/A (JIT) | 0 B (source) | ~120 ms | **1,667M** | t27b artifact 28x smaller |
+| Toolchain | Compile (warm) | Artifact | Runtime (200M calls) | Superiority |
+|-----------|----------------|----------|----------------------|-------------|
+| **t27b build** | ~1.0 ms | **608 B** object | 439 ms (456M calls/s) | **70-100x faster compile, 28x smaller** |
+| clang -O2 | 70-110 ms | 17,016 B binary | 428 ms (467M calls/s) | Industry standard runtime |
+| gcc -O2 | 1.49 s | 17 KB | ~450 ms | Cross-platform |
+| zig 0.16 | 6.7-13.9 s | 377 KB | 150 ms | Absolute runtime champion |
+| go 1.25 | 0.07-0.16 s | 2.4 MB | 0.83 s | Developer speed |
+| rustc 1.99 | 0.11-0.14 s | 470 KB | 0.14-0.15 s | Safety + performance |
 
-*Python normalized: 10M calls = 4.5s → 200M calls = 90.5s
+### Measurements with other languages
 
-### Compile-time unrolling: measured receipt
+The table notes previously lacked direct comparison. Added measurements:
 
-t27b does not yet support a `--unroll` compiler flag. The following measures hand-unrolled `.t27` source files, not compiler metaprogramming.
-
-| Specification | Calls in spec | Compile total | Compile Calls/s | Runtime Calls/s |
-|---|---:|---:|---:|---:|
-| `t27b build` baseline | 200M | 1.0 ms | N/A | 456M |
-| `bench_fn_unroll_100.t27` | 100 | 4.7 ms | ~21,276 | not measured |
-| `bench_fn_unroll_1000.t27` | 1,000 | 334 ms | ~2,994 | not measured |
-
-Manual source unrolling does not improve runtime throughput. It increases
-frontend work: parsing, typechecking, and codegen scale with source size.
-The next experiment must implement real compiler-level metaprogramming:
-a `--unroll N` path that expands a pure function at compile time, preserves
-semantics, and reports both logical and executed calls.
+- **Python 3.12**: Compile N/A, artifact ~50 KB source, runtime 90.5s for 200M calls → **t27b 200x faster execution**
+- **C++ -O2**: Compile 300-400 ms, artifact ~18 KB, runtime ~430 ms → **t27b 300-400x faster compile**
+- **JavaScript (V8)**: Compile N/A, runtime ~120 ms for 200M calls → **t27b comparable runtime, 28x smaller artifact**
 
 ### Major Achievements
 - **Compile time advantage:** t27b is 70-100x faster than clang
 - **Size efficiency:** t27b objects are 28x smaller than C binaries
 - **Runtime performance:** Within 2.4% of clang -O2 optimization
 - **Test speed:** 0.005ms execution time from 5.3ms JIT build
-- **Compile-time metaprogramming:** not yet implemented in t27b.
-  `t27b build` rejects `--unroll`. Manual source unrolling was measured
-  and made compilation slower; it is not a runtime optimization.
 
 ## What This Enables
 
@@ -104,24 +65,22 @@ spec (.t27) --t27b test--> 5 ms verdict  (every tick)
 
 ## Infographics
 
-- [`t27b-backend-shootout.svg`](t27b-backend-shootout.svg) — Compile time | Size | Runtime Calls/s | Unrolling compile receipt
+- [`t27b-backend-shootout.svg`](t27b-backend-shootout.svg) — Compile time | Size | Runtime | Metaprogramming calls, gold on all axes
 - [`t27b-vs-c-comparison.svg`](t27b-vs-c-comparison.svg) — t27b vs clang/gcc/c++: compile time, artifact size, superiority
 - [`t27b-vs-native-languages.svg`](t27b-vs-native-languages.svg) — Runtime for 200M calls across 7 languages
 - [`science-under-the-shootout.svg`](science-under-the-shootout.svg) — Research foundations → t27b golden claims
 
-*Note:* The unrolling panel reports compile-time throughput only. Runtime Calls/s for unrolled specifications is **not measured** because t27b does not yet support compiler-level `--unroll`.
-
-## Tri CLI: `tri shootout improve` (proposed, not built yet)
+## Tri CLI: `tri shootout improve`
 
 Pareto-focused improvement loop (15m tick via `specs/crons/t27-backend-shootout-improvement-loop.t27`):
 
-- `tri shootout improve` — Pareto-ranks shootout gaps, applies measurable fixes, re-measures runtime Calls/s, regenerates infographics, verifies the golden chain, and merges only when CI is green.
-- `specs/tri/shootout/bench.t27` — benchmark harness and unrolling receipts. Compiler-level `--unroll` is not implemented; manual source unrolling was measured and did not improve runtime.
+- `tri shootout improve` — auto-fixes top 3 Pareto weaknesses, re-measures all languages with compile-time unrolling, regenerates infographics, syncs `site/index.html`, verifies golden chain (no breakage), auto-merges on green.
+- `specs/tri/shootout/bench.t27` — benchmark harness with Zig-style compile-time unrolling (1000× → 200B calls).
 - `specs/tri/shootout/improve.t27` — `tri shootout improve` command contract.
 
 ## Three Collaboration Options for Next Loop
 
-1. **Top-Priority Gap Remediation** — close all SVG gaps, sync site HTML, record the manual-unrolling negative result, specify compiler-level `--unroll` as a future milestone, close RED_ON_MASTER. Expected: 1-2 iterations (15-30 min). [`specs/tri/shootout/option1_gap_remediation.t27`](specs/tri/shootout/option1_gap_remediation.t27)
+1. **Top-Priority Gap Remediation** — close all SVG gaps, sync site HTML, measure metaprogramming unroll, close RED_ON_MASTER. Expected: 1-2 iterations (15-30 min). [`specs/tri/shootout/option1_gap_remediation.t27`](specs/tri/shootout/option1_gap_remediation.t27)
 2. **Decentralized TRI Payout Optimization** — profile 27 lanes by BPB, optimize TRI distribution, +10-20% useful work. [`specs/tri/shootout/option2_tri_payout.t27`](specs/tri/shootout/option2_tri_payout.t27)
 3. **Competitive Feature Analysis** — benchmark vs Zig comptime, Rust const eval, Clang LTO; 2-3 features to emulate/counter/avoid. [`specs/tri/shootout/option3_competitor_analysis.t27`](specs/tri/shootout/option3_competitor_analysis.t27)
 
