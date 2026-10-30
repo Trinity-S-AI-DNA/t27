@@ -22,7 +22,7 @@
 //! elsewhere.
 #![cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 
-use t27b::codegen::{self, canon, TrapStyle};
+use t27b::codegen::{self, TrapStyle};
 use t27b::eval::{Interp, Stop};
 use t27b::ir::*;
 use t27b::jit::Jit;
@@ -1267,7 +1267,7 @@ struct Stats {
 /// Raw register image of an argument: canonical form, plus random garbage in
 /// the upper half for types of 32 bits or less (the ABI leaves it undefined).
 fn raw_arg(rng: &mut Rng, v: i128, ty: Ty) -> u64 {
-    let c = canon(v, ty);
+    let c = t27b::a64::canon(v as u64, ty.is64());
     if ty.is64() {
         c
     } else {
@@ -1277,9 +1277,9 @@ fn raw_arg(rng: &mut Rng, v: i128, ty: Ty) -> u64 {
 
 fn check_value(ty: Ty, want: i128, raw: u64) -> bool {
     if ty.is64() {
-        raw == canon(want, ty)
+        raw == t27b::a64::canon(want as u64, ty.is64())
     } else {
-        (raw & 0xffff_ffff) == canon(want, ty)
+        (raw & 0xffff_ffff) == t27b::a64::canon(want as u64, ty.is64())
     }
 }
 

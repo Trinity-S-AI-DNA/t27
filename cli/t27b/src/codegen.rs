@@ -105,14 +105,6 @@ enum Stub {
     AssertEq(SiteId, Reg, Reg),
     Brk(TrapKind),
 }
-/// Register image of a constant of type `ty` (see canonical form above).
-pub fn canon(c: i128, ty: Ty) -> u64 {
-    if ty.is64() {
-        c as u64
-    } else {
-        (c as i64 as u64) & 0xffff_ffff
-    }
-}
 /// Float `ty` from general register `rn` to FP register `rd`, from FP register `rn` to general register `rd`
 /// in canonical form, and a double-precision FP instruction `w` in `ty`'s precision: a64.t27's choices.
 fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_in(ty == Ty::F32, rd, rn) }
@@ -272,8 +264,11 @@ impl<'a> Gen<'a> {
         self.emit(a64::b(0));
     }
     fn bcond(&mut self, c: Cond, l: Label) {
+        // A compare against zero and the branch that follows it are one word: a64.t27's `zero_test`.
+        let z = if let Some(&p) = self.code.last() { a64::zero_test(p, c as u32) } else { 0 };
+        if z != 0 { let n = self.code.len(); self.code.pop(); for x in self.labels.iter_mut() { if *x == Some(n) { *x = Some(n - 1); } } }
         self.fixes.push((self.code.len(), l));
-        self.emit(a64::b_cond(c, 0));
+        self.emit(if z != 0 { z } else { a64::b_cond(c, 0) });
     }
     fn cbz(&mut self, sf: bool, r: Reg, nz: bool, l: Label) {
         self.fixes.push((self.code.len(), l));
@@ -628,7 +623,7 @@ impl<'a> Gen<'a> {
             }
             V::Const(0) => ZR,
             V::Const(c) => {
-                self.mov_imm(ty.is64(), scratch, canon(c, ty));
+                self.mov_imm(ty.is64(), scratch, a64::canon(c as u64, ty.is64()));
                 scratch
             }
         }
@@ -921,7 +916,7 @@ impl<'a> Gen<'a> {
 
     fn eval_into(&mut self, e: &Expr, r: Reg) {
         match &e.kind {
-            ExprKind::Const(c) => self.mov_imm(e.ty.is64(), r, canon(*c, e.ty)),
+            ExprKind::Const(c) => self.mov_imm(e.ty.is64(), r, a64::canon(*c as u64, e.ty.is64())),
             ExprKind::Var(v) => match self.homes[*v as usize] {
                 Home::Reg(h) => {
                     if h != r {
@@ -1542,7 +1537,7 @@ impl<'a> Gen<'a> {
                     self.ldr_slot(rj, off);
                 }
                 V::Reg(r) => self.emit(a64::mov(true, rj, r)),
-                V::Const(c) => self.mov_imm(ty.is64(), rj, canon(c, ty)),
+                V::Const(c) => self.mov_imm(ty.is64(), rj, a64::canon(c as u64, ty.is64())),
             }
         }
         // Outgoing stack words, 16-byte aligned at the `bl`.
@@ -1567,7 +1562,7 @@ impl<'a> Gen<'a> {
                     }
                     V::Reg(r) => r,
                     V::Const(c) => {
-                        self.mov_imm(ty.is64(), X16, canon(c, ty));
+                        self.mov_imm(ty.is64(), X16, a64::canon(c as u64, ty.is64()));
                         X16
                     }
                 };
@@ -1666,7 +1661,7 @@ impl<'a> Gen<'a> {
             }
             // ---------------------------------------------- logical immediate
             (ArithOp::And | ArithOp::Or | ArithOp::Xor, V::Const(c))
-                if !xc && a64::bitmask_imm(canon(c, ty), s).is_some() =>
+                if !xc && a64::bitmask_imm(a64::canon(c as u64, ty.is64()), s).is_some() =>
             {
                 let rx = self.use_(x, X16, ty);
                 self.release(b);
@@ -1677,7 +1672,7 @@ impl<'a> Gen<'a> {
                     ArithOp::Or => LogOp::Orr,
                     _ => LogOp::Eor,
                 };
-                self.emit(a64::logic_imm(s, lop, d, rx, canon(c, ty)).unwrap());
+                self.emit(a64::logic_imm(s, lop, d, rx, a64::canon(c as u64, ty.is64())).unwrap());
                 return self.done(d, t);
             }
             // ---------------------------------------------- constant shift amount
