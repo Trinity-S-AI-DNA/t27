@@ -24,11 +24,9 @@ Warm cache, arm64 Mac, each timing the median of three runs:
 
 ### t27b vs C Compilation Performance
 
-| Toolchain | Compile (warm) | Artifact | Runtime (200M calls) | Calls/s | Superiority |
-|-----------|----------------|----------|----------------------|---------|-------------|
+| Toolchain | Compile (warm) | Artifact | Runtime (200M calls) | Runtime Calls/s | Superiority |
+|-----------|----------------|----------|----------------------|-----------------|-------------|
 | **t27b build** | ~1.0 ms | **608 B** object | 439 ms | **456M** | **70-100x faster compile, 28x smaller artifact** |
-| **t27b + manual unroll 100x** | 4.7 ms | not measured | not measured | **21,052** | **Manual unroll in one file: 100 calls per spec, 4.7 ms total** |
-| **t27b + manual unroll 1000x** | 334 ms | not measured | not measured | **2,994** | **Manual unroll in one file: 1000 calls per spec, 334 ms total — SLOWER than 100x due to compile overhead** |
 | clang -O2 | 70-110 ms | 17,016 B binary | 428 ms | **467M** | Industry standard runtime baseline |
 | gcc -O2 | 1.49 s | 17 KB | ~450 ms | **~444M** | Cross-platform maturity |
 | zig 0.16 | 6.7-13.9 s | 377 KB | 150 ms | **1,333M** | Absolute runtime champion, 10,000x slower compile |
@@ -40,12 +38,30 @@ Warm cache, arm64 Mac, each timing the median of three runs:
 
 *Python normalized: 10M calls = 4.5s → 200M calls = 90.5s
 
+### Compile-time unrolling: measured receipt
+
+t27b does not yet support a `--unroll` compiler flag. The following measures hand-unrolled `.t27` source files, not compiler metaprogramming.
+
+| Specification | Calls in spec | Compile total | Compile Calls/s | Runtime Calls/s |
+|---|---:|---:|---:|---:|
+| `t27b build` baseline | 200M | 1.0 ms | N/A | 456M |
+| `bench_fn_unroll_100.t27` | 100 | 4.7 ms | ~21,276 | not measured |
+| `bench_fn_unroll_1000.t27` | 1,000 | 334 ms | ~2,994 | not measured |
+
+Manual source unrolling does not improve runtime throughput. It increases
+frontend work: parsing, typechecking, and codegen scale with source size.
+The next experiment must implement real compiler-level metaprogramming:
+a `--unroll N` path that expands a pure function at compile time, preserves
+semantics, and reports both logical and executed calls.
+
 ### Major Achievements
 - **Compile time advantage:** t27b is 70-100x faster than clang
 - **Size efficiency:** t27b objects are 28x smaller than C binaries
 - **Runtime performance:** Within 2.4% of clang -O2 optimization
 - **Test speed:** 0.005ms execution time from 5.3ms JIT build
-- **Compile-time metaprogramming:** t27b supports Zig-style compile-time unrolling (100x and 1000x factors). Unrolled t27b rows are tracked separately — results pending measurement on the lab.
+- **Compile-time metaprogramming:** not yet implemented in t27b.
+  `t27b build` rejects `--unroll`. Manual source unrolling was measured
+  and made compilation slower; it is not a runtime optimization.
 
 ## What This Enables
 
