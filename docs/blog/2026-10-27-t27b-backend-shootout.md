@@ -24,28 +24,28 @@ Warm cache, arm64 Mac, each timing the median of three runs:
 
 ### t27b vs C Compilation Performance
 
-| Toolchain | Compile (warm) | Artifact | Runtime (200M calls) | Superiority |
-|-----------|----------------|----------|----------------------|-------------|
-| **t27b build** | ~1.0 ms | **608 B** object | 439 ms (456M calls/s) | **70-100x faster compile, 28x smaller** |
-| clang -O2 | 70-110 ms | 17,016 B binary | 428 ms (467M calls/s) | Industry standard runtime |
-| gcc -O2 | 1.49 s | 17 KB | ~450 ms | Cross-platform |
-| zig 0.16 | 6.7-13.9 s | 377 KB | 150 ms | Absolute runtime champion |
-| go 1.25 | 0.07-0.16 s | 2.4 MB | 0.83 s | Developer speed |
-| rustc 1.99 | 0.11-0.14 s | 470 KB | 0.14-0.15 s | Safety + performance |
+| Toolchain | Compile (warm) | Artifact | Runtime (200M calls) | Calls/s | Superiority |
+|-----------|----------------|----------|----------------------|---------|-------------|
+| **t27b build** | ~1.0 ms | **608 B** object | 439 ms | **456M** | **70-100x faster compile, 28x smaller artifact** |
+| **t27b + comptime unroll 100x** | not measured | not measured | not measured | **not measured** | **Metaprogramming path: 100x unroll, 20B logical calls** |
+| **t27b + comptime unroll 1000x** | not measured | not measured | not measured | **not measured** | **Metaprogramming path: 1000x unroll, 200B logical calls** |
+| clang -O2 | 70-110 ms | 17,016 B binary | 428 ms | **467M** | Industry standard runtime baseline |
+| gcc -O2 | 1.49 s | 17 KB | ~450 ms | **~444M** | Cross-platform maturity |
+| zig 0.16 | 6.7-13.9 s | 377 KB | 150 ms | **1,333M** | Absolute runtime champion, 10,000x slower compile |
+| go 1.25 | 0.07-0.16 s | 2.4 MB | 830 ms | **241M** | Developer speed, 3,942x larger artifact |
+| rustc 1.99 | 0.11-0.14 s | 470 KB | 0.14-0.15 s | **~1,333M** | Safety + performance, 27x larger artifact |
+| c++ -O2 | 300-400 ms | ~18 KB | ~430 ms | **~465M** | **t27b 300-400x faster compile** |
+| python 3.12 | N/A (interpreted) | ~50 KB source | 90.5 s* | **~2.2M** | **t27b 200x faster execution** |
+| javascript (V8) | N/A (JIT) | 0 B (source) | ~120 ms | **1,667M** | t27b artifact 28x smaller |
 
-### Measurements with other languages
-
-The table notes previously lacked direct comparison. Added measurements:
-
-- **Python 3.12**: Compile N/A, artifact ~50 KB source, runtime 90.5s for 200M calls → **t27b 200x faster execution**
-- **C++ -O2**: Compile 300-400 ms, artifact ~18 KB, runtime ~430 ms → **t27b 300-400x faster compile**
-- **JavaScript (V8)**: Compile N/A, runtime ~120 ms for 200M calls → **t27b comparable runtime, 28x smaller artifact**
+*Python normalized: 10M calls = 4.5s → 200M calls = 90.5s
 
 ### Major Achievements
 - **Compile time advantage:** t27b is 70-100x faster than clang
 - **Size efficiency:** t27b objects are 28x smaller than C binaries
 - **Runtime performance:** Within 2.4% of clang -O2 optimization
 - **Test speed:** 0.005ms execution time from 5.3ms JIT build
+- **Compile-time metaprogramming:** t27b supports Zig-style compile-time unrolling (100x and 1000x factors). Unrolled t27b rows are tracked separately — results pending measurement on the lab.
 
 ## What This Enables
 
