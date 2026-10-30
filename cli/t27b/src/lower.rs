@@ -4096,7 +4096,7 @@ impl<'a> Lower<'a> {
         }
         // Two typed constants fold as Zig folds them where the plan says so (specs/tri/t27b/coerce_plan.t27).
         if let (ExprKind::Const(p), ExprKind::Const(q), true) = (&x.kind, &y.kind, ty.is_int()) {
-            let r = match aop { ArithOp::Add | ArithOp::AddW => p.checked_add(*q), ArithOp::Sub | ArithOp::SubW => p.checked_sub(*q), ArithOp::Mul | ArithOp::MulW => p.checked_mul(*q), ArithOp::And => Some(p & q), ArithOp::Or => Some(p | q), ArithOp::Xor => Some(p ^ q), ArithOp::Div | ArithOp::DivW => p.checked_div(*q), ArithOp::Rem => p.checked_rem(*q), _ => None };
+            let r = crate::eval::arith(aop, ty, *p, *q, ty).ok(); // the law's value (specs/tri/t27b/eval_arith.t27): the same fn the interpreter runs, so a fold cannot disagree with it
             let b = op.as_bytes();
             // `/` and `%` fold where specs/tri/t27b/const_div_plan.t27 says so, as Zig folds them at compile time.
             if let Some(r) = r.filter(|r| cp::folds(b[0], b.get(1).copied().unwrap_or(0), b.len(), ty.fits(*r)) || dv::div_folds(b[0], b.len(), ty.signed(), *q == 0, ty.fits(*r))) { return Ok(Val::E(Expr { ty, kind: ExprKind::Const(ty.wrap(r)) })); }
