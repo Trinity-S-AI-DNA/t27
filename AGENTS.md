@@ -27,6 +27,27 @@ Every bee, lane and the Queen puts its capacity into T27 OS and the loop that im
 
 Supporting: [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), [`architecture/ADR-004-language-policy.md`](architecture/ADR-004-language-policy.md).
 
+## The Golden Series (added 2026-10-31)
+
+t27 is Article 3 of **THE GOLDEN SERIES**:
+
+| Layer | Article | What it establishes |
+|---|---|---|
+| **Numbers** | [GoldenFloat](https://arxiv.org/abs/2606.05017) | One phi-derived rule for the GF4–GF1024 floating-point family |
+| **Verification** | [Golden Ruler](https://arxiv.org/abs/2606.09686) | Bit-exact conformance vectors across numeric formats |
+| **Execution** | **GOLDEN CHAIN** | One `.t27` contract from source to silicon evidence |
+
+The chain is directional:
+
+```text
+GoldenFloat → Golden Ruler → GOLDEN CHAIN
+   numbers  →   verification  →   silicon evidence
+```
+
+GOLDEN CHAIN lives in [`specs/golden/`](specs/golden/) — `series.t27` (manifest), `article3_golden_chain.t27` (Article 3), and the operating-system mechanisms `golden_invariant.t27`, `golden_oracle.t27`, `golden_head.t27`, `golden_foundry.t27`, `golden_spiral.t27`.
+
+The series rule: **one `.t27` specification produces sealed, bit-exact software, tests, generated Zig/C/Verilog artifacts, synthesizable RTL, and reproducible FPGA evidence — without hand-editing generated code.**
+
 ---
 
 ## 2. Agent model (27-letter alphabet)
