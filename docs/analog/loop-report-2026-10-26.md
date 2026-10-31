@@ -102,7 +102,7 @@ Reading the gate figures: killed, survived, hung, unviable. "Census" is the firs
 | raw_writer dead lines 683 and 954 | mutation-raw_writer-2026-10-25.md | the owner decides | kept and accepted |
 | Inherited reds on master: five stale seals (#12509, PR #12495); `same` duplicate group (#12498, PR #12499); `put_lit` group (#12419, PR #12429); 25 parse-no-discard rows (#12497, PR #12500) | rows 131, 134, 136 | other sessions | documented as inherited; the required checks decide |
 | Board: comparator step (phase 2b, #11380) not built; phase 2a unit routed at 59.46 MHz and FAILS at 100 MHz; four blocks NOT MODELLED | v0.1-release-notes.md | a board and cable on a machine the loop does not hold | v0.1 receipts stand |
-| Bare seal runs no tests; two single-line faults change no output of the model | #12065, #12067, seal-refusal note section 7 | nothing; recorded | `--save` and `--verify` are the refusing forms |
+| Bare seal runs no tests; two single-line faults give no signal in any test (documented survivors, decision (c) of #12069) | #12065, #12067, seal-refusal note section 7 | nothing; recorded | `--save` and `--verify` are the refusing forms |
 
 ## 5. Three cooperation variants
 
