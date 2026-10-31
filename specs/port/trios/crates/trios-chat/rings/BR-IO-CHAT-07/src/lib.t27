@@ -1,0 +1,205 @@
+// Port of gHashTag/trios:crates/trios-chat/rings/BR-IO-CHAT-07/src/lib.rs
+// (221 lines) to .t27, roadmap stage 6 (t27c gen-rust; issue #11579).
+//
+// The original is the async wire-emitter twin of CR-CHAT-07. Every wall-clock
+// tick consults the inner CoverScheduler and emits exactly one Emission
+// (R-CHAT-10 iii): the first queued `enqueue_real` calls become Real emissions,
+// and every tick with an empty queue still emits Cover (R-CHAT-10 v). The
+// scheduler's decisions, as pinned by this file's tests, are:
+//   - `new`/`with_default_tick` (lines 65-77): a custom tick or the 1000 ms
+//     DEFAULT_TICK_MS;
+//   - `enqueue_real` (lines 79-82): increment the pending-real depth;
+//   - `run_for` (lines 84-104): consume at most n_ticks, one tick per emission;
+//     a closed downstream channel stops the loop after the tick was produced,
+//     so at most n emissions reach the wire and `queue_depth`/`ticks` reflect
+//     the consumed ticks; logical time advances by exactly n * tick;
+//   - `queue_depth` (lines 106-109) and `ticks` (lines 111-114) are read-only
+//     views of the scheduler counters.
+//
+// The tokio mpsc channel, sleep_until and the Instant arithmetic are plumbing:
+// the port carries `channel_open` and returns the counts the original would
+// push, so the emission sequence is reconstructable without a runtime.
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module port::trios::crates::trios_chat::rings::BR_IO_CHAT_07::src::lib;
+
+// Lines 47-50: one second is the canonical upper bound on per-message timing
+// leak under R-CHAT-10.
+pub const DEFAULT_TICK_MS: u64 = 1_000;
+
+// The two emissions CR-CHAT-07 defines.
+pub enum Emission {
+    Real,
+    Cover,
+}
+
+pub struct WireEmitter {
+    queued_reals: u64,
+    tick_ms: u64,
+    ticks_consumed: u64,
+}
+
+// Lines 65-72: a fresh CoverScheduler plus the caller's tick period.
+pub fn new(tick_ms: u64) -> WireEmitter {
+    return WireEmitter { queued_reals: 0, tick_ms: tick_ms, ticks_consumed: 0 };
+}
+
+// Lines 74-77: the default tick is DEFAULT_TICK_MS.
+pub fn with_default_tick() -> WireEmitter {
+    return new(DEFAULT_TICK_MS);
+}
+
+// Lines 79-82: one pending real envelope; it will be sent at the next tick.
+pub fn enqueue_real(e: WireEmitter) -> WireEmitter {
+    var out = e;
+    out.queued_reals += 1;
+    return out;
+}
+
+pub struct RunOutcome {
+    sent: u64,
+    reals: u64,
+    covers: u64,
+    elapsed_ms: u64,
+    state: WireEmitter,
+}
+
+// Lines 84-104: the loop runs exactly n_ticks cycles, sleeping until boundary
+// i+1 from start, ticks the scheduler once, and pushes the emission. A closed
+// downstream (`out.send(...).is_err()`) breaks AFTER the tick was consumed, so
+// `sent` counts only the pushes that were accepted while `ticks` counts the
+// consumed scheduler ticks. With no queued reals every tick is Cover; with k
+// queued reals the first k ticks are Real and the rest Cover.
+pub fn run_for(e: WireEmitter, n_ticks: u64, channel_open: bool) -> RunOutcome {
+    var out = e;
+    var sent: u64 = 0;
+    var reals: u64 = 0;
+    var covers: u64 = 0;
+    var i: u64 = 0;
+    while (i < n_ticks) {
+        // let em = self.sched.tick();
+        if (out.queued_reals > 0) {
+            out.queued_reals -= 1;
+            reals += 1;
+        } else {
+            covers += 1;
+        }
+        out.ticks_consumed += 1;
+        // if self.out.send(em).is_err() { break; }
+        if (!channel_open) {
+            break;
+        }
+        sent += 1;
+        i += 1;
+    }
+    return RunOutcome {
+        sent: sent,
+        reals: reals,
+        covers: covers,
+        elapsed_ms: out.tick_ms * out.ticks_consumed,
+        state: out,
+    };
+}
+
+// Lines 106-109.
+pub fn queue_depth(e: WireEmitter) -> u64 {
+    return e.queued_reals;
+}
+
+// Lines 111-114.
+pub fn ticks(e: WireEmitter) -> u64 {
+    return e.ticks_consumed;
+}
+
+// ---------------------------------------------------------------------------
+// Tests: each asserts a behaviour read in the original (lines refer to
+// crates/trios-chat/rings/BR-IO-CHAT-07/src/lib.rs and the AE-NN tests).
+// ---------------------------------------------------------------------------
+
+test constructor_tick_period {
+    // Lines 65-77: the default tick is 1000 ms, a custom one is kept.
+    const d = with_default_tick();
+    assert(d.tick_ms == 1000);
+    assert(d.queued_reals == 0);
+    assert(d.ticks_consumed == 0);
+    const c = new(250);
+    assert(c.tick_ms == 250);
+}
+
+test ae01_empty_queue_emits_cover_every_tick {
+    // AE-01 (lines 121-134): 4 ticks, 4 Covers, then nothing more; ticks == 4.
+    const e = with_default_tick();
+    const r = run_for(e, 4, true);
+    assert(r.sent == 4);
+    assert(r.covers == 4);
+    assert(r.reals == 0);
+    assert(ticks(r.state) == 4);
+    assert(queue_depth(r.state) == 0);
+    // AE-05 (lines 196-209): logical time advances by n * tick.
+    assert(r.elapsed_ms == 4000);
+}
+
+test ae02_queued_reals_emit_first_then_cover {
+    // AE-02 (lines 136-154): 3 reals, 5 ticks -> 3 Real then 2 Cover.
+    const e0 = enqueue_real(enqueue_real(enqueue_real(with_default_tick())));
+    assert(queue_depth(e0) == 3);
+    const r = run_for(e0, 5, true);
+    assert(r.sent == 5);
+    assert(r.reals == 3);
+    assert(r.covers == 2);
+    assert(queue_depth(r.state) == 0);
+    // The ordering is checked by replaying one tick at a time.
+    const first = run_for(e0, 1, true);
+    assert(first.reals == 1);
+    assert(first.covers == 0);
+}
+
+test ae03_async_matches_pure_scheduler_sequence {
+    // AE-03 (lines 159-178): the same enqueue pattern as the pure scheduler
+    // gives Real, Real, then four Covers over 6 ticks.
+    const e0 = enqueue_real(enqueue_real(with_default_tick()));
+    const a = run_for(e0, 1, true);
+    const b = run_for(a.state, 1, true);
+    const c = run_for(b.state, 1, true);
+    const d = run_for(c.state, 1, true);
+    const f = run_for(d.state, 1, true);
+    const g = run_for(f.state, 1, true);
+    assert(a.reals == 1);
+    assert(b.reals == 1);
+    assert(c.reals == 0);
+    assert(d.reals == 0);
+    assert(f.reals == 0);
+    assert(g.reals == 0);
+    assert(ticks(g.state) == 6);
+    assert(queue_depth(g.state) == 0);
+}
+
+test ae04_closed_channel_halts_gracefully {
+    // AE-04 (lines 180-190): the first send fails, so sent == 0, but the tick
+    // had already been produced and consumed.
+    const r = run_for(with_default_tick(), 10, false);
+    assert(r.sent == 0);
+    assert(ticks(r.state) == 1);
+    assert(r.covers == 1);
+    assert(r.elapsed_ms == 1000);
+}
+
+test ae05_logical_time_for_custom_tick {
+    // AE-05 (lines 196-209): 3 ticks of a 1000 ms tick advance exactly 3 * tick.
+    const e = new(1000);
+    const r = run_for(e, 3, true);
+    assert(r.elapsed_ms == 3000);
+    assert(ticks(r.state) == 3);
+    const custom = run_for(new(250), 3, true);
+    assert(custom.elapsed_ms == 750);
+}
+
+test enqueue_real_increments_depth {
+    // Lines 79-82: each enqueue adds one pending real.
+    const e1 = enqueue_real(with_default_tick());
+    assert(queue_depth(e1) == 1);
+    const e2 = enqueue_real(e1);
+    assert(queue_depth(e2) == 2);
+    assert(ticks(e2) == 0);
+}
