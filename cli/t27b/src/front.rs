@@ -29,14 +29,14 @@ pub fn parse(path: &Path, raw: &str) -> Result<Parsed, String> {
                     })
                 }
                 Err(splice_err) => {
-                    let ast = Compiler::parse_ast(raw).map_err(|_| splice_err)?;
+                    let ast = Compiler::parse_ast(raw).map_err(|_| splice_err.clone())?;
                     return Ok(Parsed {
                         ast,
                         spliced: false,
-                        notes: vec![
-                            "spliced source did not parse; compiling the unresolved original"
-                                .to_string(),
-                        ],
+                        notes: vec![format!(
+                            "spliced source did not parse ({}); compiling the unresolved original",
+                            splice_err
+                        )],
                     });
                 }
             }
