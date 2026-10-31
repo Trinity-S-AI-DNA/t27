@@ -88,7 +88,7 @@ spec (.t27) --t27b test--> 5 ms verdict  (every tick)
 
 *Note:* The unrolling panel reports compile-time throughput only. Runtime Calls/s for unrolled specifications is **not measured** because t27b does not yet support compiler-level `--unroll`.
 
-## Tri CLI: `tri shootout improve`
+## Tri CLI: `tri shootout improve` (proposed, not built yet)
 
 Pareto-focused improvement loop (15m tick via `specs/crons/t27-backend-shootout-improvement-loop.t27`):
 
