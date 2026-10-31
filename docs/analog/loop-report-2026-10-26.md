@@ -181,3 +181,28 @@ This report merged on 2026-10-25 at 23:03Z (PR #12556). Two items that it lists 
 
 - Every other section 4 row, including the owner decisions (#12116 SC-002, #12069), the three variants of section 5, and the speed variants P1 and P2.
 - Three lessons from this work were added to the `analog-emulation` skill (#12637, PR #12638): a gate for a driver change runs with the lane-built driver, a rule over a tool's text output lives in a sealed spec, and a path no live run exercised is reported with its live count.
+
+## 9. Update after the epic closed (2026-10-31)
+
+Section 8 covers 2026-10-26. After it, the defaults of two owner decisions were applied and the epic was closed. The lines named below are left as written; this section supersedes them. Tracking issue: #12946.
+
+### 9.1 SC-002 of #12116 closed by its default (2026-10-27)
+
+- Issue #12116 was closed (completed) on 2026-10-27 08:09Z. The closing comment reads: "Closing as per default (2026-10-27): SC-002 is not met to the letter. sar_trace_raw: 1 survivor, 3 hung; bench: 3 survivors. Deviation recorded." The figures are those of section 4; no test or file changed with the closing.
+- Superseded lines: section 1 ("Open: #12116 stays open because SC-002 is not met to the letter for two specs; the owner has several decisions due on or after 2026-10-27, each with a default"); the section 4 row "SC-002 of #12116 not met to the letter" (its default, "close after 2026-10-27 with the deviation written in the closing comment", was applied and the deviation itself stands); section 8.3 ("the owner decisions (#12116 SC-002, #12069)").
+
+### 9.2 Load-constant decision (c) applied (#12069, #12067, PR #12942)
+
+- PR #12942 merged 2026-10-31 02:20Z as `763a892ea8`, docs only. Option (c) of #12069 was applied: the two `sar_logic` load constants (`SL_DC_LOAD_R`, line 177, and `SL_TG_IN_LOAD`, line 183) stay as documented survivors. Section 8 of `seal-refusal-2026-10-25.md` records the decision. #12069 (02:20Z) and #12067 (02:21Z) are closed.
+- #12067 was closed with a deviation from its criterion "all four plants KILLED" (its closing comment): met for `DR_UP` in `sar_kick_net` and the `return 9999` marker at line 1093 of `sar_logic`; not met for the two load constants, where a plant one step either way fails no test. The accurate wording is "no test gives a signal". The older wording "change no output of the model" overclaimed: `SL_TG_IN_LOAD` 429 moves one probe sum by 55 ps, below every test bound.
+- Superseded lines: the section 4 row "An owner choice recorded in the issue | #12069, row 41 | the owner | option c on 2026-10-27" (the default was applied on 2026-10-31, after its date had passed); section 8.3 as named above. The last row of section 4 was already reworded by PR #12942 ("give no signal in any test").
+
+### 9.3 Epic closed (#10486, PR #12838)
+
+- Epic #10486 was closed (completed) on 2026-10-27 12:05Z by PR #12838, titled "golden batch: the three cooperate variants + the Pareto speedup rules" (merged 12:05:40Z as `5b19b933bf`). Among its 15 files it landed `specs/tri/cooperate/framework.t27`, `variant_a.t27`, `variant_b.t27` and `variant_c.t27` with a README, and `specs/tri/mutate/speedup.t27`, each spec with a seal. The same PR also carried two `specs/fpga/` files that are not part of this work.
+- The three cooperation variants of section 5 and the speed-up variants of section 6 stay as written. The specs above are their spec form; their tests are not re-run in this update.
+
+### 9.4 What did not change
+
+- Every other section 4 row is not re-checked here and stands as written; the inherited-reds row describes master as of 2026-10-25.
+- The recorded v0.1 slowdown (about 170000 to 196000 times slower than real time, #11313) and the absence of any new emulation speed claim.
