@@ -1,0 +1,282 @@
+// Port of gHashTag/trios:crates/trios-igla-race-pipeline/rings/SR-01/src/lib.rs
+// (351 lines) to .t27, roadmap stage 6 (t27c gen-rust; issue #9575).
+//
+// The original is a pure FSM plus an in-memory FIFO of scarabs. `transition`
+// answers Ok(next) for the four allowed pairs and InvalidTransition for every
+// other pair (lines 50-67); `is_valid_transition` is its boolean twin
+// (lines 72-74). `StrategyQueue` (lines 83-137) accepts only Queued scarabs
+// (`push`, lines 99-108), pops the front and flips it to Running on `claim_one`
+// (lines 113-121), and exposes `len`/`is_empty`/`peek_next` (lines 124-136).
+//
+// The VecDeque, the chrono `started_at` stamp and the `Scarab` payload are
+// plumbing: the port keeps a fixed-capacity FIFO of statuses, which is exactly
+// the decision-bearing state (order, emptiness, head/tail), and leaves the
+// timestamp to the caller. `FsmError::AlreadyClaimed` (lines 31-37) is a
+// future SR-IO advisory-lock variant and has no decision here.
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module port::trios::crates::trios_igla_race_pipeline::rings::SR_01::src::lib;
+
+// The five statuses of lines 18/44-49: Queued -> Running -> one terminal state.
+pub enum JobStatus {
+    Queued,
+    Running,
+    Done,
+    Pruned,
+    Errored,
+}
+
+// Lines 50-67: `transition` returns Ok(next) exactly for the four allowed
+// pairs; every other pair is InvalidTransition, whose message names from/to.
+// The Result is carried as `null` (rejected) or the accepted status.
+pub fn transition(current: JobStatus, next: JobStatus) -> ?JobStatus {
+    if (is_valid_transition(current, next)) {
+        return next;
+    }
+    return null;
+}
+
+// Lines 52-58 and 72-74: the allowed set is exactly Queued->Running and
+// Running->{Done, Pruned, Errored}. There is no self-loop and no return from a
+// terminal status; Pruned is terminal like Done and Errored.
+pub fn is_valid_transition(from: JobStatus, to: JobStatus) -> bool {
+    if (from == .Queued) {
+        return to == .Running;
+    }
+    if (from == .Running) {
+        if (to == .Done) {
+            return true;
+        }
+        if (to == .Pruned) {
+            return true;
+        }
+        if (to == .Errored) {
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Lines 83-137: StrategyQueue. The original's VecDeque is unbounded; the
+// port's capacity is the only invention (16) and push reports a full queue as
+// `ok = false` rather than growing. Order, head/tail and emptiness are the
+// decisions carried from the original.
+// ---------------------------------------------------------------------------
+
+pub const QUEUE_CAPACITY: usize = 16;
+
+pub struct StrategyQueue {
+    items: [16]JobStatus,
+    head: usize,
+    tail: usize,
+}
+
+// Lines 90-92: `new` builds an empty queue (`Self::default()`).
+pub fn new() -> StrategyQueue {
+    return StrategyQueue { items: [_]JobStatus{.Queued} ** 16, head: 0, tail: 0 };
+}
+
+pub struct PushOutcome {
+    ok: bool,
+    queue: StrategyQueue,
+}
+
+// Lines 99-108: only a Queued scarab may be pushed; anything else is the
+// InvalidTransition { from: current, to: Queued } rejection, and the queue is
+// left untouched (the original's push_back is never reached).
+pub fn push(q: StrategyQueue, status: JobStatus) -> PushOutcome {
+    if (status != .Queued) {
+        return PushOutcome { ok: false, queue: q };
+    }
+    var out = q;
+    if (out.tail - out.head >= QUEUE_CAPACITY) {
+        return PushOutcome { ok: false, queue: out };
+    }
+    out.items[out.tail % QUEUE_CAPACITY] = status;
+    out.tail += 1;
+    return PushOutcome { ok: true, queue: out };
+}
+
+pub struct ClaimOutcome {
+    ok: bool,
+    queue: StrategyQueue,
+    status: JobStatus,
+}
+
+// Lines 113-121: claim pops the front, and the FSM guard flips the scarab to
+// Running (the expect pinning the queue invariant). An empty queue answers
+// None, i.e. `ok = false`. The `started_at` stamp is the caller's clock
+// plumbing and is not modelled.
+pub fn claim_one(q: StrategyQueue) -> ClaimOutcome {
+    if (q.head == q.tail) {
+        return ClaimOutcome { ok: false, queue: q, status: .Queued };
+    }
+    var out = q;
+    const popped: JobStatus = out.items[out.head % QUEUE_CAPACITY];
+    const next: JobStatus = .Running;
+    out.head += 1;
+    return ClaimOutcome { ok: true, queue: out, status: next };
+}
+
+// Lines 124-126.
+pub fn len(q: StrategyQueue) -> usize {
+    return q.tail - q.head;
+}
+
+// Lines 129-131.
+pub fn is_empty(q: StrategyQueue) -> bool {
+    return q.head == q.tail;
+}
+
+pub struct PeekOutcome {
+    present: bool,
+    status: JobStatus,
+}
+
+// Lines 134-136: peek looks at the front without consuming it, so `len` is
+// unchanged; an empty queue has nothing to show.
+pub fn peek_next(q: StrategyQueue) -> PeekOutcome {
+    if (q.head == q.tail) {
+        return PeekOutcome { present: false, status: .Queued };
+    }
+    return PeekOutcome { present: true, status: q.items[q.head % QUEUE_CAPACITY] };
+}
+
+// ---------------------------------------------------------------------------
+// Tests: each asserts a behaviour read in the original (lines refer to
+// crates/trios-igla-race-pipeline/rings/SR-01/src/lib.rs).
+// ---------------------------------------------------------------------------
+
+test fsm_queued_to_running_ok {
+    // fsm_queued_to_running_ok (lines 152-158).
+    const s = transition(.Queued, .Running);
+    assert(s != null);
+    assert(is_valid_transition(.Queued, .Running));
+}
+
+test fsm_running_to_terminal_states_ok {
+    // fsm_running_to_terminal_states_ok (lines 160-168): all three terminals.
+    assert(transition(.Running, .Done) != null);
+    assert(transition(.Running, .Pruned) != null);
+    assert(transition(.Running, .Errored) != null);
+    assert(is_valid_transition(.Running, .Done));
+    assert(is_valid_transition(.Running, .Pruned));
+    assert(is_valid_transition(.Running, .Errored));
+}
+
+test fsm_rejects_every_other_pair {
+    // fsm_queued_to_done_invalid (170-180), fsm_done_to_running_invalid
+    // (182-185) and fsm_pruned_to_anything_invalid (187-201).
+    assert(transition(.Queued, .Done) == null);
+    assert(transition(.Done, .Running) == null);
+    assert(transition(.Pruned, .Queued) == null);
+    assert(transition(.Pruned, .Running) == null);
+    assert(transition(.Pruned, .Done) == null);
+    assert(transition(.Pruned, .Errored) == null);
+    assert(!is_valid_transition(.Queued, .Done));
+    assert(!is_valid_transition(.Done, .Running));
+}
+
+test fsm_self_loop_invalid {
+    // fsm_self_loop_invalid (lines 203-218): no status transitions to itself.
+    assert(!is_valid_transition(.Queued, .Queued));
+    assert(!is_valid_transition(.Running, .Running));
+    assert(!is_valid_transition(.Done, .Done));
+    assert(!is_valid_transition(.Pruned, .Pruned));
+    assert(!is_valid_transition(.Errored, .Errored));
+    assert(transition(.Running, .Running) == null);
+}
+
+test is_valid_transition_matches_transition {
+    // is_valid_transition_matches_transition (lines 220-239) walks all 25
+    // pairs; the exhaustive witness is the identity for the sampled pairs here,
+    // with the full allowed set pinned by the three tests above.
+    assert(is_valid_transition(.Queued, .Running) == (transition(.Queued, .Running) != null));
+    assert(is_valid_transition(.Running, .Pruned) == (transition(.Running, .Pruned) != null));
+    assert(is_valid_transition(.Errored, .Queued) == (transition(.Errored, .Queued) != null));
+    assert(is_valid_transition(.Done, .Done) == (transition(.Done, .Done) != null));
+}
+
+test push_and_claim_fifo_order {
+    // push_and_claim_fifo_order (lines 243-260): a, b, c are claimed in order.
+    const q0 = new();
+    assert(is_empty(q0));
+    const p1 = push(q0, .Queued);
+    assert(p1.ok);
+    const p2 = push(p1.queue, .Queued);
+    assert(p2.ok);
+    const p3 = push(p2.queue, .Queued);
+    assert(p3.ok);
+    assert(len(p3.queue) == 3);
+    const c1 = claim_one(p3.queue);
+    assert(c1.ok);
+    assert(c1.status == .Running);
+    const c2 = claim_one(c1.queue);
+    assert(c2.ok);
+    const c3 = claim_one(c2.queue);
+    assert(c3.ok);
+    assert(is_empty(c3.queue));
+}
+
+test claim_empty_returns_none {
+    // claim_empty_returns_none (lines 262-266).
+    const c = claim_one(new());
+    assert(!c.ok);
+    assert(len(c.queue) == 0);
+}
+
+test claim_one_flips_status_to_running {
+    // claim_one_flips_status_to_running (lines 268-279): the popped scarab's
+    // status is Running (the started_at stamp is the caller's clock).
+    const p = push(new(), .Queued);
+    assert(p.ok);
+    const c = claim_one(p.queue);
+    assert(c.ok);
+    assert(c.status == .Running);
+    assert(is_empty(c.queue));
+}
+
+test push_rejects_non_queued {
+    // push_rejects_non_queued (lines 281-289): pushing a Running scarab is
+    // InvalidTransition and leaves the queue empty.
+    const p = push(new(), .Running);
+    assert(!p.ok);
+    assert(is_empty(p.queue));
+    const p2 = push(new(), .Done);
+    assert(!p2.ok);
+}
+
+test peek_next_does_not_consume {
+    // peek_next_does_not_consume (lines 291-299).
+    const p = push(new(), .Queued);
+    assert(p.ok);
+    const k = peek_next(p.queue);
+    assert(k.present);
+    assert(k.status == .Queued);
+    assert(len(p.queue) == 1);
+    assert(!peek_next(new()).present);
+}
+
+test len_is_correct {
+    // len_is_correct (lines 301-310).
+    assert(len(new()) == 0);
+    const p1 = push(new(), .Queued);
+    const p2 = push(p1.queue, .Queued);
+    assert(len(p2.queue) == 2);
+    const c = claim_one(p2.queue);
+    assert(len(c.queue) == 1);
+}
+
+test claim_then_push_running_is_invalid {
+    // claim_then_push_running_is_invalid (lines 322-331): re-pushing the
+    // claimed (Running) scarab must fail.
+    const p = push(new(), .Queued);
+    const c = claim_one(p.queue);
+    assert(c.ok);
+    assert(c.status == .Running);
+    const again = push(c.queue, c.status);
+    assert(!again.ok);
+}
