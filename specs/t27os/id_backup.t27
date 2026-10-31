@@ -1,0 +1,1126 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/id_backup.t27 -- a person keeps the identity (~/.t27os/identity) in a file under a password and brings it
+// back on a new device (Refs gHashTag/t27#11560). Pure decisions, no @extern, no crypto: id_backup_host.t27 derives the
+// key, seals and opens, reads and writes the files; every rule it follows is a tested fn here. ASCII only (L3).
+//
+// Why: the identity file holds the only copy of the P-256 key pair. Its fingerprint is the T27-... key friends added,
+// the key they pinned (peer_identity FRIENDS FILE v2) and the one calls and messages are signed with. A lost file is a
+// lost person: friends see a stranger. A backup keeps that key; the friends list itself stays on the device.
+//
+// FILE .t27id v1, BK_LEN = 297 bytes:
+//   magic "T27IDBK\n" (8) | version u32 LE (4, = 1) | PBKDF2 iterations u32 LE (4) | salt (16) | nonce (12)
+//   | ciphertext (BK_PT_LEN = 237) | GCM tag (16).
+//   key   = PBKDF2-HMAC-SHA256(password, salt, iterations, 16 bytes) (CommonCrypto CCKeyDerivationPBKDF);
+//   seal  = AES-128-GCM(key, nonce, aad = the 44 header bytes, plaintext) (CCCryptorGCMOneshotEncrypt, the routine
+//           call_crypto_probe checks against McGrew-Viega test case 2). Salt and nonce are fresh random bytes
+//           (SecRandomCopyBytes) on every save, so one password never repeats a key and nonce pair.
+//   The header is the AAD: a changed iteration count, salt, nonce or version fails the tag like a wrong password.
+// PLAINTEXT, BK_PT_LEN = 237 bytes:
+//   the identity file as it is on disk (ID_LEN = 207: public key, private key, nick, its own CRC; peer_identity)
+//   | created u64 LE (the identity file's birth time, Unix seconds) | saved u64 LE (when the backup was made)
+//   | fingerprint (10, of the public key) | CRC-32 of the 233 bytes before (4).
+//   The CRC sits inside the ciphertext. Outside it would be a linear function of the private key in the clear
+//   (32 bits about it); inside it is a second check after the tag, that the bytes laid out are the bytes meant.
+// RESTORE  the file checks (length, magic, version, iterations in BK_ITER_MIN..BK_ITER_MAX, so a file cannot make the
+//   device spin), the tag opens with the password, the plaintext checks (CRC, the identity file's own check, the
+//   fingerprint the host computes from the public key equals the one stored), the person confirms (YES in the panel;
+//   T27OS_ID_CONFIRM=yes at launch). Only then is ~/.t27os/identity replaced: the old file is first hard-linked to
+//   ~/.t27os/identity.bak (an older .bak moves to identity.bak.<seconds>), then the new one is renamed over it, so at no
+//   moment is there no identity file. Anything else changes nothing: no partial restore.
+// SECRETS  the password lives in the panel block only while typed, is wiped after each use and is never drawn (stars),
+//   logged, put in the frame key or written. The private key is never logged; the decrypted bytes waiting for YES are
+//   wiped on YES, NO and close.
+module T27osIdBackup;
+
+use t27os::peer_identity::crc32;
+use t27os::peer_identity::id_check;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OK;
+use t27os::peer_identity::FP_BYTES;
+use t27os::queen::QP_PAD;
+use t27os::friends_view::fv_in;
+use t27os::friends_view::fv_eq;
+use t27os::account_view::ac_nick_x;
+use t27os::account_view::AC_PIC_Y;
+use t27os::account_view::AC_PIC_H;
+use t27os::account_view::AC_PIC_W;
+use t27os::account_view::AC_FR_LABEL_Y;
+use t27os::account_view::AC_H_QR;
+use t27os::account_view::AC_H_ROW;
+use t27os::account_view::AC_H_IEND;
+use t27os::account_view::ac_ifield_y;
+use t27os::chat_view::chv_text_w;
+use t27os::call_view::CV_FIELD_H;
+
+// ---------------------------------------------------------------- 1. the file
+
+pub const BK_MAGIC_LEN : usize = 8;
+pub const BK_VERSION : u32 = 1;
+pub const BK_OFF_VERSION : usize = 8;
+pub const BK_OFF_ITER : usize = 12;
+pub const BK_OFF_SALT : usize = 16;
+pub const BK_OFF_NONCE : usize = 32;
+pub const BK_SALT : usize = 16;
+pub const BK_NONCE : usize = 12;
+pub const BK_KEY : usize = 16;
+pub const BK_TAG : usize = 16;
+/// The header: everything before the ciphertext, the GCM additional data.
+pub const BK_HDR : usize = 44;
+pub const BK_PT_LEN : usize = 237;
+pub const BK_TAG_AT : usize = 281;
+pub const BK_LEN : usize = 297;
+/// PBKDF2 rounds written (OWASP 2023 for PBKDF2-HMAC-SHA256), and the range a file may name.
+pub const BK_ITER : u32 = 600000;
+pub const BK_ITER_MIN : u32 = 100000;
+pub const BK_ITER_MAX : u32 = 10000000;
+
+/// The plaintext.
+pub const BK_PT_ID : usize = 0;
+pub const BK_PT_CREATED : usize = 207;
+pub const BK_PT_SAVED : usize = 215;
+pub const BK_PT_FP : usize = 223;
+pub const BK_PT_CRC : usize = 233;
+
+/// The answers, the first thing wrong is the answer.
+pub const BK_OK : u32 = 0;
+pub const BK_SHORT : u32 = 1;
+pub const BK_LONG : u32 = 2;
+pub const BK_MAGIC : u32 = 3;
+pub const BK_VERSION_BAD : u32 = 4;
+pub const BK_ITER_BAD : u32 = 5;
+/// The tag did not open: a wrong password, or a file changed after it was made.
+pub const BK_AUTH : u32 = 6;
+pub const BK_CRC : u32 = 7;
+pub const BK_ID_BAD : u32 = 8;
+pub const BK_FP_BAD : u32 = 9;
+pub const BK_PASS_BAD : u32 = 10;
+pub const BK_IO : u32 = 11;
+pub const BK_CRYPTO : u32 = 12;
+/// The typed path is not "~/..." or "/...".
+pub const BK_PATH_BAD : u32 = 13;
+
+/// The file's mode: owner read and write, nothing for anyone else.
+pub const BK_FILE_MODE : u32 = 384;
+
+fn bk_put32(b: []u8, at: usize, v: u32) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+    b[at + 2] = @as(u8, @intCast((v >> 16) & 255));
+    b[at + 3] = @as(u8, @intCast((v >> 24) & 255));
+}
+
+fn bk_get32(b: []const u8, at: usize) -> u32 {
+    return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8) | (@as(u32, b[at + 2]) << 16) | (@as(u32, b[at + 3]) << 24);
+}
+
+pub fn bk_put64(b: []u8, at: usize, v: u64) -> void {
+    var x : u64 = v;
+    var i : usize = 0;
+    while (i < 8) {
+        b[at + i] = @as(u8, @intCast(x & 255));
+        x = x >> 8;
+        i = i + 1;
+    }
+}
+
+pub fn bk_get64(b: []const u8, at: usize) -> u64 {
+    var v : u64 = 0;
+    var i : usize = 8;
+    while (i > 0) {
+        i = i - 1;
+        v = (v << 8) | @as(u64, b[at + i]);
+    }
+    return v;
+}
+
+fn bk_copy(dst: []u8, at: usize, src: []const u8, from: usize, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        dst[at + i] = src[from + i];
+        i = i + 1;
+    }
+}
+
+fn bk_same(a: []const u8, ao: usize, b: []const u8, bo: usize, n: usize) -> bool {
+    var d : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        d = d | @as(u32, a[ao + i] ^ b[bo + i]);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+/// Zero n bytes from at: the password, the key, the decrypted bytes after use.
+pub fn bk_wipe(b: []u8, at: usize, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        b[at + i] = 0;
+        i = i + 1;
+    }
+}
+
+/// "T27IDBK\n".
+pub fn bk_put_magic(b: []u8) -> void {
+    b[0] = 84;
+    b[1] = 50;
+    b[2] = 55;
+    b[3] = 73;
+    b[4] = 68;
+    b[5] = 66;
+    b[6] = 75;
+    b[7] = 10;
+}
+
+fn bk_magic_ok(b: []const u8) -> bool {
+    var m : [8]u8 = undefined;
+    bk_put_magic(m[0..8]);
+    return bk_same(b, 0, m[0..8], 0, BK_MAGIC_LEN);
+}
+
+/// The header (the AAD) into out[0..BK_HDR]: magic, version, iterations, salt, nonce. BK_HDR, or 0 on a wrong size or
+/// an iteration count outside the range.
+pub fn bk_hdr_build(iter: u32, salt: []const u8, nonce: []const u8, out: []u8) -> usize {
+    if (salt.len != BK_SALT or nonce.len != BK_NONCE or out.len < BK_HDR) { return 0; }
+    if (iter < BK_ITER_MIN or iter > BK_ITER_MAX) { return 0; }
+    bk_put_magic(out);
+    bk_put32(out, BK_OFF_VERSION, BK_VERSION);
+    bk_put32(out, BK_OFF_ITER, iter);
+    bk_copy(out, BK_OFF_SALT, salt, 0, BK_SALT);
+    bk_copy(out, BK_OFF_NONCE, nonce, 0, BK_NONCE);
+    return BK_HDR;
+}
+
+/// The whole file: header, ciphertext, tag. BK_LEN, or 0 on a wrong size.
+pub fn bk_file_join(hdr: []const u8, ct: []const u8, tag: []const u8, out: []u8) -> usize {
+    if (hdr.len != BK_HDR or ct.len != BK_PT_LEN or tag.len != BK_TAG or out.len < BK_LEN) { return 0; }
+    bk_copy(out, 0, hdr, 0, BK_HDR);
+    bk_copy(out, BK_HDR, ct, 0, BK_PT_LEN);
+    bk_copy(out, BK_TAG_AT, tag, 0, BK_TAG);
+    return BK_LEN;
+}
+
+/// Is this the shape of a .t27id v1 file? Run before any key is derived.
+pub fn bk_file_check(f: []const u8, n: usize) -> u32 {
+    if (n < BK_LEN or f.len < BK_LEN) { return BK_SHORT; }
+    if (n > BK_LEN) { return BK_LONG; }
+    if (bk_magic_ok(f) == false) { return BK_MAGIC; }
+    if (bk_get32(f, BK_OFF_VERSION) != BK_VERSION) { return BK_VERSION_BAD; }
+    const it : u32 = bk_get32(f, BK_OFF_ITER);
+    if (it < BK_ITER_MIN or it > BK_ITER_MAX) { return BK_ITER_BAD; }
+    return BK_OK;
+}
+
+pub fn bk_iter_of(f: []const u8) -> u32 { return bk_get32(f, BK_OFF_ITER); }
+
+/// The plaintext: the identity file, its birth time, the time of the save, the fingerprint, the CRC. BK_PT_LEN, or 0
+/// when the identity file does not check or a size is wrong (a broken identity is never put in a backup).
+pub fn bk_pt_build(id: []const u8, created: u64, saved: u64, fp: []const u8, out: []u8) -> usize {
+    if (id.len != ID_LEN or fp.len != FP_BYTES or out.len < BK_PT_LEN) { return 0; }
+    if (id_check(id) != ID_OK) { return 0; }
+    bk_copy(out, BK_PT_ID, id, 0, ID_LEN);
+    bk_put64(out, BK_PT_CREATED, created);
+    bk_put64(out, BK_PT_SAVED, saved);
+    bk_copy(out, BK_PT_FP, fp, 0, FP_BYTES);
+    bk_put32(out, BK_PT_CRC, crc32(out, BK_PT_CRC));
+    return BK_PT_LEN;
+}
+
+/// The opened plaintext: the CRC, the identity file's own check, and the fingerprint stored equals `fp`, the one the
+/// host computed from the public key inside.
+pub fn bk_pt_check(pt: []const u8, n: usize, fp: []const u8) -> u32 {
+    if (n < BK_PT_LEN or pt.len < BK_PT_LEN) { return BK_SHORT; }
+    if (n > BK_PT_LEN) { return BK_LONG; }
+    if (bk_get32(pt, BK_PT_CRC) != crc32(pt, BK_PT_CRC)) { return BK_CRC; }
+    if (id_check(pt[BK_PT_ID .. BK_PT_ID + ID_LEN]) != ID_OK) { return BK_ID_BAD; }
+    if (fp.len != FP_BYTES or bk_same(pt, BK_PT_FP, fp, 0, FP_BYTES) == false) { return BK_FP_BAD; }
+    return BK_OK;
+}
+
+/// The verdict of an opening: the file's shape, then the tag (the OS's status, 0 = opened), then the plaintext.
+pub fn bk_open_verdict(file_st: u32, gcm_st: u64, pt_st: u32) -> u32 {
+    if (file_st != BK_OK) { return file_st; }
+    if (gcm_st != 0) { return BK_AUTH; }
+    return pt_st;
+}
+
+/// The identity file is replaced only by an opening that checked AND a person who said yes.
+pub fn bk_may_replace(verdict: u32, confirmed: bool) -> bool { return verdict == BK_OK and confirmed; }
+
+/// A password: 12 to 64 printable ASCII characters. Empty is never allowed. 12, not 8: the key is AES-128 from
+/// PBKDF2, so the password, not the cipher, is what a guesser works against.
+pub const BK_PASS_MIN : usize = 12;
+pub const BK_PASS_MAX : usize = 64;
+pub fn bk_unit_ok(u: u32) -> bool { return u >= 32 and u <= 126; }
+pub fn bk_pass_ok(p: []const u8, n: usize) -> bool {
+    if (n < BK_PASS_MIN or n > BK_PASS_MAX or n > p.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (bk_unit_ok(@as(u32, p[i])) == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The mode a written backup must have (st_mode, the file type bits ignored): exactly 0600.
+pub fn bk_mode_ok(st_mode: u32) -> bool { return (st_mode & 511) == BK_FILE_MODE; }
+
+// ---------------------------------------------------------------- 2. names and paths
+
+pub const BK_PATH_MAX : usize = 256;
+
+fn bk_put(out: []u8, at: usize, s: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < s.len and at + i < out.len) {
+        out[at + i] = s[i];
+        i = i + 1;
+    }
+    return at + i;
+}
+
+fn bk_dec(out: []u8, at: usize, v: u32, digits: usize) -> usize {
+    var i : usize = digits;
+    var x : u32 = v;
+    while (i > 0) {
+        i = i - 1;
+        out[at + i] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+    }
+    return at + digits;
+}
+
+/// "t27-backup-YYYY-MM-DD.t27id"; k >= 2 adds "-k" before the dot (k 2..9: a second save the same day never writes
+/// over the first). Its length, 0 when k or the date is out of range.
+pub fn bk_name(y: u32, mo: u32, d: u32, k: u32, out: []u8) -> usize {
+    if (y < 2000 or y > 9999 or mo < 1 or mo > 12 or d < 1 or d > 31 or k == 1 or k > 9 or out.len < 32) { return 0; }
+    var n : usize = bk_put(out, 0, "t27-backup-");
+    n = bk_dec(out, n, y, 4);
+    out[n] = 45;
+    n = bk_dec(out, n + 1, mo, 2);
+    out[n] = 45;
+    n = bk_dec(out, n + 1, d, 2);
+    if (k >= 2) {
+        out[n] = 45;
+        n = bk_dec(out, n + 1, k, 1);
+    }
+    return bk_put(out, n, ".t27id");
+}
+
+/// <home>/Desktop/<name>, NUL-terminated; its length, 0 when it does not fit.
+pub fn bk_desktop_path(home: []const u8, hn: usize, name: []const u8, nn: usize, out: []u8) -> usize {
+    if (hn == 0 or hn + 9 + nn + 1 > out.len or hn > home.len or nn > name.len) { return 0; }
+    var n : usize = bk_put(out, 0, home[0..hn]);
+    n = bk_put(out, n, "/Desktop/");
+    n = bk_put(out, n, name[0..nn]);
+    out[n] = 0;
+    return n;
+}
+
+/// A typed path as a file path, NUL-terminated: "~/x" is <home>/x, "/x" stays; anything else (relative, empty, "~"
+/// alone, "~user") is refused with 0.
+pub fn bk_expand(home: []const u8, hn: usize, p: []const u8, pn: usize, out: []u8) -> usize {
+    if (pn == 0 or pn > p.len) { return 0; }
+    var n : usize = 0;
+    if (p[0] == 47) {
+        if (pn + 1 > out.len) { return 0; }
+        n = bk_put(out, 0, p[0..pn]);
+    } else if (p[0] == 126 and pn >= 3 and p[1] == 47) {
+        if (hn == 0 or hn + pn > out.len) { return 0; }
+        n = bk_put(out, 0, home[0..hn]);
+        n = bk_put(out, n, p[1..pn]);
+    } else {
+        return 0;
+    }
+    out[n] = 0;
+    return n;
+}
+
+/// What T27OS_ID_RESTORE, T27OS_ID_PASSWORD and T27OS_ID_CONFIRM ask for at launch.
+pub const BK_L_NONE : u32 = 0;
+/// Open the cabinet's RESTORE panel with the path filled; the person types the password.
+pub const BK_L_ASK : u32 = 1;
+/// Open the file with the password, then ask YES / NO in the panel.
+pub const BK_L_CONFIRM : u32 = 2;
+/// Open and replace before the identity is loaded (a test run that confirmed with T27OS_ID_CONFIRM=yes).
+pub const BK_L_REPLACE : u32 = 3;
+pub fn bk_launch(file_n: usize, pass_n: usize, confirm: bool) -> u32 {
+    if (file_n == 0) { return BK_L_NONE; }
+    if (pass_n == 0) { return BK_L_ASK; }
+    if (confirm) { return BK_L_REPLACE; }
+    return BK_L_CONFIRM;
+}
+
+// ---------------------------------------------------------------- 3. the panel's block (BK_CAP bytes in the window)
+
+pub const BK_CAP : usize = 1024;
+pub const BK_MODE : usize = 0;
+pub const BK_FOCUS : usize = 1;
+pub const BK_NOTE : usize = 2;
+pub const BK_PLEN : usize = 3;
+pub const BK_PATHLEN : usize = 4;
+pub const BK_OUTLEN : usize = 5;
+pub const BK_OLDFP : usize = 16;
+pub const BK_NEWFP : usize = 32;
+pub const BK_PATH : usize = 64;
+pub const BK_PATH_CAP : usize = 200;
+pub const BK_OUT : usize = 272;
+pub const BK_OUT_CAP : usize = 200;
+/// The bytes the frame key folds: everything drawn. The password is not among them (only its length, BK_PLEN).
+pub const BK_KEY_END : usize = 480;
+pub const BK_PASS : usize = 512;
+/// The decrypted plaintext waiting for YES, and whether it is there.
+pub const BK_PEND : usize = 640;
+pub const BK_PEND_OK : usize = 900;
+
+pub const BK_M_OFF : u32 = 0;
+pub const BK_M_BACKUP : u32 = 1;
+pub const BK_M_RESTORE : u32 = 2;
+pub const BK_M_CONFIRM : u32 = 3;
+
+pub const BK_F_NONE : u32 = 0;
+pub const BK_F_PATH : u32 = 1;
+pub const BK_F_PASS : u32 = 2;
+
+pub const BK_N_NONE : u32 = 0;
+pub const BK_N_SAVED : u32 = 1;
+pub const BK_N_PASS : u32 = 2;
+pub const BK_N_NO_ID : u32 = 3;
+pub const BK_N_WRITE : u32 = 4;
+pub const BK_N_CRYPTO : u32 = 5;
+pub const BK_N_READ : u32 = 6;
+pub const BK_N_FORMAT : u32 = 7;
+pub const BK_N_VERSION : u32 = 8;
+pub const BK_N_AUTH : u32 = 9;
+pub const BK_N_DAMAGED : u32 = 10;
+pub const BK_N_SAME : u32 = 11;
+pub const BK_N_RESTORED : u32 = 12;
+pub const BK_N_SWAP : u32 = 13;
+pub const BK_N_KEPT : u32 = 14;
+pub const BK_N_PATH : u32 = 15;
+pub const BK_N_BUSY : u32 = 16;
+
+pub fn bk_mode(b: []const u8) -> u32 { return @as(u32, b[BK_MODE]); }
+pub fn bk_open_shown(b: []const u8) -> bool { return b[BK_MODE] != 0; }
+pub fn bk_typing(b: []const u8) -> bool { return b[BK_MODE] != 0 and b[BK_FOCUS] != 0; }
+pub fn bk_note(b: []const u8) -> u32 { return @as(u32, b[BK_NOTE]); }
+
+/// Forget the password and the decrypted bytes.
+pub fn bk_forget(b: []u8) -> void {
+    bk_wipe(b, BK_PASS, BK_PASS_MAX);
+    b[BK_PLEN] = 0;
+    bk_wipe(b, BK_PEND, BK_PT_LEN);
+    b[BK_PEND_OK] = 0;
+    bk_wipe(b, BK_NEWFP, FP_BYTES);
+}
+
+/// BACKUP or RESTORE pressed: the panel takes the friends' place, the password field (BACKUP) or the path field
+/// (RESTORE, "~/Desktop/" when empty) has the focus.
+pub fn bk_open(b: []u8, mode: u32) -> void {
+    bk_forget(b);
+    b[BK_NOTE] = 0;
+    b[BK_OUTLEN] = 0;
+    if (mode == BK_M_RESTORE) {
+        b[BK_MODE] = @as(u8, @intCast(BK_M_RESTORE));
+        if (b[BK_PATHLEN] == 0) {
+            const n : usize = bk_put(b[BK_PATH .. BK_PATH + BK_PATH_CAP], 0, "~/Desktop/");
+            b[BK_PATHLEN] = @as(u8, @intCast(n));
+        }
+        b[BK_FOCUS] = @as(u8, @intCast(BK_F_PATH));
+        return;
+    }
+    b[BK_MODE] = @as(u8, @intCast(BK_M_BACKUP));
+    b[BK_FOCUS] = @as(u8, @intCast(BK_F_PASS));
+}
+
+/// CANCEL / CLOSE / NO, the cabinet left: secrets wiped, the friends come back. The path typed stays for next time.
+pub fn bk_close(b: []u8) -> void {
+    bk_forget(b);
+    b[BK_MODE] = 0;
+    b[BK_FOCUS] = 0;
+    b[BK_NOTE] = 0;
+    b[BK_OUTLEN] = 0;
+}
+
+/// The path field takes a whole path (a launch with T27OS_ID_RESTORE, or a paste): printable ASCII up to BK_PATH_CAP.
+pub fn bk_set_path(b: []u8, p: []const u8, n: usize) -> bool {
+    if (n == 0 or n > BK_PATH_CAP or n > p.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (bk_unit_ok(@as(u32, p[i])) == false) { return false; }
+        b[BK_PATH + i] = p[i];
+        i = i + 1;
+    }
+    b[BK_PATHLEN] = @as(u8, @intCast(n));
+    return true;
+}
+
+/// One typed character into the field with the focus; a character outside printable ASCII is dropped.
+pub fn bk_type(b: []u8, u: u32) -> void {
+    if (bk_unit_ok(u) == false) { return; }
+    const f : u32 = @as(u32, b[BK_FOCUS]);
+    if (f == BK_F_PASS) {
+        const n : usize = @as(usize, b[BK_PLEN]);
+        if (n >= BK_PASS_MAX) { return; }
+        b[BK_PASS + n] = @as(u8, @intCast(u));
+        b[BK_PLEN] = @as(u8, @intCast(n + 1));
+        b[BK_NOTE] = 0;
+    } else if (f == BK_F_PATH) {
+        const n : usize = @as(usize, b[BK_PATHLEN]);
+        if (n >= BK_PATH_CAP) { return; }
+        b[BK_PATH + n] = @as(u8, @intCast(u));
+        b[BK_PATHLEN] = @as(u8, @intCast(n + 1));
+        b[BK_NOTE] = 0;
+    }
+}
+
+/// Backspace in the field with the focus (the dropped password byte is zeroed).
+pub fn bk_back(b: []u8) -> void {
+    const f : u32 = @as(u32, b[BK_FOCUS]);
+    if (f == BK_F_PASS and b[BK_PLEN] > 0) {
+        b[BK_PLEN] = b[BK_PLEN] - 1;
+        b[BK_PASS + @as(usize, b[BK_PLEN])] = 0;
+    } else if (f == BK_F_PATH and b[BK_PATHLEN] > 0) {
+        b[BK_PATHLEN] = b[BK_PATHLEN] - 1;
+    }
+    b[BK_NOTE] = 0;
+}
+
+/// Tab: the RESTORE panel moves the focus between the path and the password.
+pub fn bk_tab(b: []u8) -> void {
+    if (b[BK_MODE] != @as(u8, @intCast(BK_M_RESTORE))) { return; }
+    if (b[BK_FOCUS] == @as(u8, @intCast(BK_F_PATH))) { b[BK_FOCUS] = @as(u8, @intCast(BK_F_PASS)); } else { b[BK_FOCUS] = @as(u8, @intCast(BK_F_PATH)); }
+}
+
+/// What the password field shows: one star a character, never the characters.
+pub fn bk_mask(n: usize, out: []u8) -> usize {
+    var i : usize = 0;
+    while (i < n and i < out.len) {
+        out[i] = 42;
+        i = i + 1;
+    }
+    return i;
+}
+
+/// The written path, to show under the button.
+pub fn bk_set_out(b: []u8, p: []const u8, n: usize) -> void {
+    var k : usize = n;
+    if (k > BK_OUT_CAP) { k = BK_OUT_CAP; }
+    bk_copy(b, BK_OUT, p, 0, k);
+    b[BK_OUTLEN] = @as(u8, @intCast(k));
+}
+
+/// An opening that checked waits here for YES: the plaintext, the fingerprint in use and the one restored.
+pub fn bk_hold(b: []u8, pt: []const u8, oldfp: []const u8, newfp: []const u8) -> void {
+    bk_copy(b, BK_PEND, pt, 0, BK_PT_LEN);
+    b[BK_PEND_OK] = 1;
+    bk_copy(b, BK_OLDFP, oldfp, 0, FP_BYTES);
+    bk_copy(b, BK_NEWFP, newfp, 0, FP_BYTES);
+    bk_wipe(b, BK_PASS, BK_PASS_MAX);
+    b[BK_PLEN] = 0;
+    b[BK_MODE] = @as(u8, @intCast(BK_M_CONFIRM));
+    b[BK_FOCUS] = 0;
+    b[BK_NOTE] = 0;
+}
+
+pub fn bk_held(b: []const u8) -> bool { return b[BK_PEND_OK] == 1 and b[BK_MODE] == @as(u8, @intCast(BK_M_CONFIRM)); }
+
+/// The note an answer leaves in the panel.
+pub fn bk_note_of(st: u32) -> u32 {
+    if (st == BK_OK) { return BK_N_NONE; }
+    if (st == BK_SHORT or st == BK_LONG or st == BK_MAGIC) { return BK_N_FORMAT; }
+    if (st == BK_VERSION_BAD) { return BK_N_VERSION; }
+    if (st == BK_AUTH or st == BK_ITER_BAD) { return BK_N_AUTH; }
+    if (st == BK_CRC or st == BK_ID_BAD or st == BK_FP_BAD) { return BK_N_DAMAGED; }
+    if (st == BK_PASS_BAD) { return BK_N_PASS; }
+    if (st == BK_IO) { return BK_N_READ; }
+    if (st == BK_PATH_BAD) { return BK_N_PATH; }
+    return BK_N_CRYPTO;
+}
+
+pub fn bk_note_text(note: u32) -> str {
+    if (note == BK_N_SAVED) { return "Saved, mode 600. Keep it off this device:"; }
+    if (note == BK_N_PASS) { return "The password needs 12 to 64 printable characters."; }
+    if (note == BK_N_NO_ID) { return "No identity on this device to save."; }
+    if (note == BK_N_WRITE) { return "Could not write to the Desktop. Nothing saved."; }
+    if (note == BK_N_CRYPTO) { return "The system crypto failed. Nothing changed."; }
+    if (note == BK_N_READ) { return "Cannot read that file."; }
+    if (note == BK_N_FORMAT) { return "Not a T27 OS identity backup (.t27id)."; }
+    if (note == BK_N_VERSION) { return "A backup from a newer T27 OS."; }
+    if (note == BK_N_AUTH) { return "Wrong password or a changed file. Nothing restored."; }
+    if (note == BK_N_DAMAGED) { return "The backup is damaged. Nothing restored."; }
+    if (note == BK_N_SAME) { return "This backup holds the identity in use."; }
+    if (note == BK_N_RESTORED) { return "Restored. Old one: ~/.t27os/identity.bak"; }
+    if (note == BK_N_SWAP) { return "Could not replace it. Identity unchanged."; }
+    if (note == BK_N_KEPT) { return "Nothing changed."; }
+    if (note == BK_N_PATH) { return "Type the full path of a .t27id file."; }
+    if (note == BK_N_BUSY) { return "Deriving the key..."; }
+    return "";
+}
+
+/// The second line under a note: the saved path (BK_N_SAVED), the restart (BK_N_RESTORED).
+pub fn bk_note2_text(note: u32) -> str {
+    if (note == BK_N_RESTORED) { return "Restart T27 OS to use the restored identity."; }
+    return "";
+}
+
+pub fn bk_title(mode: u32) -> str {
+    if (mode == BK_M_BACKUP) { return "BACKUP MY IDENTITY"; }
+    if (mode == BK_M_RESTORE) { return "RESTORE AN IDENTITY"; }
+    if (mode == BK_M_CONFIRM) { return "REPLACE THIS IDENTITY?"; }
+    return "";
+}
+
+pub fn bk_go_word(mode: u32) -> str {
+    if (mode == BK_M_RESTORE) { return "OPEN"; }
+    return "SAVE";
+}
+
+pub fn bk_cancel_word(b: []const u8) -> str {
+    if (b[BK_NOTE] == @as(u8, @intCast(BK_N_SAVED)) or b[BK_NOTE] == @as(u8, @intCast(BK_N_RESTORED))) { return "CLOSE"; }
+    return "CANCEL";
+}
+
+// ---------------------------------------------------------------- 4. where things are (panel coordinates)
+
+// ME: BACKUP and RESTORE right of CHANGE PICTURE, under SAVE. The panel: in the friends' place, as the large QR code.
+pub const BK_BTN_W : f64 = 48.0;
+pub const BK_BTN_GAP : f64 = 4.0;
+/// The fields and OPEN / SAVE are call_view CV_FIELD_H tall (draw_cl_field).
+pub const BK_FIELD_H : f64 = 26.0;
+pub const BK_GO_W : f64 = 52.0;
+pub const BK_CANCEL_W : f64 = 52.0;
+pub const BK_YES_W : f64 = 60.0;
+pub const BK_ROW_GAP : f64 = 6.0;
+pub const BK_TEXT : f64 = 9.0;
+
+/// The hits (in the cabinet's space: free numbers between the QR code and the rows, and above the invitations).
+pub const BK_H_BACKUP : u32 = 14;
+pub const BK_H_RESTORE : u32 = 15;
+pub const BK_H_PATH : u32 = 160;
+pub const BK_H_PASS : u32 = 161;
+pub const BK_H_GO : u32 = 162;
+pub const BK_H_CANCEL : u32 = 163;
+pub const BK_H_YES : u32 = 164;
+pub const BK_H_NO : u32 = 165;
+/// Inside the panel, on nothing: the friends rows under it do not answer.
+pub const BK_H_SHEET : u32 = 166;
+
+pub fn bk_is_hit(hit: u32) -> bool { return hit == BK_H_BACKUP or hit == BK_H_RESTORE or (hit >= BK_H_PATH and hit <= BK_H_SHEET); }
+
+pub fn bk_restore_x(l: f64, w: f64) -> f64 { return l + w - QP_PAD - BK_BTN_W; }
+pub fn bk_backup_x(l: f64, w: f64) -> f64 { return bk_restore_x(l, w) - BK_BTN_GAP - BK_BTN_W; }
+pub fn bk_btn_y(t: f64) -> f64 { return t + AC_PIC_Y; }
+
+/// The panel, from the friends' label line: the title's baseline, the fields, the notes.
+pub fn bk_title_y(tf: f64) -> f64 { return tf + AC_FR_LABEL_Y; }
+pub fn bk_path_y(tf: f64) -> f64 { return bk_title_y(tf) + 10.0; }
+pub fn bk_pass_y(tf: f64, mode: u32) -> f64 {
+    if (mode == BK_M_RESTORE) { return bk_path_y(tf) + BK_FIELD_H + BK_ROW_GAP; }
+    return bk_path_y(tf);
+}
+pub fn bk_note_y(tf: f64, mode: u32) -> f64 { return bk_pass_y(tf, mode) + BK_FIELD_H + 14.0; }
+pub fn bk_note2_y(tf: f64, mode: u32) -> f64 { return bk_note_y(tf, mode) + 12.0; }
+pub fn bk_field_w(w: f64) -> f64 { return w - 2.0 * QP_PAD; }
+pub fn bk_pass_w(w: f64) -> f64 { return w - 2.0 * QP_PAD - BK_GO_W - BK_BTN_GAP; }
+pub fn bk_go_x(l: f64, w: f64) -> f64 { return l + w - QP_PAD - BK_GO_W; }
+pub fn bk_cancel_x(l: f64, w: f64) -> f64 { return l + w - QP_PAD - BK_CANCEL_W; }
+pub fn bk_cancel_y(tf: f64) -> f64 { return bk_title_y(tf) - 12.0; }
+/// CONFIRM: the two fingerprints on two lines, then YES and NO.
+pub fn bk_q1_y(tf: f64) -> f64 { return bk_title_y(tf) + 16.0; }
+pub fn bk_q2_y(tf: f64) -> f64 { return bk_title_y(tf) + 30.0; }
+pub fn bk_yes_y(tf: f64) -> f64 { return bk_title_y(tf) + 40.0; }
+pub fn bk_yes_x(l: f64) -> f64 { return l + QP_PAD; }
+pub fn bk_no_x(l: f64) -> f64 { return l + QP_PAD + BK_YES_W + 8.0; }
+
+/// The cabinet's hit with BACKUP, RESTORE and the panel over it: `raw` is what ac_hit_qr answered, `key` whether the
+/// cabinet shows a key (an identity is open), `dy` how far the invitations moved the friends part. While the panel is
+/// open its buttons and fields answer and the rest of the friends part answers BK_H_SHEET (nothing under it).
+pub fn bk_hit(x: f64, y: f64, l: f64, w: f64, t: f64, h: f64, dy: f64, key: bool, mode: u32, raw: u32) -> u32 {
+    const by : f64 = bk_btn_y(t);
+    if (key and fv_in(x, y, bk_backup_x(l, w), by, BK_BTN_W, AC_PIC_H)) { return BK_H_BACKUP; }
+    if (fv_in(x, y, bk_restore_x(l, w), by, BK_BTN_W, AC_PIC_H)) { return BK_H_RESTORE; }
+    if (mode == BK_M_OFF) { return raw; }
+    const tf : f64 = t + dy;
+    if (fv_in(x, y, bk_cancel_x(l, w), bk_cancel_y(tf), BK_CANCEL_W, 16.0)) { return BK_H_CANCEL; }
+    if (mode == BK_M_CONFIRM) {
+        if (fv_in(x, y, bk_yes_x(l), bk_yes_y(tf), BK_YES_W, BK_FIELD_H)) { return BK_H_YES; }
+        if (fv_in(x, y, bk_no_x(l), bk_yes_y(tf), BK_YES_W, BK_FIELD_H)) { return BK_H_NO; }
+    } else {
+        if (mode == BK_M_RESTORE and fv_in(x, y, l + QP_PAD, bk_path_y(tf), bk_field_w(w), BK_FIELD_H)) { return BK_H_PATH; }
+        const py : f64 = bk_pass_y(tf, mode);
+        if (fv_in(x, y, l + QP_PAD, py, bk_pass_w(w), BK_FIELD_H)) { return BK_H_PASS; }
+        if (fv_in(x, y, bk_go_x(l, w), py, BK_GO_W, BK_FIELD_H)) { return BK_H_GO; }
+    }
+    if (y >= tf + AC_FR_LABEL_Y - 14.0 and y < ac_ifield_y(t, h) - 12.0) { return BK_H_SHEET; }
+    if (raw == AC_H_QR or (raw >= AC_H_ROW and raw < AC_H_IEND)) { return BK_H_SHEET; }
+    return raw;
+}
+
+/// A click on the panel's field gives it the focus.
+pub fn bk_focus_hit(b: []u8, hit: u32) -> void {
+    if (hit == BK_H_PATH) { b[BK_FOCUS] = @as(u8, @intCast(BK_F_PATH)); }
+    if (hit == BK_H_PASS) { b[BK_FOCUS] = @as(u8, @intCast(BK_F_PASS)); }
+}
+
+// ---------------------------------------------------------------- tests
+
+fn t_id(seed: u8, out: []u8) -> void {
+    // a sane identity file (peer_identity layout) made by hand: magic, version 1, suite 1, key, nick "Ann", CRC
+    var i : usize = 0;
+    while (i < ID_LEN) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    const mg : [8]u8 = [84, 50, 55, 79, 83, 73, 68, 10];
+    bk_copy(out, 0, mg[0..8], 0, 8);
+    bk_put32(out, 8, 1);
+    bk_put32(out, 12, 1);
+    out[16] = 4;
+    i = 1;
+    while (i < 65) {
+        out[16 + i] = @as(u8, @intCast((i * 7 + @as(usize, seed)) & 255));
+        i = i + 1;
+    }
+    bk_copy(out, 81, out, 16, 65);
+    i = 65;
+    while (i < 97) {
+        out[81 + i] = @as(u8, @intCast((i * 13 + @as(usize, seed) * 3) & 255));
+        i = i + 1;
+    }
+    out[178] = 3;
+    out[179] = 65;
+    out[180] = 110;
+    out[181] = 110;
+    bk_put32(out, 203, crc32(out, 203));
+}
+
+const T_FP : [10]u8 = [1, 35, 69, 103, 137, 171, 205, 239, 254, 220];
+
+fn t_pt(out: []u8) -> usize {
+    var id : [207]u8 = undefined;
+    t_id(9, id[0..207]);
+    return bk_pt_build(id[0..207], 1792000000, 1792700000, T_FP[0..10], out);
+}
+
+fn t_file(out: []u8) -> usize {
+    var salt : [16]u8 = undefined;
+    var nonce : [12]u8 = undefined;
+    var ct : [237]u8 = undefined;
+    var tag : [16]u8 = undefined;
+    var i : usize = 0;
+    while (i < 237) {
+        if (i < 16) { salt[i] = @as(u8, @intCast(i + 100)); tag[i] = @as(u8, @intCast(i * 5)); }
+        if (i < 12) { nonce[i] = @as(u8, @intCast(i + 200)); }
+        ct[i] = @as(u8, @intCast((i * 31) & 255));
+        i = i + 1;
+    }
+    var hdr : [44]u8 = undefined;
+    if (bk_hdr_build(BK_ITER, salt[0..16], nonce[0..12], hdr[0..44]) != BK_HDR) { return 0; }
+    return bk_file_join(hdr[0..44], ct[0..237], tag[0..16], out);
+}
+
+test bk_the_layout_adds_up {
+    assert BK_HDR == BK_MAGIC_LEN + 4 + 4 + BK_SALT + BK_NONCE;
+    assert BK_TAG_AT == BK_HDR + BK_PT_LEN and BK_LEN == BK_TAG_AT + BK_TAG;
+    assert BK_PT_CREATED == ID_LEN and BK_PT_SAVED == BK_PT_CREATED + 8 and BK_PT_FP == BK_PT_SAVED + 8;
+    assert BK_PT_CRC == BK_PT_FP + FP_BYTES and BK_PT_LEN == BK_PT_CRC + 4;
+    assert BK_ITER_MIN <= BK_ITER and BK_ITER <= BK_ITER_MAX and BK_FIELD_H == CV_FIELD_H;
+    // the block: the drawn part, then the secrets, all inside BK_CAP
+    assert BK_PATH + BK_PATH_CAP <= BK_OUT and BK_OUT + BK_OUT_CAP <= BK_KEY_END;
+    assert BK_KEY_END <= BK_PASS and BK_PASS + BK_PASS_MAX <= BK_PEND and BK_PEND + BK_PT_LEN <= BK_PEND_OK and BK_PEND_OK < BK_CAP;
+    assert BK_NEWFP + FP_BYTES <= BK_PATH and BK_OLDFP + FP_BYTES <= BK_NEWFP;
+    // the builders end where the layout says: the header at BK_HDR, the whole file at BK_LEN, and the file checks
+    var salt : [BK_SALT]u8 = undefined;
+    var nonce : [BK_NONCE]u8 = undefined;
+    var i : usize = 0;
+    while (i < BK_SALT) { salt[i] = @as(u8, @intCast(i)); i = i + 1; }
+    i = 0;
+    while (i < BK_NONCE) { nonce[i] = @as(u8, @intCast(100 + i)); i = i + 1; }
+    var hdr : [BK_HDR]u8 = undefined;
+    assert bk_hdr_build(BK_ITER, salt[0..BK_SALT], nonce[0..BK_NONCE], hdr[0..BK_HDR]) == BK_HDR;
+    assert bk_hdr_build(BK_ITER, salt[0..BK_SALT], nonce[0..BK_NONCE], hdr[0..BK_HDR - 1]) == 0;
+    var ct : [BK_PT_LEN]u8 = undefined;
+    var tag : [BK_TAG]u8 = undefined;
+    bk_wipe(ct[0..BK_PT_LEN], 0, BK_PT_LEN);
+    bk_wipe(tag[0..BK_TAG], 0, BK_TAG);
+    var f : [BK_LEN]u8 = undefined;
+    assert bk_file_join(hdr[0..BK_HDR], ct[0..BK_PT_LEN], tag[0..BK_TAG], f[0..BK_LEN]) == BK_LEN;
+    assert bk_file_check(f[0..BK_LEN], BK_LEN) == BK_OK and bk_iter_of(f[0..BK_LEN]) == BK_ITER;
+    assert bk_file_check(f[0..BK_LEN], BK_LEN - 1) == BK_SHORT;
+}
+
+test bk_a_file_is_built_and_read_back {
+    var f : [297]u8 = undefined;
+    assert t_file(f[0..297]) == BK_LEN;
+    assert f[0] == 84 and f[3] == 73 and f[7] == 10;
+    assert bk_file_check(f[0..297], 297) == BK_OK;
+    assert bk_iter_of(f[0..297]) == 600000;
+    assert f[BK_OFF_VERSION] == 1 and f[BK_OFF_SALT] == 100 and f[BK_OFF_NONCE] == 200 and f[BK_OFF_NONCE + 11] == 211;
+    assert f[BK_HDR] == 0 and f[BK_HDR + 1] == 31 and f[BK_TAG_AT + 1] == 5;
+    // the plaintext: identity, created, saved, fingerprint, CRC
+    var pt : [237]u8 = undefined;
+    assert t_pt(pt[0..237]) == BK_PT_LEN;
+    assert bk_pt_check(pt[0..237], 237, T_FP[0..10]) == BK_OK;
+    assert bk_get64(pt[0..237], BK_PT_CREATED) == 1792000000 and bk_get64(pt[0..237], BK_PT_SAVED) == 1792700000;
+    assert id_check(pt[0..207]) == ID_OK and pt[BK_PT_FP] == 1 and pt[BK_PT_FP + 9] == 220;
+    // a broken identity is never put in a backup; wrong sizes build nothing
+    var id : [207]u8 = undefined;
+    t_id(9, id[0..207]);
+    id[100] = id[100] ^ 1;
+    assert bk_pt_build(id[0..207], 1, 2, T_FP[0..10], pt[0..237]) == 0;
+    assert bk_pt_build(id[0..206], 1, 2, T_FP[0..10], pt[0..237]) == 0;
+    assert bk_pt_build(pt[0..207], 1, 2, T_FP[0..9], pt[0..237]) == 0;
+    var salt : [16]u8 = undefined;
+    var nonce : [12]u8 = undefined;
+    bk_wipe(salt[0..16], 0, 16);
+    bk_wipe(nonce[0..12], 0, 12);
+    var hdr : [44]u8 = undefined;
+    assert bk_hdr_build(BK_ITER, salt[0..15], nonce[0..12], hdr[0..44]) == 0;
+    assert bk_hdr_build(BK_ITER, salt[0..16], nonce[0..11], hdr[0..44]) == 0;
+    assert bk_hdr_build(BK_ITER_MIN - 1, salt[0..16], nonce[0..12], hdr[0..44]) == 0;
+    assert bk_hdr_build(BK_ITER_MAX + 1, salt[0..16], nonce[0..12], hdr[0..44]) == 0;
+    assert bk_hdr_build(BK_ITER_MAX, salt[0..16], nonce[0..12], hdr[0..44]) == BK_HDR;
+    assert bk_file_join(hdr[0..44], pt[0..236], salt[0..16], f[0..297]) == 0;
+}
+
+test bk_a_wrong_password_never_restores {
+    // the tag is the OS's answer: anything but 0 is a refusal, whatever the plaintext would have said
+    assert bk_open_verdict(BK_OK, 0, BK_OK) == BK_OK;
+    assert bk_open_verdict(BK_OK, 4294963496, BK_OK) == BK_AUTH;
+    assert bk_open_verdict(BK_OK, 1, BK_OK) == BK_AUTH;
+    assert bk_open_verdict(BK_OK, 1, BK_CRC) == BK_AUTH;
+    assert bk_open_verdict(BK_MAGIC, 0, BK_OK) == BK_MAGIC;
+    assert bk_may_replace(bk_open_verdict(BK_OK, 1, BK_OK), true) == false;
+    assert bk_may_replace(bk_open_verdict(BK_OK, 0, BK_OK), true);
+    // and only with a person's yes
+    assert bk_may_replace(BK_OK, false) == false;
+    assert bk_may_replace(BK_CRC, true) == false and bk_may_replace(BK_FP_BAD, true) == false;
+    assert bk_note_of(BK_AUTH) == BK_N_AUTH and bk_note_text(BK_N_AUTH).len > 0;
+}
+
+test bk_a_spoiled_crc_is_refused_even_when_the_identity_checks {
+    var pt : [237]u8 = undefined;
+    t_pt(pt[0..237]);
+    // a byte of the dates changed: only the CRC can see it (the identity file still checks)
+    var g : [237]u8 = pt;
+    g[BK_PT_SAVED + 2] = g[BK_PT_SAVED + 2] ^ 16;
+    assert id_check(g[0..207]) == ID_OK;
+    assert bk_pt_check(g[0..237], 237, T_FP[0..10]) == BK_CRC;
+    // the CRC itself spoiled
+    var c : [237]u8 = pt;
+    c[BK_PT_CRC] = c[BK_PT_CRC] ^ 1;
+    assert bk_pt_check(c[0..237], 237, T_FP[0..10]) == BK_CRC;
+    // every single flipped byte is refused
+    var pos : usize = 0;
+    var refused : usize = 0;
+    while (pos < BK_PT_LEN) {
+        var h : [237]u8 = pt;
+        h[pos] = h[pos] ^ 128;
+        if (bk_pt_check(h[0..237], 237, T_FP[0..10]) != BK_OK) { refused = refused + 1; }
+        pos = pos + 1;
+    }
+    assert refused == BK_PT_LEN;
+    // a plaintext whose stored fingerprint is not the key's
+    var other : [10]u8 = T_FP;
+    other[0] = 2;
+    assert bk_pt_check(pt[0..237], 237, other[0..10]) == BK_FP_BAD;
+    assert bk_pt_check(pt[0..237], 237, other[0..9]) == BK_FP_BAD;
+    assert bk_note_of(BK_CRC) == BK_N_DAMAGED and bk_note_of(BK_FP_BAD) == BK_N_DAMAGED and bk_note_of(BK_ID_BAD) == BK_N_DAMAGED;
+}
+
+test bk_a_cut_or_padded_file_is_refused {
+    var f : [298]u8 = undefined;
+    t_file(f[0..297]);
+    f[297] = 0;
+    assert bk_file_check(f[0..297], 296) == BK_SHORT;
+    assert bk_file_check(f[0..296], 296) == BK_SHORT;
+    assert bk_file_check(f[0..44], 44) == BK_SHORT;
+    assert bk_file_check(f[0..0], 0) == BK_SHORT;
+    assert bk_file_check(f[0..298], 298) == BK_LONG;
+    var pt : [237]u8 = undefined;
+    t_pt(pt[0..237]);
+    assert bk_pt_check(pt[0..236], 236, T_FP[0..10]) == BK_SHORT;
+    assert bk_note_of(BK_SHORT) == BK_N_FORMAT and bk_note_of(BK_LONG) == BK_N_FORMAT;
+}
+
+test bk_another_format_is_refused {
+    var f : [297]u8 = undefined;
+    t_file(f[0..297]);
+    // an identity file's magic, a friends file's magic, zeros
+    var g : [297]u8 = f;
+    g[3] = 79;
+    assert bk_file_check(g[0..297], 297) == BK_MAGIC;
+    var z : [297]u8 = undefined;
+    bk_wipe(z[0..297], 0, 297);
+    assert bk_file_check(z[0..297], 297) == BK_MAGIC;
+    var v : [297]u8 = f;
+    v[BK_OFF_VERSION] = 2;
+    assert bk_file_check(v[0..297], 297) == BK_VERSION_BAD and bk_note_of(BK_VERSION_BAD) == BK_N_VERSION;
+    // an iteration count that would make the device spin, or a weak one
+    var it : [297]u8 = f;
+    bk_put32(it[0..297], BK_OFF_ITER, BK_ITER_MAX + 1);
+    assert bk_file_check(it[0..297], 297) == BK_ITER_BAD;
+    bk_put32(it[0..297], BK_OFF_ITER, 1000);
+    assert bk_file_check(it[0..297], 297) == BK_ITER_BAD;
+    bk_put32(it[0..297], BK_OFF_ITER, BK_ITER_MIN);
+    assert bk_file_check(it[0..297], 297) == BK_OK;
+    // the identity file itself is not a backup
+    var id : [297]u8 = undefined;
+    bk_wipe(id[0..297], 0, 297);
+    t_id(1, id[0..207]);
+    assert bk_file_check(id[0..297], 207) == BK_SHORT and bk_file_check(id[0..297], 297) == BK_MAGIC;
+}
+
+test bk_the_password_is_12_to_64_printable_characters_and_never_empty {
+    const p : [65]u8 = [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 32, 33, 126];
+    assert bk_pass_ok(p[0..0], 0) == false;
+    assert bk_pass_ok(p[0..65], 0) == false;
+    assert bk_pass_ok(p[0..65], 7) == false;
+    // 8 and 11 are too short now; 12 is the shortest taken
+    assert bk_pass_ok(p[0..65], 8) == false;
+    assert bk_pass_ok(p[0..65], 11) == false;
+    assert bk_pass_ok(p[0..65], 12);
+    assert bk_pass_ok(p[0..65], 64);
+    assert bk_pass_ok(p[0..65], 65) == false;
+    assert bk_pass_ok(p[0..11], 12) == false;
+    var q : [12]u8 = undefined;
+    bk_copy(q[0..12], 0, p[0..12], 0, 12);
+    q[4] = 9;
+    assert bk_pass_ok(q[0..12], 12) == false;
+    q[4] = 127;
+    assert bk_pass_ok(q[0..12], 12) == false;
+    q[4] = 32;
+    assert bk_pass_ok(q[0..12], 12);
+    assert BK_PASS_MIN == 12 and BK_PASS_MAX == 64;
+    assert bk_note_of(BK_PASS_BAD) == BK_N_PASS;
+}
+
+test bk_the_file_is_written_0600_and_nothing_wider {
+    assert BK_FILE_MODE == 384;
+    assert bk_mode_ok(32768 | BK_FILE_MODE);
+    assert bk_mode_ok(33152);
+    assert bk_mode_ok(33188) == false;
+    assert bk_mode_ok(33024) == false;
+    assert bk_mode_ok(33216) == false;
+    assert bk_mode_ok(33200) == false;
+}
+
+test bk_names_and_paths {
+    var o : [40]u8 = undefined;
+    assert fv_eq(o[0..40], bk_name(2026, 10, 23, 0, o[0..40]), "t27-backup-2026-10-23.t27id");
+    assert fv_eq(o[0..40], bk_name(2026, 1, 2, 2, o[0..40]), "t27-backup-2026-01-02-2.t27id");
+    assert fv_eq(o[0..40], bk_name(2026, 12, 31, 9, o[0..40]), "t27-backup-2026-12-31-9.t27id");
+    assert bk_name(2026, 10, 23, 1, o[0..40]) == 0 and bk_name(2026, 10, 23, 10, o[0..40]) == 0;
+    assert bk_name(2026, 13, 1, 0, o[0..40]) == 0 and bk_name(2026, 0, 1, 0, o[0..40]) == 0 and bk_name(1999, 1, 1, 0, o[0..40]) == 0;
+    assert bk_name(2026, 1, 32, 0, o[0..40]) == 0 and bk_name(2026, 1, 1, 0, o[0..20]) == 0;
+    const home : str = "/Users/ann";
+    var p : [256]u8 = undefined;
+    var nm : [40]u8 = undefined;
+    const nn : usize = bk_name(2026, 10, 23, 0, nm[0..40]);
+    const pn : usize = bk_desktop_path(home, 10, nm[0..40], nn, p[0..256]);
+    assert fv_eq(p[0..256], pn, "/Users/ann/Desktop/t27-backup-2026-10-23.t27id") and p[pn] == 0;
+    assert bk_desktop_path(home, 0, nm[0..40], nn, p[0..256]) == 0;
+    assert bk_desktop_path(home, 10, nm[0..40], nn, p[0..40]) == 0;
+    // ~/ is home; an absolute path stays; relative, "~" alone and "~user" are refused
+    var e : [256]u8 = undefined;
+    const t1 : str = "~/Desktop/a.t27id";
+    var en : usize = bk_expand(home, 10, t1, t1.len, e[0..256]);
+    assert fv_eq(e[0..256], en, "/Users/ann/Desktop/a.t27id") and e[en] == 0;
+    const t2 : str = "/Volumes/USB/b.t27id";
+    en = bk_expand(home, 10, t2, t2.len, e[0..256]);
+    assert fv_eq(e[0..256], en, "/Volumes/USB/b.t27id") and e[en] == 0;
+    const t3 : str = "Desktop/a.t27id";
+    assert bk_expand(home, 10, t3, t3.len, e[0..256]) == 0;
+    const t4 : str = "~";
+    assert bk_expand(home, 10, t4, t4.len, e[0..256]) == 0;
+    const t5 : str = "~bob/a";
+    assert bk_expand(home, 10, t5, t5.len, e[0..256]) == 0;
+    assert bk_expand(home, 10, t2, 0, e[0..256]) == 0;
+    assert bk_expand(home, 0, t1, t1.len, e[0..256]) == 0;
+    assert bk_expand(home, 10, t2, t2.len, e[0..20]) == 0;
+}
+
+test bk_the_launch_restores_only_with_a_password_and_a_yes {
+    assert bk_launch(0, 0, false) == BK_L_NONE;
+    assert bk_launch(0, 12, true) == BK_L_NONE;
+    assert bk_launch(30, 0, false) == BK_L_ASK;
+    assert bk_launch(30, 0, true) == BK_L_ASK;
+    assert bk_launch(30, 12, false) == BK_L_CONFIRM;
+    assert bk_launch(30, 12, true) == BK_L_REPLACE;
+}
+
+test bk_the_panel_types_masks_and_forgets_the_password {
+    var b : [1024]u8 = undefined;
+    bk_wipe(b[0..1024], 0, 1024);
+    assert bk_open_shown(b[0..1024]) == false and bk_typing(b[0..1024]) == false;
+    bk_open(b[0..1024], BK_M_BACKUP);
+    assert bk_mode(b[0..1024]) == BK_M_BACKUP and b[BK_FOCUS] == 2 and bk_typing(b[0..1024]);
+    const s : str = "Secret 9! ok";
+    var i : usize = 0;
+    while (i < s.len) {
+        bk_type(b[0..1024], @as(u32, s[i]));
+        i = i + 1;
+    }
+    bk_type(b[0..1024], 1046);
+    bk_type(b[0..1024], 10);
+    assert b[BK_PLEN] == 12 and b[BK_PASS] == 83 and b[BK_PASS + 6] == 32;
+    assert bk_pass_ok(b[BK_PASS .. BK_PASS + 64], 12);
+    // the screen sees stars only; the frame key's bytes never hold the password
+    var m : [64]u8 = undefined;
+    assert fv_eq(m[0..64], bk_mask(12, m[0..64]), "************");
+    var k : usize = 0;
+    var leak : bool = false;
+    while (k + 6 <= BK_KEY_END) {
+        if (b[k] == 83 and b[k + 1] == 101 and b[k + 2] == 99 and b[k + 3] == 114) { leak = true; }
+        k = k + 1;
+    }
+    assert leak == false;
+    bk_back(b[0..1024]);
+    assert b[BK_PLEN] == 11 and b[BK_PASS + 11] == 0;
+    // 64 characters at most
+    i = 0;
+    while (i < 80) {
+        bk_type(b[0..1024], 120);
+        i = i + 1;
+    }
+    assert b[BK_PLEN] == 64 and b[BK_PASS + 64] == 0;
+    // close wipes the password and the held bytes
+    var pt : [237]u8 = undefined;
+    t_pt(pt[0..237]);
+    var newfp : [10]u8 = T_FP;
+    newfp[0] = 7;
+    bk_hold(b[0..1024], pt[0..237], T_FP[0..10], newfp[0..10]);
+    assert bk_held(b[0..1024]) and bk_mode(b[0..1024]) == BK_M_CONFIRM and b[BK_PLEN] == 0 and b[BK_PASS] == 0;
+    assert b[BK_NEWFP] == 7 and b[BK_OLDFP] == 1 and b[BK_PEND + 16] == 4;
+    bk_close(b[0..1024]);
+    assert bk_held(b[0..1024]) == false and bk_open_shown(b[0..1024]) == false;
+    var nz : usize = 0;
+    k = BK_PASS;
+    while (k < BK_PEND_OK + 1) {
+        if (b[k] != 0) { nz = nz + 1; }
+        k = k + 1;
+    }
+    assert nz == 0 and b[BK_NEWFP] == 0;
+}
+
+test bk_the_restore_panel_has_a_path_and_tab_moves_between_the_fields {
+    var b : [1024]u8 = undefined;
+    bk_wipe(b[0..1024], 0, 1024);
+    bk_open(b[0..1024], BK_M_RESTORE);
+    assert bk_mode(b[0..1024]) == BK_M_RESTORE and b[BK_FOCUS] == 1;
+    assert fv_eq(b[BK_PATH .. BK_PATH + 200], @as(usize, b[BK_PATHLEN]), "~/Desktop/");
+    bk_type(b[0..1024], 97);
+    bk_back(b[0..1024]);
+    bk_back(b[0..1024]);
+    assert fv_eq(b[BK_PATH .. BK_PATH + 200], @as(usize, b[BK_PATHLEN]), "~/Desktop");
+    bk_tab(b[0..1024]);
+    assert b[BK_FOCUS] == 2;
+    bk_type(b[0..1024], 120);
+    assert b[BK_PLEN] == 1 and b[BK_PATHLEN] == 9;
+    bk_tab(b[0..1024]);
+    assert b[BK_FOCUS] == 1;
+    // a whole path (launch or paste); a path typed stays after close, the password does not
+    const lp : str = "/tmp/x/t27-backup-2026-10-23.t27id";
+    assert bk_set_path(b[0..1024], lp, lp.len);
+    assert fv_eq(b[BK_PATH .. BK_PATH + 200], @as(usize, b[BK_PATHLEN]), lp);
+    assert bk_set_path(b[0..1024], lp, 0) == false;
+    bk_close(b[0..1024]);
+    bk_open(b[0..1024], BK_M_RESTORE);
+    assert fv_eq(b[BK_PATH .. BK_PATH + 200], @as(usize, b[BK_PATHLEN]), lp) and b[BK_PLEN] == 0;
+    // tab does nothing in the BACKUP panel
+    bk_open(b[0..1024], BK_M_BACKUP);
+    bk_tab(b[0..1024]);
+    assert b[BK_FOCUS] == 2;
+    // the out path and the words
+    bk_set_out(b[0..1024], lp, lp.len);
+    assert fv_eq(b[BK_OUT .. BK_OUT + 200], @as(usize, b[BK_OUTLEN]), lp);
+    b[BK_NOTE] = @as(u8, @intCast(BK_N_SAVED));
+    assert fv_eq(bk_cancel_word(b[0..1024]), 5, "CLOSE");
+    b[BK_NOTE] = 0;
+    assert fv_eq(bk_cancel_word(b[0..1024]), 6, "CANCEL");
+    assert fv_eq(bk_go_word(BK_M_BACKUP), 4, "SAVE") and fv_eq(bk_go_word(BK_M_RESTORE), 4, "OPEN");
+    assert bk_title(BK_M_CONFIRM).len > 0 and bk_title(BK_M_OFF).len == 0;
+    assert bk_note2_text(BK_N_RESTORED).len > 0 and bk_note2_text(BK_N_SAVED).len == 0;
+    var nt : u32 = 1;
+    while (nt <= BK_N_BUSY) {
+        assert bk_note_text(nt).len > 0 and bk_note_text(nt).len <= 52;
+        nt = nt + 1;
+    }
+    assert bk_note_of(BK_PATH_BAD) == BK_N_PATH and bk_note_of(BK_IO) == BK_N_READ and bk_note_of(BK_CRYPTO) == BK_N_CRYPTO and bk_note_of(BK_OK) == BK_N_NONE;
+}
+
+test bk_the_buttons_and_the_panel_answer_where_they_are_drawn {
+    const l : f64 = 400.0;
+    const w : f64 = 300.0;
+    const t : f64 = 35.0;
+    const h : f64 = 505.0;
+    // ME: right of CHANGE PICTURE, inside the panel's right edge
+    // (the buttons start after the words CHANGE PICTURE, inside the end of their click area: BACKUP is tested first)
+    assert bk_backup_x(l, w) >= ac_nick_x(l) + chv_text_w("CHANGE PICTURE", 14, 9.5) + 8.0 and bk_restore_x(l, w) + BK_BTN_W == l + w - QP_PAD;
+    assert bk_backup_x(l, w) < ac_nick_x(l) + AC_PIC_W and BK_BTN_W == 48.0;
+    const by : f64 = t + AC_PIC_Y + 4.0;
+    assert bk_hit(bk_backup_x(l, w) + 2.0, by, l, w, t, h, 0.0, true, BK_M_OFF, 0) == BK_H_BACKUP;
+    assert bk_hit(bk_backup_x(l, w) + 2.0, by, l, w, t, h, 0.0, false, BK_M_OFF, 0) == 0;
+    assert bk_hit(bk_restore_x(l, w) + 2.0, by, l, w, t, h, 0.0, false, BK_M_OFF, 0) == BK_H_RESTORE;
+    // closed: the friends answer as before
+    assert bk_hit(l + 30.0, t + 330.0, l, w, t, h, 0.0, true, BK_M_OFF, AC_H_ROW) == AC_H_ROW;
+    // BACKUP: the password field, SAVE, CANCEL; a row under the panel answers nothing
+    const py : f64 = bk_pass_y(t, BK_M_BACKUP) + 4.0;
+    assert bk_hit(l + 30.0, py, l, w, t, h, 0.0, true, BK_M_BACKUP, AC_H_ROW) == BK_H_PASS;
+    assert bk_hit(bk_go_x(l, w) + 4.0, py, l, w, t, h, 0.0, true, BK_M_BACKUP, AC_H_ROW) == BK_H_GO;
+    assert bk_hit(bk_cancel_x(l, w) + 4.0, bk_cancel_y(t) + 4.0, l, w, t, h, 0.0, true, BK_M_BACKUP, AC_H_UP) == BK_H_CANCEL;
+    assert bk_hit(l + 30.0, bk_note_y(t, BK_M_BACKUP), l, w, t, h, 0.0, true, BK_M_BACKUP, AC_H_ROW + 1) == BK_H_SHEET;
+    assert bk_hit(l + 30.0, bk_path_y(t) + 4.0, l, w, t, h, 0.0, true, BK_M_BACKUP, AC_H_ROW) == BK_H_PASS;
+    // RESTORE: the path field above the password
+    assert bk_hit(l + 30.0, bk_path_y(t) + 4.0, l, w, t, h, 0.0, true, BK_M_RESTORE, AC_H_ROW) == BK_H_PATH;
+    assert bk_hit(l + 30.0, bk_pass_y(t, BK_M_RESTORE) + 4.0, l, w, t, h, 0.0, true, BK_M_RESTORE, AC_H_ROW) == BK_H_PASS;
+    // CONFIRM: YES and NO; moved down by the invitations
+    assert bk_hit(bk_yes_x(l) + 4.0, bk_yes_y(t) + 4.0, l, w, t, h, 0.0, true, BK_M_CONFIRM, AC_H_ROW) == BK_H_YES;
+    assert bk_hit(bk_no_x(l) + 4.0, bk_yes_y(t) + 4.0, l, w, t, h, 0.0, true, BK_M_CONFIRM, AC_H_ROW) == BK_H_NO;
+    assert bk_hit(bk_yes_x(l) + 4.0, bk_yes_y(t + 40.0) + 4.0, l, w, t, h + 40.0, 40.0, true, BK_M_CONFIRM, 0) == BK_H_YES;
+    // the add part below still answers
+    assert bk_hit(l + 30.0, ac_ifield_y(t, h) + 4.0, l, w, t, h, 0.0, true, BK_M_BACKUP, 8) == 8;
+    // it all fits above the add part of the default 540 pt window
+    assert bk_note2_y(t, BK_M_RESTORE) < ac_ifield_y(t, h) - 12.0;
+    assert bk_yes_y(t) + BK_FIELD_H < ac_ifield_y(t, h) - 12.0;
+    var b : [1024]u8 = undefined;
+    bk_wipe(b[0..1024], 0, 1024);
+    bk_open(b[0..1024], BK_M_RESTORE);
+    bk_focus_hit(b[0..1024], BK_H_PASS);
+    assert b[BK_FOCUS] == 2;
+    bk_focus_hit(b[0..1024], BK_H_PATH);
+    assert b[BK_FOCUS] == 1;
+    assert bk_is_hit(BK_H_BACKUP) and bk_is_hit(BK_H_SHEET) and bk_is_hit(AC_H_ROW) == false and bk_is_hit(AC_H_QR) == false;
+}
+
+test bk_u64_fields_round_trip {
+    var b : [16]u8 = undefined;
+    bk_put64(b[0..16], 3, 18446744073709551615);
+    assert bk_get64(b[0..16], 3) == 18446744073709551615;
+    bk_put64(b[0..16], 0, 1792700000);
+    assert bk_get64(b[0..16], 0) == 1792700000 and b[0] == 96 and b[7] == 0;
+}
+
+test bk_the_small_parts_say_exactly_what_they_should {
+    var m : [8]u8 = undefined;
+    bk_put_magic(m[0..8]);
+    assert fv_eq(m[0..8], 8, "T27IDBK\n");
+    assert bk_unit_ok(32) and bk_unit_ok(126) and bk_unit_ok(31) == false and bk_unit_ok(127) == false and bk_unit_ok(1046) == false;
+    var b : [1024]u8 = undefined;
+    bk_wipe(b[0..1024], 0, 1024);
+    b[BK_NOTE] = @as(u8, @intCast(BK_N_AUTH));
+    assert bk_note(b[0..1024]) == BK_N_AUTH;
+    b[BK_PASS] = 120;
+    b[BK_PLEN] = 1;
+    b[BK_PEND + 3] = 9;
+    b[BK_PEND_OK] = 1;
+    b[BK_NEWFP] = 5;
+    b[BK_PATHLEN] = 4;
+    bk_forget(b[0..1024]);
+    assert b[BK_PASS] == 0 and b[BK_PLEN] == 0 and b[BK_PEND + 3] == 0 and b[BK_PEND_OK] == 0 and b[BK_NEWFP] == 0;
+    assert b[BK_PATHLEN] == 4 and bk_note(b[0..1024]) == BK_N_AUTH;
+    const t : f64 = 35.0;
+    assert bk_btn_y(t) == t + AC_PIC_Y and bk_title_y(t) == t + AC_FR_LABEL_Y;
+    assert bk_q1_y(t) == bk_title_y(t) + 16.0 and bk_q2_y(t) == bk_title_y(t) + 30.0 and bk_q2_y(t) < bk_yes_y(t) + 4.0;
+    assert bk_field_w(300.0) == 268.0 and bk_pass_w(300.0) == 268.0 - BK_GO_W - BK_BTN_GAP;
+}

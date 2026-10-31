@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/id_backup_host.t27 -- where id_backup.t27 touches the machine (Refs gHashTag/t27#11560).
+// Every decision (the layout, what checks, what may replace, the names, the mode) is a tested fn of id_backup.t27;
+// this file only moves bytes:
+//   * the key: PBKDF2-HMAC-SHA256 from CommonCrypto's CCKeyDerivationPBKDF (public, libSystem). It takes 9 arguments
+//     and t27b passes at most 8, so the call goes through libffi (ffi_prep_cif + ffi_call), the route
+//     call_crypto_probe takes for GCM; id_backup_probe checks it against the published PBKDF2-HMAC-SHA256 vectors;
+//   * the seal: AES-128-GCM, call_crypto_probe.ckh_gcm (CCCryptorGCMOneshotEncrypt / Decrypt), random salt and nonce
+//     from ckh_rand (SecRandomCopyBytes);
+//   * the save: <home>/Desktop/t27-backup-<local date>.t27id, written to <name>.tmp (creat mode 0600, write, fsync,
+//     chmod 0600), then link(2) to the name, which refuses when the name is taken (the next name is tried, -2 .. -9:
+//     an older backup is never written over), then stat(2) must show mode 0600 (id_backup.bk_mode_ok) or the file is
+//     removed. Before writing, the bytes are opened again with the same key: a backup that would not open is never
+//     left on the Desktop;
+//   * the replace: the new identity to identity.tmp (0600, fsync); the old file hard-linked to identity.bak (an older
+//     identity.bak first renamed to identity.bak.<unix seconds>); identity.tmp renamed over identity. If the link
+//     fails nothing is replaced. The file read back must be the bytes restored.
+// Nothing here prints or writes the password or the private key. Specs holding @extern are exercised by
+// id_backup_probe.t27; the decisions are tested in id_backup.t27.
+module T27osIdBackupHost;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_unlink;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_gettimeofday;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::call_crypto_probe::ckh_gcm;
+use t27os::call_crypto_probe::ckh_rand;
+use t27os::peer_identity::ID_LEN;
+use t27os::peer_identity::ID_OK;
+use t27os::peer_identity::ID_OFF_PUB;
+use t27os::peer_identity::PUB_BYTES;
+use t27os::peer_identity::FP_BYTES;
+use t27os::peer_identity::id_check;
+use t27os::peer_identity_host::IH_PATH_MAX;
+use t27os::peer_identity_host::ih_home;
+use t27os::peer_identity_host::ih_path;
+use t27os::peer_identity_host::ih_slurp;
+use t27os::peer_identity_host::ih_fingerprint;
+use t27os::peer_identity_host::ih_addr;
+use t27os::id_backup::BK_OK;
+use t27os::id_backup::BK_IO;
+use t27os::id_backup::BK_CRYPTO;
+use t27os::id_backup::BK_PASS_BAD;
+use t27os::id_backup::BK_PATH_BAD;
+use t27os::id_backup::BK_ID_BAD;
+use t27os::id_backup::BK_LEN;
+use t27os::id_backup::BK_HDR;
+use t27os::id_backup::BK_TAG_AT;
+use t27os::id_backup::BK_PT_LEN;
+use t27os::id_backup::BK_PT_ID;
+use t27os::id_backup::BK_SALT;
+use t27os::id_backup::BK_NONCE;
+use t27os::id_backup::BK_KEY;
+use t27os::id_backup::BK_TAG;
+use t27os::id_backup::BK_OFF_SALT;
+use t27os::id_backup::BK_OFF_NONCE;
+use t27os::id_backup::BK_ITER;
+use t27os::id_backup::BK_FILE_MODE;
+use t27os::id_backup::BK_PATH_MAX;
+use t27os::id_backup::BK_N_SAVED;
+use t27os::id_backup::BK_N_PASS;
+use t27os::id_backup::BK_N_NO_ID;
+use t27os::id_backup::BK_N_WRITE;
+use t27os::id_backup::BK_N_CRYPTO;
+use t27os::id_backup::bk_wipe;
+use t27os::id_backup::bk_pass_ok;
+use t27os::id_backup::bk_mode_ok;
+use t27os::id_backup::bk_hdr_build;
+use t27os::id_backup::bk_file_join;
+use t27os::id_backup::bk_file_check;
+use t27os::id_backup::bk_iter_of;
+use t27os::id_backup::bk_pt_build;
+use t27os::id_backup::bk_pt_check;
+use t27os::id_backup::bk_open_verdict;
+use t27os::id_backup::bk_name;
+use t27os::id_backup::bk_desktop_path;
+use t27os::id_backup::bk_expand;
+
+const BKH_RTLD_DEFAULT : u64 = 18446744073709551614;
+const BKH_FFI_SYSV : u32 = 1;
+/// kCCPBKDF2, kCCPRFHmacAlgSHA256 (CommonKeyDerivation.h).
+const BKH_PBKDF2 : u32 = 2;
+const BKH_PRF_SHA256 : u32 = 3;
+
+fn bkh_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn bkh_ffi_prep(cif: []u8, abi: u32, nargs: u32, rtype: u64, atypes: []const u8) -> i32 { return @extern("ffi_prep_cif"); }
+fn bkh_ffi_call(cif: []const u8, f: u64, rv: []u8, avals: []const u8) -> void { @extern("ffi_call"); }
+fn bkh_access(path: []const u8, mode: i32) -> i32 { return @extern("access"); }
+fn bkh_fsync(fd: i32) -> i32 { return @extern("fsync"); }
+fn bkh_chmod(path: []const u8, mode: u32) -> i32 { return @extern("chmod"); }
+fn bkh_link(from: []const u8, to: []const u8) -> i32 { return @extern("link"); }
+fn bkh_stat(path: []const u8, st: []u8) -> i32 { return @extern("stat"); }
+fn bkh_localtime(t: []const u8, tm: []u8) -> u64 { return @extern("localtime_r"); }
+fn bkh_unsetenv(name: []const u8) -> i32 { return @extern("unsetenv"); }
+
+fn bkh_now() -> u64 {
+    var tv : [16]u8 = undefined;
+    sys_gettimeofday(tv[0..16], 0);
+    return get_u64(tv[0..16], 0);
+}
+
+fn bkh_u32(b: []const u8, at: usize) -> u32 {
+    return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8) | (@as(u32, b[at + 2]) << 16) | (@as(u32, b[at + 3]) << 24);
+}
+
+// ---------------------------------------------------------------- the key and the seal
+
+/// PBKDF2-HMAC-SHA256(password, salt, rounds) into key (its whole length). True on kCCSuccess.
+pub fn bkh_pbkdf(pass: []const u8, pn: usize, salt: []const u8, rounds: u32, key: []u8) -> bool {
+    if (pn == 0 or pn > pass.len or salt.len == 0 or key.len == 0 or rounds == 0) { return false; }
+    const f : u64 = bkh_dlsym(BKH_RTLD_DEFAULT, "CCKeyDerivationPBKDF");
+    const tp : u64 = bkh_dlsym(BKH_RTLD_DEFAULT, "ffi_type_pointer");
+    const tu32 : u64 = bkh_dlsym(BKH_RTLD_DEFAULT, "ffi_type_uint32");
+    const tu64 : u64 = bkh_dlsym(BKH_RTLD_DEFAULT, "ffi_type_uint64");
+    const ts32 : u64 = bkh_dlsym(BKH_RTLD_DEFAULT, "ffi_type_sint32");
+    if (f == 0 or tp == 0 or tu32 == 0 or tu64 == 0 or ts32 == 0) { return false; }
+    // (algorithm, password, passwordLen, salt, saltLen, prf, rounds, derivedKey, derivedKeyLen)
+    var ty : [72]u8 = undefined;
+    put_u64(ty[0..72], 0, tu32);
+    put_u64(ty[0..72], 8, tp);
+    put_u64(ty[0..72], 16, tu64);
+    put_u64(ty[0..72], 24, tp);
+    put_u64(ty[0..72], 32, tu64);
+    put_u64(ty[0..72], 40, tu32);
+    put_u64(ty[0..72], 48, tu32);
+    put_u64(ty[0..72], 56, tp);
+    put_u64(ty[0..72], 64, tu64);
+    var va : [72]u8 = undefined;
+    put_u64(va[0..72], 0, @as(u64, BKH_PBKDF2));
+    put_u64(va[0..72], 8, ih_addr(pass));
+    put_u64(va[0..72], 16, @as(u64, pn));
+    put_u64(va[0..72], 24, ih_addr(salt));
+    put_u64(va[0..72], 32, @as(u64, salt.len));
+    put_u64(va[0..72], 40, @as(u64, BKH_PRF_SHA256));
+    put_u64(va[0..72], 48, @as(u64, rounds));
+    put_u64(va[0..72], 56, sys_addr(key, key, 0));
+    put_u64(va[0..72], 64, @as(u64, key.len));
+    const vb : u64 = sys_addr(va[0..72], va[0..72], 0);
+    var av : [72]u8 = undefined;
+    var k : usize = 0;
+    while (k < 9) {
+        put_u64(av[0..72], k * 8, vb + @as(u64, k) * 8);
+        k = k + 1;
+    }
+    var cif : [64]u8 = undefined;
+    bk_wipe(cif[0..64], 0, 64);
+    if (bkh_ffi_prep(cif[0..64], BKH_FFI_SYSV, 9, ts32, ty[0..72]) != 0) { return false; }
+    var rv : [8]u8 = undefined;
+    bk_wipe(rv[0..8], 0, 8);
+    bkh_ffi_call(cif[0..64], f, rv[0..8], av[0..72]);
+    // the password's address and length leave the stack slots
+    bk_wipe(va[0..72], 0, 72);
+    return (get_u64(rv[0..8], 0) & 4294967295) == 0;
+}
+
+/// Seal pt (BK_PT_LEN) under the password into out (BK_LEN): fresh salt and nonce, the header as AAD. BK_OK, or
+/// BK_CRYPTO when the OS refuses (nothing in out then counts).
+pub fn bkh_seal(pass: []const u8, pn: usize, pt: []const u8, iter: u32, out: []u8) -> u32 {
+    if (pt.len != BK_PT_LEN or out.len < BK_LEN) { return BK_CRYPTO; }
+    var salt : [16]u8 = undefined;
+    var nonce : [12]u8 = undefined;
+    if (ckh_rand(salt[0..16]) == false or ckh_rand(nonce[0..12]) == false) { return BK_CRYPTO; }
+    var hdr : [44]u8 = undefined;
+    if (bk_hdr_build(iter, salt[0..16], nonce[0..12], hdr[0..44]) != BK_HDR) { return BK_CRYPTO; }
+    var key : [16]u8 = undefined;
+    if (bkh_pbkdf(pass, pn, salt[0..16], iter, key[0..16]) == false) { return BK_CRYPTO; }
+    var ct : [237]u8 = undefined;
+    var tag : [16]u8 = undefined;
+    const st : u64 = ckh_gcm(true, key[0..16], nonce[0..12], hdr[0..44], pt, ct[0..237], tag[0..16]);
+    var ok : bool = st == 0 and bk_file_join(hdr[0..44], ct[0..237], tag[0..16], out) == BK_LEN;
+    // open it again with the same key: a backup that does not open is never written
+    if (ok) {
+        var back : [237]u8 = undefined;
+        var tg2 : [16]u8 = undefined;
+        var i : usize = 0;
+        while (i < BK_TAG) {
+            tg2[i] = out[BK_TAG_AT + i];
+            i = i + 1;
+        }
+        const sb : u64 = ckh_gcm(false, key[0..16], nonce[0..12], out[0..BK_HDR], out[BK_HDR .. BK_HDR + BK_PT_LEN], back[0..237], tg2[0..16]);
+        var d : u32 = 0;
+        i = 0;
+        while (i < BK_PT_LEN) {
+            d = d | @as(u32, back[i] ^ pt[i]);
+            i = i + 1;
+        }
+        bk_wipe(back[0..237], 0, 237);
+        ok = sb == 0 and d == 0;
+    }
+    bk_wipe(key[0..16], 0, 16);
+    if (ok) { return BK_OK; }
+    return BK_CRYPTO;
+}
+
+/// Open a file's bytes f[0..n] with the password into pt (BK_PT_LEN) and the restored key's fingerprint into fp. The
+/// id_backup verdict; on anything but BK_OK, pt is zeroed.
+pub fn bkh_unseal(f: []const u8, n: usize, pass: []const u8, pn: usize, pt: []u8, fp: []u8) -> u32 {
+    if (pt.len < BK_PT_LEN or fp.len < FP_BYTES) { return BK_CRYPTO; }
+    bk_wipe(pt, 0, BK_PT_LEN);
+    const fs : u32 = bk_file_check(f, n);
+    if (fs != BK_OK) { return fs; }
+    var key : [16]u8 = undefined;
+    if (bkh_pbkdf(pass, pn, f[BK_OFF_SALT .. BK_OFF_SALT + BK_SALT], bk_iter_of(f), key[0..16]) == false) { return BK_CRYPTO; }
+    var tag : [16]u8 = undefined;
+    var i : usize = 0;
+    while (i < BK_TAG) {
+        tag[i] = f[BK_TAG_AT + i];
+        i = i + 1;
+    }
+    const gs : u64 = ckh_gcm(false, key[0..16], f[BK_OFF_NONCE .. BK_OFF_NONCE + BK_NONCE], f[0..BK_HDR], f[BK_HDR .. BK_HDR + BK_PT_LEN], pt[0..BK_PT_LEN], tag[0..16]);
+    bk_wipe(key[0..16], 0, 16);
+    var ps : u32 = BK_ID_BAD;
+    if (gs == 0) {
+        if (ih_fingerprint(pt[ID_OFF_PUB .. ID_OFF_PUB + PUB_BYTES], fp) == false) {
+            ps = BK_CRYPTO;
+        } else {
+            ps = bk_pt_check(pt[0..BK_PT_LEN], BK_PT_LEN, fp[0..FP_BYTES]);
+        }
+    }
+    const v : u32 = bk_open_verdict(fs, gs, ps);
+    if (v != BK_OK) { bk_wipe(pt, 0, BK_PT_LEN); }
+    return v;
+}
+
+// ---------------------------------------------------------------- the files
+
+/// <home>/.t27os/identity.bak (NUL-terminated); its length.
+fn bkh_bak_path(home: []const u8, hn: usize, out: []u8) -> usize {
+    var n : usize = ih_path(home, hn, 1, false, out);
+    n = put_bytes(out, n, ".bak");
+    out[n] = 0;
+    return n;
+}
+
+/// Write buf[0..n] to path.tmp with mode 0600 and fsync; tmp gets the NUL-terminated name. True when all bytes landed.
+fn bkh_write_tmp(path: []const u8, pn: usize, buf: []const u8, n: usize, tmp: []u8) -> bool {
+    var tn : usize = put_bytes(tmp, 0, path[0..pn]);
+    tn = put_bytes(tmp, tn, ".tmp");
+    tmp[tn] = 0;
+    const fd : i32 = sys_creat(tmp, BK_FILE_MODE);
+    if (fd < 0) { return false; }
+    var done : usize = 0;
+    while (done < n) {
+        const w : i64 = sys_write(fd, buf[done..n], @as(u64, n - done));
+        if (w <= 0) {
+            sys_close(fd);
+            sys_unlink(tmp);
+            return false;
+        }
+        done = done + @as(usize, @intCast(w));
+    }
+    const fs : i32 = bkh_fsync(fd);
+    sys_close(fd);
+    if (fs != 0 or bkh_chmod(tmp, BK_FILE_MODE) != 0) {
+        sys_unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+/// st_mode of a path (the low 16 bits), 0 when it cannot be read.
+pub fn bkh_mode(path: []const u8) -> u32 {
+    var st : [256]u8 = undefined;
+    if (bkh_stat(path, st[0..256]) != 0) { return 0; }
+    return @as(u32, st[4]) | (@as(u32, st[5]) << 8);
+}
+
+/// The birth time of a path in Unix seconds (st_birthtimespec), 0 when it cannot be read.
+fn bkh_birth(path: []const u8) -> u64 {
+    var st : [256]u8 = undefined;
+    if (bkh_stat(path, st[0..256]) != 0) { return 0; }
+    return get_u64(st[0..256], 80);
+}
+
+/// Today's local date: year, month 1..12, day.
+fn bkh_today(ymd: []u32) -> void {
+    var t : [8]u8 = undefined;
+    put_u64(t[0..8], 0, bkh_now());
+    var tm : [64]u8 = undefined;
+    bk_wipe(tm[0..64], 0, 64);
+    bkh_localtime(t[0..8], tm[0..64]);
+    ymd[0] = bkh_u32(tm[0..64], 20) + 1900;
+    ymd[1] = bkh_u32(tm[0..64], 16) + 1;
+    ymd[2] = bkh_u32(tm[0..64], 12);
+}
+
+/// Read and check this device's identity into id (ID_LEN + 1) and its fingerprint; false when there is none that checks.
+pub fn bkh_current(id: []u8, fp: []u8) -> bool {
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return false; }
+    var path : [IH_PATH_MAX]u8 = undefined;
+    ih_path(home[0..IH_PATH_MAX], hn, 1, false, path[0..IH_PATH_MAX]);
+    const got : i64 = ih_slurp(path[0..IH_PATH_MAX], id, ID_LEN + 1);
+    if (got != @as(i64, @intCast(ID_LEN))) { return false; }
+    if (id_check(id[0..ID_LEN]) != ID_OK) { return false; }
+    return ih_fingerprint(id[ID_OFF_PUB .. ID_OFF_PUB + PUB_BYTES], fp);
+}
+
+/// BACKUP: this device's identity, sealed under the password, to <home>/Desktop/t27-backup-<date>[-k].t27id with mode
+/// 0600. The note (id_backup BK_N_*); out gets the path written (NUL-terminated) on BK_N_SAVED.
+pub fn bkh_save(pass: []const u8, pn: usize, out: []u8) -> u32 {
+    out[0] = 0;
+    if (bk_pass_ok(pass, pn) == false) { return BK_N_PASS; }
+    var id : [208]u8 = undefined;
+    var fp : [10]u8 = undefined;
+    if (bkh_current(id[0..208], fp[0..10]) == false) { return BK_N_NO_ID; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    var idp : [IH_PATH_MAX]u8 = undefined;
+    ih_path(home[0..IH_PATH_MAX], hn, 1, false, idp[0..IH_PATH_MAX]);
+    var pt : [237]u8 = undefined;
+    if (bk_pt_build(id[0..ID_LEN], bkh_birth(idp[0..IH_PATH_MAX]), bkh_now(), fp[0..10], pt[0..237]) != BK_PT_LEN) {
+        bk_wipe(id[0..208], 0, 208);
+        return BK_N_NO_ID;
+    }
+    bk_wipe(id[0..208], 0, 208);
+    var f : [297]u8 = undefined;
+    const ss : u32 = bkh_seal(pass, pn, pt[0..237], BK_ITER, f[0..297]);
+    bk_wipe(pt[0..237], 0, 237);
+    if (ss != BK_OK) { return BK_N_CRYPTO; }
+    // the Desktop of this home (a fresh test home may have none: made with mode 0700)
+    var dsk : [IH_PATH_MAX]u8 = undefined;
+    var dn : usize = put_bytes(dsk[0..IH_PATH_MAX], 0, home[0..hn]);
+    dn = put_bytes(dsk[0..IH_PATH_MAX], dn, "/Desktop");
+    dsk[dn] = 0;
+    sys_mkdir(dsk[0..IH_PATH_MAX], 448);
+    var ymd : [3]u32 = undefined;
+    bkh_today(ymd[0..3]);
+    var k : u32 = 0;
+    while (k <= 9) {
+        var nm : [40]u8 = undefined;
+        const nn : usize = bk_name(ymd[0], ymd[1], ymd[2], k, nm[0..40]);
+        if (nn > 0) {
+            var path : [BK_PATH_MAX]u8 = undefined;
+            const pl : usize = bk_desktop_path(home[0..hn], hn, nm[0..40], nn, path[0..BK_PATH_MAX]);
+            if (pl > 0 and bkh_access(path[0..BK_PATH_MAX], 0) != 0) {
+                var tmp : [BK_PATH_MAX]u8 = undefined;
+                if (pl + 5 >= BK_PATH_MAX or bkh_write_tmp(path[0..BK_PATH_MAX], pl, f[0..297], BK_LEN, tmp[0..BK_PATH_MAX]) == false) { return BK_N_WRITE; }
+                // link refuses a taken name: an older backup is never written over
+                const lk : i32 = bkh_link(tmp[0..BK_PATH_MAX], path[0..BK_PATH_MAX]);
+                sys_unlink(tmp[0..BK_PATH_MAX]);
+                if (lk == 0) {
+                    if (bk_mode_ok(bkh_mode(path[0..BK_PATH_MAX])) == false) {
+                        sys_unlink(path[0..BK_PATH_MAX]);
+                        return BK_N_WRITE;
+                    }
+                    var q : usize = 0;
+                    while (q <= pl and q < out.len) {
+                        out[q] = path[q];
+                        q = q + 1;
+                    }
+                    return BK_N_SAVED;
+                }
+            }
+        }
+        if (k == 0) { k = 2; } else { k = k + 1; }
+    }
+    return BK_N_WRITE;
+}
+
+/// RESTORE, the first half: read the typed path (expanded with this home), open it with the password. The verdict;
+/// pt gets the plaintext and fp its fingerprint only on BK_OK. Nothing on disk changes.
+pub fn bkh_open(p: []const u8, pn: usize, pass: []const u8, passn: usize, pt: []u8, fp: []u8) -> u32 {
+    bk_wipe(pt, 0, pt.len);
+    if (bk_pass_ok(pass, passn) == false) { return BK_PASS_BAD; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    var path : [BK_PATH_MAX]u8 = undefined;
+    if (bk_expand(home[0..IH_PATH_MAX], hn, p, pn, path[0..BK_PATH_MAX]) == 0) { return BK_PATH_BAD; }
+    var f : [298]u8 = undefined;
+    const got : i64 = ih_slurp(path[0..BK_PATH_MAX], f[0..298], BK_LEN + 1);
+    if (got < 0) { return BK_IO; }
+    return bkh_unseal(f[0..298], @as(usize, @intCast(got)), pass, passn, pt, fp);
+}
+
+/// RESTORE, the second half (after YES): the identity file becomes pt's identity; the old one is kept as identity.bak.
+/// BK_OK, BK_ID_BAD when pt does not check (never written), BK_IO when the files could not be swapped (the identity in
+/// place is unchanged).
+pub fn bkh_replace(pt: []const u8) -> u32 {
+    var fp : [10]u8 = undefined;
+    if (pt.len < BK_PT_LEN) { return BK_ID_BAD; }
+    if (ih_fingerprint(pt[ID_OFF_PUB .. ID_OFF_PUB + PUB_BYTES], fp[0..10]) == false) { return BK_CRYPTO; }
+    if (bk_pt_check(pt[0..BK_PT_LEN], BK_PT_LEN, fp[0..10]) != BK_OK) { return BK_ID_BAD; }
+    var home : [IH_PATH_MAX]u8 = undefined;
+    const hn : usize = ih_home(home[0..IH_PATH_MAX]);
+    if (hn == 0) { return BK_IO; }
+    var dir : [IH_PATH_MAX]u8 = undefined;
+    var path : [IH_PATH_MAX]u8 = undefined;
+    var bak : [IH_PATH_MAX]u8 = undefined;
+    ih_path(home[0..IH_PATH_MAX], hn, 0, false, dir[0..IH_PATH_MAX]);
+    const pl : usize = ih_path(home[0..IH_PATH_MAX], hn, 1, false, path[0..IH_PATH_MAX]);
+    const bl : usize = bkh_bak_path(home[0..IH_PATH_MAX], hn, bak[0..IH_PATH_MAX]);
+    sys_mkdir(dir[0..IH_PATH_MAX], 448);
+    var tmp : [IH_PATH_MAX]u8 = undefined;
+    if (bkh_write_tmp(path[0..IH_PATH_MAX], pl, pt[BK_PT_ID .. BK_PT_ID + ID_LEN], ID_LEN, tmp[0..IH_PATH_MAX]) == false) { return BK_IO; }
+    if (bkh_access(path[0..IH_PATH_MAX], 0) == 0) {
+        if (bkh_access(bak[0..IH_PATH_MAX], 0) == 0) {
+            var old : [IH_PATH_MAX]u8 = undefined;
+            var on : usize = put_bytes(old[0..IH_PATH_MAX], 0, bak[0..bl]);
+            on = put_bytes(old[0..IH_PATH_MAX], on, ".");
+            on = put_dec(old[0..IH_PATH_MAX], on, bkh_now());
+            old[on] = 0;
+            if (sys_rename(bak[0..IH_PATH_MAX], old[0..IH_PATH_MAX]) != 0) {
+                sys_unlink(tmp[0..IH_PATH_MAX]);
+                return BK_IO;
+            }
+        }
+        if (bkh_link(path[0..IH_PATH_MAX], bak[0..IH_PATH_MAX]) != 0) {
+            sys_unlink(tmp[0..IH_PATH_MAX]);
+            return BK_IO;
+        }
+    }
+    if (sys_rename(tmp[0..IH_PATH_MAX], path[0..IH_PATH_MAX]) != 0) {
+        sys_unlink(tmp[0..IH_PATH_MAX]);
+        return BK_IO;
+    }
+    var back : [208]u8 = undefined;
+    const got : i64 = ih_slurp(path[0..IH_PATH_MAX], back[0..208], ID_LEN + 1);
+    var d : u32 = 0;
+    var i : usize = 0;
+    while (i < ID_LEN) {
+        d = d | @as(u32, back[i] ^ pt[BK_PT_ID + i]);
+        i = i + 1;
+    }
+    bk_wipe(back[0..208], 0, 208);
+    if (got != @as(i64, @intCast(ID_LEN)) or d != 0) { return BK_IO; }
+    return BK_OK;
+}
+
+/// An environment variable into out (NUL-terminated); its length, 0 when unset, empty or too long.
+pub fn bkh_env(name: []const u8, out: []u8) -> usize {
+    const p : u64 = sys_getenv(name);
+    if (p == 0) { return 0; }
+    const n : u64 = sys_strlen(p);
+    if (n == 0 or n + 1 > @as(u64, out.len)) { return 0; }
+    sys_peek(out[0..@as(usize, n)], p, n);
+    out[@as(usize, n)] = 0;
+    return @as(usize, n);
+}
+
+/// T27OS_ID_PASSWORD, read once and removed from the environment (child processes never see it).
+pub fn bkh_env_pass(out: []u8) -> usize {
+    const n : usize = bkh_env("T27OS_ID_PASSWORD", out);
+    bkh_unsetenv("T27OS_ID_PASSWORD");
+    return n;
+}
+
+/// 20 hex digits of a fingerprint (public), for the one launch line.
+pub fn bkh_fp_hex(fp: []const u8, out: []u8) -> usize {
+    const hx : str = "0123456789abcdef";
+    var i : usize = 0;
+    while (i < FP_BYTES) {
+        out[2 * i] = hx[@as(usize, fp[i] >> 4)];
+        out[2 * i + 1] = hx[@as(usize, fp[i] & 15)];
+        i = i + 1;
+    }
+    return 2 * FP_BYTES;
+}

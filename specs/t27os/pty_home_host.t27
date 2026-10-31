@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/pty_home_host.t27 -- the pane server in HOME, the host half (owner, 2026-10-23).
+// What only the OS can do for pty_home.t27: lstat the source candidates, ~/.t27os and ~/.t27os/t27os-pty, compare
+// the bytes a chunk at a time, write ~/.t27os/t27os-pty.new with O_CREAT | O_EXCL | O_NOFOLLOW and fchmod 0700, and
+// rename it over the destination. A destination that is a link is never opened and never replaced. No decision
+// lives here that pty_home.t27 does not name. ASCII only (L3).
+
+module T27osPtyHomeHost;
+
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_unlink;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_sys::sys_chmod;
+use t27os::pty_home::PH_MODE;
+use t27os::pty_home::PH_WFLAGS;
+use t27os::pty_home::PH_RFLAGS;
+use t27os::pty_home::PH_CHUNK;
+use t27os::pty_home::PH_K_NONE;
+use t27os::pty_home::PH_K_FILE;
+use t27os::pty_home::PH_SRC_NONE;
+use t27os::pty_home::PH_SRC_INSIDE;
+use t27os::pty_home::PH_KEEP;
+use t27os::pty_home::PH_COPY;
+use t27os::pty_home::PH_CHMOD;
+use t27os::pty_home::PR_KEPT;
+use t27os::pty_home::PR_COPIED;
+use t27os::pty_home::PR_CHMOD;
+use t27os::pty_home::PR_NO_SOURCE;
+use t27os::pty_home::PR_NO_DIR;
+use t27os::pty_home::PR_WRITE_FAILED;
+use t27os::pty_home::ph_kind;
+use t27os::pty_home::ph_src_pick;
+use t27os::pty_home::ph_src_usable;
+use t27os::pty_home::ph_src_fit;
+use t27os::pty_home::ph_action;
+use t27os::pty_home::ph_compare_due;
+use t27os::pty_home::ph_dir_ok;
+use t27os::pty_home::ph_refuse_reason;
+use t27os::pty_home::ph_join;
+use t27os::pty_home::ph_src_paths;
+use t27os::pty_home::ph_line;
+
+fn phh_lstat(path: []const u8, st: []u8) -> i32 { return @extern("lstat"); }
+/// open(2) with O_CREAT: the mode travels on the stack of a variadic call, which an @extern call does not fill
+/// (pty_sys.t27), so the mode is set by fchmod right after, before a byte is written (as call_video cv_private_file).
+pub fn phh_open(path: []const u8, flags: i32, mode: u32) -> i32 { return @extern("open"); }
+pub fn phh_fchmod(fd: i32, mode: u32) -> i32 { return @extern("fchmod"); }
+fn phh_now() -> f64 { return @extern("CFAbsoluteTimeGetCurrent"); }
+
+/// What lstat says of a NUL-terminated path: kind (pty_home ph_kind), size and st_mode. struct stat of arm64 macOS:
+/// 144 bytes, st_mode (u16) at 4, st_size (i64) at 96.
+pub fn phh_look(path: []const u8, r: []u64) -> u32 {
+    var st : [144]u8 = undefined;
+    if (phh_lstat(path, st[0..144]) != 0) {
+        r[0] = 0;
+        r[1] = 0;
+        return PH_K_NONE;
+    }
+    const mode : u32 = @as(u32, st[4]) | (@as(u32, st[5]) << 8);
+    var sz : u64 = 0;
+    var i : usize = 8;
+    while (i > 0) {
+        i = i - 1;
+        sz = (sz << 8) | @as(u64, st[96 + i]);
+    }
+    r[0] = sz;
+    r[1] = @as(u64, mode);
+    return ph_kind(true, mode);
+}
+
+/// Read up to n bytes, looping over short reads; the count read.
+pub fn phh_fill(fd: i32, b: []u8, n: usize) -> usize {
+    var got : usize = 0;
+    while (got < n) {
+        const k : i64 = sys_read(fd, b[got..n], @as(u64, n - got));
+        if (k <= 0) { return got; }
+        got = got + @as(usize, @intCast(k));
+    }
+    return got;
+}
+
+/// Are the two files byte for byte the same (the destination opened without following a link)?
+pub fn phh_same(src: []const u8, dst: []const u8) -> bool {
+    const a : i32 = sys_open_ro(src, 0);
+    if (a < 0) { return false; }
+    const b : i32 = sys_open_ro(dst, PH_RFLAGS);
+    if (b < 0) {
+        sys_close(a);
+        return false;
+    }
+    var x : [65536]u8 = undefined;
+    var y : [65536]u8 = undefined;
+    var same : bool = true;
+    while (same) {
+        const n : usize = phh_fill(a, x[0..65536], PH_CHUNK);
+        const m : usize = phh_fill(b, y[0..65536], PH_CHUNK);
+        if (n != m) { same = false; }
+        var i : usize = 0;
+        while (same and i < n) {
+            if (x[i] != y[i]) { same = false; }
+            i = i + 1;
+        }
+        if (n < PH_CHUNK) { break; }
+    }
+    sys_close(a);
+    sys_close(b);
+    return same;
+}
+
+/// Copy src into tmp (a new file: O_EXCL | O_NOFOLLOW, then 0700) and rename tmp over dst. False on any failure, the
+/// tmp file removed.
+pub fn phh_copy(src: []const u8, size: u64, tmp: []const u8, dst: []const u8) -> bool {
+    sys_unlink(tmp);
+    const a : i32 = sys_open_ro(src, 0);
+    if (a < 0) { return false; }
+    const w : i32 = phh_open(tmp, PH_WFLAGS, PH_MODE);
+    if (w < 0) {
+        sys_close(a);
+        return false;
+    }
+    var ok : bool = phh_fchmod(w, PH_MODE) == 0;
+    var buf : [65536]u8 = undefined;
+    var total : u64 = 0;
+    while (ok) {
+        const n : usize = phh_fill(a, buf[0..65536], PH_CHUNK);
+        if (n == 0) { break; }
+        var off : usize = 0;
+        while (ok and off < n) {
+            const k : i64 = sys_write(w, buf[off..n], @as(u64, n - off));
+            if (k <= 0) { ok = false; } else { off = off + @as(usize, @intCast(k)); }
+        }
+        total = total + @as(u64, n);
+        if (n < PH_CHUNK) { break; }
+    }
+    sys_close(a);
+    if (sys_close(w) != 0) { ok = false; }
+    if (total != size) { ok = false; }
+    if (ok) {
+        // the destination is looked at again just before the rename: a link that appeared meanwhile is not replaced
+        var r : [2]u64 = undefined;
+        const k : u32 = phh_look(dst, r[0..2]);
+        if (k != PH_K_NONE and k != PH_K_FILE) { ok = false; }
+    }
+    if (ok and sys_rename(tmp, dst) != 0) { ok = false; }
+    if (!ok) { sys_unlink(tmp); }
+    return ok;
+}
+
+/// One start: make home/.t27os/t27os-pty the server of the bundle of exe. info[0] = the source (PH_SRC_*), info[1]
+/// = its size, info[2] = milliseconds spent. The result is a PR_* of pty_home.
+pub fn ph_ensure(exe: []const u8, home: []const u8, info: []u64) -> u32 {
+    const t0 : f64 = phh_now();
+    const r : u32 = ph_ensure_at(exe, home, info);
+    const dt : f64 = (phh_now() - t0) * 1000.0;
+    if (dt > 0.0) { info[2] = @as(u64, @intFromFloat(dt)); } else { info[2] = 0; }
+    return r;
+}
+
+pub fn ph_ensure_at(exe: []const u8, home: []const u8, info: []u64) -> u32 {
+    info[0] = PH_SRC_NONE;
+    info[1] = 0;
+    var ins : [512]u8 = undefined;
+    var bes : [512]u8 = undefined;
+    const sp : [2]usize = ph_src_paths(exe, ins[0..512], bes[0..512]);
+    var si : [2]u64 = undefined;
+    var sb : [2]u64 = undefined;
+    const in_ok : bool = sp[0] > 0 and ph_src_fit(ins[0..512], sp[0]) and ph_src_usable(phh_look(ins[0..512], si[0..2]), si[0]);
+    const be_ok : bool = sp[1] > 0 and ph_src_fit(bes[0..512], sp[1]) and ph_src_usable(phh_look(bes[0..512], sb[0..2]), sb[0]);
+    const pick : u32 = ph_src_pick(in_ok, be_ok);
+    if (pick == PH_SRC_NONE) { return PR_NO_SOURCE; }
+    info[0] = pick;
+    var ssz : u64 = sb[0];
+    if (pick == PH_SRC_INSIDE) { ssz = si[0]; }
+    info[1] = ssz;
+    var dir : [512]u8 = undefined;
+    var dst : [512]u8 = undefined;
+    var tmp : [512]u8 = undefined;
+    if (ph_join(home, home.len, "/.t27os", dir[0..512]) == 0 or ph_join(home, home.len, "/.t27os/t27os-pty", dst[0..512]) == 0
+        or ph_join(home, home.len, "/.t27os/t27os-pty.new", tmp[0..512]) == 0) { return PR_NO_DIR; }
+    sys_mkdir(dir[0..512], PH_MODE);
+    var di : [2]u64 = undefined;
+    if (!ph_dir_ok(phh_look(dir[0..512], di[0..2]))) { return PR_NO_DIR; }
+    var dd : [2]u64 = undefined;
+    const dk : u32 = phh_look(dst[0..512], dd[0..2]);
+    var same : bool = false;
+    if (ph_compare_due(dk, dd[0], ssz)) {
+        if (pick == PH_SRC_INSIDE) { same = phh_same(ins[0..512], dst[0..512]); } else { same = phh_same(bes[0..512], dst[0..512]); }
+    }
+    const act : u32 = ph_action(dk, dd[0], @as(u32, @intCast(dd[1])), ssz, same);
+    if (act == PH_KEEP) { return PR_KEPT; }
+    if (act == PH_CHMOD) {
+        // a plain file (lstat said so): chmod on it cannot reach a link's target
+        if (sys_chmod(dst[0..512], PH_MODE) != 0) { return PR_WRITE_FAILED; }
+        return PR_CHMOD;
+    }
+    if (act != PH_COPY) { return ph_refuse_reason(dk); }
+    var ok : bool = false;
+    if (pick == PH_SRC_INSIDE) { ok = phh_copy(ins[0..512], ssz, tmp[0..512], dst[0..512]); } else { ok = phh_copy(bes[0..512], ssz, tmp[0..512], dst[0..512]); }
+    if (!ok) { return PR_WRITE_FAILED; }
+    return PR_COPIED;
+}
+
+/// The start's one log line into out (no newline), from ph_ensure's result and info.
+pub fn ph_ensure_line(out: []u8, r: u32, info: []const u64) -> usize {
+    return ph_line(out, r, @as(u32, @intCast(info[0])), info[1], info[2]);
+}
+
+// The real-folder checks (a missing file appears 0700, a link is refused and its target untouched, a stale .new
+// link is not written through, ~/.t27os as a link is refused) run in pty_home_probe.t27: t27b test does not run
+// an @extern.
+
+test phh_the_log_line_reads_the_info_ph_ensure_fills {
+    var info : [3]u64 = undefined;
+    info[0] = PH_SRC_INSIDE;
+    info[1] = 170576;
+    info[2] = 2;
+    var o : [200]u8 = undefined;
+    assert ph_ensure_line(o[0..200], PR_COPIED, info[0..3]) == 82;
+    info[0] = PH_SRC_NONE;
+    assert ph_ensure_line(o[0..200], PR_NO_SOURCE, info[0..3]) == 32 + 45 + 2 + 5;
+}

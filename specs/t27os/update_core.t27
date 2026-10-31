@@ -1,0 +1,1971 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/update_core.t27 -- self-update over the local network, the decisions (Refs gHashTag/t27#11560).
+// Pure decisions, no @extern, no crypto: the host (update_host.t27) hashes the bundle, signs and verifies with the
+// identity key; every rule it follows is a tested fn here. The release path through GitHub (release.t27) is not touched:
+// this is the second road, a build that spreads from a device that has it to the devices next to it, with no server.
+// Trust sits on what already exists (peer_identity.t27): the P-256 identity key and its 10-byte fingerprint; an update
+// is offered only when its author is a friend (or this device). ASCII only (L3), English only (LANG-EN).
+//
+// MANIFEST  216 bytes, fixed, little endian:
+//   0   magic "T27OSUP\n" (8) | 8 format u32 (1) | 12 major u32 | 16 minor u32 | 20 patch u32 | 24 build u32
+//   | 28 bundle size u64 | 36 SHA-256 of the bundle (32) | 68 author fingerprint (10) | 78 author public key (65, 0x04..)
+//   | 143 signature length u8 (8..72) | 144 signature, X9.62 DER (72, zero padded).
+//   The first 143 bytes are the BODY. The author signs "t27os-update-v1" 0x00 || BODY (ECDSA over SHA-256; the domain
+//   prefix stops a signature made for another purpose from being replayed as an update). The key rides in the manifest
+//   because the friends table keeps fingerprints only; the host checks that the fingerprint of that key is the
+//   fingerprint field, and the fingerprint is what the friends table knows. A version part is 0..99, the build is
+//   1..999999 (so both always fit the mDNS TXT record: "ver=a.b.c" and "build=N").
+// OFFER RULE  see um_offer: stranger, rollback, older version and a size out of range are refused here; whether the
+//   hash and the signature are TRUE is checked by the host (this level only checks their shape).
+// DOWNLOAD STATE  idle -> fetching -> verifying -> ready -> installing -> done / failed; one update at a time.
+// mDNS  two more TXT strings next to fp/port/nick: ver=<major>.<minor>.<patch>, build=<build>.
+
+module T27osUpdateCore;
+
+use t27os::peer_identity::FT_MAX;
+use t27os::peer_identity::ft_find;
+use t27os::peer_identity::TXT_MAX;
+use t27os::peer_identity::txt_get;
+use t27os::peer_identity::txt_build;
+use t27os::peer_identity::txt_fp;
+use t27os::peer_identity::txt_port;
+use t27os::peer_identity::invite_make;
+use t27os::peer_identity::ft_init;
+use t27os::peer_identity::ft_add;
+use t27os::peer_identity::FA_OK;
+
+// ---------------------------------------------------------------- limits and layout
+
+pub const UM_LEN : usize = 216;
+pub const UM_BODY_LEN : usize = 143;
+pub const UM_SIGIN_LEN : usize = 159;
+pub const UM_OFF_FMT : usize = 8;
+pub const UM_OFF_MAJOR : usize = 12;
+pub const UM_OFF_MINOR : usize = 16;
+pub const UM_OFF_PATCH : usize = 20;
+pub const UM_OFF_BUILD : usize = 24;
+pub const UM_OFF_SIZE : usize = 28;
+pub const UM_OFF_SHA : usize = 36;
+pub const UM_OFF_FP : usize = 68;
+pub const UM_OFF_PUB : usize = 78;
+pub const UM_OFF_SIGLEN : usize = 143;
+pub const UM_OFF_SIG : usize = 144;
+pub const UM_SIG_MAX : usize = 72;
+pub const UM_SIG_MIN : usize = 8;
+
+pub const UM_PART_MAX : u32 = 99;
+pub const UM_BUILD_MAX : u32 = 999999;
+pub const UM_SIZE_MIN : u64 = 1048576;
+pub const UM_SIZE_MAX : u64 = 209715200;
+
+pub const NO_VERSION : u64 = 18446744073709551615;
+
+// parse status
+pub const UM_OK : u32 = 0;
+pub const UM_SHORT : u32 = 1;
+pub const UM_LONG : u32 = 2;
+pub const UM_MAGIC : u32 = 3;
+pub const UM_FORMAT : u32 = 4;
+pub const UM_VERSION : u32 = 5;
+pub const UM_BUILD : u32 = 6;
+pub const UM_PUB : u32 = 7;
+pub const UM_SIGLEN : u32 = 8;
+pub const UM_PAD : u32 = 9;
+pub const UM_DER : u32 = 10;
+
+fn um_put32(b: []u8, at: usize, v: u32) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+    b[at + 2] = @as(u8, @intCast((v >> 16) & 255));
+    b[at + 3] = @as(u8, @intCast((v >> 24) & 255));
+}
+
+fn um_get32(b: []const u8, at: usize) -> u32 {
+    return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8) | (@as(u32, b[at + 2]) << 16) | (@as(u32, b[at + 3]) << 24);
+}
+
+fn um_put64(b: []u8, at: usize, v: u64) -> void {
+    um_put32(b, at, @as(u32, @intCast(v & 4294967295)));
+    um_put32(b, at + 4, @as(u32, @intCast(v >> 32)));
+}
+
+fn um_get64(b: []const u8, at: usize) -> u64 {
+    return @as(u64, um_get32(b, at)) | (@as(u64, um_get32(b, at + 4)) << 32);
+}
+
+fn um_copy(dst: []u8, at: usize, src: []const u8, n: usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        dst[at + i] = src[i];
+        i = i + 1;
+    }
+}
+
+/// The packed version: major in bits 40.., minor in 20..39, patch in 0..19 (the same packing release.t27 uses), so a
+/// packed value compares as a semver does.
+pub fn um_pack(major: u32, minor: u32, patch: u32) -> u64 {
+    return (@as(u64, major) << 40) | (@as(u64, minor) << 20) | @as(u64, patch);
+}
+
+// ---------------------------------------------------------------- build, sign input, seal
+
+/// The 143 canonical bytes the author signs (after the domain prefix). 0 on a bad argument: a version part above 99,
+/// a build of 0 or above 999999, a key that is not 65 bytes starting 0x04, a hash or fingerprint of the wrong size,
+/// or an output that is too small. The size is NOT judged here (um_offer judges it).
+pub fn um_body(major: u32, minor: u32, patch: u32, build: u32, size: u64, sha: []const u8, fp: []const u8, pubk: []const u8, out: []u8) -> usize {
+    if (out.len < UM_BODY_LEN or sha.len != 32 or fp.len != 10 or pubk.len != 65) { return 0; }
+    if (major > UM_PART_MAX or minor > UM_PART_MAX or patch > UM_PART_MAX) { return 0; }
+    if (build == 0 or build > UM_BUILD_MAX or pubk[0] != 4) { return 0; }
+    const magic : [8]u8 = [84, 50, 55, 79, 83, 85, 80, 10];
+    um_copy(out, 0, magic[0..8], 8);
+    um_put32(out, UM_OFF_FMT, 1);
+    um_put32(out, UM_OFF_MAJOR, major);
+    um_put32(out, UM_OFF_MINOR, minor);
+    um_put32(out, UM_OFF_PATCH, patch);
+    um_put32(out, UM_OFF_BUILD, build);
+    um_put64(out, UM_OFF_SIZE, size);
+    um_copy(out, UM_OFF_SHA, sha, 32);
+    um_copy(out, UM_OFF_FP, fp, 10);
+    um_copy(out, UM_OFF_PUB, pubk, 65);
+    return UM_BODY_LEN;
+}
+
+/// What the host signs and verifies: "t27os-update-v1" 0x00 then the 143-byte body. 159 bytes; 0 on a bad size.
+pub fn um_sign_input(body: []const u8, out: []u8) -> usize {
+    if (body.len != UM_BODY_LEN or out.len < UM_SIGIN_LEN) { return 0; }
+    const p : [16]u8 = [116, 50, 55, 111, 115, 45, 117, 112, 100, 97, 116, 101, 45, 118, 49, 0];
+    um_copy(out, 0, p[0..16], 16);
+    um_copy(out, 16, body, UM_BODY_LEN);
+    return UM_SIGIN_LEN;
+}
+
+/// body + signature -> the 216 manifest bytes. 0 when the signature is not 8..72 bytes of DER shape.
+pub fn um_seal(body: []const u8, sig: []const u8, out: []u8) -> usize {
+    if (body.len != UM_BODY_LEN or out.len < UM_LEN) { return 0; }
+    if (sig.len < UM_SIG_MIN or sig.len > UM_SIG_MAX) { return 0; }
+    if (sig[0] != 48 or @as(usize, sig[1]) + 2 != sig.len) { return 0; }
+    var i : usize = 0;
+    while (i < UM_LEN) {
+        out[i] = 0;
+        i = i + 1;
+    }
+    um_copy(out, 0, body, UM_BODY_LEN);
+    out[UM_OFF_SIGLEN] = @as(u8, @intCast(sig.len));
+    um_copy(out, UM_OFF_SIG, sig, sig.len);
+    return UM_LEN;
+}
+
+// ---------------------------------------------------------------- parse
+
+/// Is this a whole manifest? UM_OK or the first reason it is not. Shape only: it says nothing about the hash or the
+/// signature being true, and nothing about whether the size is acceptable (um_offer).
+pub fn um_parse(m: []const u8) -> u32 {
+    if (m.len < UM_LEN) { return UM_SHORT; }
+    if (m.len > UM_LEN) { return UM_LONG; }
+    const magic : [8]u8 = [84, 50, 55, 79, 83, 85, 80, 10];
+    var i : usize = 0;
+    while (i < 8) {
+        if (m[i] != magic[i]) { return UM_MAGIC; }
+        i = i + 1;
+    }
+    if (um_get32(m, UM_OFF_FMT) != 1) { return UM_FORMAT; }
+    if (um_get32(m, UM_OFF_MAJOR) > UM_PART_MAX or um_get32(m, UM_OFF_MINOR) > UM_PART_MAX or um_get32(m, UM_OFF_PATCH) > UM_PART_MAX) { return UM_VERSION; }
+    const b : u32 = um_get32(m, UM_OFF_BUILD);
+    if (b == 0 or b > UM_BUILD_MAX) { return UM_BUILD; }
+    if (m[UM_OFF_PUB] != 4) { return UM_PUB; }
+    const sl : usize = @as(usize, m[UM_OFF_SIGLEN]);
+    if (sl < UM_SIG_MIN or sl > UM_SIG_MAX) { return UM_SIGLEN; }
+    if (m[UM_OFF_SIG] != 48 or @as(usize, m[UM_OFF_SIG + 1]) + 2 != sl) { return UM_DER; }
+    i = sl;
+    while (i < UM_SIG_MAX) {
+        if (m[UM_OFF_SIG + i] != 0) { return UM_PAD; }
+        i = i + 1;
+    }
+    return UM_OK;
+}
+
+pub fn um_version(m: []const u8) -> u64 {
+    return um_pack(um_get32(m, UM_OFF_MAJOR), um_get32(m, UM_OFF_MINOR), um_get32(m, UM_OFF_PATCH));
+}
+pub fn um_build_of(m: []const u8) -> u32 { return um_get32(m, UM_OFF_BUILD); }
+pub fn um_size_of(m: []const u8) -> u64 { return um_get64(m, UM_OFF_SIZE); }
+pub fn um_sig_len(m: []const u8) -> usize { return @as(usize, m[UM_OFF_SIGLEN]); }
+
+// ---------------------------------------------------------------- the offer rule
+
+pub const OF_OK : u32 = 0;
+pub const OF_BAD : u32 = 1;
+pub const OF_FP : u32 = 2;
+pub const OF_STRANGER : u32 = 3;
+pub const OF_ROLLBACK : u32 = 4;
+pub const OF_OLDVER : u32 = 5;
+pub const OF_SIZE : u32 = 6;
+
+/// Is the author a friend or this device? own_fp is this device's fingerprint (10 bytes), ft the friends table.
+pub fn um_author_known(ft: []const u8, own_fp: []const u8, fp: []const u8) -> bool {
+    if (fp.len != 10 or own_fp.len != 10) { return false; }
+    var same : bool = true;
+    var i : usize = 0;
+    while (i < 10) {
+        if (own_fp[i] != fp[i]) { same = false; }
+        i = i + 1;
+    }
+    if (same) { return true; }
+    return ft_find(ft, fp) != FT_MAX;
+}
+
+/// Offer this update? Refused, in this order: a manifest that does not parse (OF_BAD); a fingerprint field that is not
+/// the fingerprint of the key in it (OF_FP; fp_matches is what the host computed); an author that is neither a friend
+/// nor this device (OF_STRANGER, known from um_author_known); a build that is not strictly greater than the running
+/// one (OF_ROLLBACK, equal included: the same build is not an update); a version below the running one (OF_OLDVER);
+/// a bundle outside 1 MiB..200 MiB (OF_SIZE). The hash and the signature are NOT judged here: the host checks that
+/// they are true, after this says the manifest is worth fetching. cur_ver is a packed version (um_pack).
+pub fn um_offer(m: []const u8, known: bool, fp_matches: bool, cur_ver: u64, cur_build: u32) -> u32 {
+    if (um_parse(m) != UM_OK or cur_ver == NO_VERSION) { return OF_BAD; }
+    if (fp_matches == false) { return OF_FP; }
+    if (known == false) { return OF_STRANGER; }
+    if (um_build_of(m) <= cur_build) { return OF_ROLLBACK; }
+    if (um_version(m) < cur_ver) { return OF_OLDVER; }
+    const s : u64 = um_size_of(m);
+    if (s < UM_SIZE_MIN or s > UM_SIZE_MAX) { return OF_SIZE; }
+    return OF_OK;
+}
+
+// ---------------------------------------------------------------- download state
+
+pub const ST_IDLE : u32 = 0;
+pub const ST_FETCHING : u32 = 1;
+pub const ST_VERIFYING : u32 = 2;
+pub const ST_READY : u32 = 3;
+pub const ST_INSTALLING : u32 = 4;
+pub const ST_DONE : u32 = 5;
+pub const ST_FAILED : u32 = 6;
+pub const ST_REJECT : u32 = 255;
+
+pub const EV_START : u32 = 1;
+pub const EV_FETCHED : u32 = 2;
+pub const EV_VERIFIED : u32 = 3;
+pub const EV_INSTALL : u32 = 4;
+pub const EV_INSTALLED : u32 = 5;
+pub const EV_FAIL : u32 = 6;
+pub const EV_RESET : u32 = 7;
+
+/// The next state, or ST_REJECT when the event is not allowed now. A new start is refused while one is under way
+/// (fetching, verifying, ready, installing): one update at a time.
+pub fn st_next(state: u32, ev: u32) -> u32 {
+    if (ev == EV_START) {
+        if (state == ST_IDLE or state == ST_DONE or state == ST_FAILED) { return ST_FETCHING; }
+        return ST_REJECT;
+    }
+    if (ev == EV_FETCHED and state == ST_FETCHING) { return ST_VERIFYING; }
+    if (ev == EV_VERIFIED and state == ST_VERIFYING) { return ST_READY; }
+    if (ev == EV_INSTALL and state == ST_READY) { return ST_INSTALLING; }
+    if (ev == EV_INSTALLED and state == ST_INSTALLING) { return ST_DONE; }
+    if (ev == EV_FAIL and state >= ST_FETCHING and state <= ST_INSTALLING) { return ST_FAILED; }
+    if (ev == EV_RESET and (state == ST_DONE or state == ST_FAILED)) { return ST_IDLE; }
+    return ST_REJECT;
+}
+
+/// An update is under way: no second one may start.
+pub fn st_busy(state: u32) -> bool { return state >= ST_FETCHING and state <= ST_INSTALLING; }
+
+// ---------------------------------------------------------------- mDNS TXT: ver and build
+
+fn um_put_dec(out: []u8, at: usize, v: u32) -> usize {
+    var tmp : [10]u8 = undefined;
+    var n : usize = 0;
+    var x : u32 = v;
+    if (x == 0) {
+        out[at] = 48;
+        return at + 1;
+    }
+    while (x > 0) {
+        tmp[n] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+        n = n + 1;
+    }
+    var p : usize = at;
+    while (n > 0) {
+        n = n - 1;
+        out[p] = tmp[n];
+        p = p + 1;
+    }
+    return p;
+}
+
+/// txt (n bytes, from txt_build) plus "ver=a.b.c" and "build=N" in out. The new length, or 0 when a part is above 99,
+/// the build is 0 or above 999999, ver/build are already there, or the result would pass TXT_MAX (96).
+pub fn upd_txt_add(txt: []const u8, n: usize, major: u32, minor: u32, patch: u32, build: u32, out: []u8) -> usize {
+    if (n > txt.len or n > TXT_MAX or out.len < TXT_MAX) { return 0; }
+    if (major > UM_PART_MAX or minor > UM_PART_MAX or patch > UM_PART_MAX) { return 0; }
+    if (build == 0 or build > UM_BUILD_MAX) { return 0; }
+    const kv : [3]u8 = [118, 101, 114];
+    const kb : [5]u8 = [98, 117, 105, 108, 100];
+    var probe : [16]u8 = undefined;
+    if (txt_get(txt, n, kv[0..3], probe[0..16]) != 0 or txt_get(txt, n, kb[0..5], probe[0..16]) != 0) { return 0; }
+    var vt : [16]u8 = undefined;
+    var p : usize = um_put_dec(vt[0..16], 0, major);
+    vt[p] = 46;
+    p = um_put_dec(vt[0..16], p + 1, minor);
+    vt[p] = 46;
+    p = um_put_dec(vt[0..16], p + 1, patch);
+    var bt : [16]u8 = undefined;
+    const bn : usize = um_put_dec(bt[0..16], 0, build);
+    // "ver=" + text, "build=" + text, each with a length byte
+    const need : usize = n + 1 + 4 + p + 1 + 6 + bn;
+    if (need > TXT_MAX) { return 0; }
+    um_copy(out, 0, txt, n);
+    var w : usize = n;
+    out[w] = @as(u8, @intCast(4 + p));
+    out[w + 1] = 118;
+    out[w + 2] = 101;
+    out[w + 3] = 114;
+    out[w + 4] = 61;
+    um_copy(out, w + 5, vt[0..p], p);
+    w = w + 5 + p;
+    out[w] = @as(u8, @intCast(6 + bn));
+    out[w + 1] = 98;
+    out[w + 2] = 117;
+    out[w + 3] = 105;
+    out[w + 4] = 108;
+    out[w + 5] = 100;
+    out[w + 6] = 61;
+    um_copy(out, w + 7, bt[0..bn], bn);
+    return w + 7 + bn;
+}
+
+fn um_dec_part(t: []const u8, from: usize, to: usize) -> u32 {
+    // 1..2 digits, no leading zero unless the part is "0"; 100 on any fault
+    const len : usize = to - from;
+    if (len == 0 or len > 2) { return 100; }
+    var v : u32 = 0;
+    var i : usize = from;
+    while (i < to) {
+        if (t[i] < 48 or t[i] > 57) { return 100; }
+        v = v * 10 + @as(u32, t[i]) - 48;
+        i = i + 1;
+    }
+    if (len == 2 and t[from] == 48) { return 100; }
+    return v;
+}
+
+/// The neighbour's announced version as a packed value (um_pack); NO_VERSION for a missing, cut or malformed "ver".
+pub fn upd_txt_version(txt: []const u8, n: usize) -> u64 {
+    var v : [16]u8 = undefined;
+    const key : [3]u8 = [118, 101, 114];
+    const vn : usize = txt_get(txt, n, key[0..3], v[0..16]);
+    if (vn == 0) { return NO_VERSION; }
+    var dots : [2]usize = undefined;
+    var d : usize = 0;
+    var i : usize = 0;
+    while (i < vn) {
+        if (v[i] == 46) {
+            if (d >= 2) { return NO_VERSION; }
+            dots[d] = i;
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    if (d != 2) { return NO_VERSION; }
+    const a : u32 = um_dec_part(v[0..16], 0, dots[0]);
+    const b : u32 = um_dec_part(v[0..16], dots[0] + 1, dots[1]);
+    const c : u32 = um_dec_part(v[0..16], dots[1] + 1, vn);
+    if (a > UM_PART_MAX or b > UM_PART_MAX or c > UM_PART_MAX) { return NO_VERSION; }
+    return um_pack(a, b, c);
+}
+
+/// The neighbour's announced build; 0 for a missing, non-numeric, zero, leading-zero or above-999999 value.
+pub fn upd_txt_build(txt: []const u8, n: usize) -> u32 {
+    var v : [16]u8 = undefined;
+    const key : [5]u8 = [98, 117, 105, 108, 100];
+    const vn : usize = txt_get(txt, n, key[0..5], v[0..16]);
+    if (vn == 0 or vn > 6) { return 0; }
+    if (v[0] == 48) { return 0; }
+    var x : u32 = 0;
+    var i : usize = 0;
+    while (i < vn) {
+        if (v[i] < 48 or v[i] > 57) { return 0; }
+        x = x * 10 + @as(u32, v[i]) - 48;
+        i = i + 1;
+    }
+    return x;
+}
+
+/// Does a neighbour's announcement say it runs a newer build than ours? A hint to go and read its manifest, nothing more.
+pub fn upd_neighbour_newer(txt: []const u8, n: usize, cur_ver: u64, cur_build: u32) -> bool {
+    const b : u32 = upd_txt_build(txt, n);
+    const v : u64 = upd_txt_version(txt, n);
+    if (b == 0 or v == NO_VERSION) { return false; }
+    return b > cur_build and v >= cur_ver;
+}
+
+// ---------------------------------------------------------------- part 3: the running app serves and takes updates
+//
+// The app answers update requests on a TCP port of its own (any free one; the call port is UDP) and says so in its
+// announcement: "up=<port>" after ver and build. A record with the longest nickname and the longest ver/build has no
+// room left for it (all 96 bytes are taken): such a device announces ver and build and serves nobody, which the window says.
+
+/// txt (n bytes) plus "up=<port>" in out. The new length, or 0 when the port is 0 or above 65535, "up" is already
+/// there, or the result would pass TXT_MAX (96).
+pub fn upd_txt_add_port(txt: []const u8, n: usize, port: u32, out: []u8) -> usize {
+    if (n > txt.len or n > TXT_MAX or out.len < TXT_MAX) { return 0; }
+    if (port == 0 or port > 65535) { return 0; }
+    const ku : [2]u8 = [117, 112];
+    var probe : [16]u8 = undefined;
+    if (txt_get(txt, n, ku[0..2], probe[0..16]) != 0) { return 0; }
+    var pt : [8]u8 = undefined;
+    const pn : usize = um_put_dec(pt[0..8], 0, port);
+    if (n + 4 + pn > TXT_MAX) { return 0; }
+    um_copy(out, 0, txt, n);
+    out[n] = @as(u8, @intCast(3 + pn));
+    out[n + 1] = 117;
+    out[n + 2] = 112;
+    out[n + 3] = 61;
+    um_copy(out, n + 4, pt[0..pn], pn);
+    return n + 4 + pn;
+}
+
+/// The neighbour's update port ("up="), 0 when missing, not 1..65535, or written with a leading zero.
+pub fn upd_txt_uport(txt: []const u8, n: usize) -> u32 {
+    var v : [16]u8 = undefined;
+    const ku : [2]u8 = [117, 112];
+    const vn : usize = txt_get(txt, n, ku[0..2], v[0..16]);
+    if (vn == 0 or vn > 5 or v[0] == 48) { return 0; }
+    var x : u32 = 0;
+    var i : usize = 0;
+    while (i < vn) {
+        if (v[i] < 48 or v[i] > 57) { return 0; }
+        x = x * 10 + @as(u32, v[i]) - 48;
+        i = i + 1;
+    }
+    if (x > 65535) { return 0; }
+    return x;
+}
+
+/// "a.b.c" (the bundle's CFBundleShortVersionString) as a packed version; NO_VERSION for anything else.
+pub fn um_parse_ver(t: []const u8, n: usize) -> u64 {
+    if (n > t.len or n == 0 or n > 8) { return NO_VERSION; }
+    var dots : [2]usize = undefined;
+    var d : usize = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t[i] == 46) {
+            if (d >= 2) { return NO_VERSION; }
+            dots[d] = i;
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    if (d != 2) { return NO_VERSION; }
+    const a : u32 = um_dec_part(t, 0, dots[0]);
+    const b : u32 = um_dec_part(t, dots[0] + 1, dots[1]);
+    const c : u32 = um_dec_part(t, dots[1] + 1, n);
+    if (a > UM_PART_MAX or b > UM_PART_MAX or c > UM_PART_MAX) { return NO_VERSION; }
+    return um_pack(a, b, c);
+}
+
+/// One part of a packed version: 2 = major, 1 = minor, 0 = patch.
+pub fn um_ver_part(v: u64, which: u32) -> u32 {
+    if (which == 2) { return @as(u32, @intCast((v >> 40) & 1048575)); }
+    if (which == 1) { return @as(u32, @intCast((v >> 20) & 1048575)); }
+    return @as(u32, @intCast(v & 1048575));
+}
+
+// The lock next to the app (<app>.lock, a directory) holds a file "pid" with the decimal pid of the process that took
+// it. An update that died (power, kill -9) leaves the lock behind and every later update would read "another update is
+// running". At launch the app judges it: a lock whose owner still runs is kept; a lock younger than UK_STALE_S is kept
+// (its owner may be starting); an older one whose owner is gone (or never written) is removed, and the log says so.
+pub const UK_STALE_S : u64 = 600;
+pub const UK_NONE : u32 = 0;
+pub const UK_KEEP_FRESH : u32 = 1;
+pub const UK_KEEP_ALIVE : u32 = 2;
+pub const UK_REMOVE : u32 = 3;
+
+pub fn uk_verdict(exists: bool, age_s: u64, owner: u32, alive: bool) -> u32 {
+    if (exists == false) { return UK_NONE; }
+    if (owner != 0 and alive) { return UK_KEEP_ALIVE; }
+    if (age_s <= UK_STALE_S) { return UK_KEEP_FRESH; }
+    return UK_REMOVE;
+}
+
+/// The words the log line uses for a verdict.
+pub fn uk_text(v: u32, out: []u8) -> usize {
+    if (v == UK_NONE) { return ui_join("", 0, "no lock", out); }
+    if (v == UK_KEEP_FRESH) { return ui_join("", 0, "kept: younger than 10 min", out); }
+    if (v == UK_KEEP_ALIVE) { return ui_join("", 0, "kept: its owner still runs", out); }
+    return ui_join("", 0, "removed: older than 10 min and its owner is gone", out);
+}
+
+/// The pid in the lock's file: decimal digits, an optional newline; 0 for anything else (or above 99999999).
+pub fn uk_pid_of(t: []const u8, n: usize) -> u32 {
+    var m : usize = n;
+    if (m > t.len) { return 0; }
+    if (m > 0 and t[m - 1] == 10) { m = m - 1; }
+    if (m == 0 or m > 8 or t[0] == 48) { return 0; }
+    var x : u32 = 0;
+    var i : usize = 0;
+    while (i < m) {
+        if (t[i] < 48 or t[i] > 57) { return 0; }
+        x = x * 10 + @as(u32, t[i]) - 48;
+        i = i + 1;
+    }
+    return x;
+}
+
+/// The text of the lock's pid file: the digits and a newline. Its length.
+pub fn uk_pid_text(pid: u32, out: []u8) -> usize {
+    const p : usize = um_put_dec(out, 0, pid);
+    out[p] = 10;
+    return p + 1;
+}
+
+// The STATUS RECORD a helper process writes for the window (the window never blocks on a socket or a ditto: serving and
+// taking an update run in a second process of the app's own executable, and the window reads this file a few times a
+// second). 96 bytes, little endian: 0 magic "T27UGST1" | 8 role u8 | 9 phase u8 | 10 why u8 (FR_*) | 11 offer u8
+// (UH_OK / OF_* / 10) | 12 fetch u8 (UF_*) | 13 step u8 | 14 undo u8 | 15 zero | 16 build u32 (of the manifest) | 20 port
+// u32 (served) | 24 total u64 (bundle size) | 32 have u64 | 40 served u32 (bundles sent whole) | 44 pid u32 | 48 the
+// bundle's SHA-256 (32; the window finds the part file by it) | 80 zero (16).
+pub const UW_LEN : usize = 96;
+pub const UW_ROLE : usize = 8;
+pub const UW_PHASE : usize = 9;
+pub const UW_WHY : usize = 10;
+pub const UW_OFFER : usize = 11;
+pub const UW_FETCH : usize = 12;
+pub const UW_STEP : usize = 13;
+pub const UW_UNDO : usize = 14;
+pub const UW_BUILD : usize = 16;
+pub const UW_PORT : usize = 20;
+pub const UW_TOTAL : usize = 24;
+pub const UW_HAVE : usize = 32;
+pub const UW_SERVED : usize = 40;
+pub const UW_PID : usize = 44;
+pub const UW_SHA : usize = 48;
+
+pub const UW_R_SERVE : u32 = 1;
+pub const UW_R_FETCH : u32 = 2;
+
+pub const UW_P_NONE : u32 = 0;
+pub const UW_P_MANIFEST : u32 = 1;
+pub const UW_P_FETCH : u32 = 2;
+pub const UW_P_INSTALL : u32 = 3;
+pub const UW_P_DONE : u32 = 4;
+pub const UW_P_FAILED : u32 = 5;
+pub const UW_P_SERVING : u32 = 8;
+pub const UW_P_SERVE_FAIL : u32 = 9;
+
+const UW_MAGIC : [8]u8 = [84, 50, 55, 85, 71, 83, 84, 49];
+
+/// A fresh record: the magic, the role, the pid, every other byte 0.
+pub fn uw_init(r: []u8, role: u32, pid: u32) -> void {
+    var i : usize = 0;
+    while (i < UW_LEN) {
+        r[i] = 0;
+        i = i + 1;
+    }
+    um_copy(r, 0, UW_MAGIC[0..8], 8);
+    r[UW_ROLE] = @as(u8, @intCast(role & 255));
+    um_put32(r, UW_PID, pid);
+}
+
+/// A record read back: whole and with the magic.
+pub fn uw_ok(r: []const u8, n: usize) -> bool {
+    if (n != UW_LEN or r.len < UW_LEN) { return false; }
+    var i : usize = 0;
+    while (i < 8) {
+        if (r[i] != UW_MAGIC[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn uw_put32(r: []u8, at: usize, v: u32) -> void { um_put32(r, at, v); }
+pub fn uw_get32(r: []const u8, at: usize) -> u32 { return um_get32(r, at); }
+pub fn uw_put64(r: []u8, at: usize, v: u64) -> void { um_put64(r, at, v); }
+pub fn uw_get64(r: []const u8, at: usize) -> u64 { return um_get64(r, at); }
+
+/// The manifest's build, size and hash into the record (the phase that follows the manifest's judgement).
+pub fn uw_from_manifest(r: []u8, m: []const u8) -> void {
+    um_put32(r, UW_BUILD, um_build_of(m));
+    um_put64(r, UW_TOTAL, um_size_of(m));
+    um_copy(r, UW_SHA, m[UM_OFF_SHA..UM_OFF_SHA + 32], 32);
+}
+
+/// Percent of a download, 0..100 (100 only when every byte is there).
+pub fn uw_percent(have: u64, total: u64) -> u32 {
+    if (total == 0) { return 0; }
+    if (have >= total) { return 100; }
+    const p : u64 = have * 100 / total;
+    if (p >= 100) { return 99; }
+    return @as(u32, @intCast(p));
+}
+
+// ---------------------------------------------------------------- transfer (part 2): request, answer, chunks, resume
+//
+// TCP, one request per connection, all integers little endian. The bundle is the .app packed by
+// `ditto -c -k --keepParent` (a zip that keeps the code signature); the manifest's size and SHA-256 are of that zip.
+// REQUEST  72 bytes: magic "T27UPRQ1" (8) | 8 kind u32 (1 manifest, 2 bundle) | 12 build u32 | 16 offset u64
+//   | 24 author fingerprint (10) | 34 zero (6) | 40 SHA-256 of the bundle (32). A manifest request carries zeros after
+//   the kind. A bundle request names the build, the author and the hash of the manifest it was judged by, and the
+//   offset to start from (the size of the part already on disk: that is the resume).
+// ANSWER   24 bytes: magic "T27UPRS1" (8) | 8 status u32 | 12 zero u32 | 16 length u64 (bytes that follow). For a
+//   manifest: the 216 manifest bytes. For a bundle: CHUNKS from the offset, then the END chunk.
+// CHUNK    16-byte header: 0 length u32 (1..65536) | 4 sequence u32 (0, 1, 2 ... in this answer) | 8 offset u64
+//   (where these bytes go in the bundle), then the bytes. END: length 0, offset = the bundle size. A stream that stops
+//   before END is a broken transfer: the part on disk is kept and the next request starts at its size.
+
+pub const RQ_LEN : usize = 72;
+pub const RS_LEN : usize = 24;
+pub const CH_LEN : usize = 16;
+pub const UX_CHUNK : u64 = 65536;
+pub const UX_RETRY_MAX : u32 = 4;
+
+pub const RQ_MANIFEST : u32 = 1;
+pub const RQ_BUNDLE : u32 = 2;
+pub const RQ_OFF_KIND : usize = 8;
+pub const RQ_OFF_BUILD : usize = 12;
+pub const RQ_OFF_OFFSET : usize = 16;
+pub const RQ_OFF_FP : usize = 24;
+pub const RQ_OFF_SHA : usize = 40;
+
+// answer status
+pub const RS_OK : u32 = 0;
+pub const RS_BAD : u32 = 1;
+pub const RS_NOT_HERE : u32 = 2;
+pub const RS_RANGE : u32 = 3;
+
+// chunk check
+pub const CH_OK : u32 = 0;
+pub const CH_END : u32 = 1;
+pub const CH_SIZE : u32 = 2;
+pub const CH_SEQ : u32 = 3;
+pub const CH_OFF : u32 = 4;
+
+fn ux_magic(out: []u8, last: u8) -> void {
+    const m : [7]u8 = [84, 50, 55, 85, 80, 82, 0];
+    um_copy(out, 0, m[0..6], 6);
+    out[6] = last;
+    out[7] = 49;
+}
+
+fn ux_magic_is(b: []const u8, last: u8) -> bool {
+    var m : [8]u8 = undefined;
+    ux_magic(m[0..8], last);
+    var i : usize = 0;
+    while (i < 8) {
+        if (b[i] != m[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn ux_zero(b: []u8, from: usize, to: usize) -> void {
+    var i : usize = from;
+    while (i < to) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn ux_same(a: []const u8, ao: usize, b: []const u8, bo: usize, n: usize) -> bool {
+    var d : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        d = d | @as(u32, a[ao + i] ^ b[bo + i]);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+/// A manifest request: 72 bytes in out, their count (0 when out is short).
+pub fn rq_manifest(out: []u8) -> usize {
+    if (out.len < RQ_LEN) { return 0; }
+    ux_zero(out, 0, RQ_LEN);
+    ux_magic(out, 81);
+    um_put32(out, RQ_OFF_KIND, RQ_MANIFEST);
+    return RQ_LEN;
+}
+
+/// A bundle request for the bundle manifest m describes, from offset. 0 when m does not parse or out is short.
+pub fn rq_bundle(m: []const u8, offset: u64, out: []u8) -> usize {
+    if (out.len < RQ_LEN or um_parse(m) != UM_OK) { return 0; }
+    ux_zero(out, 0, RQ_LEN);
+    ux_magic(out, 81);
+    um_put32(out, RQ_OFF_KIND, RQ_BUNDLE);
+    um_put32(out, RQ_OFF_BUILD, um_build_of(m));
+    um_put64(out, RQ_OFF_OFFSET, offset);
+    um_copy(out, RQ_OFF_FP, m[UM_OFF_FP..UM_OFF_FP + 10], 10);
+    um_copy(out, RQ_OFF_SHA, m[UM_OFF_SHA..UM_OFF_SHA + 32], 32);
+    return RQ_LEN;
+}
+
+pub fn rq_kind(r: []const u8) -> u32 { return um_get32(r, RQ_OFF_KIND); }
+pub fn rq_offset(r: []const u8) -> u64 { return um_get64(r, RQ_OFF_OFFSET); }
+
+/// Is r a well-formed request? A wrong length, magic or kind, a non-zero spare byte, or a manifest request that carries
+/// anything after its kind is not.
+pub fn rq_ok(r: []const u8) -> bool {
+    if (r.len != RQ_LEN or ux_magic_is(r, 81) == false) { return false; }
+    const k : u32 = rq_kind(r);
+    if (k != RQ_MANIFEST and k != RQ_BUNDLE) { return false; }
+    var i : usize = 34;
+    while (i < 40) {
+        if (r[i] != 0) { return false; }
+        i = i + 1;
+    }
+    if (k == RQ_MANIFEST) {
+        i = 12;
+        while (i < RQ_LEN) {
+            if (r[i] != 0) { return false; }
+            i = i + 1;
+        }
+    }
+    return true;
+}
+
+/// The serving side's answer to request r when it serves the bundle manifest m describes: RS_BAD for a malformed
+/// request, RS_NOT_HERE when a bundle request names another build, author or hash (this side never sends bytes it
+/// was not asked for by name), RS_RANGE for an offset past the end, else RS_OK.
+pub fn us_answer(r: []const u8, m: []const u8) -> u32 {
+    if (rq_ok(r) == false or um_parse(m) != UM_OK) { return RS_BAD; }
+    if (rq_kind(r) == RQ_MANIFEST) { return RS_OK; }
+    if (um_get32(r, RQ_OFF_BUILD) != um_build_of(m)) { return RS_NOT_HERE; }
+    if (ux_same(r, RQ_OFF_FP, m, UM_OFF_FP, 10) == false) { return RS_NOT_HERE; }
+    if (ux_same(r, RQ_OFF_SHA, m, UM_OFF_SHA, 32) == false) { return RS_NOT_HERE; }
+    if (rq_offset(r) > um_size_of(m)) { return RS_RANGE; }
+    return RS_OK;
+}
+
+/// The 24-byte answer header.
+pub fn rs_make(status: u32, length: u64, out: []u8) -> usize {
+    if (out.len < RS_LEN) { return 0; }
+    ux_zero(out, 0, RS_LEN);
+    ux_magic(out, 83);
+    um_put32(out, 8, status);
+    um_put64(out, 16, length);
+    return RS_LEN;
+}
+
+pub fn rs_ok_shape(h: []const u8) -> bool {
+    if (h.len < RS_LEN or ux_magic_is(h, 83) == false) { return false; }
+    return um_get32(h, 12) == 0 and um_get32(h, 8) <= RS_RANGE;
+}
+pub fn rs_status(h: []const u8) -> u32 { return um_get32(h, 8); }
+pub fn rs_length(h: []const u8) -> u64 { return um_get64(h, 16); }
+
+/// How many bytes the next chunk carries: at most 64 KiB, never past the end; 0 at or past the end.
+pub fn ux_chunk_len(size: u64, offset: u64) -> u64 {
+    if (offset >= size) { return 0; }
+    const left : u64 = size - offset;
+    if (left > UX_CHUNK) { return UX_CHUNK; }
+    return left;
+}
+
+/// How many chunks an answer from offset carries (END not counted).
+pub fn ux_chunk_count(size: u64, offset: u64) -> u64 {
+    if (offset >= size) { return 0; }
+    return (size - offset + UX_CHUNK - 1) / UX_CHUNK;
+}
+
+pub fn ch_make(len: u32, seq: u32, offset: u64, out: []u8) -> usize {
+    if (out.len < CH_LEN) { return 0; }
+    um_put32(out, 0, len);
+    um_put32(out, 4, seq);
+    um_put64(out, 8, offset);
+    return CH_LEN;
+}
+pub fn ch_len(h: []const u8) -> u32 { return um_get32(h, 0); }
+
+/// Judge a chunk header against what the receiver expects next: the sequence number and the offset it has written to.
+/// CH_END for the end mark (length 0 at exactly the bundle size), CH_SEQ / CH_OFF for a chunk out of order or at the
+/// wrong place, CH_SIZE for a length above 64 KiB, a length that is not ux_chunk_len (a chunk may only be short at the
+/// end), or an end mark before the end. Anything but CH_OK / CH_END ends the transfer.
+pub fn ch_check(h: []const u8, seq: u32, offset: u64, size: u64) -> u32 {
+    if (h.len < CH_LEN) { return CH_SIZE; }
+    if (um_get32(h, 4) != seq) { return CH_SEQ; }
+    if (um_get64(h, 8) != offset) { return CH_OFF; }
+    const n : u64 = @as(u64, ch_len(h));
+    if (n == 0) {
+        if (offset == size) { return CH_END; }
+        return CH_SIZE;
+    }
+    if (n != ux_chunk_len(size, offset)) { return CH_SIZE; }
+    return CH_OK;
+}
+
+/// Where a download starts, given the part already on disk (-1 when there is none) and the bundle size: at the part's
+/// size, so nothing is fetched twice; at 0 when there is no part or the part is LONGER than the bundle (it is not a
+/// prefix of it, ux_part_discard says so and the host empties it).
+pub fn ux_resume_from(part: i64, size: u64) -> u64 {
+    if (part <= 0) { return 0; }
+    if (@as(u64, @intCast(part)) > size) { return 0; }
+    return @as(u64, @intCast(part));
+}
+pub fn ux_part_discard(part: i64, size: u64) -> bool { return part > 0 and @as(u64, @intCast(part)) > size; }
+
+/// Try again after a broken transfer? While fewer than UX_RETRY_MAX tries ended without progress in a row: a
+/// connection that brought new bytes resets the count, so a slow but moving peer is never given up on.
+pub fn ux_retry(fails_in_row: u32) -> bool { return fails_in_row < UX_RETRY_MAX; }
+
+// ---------------------------------------------------------------- install (part 2): steps, checks, undo
+//
+// Next to the running app (same volume, so rename(2) is atomic): <app>.new/ receives the unpacked zip, <app>.prev is
+// the copy that ran before. Steps, in order: UNPACK (ditto -x -k into <app>.new), CHECK (an .app with Contents/
+// Info.plist, the same CFBundleIdentifier as the running app, CFBundleVersion = the manifest build, the
+// CFBundleExecutable file present), MOVE_OLD (rename <app> -> <app>.prev, an older .prev removed first), MOVE_NEW
+// (rename <app>.new/<name> -> <app>), HEALTH (the installed copy passes its check), then DONE. The relaunch after DONE
+// is the caller's (update_host.uh_relaunch); the lock (<app>.lock) left by a process that died stays until removed.
+// A failure at a step is undone by ui_undo(step); the live path never stays empty and never holds a bundle that
+// failed a check.
+
+pub const IS_UNPACK : u32 = 1;
+pub const IS_CHECK : u32 = 2;
+pub const IS_MOVE_OLD : u32 = 3;
+pub const IS_MOVE_NEW : u32 = 4;
+pub const IS_HEALTH : u32 = 5;
+pub const IS_DONE : u32 = 6;
+
+pub const UA_NONE : u32 = 0;
+pub const UA_CLEAN : u32 = 1;
+pub const UA_RESTORE : u32 = 2;
+pub const UA_SWAP_BACK : u32 = 3;
+
+/// The step after a good one; IS_DONE stays IS_DONE; 0 for a step that does not exist.
+pub fn ui_next(step: u32) -> u32 {
+    if (step < IS_UNPACK or step > IS_DONE) { return 0; }
+    if (step == IS_DONE) { return IS_DONE; }
+    return step + 1;
+}
+
+/// What undoes a failure at step: UA_CLEAN before the live app was moved (remove <app>.new, the live app was never
+/// touched; a failed MOVE_OLD rename moved nothing), UA_RESTORE when the old copy is already <app>.prev but the new one
+/// did not arrive (rename <app>.prev back to <app>), UA_SWAP_BACK when the new copy is live and failed its health
+/// check (move it aside to <app>.new, then <app>.prev back to <app>). UA_NONE for DONE and for no step.
+pub fn ui_undo(step: u32) -> u32 {
+    if (step == IS_UNPACK or step == IS_CHECK or step == IS_MOVE_OLD) { return UA_CLEAN; }
+    if (step == IS_MOVE_NEW) { return UA_RESTORE; }
+    if (step == IS_HEALTH) { return UA_SWAP_BACK; }
+    return UA_NONE;
+}
+
+/// Has the live path been changed by the time step runs? (Only these steps ever need the old copy back.)
+pub fn ui_touches_live(step: u32) -> bool { return step >= IS_MOVE_NEW and step <= IS_HEALTH; }
+
+// bundle check codes
+pub const UB_OK : u32 = 0;
+pub const UB_NOPLIST : u32 = 1;
+pub const UB_ID : u32 = 2;
+pub const UB_BUILD : u32 = 3;
+pub const UB_EXE : u32 = 4;
+
+/// A CFBundleVersion string as a build: 1..999999 in plain digits, 0 otherwise.
+pub fn ui_build_text(t: []const u8, n: usize) -> u32 {
+    if (n == 0 or n > 6 or n > t.len or t[0] == 48) { return 0; }
+    var x : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t[i] < 48 or t[i] > 57) { return 0; }
+        x = x * 10 + @as(u32, t[i]) - 48;
+        i = i + 1;
+    }
+    return x;
+}
+
+/// Is the unpacked bundle the app it claims to be? plist = Contents/Info.plist was read and is a dictionary; nid / cid
+/// the new and the running CFBundleIdentifier (an empty one never matches); ver the new CFBundleVersion; exe = the
+/// CFBundleExecutable file is there. Each text is passed cut to its length (t27b: at most 8 parameters). UB_OK or the
+/// first reason it is not.
+pub fn ui_bundle_ok(plist: bool, nid: []const u8, cid: []const u8, ver: []const u8, build: u32, exe: bool) -> u32 {
+    if (plist == false) { return UB_NOPLIST; }
+    if (nid.len == 0 or nid.len != cid.len) { return UB_ID; }
+    if (ux_same(nid, 0, cid, 0, nid.len) == false) { return UB_ID; }
+    if (build == 0 or ui_build_text(ver, ver.len) != build) { return UB_BUILD; }
+    if (exe == false) { return UB_EXE; }
+    return UB_OK;
+}
+
+/// path (n bytes) + suffix into out, NUL-terminated; the length without the NUL, 0 when it does not fit.
+pub fn ui_join(path: []const u8, n: usize, suffix: []const u8, out: []u8) -> usize {
+    if (n > path.len or n + suffix.len + 1 > out.len) { return 0; }
+    um_copy(out, 0, path, n);
+    um_copy(out, n, suffix, suffix.len);
+    out[n + suffix.len] = 0;
+    return n + suffix.len;
+}
+
+/// Where the last path part of path[0..n] starts (after the last '/'); 0 when there is no '/'.
+pub fn ui_base_at(path: []const u8, n: usize) -> usize {
+    var at : usize = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (path[i] == 47) { at = i + 1; }
+        i = i + 1;
+    }
+    return at;
+}
+
+/// The part file of a download: dir + "/.t27os-update-" + the first 8 bytes of the bundle hash in hex + ".part", so a
+/// part is only ever resumed by a download of the same bundle. NUL-terminated; the length, 0 when it does not fit.
+pub fn ui_part_path(dir: []const u8, dn: usize, sha: []const u8, out: []u8) -> usize {
+    const tag : [15]u8 = [47, 46, 116, 50, 55, 111, 115, 45, 117, 112, 100, 97, 116, 101, 45];
+    if (sha.len < 8 or dn > dir.len or dn + 15 + 16 + 5 + 1 > out.len) { return 0; }
+    um_copy(out, 0, dir, dn);
+    um_copy(out, dn, tag[0..15], 15);
+    var w : usize = dn + 15;
+    var i : usize = 0;
+    while (i < 8) {
+        const hi : u32 = @as(u32, sha[i]) >> 4;
+        const lo : u32 = @as(u32, sha[i]) & 15;
+        var c1 : u32 = 87 + hi;
+        if (hi < 10) { c1 = 48 + hi; }
+        var c2 : u32 = 87 + lo;
+        if (lo < 10) { c2 = 48 + lo; }
+        out[w] = @as(u8, @intCast(c1));
+        out[w + 1] = @as(u8, @intCast(c2));
+        w = w + 2;
+        i = i + 1;
+    }
+    const ext : [5]u8 = [46, 112, 97, 114, 116];
+    um_copy(out, w, ext[0..5], 5);
+    out[w + 5] = 0;
+    return w + 5;
+}
+
+/// A CFBundleExecutable name that stays inside Contents/MacOS: 1..64 bytes, no '/', not "." or "..".
+pub fn ui_exe_name_ok(name: []const u8, n: usize) -> bool {
+    if (n == 0 or n > 64 or n > name.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (name[i] == 47 or name[i] == 0) { return false; }
+        i = i + 1;
+    }
+    if (n == 1 and name[0] == 46) { return false; }
+    if (n == 2 and name[0] == 46 and name[1] == 46) { return false; }
+    return true;
+}
+
+/// Is path[0..n] an app the installer may replace: absolute, ending in ".app", with a name before it, no "/../" and no
+/// trailing '/'. The siblings <app>.new / .prev / .lock are made from it, and only they are ever removed.
+pub fn ui_app_path_ok(path: []const u8, n: usize) -> bool {
+    if (n < 6 or n > path.len or n > 400 or path[0] != 47) { return false; }
+    if (path[n - 4] != 46 or path[n - 3] != 97 or path[n - 2] != 112 or path[n - 1] != 112) { return false; }
+    if (path[n - 5] == 47) { return false; }
+    var i : usize = 0;
+    while (i + 2 < n) {
+        if (path[i] == 46 and path[i + 1] == 46 and (i == 0 or path[i - 1] == 47) and path[i + 2] == 47) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// why an update ended in ST_FAILED (the state the window shows)
+pub const FR_NONE : u32 = 0;
+pub const FR_OFFER : u32 = 1;
+pub const FR_NET : u32 = 2;
+pub const FR_HASH : u32 = 3;
+pub const FR_UNPACK : u32 = 4;
+pub const FR_BUNDLE : u32 = 5;
+pub const FR_MOVE : u32 = 6;
+pub const FR_HEALTH : u32 = 7;
+pub const FR_BUSY : u32 = 8;
+pub const FR_UNDO : u32 = 9;
+
+/// The reason a failed install step gives (the step itself failed; FR_UNDO is reported instead when its undo failed too).
+pub fn fr_of_step(step: u32) -> u32 {
+    if (step == IS_UNPACK) { return FR_UNPACK; }
+    if (step == IS_CHECK) { return FR_BUNDLE; }
+    if (step == IS_MOVE_OLD or step == IS_MOVE_NEW) { return FR_MOVE; }
+    if (step == IS_HEALTH) { return FR_HEALTH; }
+    return FR_NONE;
+}
+
+/// One short ASCII line for a reason, for the window and the log. Its length.
+pub fn fr_text(why: u32, out: []u8) -> usize {
+    if (why == FR_NONE) { return ui_join("", 0, "updated", out); }
+    if (why == FR_OFFER) { return ui_join("", 0, "update refused before download", out); }
+    if (why == FR_NET) { return ui_join("", 0, "transfer broken, part kept for resume", out); }
+    if (why == FR_HASH) { return ui_join("", 0, "bundle hash does not match, nothing installed", out); }
+    if (why == FR_UNPACK) { return ui_join("", 0, "bundle did not unpack, nothing installed", out); }
+    if (why == FR_BUNDLE) { return ui_join("", 0, "not this app or wrong build, nothing installed", out); }
+    if (why == FR_MOVE) { return ui_join("", 0, "could not move into place, previous copy restored", out); }
+    if (why == FR_HEALTH) { return ui_join("", 0, "new copy failed its check, previous copy restored", out); }
+    if (why == FR_BUSY) { return ui_join("", 0, "another update is running", out); }
+    return ui_join("", 0, "rollback failed, previous copy is at .prev", out);
+}
+
+// ---------------------------------------------------------------- tests
+
+const UT_SHA : [32]u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+const UT_FP : [10]u8 = [1, 35, 69, 103, 137, 171, 205, 239, 254, 220];
+const UT_OTHER_FP : [10]u8 = [9, 35, 69, 103, 137, 171, 205, 239, 254, 220];
+
+fn ut_pub(out: []u8) -> void {
+    var i : usize = 0;
+    while (i < 65) {
+        out[i] = @as(u8, @intCast(i + 3));
+        i = i + 1;
+    }
+    out[0] = 4;
+}
+
+fn ut_sig(out: []u8) -> usize {
+    // a DER-shaped fake: 30 L ..., 70 bytes in all
+    var i : usize = 0;
+    while (i < 70) {
+        out[i] = @as(u8, @intCast(100 + i));
+        i = i + 1;
+    }
+    out[0] = 48;
+    out[1] = 68;
+    return 70;
+}
+
+fn ut_manifest(major: u32, minor: u32, patch: u32, build: u32, size: u64, out: []u8) -> usize {
+    var pubk : [65]u8 = undefined;
+    ut_pub(pubk[0..65]);
+    var body : [143]u8 = undefined;
+    if (um_body(major, minor, patch, build, size, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) != 143) { return 0; }
+    var sig : [72]u8 = undefined;
+    const sn : usize = ut_sig(sig[0..72]);
+    return um_seal(body[0..143], sig[0..sn], out);
+}
+
+const UT_SIZE : u64 = 52428800;
+
+test the_manifest_has_the_fixed_shape {
+    var m : [216]u8 = undefined;
+    assert ut_manifest(0, 1, 3, 4321, UT_SIZE, m[0..216]) == 216;
+    assert um_parse(m[0..216]) == UM_OK;
+    assert m[0] == 84 and m[6] == 80 and m[7] == 10;
+    assert um_get32(m[0..216], 8) == 1;
+    assert um_version(m[0..216]) == um_pack(0, 1, 3);
+    assert um_build_of(m[0..216]) == 4321;
+    assert um_size_of(m[0..216]) == UT_SIZE;
+    assert m[68] == 1 and m[77] == 220;
+    assert m[78] == 4;
+    assert um_sig_len(m[0..216]) == 70;
+    assert m[143] == 70 and m[144] == 48 and m[145] == 68;
+    // the two spare signature bytes are zero
+    assert m[214] == 0 and m[215] == 0;
+}
+
+test the_sign_input_is_a_domain_prefix_then_the_body {
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 3, 4321, UT_SIZE, m[0..216]);
+    var si : [159]u8 = undefined;
+    assert um_sign_input(m[0..143], si[0..159]) == 159;
+    assert si[0] == 116 and si[14] == 49 and si[15] == 0;
+    assert si[16] == 84 and si[158] == m[142];
+    assert um_sign_input(m[0..142], si[0..159]) == 0;
+}
+
+test the_builder_refuses_what_the_parser_would_refuse {
+    var pubk : [65]u8 = undefined;
+    ut_pub(pubk[0..65]);
+    var body : [143]u8 = undefined;
+    assert um_body(100, 0, 0, 5, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) == 0;
+    assert um_body(0, 100, 0, 5, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) == 0;
+    assert um_body(0, 0, 100, 5, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) == 0;
+    assert um_body(0, 1, 3, 0, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) == 0;
+    assert um_body(0, 1, 3, 1000000, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) == 0;
+    assert um_body(0, 1, 3, 5, UT_SIZE, UT_SHA[0..31], UT_FP[0..10], pubk[0..65], body[0..143]) == 0;
+    assert um_body(0, 1, 3, 5, UT_SIZE, UT_SHA[0..32], UT_FP[0..9], pubk[0..65], body[0..143]) == 0;
+    assert um_body(0, 1, 3, 5, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..64], body[0..143]) == 0;
+    pubk[0] = 2;
+    assert um_body(0, 1, 3, 5, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) == 0;
+    var sig : [72]u8 = undefined;
+    const sn : usize = ut_sig(sig[0..72]);
+    ut_pub(pubk[0..65]);
+    assert um_body(0, 1, 3, 5, UT_SIZE, UT_SHA[0..32], UT_FP[0..10], pubk[0..65], body[0..143]) == 143;
+    var out : [216]u8 = undefined;
+    assert um_seal(body[0..143], sig[0..7], out[0..216]) == 0;
+    assert um_seal(body[0..143], sig[0..sn], out[0..215]) == 0;
+    sig[1] = 66;
+    assert um_seal(body[0..143], sig[0..sn], out[0..216]) == 0;
+    sig[1] = 68;
+    sig[0] = 49;
+    assert um_seal(body[0..143], sig[0..sn], out[0..216]) == 0;
+}
+
+test a_truncated_or_padded_manifest_is_refused {
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 3, 4321, UT_SIZE, m[0..216]);
+    assert um_parse(m[0..215]) == UM_SHORT;
+    assert um_parse(m[0..143]) == UM_SHORT;
+    assert um_parse(m[0..0]) == UM_SHORT;
+    var big : [217]u8 = undefined;
+    var i : usize = 0;
+    while (i < 216) {
+        big[i] = m[i];
+        i = i + 1;
+    }
+    big[216] = 0;
+    assert um_parse(big[0..217]) == UM_LONG;
+}
+
+test a_typo_in_a_fixed_field_is_refused {
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 3, 4321, UT_SIZE, m[0..216]);
+    // magic
+    m[3] = 78;
+    assert um_parse(m[0..216]) == UM_MAGIC;
+    m[3] = 79;
+    // format
+    m[8] = 2;
+    assert um_parse(m[0..216]) == UM_FORMAT;
+    m[8] = 1;
+    // version part 100
+    m[12] = 100;
+    assert um_parse(m[0..216]) == UM_VERSION;
+    m[12] = 0;
+    m[17] = 1;
+    assert um_parse(m[0..216]) == UM_VERSION;
+    m[17] = 0;
+    // build 0 and build 1000000 (0x0F4240)
+    var save : [4]u8 = undefined;
+    save[0] = m[24];
+    save[1] = m[25];
+    save[2] = m[26];
+    save[3] = m[27];
+    m[24] = 0;
+    m[25] = 0;
+    m[26] = 0;
+    m[27] = 0;
+    assert um_parse(m[0..216]) == UM_BUILD;
+    m[24] = 64;
+    m[25] = 66;
+    m[26] = 15;
+    assert um_parse(m[0..216]) == UM_BUILD;
+    m[24] = save[0];
+    m[25] = save[1];
+    m[26] = save[2];
+    m[27] = save[3];
+    assert um_parse(m[0..216]) == UM_OK;
+    // public key prefix
+    m[78] = 3;
+    assert um_parse(m[0..216]) == UM_PUB;
+    m[78] = 4;
+    // signature length 7 and 73
+    m[143] = 7;
+    assert um_parse(m[0..216]) == UM_SIGLEN;
+    m[143] = 73;
+    assert um_parse(m[0..216]) == UM_SIGLEN;
+    // DER length byte that disagrees with the signature length
+    m[143] = 70;
+    m[145] = 67;
+    assert um_parse(m[0..216]) == UM_DER;
+    m[145] = 68;
+    m[144] = 49;
+    assert um_parse(m[0..216]) == UM_DER;
+    m[144] = 48;
+    // a non-zero byte in the padding
+    m[215] = 1;
+    assert um_parse(m[0..216]) == UM_PAD;
+    m[215] = 0;
+    assert um_parse(m[0..216]) == UM_OK;
+}
+
+test the_offer_is_made_only_for_a_known_author_and_a_strictly_newer_build {
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 3, 4321, UT_SIZE, m[0..216]);
+    const cur : u64 = um_pack(0, 1, 3);
+    assert um_offer(m[0..216], true, true, cur, 4320) == OF_OK;
+    // a stranger
+    assert um_offer(m[0..216], false, true, cur, 4320) == OF_STRANGER;
+    // the fingerprint field does not belong to the key in the manifest
+    assert um_offer(m[0..216], true, false, cur, 4320) == OF_FP;
+    // the same build is no update; neither is an older one (rollback)
+    assert um_offer(m[0..216], true, true, cur, 4321) == OF_ROLLBACK;
+    assert um_offer(m[0..216], true, true, cur, 4322) == OF_ROLLBACK;
+    assert um_offer(m[0..216], true, true, cur, 999999) == OF_ROLLBACK;
+    // a manifest that does not parse
+    assert um_offer(m[0..215], true, true, cur, 4320) == OF_BAD;
+    assert um_offer(m[0..216], true, true, NO_VERSION, 4320) == OF_BAD;
+}
+
+test a_build_one_below_is_a_rollback_whatever_the_version_says {
+    // build 4320 offered to a device on 4321, although the offered version is higher
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 2, 0, 4320, UT_SIZE, m[0..216]);
+    assert um_offer(m[0..216], true, true, um_pack(0, 1, 3), 4321) == OF_ROLLBACK;
+}
+
+test a_version_below_the_running_one_is_refused_even_with_a_higher_build {
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 2, 9000, UT_SIZE, m[0..216]);
+    assert um_offer(m[0..216], true, true, um_pack(0, 1, 3), 4321) == OF_OLDVER;
+    ut_manifest(0, 0, 99, 9000, UT_SIZE, m[0..216]);
+    assert um_offer(m[0..216], true, true, um_pack(0, 1, 0), 4321) == OF_OLDVER;
+    // the same version with a newer build is fine
+    ut_manifest(0, 1, 3, 9000, UT_SIZE, m[0..216]);
+    assert um_offer(m[0..216], true, true, um_pack(0, 1, 3), 4321) == OF_OK;
+    // a higher version with a newer build is fine
+    ut_manifest(1, 0, 0, 9000, UT_SIZE, m[0..216]);
+    assert um_offer(m[0..216], true, true, um_pack(0, 99, 99), 4321) == OF_OK;
+}
+
+test the_size_must_be_between_one_and_two_hundred_mebibytes {
+    var m : [216]u8 = undefined;
+    const cur : u64 = um_pack(0, 1, 3);
+    ut_manifest(0, 1, 3, 4400, 1048575, m[0..216]);
+    assert um_offer(m[0..216], true, true, cur, 4321) == OF_SIZE;
+    ut_manifest(0, 1, 3, 4400, 1048576, m[0..216]);
+    assert um_offer(m[0..216], true, true, cur, 4321) == OF_OK;
+    ut_manifest(0, 1, 3, 4400, 209715200, m[0..216]);
+    assert um_offer(m[0..216], true, true, cur, 4321) == OF_OK;
+    ut_manifest(0, 1, 3, 4400, 209715201, m[0..216]);
+    assert um_offer(m[0..216], true, true, cur, 4321) == OF_SIZE;
+    ut_manifest(0, 1, 3, 4400, 0, m[0..216]);
+    assert um_offer(m[0..216], true, true, cur, 4321) == OF_SIZE;
+    // a size that wraps a 32-bit count
+    ut_manifest(0, 1, 3, 4400, 4294967296 + 52428800, m[0..216]);
+    assert um_offer(m[0..216], true, true, cur, 4321) == OF_SIZE;
+}
+
+test the_author_is_known_when_it_is_a_friend_or_this_device {
+    var own : [10]u8 = undefined;
+    var i : usize = 0;
+    while (i < 10) {
+        own[i] = @as(u8, @intCast(200 + i));
+        i = i + 1;
+    }
+    var ft : [1108]u8 = undefined;
+    assert ft_init(ft[0..1108]);
+    var inv : [25]u8 = undefined;
+    invite_make(UT_FP[0..10], inv[0..25]);
+    assert ft_add(ft[0..1108], inv[0..25], own[0..10]) == FA_OK;
+    assert um_author_known(ft[0..1108], own[0..10], UT_FP[0..10]);
+    assert um_author_known(ft[0..1108], own[0..10], own[0..10]);
+    assert um_author_known(ft[0..1108], own[0..10], UT_OTHER_FP[0..10]) == false;
+    assert um_author_known(ft[0..1108], own[0..10], UT_FP[0..9]) == false;
+    // a one-digit typo in the fingerprint is a stranger
+    var typo : [10]u8 = undefined;
+    i = 0;
+    while (i < 10) {
+        typo[i] = UT_FP[i];
+        i = i + 1;
+    }
+    typo[9] = typo[9] ^ 1;
+    assert um_author_known(ft[0..1108], own[0..10], typo[0..10]) == false;
+}
+
+test only_one_update_runs_at_a_time {
+    var s : u32 = ST_IDLE;
+    s = st_next(s, EV_START);
+    assert s == ST_FETCHING;
+    assert st_busy(s);
+    // a second start while it fetches, verifies, is ready or installs is refused
+    assert st_next(ST_FETCHING, EV_START) == ST_REJECT;
+    assert st_next(ST_VERIFYING, EV_START) == ST_REJECT;
+    assert st_next(ST_READY, EV_START) == ST_REJECT;
+    assert st_next(ST_INSTALLING, EV_START) == ST_REJECT;
+    assert st_busy(ST_VERIFYING) and st_busy(ST_READY) and st_busy(ST_INSTALLING);
+    assert st_busy(ST_IDLE) == false and st_busy(ST_DONE) == false and st_busy(ST_FAILED) == false;
+}
+
+test the_download_goes_forward_in_order_and_nowhere_else {
+    var s : u32 = ST_IDLE;
+    s = st_next(s, EV_START);
+    s = st_next(s, EV_FETCHED);
+    assert s == ST_VERIFYING;
+    s = st_next(s, EV_VERIFIED);
+    assert s == ST_READY;
+    s = st_next(s, EV_INSTALL);
+    assert s == ST_INSTALLING;
+    s = st_next(s, EV_INSTALLED);
+    assert s == ST_DONE;
+    // steps cannot be skipped: no install before the check, no verified before fetched
+    assert st_next(ST_IDLE, EV_INSTALL) == ST_REJECT;
+    assert st_next(ST_FETCHING, EV_INSTALL) == ST_REJECT;
+    assert st_next(ST_FETCHING, EV_VERIFIED) == ST_REJECT;
+    assert st_next(ST_VERIFYING, EV_INSTALL) == ST_REJECT;
+    assert st_next(ST_READY, EV_INSTALLED) == ST_REJECT;
+    assert st_next(ST_IDLE, EV_FETCHED) == ST_REJECT;
+    assert st_next(ST_DONE, EV_INSTALL) == ST_REJECT;
+    // an event number that does not exist
+    assert st_next(ST_IDLE, 0) == ST_REJECT;
+    assert st_next(ST_IDLE, 99) == ST_REJECT;
+}
+
+test a_failure_ends_the_run_and_a_new_one_may_follow {
+    assert st_next(ST_FETCHING, EV_FAIL) == ST_FAILED;
+    assert st_next(ST_VERIFYING, EV_FAIL) == ST_FAILED;
+    assert st_next(ST_READY, EV_FAIL) == ST_FAILED;
+    assert st_next(ST_INSTALLING, EV_FAIL) == ST_FAILED;
+    assert st_next(ST_IDLE, EV_FAIL) == ST_REJECT;
+    assert st_next(ST_DONE, EV_FAIL) == ST_REJECT;
+    assert st_next(ST_FAILED, EV_START) == ST_FETCHING;
+    assert st_next(ST_DONE, EV_START) == ST_FETCHING;
+    assert st_next(ST_FAILED, EV_RESET) == ST_IDLE;
+    assert st_next(ST_DONE, EV_RESET) == ST_IDLE;
+    assert st_next(ST_FETCHING, EV_RESET) == ST_REJECT;
+    assert st_next(ST_IDLE, EV_RESET) == ST_REJECT;
+}
+
+fn ut_inv_txt(out: []u8, nick: []const u8, nn: usize) -> usize {
+    var inv : [25]u8 = undefined;
+    invite_make(UT_FP[0..10], inv[0..25]);
+    return txt_build(inv[0..25], 47741, nick, nn, out);
+}
+
+test the_announcement_carries_ver_and_build_and_keeps_the_rest {
+    var t : [96]u8 = undefined;
+    const nick : [5]u8 = [116, 50, 55, 111, 115];
+    const n : usize = ut_inv_txt(t[0..96], nick[0..5], 5);
+    assert n > 0;
+    var o : [96]u8 = undefined;
+    const k : usize = upd_txt_add(t[0..96], n, 0, 1, 3, 4321, o[0..96]);
+    assert k == n + 10 + 11;
+    assert upd_txt_version(o[0..96], k) == um_pack(0, 1, 3);
+    assert upd_txt_build(o[0..96], k) == 4321;
+    // fp, port and nick still read
+    var fp : [10]u8 = undefined;
+    assert txt_fp(o[0..96], k, fp[0..10]) == 0;
+    assert fp[0] == 1 and fp[9] == 220;
+    assert txt_port(o[0..96], k) == 47741;
+    // an announcement made before this change has no ver and no build
+    assert upd_txt_version(t[0..96], n) == NO_VERSION;
+    assert upd_txt_build(t[0..96], n) == 0;
+    // the neighbour is newer only when its build is greater and its version not lower
+    assert upd_neighbour_newer(o[0..96], k, um_pack(0, 1, 3), 4320);
+    assert upd_neighbour_newer(o[0..96], k, um_pack(0, 1, 3), 4321) == false;
+    assert upd_neighbour_newer(o[0..96], k, um_pack(0, 1, 4), 4320) == false;
+    assert upd_neighbour_newer(t[0..96], n, um_pack(0, 1, 3), 1) == false;
+}
+
+test the_announcement_never_overflows_the_txt_record {
+    // the longest allowed nick (24) and the longest ver/build still fit
+    var t : [96]u8 = undefined;
+    var nick : [24]u8 = undefined;
+    var i : usize = 0;
+    while (i < 24) {
+        nick[i] = 97;
+        i = i + 1;
+    }
+    const n : usize = ut_inv_txt(t[0..96], nick[0..24], 24);
+    assert n > 0;
+    var o : [96]u8 = undefined;
+    assert upd_txt_add(t[0..96], n, 99, 99, 99, 999999, o[0..96]) > 0;
+    // a record that is already full gets nothing added, and the output is untouched in size terms
+    var full : [96]u8 = undefined;
+    i = 0;
+    while (i < 96) {
+        full[i] = 0;
+        i = i + 1;
+    }
+    assert upd_txt_add(full[0..96], 90, 0, 1, 3, 4321, o[0..96]) == 0;
+    assert upd_txt_add(t[0..96], n, 0, 1, 3, 4321, o[0..95]) == 0;
+    assert upd_txt_add(t[0..96], 97, 0, 1, 3, 4321, o[0..96]) == 0;
+}
+
+test ver_and_build_are_not_added_twice_and_bad_numbers_are_refused {
+    var t : [96]u8 = undefined;
+    const nick : [3]u8 = [97, 98, 99];
+    const n : usize = ut_inv_txt(t[0..96], nick[0..3], 3);
+    var o : [96]u8 = undefined;
+    var o2 : [96]u8 = undefined;
+    const k : usize = upd_txt_add(t[0..96], n, 0, 1, 3, 4321, o[0..96]);
+    assert k > 0;
+    assert upd_txt_add(o[0..96], k, 0, 1, 4, 4322, o2[0..96]) == 0;
+    assert upd_txt_add(t[0..96], n, 100, 0, 0, 5, o2[0..96]) == 0;
+    assert upd_txt_add(t[0..96], n, 0, 100, 0, 5, o2[0..96]) == 0;
+    assert upd_txt_add(t[0..96], n, 0, 0, 100, 5, o2[0..96]) == 0;
+    assert upd_txt_add(t[0..96], n, 0, 1, 3, 0, o2[0..96]) == 0;
+    assert upd_txt_add(t[0..96], n, 0, 1, 3, 1000000, o2[0..96]) == 0;
+}
+
+fn ut_raw_txt(ver: []const u8, vn: usize, bld: []const u8, bn: usize, out: []u8) -> usize {
+    // "ver=<ver>" "build=<bld>" by hand, as a hostile neighbour could send them
+    var w : usize = 0;
+    out[w] = @as(u8, @intCast(4 + vn));
+    out[w + 1] = 118;
+    out[w + 2] = 101;
+    out[w + 3] = 114;
+    out[w + 4] = 61;
+    w = w + 5;
+    var i : usize = 0;
+    while (i < vn) {
+        out[w + i] = ver[i];
+        i = i + 1;
+    }
+    w = w + vn;
+    out[w] = @as(u8, @intCast(6 + bn));
+    out[w + 1] = 98;
+    out[w + 2] = 117;
+    out[w + 3] = 105;
+    out[w + 4] = 108;
+    out[w + 5] = 100;
+    out[w + 6] = 61;
+    w = w + 7;
+    i = 0;
+    while (i < bn) {
+        out[w + i] = bld[i];
+        i = i + 1;
+    }
+    return w + bn;
+}
+
+test a_malformed_neighbour_announcement_reads_as_no_version {
+    var t : [64]u8 = undefined;
+    // good: "1.22.3" / "77"
+    const good : [6]u8 = [49, 46, 50, 50, 46, 51];
+    const b77 : [2]u8 = [55, 55];
+    var n : usize = ut_raw_txt(good[0..6], 6, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == um_pack(1, 22, 3);
+    assert upd_txt_build(t[0..64], n) == 77;
+    // two parts, four parts, empty part, letters, leading zero, 100
+    const two : [3]u8 = [49, 46, 50];
+    n = ut_raw_txt(two[0..3], 3, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == NO_VERSION;
+    const four : [7]u8 = [49, 46, 50, 46, 51, 46, 52];
+    n = ut_raw_txt(four[0..7], 7, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == NO_VERSION;
+    const hole : [4]u8 = [49, 46, 46, 51];
+    n = ut_raw_txt(hole[0..4], 4, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == NO_VERSION;
+    const letters : [5]u8 = [49, 46, 120, 46, 51];
+    n = ut_raw_txt(letters[0..5], 5, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == NO_VERSION;
+    const lead : [5]u8 = [49, 46, 48, 49, 46];
+    n = ut_raw_txt(lead[0..5], 5, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == NO_VERSION;
+    const lead2 : [6]u8 = [49, 46, 48, 49, 46, 49];
+    n = ut_raw_txt(lead2[0..6], 6, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == NO_VERSION;
+    const big : [6]u8 = [49, 48, 48, 46, 48, 46];
+    n = ut_raw_txt(big[0..6], 6, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n) == NO_VERSION;
+    // builds: zero, leading zero, letters, seven digits
+    const z : [1]u8 = [48];
+    n = ut_raw_txt(good[0..6], 6, z[0..1], 1, t[0..64]);
+    assert upd_txt_build(t[0..64], n) == 0;
+    const lz : [2]u8 = [48, 55];
+    n = ut_raw_txt(good[0..6], 6, lz[0..2], 2, t[0..64]);
+    assert upd_txt_build(t[0..64], n) == 0;
+    const lt : [2]u8 = [55, 120];
+    n = ut_raw_txt(good[0..6], 6, lt[0..2], 2, t[0..64]);
+    assert upd_txt_build(t[0..64], n) == 0;
+    const seven : [7]u8 = [49, 50, 51, 52, 53, 54, 55];
+    n = ut_raw_txt(good[0..6], 6, seven[0..7], 7, t[0..64]);
+    assert upd_txt_build(t[0..64], n) == 0;
+    // a record cut short (a length byte past the end) reads as nothing
+    n = ut_raw_txt(good[0..6], 6, b77[0..2], 2, t[0..64]);
+    assert upd_txt_version(t[0..64], n - 3) == NO_VERSION or upd_txt_build(t[0..64], n - 3) == 0;
+    assert upd_txt_build(t[0..64], n - 1) == 0;
+}
+
+test a_request_names_the_bundle_by_build_author_and_hash {
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 3, 4321, UT_SIZE, m[0..216]);
+    var r : [72]u8 = undefined;
+    assert rq_bundle(m[0..216], 131072, r[0..72]) == 72;
+    assert rq_ok(r[0..72]);
+    assert rq_kind(r[0..72]) == RQ_BUNDLE;
+    assert rq_offset(r[0..72]) == 131072;
+    assert r[0] == 84 and r[6] == 81 and r[7] == 49;
+    assert um_get32(r[0..72], 12) == 4321;
+    assert r[24] == 1 and r[33] == 220 and r[40] == 1 and r[71] == 32;
+    assert us_answer(r[0..72], m[0..216]) == RS_OK;
+    // the server serves only the bundle it was asked for by name
+    r[50] = r[50] ^ 1;
+    assert us_answer(r[0..72], m[0..216]) == RS_NOT_HERE;
+    r[50] = r[50] ^ 1;
+    r[30] = r[30] ^ 1;
+    assert us_answer(r[0..72], m[0..216]) == RS_NOT_HERE;
+    r[30] = r[30] ^ 1;
+    r[12] = r[12] ^ 1;
+    assert us_answer(r[0..72], m[0..216]) == RS_NOT_HERE;
+    r[12] = r[12] ^ 1;
+    // an offset at the end is fine (nothing left, only END), past the end is not
+    rq_bundle(m[0..216], UT_SIZE, r[0..72]);
+    assert us_answer(r[0..72], m[0..216]) == RS_OK;
+    rq_bundle(m[0..216], UT_SIZE + 1, r[0..72]);
+    assert us_answer(r[0..72], m[0..216]) == RS_RANGE;
+    // a manifest that does not parse makes no request
+    assert rq_bundle(m[0..215], 0, r[0..72]) == 0;
+}
+
+test a_malformed_request_is_refused {
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 3, 4321, UT_SIZE, m[0..216]);
+    var r : [72]u8 = undefined;
+    assert rq_manifest(r[0..72]) == 72;
+    assert rq_ok(r[0..72]) and us_answer(r[0..72], m[0..216]) == RS_OK;
+    // a manifest request that carries a field
+    r[20] = 1;
+    assert rq_ok(r[0..72]) == false and us_answer(r[0..72], m[0..216]) == RS_BAD;
+    r[20] = 0;
+    // wrong magic, unknown kind, a spare byte set, a short request
+    r[6] = 83;
+    assert rq_ok(r[0..72]) == false;
+    r[6] = 81;
+    r[8] = 3;
+    assert rq_ok(r[0..72]) == false;
+    rq_bundle(m[0..216], 0, r[0..72]);
+    r[36] = 1;
+    assert rq_ok(r[0..72]) == false;
+    r[36] = 0;
+    assert rq_ok(r[0..71]) == false;
+    assert rq_ok(r[0..72]);
+}
+
+test the_answer_header_has_a_fixed_shape {
+    var h : [24]u8 = undefined;
+    assert rs_make(RS_OK, 216, h[0..24]) == 24;
+    assert rs_ok_shape(h[0..24]) and rs_status(h[0..24]) == RS_OK and rs_length(h[0..24]) == 216;
+    assert rs_make(RS_NOT_HERE, 0, h[0..24]) == 24;
+    assert rs_ok_shape(h[0..24]) and rs_status(h[0..24]) == RS_NOT_HERE;
+    h[8] = 9;
+    assert rs_ok_shape(h[0..24]) == false;
+    h[8] = 0;
+    h[13] = 1;
+    assert rs_ok_shape(h[0..24]) == false;
+    h[13] = 0;
+    h[6] = 81;
+    assert rs_ok_shape(h[0..24]) == false;
+    assert rs_ok_shape(h[0..23]) == false;
+}
+
+test chunks_are_64_kib_and_only_the_last_is_short {
+    assert ux_chunk_len(1048576, 0) == 65536;
+    assert ux_chunk_len(1048576, 1048576 - 65536) == 65536;
+    assert ux_chunk_len(1048577, 1048576) == 1;
+    assert ux_chunk_len(100, 40) == 60;
+    assert ux_chunk_len(100, 100) == 0;
+    assert ux_chunk_len(100, 101) == 0;
+    assert ux_chunk_count(1048576, 0) == 16;
+    assert ux_chunk_count(1048577, 0) == 17;
+    assert ux_chunk_count(1048577, 1048576) == 1;
+    assert ux_chunk_count(1048576, 1048576) == 0;
+    // a 200 MiB bundle in 3200 chunks, a resume from the middle of a chunk
+    assert ux_chunk_count(209715200, 0) == 3200;
+    assert ux_chunk_count(209715200, 100) == 3200;
+    assert ux_chunk_len(209715200, 100) == 65536;
+}
+
+test a_chunk_out_of_order_or_out_of_place_ends_the_transfer {
+    var h : [16]u8 = undefined;
+    const size : u64 = 200000;
+    ch_make(65536, 0, 0, h[0..16]);
+    assert ch_check(h[0..16], 0, 0, size) == CH_OK;
+    assert ch_check(h[0..16], 1, 0, size) == CH_SEQ;
+    assert ch_check(h[0..16], 0, 65536, size) == CH_OFF;
+    // the last chunk is short, a short chunk in the middle is not allowed
+    ch_make(3392, 3, 196608, h[0..16]);
+    assert ch_check(h[0..16], 3, 196608, size) == CH_OK;
+    ch_make(1000, 1, 65536, h[0..16]);
+    assert ch_check(h[0..16], 1, 65536, size) == CH_SIZE;
+    ch_make(65537, 1, 65536, h[0..16]);
+    assert ch_check(h[0..16], 1, 65536, size) == CH_SIZE;
+    // the end mark only at the end
+    ch_make(0, 4, 200000, h[0..16]);
+    assert ch_check(h[0..16], 4, 200000, size) == CH_END;
+    ch_make(0, 2, 131072, h[0..16]);
+    assert ch_check(h[0..16], 2, 131072, size) == CH_SIZE;
+    // a resumed answer counts its own chunks from 0, at the resume offset
+    ch_make(65536, 0, 70000, h[0..16]);
+    assert ch_check(h[0..16], 0, 70000, size) == CH_OK;
+    assert ch_check(h[0..15], 0, 70000, size) == CH_SIZE;
+}
+
+test the_resume_starts_at_the_part_on_disk {
+    assert ux_resume_from(-1, 2000000) == 0;
+    assert ux_resume_from(0, 2000000) == 0;
+    assert ux_resume_from(900000, 2000000) == 900000;
+    assert ux_resume_from(2000000, 2000000) == 2000000;
+    // a part longer than the bundle is not its prefix: start over and empty it
+    assert ux_resume_from(2000001, 2000000) == 0;
+    assert ux_part_discard(2000001, 2000000);
+    assert ux_part_discard(2000000, 2000000) == false;
+    assert ux_part_discard(-1, 2000000) == false;
+    // retries: four broken tries in a row without new bytes and it gives up
+    assert ux_retry(0) and ux_retry(3);
+    assert ux_retry(4) == false;
+}
+
+test the_install_goes_step_by_step {
+    assert ui_next(IS_UNPACK) == IS_CHECK;
+    assert ui_next(IS_CHECK) == IS_MOVE_OLD;
+    assert ui_next(IS_MOVE_OLD) == IS_MOVE_NEW;
+    assert ui_next(IS_MOVE_NEW) == IS_HEALTH;
+    assert ui_next(IS_HEALTH) == IS_DONE;
+    assert ui_next(IS_DONE) == IS_DONE;
+    assert ui_next(0) == 0 and ui_next(7) == 0;
+}
+
+test the_undo_of_each_step_never_leaves_the_live_path_empty {
+    // before the live app is moved: only the temporary copy goes
+    assert ui_undo(IS_UNPACK) == UA_CLEAN;
+    assert ui_undo(IS_CHECK) == UA_CLEAN;
+    assert ui_undo(IS_MOVE_OLD) == UA_CLEAN;
+    // the old copy is .prev and the new one did not arrive: put the old one back
+    assert ui_undo(IS_MOVE_NEW) == UA_RESTORE;
+    // the new copy is live and failed: move it aside, put the old one back
+    assert ui_undo(IS_HEALTH) == UA_SWAP_BACK;
+    assert ui_undo(IS_DONE) == UA_NONE and ui_undo(0) == UA_NONE;
+    assert ui_touches_live(IS_CHECK) == false and ui_touches_live(IS_MOVE_OLD) == false;
+    assert ui_touches_live(IS_MOVE_NEW) and ui_touches_live(IS_HEALTH);
+    assert ui_touches_live(IS_DONE) == false;
+    // every failed step has a reason for the window
+    assert fr_of_step(IS_UNPACK) == FR_UNPACK and fr_of_step(IS_CHECK) == FR_BUNDLE;
+    assert fr_of_step(IS_MOVE_OLD) == FR_MOVE and fr_of_step(IS_MOVE_NEW) == FR_MOVE;
+    assert fr_of_step(IS_HEALTH) == FR_HEALTH and fr_of_step(IS_DONE) == FR_NONE;
+    var t : [64]u8 = undefined;
+    assert fr_text(FR_HASH, t[0..64]) > 10;
+    assert t[0] == 98;
+    assert fr_text(FR_UNDO, t[0..64]) > 10;
+}
+
+test the_unpacked_bundle_must_be_this_app_at_the_manifest_build {
+    const id : [9]u8 = [97, 105, 46, 116, 50, 55, 46, 111, 115];
+    const other : [9]u8 = [97, 105, 46, 116, 50, 55, 46, 111, 120];
+    const v : [4]u8 = [52, 51, 50, 49];
+    assert ui_bundle_ok(true, id[0..9], id[0..9], v[0..4], 4321, true) == UB_OK;
+    assert ui_bundle_ok(false, id[0..9], id[0..9], v[0..4], 4321, true) == UB_NOPLIST;
+    assert ui_bundle_ok(true, other[0..9], id[0..9], v[0..4], 4321, true) == UB_ID;
+    assert ui_bundle_ok(true, id[0..8], id[0..9], v[0..4], 4321, true) == UB_ID;
+    assert ui_bundle_ok(true, id[0..0], id[0..0], v[0..4], 4321, true) == UB_ID;
+    assert ui_bundle_ok(true, id[0..9], id[0..9], v[0..4], 4322, true) == UB_BUILD;
+    assert ui_bundle_ok(true, id[0..9], id[0..9], v[0..0], 4321, true) == UB_BUILD;
+    assert ui_bundle_ok(true, id[0..9], id[0..9], v[0..4], 4321, false) == UB_EXE;
+    const lead : [3]u8 = [48, 52, 51];
+    assert ui_build_text(lead[0..3], 3) == 0;
+    const sev : [7]u8 = [49, 50, 51, 52, 53, 54, 55];
+    assert ui_build_text(sev[0..7], 7) == 0;
+    assert ui_build_text(v[0..4], 4) == 4321;
+}
+
+test the_paths_next_to_the_app {
+    var o : [64]u8 = undefined;
+    const app : [14]u8 = [47, 116, 47, 84, 50, 55, 79, 83, 46, 97, 112, 112, 0, 0];
+    assert ui_join(app[0..14], 12, ".prev", o[0..64]) == 17;
+    assert o[12] == 46 and o[16] == 118 and o[17] == 0;
+    assert ui_join(app[0..14], 12, ".prev", o[0..17]) == 0;
+    assert ui_base_at(app[0..14], 12) == 3;
+    assert ui_base_at(app[3..14], 9) == 0;
+    var p : [64]u8 = undefined;
+    const dir : [2]u8 = [47, 116];
+    const n : usize = ui_part_path(dir[0..2], 2, UT_SHA[0..32], p[0..64]);
+    // "/t/.t27os-update-0102030405060708.part"
+    assert n == 2 + 15 + 16 + 5;
+    assert p[17] == 48 and p[18] == 49 and p[32] == 56 and p[33] == 46 and p[n] == 0;
+    assert ui_part_path(dir[0..2], 2, UT_SHA[0..32], p[0..38]) == 0;
+}
+
+test only_a_plain_executable_name_and_an_absolute_app_path_pass {
+    const t : [5]u8 = [84, 50, 55, 79, 83];
+    assert ui_exe_name_ok(t[0..5], 5);
+    const up : [5]u8 = [46, 46, 47, 115, 104];
+    assert ui_exe_name_ok(up[0..5], 5) == false;
+    assert ui_exe_name_ok(up[0..2], 2) == false;
+    assert ui_exe_name_ok(up[0..1], 1) == false;
+    assert ui_exe_name_ok(t[0..5], 0) == false;
+    // "/t/T27OS.app"
+    const a : [12]u8 = [47, 116, 47, 84, 50, 55, 79, 83, 46, 97, 112, 112];
+    assert ui_app_path_ok(a[0..12], 12);
+    assert ui_app_path_ok(a[1..12], 11) == false;
+    assert ui_app_path_ok(a[0..11], 11) == false;
+    // "/t/.app" has no name; "/../T.app" climbs
+    const e : [7]u8 = [47, 116, 47, 46, 97, 112, 112];
+    assert ui_app_path_ok(e[0..7], 7) == false;
+    const c : [9]u8 = [47, 46, 46, 47, 84, 46, 97, 112, 112];
+    assert ui_app_path_ok(c[0..9], 9) == false;
+}
+
+test the_announcement_names_the_update_port_after_ver_and_build {
+    var t : [96]u8 = undefined;
+    const nick : [5]u8 = [116, 50, 55, 111, 115];
+    const n : usize = ut_inv_txt(t[0..96], nick[0..5], 5);
+    var o : [96]u8 = undefined;
+    const k : usize = upd_txt_add(t[0..96], n, 0, 1, 3, 7068, o[0..96]);
+    var o2 : [96]u8 = undefined;
+    const k2 : usize = upd_txt_add_port(o[0..96], k, 52144, o2[0..96]);
+    assert k2 == k + 9;
+    assert upd_txt_uport(o2[0..96], k2) == 52144;
+    // what was there still reads
+    assert upd_txt_build(o2[0..96], k2) == 7068 and upd_txt_version(o2[0..96], k2) == um_pack(0, 1, 3);
+    assert txt_port(o2[0..96], k2) == 47741;
+    // no port in an older announcement; never twice; a port out of range is refused
+    assert upd_txt_uport(o[0..96], k) == 0;
+    var o3 : [96]u8 = undefined;
+    assert upd_txt_add_port(o2[0..96], k2, 52145, o3[0..96]) == 0;
+    assert upd_txt_add_port(o[0..96], k, 0, o3[0..96]) == 0;
+    assert upd_txt_add_port(o[0..96], k, 65536, o3[0..96]) == 0;
+    assert upd_txt_add_port(o[0..96], k, 1, o3[0..96]) == k + 5;
+    assert upd_txt_uport(o3[0..96], k + 5) == 1;
+}
+
+test the_longest_nickname_leaves_no_room_for_the_update_port {
+    var t : [96]u8 = undefined;
+    var nick : [24]u8 = undefined;
+    var i : usize = 0;
+    while (i < 24) {
+        nick[i] = 97;
+        i = i + 1;
+    }
+    const n : usize = ut_inv_txt(t[0..96], nick[0..24], 24);
+    var o : [96]u8 = undefined;
+    const k : usize = upd_txt_add(t[0..96], n, 99, 99, 99, 999999, o[0..96]);
+    assert k == 96;
+    var o2 : [96]u8 = undefined;
+    assert upd_txt_add_port(o[0..96], k, 47741, o2[0..96]) == 0;
+    // even today's short version leaves no room after a 24-letter nickname; a 14-letter one has room
+    const k2 : usize = upd_txt_add(t[0..96], n, 0, 1, 3, 7068, o[0..96]);
+    assert k2 == 91 and upd_txt_add_port(o[0..96], k2, 65535, o2[0..96]) == 0;
+    const n3 : usize = ut_inv_txt(t[0..96], nick[0..14], 14);
+    const k3 : usize = upd_txt_add(t[0..96], n3, 0, 1, 3, 7068, o[0..96]);
+    assert upd_txt_add_port(o[0..96], k3, 65535, o2[0..96]) == k3 + 9 and k3 + 9 <= 96;
+}
+
+test a_hostile_update_port_reads_as_none {
+    var t : [16]u8 = undefined;
+    // "up=" with leading zero, letters, six digits, above 65535
+    const v0 : [5]u8 = [48, 55, 55, 55, 55];
+    const v1 : [3]u8 = [52, 120, 52];
+    const v2 : [6]u8 = [49, 50, 51, 52, 53, 54];
+    const v3 : [5]u8 = [54, 53, 53, 51, 54];
+    var cases : [4]usize = undefined;
+    cases[0] = 0;
+    var c : usize = 0;
+    while (c < 4) {
+        var vn : usize = 5;
+        if (c == 1) { vn = 3; }
+        if (c == 2) { vn = 6; }
+        t[0] = @as(u8, @intCast(3 + vn));
+        t[1] = 117;
+        t[2] = 112;
+        t[3] = 61;
+        var i : usize = 0;
+        while (i < vn) {
+            if (c == 0) { t[4 + i] = v0[i]; }
+            if (c == 1) { t[4 + i] = v1[i]; }
+            if (c == 2) { t[4 + i] = v2[i]; }
+            if (c == 3) { t[4 + i] = v3[i]; }
+            i = i + 1;
+        }
+        assert upd_txt_uport(t[0..16], 4 + vn) == 0;
+        c = c + 1;
+    }
+}
+
+test the_bundle_version_text_packs_like_the_announced_one {
+    const a : [5]u8 = [48, 46, 49, 46, 51];
+    assert um_parse_ver(a[0..5], 5) == um_pack(0, 1, 3);
+    assert um_ver_part(um_parse_ver(a[0..5], 5), 2) == 0;
+    assert um_ver_part(um_parse_ver(a[0..5], 5), 1) == 1;
+    assert um_ver_part(um_parse_ver(a[0..5], 5), 0) == 3;
+    const b : [8]u8 = [57, 57, 46, 57, 57, 46, 57, 57];
+    assert um_parse_ver(b[0..8], 8) == um_pack(99, 99, 99);
+    assert um_parse_ver(a[0..5], 4) == NO_VERSION;
+    assert um_parse_ver(a[0..3], 3) == NO_VERSION;
+    assert um_parse_ver(a[0..5], 0) == NO_VERSION;
+    const z : [5]u8 = [48, 46, 48, 49, 46];
+    assert um_parse_ver(z[0..5], 5) == NO_VERSION;
+}
+
+test a_lock_is_removed_only_when_old_and_its_owner_is_gone {
+    assert uk_verdict(false, 99999, 0, false) == UK_NONE;
+    // the owner runs: kept whatever its age
+    assert uk_verdict(true, 99999, 4242, true) == UK_KEEP_ALIVE;
+    assert uk_verdict(true, 5, 4242, true) == UK_KEEP_ALIVE;
+    // the owner is gone: kept for 10 minutes, then removed
+    assert uk_verdict(true, 30, 4242, false) == UK_KEEP_FRESH;
+    assert uk_verdict(true, 600, 4242, false) == UK_KEEP_FRESH;
+    assert uk_verdict(true, 601, 4242, false) == UK_REMOVE;
+    // a lock with no pid file (or an unreadable one) has no owner to wait for
+    assert uk_verdict(true, 601, 0, false) == UK_REMOVE;
+    assert uk_verdict(true, 601, 0, true) == UK_REMOVE;
+    assert uk_verdict(true, 20, 0, false) == UK_KEEP_FRESH;
+    var o : [64]u8 = undefined;
+    assert uk_text(UK_REMOVE, o[0..64]) == 48;
+    assert uk_text(UK_KEEP_ALIVE, o[0..64]) == 26;
+}
+
+test the_lock_pid_file_reads_back_and_refuses_junk {
+    var o : [16]u8 = undefined;
+    const n : usize = uk_pid_text(81234, o[0..16]);
+    assert n == 6 and o[5] == 10;
+    assert uk_pid_of(o[0..16], n) == 81234;
+    assert uk_pid_of(o[0..16], n - 1) == 81234;
+    assert uk_pid_of(o[0..16], 0) == 0;
+    const lz : [3]u8 = [48, 49, 10];
+    assert uk_pid_of(lz[0..3], 3) == 0;
+    const bad : [3]u8 = [49, 120, 10];
+    assert uk_pid_of(bad[0..3], 3) == 0;
+    const nine : [9]u8 = [49, 49, 49, 49, 49, 49, 49, 49, 49];
+    assert uk_pid_of(nine[0..9], 9) == 0;
+    assert uk_pid_of(o[0..16], 17) == 0;
+}
+
+test the_helper_status_record_has_a_fixed_shape {
+    var r : [96]u8 = undefined;
+    uw_init(r[0..96], UW_R_FETCH, 31337);
+    assert uw_ok(r[0..96], 96);
+    assert uw_ok(r[0..96], 95) == false;
+    assert r[UW_ROLE] == 2 and uw_get32(r[0..96], UW_PID) == 31337;
+    var m : [216]u8 = undefined;
+    ut_manifest(0, 1, 3, 7068, UT_SIZE, m[0..216]);
+    uw_from_manifest(r[0..96], m[0..216]);
+    assert uw_get32(r[0..96], UW_BUILD) == 7068;
+    assert uw_get64(r[0..96], UW_TOTAL) == UT_SIZE;
+    assert r[UW_SHA] == 1 and r[UW_SHA + 31] == 32;
+    uw_put64(r[0..96], UW_HAVE, 123456789);
+    assert uw_get64(r[0..96], UW_HAVE) == 123456789;
+    // the fields do not overlap and end inside the record
+    assert UW_UNDO < UW_BUILD and UW_BUILD + 4 <= UW_PORT and UW_PORT + 4 <= UW_TOTAL and UW_TOTAL + 8 <= UW_HAVE;
+    assert UW_HAVE + 8 <= UW_SERVED and UW_SERVED + 4 <= UW_PID and UW_PID + 4 <= UW_SHA and UW_SHA + 32 <= UW_LEN;
+    // a damaged magic is not a record
+    r[3] = 0;
+    assert uw_ok(r[0..96], 96) == false;
+}
+
+test the_percent_reaches_100_only_with_every_byte {
+    assert uw_percent(0, 0) == 0;
+    assert uw_percent(0, 1000) == 0;
+    assert uw_percent(500, 1000) == 50;
+    assert uw_percent(999, 1000) == 99;
+    assert uw_percent(1000, 1000) == 100;
+    assert uw_percent(2000, 1000) == 100;
+    assert uw_percent(1397066, 1397067) == 99;
+}
+
+test um_put32_writes_little_endian_and_um_put64_splits_at_bit_32 {
+    var b : [16]u8 = undefined;
+    ux_zero(b[0..16], 0, 16);
+    um_put32(b[0..16], 0, 67305985);
+    assert b[0] == 1 and b[1] == 2 and b[2] == 3 and b[3] == 4 and b[4] == 0;
+    um_put32(b[0..16], 4, 4294967295);
+    assert b[4] == 255 and b[5] == 255 and b[6] == 255 and b[7] == 255 and b[8] == 0;
+    um_put32(b[0..16], 4, 0);
+    assert b[4] == 0 and b[7] == 0 and b[3] == 4;
+    um_put64(b[0..16], 8, 4294967296);
+    assert b[8] == 0 and b[11] == 0 and b[12] == 1 and b[13] == 0;
+    um_put64(b[0..16], 8, 18446744073709551615);
+    assert b[8] == 255 and b[11] == 255 and b[12] == 255 and b[15] == 255;
+}
+
+test um_get64_reads_both_halves_back_and_uw_put32_matches_um_put32 {
+    var b : [16]u8 = undefined;
+    ux_zero(b[0..16], 0, 16);
+    assert um_get64(b[0..16], 0) == 0;
+    um_put64(b[0..16], 0, 1397067);
+    assert um_get64(b[0..16], 0) == 1397067;
+    um_put64(b[0..16], 8, 1099511627777);
+    assert um_get64(b[0..16], 8) == 1099511627777;
+    um_put64(b[0..16], 8, 18446744073709551615);
+    assert um_get64(b[0..16], 8) == 18446744073709551615;
+    var c : [8]u8 = undefined;
+    ux_zero(c[0..8], 0, 8);
+    uw_put32(c[0..8], 2, 16909060);
+    assert c[0] == 0 and c[1] == 0 and c[2] == 4 and c[3] == 3 and c[4] == 2 and c[5] == 1 and c[6] == 0;
+    assert um_get32(c[0..8], 2) == 16909060;
+    uw_put32(c[0..8], 4, 4294967295);
+    assert uw_get32(c[0..8], 4) == 4294967295 and c[3] == 3;
+}
+
+test um_copy_moves_exactly_n_bytes_at_an_offset {
+    var d : [6]u8 = undefined;
+    ux_zero(d[0..6], 0, 6);
+    const s : [4]u8 = [1, 2, 3, 4];
+    um_copy(d[0..6], 1, s[0..4], 3);
+    assert d[0] == 0 and d[1] == 1 and d[2] == 2 and d[3] == 3 and d[4] == 0 and d[5] == 0;
+    um_copy(d[0..6], 2, s[0..4], 0);
+    assert d[2] == 2 and d[3] == 3;
+    um_copy(d[0..6], 2, s[0..4], 4);
+    assert d[2] == 1 and d[5] == 4 and d[0] == 0;
+}
+
+test um_put_dec_writes_decimal_text_for_zero_nine_ten_and_max {
+    var o : [12]u8 = undefined;
+    ux_zero(o[0..12], 0, 12);
+    assert um_put_dec(o[0..12], 0, 0) == 1 and o[0] == 48 and o[1] == 0;
+    assert um_put_dec(o[0..12], 2, 9) == 3 and o[2] == 57;
+    assert um_put_dec(o[0..12], 0, 10) == 2 and o[0] == 49 and o[1] == 48;
+    assert um_put_dec(o[0..12], 0, 100) == 3 and o[0] == 49 and o[1] == 48 and o[2] == 48;
+    assert um_put_dec(o[0..12], 1, 4294967295) == 11;
+    assert o[1] == 52 and o[2] == 50 and o[3] == 57 and o[4] == 52 and o[5] == 57 and o[6] == 54;
+    assert o[7] == 55 and o[8] == 50 and o[9] == 57 and o[10] == 53;
+}
+
+test um_dec_part_accepts_one_or_two_digits_and_gives_100_on_any_fault {
+    const t : [12]u8 = [48, 55, 57, 57, 49, 48, 46, 120, 52, 50, 48, 48];
+    assert um_dec_part(t[0..12], 0, 1) == 0;
+    assert um_dec_part(t[0..12], 2, 3) == 9;
+    assert um_dec_part(t[0..12], 2, 4) == 99;
+    assert um_dec_part(t[0..12], 4, 6) == 10;
+    assert um_dec_part(t[0..12], 0, 2) == 100;
+    assert um_dec_part(t[0..12], 4, 4) == 100;
+    assert um_dec_part(t[0..12], 2, 5) == 100;
+    assert um_dec_part(t[0..12], 6, 7) == 100;
+    assert um_dec_part(t[0..12], 7, 8) == 100;
+    assert um_dec_part(t[0..12], 8, 10) == 42;
+    assert um_dec_part(t[0..12], 9, 10) == 2;
+}
+
+test ux_magic_writes_the_eight_byte_tag_with_the_given_last_kind_byte {
+    var m : [8]u8 = undefined;
+    ux_zero(m[0..8], 0, 8);
+    ux_magic(m[0..8], 81);
+    assert m[0] == 84 and m[1] == 50 and m[2] == 55 and m[3] == 85 and m[4] == 80 and m[5] == 82;
+    assert m[6] == 81 and m[7] == 49;
+    ux_magic(m[0..8], 0);
+    assert m[6] == 0 and m[7] == 49 and m[0] == 84;
+}
+
+test ux_magic_is_accepts_only_the_exact_tag_and_kind {
+    var m : [8]u8 = undefined;
+    ux_magic(m[0..8], 81);
+    assert ux_magic_is(m[0..8], 81);
+    assert ux_magic_is(m[0..8], 82) == false;
+    var i : usize = 0;
+    while (i < 8) {
+        var c : [8]u8 = undefined;
+        um_copy(c[0..8], 0, m[0..8], 8);
+        c[i] = c[i] ^ 1;
+        assert ux_magic_is(c[0..8], 81) == false;
+        i = i + 1;
+    }
+}
+
+test ux_zero_clears_only_the_half_open_range {
+    var b : [6]u8 = undefined;
+    var i : usize = 0;
+    while (i < 6) { b[i] = 255; i = i + 1; }
+    ux_zero(b[0..6], 1, 4);
+    assert b[0] == 255 and b[1] == 0 and b[2] == 0 and b[3] == 0 and b[4] == 255 and b[5] == 255;
+    ux_zero(b[0..6], 4, 4);
+    assert b[4] == 255;
+    ux_zero(b[0..6], 0, 6);
+    assert b[0] == 0 and b[5] == 0;
+}
+
+test ux_same_compares_a_window_of_n_bytes_at_both_offsets {
+    const a : [6]u8 = [1, 2, 3, 4, 5, 6];
+    const b : [4]u8 = [9, 3, 4, 5];
+    assert ux_same(a[0..6], 2, b[0..4], 1, 3);
+    assert ux_same(a[0..6], 2, b[0..4], 1, 3);
+    assert ux_same(a[0..6], 1, b[0..4], 1, 3) == false;
+    assert ux_same(a[0..6], 0, b[0..4], 0, 0);
+    assert ux_same(a[0..6], 0, b[0..4], 0, 1) == false;
+    assert ux_same(a[0..6], 3, b[0..4], 2, 2);
+    assert ux_same(a[0..6], 3, b[0..4], 1, 1) == false;
+}
+
+test ch_len_reads_the_length_word_of_a_made_header {
+    var h : [32]u8 = undefined;
+    const n : usize = ch_make(65536, 7, 4294967296, h[0..32]);
+    assert n == CH_LEN;
+    assert ch_len(h[0..32]) == 65536;
+    assert ch_make(0, 1, 0, h[0..32]) == CH_LEN and ch_len(h[0..32]) == 0;
+    assert ch_make(4294967295, 1, 0, h[0..32]) == CH_LEN and ch_len(h[0..32]) == 4294967295;
+    var s : [4]u8 = undefined;
+    assert ch_make(5, 1, 0, s[0..4]) == 0;
+}
+
+test ux_same_sees_a_difference_in_the_high_bit_and_in_the_last_byte {
+    const a : [4]u8 = [1, 2, 3, 4];
+    const b : [4]u8 = [1, 2, 3, 132];
+    const c : [4]u8 = [1, 2, 3, 4];
+    assert ux_same(a[0..4], 0, b[0..4], 0, 4) == false;
+    assert ux_same(a[0..4], 0, b[0..4], 0, 3);
+    assert ux_same(a[0..4], 0, c[0..4], 0, 4);
+}

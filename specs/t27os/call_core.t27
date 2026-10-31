@@ -1,0 +1,2113 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_core.t27 -- the core of a T27 OS call: who may move the call where, what a call frame says
+// about itself, how both people get the same 6-digit code, which frames are replays or late, and how each
+// direction gets its own key and nonce. Pure decisions only: no @extern, no clock, no randomness, no hashing.
+// The host (specs/t27os/call_crypto_probe.t27 today) hashes, draws random bytes, runs ECDH and the AEAD from the
+// operating system and feeds the results back through these fns. Owner, 2026-10-21: calls run inside the OS and
+// the devices, explicit consent, never auto-answer. Contract: the T27 OS calls contract draft (R1, R2, R6; not in
+// this repository). Its R3/R4 name SRTP (AES-CM + HMAC-SHA1); this slice uses AES-128-GCM with the whole header
+// as associated data instead, and that choice is open for review.
+//
+// Call states. IDLE -> CALLING (I dialled) or RINGING (an invite arrived) -> VERIFY (both ephemeral keys and both
+// nonces are known, the people compare 6 digits) -> ACTIVE -> ENDED or FAILED -> IDLE. RINGING leaves for VERIFY
+// only on the local ANSWER event, and ACTIVE is entered only from VERIFY on CODE_OK: no path answers by itself and
+// no path carries media before both people said "the codes match". ENDED and FAILED take a new CALL or INVITE
+// like IDLE (R6), so a finished call never blocks the next one.
+//
+// Frame header (52 bytes, every message): magic "T27P", version 1, type, flags 0, reserved 0, sender fp (10),
+// recipient fp (10), session id (16), sequence (u64 LE). For sealed frames the whole header is the AEAD
+// associated data, so a changed byte anywhere in it fails the tag.
+//
+// Code (numeric comparison, the shape of Bluetooth LE Secure Connections): the caller I sends INVITE with its
+// ephemeral public key and C = H(tag || session || fp_I || fp_R || pub_I || N_I), keeping N_I secret; the callee R
+// answers with its ephemeral key, N_R and H(INVITE); I reveals N_I with H(ANSWER); R recomputes C and closes the
+// attempt on a mismatch. T = H(INVITE || ANSWER || REVEAL), the exact bytes; the code is the first 4 bytes of
+// H("t27os.call.v1.sas\n" || T), big-endian, mod 10^6. Someone in the middle must fix N_I before seeing N_R, so
+// one attempt gives one chance in 10^6. The rate limit caps failed attempts per peer.
+//
+// Keys: IKM = ECDH of the two ephemeral keys; PRK = HMAC-SHA256(salt = T, IKM); per direction (0 caller to
+// callee, 1 callee to caller) OKM = HMAC-SHA256(PRK, info || 0x01), info = "t27os.call.v1.aead\n" || direction ||
+// fp_caller || fp_callee || session (HKDF, RFC 5869, one block). Key = OKM[0..16] (AES-128-GCM), IV = OKM[16..28];
+// nonce = IV XOR (0^4 || seq big-endian), as TLS 1.3 does. A sender's seq starts at 1 and stops at CK_SEQ_MAX, and
+// a call never reuses its ephemeral keys, so a (key, nonce) pair is never used twice.
+//
+// These are behaviour rules with tests; they are not a security audit. Refs gHashTag/t27#11560.
+module T27osCallCore;
+
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::keysync::kfill;
+
+// ---------------------------------------------------------------- call states and events
+
+pub const CK_IDLE : u32 = 0;
+pub const CK_CALLING : u32 = 1;
+pub const CK_RINGING : u32 = 2;
+pub const CK_VERIFY : u32 = 3;
+pub const CK_ACTIVE : u32 = 4;
+pub const CK_ENDED : u32 = 5;
+pub const CK_FAILED : u32 = 6;
+pub const CK_STATES : u32 = 7;
+
+/// Local: I dial.
+pub const CK_EV_CALL : u32 = 1;
+/// Remote: an INVITE for me arrived.
+pub const CK_EV_INVITE : u32 = 2;
+/// Local: the person pressed Answer.
+pub const CK_EV_ANSWER : u32 = 3;
+/// Remote: the callee's ANSWER (its key and nonce) arrived.
+pub const CK_EV_ANSWERED : u32 = 4;
+pub const CK_EV_DECLINE : u32 = 5;
+pub const CK_EV_DECLINED : u32 = 6;
+pub const CK_EV_CANCEL : u32 = 7;
+pub const CK_EV_CANCELLED : u32 = 8;
+/// Both people said "match" and the peer's sealed CONFIRM names the same transcript.
+pub const CK_EV_CODE_OK : u32 = 9;
+/// Either person said "differ", the commitment failed, or the peer's CONFIRM names another transcript.
+pub const CK_EV_CODE_BAD : u32 = 10;
+pub const CK_EV_HANGUP : u32 = 11;
+pub const CK_EV_BYE : u32 = 12;
+pub const CK_EV_TIMEOUT : u32 = 13;
+pub const CK_EV_ERROR : u32 = 14;
+/// The end line was shown long enough or clicked away.
+pub const CK_EV_DISMISS : u32 = 15;
+pub const CK_EVENTS : u32 = 16;
+
+/// The next call state. An event that does not apply leaves the state as it is.
+pub fn ck_next(state: u32, ev: u32) -> u32 {
+    if (state == CK_IDLE or state == CK_ENDED or state == CK_FAILED) {
+        if (ev == CK_EV_CALL) { return CK_CALLING; }
+        if (ev == CK_EV_INVITE) { return CK_RINGING; }
+        if (ev == CK_EV_DISMISS and state != CK_IDLE) { return CK_IDLE; }
+        return state;
+    }
+    if (state == CK_CALLING) {
+        if (ev == CK_EV_ANSWERED) { return CK_VERIFY; }
+        if (ev == CK_EV_DECLINED or ev == CK_EV_CANCEL or ev == CK_EV_TIMEOUT) { return CK_ENDED; }
+        if (ev == CK_EV_ERROR) { return CK_FAILED; }
+        return state;
+    }
+    if (state == CK_RINGING) {
+        if (ev == CK_EV_ANSWER) { return CK_VERIFY; }
+        if (ev == CK_EV_DECLINE or ev == CK_EV_CANCELLED or ev == CK_EV_TIMEOUT) { return CK_ENDED; }
+        if (ev == CK_EV_ERROR) { return CK_FAILED; }
+        return state;
+    }
+    if (state == CK_VERIFY) {
+        if (ev == CK_EV_CODE_OK) { return CK_ACTIVE; }
+        if (ev == CK_EV_CODE_BAD or ev == CK_EV_TIMEOUT or ev == CK_EV_ERROR) { return CK_FAILED; }
+        if (ev == CK_EV_HANGUP or ev == CK_EV_BYE or ev == CK_EV_CANCEL or ev == CK_EV_CANCELLED) { return CK_ENDED; }
+        return state;
+    }
+    if (state == CK_ACTIVE) {
+        if (ev == CK_EV_HANGUP or ev == CK_EV_BYE) { return CK_ENDED; }
+        if (ev == CK_EV_TIMEOUT or ev == CK_EV_ERROR) { return CK_FAILED; }
+        return state;
+    }
+    return CK_IDLE;
+}
+
+/// Media frames are sealed, sent and accepted only in ACTIVE.
+pub fn ck_media_ok(state: u32) -> bool { return state == CK_ACTIVE; }
+
+/// Keys exist only in VERIFY (for CONFIRM) and ACTIVE; any other state wipes them.
+pub fn ck_keys_live(state: u32) -> bool { return state == CK_VERIFY or state == CK_ACTIVE; }
+
+// ---------------------------------------------------------------- the two verdicts
+
+pub const CK_SAY_NONE : u32 = 0;
+pub const CK_SAY_MATCH : u32 = 1;
+pub const CK_SAY_DIFFER : u32 = 2;
+pub const CK_V_WAIT : u32 = 0;
+pub const CK_V_OPEN : u32 = 1;
+pub const CK_V_FAIL : u32 = 2;
+
+/// What the call does with the local person's verdict and the peer's (from its sealed CONFIRM): open only when
+/// both said match; fail as soon as either said differ or sent anything else.
+pub fn ck_verdict(local: u32, peer: u32) -> u32 {
+    if (local == CK_SAY_DIFFER or peer == CK_SAY_DIFFER) { return CK_V_FAIL; }
+    if (local > CK_SAY_DIFFER or peer > CK_SAY_DIFFER) { return CK_V_FAIL; }
+    if (local == CK_SAY_MATCH and peer == CK_SAY_MATCH) { return CK_V_OPEN; }
+    return CK_V_WAIT;
+}
+
+// ---------------------------------------------------------------- frame header
+
+pub const CK_VERSION : u8 = 1;
+pub const CK_FP : usize = 10;
+pub const CK_SID : usize = 16;
+pub const CK_HDR : usize = 52;
+pub const CK_PUB : usize = 65;
+pub const CK_NONCE : usize = 16;
+pub const CK_HASH : usize = 32;
+pub const CK_TAG : usize = 16;
+pub const CK_KEY : usize = 16;
+pub const CK_IV : usize = 12;
+
+pub const CK_T_INVITE : u32 = 16;
+pub const CK_T_ANSWER : u32 = 17;
+pub const CK_T_REVEAL : u32 = 18;
+pub const CK_T_CONFIRM : u32 = 19;
+pub const CK_T_BYE : u32 = 20;
+pub const CK_T_MEDIA : u32 = 32;
+
+/// INVITE body: ephemeral public key, commitment C.
+pub const CK_INVITE_LEN : usize = 149;
+/// ANSWER body: ephemeral public key, N_R, H(INVITE).
+pub const CK_ANSWER_LEN : usize = 165;
+/// REVEAL body: N_I, H(ANSWER).
+pub const CK_REVEAL_LEN : usize = 100;
+/// The three plain messages that make the transcript.
+pub const CK_TRANSCRIPT_LEN : usize = 414;
+
+/// Write the header into out[0..52]: 52, or 0 when a part has the wrong size or the type does not fit a byte.
+pub fn ck_put_header(out: []u8, typ: u32, sender: []const u8, recipient: []const u8, session: []const u8, seq: u64) -> usize {
+    if (out.len < CK_HDR or sender.len != CK_FP or recipient.len != CK_FP or session.len != CK_SID or typ > 255) { return 0; }
+    out[0] = 84;
+    out[1] = 50;
+    out[2] = 55;
+    out[3] = 80;
+    out[4] = CK_VERSION;
+    out[5] = @as(u8, @intCast(typ));
+    out[6] = 0;
+    out[7] = 0;
+    var i : usize = 0;
+    while (i < CK_FP) {
+        out[8 + i] = sender[i];
+        out[18 + i] = recipient[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < CK_SID) {
+        out[28 + i] = session[i];
+        i = i + 1;
+    }
+    put_u64(out, 44, seq);
+    return CK_HDR;
+}
+
+/// The type of a well-formed header (magic, version, flags and reserved zero), 0 for anything else.
+pub fn ck_hdr_type(b: []const u8) -> u32 {
+    if (b.len < CK_HDR) { return 0; }
+    if (b[0] != 84 or b[1] != 50 or b[2] != 55 or b[3] != 80) { return 0; }
+    if (b[4] != CK_VERSION or b[6] != 0 or b[7] != 0) { return 0; }
+    return @as(u32, b[5]);
+}
+
+pub fn ck_hdr_seq(b: []const u8) -> u64 {
+    if (b.len < CK_HDR) { return 0; }
+    return get_u64(b, 44);
+}
+
+/// Is this header addressed to me (fp `me`), from `peer`, in `session`. Zero-length `peer` or `session` means
+/// "not known yet" (an INVITE names the session; the callee learns it from there).
+pub fn ck_hdr_admit(b: []const u8, me: []const u8, peer: []const u8, session: []const u8) -> bool {
+    if (ck_hdr_type(b) == 0 or me.len != CK_FP) { return false; }
+    if (!ck_same(b[18..28], me)) { return false; }
+    if (peer.len != 0 and (peer.len != CK_FP or !ck_same(b[8..18], peer))) { return false; }
+    if (session.len != 0 and (session.len != CK_SID or !ck_same(b[28..44], session))) { return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------- bytes
+
+/// Equal length and equal bytes; the time does not depend on where the first difference is.
+pub fn ck_same(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var d : u8 = 0;
+    var i : usize = 0;
+    while (i < a.len) {
+        d = d | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+/// Copy src into out at `at`; the next offset, or 0 when it does not fit.
+pub fn ck_put(out: []u8, at: usize, src: []const u8) -> usize {
+    if (at > out.len or src.len > out.len - at) { return 0; }
+    var i : usize = 0;
+    while (i < src.len) {
+        out[at + i] = src[i];
+        i = i + 1;
+    }
+    return at + src.len;
+}
+
+/// Zero a secret or a buffer before reuse.
+pub fn ck_wipe(b: []u8) -> void { kfill(b, 0); }
+
+// ---------------------------------------------------------------- the 6-digit code
+
+pub const CK_TAG_COMMIT : str = "t27os.call.v1.commit\n";
+pub const CK_TAG_SAS : str = "t27os.call.v1.sas\n";
+pub const CK_TAG_AEAD : str = "t27os.call.v1.aead\n";
+
+/// What the caller hashes into its commitment: tag || session || fp_I || fp_R || pub_I || N_I. Its length, 0 on a
+/// wrong size.
+pub fn ck_commit_input(session: []const u8, fp_i: []const u8, fp_r: []const u8, pub_i: []const u8, n_i: []const u8, out: []u8) -> usize {
+    if (session.len != CK_SID or fp_i.len != CK_FP or fp_r.len != CK_FP or pub_i.len != CK_PUB or n_i.len != CK_NONCE) { return 0; }
+    var at : usize = ck_put(out, 0, CK_TAG_COMMIT);
+    if (at == 0) { return 0; }
+    at = ck_put(out, at, session);
+    if (at == 0) { return 0; }
+    at = ck_put(out, at, fp_i);
+    if (at == 0) { return 0; }
+    at = ck_put(out, at, fp_r);
+    if (at == 0) { return 0; }
+    at = ck_put(out, at, pub_i);
+    if (at == 0) { return 0; }
+    return ck_put(out, at, n_i);
+}
+
+/// Append one exact message to the transcript buffer that already holds `used` bytes; the new length, 0 when it
+/// would not fit.
+pub fn ck_transcript_add(buf: []u8, used: usize, msg: []const u8) -> usize {
+    if (msg.len == 0) { return 0; }
+    return ck_put(buf, used, msg);
+}
+
+/// What is hashed for the code: tag || T (the transcript digest).
+pub fn ck_sas_input(t: []const u8, out: []u8) -> usize {
+    if (t.len != CK_HASH) { return 0; }
+    const at : usize = ck_put(out, 0, CK_TAG_SAS);
+    if (at == 0) { return 0; }
+    return ck_put(out, at, t);
+}
+
+/// The code from the digest of ck_sas_input: first 4 bytes big-endian mod 10^6, as six ASCII digits with leading
+/// zeros in out[0..6]. Returns the number, or 1000000 when the digest is short.
+pub fn ck_sas_digits(digest: []const u8, out: []u8) -> u32 {
+    if (digest.len < 4 or out.len < 6) { return 1000000; }
+    const v : u64 = (@as(u64, digest[0]) << 24) | (@as(u64, digest[1]) << 16) | (@as(u64, digest[2]) << 8) | @as(u64, digest[3]);
+    const code : u64 = v % 1000000;
+    var x : u64 = code;
+    var i : usize = 6;
+    while (i > 0) {
+        i = i - 1;
+        out[i] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+    }
+    return @as(u32, @intCast(code));
+}
+
+// ---------------------------------------------------------------- identity proof (owner, 2026-10-22)
+//
+// Once both sides hold the keys (VERIFY, the code known) each sends one sealed IDENT frame (type 21, same AEAD as
+// CONFIRM): its long-lived identity key (P-256, 65 bytes, the key whose hash is the fingerprint it puts in every
+// header), the DER length (1 byte) and the ECDSA P-256 / SHA-256 signature (8..72 bytes, zero padded to 72) over
+//   tag || role (1 = the caller signs, 0 = the callee) || session (16) || T (32, the hash of INVITE || ANSWER ||
+//   REVEAL, so both ephemeral keys and both nonces) || the signer's own ephemeral key (65) || fp_signer || fp_peer.
+// Someone in the middle runs two handshakes with two different T, so a signature from one cannot be shown in the
+// other. What a proof means for the call (code, no code, refused) is peer_identity.t27 pid_verdict.
+
+pub const CK_T_IDENT : u32 = 21;
+pub const CK_TAG_IDENT : str = "t27os.call.v1.ident\n";
+pub const CK_SIG_MAX : usize = 72;
+pub const CK_SIG_MIN : usize = 8;
+/// The IDENT plaintext: key (65) || DER length (1) || signature padded to 72.
+pub const CK_IDENT_PT : usize = 138;
+pub const CK_IDENT_INPUT_LEN : usize = 154;
+
+/// What the signer signs: tag || role || session || T || own ephemeral key || fp_signer || fp_peer. Its length
+/// (CK_IDENT_INPUT_LEN), 0 on a wrong size.
+pub fn ck_ident_input(caller: bool, session: []const u8, t: []const u8, eph_pub: []const u8, fp_signer: []const u8, fp_peer: []const u8, out: []u8) -> usize {
+    if (session.len != CK_SID or t.len != CK_HASH or eph_pub.len != CK_PUB or fp_signer.len != CK_FP or fp_peer.len != CK_FP) { return 0; }
+    if (out.len < CK_IDENT_INPUT_LEN) { return 0; }
+    var at : usize = ck_put(out, 0, CK_TAG_IDENT);
+    if (caller) { out[at] = 1; } else { out[at] = 0; }
+    at = at + 1;
+    at = ck_put(out, at, session);
+    at = ck_put(out, at, t);
+    at = ck_put(out, at, eph_pub);
+    at = ck_put(out, at, fp_signer);
+    return ck_put(out, at, fp_peer);
+}
+
+/// The IDENT plaintext from a key and a DER signature; CK_IDENT_PT, 0 on a wrong size.
+pub fn ck_ident_build(key: []const u8, sig: []const u8, out: []u8) -> usize {
+    if (key.len != CK_PUB or key[0] != 4 or sig.len < CK_SIG_MIN or sig.len > CK_SIG_MAX or out.len < CK_IDENT_PT) { return 0; }
+    ck_wipe(out[0..CK_IDENT_PT]);
+    ck_put(out, 0, key);
+    out[CK_PUB] = @as(u8, @intCast(sig.len));
+    ck_put(out, CK_PUB + 1, sig);
+    return CK_IDENT_PT;
+}
+
+/// The signature length of an IDENT plaintext (the key is pt[0..65], the signature pt[66..66 + length]); 0 when it is
+/// malformed: a wrong size, a key that is not an uncompressed point, a length outside 8..72, a non-zero pad.
+pub fn ck_ident_sig_len(pt: []const u8) -> usize {
+    if (pt.len != CK_IDENT_PT or pt[0] != 4) { return 0; }
+    const n : usize = @as(usize, pt[CK_PUB]);
+    if (n < CK_SIG_MIN or n > CK_SIG_MAX) { return 0; }
+    var i : usize = CK_PUB + 1 + n;
+    while (i < CK_IDENT_PT) {
+        if (pt[i] != 0) { return 0; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- attempt limit
+
+// Owner, 2026-10-23: a link that saw CK_MAX_FAILS failed code comparisons in a row (a "differ" said by either side, or
+// a key that did not match its commitment) takes no new attempt for CK_PAUSE_MS: a call out is refused and a call in
+// is declined, both with the reason "too many attempts". A matched code (the call became ACTIVE) clears the count.
+// The state is two u64 in the link's block in memory, never written anywhere: it is gone when the session closes.
+
+pub const CK_MAX_FAILS : u64 = 5;
+pub const CK_PAUSE_MS : u64 = 60000;
+pub const CK_RATE_LEN : usize = 16;
+
+/// May a new attempt start at `now` (ms)? `st` is the failures so far (u64 LE) then the end of the pause (u64 LE,
+/// 0 = none). A short block says no.
+pub fn ck_rate_ok(st: []const u8, now: u64) -> bool {
+    if (st.len < CK_RATE_LEN) { return false; }
+    return now >= get_u64(st, 8);
+}
+
+/// Record one failed comparison at `now`: the CK_MAX_FAILS-th starts the pause and the count starts again.
+pub fn ck_rate_note(st: []u8, now: u64) -> void {
+    if (st.len < CK_RATE_LEN) { return; }
+    const n : u64 = get_u64(st, 0) + 1;
+    if (n >= CK_MAX_FAILS) {
+        put_u64(st, 0, 0);
+        put_u64(st, 8, now + CK_PAUSE_MS);
+        return;
+    }
+    put_u64(st, 0, n);
+}
+
+/// A matched code: the count of failures goes back to 0 (a pause already running is not cut short).
+pub fn ck_rate_reset(st: []u8) -> void {
+    if (st.len < CK_RATE_LEN) { return; }
+    put_u64(st, 0, 0);
+}
+
+/// Does a call that ended with this outcome count as a failed comparison? `differ` = a side said the codes differ,
+/// `commit` = the key did not match its commitment.
+pub fn ck_rate_counts(differ: bool, commit: bool) -> bool { return differ or commit; }
+
+// ---------------------------------------------------------------- replays and late frames
+
+/// Replay window: 8 bytes LE highest accepted seq (0 = none yet), then 64 flags by seq % 64.
+pub const CK_WIN : u64 = 64;
+pub const CK_WIN_LEN : usize = 72;
+pub const CK_RP_DUP : u32 = 0;
+pub const CK_RP_AHEAD : u32 = 1;
+pub const CK_RP_FILL : u32 = 2;
+pub const CK_RP_OLD : u32 = 3;
+
+/// What seq would be to the window, without changing it. A seq no sender makes (0, or past CK_SEQ_MAX) is OLD: the
+/// window never moves to it, so a peer cannot run the slot loop below to the end of u64.
+pub fn ck_replay_check(st: []const u8, seq: u64) -> u32 {
+    if (st.len < CK_WIN_LEN or seq == 0 or seq > CK_SEQ_MAX) { return CK_RP_OLD; }
+    const hi : u64 = get_u64(st, 0);
+    if (seq > hi) { return CK_RP_AHEAD; }
+    if (hi - seq >= CK_WIN) { return CK_RP_OLD; }
+    if (st[8 + @as(usize, @intCast(seq % CK_WIN))] != 0) { return CK_RP_DUP; }
+    return CK_RP_FILL;
+}
+
+/// Accept seq once. Call only after the AEAD tag verified: a forged frame must not move the window.
+pub fn ck_replay_accept(st: []u8, seq: u64) -> bool {
+    const r : u32 = ck_replay_check(st, seq);
+    if (r == CK_RP_DUP or r == CK_RP_OLD) { return false; }
+    if (r == CK_RP_AHEAD) {
+        const hi : u64 = get_u64(st, 0);
+        var gap : u64 = seq - hi;
+        if (gap > CK_WIN) { gap = CK_WIN; }
+        var s : u64 = seq - gap + 1;
+        while (s <= seq) {
+            st[8 + @as(usize, @intCast(s % CK_WIN))] = 0;
+            s = s + 1;
+        }
+        put_u64(st, 0, seq);
+    }
+    st[8 + @as(usize, @intCast(seq % CK_WIN))] = 1;
+    return true;
+}
+
+/// A frame whose seq the player has already passed is late: it is dropped, never played out of order.
+pub fn ck_late(seq: u64, play_next: u64) -> bool { return seq < play_next; }
+
+// ---------------------------------------------------------------- keys and nonces
+
+/// A sender stops before this seq; the call then ends (far beyond any call: 2^32 - 1 frames of 10 ms is 497 days).
+pub const CK_SEQ_MAX : u64 = 4294967295;
+
+/// The next seq from the sender's 8-byte LE counter (which starts at 0), or 0 when the counter is spent: then the
+/// frame is not sealed at all, so no (key, nonce) pair repeats.
+pub fn ck_send_seq(ctr: []u8) -> u64 {
+    if (ctr.len < 8) { return 0; }
+    const n : u64 = get_u64(ctr, 0);
+    if (n >= CK_SEQ_MAX) { return 0; }
+    put_u64(ctr, 0, n + 1);
+    return n + 1;
+}
+
+/// HKDF-Expand input for one direction's key: info || 0x01 with info = tag || direction || fp_caller ||
+/// fp_callee || session. 0 on a wrong size or a direction other than 0 / 1.
+pub fn ck_expand_input(dir: u32, fp_caller: []const u8, fp_callee: []const u8, session: []const u8, out: []u8) -> usize {
+    if (dir > 1 or fp_caller.len != CK_FP or fp_callee.len != CK_FP or session.len != CK_SID) { return 0; }
+    var at : usize = ck_put(out, 0, CK_TAG_AEAD);
+    if (at == 0 or at + 1 > out.len) { return 0; }
+    out[at] = @as(u8, @intCast(dir));
+    at = ck_put(out, at + 1, fp_caller);
+    if (at == 0) { return 0; }
+    at = ck_put(out, at, fp_callee);
+    if (at == 0) { return 0; }
+    at = ck_put(out, at, session);
+    if (at == 0 or at + 1 > out.len) { return 0; }
+    out[at] = 1;
+    return at + 1;
+}
+
+/// My sending direction: the caller sends on 0, the callee on 1; I receive on the other.
+pub fn ck_tx_dir(caller: bool) -> u32 {
+    if (caller) { return 0; }
+    return 1;
+}
+
+/// nonce = iv XOR (0^4 || seq big-endian), 12 bytes. False on a wrong size.
+pub fn ck_nonce(iv: []const u8, seq: u64, out: []u8) -> bool {
+    if (iv.len != CK_IV or out.len < CK_IV) { return false; }
+    var i : usize = 0;
+    while (i < 4) {
+        out[i] = iv[i];
+        i = i + 1;
+    }
+    var x : u64 = seq;
+    var k : usize = 12;
+    while (k > 4) {
+        k = k - 1;
+        out[k] = iv[k] ^ @as(u8, @intCast(x & 255));
+        x = x >> 8;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- group call (mesh, owner 2026-10-22)
+
+// A group call is up to four people, each pair joined by its own 1:1 call (its own handshake, code, keys and replay
+// window) over one UDP socket per person: no server, no relay, so nobody's voice comes back to its owner. The
+// initiator calls the people it picked and, once a link is ACTIVE, tells that person the list (fingerprint, address,
+// port of every member). A member that learns a name it has no link to dials it when its own fingerprint is the lower
+// one (so two members never dial each other at once); the other waits, and dials after GR_WAIT_MS if the first never
+// came. A late member gets the current list from whoever it called and dials the rest the same way; the members get
+// the list again with its name. One leaving ends only its own links.
+
+pub const GR_MAX : usize = 4;
+pub const GR_PEERS : usize = 3;
+
+/// The group as a whole.
+pub const GR_NONE : u32 = 0;
+pub const GR_WAITING : u32 = 1;
+pub const GR_PARTIAL : u32 = 2;
+pub const GR_FULL : u32 = 3;
+pub const GR_ENDED : u32 = 4;
+
+/// One other member, as seen from here.
+pub const GM_NONE : u32 = 0;
+pub const GM_KNOWN : u32 = 1;
+pub const GM_LINKING : u32 = 2;
+pub const GM_UP : u32 = 3;
+pub const GM_LEFT : u32 = 4;
+pub const GM_FAILED : u32 = 5;
+
+/// A member that should dial and has not yet been dialled by the other waits this long, then dials anyway.
+pub const GR_WAIT_MS : u64 = 4000;
+
+/// The state of the group from the counts of the other members: pending (listed, not up yet), up (media flows),
+/// gone (was up, left or fell silent). `started` is false until a group was opened here.
+pub fn gr_state(started: bool, pending: u32, up: u32, gone: u32) -> u32 {
+    if (!started) { return GR_NONE; }
+    if (up == 0 and pending == 0) { return GR_ENDED; }
+    if (up == 0) { return GR_WAITING; }
+    if (pending > 0 or gone > 0) { return GR_PARTIAL; }
+    return GR_FULL;
+}
+
+/// A member's status from the state of the link that carries it (has_link false: no link names it) and whether the
+/// link was ever ACTIVE.
+pub fn gm_status(has_link: bool, link_state: u32, ever_up: bool) -> u32 {
+    if (!has_link or link_state == CK_IDLE) {
+        if (ever_up) { return GM_LEFT; }
+        return GM_KNOWN;
+    }
+    if (link_state == CK_ACTIVE) { return GM_UP; }
+    if (link_state == CK_ENDED or link_state == CK_FAILED) {
+        if (ever_up) { return GM_LEFT; }
+        return GM_FAILED;
+    }
+    return GM_LINKING;
+}
+
+/// Listed and still to be linked: counted as pending.
+pub fn gm_pending(status: u32) -> bool { return status == GM_KNOWN or status == GM_LINKING; }
+
+/// Byte order of two fingerprints: a is lower than b.
+pub fn gr_fp_less(a: []const u8, b: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < a.len and i < b.len) {
+        if (a[i] < b[i]) { return true; }
+        if (a[i] > b[i]) { return false; }
+        i = i + 1;
+    }
+    return a.len < b.len;
+}
+
+/// May I dial this member now. The person I picked myself: at once. Anyone else: when my fingerprint is the lower
+/// one, or when I have waited GR_WAIT_MS for the other to dial me.
+pub fn gr_should_dial(me: []const u8, peer: []const u8, picked: bool, waited_ms: u64) -> bool {
+    if (ck_same(me, peer)) { return false; }
+    if (picked) { return true; }
+    if (gr_fp_less(me, peer)) { return true; }
+    return waited_ms >= GR_WAIT_MS;
+}
+
+/// The 16-bit little-endian sample (lo, hi) as a signed number.
+pub fn gr_s16(lo: u8, hi: u8) -> i64 {
+    const v : i64 = @as(i64, lo) + @as(i64, hi) * 256;
+    if (v >= 32768) { return v - 65536; }
+    return v;
+}
+
+/// Hold a sum inside the 16-bit range instead of letting it wrap.
+pub fn gr_clamp16(v: i64) -> i64 {
+    if (v > 32767) { return 32767; }
+    if (v < -32768) { return -32768; }
+    return v;
+}
+
+/// The two bytes of a signed 16-bit sample: low into out[at], high into out[at + 1].
+pub fn gr_put16(out: []u8, at: usize, v: i64) -> void {
+    var u : i64 = v;
+    if (u < 0) { u = u + 65536; }
+    out[at] = @as(u8, @intCast(u % 256));
+    out[at + 1] = @as(u8, @intCast(u / 256));
+}
+
+/// |sample| of a signed 16-bit value (32768 for the lowest).
+pub fn gr_abs16(v: i64) -> u64 {
+    if (v < 0) { return @as(u64, @intCast(0 - v)); }
+    return @as(u64, @intCast(v));
+}
+
+/// A member list on the wire (the plaintext of a sealed control packet): 4 zero bytes, 193, 3, the count, 0, then per
+/// member fingerprint (10), IPv4 big-endian (4), port big-endian (2).
+pub const GR_LIST_KIND : u8 = 193;
+pub const GR_ENTRY : usize = 16;
+pub const GR_LIST_HDR : usize = 8;
+pub const GR_LIST_MAX : usize = 72;
+
+pub fn gr_list_init(out: []u8) -> void {
+    if (out.len < GR_LIST_HDR) { return; }
+    ck_wipe(out[0..GR_LIST_HDR]);
+    out[4] = GR_LIST_KIND;
+    out[5] = 3;
+}
+
+/// Entry n (0-based) into the list; the new count, or the old one when it does not fit.
+pub fn gr_list_add(out: []u8, fp: []const u8, ip: u64, port: u64) -> usize {
+    const n : usize = @as(usize, out[6]);
+    if (n >= GR_MAX or out.len < GR_LIST_HDR + (n + 1) * GR_ENTRY or fp.len != CK_FP) { return n; }
+    const at : usize = GR_LIST_HDR + n * GR_ENTRY;
+    ck_put(out, at, fp);
+    out[at + 10] = @as(u8, @intCast((ip >> 24) & 255));
+    out[at + 11] = @as(u8, @intCast((ip >> 16) & 255));
+    out[at + 12] = @as(u8, @intCast((ip >> 8) & 255));
+    out[at + 13] = @as(u8, @intCast(ip & 255));
+    out[at + 14] = @as(u8, @intCast((port >> 8) & 255));
+    out[at + 15] = @as(u8, @intCast(port & 255));
+    out[6] = @as(u8, @intCast(n + 1));
+    return n + 1;
+}
+
+/// A well-formed list: the marker, 1..GR_MAX members, the whole body present.
+pub fn gr_list_ok(b: []const u8) -> bool {
+    if (b.len < GR_LIST_HDR or b[4] != GR_LIST_KIND or b[5] != 3 or b[7] != 0) { return false; }
+    const n : usize = @as(usize, b[6]);
+    if (n == 0 or n > GR_MAX) { return false; }
+    return b.len >= GR_LIST_HDR + n * GR_ENTRY;
+}
+
+pub fn gr_list_count(b: []const u8) -> usize { return @as(usize, b[6]); }
+
+pub fn gr_list_ip(b: []const u8, n: usize) -> u64 {
+    const at : usize = GR_LIST_HDR + n * GR_ENTRY;
+    return (@as(u64, b[at + 10]) << 24) | (@as(u64, b[at + 11]) << 16) | (@as(u64, b[at + 12]) << 8) | @as(u64, b[at + 13]);
+}
+
+pub fn gr_list_port(b: []const u8, n: usize) -> u64 {
+    const at : usize = GR_LIST_HDR + n * GR_ENTRY;
+    return (@as(u64, b[at + 14]) << 8) | @as(u64, b[at + 15]);
+}
+
+/// Where I reach a member a list names, given the address the list came from: a sender reaches a friend on its own
+/// machine by 127.x and names itself with 0 when it listens on all interfaces, so from a sender that is not on this
+/// machine both mean the sender's address (the port stays). From a sender on this machine the list is taken as it is.
+pub fn gr_list_reach(ip: u64, from: u64) -> u64 {
+    if (from == 0 or (from >> 24) == 127) { return ip; }
+    if (ip == 0 or (ip >> 24) == 127) { return from; }
+    return ip;
+}
+
+// Who may hand me a list (owner, 2026-10-23). A list makes this device call every address in it, so it is taken only
+// from the member that brought me into the group: the peer of a link that called me (it initiated that link), and
+// only when that peer is a trusted friend (its stored identity key proved in this call). A list from the side I
+// called, or from anyone not trusted, is refused and counted with its reason. A list names at most GR_LIST_CAP
+// members; a link has its list taken at most once per GR_LIST_GAP_MS (a newer one waits, the latest wins).
+
+pub const GR_LIST_CAP : usize = 8;
+pub const GR_LIST_GAP_MS : u64 = 2000;
+pub const GR_LR_OK : u32 = 0;
+pub const GR_LR_NOT_INITIATOR : u32 = 1;
+pub const GR_LR_UNTRUSTED : u32 = 2;
+pub const GR_LR_SIZE : u32 = 3;
+pub const GR_LR_FORM : u32 = 4;
+
+/// Looks like a list on the wire (marker and version), well formed or not: the bytes a sender meant as a list.
+pub fn gr_list_kind(b: []const u8) -> bool { return b.len >= GR_LIST_HDR and b[4] == GR_LIST_KIND and b[5] == 3; }
+
+/// The verdict on a list that arrived on a link: `peer_called_me` = the peer initiated this link, `trusted` = it is a
+/// friend whose stored key it proved in this call. Size first (a list past GR_LIST_CAP is refused whoever sends it).
+pub fn gr_list_admit(b: []const u8, peer_called_me: bool, trusted: bool) -> u32 {
+    if (!gr_list_kind(b)) { return GR_LR_FORM; }
+    if (@as(usize, b[6]) > GR_LIST_CAP) { return GR_LR_SIZE; }
+    if (!peer_called_me) { return GR_LR_NOT_INITIATOR; }
+    if (!trusted) { return GR_LR_UNTRUSTED; }
+    if (!gr_list_ok(b) or b.len > GR_LIST_MAX) { return GR_LR_FORM; }
+    return GR_LR_OK;
+}
+
+/// May a link's waiting list be taken at `now` (ms)? `last` is when its list was last taken (0 = never).
+pub fn gr_list_due(now: u64, last: u64) -> bool { return last == 0 or now >= last + GR_LIST_GAP_MS; }
+
+/// A trusted friend for a list: the identity proof verified and the key it proved is the one stored for that friend
+/// (stored before the call, or stored now after a matched code).
+pub fn gr_trusted(proof_ok: bool, same_as_stored: bool, stored_now: bool) -> bool { return proof_ok and (same_as_stored or stored_now); }
+
+// ---------------------------------------------------------------- video (owner, 2026-10-22)
+
+// A video frame is one JPEG of 320x240 (7-8 KB) cut into parts of at most VC_PART (1000) bytes. Every part is its own
+// sealed frame of type CK_T_VIDEO (33) on the call's UDP socket, with the same header, the same AES-128-GCM key per
+// direction and the same replay window as audio. The plaintext of a part is VC_HDR (12) bytes then the cut:
+//   frame u32 LE (the video sequence, 1, 2, 3 ..), part u16 LE (0 ..), parts u16 LE (how many in this frame),
+//   total u32 LE (the JPEG length), then the cut: bytes part*1000 .. min(total, part*1000 + 1000) of the JPEG.
+// A sealed part is 52 + 12 + 1000 + 16 = 1080 bytes at most. The receiver keeps ONE frame in assembly: a part of a
+// newer frame drops the half-built older one at once, a part of an older frame is stale, and a frame is shown only
+// when every part is there and the length adds up. A lost part therefore skips the whole frame (the picture is never
+// torn) and the stream goes on with the next one. There is no retransmission: 10 frames a second, the next one is
+// 100 ms away.
+
+pub const CK_T_VIDEO : u32 = 33;
+/// A chat frame (owner, 2026-10-22): sealed like media, carried only by a message session (call_session
+/// CS_AUDIO_NONE); its plaintext is chat_core.t27's payload (text part, ACK or READ).
+pub const CK_T_TEXT : u32 = 34;
+/// The H.264 video of a one to one call (owner, 2026-10-23; call_h264.t27): one part of a coded frame, and the video's
+/// control messages (HELLO, KEYREQ, REPORT). Sealed like media, only while ACTIVE; an older build refuses both by type.
+pub const CK_T_H264 : u32 = 35;
+pub const CK_T_VCTL : u32 = 36;
+pub const VC_PART : usize = 1000;
+pub const VC_HDR : usize = 12;
+pub const VC_PT_MAX : usize = 1012;
+pub const VC_JPEG_MAX : usize = 24000;
+pub const VC_PARTS_MAX : usize = 24;
+pub const VC_W : u32 = 320;
+pub const VC_H : u32 = 240;
+/// 10 frames a second.
+pub const VC_PERIOD_MS : u64 = 100;
+/// A camera frame older than this is not current: the test generator takes over.
+pub const VC_CAM_FRESH_MS : u64 = 500;
+/// The window shows "video on" while a frame arrived within this time.
+pub const VC_LIVE_MS : u64 = 1000;
+
+pub const VC_SRC_GEN : u32 = 1;
+pub const VC_SRC_CAM : u32 = 2;
+
+// Group video (owner, 2026-10-23): a group call sends 5 frames a second of 160x120 at a lower JPEG quality (1.5-3 KB),
+// cut into parts of VC_G_PART (700) bytes. The part format is the same; the receiver tells the part size from the
+// header itself (vc_psz: the count of parts and the length of the cut agree with one size only, or the frame is one
+// part and the size does not matter), so a one to one call's parts are byte for byte what they were.
+pub const VC_G_PART : usize = 700;
+pub const VC_G_W : u32 = 160;
+pub const VC_G_H : u32 = 120;
+/// 5 frames a second.
+pub const VC_G_PERIOD_MS : u64 = 200;
+
+/// The parts a JPEG of `total` bytes needs at part size psz (VC_PART or VC_G_PART): 0 when it is empty, longer than
+/// VC_JPEG_MAX or psz is neither.
+pub fn vc_parts_of(total: usize, psz: usize) -> usize {
+    if (total == 0 or total > VC_JPEG_MAX or (psz != VC_PART and psz != VC_G_PART)) { return 0; }
+    return (total + psz - 1) / psz;
+}
+
+/// The length of part `k` of a JPEG of `total` bytes at part size psz (0 when k is out of range).
+pub fn vc_cut_of(total: usize, k: usize, psz: usize) -> usize {
+    const n : usize = vc_parts_of(total, psz);
+    if (n == 0 or k >= n) { return 0; }
+    if (k + 1 < n) { return psz; }
+    return total - k * psz;
+}
+
+/// The parts a JPEG of `total` bytes needs in a one to one call: 0 when it is empty or longer than VC_JPEG_MAX.
+pub fn vc_parts_for(total: usize) -> usize { return vc_parts_of(total, VC_PART); }
+
+/// The length of part `k` of a JPEG of `total` bytes in a one to one call (0 when k is out of range).
+pub fn vc_cut_len(total: usize, k: usize) -> usize { return vc_cut_of(total, k, VC_PART); }
+
+fn vc_put32(b: []u8, at: usize, v: u64) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+    b[at + 2] = @as(u8, @intCast((v >> 16) & 255));
+    b[at + 3] = @as(u8, @intCast((v >> 24) & 255));
+}
+
+fn vc_get32(b: []const u8, at: usize) -> u64 {
+    return @as(u64, b[at]) | (@as(u64, b[at + 1]) << 8) | (@as(u64, b[at + 2]) << 16) | (@as(u64, b[at + 3]) << 24);
+}
+
+fn vc_get16(b: []const u8, at: usize) -> usize {
+    return @as(usize, b[at]) | (@as(usize, b[at + 1]) << 8);
+}
+
+/// The plaintext of part `k` of `jpeg` as frame number `frame` into out: its length, 0 on a bad part or a short out.
+pub fn vc_part(out: []u8, frame: u64, jpeg: []const u8, k: usize) -> usize { return vc_part_of(out, frame, jpeg, k, VC_PART); }
+
+/// The same at part size psz (a group call cuts at VC_G_PART).
+pub fn vc_part_of(out: []u8, frame: u64, jpeg: []const u8, k: usize, psz: usize) -> usize {
+    const total : usize = jpeg.len;
+    const n : usize = vc_parts_of(total, psz);
+    const len : usize = vc_cut_of(total, k, psz);
+    if (n == 0 or len == 0 or out.len < VC_HDR + len or frame == 0 or frame > 4294967295) { return 0; }
+    vc_put32(out, 0, frame);
+    out[4] = @as(u8, @intCast(k & 255));
+    out[5] = @as(u8, @intCast((k >> 8) & 255));
+    out[6] = @as(u8, @intCast(n & 255));
+    out[7] = @as(u8, @intCast((n >> 8) & 255));
+    vc_put32(out, 8, @as(u64, total));
+    var i : usize = 0;
+    while (i < len) {
+        out[VC_HDR + i] = jpeg[k * psz + i];
+        i = i + 1;
+    }
+    return VC_HDR + len;
+}
+
+/// The part size a part plaintext was cut with: VC_PART when header, counts and length agree with it, else
+/// VC_G_PART when they agree with that; 0 for a malformed part.
+pub fn vc_psz(pt: []const u8) -> usize {
+    if (pt.len < VC_HDR + 1 or pt.len > VC_PT_MAX) { return 0; }
+    const total : usize = @as(usize, @intCast(vc_get32(pt, 8)));
+    const n : usize = vc_get16(pt, 6);
+    const k : usize = vc_get16(pt, 4);
+    if (vc_get32(pt, 0) == 0 or n == 0 or k >= n) { return 0; }
+    if (n == vc_parts_of(total, VC_PART) and pt.len == VC_HDR + vc_cut_of(total, k, VC_PART)) { return VC_PART; }
+    if (n == vc_parts_of(total, VC_G_PART) and pt.len == VC_HDR + vc_cut_of(total, k, VC_G_PART)) { return VC_G_PART; }
+    return 0;
+}
+
+/// A part plaintext that is well formed: header, counts and length agree (at either part size).
+pub fn vc_ok(pt: []const u8) -> bool { return vc_psz(pt) != 0; }
+
+pub fn vc_frame(pt: []const u8) -> u64 { return vc_get32(pt, 0); }
+pub fn vc_index(pt: []const u8) -> usize { return vc_get16(pt, 4); }
+pub fn vc_count(pt: []const u8) -> usize { return vc_get16(pt, 6); }
+pub fn vc_total(pt: []const u8) -> usize { return @as(usize, @intCast(vc_get32(pt, 8))); }
+
+/// A 64-bit hash of a JPEG (shift, add, xor: a check that both sides saw the same bytes, not a MAC).
+pub fn vc_hash(b: []const u8) -> u64 {
+    var h : u64 = 5381;
+    var i : usize = 0;
+    while (i < b.len) {
+        h = ((h << 5) +% h) ^ @as(u64, b[i]);
+        i = i + 1;
+    }
+    return h;
+}
+
+/// The next frame is due when none was made yet or VC_PERIOD_MS passed. One frame per call: a late poll does not burst.
+pub fn vc_due(now: u64, last: u64) -> bool {
+    if (last == 0) { return true; }
+    return now >= last + VC_PERIOD_MS;
+}
+
+/// Where the next frame comes from: the camera when its last frame (at time cam_at, 0 = none) is fresh, else the
+/// test generator. Switches back and forth by availability and never fails.
+pub fn vc_source(now: u64, cam_at: u64) -> u32 {
+    if (cam_at != 0 and now >= cam_at and now - cam_at <= VC_CAM_FRESH_MS) { return VC_SRC_CAM; }
+    return VC_SRC_GEN;
+}
+
+/// "Video on": a frame was completed within VC_LIVE_MS of now.
+pub fn vc_live(now: u64, last_at: u64) -> bool {
+    return last_at != 0 and now >= last_at and now - last_at <= VC_LIVE_MS;
+}
+
+// ---------------------------------------------------------------- group video (owner, 2026-10-23)
+
+// In a group call every member sends ONE picture a period to every other member whose link is healthy: the frame is
+// made (or taken from the camera) once and sealed once per link, on the link's own key. A link is FULL while it is
+// ACTIVE and its sound arrives (the last frame within VG_STALE_MS, at most VG_UNDER_MAX underruns in the last second);
+// an ACTIVE link that misses either is PARTIAL and gets the sound only, so the video never pushes a weak link over.
+// The receiver shows at most VG_SHOW pictures: the members whose first frame came first; the others are heard only.
+pub const VG_STALE_MS : u64 = 300;
+pub const VG_UNDER_MAX : u64 = 3;
+pub const VG_SHOW : usize = 2;
+/// No link (vg_show).
+pub const VG_NO_LINK : u32 = 255;
+
+/// The video class of a link: GR_NONE (not ACTIVE), GR_PARTIAL (ACTIVE, weak) or GR_FULL.
+pub fn vg_link(active: bool, rx_age_ms: u64, under_1s: u64) -> u32 {
+    if (!active) { return GR_NONE; }
+    if (rx_age_ms > VG_STALE_MS or under_1s > VG_UNDER_MAX) { return GR_PARTIAL; }
+    return GR_FULL;
+}
+
+/// The links a frame goes to: bit k for every link whose class is GR_FULL (never a PARTIAL one), at most 8 links.
+pub fn vg_to(cls: []const u32) -> u32 {
+    var m : u32 = 0;
+    var k : usize = 0;
+    while (k < cls.len and k < 8) {
+        if (cls[k] == GR_FULL) { m = m | (@as(u32, 1) << @as(u32, @intCast(k))); }
+        k = k + 1;
+    }
+    return m;
+}
+
+/// How many links a mask names.
+pub fn vg_count(m: u32) -> u64 {
+    var n : u64 = 0;
+    var x : u32 = m;
+    while (x != 0) {
+        n = n + @as(u64, x & 1);
+        x = x >> 1;
+    }
+    return n;
+}
+
+/// The sender's state (u64 slots): the last due tick, frames sent, encoder jobs queued, due frames skipped because the
+/// encoder was still busy (txencskip), frames sealed and sent summed over the links.
+pub const VG_LAST : usize = 0;
+pub const VG_FRAMES : usize = 1;
+pub const VG_ENC : usize = 2;
+pub const VG_SKIP : usize = 3;
+pub const VG_SENDS : usize = 4;
+pub const VG_N : usize = 5;
+/// What a tick does: send the JPEG at hand to every link of the mask, queue ONE encoder job, or count a skip.
+pub const VG_A_SEND : u32 = 1;
+pub const VG_A_KICK : u32 = 2;
+pub const VG_A_BUSY : u32 = 4;
+
+/// One pass of the group sender. Nothing happens with nobody to send to or before VC_G_PERIOD_MS passed (one frame a
+/// period, a late pass does not burst). `have`: a JPEG is at hand without the encoder (the camera's, or one made in the
+/// pass); `ready`: the encoder published the frame queued last time; `busy`: its job still runs. A frame at hand goes
+/// to every link of `to` (one JPEG, sealed once per link); then one job is queued for the next frame, or, while one
+/// still runs, the frame is skipped and counted: never two jobs in flight, never one job per link.
+pub fn vg_step(st: []u64, now: u64, to: u32, have: bool, ready: bool, busy: bool) -> u32 {
+    if (st.len < VG_N or to == 0) { return 0; }
+    if (st[VG_LAST] != 0 and now < st[VG_LAST] + VC_G_PERIOD_MS) { return 0; }
+    st[VG_LAST] = now;
+    var a : u32 = 0;
+    if (have or ready) {
+        st[VG_FRAMES] = st[VG_FRAMES] + 1;
+        st[VG_SENDS] = st[VG_SENDS] + vg_count(to);
+        a = a | VG_A_SEND;
+    }
+    if (have) { return a; }
+    if (busy) {
+        st[VG_SKIP] = st[VG_SKIP] + 1;
+        a = a | VG_A_BUSY;
+    } else {
+        st[VG_ENC] = st[VG_ENC] + 1;
+        a = a | VG_A_KICK;
+    }
+    return a;
+}
+
+/// The links whose pictures are shown: first[k] is when link k's first frame was complete (0 = none yet); the two
+/// earliest, the lower link first on a tie, as a | b << 8 (VG_NO_LINK for a missing one).
+pub fn vg_show(first: []const u64) -> u32 {
+    var a : u32 = VG_NO_LINK;
+    var b : u32 = VG_NO_LINK;
+    var k : usize = 0;
+    while (k < first.len and k < 8) {
+        const t : u64 = first[k];
+        if (t != 0) {
+            if (a == VG_NO_LINK or t < first[@as(usize, a)]) {
+                b = a;
+                a = @as(u32, @intCast(k));
+            } else if (b == VG_NO_LINK or t < first[@as(usize, b)]) {
+                b = @as(u32, @intCast(k));
+            }
+        }
+        k = k + 1;
+    }
+    return a | (b << 8);
+}
+
+// The assembly state (VR_LEN bytes, u64 LE slots) and the bytes of the frame in assembly are the receiver's.
+pub const VR_LEN : usize = 128;
+pub const VR_CUR : usize = 0;
+pub const VR_MASK : usize = 1;
+pub const VR_TOTAL : usize = 2;
+pub const VR_LAST : usize = 3;
+pub const VR_DONE : usize = 4;
+pub const VR_SKIP : usize = 5;
+pub const VR_PARTS : usize = 6;
+pub const VR_REFUSED : usize = 7;
+pub const VR_STALE : usize = 8;
+pub const VR_HASH : usize = 9;
+pub const VR_SIZE : usize = 10;
+pub const VR_AT : usize = 11;
+
+pub const VR_NO : u32 = 0;
+pub const VR_STORED : u32 = 1;
+pub const VR_COMPLETE : u32 = 2;
+pub const VR_OLD : u32 = 3;
+
+fn vr_g(st: []const u8, k: usize) -> u64 { return get_u64(st, k * 8); }
+fn vr_p(st: []u8, k: usize, v: u64) -> void { put_u64(st, k * 8, v); }
+pub fn vr_get(st: []const u8, k: usize) -> u64 {
+    if (st.len < VR_LEN or k * 8 + 8 > VR_LEN) { return 0; }
+    return vr_g(st, k);
+}
+
+/// Take one opened part. VR_NO a malformed part; VR_STORED kept; VR_OLD a duplicate or a part of a frame that is
+/// already shown or dropped; VR_COMPLETE every part of the frame is in `buf` (buf[0..VR_SIZE]) and it is newer than
+/// the last shown one. The frames between two shown ones are counted as skipped (not those before the first).
+pub fn vr_take(st: []u8, buf: []u8, pt: []const u8, now: u64) -> u32 {
+    if (st.len < VR_LEN or buf.len < VC_JPEG_MAX or !vc_ok(pt)) {
+        if (st.len >= VR_LEN) { vr_p(st, VR_REFUSED, vr_g(st, VR_REFUSED) + 1); }
+        return VR_NO;
+    }
+    const f : u64 = vc_frame(pt);
+    const total : usize = vc_total(pt);
+    const k : usize = vc_index(pt);
+    const n : usize = vc_count(pt);
+    if (f <= vr_g(st, VR_LAST) or (f < vr_g(st, VR_CUR))) {
+        vr_p(st, VR_STALE, vr_g(st, VR_STALE) + 1);
+        return VR_OLD;
+    }
+    if (f > vr_g(st, VR_CUR)) {
+        // a newer frame: whatever was half built is dropped, never shown
+        vr_p(st, VR_CUR, f);
+        vr_p(st, VR_MASK, 0);
+        vr_p(st, VR_TOTAL, @as(u64, total));
+    } else if (vr_g(st, VR_TOTAL) != @as(u64, total)) {
+        vr_p(st, VR_REFUSED, vr_g(st, VR_REFUSED) + 1);
+        return VR_NO;
+    }
+    const bit : u64 = @as(u64, 1) << @as(u64, @intCast(k));
+    if ((vr_g(st, VR_MASK) & bit) != 0) {
+        vr_p(st, VR_STALE, vr_g(st, VR_STALE) + 1);
+        return VR_OLD;
+    }
+    const psz : usize = vc_psz(pt);
+    var i : usize = 0;
+    while (i < pt.len - VC_HDR) {
+        buf[k * psz + i] = pt[VC_HDR + i];
+        i = i + 1;
+    }
+    vr_p(st, VR_MASK, vr_g(st, VR_MASK) | bit);
+    vr_p(st, VR_PARTS, vr_g(st, VR_PARTS) + 1);
+    const all : u64 = (@as(u64, 1) << @as(u64, @intCast(n))) - 1;
+    if (vr_g(st, VR_MASK) != all) { return VR_STORED; }
+    // the numbers before the first frame shown are not frames lost: a link of a group that comes up later gets its
+    // first frame with a number above 1 (the sender numbers one stream for all its links)
+    if (vr_g(st, VR_DONE) > 0) { vr_p(st, VR_SKIP, vr_g(st, VR_SKIP) + (f - vr_g(st, VR_LAST) - 1)); }
+    vr_p(st, VR_LAST, f);
+    vr_p(st, VR_DONE, vr_g(st, VR_DONE) + 1);
+    vr_p(st, VR_SIZE, @as(u64, total));
+    vr_p(st, VR_AT, now);
+    vr_p(st, VR_HASH, vr_g(st, VR_HASH) +% vc_hash(buf[0..total]));
+    vr_p(st, VR_MASK, 0);
+    return VR_COMPLETE;
+}
+
+// ---------------------------------------------------------------- tests
+
+fn ck_fill(b: []u8, base: u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = base +% @as(u8, @intCast(i & 255));
+        i = i + 1;
+    }
+}
+
+test a_call_goes_ring_verify_active_end_and_back_to_idle {
+    var s : u32 = ck_next(CK_IDLE, CK_EV_CALL);
+    assert s == CK_CALLING;
+    s = ck_next(s, CK_EV_ANSWERED);
+    assert s == CK_VERIFY;
+    s = ck_next(s, CK_EV_CODE_OK);
+    assert s == CK_ACTIVE;
+    assert ck_media_ok(s);
+    s = ck_next(s, CK_EV_HANGUP);
+    assert s == CK_ENDED;
+    assert ck_media_ok(s) == false;
+    assert ck_keys_live(s) == false;
+    assert ck_next(s, CK_EV_DISMISS) == CK_IDLE;
+    // the callee's side
+    var r : u32 = ck_next(CK_IDLE, CK_EV_INVITE);
+    assert r == CK_RINGING;
+    r = ck_next(r, CK_EV_ANSWER);
+    assert r == CK_VERIFY;
+    assert ck_keys_live(r);
+    assert ck_media_ok(r) == false;
+    assert ck_next(r, CK_EV_CODE_BAD) == CK_FAILED;
+}
+
+test nothing_answers_by_itself_and_nothing_skips_the_code {
+    // every (state, event): RINGING reaches VERIFY only on the local ANSWER; ACTIVE is entered only from VERIFY on
+    // CODE_OK; IDLE never jumps straight to VERIFY or ACTIVE.
+    var st : u32 = 0;
+    while (st < CK_STATES) {
+        var ev : u32 = 0;
+        while (ev < CK_EVENTS) {
+            const n : u32 = ck_next(st, ev);
+            assert n < CK_STATES;
+            if (st == CK_RINGING and n == CK_VERIFY) { assert ev == CK_EV_ANSWER; }
+            if (n == CK_ACTIVE and st != CK_ACTIVE) { assert st == CK_VERIFY and ev == CK_EV_CODE_OK; }
+            if (n == CK_VERIFY and st != CK_VERIFY) { assert (st == CK_RINGING and ev == CK_EV_ANSWER) or (st == CK_CALLING and ev == CK_EV_ANSWERED); }
+            ev = ev + 1;
+        }
+        st = st + 1;
+    }
+}
+
+test every_end_can_take_the_next_call {
+    // hang-up, decline, cancel, no answer, a bad code and a lost link each end in a state that takes a new call
+    assert ck_next(ck_next(CK_ACTIVE, CK_EV_HANGUP), CK_EV_CALL) == CK_CALLING;
+    assert ck_next(ck_next(CK_RINGING, CK_EV_DECLINE), CK_EV_INVITE) == CK_RINGING;
+    assert ck_next(ck_next(CK_CALLING, CK_EV_CANCEL), CK_EV_CALL) == CK_CALLING;
+    assert ck_next(ck_next(CK_CALLING, CK_EV_TIMEOUT), CK_EV_INVITE) == CK_RINGING;
+    assert ck_next(ck_next(CK_VERIFY, CK_EV_CODE_BAD), CK_EV_CALL) == CK_CALLING;
+    assert ck_next(ck_next(CK_ACTIVE, CK_EV_TIMEOUT), CK_EV_DISMISS) == CK_IDLE;
+    // a busy line ignores a second invite
+    assert ck_next(CK_ACTIVE, CK_EV_INVITE) == CK_ACTIVE;
+    assert ck_next(CK_VERIFY, CK_EV_INVITE) == CK_VERIFY;
+}
+
+test the_code_opens_only_when_both_say_match {
+    assert ck_verdict(CK_SAY_MATCH, CK_SAY_MATCH) == CK_V_OPEN;
+    assert ck_verdict(CK_SAY_MATCH, CK_SAY_NONE) == CK_V_WAIT;
+    assert ck_verdict(CK_SAY_NONE, CK_SAY_MATCH) == CK_V_WAIT;
+    assert ck_verdict(CK_SAY_MATCH, CK_SAY_DIFFER) == CK_V_FAIL;
+    assert ck_verdict(CK_SAY_DIFFER, CK_SAY_MATCH) == CK_V_FAIL;
+    assert ck_verdict(CK_SAY_DIFFER, CK_SAY_NONE) == CK_V_FAIL;
+    assert ck_verdict(CK_SAY_MATCH, 7) == CK_V_FAIL;
+}
+
+test the_header_round_trips_and_names_its_parties {
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    var sid : [16]u8 = undefined;
+    ck_fill(a[0..10], 1);
+    ck_fill(b[0..10], 101);
+    ck_fill(sid[0..16], 200);
+    var h : [52]u8 = undefined;
+    assert ck_put_header(h[0..52], CK_T_MEDIA, a[0..10], b[0..10], sid[0..16], 4660) == CK_HDR;
+    assert h[0] == 84 and h[3] == 80 and h[4] == 1 and h[5] == 32;
+    assert ck_hdr_type(h[0..52]) == CK_T_MEDIA;
+    assert ck_hdr_seq(h[0..52]) == 4660;
+    assert ck_hdr_admit(h[0..52], b[0..10], a[0..10], sid[0..16]);
+    // wrong recipient, wrong sender, wrong session, unknown peer and session (an INVITE) admitted by recipient
+    assert ck_hdr_admit(h[0..52], a[0..10], a[0..10], sid[0..16]) == false;
+    assert ck_hdr_admit(h[0..52], b[0..10], b[0..10], sid[0..16]) == false;
+    sid[3] = sid[3] ^ 1;
+    assert ck_hdr_admit(h[0..52], b[0..10], a[0..10], sid[0..16]) == false;
+    assert ck_hdr_admit(h[0..52], b[0..10], a[0..0], sid[0..0]);
+    // a broken magic, version or reserved byte is no header
+    h[4] = 2;
+    assert ck_hdr_type(h[0..52]) == 0;
+    h[4] = 1;
+    h[7] = 1;
+    assert ck_hdr_type(h[0..52]) == 0;
+    h[7] = 0;
+    h[0] = 0;
+    assert ck_hdr_type(h[0..52]) == 0;
+    assert ck_put_header(h[0..51], CK_T_MEDIA, a[0..10], b[0..10], sid[0..16], 1) == 0;
+    assert ck_put_header(h[0..52], 256, a[0..10], b[0..10], sid[0..16], 1) == 0;
+}
+
+test the_message_sizes_add_up {
+    assert CK_INVITE_LEN == CK_HDR + CK_PUB + CK_HASH;
+    assert CK_ANSWER_LEN == CK_HDR + CK_PUB + CK_NONCE + CK_HASH;
+    assert CK_REVEAL_LEN == CK_HDR + CK_NONCE + CK_HASH;
+    assert CK_TRANSCRIPT_LEN == CK_INVITE_LEN + CK_ANSWER_LEN + CK_REVEAL_LEN;
+    // each message built part by part, the way the session writes it, ends at its length and fits no smaller buffer
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    var sid : [16]u8 = undefined;
+    var pk : [65]u8 = undefined;
+    var nn : [16]u8 = undefined;
+    var hh : [32]u8 = undefined;
+    ck_fill(fa[0..10], 1);
+    ck_fill(fb[0..10], 40);
+    ck_fill(sid[0..16], 80);
+    ck_fill(pk[0..65], 100);
+    ck_fill(nn[0..16], 170);
+    ck_fill(hh[0..32], 190);
+    var b : [CK_ANSWER_LEN]u8 = undefined;
+    // INVITE: the header, the ephemeral public key, the commitment
+    var n : usize = ck_put_header(b[0..CK_ANSWER_LEN], CK_T_INVITE, fa[0..10], fb[0..10], sid[0..16], 1);
+    n = ck_put(b[0..CK_ANSWER_LEN], n, pk[0..65]);
+    n = ck_put(b[0..CK_ANSWER_LEN], n, hh[0..32]);
+    assert n == CK_INVITE_LEN;
+    // ANSWER: the header, the ephemeral public key, N_R, H(INVITE); it fills the buffer, one byte less refuses
+    n = ck_put_header(b[0..CK_ANSWER_LEN], CK_T_ANSWER, fb[0..10], fa[0..10], sid[0..16], 1);
+    n = ck_put(b[0..CK_ANSWER_LEN], n, pk[0..65]);
+    n = ck_put(b[0..CK_ANSWER_LEN], n, nn[0..16]);
+    assert ck_put(b[0..CK_ANSWER_LEN - 1], n, hh[0..32]) == 0;
+    n = ck_put(b[0..CK_ANSWER_LEN], n, hh[0..32]);
+    assert n == CK_ANSWER_LEN;
+    // REVEAL: the header, N_I, H(ANSWER)
+    n = ck_put_header(b[0..CK_ANSWER_LEN], CK_T_REVEAL, fa[0..10], fb[0..10], sid[0..16], 2);
+    n = ck_put(b[0..CK_ANSWER_LEN], n, nn[0..16]);
+    n = ck_put(b[0..CK_ANSWER_LEN], n, hh[0..32]);
+    assert n == CK_REVEAL_LEN;
+}
+
+test the_commitment_binds_session_parties_key_and_nonce {
+    var sid : [16]u8 = undefined;
+    var fi : [10]u8 = undefined;
+    var fr : [10]u8 = undefined;
+    var pk : [65]u8 = undefined;
+    var ni : [16]u8 = undefined;
+    ck_fill(sid[0..16], 3);
+    ck_fill(fi[0..10], 30);
+    ck_fill(fr[0..10], 60);
+    ck_fill(pk[0..65], 90);
+    ck_fill(ni[0..16], 160);
+    var o : [160]u8 = undefined;
+    const n : usize = ck_commit_input(sid[0..16], fi[0..10], fr[0..10], pk[0..65], ni[0..16], o[0..160]);
+    assert n == 21 + 16 + 10 + 10 + 65 + 16;
+    assert o[0] == 116 and o[20] == 10;
+    assert o[21] == sid[0] and o[37] == fi[0] and o[47] == fr[0] and o[57] == pk[0] and o[122] == ni[0];
+    // swapping the parties changes the input
+    var p : [160]u8 = undefined;
+    assert ck_commit_input(sid[0..16], fr[0..10], fi[0..10], pk[0..65], ni[0..16], p[0..160]) == n;
+    assert ck_same(o[0..n], p[0..n]) == false;
+    // wrong sizes and a short buffer
+    assert ck_commit_input(sid[0..15], fi[0..10], fr[0..10], pk[0..65], ni[0..16], o[0..160]) == 0;
+    assert ck_commit_input(sid[0..16], fi[0..10], fr[0..10], pk[0..64], ni[0..16], o[0..160]) == 0;
+    assert ck_commit_input(sid[0..16], fi[0..10], fr[0..10], pk[0..65], ni[0..16], o[0..137]) == 0;
+}
+
+test the_identity_proof_signs_role_session_transcript_own_key_and_both_parties {
+    var sid : [16]u8 = undefined;
+    var t : [32]u8 = undefined;
+    var pk : [65]u8 = undefined;
+    var fa : [10]u8 = undefined;
+    var fb : [10]u8 = undefined;
+    ck_fill(sid[0..16], 3);
+    ck_fill(t[0..32], 40);
+    ck_fill(pk[0..65], 90);
+    ck_fill(fa[0..10], 30);
+    ck_fill(fb[0..10], 60);
+    var o : [160]u8 = undefined;
+    const n : usize = ck_ident_input(true, sid[0..16], t[0..32], pk[0..65], fa[0..10], fb[0..10], o[0..160]);
+    assert n == CK_IDENT_INPUT_LEN;
+    assert n == 20 + 1 + 16 + 32 + 65 + 10 + 10;
+    assert o[0] == 116 and o[19] == 10;
+    assert o[20] == 1;
+    assert o[21] == sid[0] and o[37] == t[0] and o[69] == pk[0] and o[134] == fa[0] and o[144] == fb[0];
+    // the other role, the parties swapped or another transcript sign other bytes
+    var p : [160]u8 = undefined;
+    assert ck_ident_input(false, sid[0..16], t[0..32], pk[0..65], fa[0..10], fb[0..10], p[0..160]) == n;
+    assert ck_same(o[0..n], p[0..n]) == false;
+    assert ck_ident_input(true, sid[0..16], t[0..32], pk[0..65], fb[0..10], fa[0..10], p[0..160]) == n;
+    assert ck_same(o[0..n], p[0..n]) == false;
+    var t2 : [32]u8 = t;
+    t2[31] = t2[31] ^ 1;
+    assert ck_ident_input(true, sid[0..16], t2[0..32], pk[0..65], fa[0..10], fb[0..10], p[0..160]) == n;
+    assert ck_same(o[0..n], p[0..n]) == false;
+    // wrong sizes and a short buffer
+    assert ck_ident_input(true, sid[0..15], t[0..32], pk[0..65], fa[0..10], fb[0..10], o[0..160]) == 0;
+    assert ck_ident_input(true, sid[0..16], t[0..31], pk[0..65], fa[0..10], fb[0..10], o[0..160]) == 0;
+    assert ck_ident_input(true, sid[0..16], t[0..32], pk[0..65], fa[0..10], fb[0..10], o[0..153]) == 0;
+}
+
+test the_identity_frame_carries_the_key_and_a_signature_of_8_to_72_bytes {
+    var k : [65]u8 = undefined;
+    ck_fill(k[0..65], 9);
+    k[0] = 4;
+    var sig : [72]u8 = undefined;
+    ck_fill(sig[0..72], 200);
+    var pt : [138]u8 = undefined;
+    assert ck_ident_build(k[0..65], sig[0..70], pt[0..138]) == CK_IDENT_PT;
+    assert ck_ident_sig_len(pt[0..138]) == 70;
+    assert ck_same(pt[0..65], k[0..65]);
+    assert pt[66] == sig[0] and pt[135] == sig[69] and pt[136] == 0 and pt[137] == 0;
+    assert ck_ident_build(k[0..65], sig[0..72], pt[0..138]) == CK_IDENT_PT;
+    assert ck_ident_sig_len(pt[0..138]) == 72;
+    // too short or too long a signature, a key that is not a point, a short buffer
+    assert ck_ident_build(k[0..65], sig[0..7], pt[0..138]) == 0;
+    var k2 : [65]u8 = k;
+    k2[0] = 2;
+    assert ck_ident_build(k2[0..65], sig[0..70], pt[0..138]) == 0;
+    assert ck_ident_build(k[0..65], sig[0..70], pt[0..137]) == 0;
+    // a malformed frame reads as no signature
+    assert ck_ident_build(k[0..65], sig[0..70], pt[0..138]) == CK_IDENT_PT;
+    var a : [138]u8 = pt;
+    a[65] = 73;
+    assert ck_ident_sig_len(a[0..138]) == 0;
+    var b : [138]u8 = pt;
+    b[137] = 1;
+    assert ck_ident_sig_len(b[0..138]) == 0;
+    var c : [138]u8 = pt;
+    c[0] = 3;
+    assert ck_ident_sig_len(c[0..138]) == 0;
+    assert ck_ident_sig_len(pt[0..137]) == 0;
+}
+
+test the_transcript_is_the_three_messages_in_order {
+    var t : [414]u8 = undefined;
+    var m1 : [149]u8 = undefined;
+    var m2 : [165]u8 = undefined;
+    var m3 : [100]u8 = undefined;
+    ck_fill(m1[0..149], 1);
+    ck_fill(m2[0..165], 2);
+    ck_fill(m3[0..100], 3);
+    var u : usize = ck_transcript_add(t[0..414], 0, m1[0..149]);
+    assert u == 149;
+    u = ck_transcript_add(t[0..414], u, m2[0..165]);
+    assert u == 314;
+    u = ck_transcript_add(t[0..414], u, m3[0..100]);
+    assert u == CK_TRANSCRIPT_LEN;
+    assert t[0] == m1[0] and t[149] == m2[0] and t[314] == m3[0] and t[413] == m3[99];
+    assert ck_transcript_add(t[0..414], u, m3[0..1]) == 0;
+}
+
+test the_code_is_six_digits_from_the_first_four_bytes {
+    var d : [32]u8 = undefined;
+    ck_wipe(d[0..32]);
+    var c : [6]u8 = undefined;
+    assert ck_sas_digits(d[0..32], c[0..6]) == 0;
+    assert ck_same(c[0..6], "000000");
+    // 0xFFFFFFFF = 4294967295 -> 967295
+    d[0] = 255;
+    d[1] = 255;
+    d[2] = 255;
+    d[3] = 255;
+    assert ck_sas_digits(d[0..32], c[0..6]) == 967295;
+    assert ck_same(c[0..6], "967295");
+    // 0x00012345 = 74565 -> 074565 (leading zero kept); byte 4 is not used
+    d[0] = 0;
+    d[1] = 1;
+    d[2] = 35;
+    d[3] = 69;
+    d[4] = 99;
+    assert ck_sas_digits(d[0..32], c[0..6]) == 74565;
+    assert ck_same(c[0..6], "074565");
+    assert ck_sas_digits(d[0..3], c[0..6]) == 1000000;
+    var si : [64]u8 = undefined;
+    assert ck_sas_input(d[0..32], si[0..64]) == 18 + 32;
+    assert si[18] == d[0];
+    assert ck_sas_input(d[0..31], si[0..64]) == 0;
+}
+
+test five_failed_codes_pause_the_link_for_a_minute_and_a_match_clears_the_count {
+    var f : [16]u8 = undefined;
+    ck_wipe(f[0..16]);
+    assert ck_rate_ok(f[0..16], 1000);
+    ck_rate_note(f[0..16], 1000);
+    ck_rate_note(f[0..16], 2000);
+    ck_rate_note(f[0..16], 3000);
+    ck_rate_note(f[0..16], 4000);
+    // four failures: still allowed
+    assert ck_rate_ok(f[0..16], 4500);
+    ck_rate_note(f[0..16], 5000);
+    // the fifth starts a pause of 60 s: the sixth attempt is refused for the whole minute
+    assert ck_rate_ok(f[0..16], 5000) == false;
+    assert ck_rate_ok(f[0..16], 5000 + CK_PAUSE_MS - 1) == false;
+    assert ck_rate_ok(f[0..16], 5000 + CK_PAUSE_MS);
+    // the count started again: four more do not pause
+    assert get_u64(f[0..16], 0) == 0;
+    ck_rate_note(f[0..16], 70000);
+    ck_rate_note(f[0..16], 71000);
+    ck_rate_note(f[0..16], 72000);
+    ck_rate_note(f[0..16], 73000);
+    assert ck_rate_ok(f[0..16], 73500);
+    // a matched code clears the count: two more failures after it do not pause
+    ck_rate_reset(f[0..16]);
+    ck_rate_note(f[0..16], 74000);
+    ck_rate_note(f[0..16], 75000);
+    assert ck_rate_ok(f[0..16], 75500);
+    assert get_u64(f[0..16], 0) == 2;
+    // a short block says no and is not written
+    assert ck_rate_ok(f[0..15], 900000) == false;
+    // what counts: a differ on either side, a broken commitment; nothing else
+    assert ck_rate_counts(true, false);
+    assert ck_rate_counts(false, true);
+    assert ck_rate_counts(false, false) == false;
+}
+
+test four_failures_and_a_match_never_pause {
+    var f : [16]u8 = undefined;
+    ck_wipe(f[0..16]);
+    var r : u32 = 0;
+    while (r < 3) {
+        ck_rate_note(f[0..16], 1000);
+        ck_rate_note(f[0..16], 1000);
+        ck_rate_note(f[0..16], 1000);
+        ck_rate_note(f[0..16], 1000);
+        ck_rate_reset(f[0..16]);
+        r = r + 1;
+    }
+    assert ck_rate_ok(f[0..16], 1000);
+    assert get_u64(f[0..16], 8) == 0;
+}
+
+test the_replay_window_takes_each_seq_once {
+    var w : [72]u8 = undefined;
+    ck_wipe(w[0..72]);
+    assert ck_replay_accept(w[0..72], 0) == false;
+    assert ck_replay_accept(w[0..72], 1);
+    assert ck_replay_accept(w[0..72], 1) == false;
+    assert ck_replay_accept(w[0..72], 3);
+    // 2 arrives late but inside the window: accepted once
+    assert ck_replay_check(w[0..72], 2) == CK_RP_FILL;
+    assert ck_replay_accept(w[0..72], 2);
+    assert ck_replay_accept(w[0..72], 2) == false;
+    assert ck_replay_check(w[0..72], 3) == CK_RP_DUP;
+    // jump far ahead: everything 64 or more behind is too old, the window is clean for what is inside
+    assert ck_replay_accept(w[0..72], 1000);
+    assert ck_replay_check(w[0..72], 936) == CK_RP_OLD;
+    assert ck_replay_check(w[0..72], 937) == CK_RP_FILL;
+    assert ck_replay_check(w[0..72], 1000) == CK_RP_DUP;
+    assert ck_replay_accept(w[0..72], 937);
+    assert ck_replay_accept(w[0..72], 937) == false;
+    // a slot reused by seq + 64 is cleared when the window moves over it
+    assert ck_replay_accept(w[0..72], 1001);
+    assert ck_replay_check(w[0..72], 1001 - 64) == CK_RP_OLD;
+    assert ck_replay_accept(w[0..72], 1065);
+    assert ck_replay_check(w[0..72], 1064) == CK_RP_FILL;
+    assert ck_replay_check(w[0..72], 1001) == CK_RP_OLD;
+    // checking does not change the window
+    assert ck_replay_check(w[0..72], 2000) == CK_RP_AHEAD;
+    assert get_u64(w[0..72], 0) == 1065;
+}
+
+test every_seq_in_order_and_out_of_order_is_taken_exactly_once {
+    var w : [72]u8 = undefined;
+    ck_wipe(w[0..72]);
+    var taken : u64 = 0;
+    var s : u64 = 1;
+    while (s <= 500) {
+        // pairs swapped: 2,1,4,3,...
+        var q : u64 = s + 1;
+        if (s % 2 == 0) { q = s - 1; }
+        if (ck_replay_accept(w[0..72], q)) { taken = taken + 1; }
+        if (ck_replay_accept(w[0..72], q)) { taken = taken + 1000; }
+        s = s + 1;
+    }
+    assert taken == 500;
+}
+
+test a_frame_the_player_has_passed_is_late {
+    assert ck_late(9, 10);
+    assert ck_late(10, 10) == false;
+    assert ck_late(11, 10) == false;
+}
+
+test the_sender_seq_starts_at_one_and_stops_before_wrapping {
+    var c : [8]u8 = undefined;
+    ck_wipe(c[0..8]);
+    assert ck_send_seq(c[0..8]) == 1;
+    assert ck_send_seq(c[0..8]) == 2;
+    put_u64(c[0..8], 0, CK_SEQ_MAX - 1);
+    assert ck_send_seq(c[0..8]) == CK_SEQ_MAX;
+    assert ck_send_seq(c[0..8]) == 0;
+    assert ck_send_seq(c[0..8]) == 0;
+}
+
+test each_direction_has_its_own_key_input {
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    var sid : [16]u8 = undefined;
+    ck_fill(a[0..10], 10);
+    ck_fill(b[0..10], 50);
+    ck_fill(sid[0..16], 90);
+    var e0 : [64]u8 = undefined;
+    var e1 : [64]u8 = undefined;
+    const n : usize = ck_expand_input(0, a[0..10], b[0..10], sid[0..16], e0[0..64]);
+    assert n == 19 + 1 + 10 + 10 + 16 + 1;
+    assert ck_expand_input(1, a[0..10], b[0..10], sid[0..16], e1[0..64]) == n;
+    assert e0[19] == 0 and e1[19] == 1 and e0[n - 1] == 1;
+    assert ck_same(e0[0..n], e1[0..n]) == false;
+    // another session gives another input
+    sid[15] = sid[15] ^ 128;
+    assert ck_expand_input(0, a[0..10], b[0..10], sid[0..16], e1[0..64]) == n;
+    assert ck_same(e0[0..n], e1[0..n]) == false;
+    assert ck_expand_input(2, a[0..10], b[0..10], sid[0..16], e1[0..64]) == 0;
+    assert ck_expand_input(0, a[0..10], b[0..10], sid[0..16], e1[0..56]) == 0;
+    assert ck_tx_dir(true) == 0 and ck_tx_dir(false) == 1;
+}
+
+test the_nonce_is_the_iv_xor_the_seq_and_never_repeats_for_distinct_seq {
+    var iv : [12]u8 = undefined;
+    ck_fill(iv[0..12], 7);
+    var n1 : [12]u8 = undefined;
+    var n2 : [12]u8 = undefined;
+    assert ck_nonce(iv[0..12], 0, n1[0..12]);
+    assert ck_same(n1[0..12], iv[0..12]);
+    assert ck_nonce(iv[0..12], 258, n1[0..12]);
+    assert n1[11] == iv[11] ^ 2 and n1[10] == iv[10] ^ 1 and n1[0] == iv[0] and n1[3] == iv[3];
+    // seqs that differ only in a high byte still give different nonces
+    assert ck_nonce(iv[0..12], 258 + 72057594037927936, n2[0..12]);
+    assert ck_same(n1[0..12], n2[0..12]) == false;
+    assert n2[4] == iv[4] ^ 1;
+    assert ck_nonce(iv[0..11], 1, n1[0..12]) == false;
+}
+
+test equal_compares_every_byte {
+    assert ck_same("abc", "abc");
+    assert ck_same("abc", "abd") == false;
+    assert ck_same("abc", "ab") == false;
+    var b : [4]u8 = undefined;
+    assert ck_put(b[0..4], 1, "xyz") == 4;
+    assert ck_put(b[0..4], 2, "xyz") == 0;
+    kfill(b[0..4], 7);
+    assert b[0] == 7 and b[3] == 7;
+    ck_wipe(b[1..3]);
+    assert b[0] == 7 and b[1] == 0 and b[2] == 0 and b[3] == 7;
+}
+
+test the_group_goes_waiting_partial_full_and_ended {
+    // nothing opened here
+    assert gr_state(false, 0, 0, 0) == GR_NONE;
+    // A picked B and C: both pending, nobody up
+    assert gr_state(true, 2, 0, 0) == GR_WAITING;
+    // B is up, C still linking
+    assert gr_state(true, 1, 1, 0) == GR_PARTIAL;
+    // both up
+    assert gr_state(true, 0, 2, 0) == GR_FULL;
+    // B leaves: C stays, the roster is no longer whole
+    assert gr_state(true, 0, 1, 1) == GR_PARTIAL;
+    // C leaves too: nobody is left to talk to
+    assert gr_state(true, 0, 0, 2) == GR_ENDED;
+    // everybody the group listed declined
+    assert gr_state(true, 0, 0, 0) == GR_ENDED;
+    // a late member listed while two are up
+    assert gr_state(true, 1, 2, 0) == GR_PARTIAL;
+    assert gr_state(true, 0, 3, 0) == GR_FULL;
+}
+
+test group_member_status_follows_its_link {
+    assert gm_status(false, CK_IDLE, false) == GM_KNOWN;
+    assert gm_status(true, CK_CALLING, false) == GM_LINKING;
+    assert gm_status(true, CK_RINGING, false) == GM_LINKING;
+    assert gm_status(true, CK_VERIFY, false) == GM_LINKING;
+    assert gm_status(true, CK_ACTIVE, true) == GM_UP;
+    assert gm_status(true, CK_ENDED, true) == GM_LEFT;
+    assert gm_status(true, CK_FAILED, true) == GM_LEFT;
+    assert gm_status(true, CK_ENDED, false) == GM_FAILED;
+    assert gm_status(true, CK_FAILED, false) == GM_FAILED;
+    assert gm_status(false, CK_IDLE, true) == GM_LEFT;
+    assert gm_pending(GM_KNOWN) and gm_pending(GM_LINKING);
+    assert gm_pending(GM_UP) == false and gm_pending(GM_LEFT) == false and gm_pending(GM_FAILED) == false;
+}
+
+test exactly_one_of_two_members_dials_first {
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    ck_fill(a[0..10], 10);
+    ck_fill(b[0..10], 20);
+    // the lower fingerprint dials at once, the higher waits
+    assert gr_should_dial(a[0..10], b[0..10], false, 0);
+    assert gr_should_dial(b[0..10], a[0..10], false, 0) == false;
+    assert gr_should_dial(b[0..10], a[0..10], false, GR_WAIT_MS - 1) == false;
+    // the one that waited long enough dials anyway (the other never came)
+    assert gr_should_dial(b[0..10], a[0..10], false, GR_WAIT_MS);
+    // the person I picked myself is dialled at once, whichever fingerprint is lower
+    assert gr_should_dial(b[0..10], a[0..10], true, 0);
+    // never myself
+    assert gr_should_dial(a[0..10], a[0..10], true, 99999) == false;
+    // a difference in the last byte decides
+    ck_fill(b[0..10], 10);
+    b[9] = b[9] + 1;
+    assert gr_fp_less(a[0..10], b[0..10]) and gr_fp_less(b[0..10], a[0..10]) == false;
+    assert gr_fp_less(a[0..10], a[0..10]) == false;
+}
+
+test a_late_member_is_dialled_by_the_lower_fingerprints_and_dials_the_rest {
+    // D joins A's group of A, B, C. Each pair has exactly one first dialler, so no pair is dialled twice at once.
+    var f0 : [10]u8 = undefined;
+    var f1 : [10]u8 = undefined;
+    var f2 : [10]u8 = undefined;
+    var f3 : [10]u8 = undefined;
+    ck_fill(f0[0..10], 40);
+    ck_fill(f1[0..10], 90);
+    ck_fill(f2[0..10], 20);
+    ck_fill(f3[0..10], 60);
+    var firsts : u32 = 0;
+    if (gr_should_dial(f0[0..10], f1[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f1[0..10], f0[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f0[0..10], f2[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f2[0..10], f0[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f0[0..10], f3[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f3[0..10], f0[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f1[0..10], f2[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f2[0..10], f1[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f1[0..10], f3[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f3[0..10], f1[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f2[0..10], f3[0..10], false, 0)) { firsts = firsts + 1; }
+    if (gr_should_dial(f3[0..10], f2[0..10], false, 0)) { firsts = firsts + 1; }
+    // 6 pairs, one first dialler each
+    assert firsts == 6;
+}
+
+test the_sum_of_voices_is_clamped_not_wrapped {
+    assert gr_s16(0, 0) == 0;
+    assert gr_s16(255, 127) == 32767;
+    assert gr_s16(0, 128) == -32768;
+    assert gr_s16(255, 255) == -1;
+    assert gr_clamp16(30000 + 30000) == 32767;
+    assert gr_clamp16(-30000 - 30000) == -32768;
+    assert gr_clamp16(1000 - 400) == 600;
+    assert gr_clamp16(32767) == 32767 and gr_clamp16(-32768) == -32768;
+    var o : [4]u8 = undefined;
+    gr_put16(o[0..4], 0, 32767);
+    gr_put16(o[0..4], 2, -32768);
+    assert o[0] == 255 and o[1] == 127 and o[2] == 0 and o[3] == 128;
+    assert gr_s16(o[0], o[1]) == 32767 and gr_s16(o[2], o[3]) == -32768;
+    gr_put16(o[0..4], 0, -1);
+    assert o[0] == 255 and o[1] == 255;
+    assert gr_abs16(-32768) == 32768 and gr_abs16(7) == 7 and gr_abs16(-7) == 7 and gr_abs16(0) == 0;
+    // two loud equal voices: the wrapped sum would flip the sign, the clamped one holds the ceiling
+    assert gr_clamp16(gr_s16(0, 120) + gr_s16(0, 120)) == 32767;
+}
+
+test the_member_list_round_trips_and_refuses_a_short_or_marked_wrong_body {
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    ck_fill(a[0..10], 1);
+    ck_fill(b[0..10], 2);
+    var l : [72]u8 = undefined;
+    gr_list_init(l[0..72]);
+    assert gr_list_ok(l[0..72]) == false;
+    assert gr_list_add(l[0..72], a[0..10], 3232235787, 47741) == 1;
+    assert gr_list_add(l[0..72], b[0..10], 3232235787, 47742) == 2;
+    assert gr_list_ok(l[0..8 + 32]);
+    assert gr_list_ok(l[0..8 + 31]) == false;
+    assert gr_list_count(l[0..72]) == 2;
+    assert gr_list_ip(l[0..72], 0) == 3232235787 and gr_list_port(l[0..72], 0) == 47741;
+    assert gr_list_ip(l[0..72], 1) == 3232235787 and gr_list_port(l[0..72], 1) == 47742;
+    assert l[8] == 1 and l[8 + 16] == 2;
+    // a loopback or empty address from a sender on another machine is the sender's machine; a LAN one stays
+    assert gr_list_reach(2130706433, 3232235784) == 3232235784;
+    assert gr_list_reach(0, 3232235784) == 3232235784;
+    assert gr_list_reach(3232235780, 3232235784) == 3232235780;
+    // from a sender on this machine (or an unknown one) the list is taken as it is
+    assert gr_list_reach(2130706433, 2130706433) == 2130706433;
+    assert gr_list_reach(2130706433, 0) == 2130706433;
+    // a fifth does not fit, the count stays
+    assert gr_list_add(l[0..72], a[0..10], 1, 1) == 3;
+    assert gr_list_add(l[0..72], a[0..10], 1, 1) == 4;
+    assert gr_list_add(l[0..72], a[0..10], 1, 1) == 4;
+    // a wrong marker, a zero count and media (192) are not a list
+    l[4] = 192;
+    assert gr_list_ok(l[0..72]) == false;
+    l[4] = 193;
+    l[6] = 0;
+    assert gr_list_ok(l[0..72]) == false;
+}
+
+fn gr_test_list(out: []u8, n: usize) -> usize {
+    gr_list_init(out);
+    var f : [10]u8 = undefined;
+    var k : usize = 0;
+    while (k < 10) {
+        f[k] = @as(u8, @intCast(k + 1));
+        k = k + 1;
+    }
+    k = 0;
+    while (k < n) {
+        f[0] = @as(u8, @intCast(k + 1));
+        gr_list_add(out, f[0..10], 3232235777 + @as(u64, k), 47727);
+        k = k + 1;
+    }
+    return GR_LIST_HDR + gr_list_count(out) * GR_ENTRY;
+}
+
+test a_list_is_taken_only_from_the_trusted_friend_that_called_me {
+    var l : [72]u8 = undefined;
+    const n : usize = gr_test_list(l[0..72], 3);
+    assert gr_list_admit(l[0..n], true, true) == GR_LR_OK;
+    // from the side I called (not the initiator of the link): refused, trusted or not
+    assert gr_list_admit(l[0..n], false, true) == GR_LR_NOT_INITIATOR;
+    assert gr_list_admit(l[0..n], false, false) == GR_LR_NOT_INITIATOR;
+    // from the initiator that is not a trusted friend: refused
+    assert gr_list_admit(l[0..n], true, false) == GR_LR_UNTRUSTED;
+    // trusted: the proof verified and the key is the stored one (before the call, or stored now)
+    assert gr_trusted(true, true, false);
+    assert gr_trusted(true, false, true);
+    assert gr_trusted(true, false, false) == false;
+    assert gr_trusted(false, true, true) == false;
+    // a broken body or not a list at all
+    assert gr_list_admit(l[0..n - 1], true, true) == GR_LR_FORM;
+    l[4] = 192;
+    assert gr_list_admit(l[0..n], true, true) == GR_LR_FORM;
+}
+
+test a_list_of_nine_members_is_refused_whoever_sends_it {
+    var big : [160]u8 = undefined;
+    ck_wipe(big[0..160]);
+    gr_list_init(big[0..160]);
+    big[6] = 9;
+    assert gr_list_admit(big[0..152], true, true) == GR_LR_SIZE;
+    assert gr_list_admit(big[0..152], false, false) == GR_LR_SIZE;
+    // eight is the cap of the rule; past GR_MAX the table cannot hold it, so it is refused as a form
+    big[6] = 8;
+    assert gr_list_admit(big[0..136], true, true) == GR_LR_FORM;
+    assert GR_LIST_CAP == 8;
+}
+
+test a_link_has_its_list_taken_at_most_every_two_seconds {
+    assert gr_list_due(5000, 0);
+    assert gr_list_due(5000, 4000) == false;
+    assert gr_list_due(5999, 4000) == false;
+    assert gr_list_due(6000, 4000);
+}
+
+test a_list_is_known_by_its_marker_and_version_alone_and_a_short_body_is_not_one {
+    var l : [72]u8 = undefined;
+    const n : usize = gr_test_list(l[0..72], 2);
+    assert gr_list_kind(l[0..n]);
+    // the header alone is enough: a list with no members still looks like one (gr_list_admit then says FORM)
+    assert gr_list_kind(l[0..GR_LIST_HDR]);
+    l[6] = 0;
+    assert gr_list_kind(l[0..n]) and gr_list_ok(l[0..n]) == false;
+    assert gr_list_admit(l[0..n], true, true) == GR_LR_FORM;
+    // one byte short of the header, or nothing at all
+    assert gr_list_kind(l[0..GR_LIST_HDR - 1]) == false;
+    assert gr_list_kind(l[0..0]) == false;
+    // the marker: media (192) and the next byte (194) are not a list
+    l[4] = 192;
+    assert gr_list_kind(l[0..n]) == false;
+    l[4] = 194;
+    assert gr_list_kind(l[0..n]) == false;
+    l[4] = GR_LIST_KIND;
+    // the version: only 3
+    l[5] = 2;
+    assert gr_list_kind(l[0..n]) == false;
+    l[5] = 4;
+    assert gr_list_kind(l[0..n]) == false;
+    l[5] = 3;
+    assert gr_list_kind(l[0..n]);
+}
+
+fn vc_fake(j: []u8, n: usize, seed: u8) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        j[i] = seed +% @as(u8, @intCast((i * 13 + i / 7) & 255));
+        i = i + 1;
+    }
+}
+
+test a_jpeg_is_cut_in_parts_of_1000_and_the_last_is_what_is_left {
+    assert vc_parts_for(0) == 0;
+    assert vc_parts_for(1) == 1;
+    assert vc_parts_for(1000) == 1;
+    assert vc_parts_for(1001) == 2;
+    assert vc_parts_for(7900) == 8;
+    assert vc_parts_for(VC_JPEG_MAX) == VC_PARTS_MAX;
+    assert vc_parts_for(VC_JPEG_MAX + 1) == 0;
+    assert vc_cut_len(7900, 0) == 1000;
+    assert vc_cut_len(7900, 6) == 1000;
+    assert vc_cut_len(7900, 7) == 900;
+    assert vc_cut_len(7900, 8) == 0;
+    assert vc_cut_len(2000, 1) == 1000;
+    // a sealed part fits a datagram with room to spare
+    assert CK_HDR + VC_PT_MAX + CK_TAG == 1080;
+    assert VC_HDR + VC_PART == VC_PT_MAX;
+}
+
+test a_part_names_its_frame_index_count_and_total_and_reads_back {
+    var j : [7900]u8 = undefined;
+    vc_fake(j[0..7900], 7900, 3);
+    var pt : [1012]u8 = undefined;
+    assert vc_part(pt[0..1012], 77, j[0..7900], 7) == VC_HDR + 900;
+    assert vc_ok(pt[0..VC_HDR + 900]);
+    assert vc_frame(pt[0..VC_HDR + 900]) == 77;
+    assert vc_index(pt[0..VC_HDR + 900]) == 7;
+    assert vc_count(pt[0..VC_HDR + 900]) == 8;
+    assert vc_total(pt[0..VC_HDR + 900]) == 7900;
+    assert pt[VC_HDR] == j[7000];
+    assert pt[VC_HDR + 899] == j[7899];
+    // refusals: part out of range, frame 0, an out too short for the part
+    assert vc_part(pt[0..1012], 77, j[0..7900], 8) == 0;
+    assert vc_part(pt[0..1012], 0, j[0..7900], 0) == 0;
+    assert vc_part(pt[0..100], 77, j[0..7900], 0) == 0;
+}
+
+test a_malformed_part_is_refused {
+    var j : [2500]u8 = undefined;
+    vc_fake(j[0..2500], 2500, 9);
+    var pt : [1012]u8 = undefined;
+    const n : usize = vc_part(pt[0..1012], 5, j[0..2500], 1);
+    assert vc_ok(pt[0..n]);
+    assert vc_ok(pt[0..n - 1]) == false;
+    assert vc_ok(pt[0..VC_HDR]) == false;
+    pt[6] = 4;
+    assert vc_ok(pt[0..n]) == false;
+    pt[6] = 3;
+    pt[4] = 3;
+    assert vc_ok(pt[0..n]) == false;
+    pt[4] = 1;
+    vc_put32(pt[0..1012], 0, 0);
+    assert vc_ok(pt[0..n]) == false;
+    vc_put32(pt[0..1012], 0, 5);
+    vc_put32(pt[0..1012], 8, 30000);
+    assert vc_ok(pt[0..n]) == false;
+}
+
+test every_part_in_any_order_builds_the_same_jpeg_once {
+    var j : [7900]u8 = undefined;
+    vc_fake(j[0..7900], 7900, 11);
+    var st : [128]u8 = undefined;
+    kfill(st[0..128], 0);
+    var buf : [24576]u8 = undefined;
+    var pt : [1012]u8 = undefined;
+    var order : [8]usize = undefined;
+    order[0] = 3;
+    order[1] = 0;
+    order[2] = 7;
+    order[3] = 5;
+    order[4] = 1;
+    order[5] = 6;
+    order[6] = 2;
+    order[7] = 4;
+    var i : usize = 0;
+    var got : u32 = 0;
+    while (i < 8) {
+        const n : usize = vc_part(pt[0..1012], 1, j[0..7900], order[i]);
+        got = vr_take(st[0..128], buf[0..24576], pt[0..n], 1000);
+        if (i < 7) { assert got == VR_STORED; }
+        i = i + 1;
+    }
+    assert got == VR_COMPLETE;
+    assert vr_get(st[0..128], VR_DONE) == 1;
+    assert vr_get(st[0..128], VR_LAST) == 1;
+    assert vr_get(st[0..128], VR_SIZE) == 7900;
+    assert vr_get(st[0..128], VR_SKIP) == 0;
+    assert vr_get(st[0..128], VR_HASH) == vc_hash(j[0..7900]);
+    var same : bool = true;
+    i = 0;
+    while (i < 7900) {
+        if (buf[i] != j[i]) { same = false; }
+        i = i + 1;
+    }
+    assert same;
+    // the same part again is a duplicate of a shown frame
+    const n2 : usize = vc_part(pt[0..1012], 1, j[0..7900], 2);
+    assert vr_take(st[0..128], buf[0..24576], pt[0..n2], 1000) == VR_OLD;
+    assert vr_get(st[0..128], VR_DONE) == 1;
+}
+
+test a_frame_missing_one_part_is_never_shown_and_the_next_one_is {
+    var j1 : [3500]u8 = undefined;
+    var j2 : [3600]u8 = undefined;
+    var j3 : [3700]u8 = undefined;
+    vc_fake(j1[0..3500], 3500, 1);
+    vc_fake(j2[0..3600], 3600, 2);
+    vc_fake(j3[0..3700], 3700, 3);
+    var st : [128]u8 = undefined;
+    kfill(st[0..128], 0);
+    var buf : [24576]u8 = undefined;
+    var pt : [1012]u8 = undefined;
+    var k : usize = 0;
+    var r : u32 = 0;
+    while (k < 4) {
+        const n : usize = vc_part(pt[0..1012], 1, j1[0..3500], k);
+        r = vr_take(st[0..128], buf[0..24576], pt[0..n], 100);
+        k = k + 1;
+    }
+    assert r == VR_COMPLETE;
+    // frame 2 loses part 1
+    k = 0;
+    while (k < 4) {
+        if (k != 1) {
+            const n : usize = vc_part(pt[0..1012], 2, j2[0..3600], k);
+            r = vr_take(st[0..128], buf[0..24576], pt[0..n], 200);
+            assert r == VR_STORED;
+        }
+        k = k + 1;
+    }
+    assert vr_get(st[0..128], VR_DONE) == 1;
+    // frame 3 arrives whole: it replaces the half-built frame 2 and is shown; frame 2 counts as skipped
+    k = 0;
+    while (k < 4) {
+        const n : usize = vc_part(pt[0..1012], 3, j3[0..3700], k);
+        r = vr_take(st[0..128], buf[0..24576], pt[0..n], 300);
+        k = k + 1;
+    }
+    assert r == VR_COMPLETE;
+    assert vr_get(st[0..128], VR_DONE) == 2;
+    assert vr_get(st[0..128], VR_SKIP) == 1;
+    assert vr_get(st[0..128], VR_LAST) == 3;
+    assert vr_get(st[0..128], VR_AT) == 300;
+    assert buf[0] == j3[0] and buf[3699] == j3[3699];
+    // the lost part of frame 2 turns up late: stale, nothing changes
+    const nl : usize = vc_part(pt[0..1012], 2, j2[0..3600], 1);
+    assert vr_take(st[0..128], buf[0..24576], pt[0..nl], 400) == VR_OLD;
+    assert vr_get(st[0..128], VR_DONE) == 2;
+}
+
+test a_frame_that_never_came_is_counted_as_skipped_when_the_next_is_shown {
+    var j : [1500]u8 = undefined;
+    vc_fake(j[0..1500], 1500, 5);
+    var st : [128]u8 = undefined;
+    kfill(st[0..128], 0);
+    var buf : [24576]u8 = undefined;
+    var pt : [1012]u8 = undefined;
+    var f : u64 = 1;
+    while (f <= 10) {
+        if (f != 4 and f != 5) {
+            var k : usize = 0;
+            while (k < 2) {
+                const n : usize = vc_part(pt[0..1012], f, j[0..1500], k);
+                vr_take(st[0..128], buf[0..24576], pt[0..n], f * 100);
+                k = k + 1;
+            }
+        }
+        f = f + 1;
+    }
+    assert vr_get(st[0..128], VR_DONE) == 8;
+    assert vr_get(st[0..128], VR_SKIP) == 2;
+    assert vr_get(st[0..128], VR_LAST) == 10;
+}
+
+test a_part_that_disagrees_about_the_frame_length_is_refused {
+    var j : [2500]u8 = undefined;
+    var j2 : [2600]u8 = undefined;
+    vc_fake(j[0..2500], 2500, 1);
+    vc_fake(j2[0..2600], 2600, 1);
+    var st : [128]u8 = undefined;
+    kfill(st[0..128], 0);
+    var buf : [24576]u8 = undefined;
+    var pt : [1012]u8 = undefined;
+    var n : usize = vc_part(pt[0..1012], 9, j[0..2500], 0);
+    assert vr_take(st[0..128], buf[0..24576], pt[0..n], 1) == VR_STORED;
+    n = vc_part(pt[0..1012], 9, j2[0..2600], 1);
+    assert vr_take(st[0..128], buf[0..24576], pt[0..n], 1) == VR_NO;
+    assert vr_get(st[0..128], VR_REFUSED) == 1;
+    assert vr_take(st[0..100], buf[0..24576], pt[0..n], 1) == VR_NO;
+}
+
+test the_source_is_the_camera_only_while_its_frame_is_fresh {
+    assert vc_source(10000, 0) == VC_SRC_GEN;
+    assert vc_source(10000, 9800) == VC_SRC_CAM;
+    assert vc_source(10000, 9500) == VC_SRC_CAM;
+    assert vc_source(10000, 9499) == VC_SRC_GEN;
+    assert vc_source(10000, 10001) == VC_SRC_GEN;
+    assert vc_due(1000, 0);
+    assert vc_due(1099, 1000) == false;
+    assert vc_due(1100, 1000);
+    assert vc_live(5000, 4500);
+    assert vc_live(5000, 3999) == false;
+    assert vc_live(5000, 0) == false;
+}
+
+test a_group_frame_is_cut_in_parts_of_700_and_a_one_to_one_frame_is_cut_as_before {
+    assert vc_parts_of(2500, VC_G_PART) == 4 and vc_cut_of(2500, 3, VC_G_PART) == 400 and vc_cut_of(2500, 2, VC_G_PART) == 700;
+    assert vc_parts_of(2500, 999) == 0 and vc_parts_of(VC_JPEG_MAX, VC_G_PART) == 35 and vc_parts_of(VC_JPEG_MAX, VC_G_PART) < 64;
+    assert CK_HDR + VC_HDR + VC_G_PART + CK_TAG == 780;
+    assert VC_G_W * 2 == VC_W and VC_G_H * 2 == VC_H and VC_G_PERIOD_MS == 2 * VC_PERIOD_MS;
+    var j : [2500]u8 = undefined;
+    vc_fake(j[0..2500], 2500, 5);
+    var a : [1012]u8 = undefined;
+    var b : [1012]u8 = undefined;
+    // a one to one part is byte for byte the part of 1000 it always was
+    assert vc_part(a[0..1012], 9, j[0..2500], 1) == vc_part_of(b[0..1012], 9, j[0..2500], 1, VC_PART);
+    var same : bool = true;
+    var i : usize = 0;
+    while (i < VC_HDR + 1000) {
+        if (a[i] != b[i]) { same = false; }
+        i = i + 1;
+    }
+    assert same and vc_psz(a[0..VC_HDR + 1000]) == VC_PART;
+    // a group part: 700 bytes, its size read back from the header alone
+    assert vc_part_of(b[0..1012], 9, j[0..2500], 1, VC_G_PART) == VC_HDR + 700;
+    assert vc_psz(b[0..VC_HDR + 700]) == VC_G_PART and vc_ok(b[0..VC_HDR + 700]);
+    assert b[VC_HDR] == j[700] and vc_count(b[0..VC_HDR + 700]) == 4;
+    assert vc_part_of(b[0..1012], 9, j[0..2500], 3, VC_G_PART) == VC_HDR + 400 and vc_psz(b[0..VC_HDR + 400]) == VC_G_PART;
+    // 1400 bytes: two parts at either size, told apart by the length of the cut
+    assert vc_part_of(a[0..1012], 3, j[0..1400], 1, VC_PART) == VC_HDR + 400 and vc_psz(a[0..VC_HDR + 400]) == VC_PART;
+    assert vc_part_of(a[0..1012], 3, j[0..1400], 1, VC_G_PART) == VC_HDR + 700 and vc_psz(a[0..VC_HDR + 700]) == VC_G_PART;
+    // a cut that fits neither size is refused
+    assert vc_psz(a[0..VC_HDR + 699]) == 0;
+}
+
+test every_part_of_a_group_frame_builds_the_same_jpeg {
+    var j : [2500]u8 = undefined;
+    vc_fake(j[0..2500], 2500, 21);
+    var st : [128]u8 = undefined;
+    kfill(st[0..128], 0);
+    var buf : [24576]u8 = undefined;
+    var pt : [1012]u8 = undefined;
+    var k : usize = 4;
+    var got : u32 = 0;
+    while (k > 0) {
+        k = k - 1;
+        const n : usize = vc_part_of(pt[0..1012], 1, j[0..2500], k, VC_G_PART);
+        got = vr_take(st[0..128], buf[0..24576], pt[0..n], 1000);
+    }
+    assert got == VR_COMPLETE and vr_get(st[0..128], VR_SIZE) == 2500 and vr_get(st[0..128], VR_HASH) == vc_hash(j[0..2500]);
+    var same : bool = true;
+    var i : usize = 0;
+    while (i < 2500) {
+        if (buf[i] != j[i]) { same = false; }
+        i = i + 1;
+    }
+    assert same;
+}
+
+test a_frame_goes_to_full_links_only_never_to_a_partial_one {
+    assert vg_link(false, 0, 0) == GR_NONE;
+    assert vg_link(true, 10, 0) == GR_FULL;
+    assert vg_link(true, VG_STALE_MS, VG_UNDER_MAX) == GR_FULL;
+    assert vg_link(true, VG_STALE_MS + 1, 0) == GR_PARTIAL;
+    assert vg_link(true, 10, VG_UNDER_MAX + 1) == GR_PARTIAL;
+    var c : [3]u32 = undefined;
+    c[0] = GR_FULL;
+    c[1] = GR_PARTIAL;
+    c[2] = GR_FULL;
+    assert vg_to(c[0..3]) == 5 and vg_count(vg_to(c[0..3])) == 2;
+    c[0] = GR_PARTIAL;
+    c[2] = GR_NONE;
+    assert vg_to(c[0..3]) == 0;
+    c[1] = GR_FULL;
+    assert vg_to(c[0..3]) == 2;
+    assert vg_count(0) == 0 and vg_count(255) == 8;
+}
+
+/// A group call of `secs` seconds polled every 10 ms, two FULL links, the encoder job taking `cost` ms: frames, jobs,
+/// skips, sends, the most jobs in flight and the shortest gap between two frames.
+fn vg_sim(secs: u64, cost: u64, out: []u64) -> void {
+    var st : [5]u64 = undefined;
+    var i : usize = 0;
+    while (i < VG_N) {
+        st[i] = 0;
+        i = i + 1;
+    }
+    var req : u64 = 0;
+    var done : u64 = 0;
+    var due : u64 = 0;
+    var have : bool = false;
+    var maxfly : u64 = 0;
+    var gap : u64 = 1000000;
+    var last : u64 = 0;
+    var t : u64 = 1000;
+    while (t < 1000 + secs * 1000) {
+        if (req > done and t >= due) {
+            done = done + 1;
+            have = true;
+        }
+        const a : u32 = vg_step(st[0..5], t, 3, false, have, req > done);
+        if ((a & VG_A_SEND) != 0) {
+            have = false;
+            if (last != 0 and t - last < gap) { gap = t - last; }
+            last = t;
+        }
+        if ((a & VG_A_KICK) != 0) {
+            req = req + 1;
+            due = t + cost;
+        }
+        if (req - done > maxfly) { maxfly = req - done; }
+        t = t + 10;
+    }
+    out[0] = st[VG_FRAMES];
+    out[1] = st[VG_ENC];
+    out[2] = st[VG_SKIP];
+    out[3] = st[VG_SENDS];
+    out[4] = maxfly;
+    out[5] = gap;
+}
+
+test one_encode_a_frame_for_two_links_and_at_most_5_frames_a_second {
+    var r : [6]u64 = undefined;
+    vg_sim(10, 30, r[0..6]);
+    // one job per frame (the last one still in flight), each frame sealed for both links
+    assert r[0] >= 45 and r[0] <= 50;
+    assert r[1] == r[0] + 1;
+    assert r[3] == 2 * r[0];
+    assert r[2] == 0 and r[4] == 1;
+    // never closer than 200 ms
+    assert r[5] >= VC_G_PERIOD_MS;
+}
+
+test a_busy_encoder_skips_the_frame_and_counts_it {
+    var r : [6]u64 = undefined;
+    // a job of 450 ms: two due ticks find it busy for every frame made
+    vg_sim(10, 450, r[0..6]);
+    assert r[4] == 1;
+    assert r[2] > 0 and r[2] >= r[0];
+    assert r[0] + r[2] <= 50;
+    assert r[3] == 2 * r[0];
+    // nobody to send to: no frame, no job
+    var st : [5]u64 = undefined;
+    st[0] = 0; st[1] = 0; st[2] = 0; st[3] = 0; st[4] = 0;
+    assert vg_step(st[0..5], 5000, 0, true, true, false) == 0 and st[VG_ENC] == 0 and st[VG_FRAMES] == 0;
+    // a frame at hand (the camera's) is sent without the encoder
+    assert vg_step(st[0..5], 5000, 6, true, false, false) == VG_A_SEND and st[VG_ENC] == 0 and st[VG_SENDS] == 2;
+    assert vg_step(st[0..5], 5100, 6, true, false, false) == 0;
+}
+
+test the_first_two_members_who_sent_a_frame_are_shown {
+    var f : [3]u64 = undefined;
+    f[0] = 0; f[1] = 0; f[2] = 0;
+    assert vg_show(f[0..3]) == VG_NO_LINK | (VG_NO_LINK << 8);
+    f[2] = 500;
+    assert vg_show(f[0..3]) == 2 | (VG_NO_LINK << 8);
+    f[0] = 700;
+    assert vg_show(f[0..3]) == 2 | (0 << 8);
+    // a third member is heard, not shown
+    f[1] = 900;
+    assert vg_show(f[0..3]) == 2 | (0 << 8);
+    // a tie goes to the lower link
+    f[1] = 500;
+    assert vg_show(f[0..3]) == 1 | (2 << 8);
+}
+
+test a_link_that_comes_up_later_does_not_count_the_frames_before_its_first_as_skipped {
+    var j : [1500]u8 = undefined;
+    vc_fake(j[0..1500], 1500, 8);
+    var st : [128]u8 = undefined;
+    kfill(st[0..128], 0);
+    var buf : [24576]u8 = undefined;
+    var pt : [1012]u8 = undefined;
+    var f : u64 = 11;
+    while (f <= 14) {
+        if (f != 13) {
+            var k : usize = 0;
+            while (k < 3) {
+                const n : usize = vc_part_of(pt[0..1012], f, j[0..1500], k, VC_G_PART);
+                vr_take(st[0..128], buf[0..24576], pt[0..n], f * 200);
+                k = k + 1;
+            }
+        }
+        f = f + 1;
+    }
+    // frames 1..10 went to the other members before this link was up: not skipped; frame 13 was lost: skipped
+    assert vr_get(st[0..128], VR_DONE) == 3 and vr_get(st[0..128], VR_SKIP) == 1 and vr_get(st[0..128], VR_LAST) == 14;
+}
+
+test a_seq_no_sender_makes_is_refused_and_does_not_move_the_window {
+    var w : [72]u8 = undefined;
+    ck_wipe(w[0..72]);
+    assert ck_replay_accept(w[0..72], 5);
+    // the last seq a sender makes is taken; anything past it, up to the end of u64, is old and changes nothing
+    assert ck_replay_check(w[0..72], CK_SEQ_MAX) == CK_RP_AHEAD;
+    assert ck_replay_check(w[0..72], CK_SEQ_MAX + 1) == CK_RP_OLD;
+    assert ck_replay_accept(w[0..72], 18446744073709551615) == false;
+    assert ck_replay_accept(w[0..72], 18446744073709551552) == false;
+    assert get_u64(w[0..72], 0) == 5;
+    assert ck_replay_accept(w[0..72], 6);
+    assert ck_replay_accept(w[0..72], CK_SEQ_MAX);
+    assert get_u64(w[0..72], 0) == CK_SEQ_MAX;
+    assert ck_replay_accept(w[0..72], CK_SEQ_MAX) == false;
+}

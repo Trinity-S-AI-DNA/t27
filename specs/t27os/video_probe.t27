@@ -1,0 +1,625 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/video_probe.t27 -- can code written in .t27 CAPTURE THE CAMERA on macOS and receive frames?
+// (owner, 2026-10-22: first step toward video in the in-OS call; capture only, not a video call.) Not part of the app.
+// AVCaptureVideoDataOutput wants a delegate OBJECT that answers
+//   captureOutput:didOutputSampleBuffer:fromConnection:
+// and the language cannot declare an Objective-C class. So the class is made at run time: objc_allocateClassPair
+// (subclass of NSObject) + class_addIvar("st", the address of our state block) + class_addMethod whose IMP is the
+// dlsym address of the .t27 fn vidp_frame (a t27b all-scalar fn is exported, callback_probe.t27 proved the trick for
+// AudioQueue). The method has FIVE scalar parameters (self, cmd, output, sampleBuffer, connection), not four.
+// The camera delivers BGRA frames on a private serial dispatch queue (a thread of its own); vidp_frame counts
+// them, notes the clock of the first and last, the frame size, a hash of 4096 sampled bytes, and writes 10 frames (every 6th from the 30th, the first ones are dark while exposure settles) as 320x240 JPEG (quality 0.5)
+// to /tmp/vid/NN.jpg through ImageIO, with min/max/mean of the raw and the 320x240 pixels, and dumps frame 40 raw to
+// /tmp/vid/raw_frame.bgra.
+// The camera permission is the system's: if AVCaptureDevice authorizationStatusForMediaType is not 3 (authorized),
+// the probe prints the exact status and stops; it never tries to get around TCC. VIDP_ASK=1 lets a status of 0
+// (not determined) go on, which makes the system ask once.
+// Build (Apple silicon):
+//   t27b build specs/t27os/video_probe.t27 -o vp.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -framework CoreFoundation -framework AVFoundation -framework CoreMedia \
+//      -framework CoreVideo -framework CoreGraphics -framework ImageIO -o vp vp.o
+// Exit codes: 0 frames arrived and 10 JPEG written; 2 camera not authorized; 3 no camera; 4 setup failed; 1 no frames.
+
+module T27osVideoProbe;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+
+const VP_RTLD_DEFAULT : u64 = 18446744073709551614;
+/// kCVPixelFormatType_32BGRA, 'BGRA'.
+const VP_BGRA : u32 = 1111970369;
+/// kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little.
+const VP_BITMAP_INFO : u32 = 8194;
+/// The state block's magic (any fixed value; vidp_frame refuses a block without it).
+const VP_MAGIC : u64 = 6074266361726094631;
+const VP_KEEP : u64 = 10;
+const VP_W : u64 = 320;
+const VP_H : u64 = 240;
+
+fn vp_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn vp_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn vp_now() -> f64 { return @extern("CFAbsoluteTimeGetCurrent"); }
+fn vp_run(mode: u64, seconds: f64, after_one: bool) -> i32 { return @extern("CFRunLoopRunInMode"); }
+fn vp_release(x: u64) -> void { @extern("CFRelease"); }
+fn vp_is_main() -> i32 { return @extern("pthread_main_np"); }
+fn vp_thread() -> u64 { return @extern("pthread_self"); }
+fn vp_mkdir(path: []const u8, mode: u32) -> i32 { return @extern("mkdir"); }
+fn vp_calloc(n: u64, size: u64) -> u64 { return @extern("calloc"); }
+fn vp_free(p: u64) -> void { @extern("free"); }
+fn vp_open(path: []const u8, flags: i32, mode: u32) -> i32 { return @extern("open"); }
+fn vp_close(fd: i32) -> i32 { return @extern("close"); }
+fn vp_write_at(fd: i32, p: u64, n: u64) -> i64 { return @extern("write"); }
+fn vp_cf_str(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn vp_cf_url(alloc: u64, path: u64, style: u64, is_dir: bool) -> u64 { return @extern("CFURLCreateWithFileSystemPath"); }
+fn vp_cf_num(alloc: u64, kind: u64, p: []const u8) -> u64 { return @extern("CFNumberCreate"); }
+fn vp_cf_dict(alloc: u64, keys: []const u8, vals: []const u8, n: u64, kcb: u64, vcb: u64) -> u64 { return @extern("CFDictionaryCreate"); }
+fn vp_objc_class(name: []const u8) -> u64 { return @extern("objc_getClass"); }
+fn vp_sel(name: []const u8) -> u64 { return @extern("sel_registerName"); }
+fn vp_alloc_class(sup: u64, name: []const u8, extra: u64) -> u64 { return @extern("objc_allocateClassPair"); }
+fn vp_register_class(c: u64) -> void { @extern("objc_registerClassPair"); }
+fn vp_add_method(c: u64, s: u64, imp: u64, types: []const u8) -> bool { return @extern("class_addMethod"); }
+fn vp_add_ivar(c: u64, name: []const u8, size: u64, align: u8, types: []const u8) -> bool { return @extern("class_addIvar"); }
+fn vp_get_ivar_def(c: u64, name: []const u8) -> u64 { return @extern("class_getInstanceVariable"); }
+fn vp_object_class(o: u64) -> u64 { return @extern("object_getClass"); }
+fn vp_ivar_get(o: u64, iv: u64) -> u64 { return @extern("object_getIvar"); }
+fn vp_ivar_set(o: u64, iv: u64, v: u64) -> void { @extern("object_setIvar"); }
+fn vp_queue(label: []const u8, attr: u64) -> u64 { return @extern("dispatch_queue_create"); }
+fn msg0(o: u64, s: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg1(o: u64, s: u64, a: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg2(o: u64, s: u64, a: u64, b: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg3(o: u64, s: u64, a: u64, b: u64, c: u64) -> u64 { return @extern("objc_msgSend"); }
+fn msg_flag(o: u64, s: u64, a: bool) -> u64 { return @extern("objc_msgSend"); }
+fn msg_test(o: u64, s: u64) -> bool { return @extern("objc_msgSend"); }
+fn msg_test1(o: u64, s: u64, a: u64) -> bool { return @extern("objc_msgSend"); }
+fn vp_sample_image(sb: u64) -> u64 { return @extern("CMSampleBufferGetImageBuffer"); }
+fn vp_pb_lock(pb: u64, flags: u64) -> i32 { return @extern("CVPixelBufferLockBaseAddress"); }
+fn vp_pb_unlock(pb: u64, flags: u64) -> i32 { return @extern("CVPixelBufferUnlockBaseAddress"); }
+fn vp_pb_base(pb: u64) -> u64 { return @extern("CVPixelBufferGetBaseAddress"); }
+fn vp_pb_row(pb: u64) -> u64 { return @extern("CVPixelBufferGetBytesPerRow"); }
+fn vp_pb_w(pb: u64) -> u64 { return @extern("CVPixelBufferGetWidth"); }
+fn vp_pb_h(pb: u64) -> u64 { return @extern("CVPixelBufferGetHeight"); }
+fn vp_pb_fmt(pb: u64) -> u32 { return @extern("CVPixelBufferGetPixelFormatType"); }
+fn vp_pb_create(alloc: u64, w: u64, h: u64, fmt: u32, attrs: u64, out: []u8) -> i32 { return @extern("CVPixelBufferCreate"); }
+fn vp_fd_create(alloc: u64, pb: u64, out: []u8) -> i32 { return @extern("CMVideoFormatDescriptionCreateForImageBuffer"); }
+fn vp_sb_create(alloc: u64, pb: u64, fd: u64, timing: []const u8, out: []u8) -> i32 { return @extern("CMSampleBufferCreateReadyWithImageBuffer"); }
+fn vp_cg_rgb() -> u64 { return @extern("CGColorSpaceCreateDeviceRGB"); }
+fn vp_cg_bitmap(data: u64, w: usize, h: usize, bits: usize, row: usize, space: u64, info: u32) -> u64 { return @extern("CGBitmapContextCreate"); }
+fn vp_cg_image(c: u64) -> u64 { return @extern("CGBitmapContextCreateImage"); }
+fn vp_cg_draw(c: u64, x: f64, y: f64, w: f64, h: f64, img: u64) -> void { @extern("CGContextDrawImage"); }
+fn vp_cg_ctx_release(c: u64) -> void { @extern("CGContextRelease"); }
+fn vp_cg_image_release(i: u64) -> void { @extern("CGImageRelease"); }
+fn vp_cg_space_release(s: u64) -> void { @extern("CGColorSpaceRelease"); }
+fn vp_dest_url(url: u64, kind: u64, count: u64, opts: u64) -> u64 { return @extern("CGImageDestinationCreateWithURL"); }
+fn vp_dest_add(d: u64, img: u64, props: u64) -> void { @extern("CGImageDestinationAddImage"); }
+fn vp_dest_end(d: u64) -> bool { return @extern("CGImageDestinationFinalize"); }
+
+fn vp_get(at: u64) -> u64 {
+    var c : [8]u8 = undefined;
+    sys_peek(c[0..8], at, 8);
+    return get_u64(c[0..8], 0);
+}
+
+fn vp_put(at: u64, v: u64) -> void {
+    var c : [8]u8 = undefined;
+    put_u64(c[0..8], 0, v);
+    vp_poke(at, c[0..8], 8);
+}
+
+fn vp_us() -> u64 { return @as(u64, @intFromFloat(vp_now() * 1000000.0)); }
+
+fn vp_cf(s: []const u8) -> u64 { return vp_cf_str(0, s, s.len, 134217984, false); }
+
+/// The CFStringRef (or other pointer) a framework constant holds, read through its dlsym address; 0 when absent.
+fn vp_konst(name: []const u8) -> u64 {
+    const a : u64 = vp_dlsym(VP_RTLD_DEFAULT, name);
+    if (a == 0) { return 0; }
+    return vp_get(a);
+}
+
+/// State block at `st` (u64 slots): 0 frames, 1 first us, 2 last us, 3 width, 4 height, 5 JPEG written,
+/// 6 JPEG failed, 7 callbacks on the main thread, 8 magic, 9 bytes per row, 10 pixel format, 11 callback thread,
+/// 12 callbacks that found no pixel buffer, 16..25 hash of the first 10 frames.
+const VP_SLOT_HASH : u64 = 16;
+
+/// More slots: 13 JPEG frames saved so far (the next JPEG index), 14 raw frame dumped (0/1), 15 frame number of the dump;
+/// 26..35 frame number (0-based) of each saved JPEG; 40..79 sampled raw stats of each saved frame (min, max, mean x100,
+/// non-zero channel count; 4 slots each); 80..119 the same for the 320x240 image just before JPEG encoding;
+/// 120..123 the full raw stats of the dumped frame (min, max, mean x100, non-zero channels), 124 its channel count;
+/// 136..199 sampled mean x100 of each of the first 64 frames (the warm-up curve).
+const VP_SLOT_RAWSTAT : u64 = 40;
+const VP_SLOT_JPGSTAT : u64 = 80;
+const VP_SLOT_FULL : u64 = 120;
+const VP_SLOT_CURVE : u64 = 136;
+/// JPEGs are taken from this frame on (a camera needs about a second to settle exposure), every VP_EVERY-th frame.
+const VP_WARM : u64 = 30;
+const VP_EVERY : u64 = 6;
+/// The frame whose BGRA bytes go to /tmp/vid/raw_frame.bgra.
+const VP_RAW_AT : u64 = 40;
+
+/// Stats of the B, G, R bytes of a BGRA image (alpha is skipped), looking at every sx-th pixel of every sy-th row:
+/// writes min, max, mean x100, non-zero count to st slots at..at+3 and returns the channel count looked at.
+fn vp_stats(base: u64, row: u64, w: u64, h: u64, sx: u64, sy: u64, st: u64, at: u64) -> u64 {
+    var mn : u64 = 255;
+    var mx : u64 = 0;
+    var sum : u64 = 0;
+    var nz : u64 = 0;
+    var cnt : u64 = 0;
+    var px : [4]u8 = undefined;
+    var y : u64 = 0;
+    while (y < h) {
+        var x : u64 = 0;
+        while (x < w) {
+            sys_peek(px[0..4], base + y * row + x * 4, 4);
+            var c : usize = 0;
+            while (c < 3) {
+                const v : u64 = @as(u64, @intCast(px[c]));
+                if (v < mn) { mn = v; }
+                if (v > mx) { mx = v; }
+                if (v != 0) { nz = nz + 1; }
+                sum = sum + v;
+                cnt = cnt + 1;
+                c = c + 1;
+            }
+            x = x + sx;
+        }
+        y = y + sy;
+    }
+    if (cnt == 0) { return 0; }
+    vp_put(st + at * 8, mn);
+    vp_put(st + (at + 1) * 8, mx);
+    vp_put(st + (at + 2) * 8, sum * 100 / cnt);
+    vp_put(st + (at + 3) * 8, nz);
+    return cnt;
+}
+
+/// All bytes of the locked frame to /tmp/vid/raw_frame.bgra (row * h bytes, rows as the camera gave them).
+fn vp_dump_raw(base: u64, row: u64, h: u64) -> bool {
+    const fd : i32 = vp_open("/tmp/vid/raw_frame.bgra", 1537, 420);
+    if (fd < 0) { return false; }
+    const n : u64 = row * h;
+    const w : i64 = vp_write_at(fd, base, n);
+    vp_close(fd);
+    return w == @as(i64, @intCast(n));
+}
+
+/// "/tmp/vid/NN.jpg" for frame index i (0..99) into out; the length.
+fn vp_path(i: u64, out: []u8) -> usize {
+    const t : []const u8 = "/tmp/vid/";
+    var k : usize = 0;
+    while (k < 9) { out[k] = t[k]; k = k + 1; }
+    out[9] = @as(u8, @intCast(48 + (i / 10) % 10));
+    out[10] = @as(u8, @intCast(48 + i % 10));
+    out[11] = 46;
+    out[12] = 106;
+    out[13] = 112;
+    out[14] = 103;
+    return 15;
+}
+
+/// Sample step so that about 4096 bytes of an n-byte frame are read.
+fn vp_stride(n: u64) -> u64 {
+    if (n <= 4096) { return 1; }
+    return n / 4096;
+}
+
+/// A 320x240 JPEG of the locked BGRA buffer at `base` into the file `idx`; true when ImageIO wrote it.
+fn vp_write_jpeg(base: u64, w: u64, h: u64, row: u64, idx: u64, st: u64) -> bool {
+    const space : u64 = vp_cg_rgb();
+    const sctx : u64 = vp_cg_bitmap(base, @as(usize, w), @as(usize, h), 8, @as(usize, row), space, VP_BITMAP_INFO);
+    if (sctx == 0) { vp_cg_space_release(space); return false; }
+    const simg : u64 = vp_cg_image(sctx);
+    const mem : u64 = vp_calloc(VP_W * VP_H, 4);
+    var ok : bool = false;
+    if (simg != 0 and mem != 0) {
+        const dctx : u64 = vp_cg_bitmap(mem, @as(usize, VP_W), @as(usize, VP_H), 8, @as(usize, VP_W * 4), space, VP_BITMAP_INFO);
+        if (dctx != 0) {
+            vp_cg_draw(dctx, 0.0, 0.0, 320.0, 240.0, simg);
+            vp_stats(mem, VP_W * 4, VP_W, VP_H, 1, 1, st, VP_SLOT_JPGSTAT + idx * 4);
+            const dimg : u64 = vp_cg_image(dctx);
+            if (dimg != 0) {
+                var pb : [16]u8 = undefined;
+                const pn : usize = vp_path(idx, pb[0..16]);
+                const ps : u64 = vp_cf_str(0, pb[0..16], pn, 134217984, false);
+                const url : u64 = vp_cf_url(0, ps, 0, false);
+                const kind : u64 = vp_cf("public.jpeg");
+                const dest : u64 = vp_dest_url(url, kind, 1, 0);
+                if (dest != 0) {
+                    // properties { kCGImageDestinationLossyCompressionQuality : 0.5 }
+                    var kb : [8]u8 = undefined;
+                    var vb : [8]u8 = undefined;
+                    var qb : [8]u8 = undefined;
+                    put_u64(kb[0..8], 0, vp_konst("kCGImageDestinationLossyCompressionQuality"));
+                    // 0.5 as IEEE-754 binary64 = 0x3FE0000000000000.
+                    put_u64(qb[0..8], 0, 4602678819172646912);
+                    const qn : u64 = vp_cf_num(0, 6, qb[0..8]);
+                    put_u64(vb[0..8], 0, qn);
+                    const props : u64 = vp_cf_dict(0, kb[0..8], vb[0..8], 1, vp_dlsym(VP_RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks"), vp_dlsym(VP_RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks"));
+                    vp_dest_add(dest, dimg, props);
+                    ok = vp_dest_end(dest);
+                    if (props != 0) { vp_release(props); }
+                    if (qn != 0) { vp_release(qn); }
+                    vp_release(dest);
+                }
+                vp_release(kind);
+                if (url != 0) { vp_release(url); }
+                vp_release(ps);
+                vp_cg_image_release(dimg);
+            }
+            vp_cg_ctx_release(dctx);
+        }
+    }
+    if (simg != 0) { vp_cg_image_release(simg); }
+    if (mem != 0) { vp_free(mem); }
+    vp_cg_ctx_release(sctx);
+    vp_cg_space_release(space);
+    return ok;
+}
+
+/// The delegate method -captureOutput:didOutputSampleBuffer:fromConnection:, as a plain fn: self, _cmd, output,
+/// sampleBuffer, connection. Runs on the capture queue's thread. The state block address is the ivar "st".
+pub fn vidp_frame(me: u64, cmd: u64, output: u64, sbuf: u64, conn: u64) -> u64 {
+    const iv : u64 = vp_get_ivar_def(vp_object_class(me), "st");
+    if (iv == 0) { return 0; }
+    const st : u64 = vp_ivar_get(me, iv);
+    if (st == 0) { return 0; }
+    if (vp_get(st + 64) != VP_MAGIC) { return 0; }
+    const t : u64 = vp_us();
+    const pb : u64 = vp_sample_image(sbuf);
+    if (pb == 0) { vp_put(st + 96, vp_get(st + 96) + 1); return 0; }
+    const n : u64 = vp_get(st);
+    if (n == 0) { vp_put(st + 8, t); vp_put(st + 88, vp_thread()); }
+    vp_put(st + 16, t);
+    if (vp_is_main() != 0) { vp_put(st + 56, vp_get(st + 56) + 1); }
+    const w : u64 = vp_pb_w(pb);
+    const h : u64 = vp_pb_h(pb);
+    vp_put(st + 24, w);
+    vp_put(st + 32, h);
+    vp_pb_lock(pb, 1);
+    const base : u64 = vp_pb_base(pb);
+    const row : u64 = vp_pb_row(pb);
+    vp_put(st + 72, row);
+    vp_put(st + 80, @as(u64, vp_pb_fmt(pb)));
+    if (base != 0 and vp_pb_fmt(pb) == VP_BGRA) {
+        // warm-up curve: sampled mean x100 of each of the first 64 frames
+        if (n < 64) {
+            vp_stats(base, row, w, h, 16, 16, st, 127);
+            vp_put(st + (VP_SLOT_CURVE + n) * 8, vp_get(st + 129 * 8));
+        }
+        if (n == VP_RAW_AT and vp_get(st + 14 * 8) == 0) {
+            const cc : u64 = vp_stats(base, row, w, h, 1, 1, st, VP_SLOT_FULL);
+            vp_put(st + 124 * 8, cc);
+            if (vp_dump_raw(base, row, h)) { vp_put(st + 14 * 8, 1); } else { vp_put(st + 14 * 8, 2); }
+            vp_put(st + 15 * 8, n);
+        }
+        const k : u64 = vp_get(st + 13 * 8);
+        if (k < VP_KEEP and n >= VP_WARM and (n - VP_WARM) % VP_EVERY == 0) {
+            // hash of about 4096 sampled bytes, so two frames can be told apart without trusting the encoder
+            const total : u64 = row * h;
+            const step : u64 = vp_stride(total);
+            var hsh : u64 = 7;
+            var p : u64 = 0;
+            var one : [1]u8 = undefined;
+            while (p < total) {
+                sys_peek(one[0..1], base + p, 1);
+                hsh = (hsh * 31 + @as(u64, @intCast(one[0]))) % 1000000007;
+                p = p + step;
+            }
+            vp_put(st + (VP_SLOT_HASH + k) * 8, hsh);
+            vp_put(st + (26 + k) * 8, n);
+            vp_stats(base, row, w, h, 4, 4, st, VP_SLOT_RAWSTAT + k * 4);
+            if (vp_write_jpeg(base, w, h, row, k, st)) { vp_put(st + 40, vp_get(st + 40) + 1); }
+            else { vp_put(st + 48, vp_get(st + 48) + 1); }
+            vp_put(st + 13 * 8, k + 1);
+        }
+    }
+    vp_pb_unlock(pb, 1);
+    vp_put(st, n + 1);
+    return 0;
+}
+
+fn say_line(s: []const u8) -> void { sys_write(1, s, @as(u64, s.len)); }
+
+fn say(s: []const u8, ok: bool) -> bool {
+    if (ok) { sys_write(1, "ok   ", 5); } else { sys_write(1, "FAIL ", 5); }
+    sys_write(1, s, @as(u64, s.len));
+    sys_write(1, "\n", 1);
+    return ok;
+}
+
+/// One decimal line, "<label><n>".
+fn say_num(label: []const u8, n: u64) -> void {
+    var b : [24]u8 = undefined;
+    var v : u64 = n;
+    var i : usize = 24;
+    if (v == 0) { i = i - 1; b[i] = 48; }
+    while (v > 0) {
+        i = i - 1;
+        b[i] = @as(u8, @intCast(48 + v % 10));
+        v = v / 10;
+    }
+    sys_write(1, label, @as(u64, label.len));
+    sys_write(1, b[i..24], @as(u64, 24 - i));
+    sys_write(1, "\n", 1);
+}
+
+/// The delegate class, made now: NSObject subclass T27VideoProbeDelegate with the ivar st and the method
+/// captureOutput:didOutputSampleBuffer:fromConnection: whose IMP is vidp_frame. One instance, ivar = st; 0 on failure.
+fn vp_make_delegate(st: u64) -> u64 {
+    const imp : u64 = vp_dlsym(VP_RTLD_DEFAULT, "vidp_frame");
+    say("dlsym finds vidp_frame", imp != 0);
+    const nsobject : u64 = vp_objc_class("NSObject");
+    const dcls : u64 = vp_alloc_class(nsobject, "T27VideoProbeDelegate", 0);
+    say("objc_allocateClassPair made T27VideoProbeDelegate", dcls != 0);
+    if (dcls == 0 or imp == 0) { return 0; }
+    const ivar_ok : bool = vp_add_ivar(dcls, "st", 8, 3, "Q");
+    const meth_ok : bool = vp_add_method(dcls, vp_sel("captureOutput:didOutputSampleBuffer:fromConnection:"), imp, "v@:@@@");
+    say("class_addIvar st and class_addMethod captureOutput:didOutputSampleBuffer:fromConnection:", ivar_ok and meth_ok);
+    vp_register_class(dcls);
+    const del : u64 = msg0(msg0(dcls, vp_sel("alloc")), vp_sel("init"));
+    const iv : u64 = vp_get_ivar_def(dcls, "st");
+    say("delegate instance made, ivar st found", del != 0 and iv != 0);
+    if (del == 0 or iv == 0) { return 0; }
+    vp_ivar_set(del, iv, st);
+    say("the ivar returns the state address", vp_ivar_get(del, iv) == st);
+    return del;
+}
+
+/// A BGRA frame of 640x480 whose picture depends on k (a moving pattern), as a CMSampleBuffer; 0 on failure.
+fn vp_fake_sample(k: u64) -> u64 {
+    var pbo : [8]u8 = undefined;
+    put_u64(pbo[0..8], 0, 0);
+    if (vp_pb_create(0, 640, 480, VP_BGRA, 0, pbo[0..8]) != 0) { return 0; }
+    const pb : u64 = get_u64(pbo[0..8], 0);
+    vp_pb_lock(pb, 0);
+    const base : u64 = vp_pb_base(pb);
+    const row : u64 = vp_pb_row(pb);
+    var line : [2560]u8 = undefined;
+    var y : u64 = 0;
+    while (y < 480) {
+        var x : u64 = 0;
+        while (x < 640) {
+            line[@as(usize, x * 4)] = @as(u8, @intCast((x / 3 + k * 20) % 256));
+            line[@as(usize, x * 4 + 1)] = @as(u8, @intCast(y / 2));
+            line[@as(usize, x * 4 + 2)] = @as(u8, @intCast((x + y + k * 40) % 256));
+            line[@as(usize, x * 4 + 3)] = 255;
+            x = x + 1;
+        }
+        vp_poke(base + y * row, line[0..2560], 2560);
+        y = y + 1;
+    }
+    vp_pb_unlock(pb, 0);
+    var fdo : [8]u8 = undefined;
+    put_u64(fdo[0..8], 0, 0);
+    var sbo : [8]u8 = undefined;
+    put_u64(sbo[0..8], 0, 0);
+    var sb : u64 = 0;
+    if (vp_fd_create(0, pb, fdo[0..8]) == 0) {
+        const fd : u64 = get_u64(fdo[0..8], 0);
+        // CMSampleTimingInfo: duration (invalid), presentationTimeStamp (value k, scale 600, valid), decodeTimeStamp (invalid)
+        var tm : [72]u8 = undefined;
+        var t : usize = 0;
+        while (t < 72) { tm[t] = 0; t = t + 1; }
+        put_u64(tm[0..72], 24, k * 20);
+        tm[32] = 88; tm[33] = 2;
+        tm[36] = 1;
+        if (vp_sb_create(0, pb, fd, tm[0..72], sbo[0..8]) == 0) { sb = get_u64(sbo[0..8], 0); }
+        vp_release(fd);
+    }
+    vp_release(pb);
+    return sb;
+}
+
+pub fn main() -> void {
+    var sb : [2048]u8 = undefined;
+    var z : usize = 0;
+    while (z < 2048) { sb[z] = 0; z = z + 1; }
+    const st : u64 = sys_addr(sb[0..2048], sb[0..2048], 0);
+    vp_put(st + 64, VP_MAGIC);
+    // Never true (the magic is set): only makes sure vidp_frame is emitted and so exported.
+    if (vp_get(st + 64) == 99) { vidp_frame(0, 0, 0, 0, 0); }
+    vp_mkdir("/tmp/vid", 493);
+
+    if (sys_getenv("VIDP_SELFTEST") != 0) {
+        // No camera: the same delegate class, reached through objc_msgSend with 90 synthetic frames (JPEGs start at frame 30).
+        const d : u64 = vp_make_delegate(st);
+        if (d == 0) { sys_exit(4); }
+        var k : u64 = 0;
+        while (k < 90) {
+            const fsb : u64 = vp_fake_sample(k);
+            if (fsb == 0) { say_line("synthetic sample buffer failed\n"); sys_exit(4); }
+            msg3(d, vp_sel("captureOutput:didOutputSampleBuffer:fromConnection:"), 0, fsb, 0);
+            vp_release(fsb);
+            k = k + 1;
+        }
+        const ok : bool = vp_get(st) == 90 and vp_get(st + 40) == 10;
+        say_num("SELFTEST delegate calls: ", vp_get(st));
+        say_num("SELFTEST JPEG written: ", vp_get(st + 40));
+        say_num("SELFTEST width x: ", vp_get(st + 24));
+        say_num("SELFTEST height: ", vp_get(st + 32));
+        var j : u64 = 0;
+        while (j < 10) { say_num("SELFTEST hash: ", vp_get(st + (VP_SLOT_HASH + j) * 8)); j = j + 1; }
+        if (ok) { say_line("SELFTEST OK (the runtime class and its IMP work; this says nothing about the camera)\n"); sys_exit(0); }
+        say_line("SELFTEST FAILED\n");
+        sys_exit(1);
+    }
+    const mode : u64 = vp_konst("kCFRunLoopDefaultMode");
+    const media : u64 = vp_konst("AVMediaTypeVideo");
+    const dev_cls : u64 = vp_objc_class("AVCaptureDevice");
+    say("AVFoundation classes and AVMediaTypeVideo found", dev_cls != 0 and media != 0 and mode != 0);
+    if (dev_cls == 0 or media == 0) { sys_exit(4); }
+
+    const auth : u64 = msg1(dev_cls, vp_sel("authorizationStatusForMediaType:"), media);
+    say_num("camera authorization status (0 not determined, 1 restricted, 2 denied, 3 authorized): ", auth);
+    if (auth != 3 and !(auth == 0 and sys_getenv("VIDP_ASK") != 0)) {
+        say_line("CAMERA NOT AUTHORIZED: stopped, nothing was captured and nothing was bypassed\n");
+        if (auth == 2) { say_line("denied: System Settings > Privacy & Security > Camera, switch on the app that runs this probe\n"); }
+        if (auth == 1) { say_line("restricted: a profile or Screen Time forbids the camera; only its owner can change that\n"); }
+        if (auth == 0) { say_line("not determined: run with VIDP_ASK=1 from the app that may use the camera, and accept the system prompt\n"); }
+        sys_exit(2);
+    }
+
+    const dev : u64 = msg1(dev_cls, vp_sel("defaultDeviceWithMediaType:"), media);
+    say("default video device found", dev != 0);
+    if (dev == 0) { sys_exit(3); }
+    const name : u64 = msg0(dev, vp_sel("localizedName"));
+    var nb : [96]u8 = undefined;
+    const got : bool = msg_cstr(name, vp_sel("getCString:maxLength:encoding:"), nb[0..96], 95, 4);
+    if (got) { say_line("device: "); sys_write(1, nb[0..96], vp_strlen_at(nb[0..96])); say_line("\n"); }
+
+    const inp : u64 = msg2(vp_objc_class("AVCaptureDeviceInput"), vp_sel("deviceInputWithDevice:error:"), dev, 0);
+    say("device input created", inp != 0);
+    if (inp == 0) { sys_exit(4); }
+    const sess : u64 = msg0(msg0(vp_objc_class("AVCaptureSession"), vp_sel("alloc")), vp_sel("init"));
+    const preset : u64 = vp_konst("AVCaptureSessionPreset320x240");
+    const can_preset : bool = preset != 0 and msg_test1(sess, vp_sel("canSetSessionPreset:"), preset);
+    say("session accepts the 320x240 preset", can_preset);
+    if (can_preset) { msg1(sess, vp_sel("setSessionPreset:"), preset); }
+    const can_in : bool = msg_test1(sess, vp_sel("canAddInput:"), inp);
+    say("session accepts the input", can_in);
+    if (!can_in) { sys_exit(4); }
+    msg1(sess, vp_sel("addInput:"), inp);
+
+    const out : u64 = msg0(msg0(vp_objc_class("AVCaptureVideoDataOutput"), vp_sel("alloc")), vp_sel("init"));
+    // videoSettings { kCVPixelBufferPixelFormatTypeKey : 'BGRA' }
+    var kb : [8]u8 = undefined;
+    var vb : [8]u8 = undefined;
+    var fb : [4]u8 = undefined;
+    fb[0] = 65; fb[1] = 82; fb[2] = 71; fb[3] = 66;
+    const fnum : u64 = vp_cf_num(0, 3, fb[0..4]);
+    put_u64(kb[0..8], 0, vp_konst("kCVPixelBufferPixelFormatTypeKey"));
+    put_u64(vb[0..8], 0, fnum);
+    const vs : u64 = vp_cf_dict(0, kb[0..8], vb[0..8], 1, vp_dlsym(VP_RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks"), vp_dlsym(VP_RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks"));
+    msg1(out, vp_sel("setVideoSettings:"), vs);
+    msg_flag(out, vp_sel("setAlwaysDiscardsLateVideoFrames:"), true);
+
+    const del : u64 = vp_make_delegate(st);
+    if (del == 0) { sys_exit(4); }
+    const proto : u64 = vp_dlsym(VP_RTLD_DEFAULT, "objc_getProtocol");
+    const queue : u64 = vp_queue("t27.videoprobe", 0);
+    say("dispatch queue made", queue != 0);
+    msg2(out, vp_sel("setSampleBufferDelegate:queue:"), del, queue);
+    const can_out : bool = msg_test1(sess, vp_sel("canAddOutput:"), out);
+    say("session accepts the output", can_out);
+    if (!can_out) { sys_exit(4); }
+    msg1(sess, vp_sel("addOutput:"), out);
+
+    // 9 seconds (the JPEGs start at frame 30 and the 10th is frame 84, about 5.5 s at 16 FPS).
+    const t0 : u64 = vp_us();
+    msg0(sess, vp_sel("startRunning"));
+    const running : bool = msg_test(sess, vp_sel("isRunning"));
+    say("session is running", running);
+    var s : u32 = 0;
+    while (s < 90) {
+        vp_run(mode, 0.1, false);
+        s = s + 1;
+        if (s % 10 == 0) { say_num("frames so far: ", vp_get(st)); }
+    }
+    msg0(sess, vp_sel("stopRunning"));
+    vp_run(mode, 0.3, false);
+    msg2(out, vp_sel("setSampleBufferDelegate:queue:"), 0, 0);
+    vp_run(mode, 0.1, false);
+
+    const frames : u64 = vp_get(st);
+    if (frames > 0) { say_num("start-up (startRunning to first frame), ms: ", (vp_get(st + 8) - t0) / 1000); }
+    say_num("frames: ", frames);
+    say_num("width: ", vp_get(st + 24));
+    say_num("height: ", vp_get(st + 32));
+    say_num("pixel format (1111970369 = BGRA): ", vp_get(st + 80));
+    say_num("bytes per row: ", vp_get(st + 72));
+    say_num("callbacks without a pixel buffer: ", vp_get(st + 96));
+    say_num("callbacks on the main thread (0 = another thread): ", vp_get(st + 56));
+    if (frames > 1) {
+        const span : u64 = vp_get(st + 16) - vp_get(st + 8);
+        say_num("first to last frame, us: ", span);
+        say_num("FPS x100: ", (frames - 1) * 100000000 / span);
+    }
+    say_num("JPEG written: ", vp_get(st + 40));
+    say_num("JPEG failed: ", vp_get(st + 48));
+    var i : u64 = 0;
+    var distinct : u64 = 0;
+    const kept : u64 = vp_get(st + 13 * 8);
+    while (i < kept) {
+        var pb2 : [16]u8 = undefined;
+        const pn : usize = vp_path(i, pb2[0..16]);
+        sys_write(1, pb2[0..16], @as(u64, pn));
+        say_num("  frame number: ", vp_get(st + (26 + i) * 8));
+        say_num("    raw sampled min: ", vp_get(st + (VP_SLOT_RAWSTAT + i * 4) * 8));
+        say_num("    raw sampled max: ", vp_get(st + (VP_SLOT_RAWSTAT + i * 4 + 1) * 8));
+        say_num("    raw sampled mean x100: ", vp_get(st + (VP_SLOT_RAWSTAT + i * 4 + 2) * 8));
+        say_num("    raw sampled non-zero channels: ", vp_get(st + (VP_SLOT_RAWSTAT + i * 4 + 3) * 8));
+        say_num("    320x240 pre-JPEG min: ", vp_get(st + (VP_SLOT_JPGSTAT + i * 4) * 8));
+        say_num("    320x240 pre-JPEG max: ", vp_get(st + (VP_SLOT_JPGSTAT + i * 4 + 1) * 8));
+        say_num("    320x240 pre-JPEG mean x100: ", vp_get(st + (VP_SLOT_JPGSTAT + i * 4 + 2) * 8));
+        say_num("    320x240 pre-JPEG non-zero channels: ", vp_get(st + (VP_SLOT_JPGSTAT + i * 4 + 3) * 8));
+        say_num("    sampled-pixel hash: ", vp_get(st + (VP_SLOT_HASH + i) * 8));
+        if (i == 0 or vp_get(st + (VP_SLOT_HASH + i) * 8) != vp_get(st + (VP_SLOT_HASH + i - 1) * 8)) { distinct = distinct + 1; }
+        i = i + 1;
+    }
+    say_num("frames whose hash differs from the previous one: ", distinct);
+    say_num("RAW DUMP state (1 written, 2 failed, 0 none): ", vp_get(st + 14 * 8));
+    say_num("RAW frame number: ", vp_get(st + 15 * 8));
+    say_num("RAW full min: ", vp_get(st + VP_SLOT_FULL * 8));
+    say_num("RAW full max: ", vp_get(st + (VP_SLOT_FULL + 1) * 8));
+    say_num("RAW full mean x100: ", vp_get(st + (VP_SLOT_FULL + 2) * 8));
+    say_num("RAW full non-zero channels: ", vp_get(st + (VP_SLOT_FULL + 3) * 8));
+    say_num("RAW full channels counted: ", vp_get(st + 124 * 8));
+    var c : u64 = 0;
+    while (c < 64 and c < frames) {
+        say_num("curve frame mean x100: ", vp_get(st + (VP_SLOT_CURVE + c) * 8));
+        c = c + 4;
+    }
+    if (proto == 0) { say_line("note: objc_getProtocol not found by dlsym (not needed, the selector is what AVFoundation calls)\n"); }
+    if (frames > 0 and vp_get(st + 40) >= VP_KEEP) { say_line("CAPTURE OK (frames only, not a video call)\n"); sys_exit(0); }
+    say_line("CAPTURE NOT PROVEN: see the counters above\n");
+    sys_exit(1);
+}
+
+fn msg_cstr(o: u64, s: u64, buf: []u8, max: u64, enc: u64) -> bool { return @extern("objc_msgSend"); }
+fn vp_strlen_at(b: []const u8) -> u64 {
+    var n : u64 = 0;
+    while (n < 95 and b[@as(usize, n)] != 0) { n = n + 1; }
+    return n;
+}
+
+test the_path_of_frame_7_is_tmp_vid_07_jpg {
+    var b : [16]u8 = undefined;
+    const n : usize = vp_path(7, b[0..16]);
+    assert(n == 15);
+    assert(b[9] == 48 and b[10] == 55);
+    assert(b[11] == 46 and b[12] == 106 and b[13] == 112 and b[14] == 103);
+    assert(b[0] == 47 and b[8] == 47);
+}
+
+test the_path_of_frame_10_has_two_digits {
+    var b : [16]u8 = undefined;
+    vp_path(10, b[0..16]);
+    assert(b[9] == 49 and b[10] == 48);
+}
+
+test the_hash_sample_reads_about_4096_bytes {
+    assert(vp_stride(100) == 1);
+    assert(vp_stride(4096) == 1);
+    assert(vp_stride(307200) == 75);
+    assert(307200 / vp_stride(307200) == 4096);
+}
+
+test the_keep_count_and_frame_size_are_the_spec {
+    assert(VP_KEEP == 10);
+    assert(VP_W == 320 and VP_H == 240);
+    assert(VP_BGRA == 1111970369);
+    assert(VP_BITMAP_INFO == 8194);
+}
+
+test the_strlen_stops_at_the_nul {
+    var b : [96]u8 = undefined;
+    var i : usize = 0;
+    while (i < 96) { b[i] = 0; i = i + 1; }
+    b[0] = 65; b[1] = 66;
+    assert(vp_strlen_at(b[0..96]) == 2);
+}

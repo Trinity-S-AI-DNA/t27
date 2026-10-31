@@ -1,0 +1,308 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS nvidia_host: where the direct NVIDIA route (nvidia_direct.t27) touches the machine. No decisions:
+//   - nv_kc_read: the key list, one Keychain item (service NV_KC_SERVICE, account NV_KC_ACCOUNT), read by
+//     /usr/bin/security like every other key (keys_host.t27 sec_run); never printed, never written to a file;
+//     the buffer is wiped by whoever asked for it. Under a HOME that is not the user's own folder the login
+//     keychain is named (nvidia_direct.t27 nv_kc_argv); T27OS_NVIDIA_DEBUG=1 prints lengths and codes only.
+//   - the state file ~/.t27os/nvidia/state.t27 (nv_state_text: counters, dead flags, answer times, the current key, the
+//     list's hash; no key), written to a temporary file and renamed over the old one.
+//   - nv_line: the KEYS panel's NVIDIA line, read from the Keychain item and the state file.
+//   - nv_check_main: T27OS_NVIDIA_CHECK=<1..5> runs that many checks at most (a one-token chat completion,
+//     keys_probe.t27 probe_nvidia) on the key nv_pick names (the smallest median answer time), times each one
+//     (nv_on_answer puts the time into the key's window), saves the state, prints one line per request and the
+//     status line to standard error (the key number, the time and the median only, never the key) and ends the
+//     process before any window. T27OS_NVIDIA_KEY=<number> sends every check of the run with that key instead.
+// Only the window imports this module (keys_probe needs Foundation). Specs holding @extern cannot run tests
+// under t27c; every rule here is a tested fn in nvidia_direct.t27.
+// Refs gHashTag/t27#10782.
+module T27osNvidiaHost;
+
+use t27os::keys::NV_KC_SERVICE;
+use t27os::keys::NV_KC_ACCOUNT;
+use t27os::keys::NV_MODEL_DEFAULT;
+use t27os::keys::SEC_OK;
+use t27os::keys::SEC_TIMEOUT_MS;
+use t27os::keys_host::sec_run;
+use t27os::keys_host::kc_env;
+use t27os::keys_host::kc_user_home;
+use t27os::keys_probe::probe_nvidia;
+use t27os::nvidia_direct::NV_BAD;
+use t27os::nvidia_direct::NV_NONE;
+use t27os::nvidia_direct::NV_MAX;
+use t27os::nvidia_direct::NV_JSON_CAP;
+use t27os::nvidia_direct::NV_ST_LEN;
+use t27os::nvidia_direct::NV_ACTION_WORDS;
+use t27os::nvidia_direct::nv_parse;
+use t27os::nvidia_direct::nv_kc_argv;
+use t27os::nvidia_direct::nv_list_hash;
+use t27os::nvidia_direct::nv_state_init;
+use t27os::nvidia_direct::nv_state_load;
+use t27os::nvidia_direct::nv_state_text;
+use t27os::nvidia_direct::nv_pick;
+use t27os::nvidia_direct::nv_on_answer;
+use t27os::nvidia_direct::nv_median;
+use t27os::nvidia_direct::NV_A_MODEL;
+use t27os::nvidia_direct::nv_model_for;
+use t27os::nvidia_direct::nv_status_line;
+use t27os::nvidia_direct::nv_live;
+use t27os::nvidia_direct::nv_answered;
+use t27os::nvidia_direct::nv_ok_keys;
+use t27os::nvidia_direct::nv_dead;
+use t27os::nvidia_direct::NV_S_N;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::session_store::csv_field;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_mkdir;
+
+/// The most checks one T27OS_NVIDIA_CHECK run sends.
+pub const NV_CHECK_MAX : u32 = 5;
+
+fn nv_clock(id: u32) -> u64 { return @extern("clock_gettime_nsec_np"); }
+
+/// Milliseconds on the monotonic clock (CLOCK_UPTIME_RAW): only differences mean anything.
+fn nv_now_ms() -> u64 {
+    return nv_clock(8) / 1000000;
+}
+
+fn nv_wipe(b: []u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// T27OS_NVIDIA_DEBUG=1: one line to standard error with three numbers (lengths and codes only, never a key).
+fn nv_debug3(tag: []const u8, a: u32, b: u32, c: u32) -> void {
+    var e : [8]u8 = undefined;
+    if (kc_env("T27OS_NVIDIA_DEBUG", e[0..8]) == 0 or e[0] != 49) { return; }
+    var l : [128]u8 = undefined;
+    var n : usize = put_bytes(l[0..128], 0, tag);
+    n = put_dec(l[0..128], n, @as(u64, a));
+    n = put_bytes(l[0..128], n, " ");
+    n = put_dec(l[0..128], n, @as(u64, b));
+    n = put_bytes(l[0..128], n, " ");
+    n = put_dec(l[0..128], n, @as(u64, c));
+    l[n] = 10;
+    sys_write(2, l[0..128], @as(u64, n + 1));
+}
+
+/// The key list item into out (NV_JSON_CAP bytes); its length, 0 when it is missing, the tool failed or the
+/// bytes did not fit.
+pub fn nv_kc_read(out: []u8) -> usize {
+    var words : [256]u8 = undefined;
+    var offs : [8]u32 = undefined;
+    nv_wipe(words[0..256]);
+    var z : usize = 0;
+    while (z < 8) {
+        offs[z] = 0;
+        z = z + 1;
+    }
+    var home : [160]u8 = undefined;
+    const hn : usize = kc_env("HOME", home[0..160]);
+    var uh : [160]u8 = undefined;
+    const un : usize = kc_user_home(uh[0..160]);
+    const argc : u32 = nv_kc_argv(home[0..hn], uh[0..un], words[0..256], offs[0..8]);
+    if (argc == 0) { return 0; }
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = sec_run(words[0..256], offs[0..8], argc, "", out, res[0..2], @as(i32, @intCast(SEC_TIMEOUT_MS)));
+    nv_debug3("nvidia debug: security argc st bytes exit ", argc, st, res[0]);
+    nv_debug3("nvidia debug: security exit home user_home ", res[1], @as(u32, @intCast(hn)), @as(u32, @intCast(un)));
+    if (st != SEC_OK) {
+        nv_wipe(out);
+        return 0;
+    }
+    return @as(usize, res[0]);
+}
+
+/// ~/.t27os/nvidia, then `leaf` after a slash, NUL-ended in out; the length without the NUL, 0 without HOME.
+fn nv_path(leaf: []const u8, out: []u8) -> usize {
+    var home : [256]u8 = undefined;
+    const hn : usize = kc_env("HOME", home[0..256]);
+    if (hn == 0) { return 0; }
+    var n : usize = put_bytes(out, 0, home[0..hn]);
+    n = put_bytes(out, n, "/.t27os/nvidia");
+    if (leaf.len > 0) {
+        n = put_bytes(out, n, "/");
+        n = put_bytes(out, n, leaf);
+    }
+    out[n] = 0;
+    return n;
+}
+
+/// Read the key list and the saved state into st (NV_ST_LEN words); what nv_parse said (NV_BAD: not a key
+/// list; 0 also when the item is missing). json holds the keys afterwards (offs, lens): the caller wipes it.
+pub fn nv_load(st: []u32, json: []u8, offs: []u32, lens: []u32) -> u32 {
+    const n : usize = nv_kc_read(json);
+    if (n == 0) {
+        nv_state_init(st, 0, 0);
+        return 0;
+    }
+    var res : [2]u32 = undefined;
+    const listed : u32 = nv_parse(json[0..n], offs, lens, res[0..2]);
+    nv_debug3("nvidia debug: parse listed repeats rejected ", listed, res[0], res[1]);
+    if (listed == NV_BAD) {
+        nv_wipe(json);
+        nv_state_init(st, 0, 0);
+        return NV_BAD;
+    }
+    const hash : u32 = nv_list_hash(json[0..n], offs, lens, listed);
+    var p : [320]u8 = undefined;
+    var text : [8192]u8 = undefined;
+    var got : i64 = 0;
+    if (nv_path("state.t27", p[0..320]) > 0) {
+        const fd : i32 = sys_open_ro(p[0..320], 0);
+        if (fd >= 0) {
+            got = sys_read(fd, text[0..8192], 8192);
+            sys_close(fd);
+        }
+    }
+    if (got < 0) { got = 0; }
+    nv_state_load(text[0 .. @as(usize, @intCast(got))], listed, hash, st);
+    return listed;
+}
+
+/// Write the state file (no key in it). True when it was renamed into place.
+pub fn nv_save(st: []const u32) -> bool {
+    var d : [320]u8 = undefined;
+    const dn : usize = nv_path("", d[0..320]);
+    if (dn == 0) { return false; }
+    // ~/.t27os first: a fresh HOME has neither folder
+    d[dn - 7] = 0;
+    sys_mkdir(d[0..320], 448);
+    d[dn - 7] = 47;
+    sys_mkdir(d[0..320], 448);
+    var t : [8192]u8 = undefined;
+    const n : usize = nv_state_text(st, t[0..8192]);
+    var tmp : [320]u8 = undefined;
+    var fin : [320]u8 = undefined;
+    nv_path("state.t27.tmp", tmp[0..320]);
+    nv_path("state.t27", fin[0..320]);
+    const fd : i32 = sys_creat(tmp[0..320], 384);
+    if (fd < 0) { return false; }
+    const w : i64 = sys_write(fd, t[0..8192], @as(u64, n));
+    sys_close(fd);
+    if (w != @as(i64, @intCast(n))) { return false; }
+    return sys_rename(tmp[0..320], fin[0..320]) == 0;
+}
+
+/// The KEYS panel's NVIDIA line into out (96 bytes); its length.
+pub fn nv_line(out: []u8) -> usize {
+    var cnt : [5]u32 = undefined;
+    return nv_line_counts(out, cnt[0..5]);
+}
+
+/// nv_line, and the numbers the line was made from (the same read, no other): cnt[0] = 1 when the key list was
+/// readable, cnt[1] = the keys, cnt[2] = the live ones (nv_live), and with five words cnt[3] = the keys that
+/// answered (nv_answered), cnt[4] = those known to work (nv_ok_keys). The ACCOUNT cabinet's KEYS line shows them.
+pub fn nv_line_counts(out: []u8, cnt: []u32) -> usize {
+    var st : [964]u32 = undefined;
+    var json : [8192]u8 = undefined;
+    var offs : [64]u32 = undefined;
+    var lens : [64]u32 = undefined;
+    const listed : u32 = nv_load(st[0..964], json[0..8192], offs[0..64], lens[0..64]);
+    nv_wipe(json[0..8192]);
+    cnt[0] = 1;
+    if (listed == NV_BAD) { cnt[0] = 0; }
+    cnt[1] = st[NV_S_N];
+    cnt[2] = nv_live(st[0..964]);
+    if (cnt.len >= 5) {
+        cnt[3] = nv_answered(st[0..964]);
+        cnt[4] = nv_ok_keys(st[0..964]);
+    }
+    return nv_status_line(st[0..964], listed, NV_MODEL_DEFAULT, out);
+}
+
+fn nv_err(b: []const u8, n: usize) -> void {
+    sys_write(2, b, @as(u64, n));
+}
+
+/// T27OS_NVIDIA_CHECK=<1..5>: that many checks at most, then the process ends. False when the variable is
+/// unset (the window starts as usual). Each check goes to the key nv_pick names, so a refused (401/403), rate
+/// limited (429) or slow key gives way to the next; a 404 (the model is not deployed) ends the run.
+/// T27OS_NVIDIA_MODEL names a model (a dead one is replaced); T27OS_NVIDIA_KEY=<1..64> sends every check
+/// with that key number (a dead or missing number sends nothing).
+pub fn nv_check_main() -> bool {
+    var e : [16]u8 = undefined;
+    const en : usize = kc_env("T27OS_NVIDIA_CHECK", e[0..16]);
+    if (en == 0) { return false; }
+    var times : u32 = 1;
+    if (e[0] >= 49 and e[0] <= 57) { times = @as(u32, e[0] - 48); }
+    if (times > NV_CHECK_MAX) { times = NV_CHECK_MAX; }
+    var mw : [96]u8 = undefined;
+    const mwn : usize = kc_env("T27OS_NVIDIA_MODEL", mw[0..96]);
+    var model : [96]u8 = undefined;
+    const mn : usize = nv_model_for(mw[0..mwn], model[0..96]);
+    var st : [964]u32 = undefined;
+    var json : [8192]u8 = undefined;
+    var offs : [64]u32 = undefined;
+    var lens : [64]u32 = undefined;
+    const listed : u32 = nv_load(st[0..964], json[0..8192], offs[0..64], lens[0..64]);
+    var kw : [8]u8 = undefined;
+    const kwn : usize = kc_env("T27OS_NVIDIA_KEY", kw[0..8]);
+    var forced : u32 = NV_NONE;
+    if (kwn > 0) {
+        var x : u32 = 0;
+        var d : usize = 0;
+        while (d < kwn and kw[d] >= 48 and kw[d] <= 57 and x < 1000) {
+            x = x * 10 + @as(u32, kw[d] - 48);
+            d = d + 1;
+        }
+        forced = 0;
+        if (x >= 1) { forced = x - 1; } else { forced = NV_MAX; }
+    }
+    var line : [160]u8 = undefined;
+    var sent : u32 = 0;
+    var go : bool = listed != NV_BAD and listed > 0;
+    while (go and sent < times) {
+        var k : u32 = nv_pick(st[0..964]);
+        if (forced != NV_NONE) {
+            k = forced;
+            if (k >= st[NV_S_N] or nv_dead(st[0..964], k)) { k = NV_NONE; }
+        }
+        if (k == NV_NONE) {
+            go = false;
+        } else {
+            const o : usize = @as(usize, offs[k]);
+            const t0 : u64 = nv_now_ms();
+            const code : u32 = probe_nvidia(json[o .. o + @as(usize, lens[k])], model[0..mn]);
+            var ms : u64 = nv_now_ms() - t0;
+            if (ms > 4000000000) { ms = 4000000000; }
+            const act : u32 = nv_on_answer(st[0..964], k, code, @as(u32, @intCast(ms)));
+            nv_save(st[0..964]);
+            sent = sent + 1;
+            var n : usize = put_bytes(line[0..160], 0, "nvidia check: key #");
+            n = put_dec(line[0..160], n, @as(u64, k + 1));
+            n = put_bytes(line[0..160], n, " HTTP ");
+            n = put_dec(line[0..160], n, @as(u64, code));
+            n = put_bytes(line[0..160], n, " ");
+            n = put_dec(line[0..160], n, ms);
+            n = put_bytes(line[0..160], n, " ms, median ");
+            n = put_dec(line[0..160], n, @as(u64, nv_median(st[0..964], k)));
+            n = put_bytes(line[0..160], n, " ms -> ");
+            n = n + csv_field(NV_ACTION_WORDS, act, line[n .. 160]);
+            line[n] = 10;
+            nv_err(line[0..160], n + 1);
+            if (act == NV_A_MODEL) { go = false; }
+        }
+    }
+    nv_wipe(json[0..8192]);
+    const sl : usize = nv_status_line(st[0..964], listed, model[0..mn], line[0..160]);
+    line[sl] = 10;
+    nv_err(line[0..160], sl + 1);
+    return true;
+}
+
+test the_host_module_is_declared {
+    var b : [2]u8 = undefined;
+    b[0] = 1;
+    assert b[0] == 1 and NV_CHECK_MAX == 5 and NV_MAX == 64 and NV_ST_LEN == 964 and NV_JSON_CAP == 8192;
+}
