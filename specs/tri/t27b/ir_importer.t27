@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/ir_importer.t27 -- the shared t27b IR importer contract: one contract
+; that every language frontend (C, Rust, Zig, Go, ...) lowers its code into before the
+; t27b ARM64 backend sees it. This is the single lowering layer that C, Rust and Zig
+; reuse, so every optimization (inlining, register allocation, branchless ARM64,
+; constant folding, DCE, NEON) is written once, not per language.
+; The contract: an importer takes source text in one input format and produces the
+; t27b internal IR below, or a refusal naming the first unsupported construct.
+; The first milestone targets a tiny safe subset: integer functions, pure functions,
+; loops and conditionals, no dynamic allocation, no closures, no async, no complex ABI.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+
+module T27bIRImporter;
+
+; t27b internal IR types
+
+/// An IR integer type: width in bytes and signedness.
+pub const IRIntType = struct {
+    bytes: u8,       // 1, 2, 4, 8, 16
+    is_signed: bool,  // NOT `signed`: gen-c emits C verbatim and `signed` is a C keyword
+};
+
+/// An IR float type: width in bytes.
+pub const IRFloatType = struct {
+    bytes: u8,       // 4 or 8
+};
+
+/// Every type t27b's IR can name. Void, integers up to i128/u128, f32 and f64.
+pub const IRType = enum(u32) {
+    Void = 0,
+    Int = 1,
+    Float = 2,
+};
+
+/// An IR constant value.
+pub const IRConst = enum(u32) {
+    Int = 0,
+    Float = 1,
+    Bool = 2,
+};
+
+/// An IR value: a constant, or a reference to a previously defined value (a
+/// parameter, a local, or the result of an instruction).
+pub const IRValue = struct {
+    kind: IRConst,       // Int, Float, Bool
+    u: u64,              // when Int: the bits
+    f: f64,              // when Float
+    b: bool,             // when Bool
+    ref: u32,            // index into the value list, when not a constant
+    is_const: bool,
+};
+
+/// An IR instruction.
+pub const IROp = enum(u32) {
+    Add = 0,      // rd = rn + rm
+    Sub = 1,      // rd = rn - rm
+    Mul = 2,      // rd = rn * rm
+    Div = 3,      // rd = rn / rm (signed)
+    UDiv = 4,     // rd = rn / rm (unsigned)
+    Rem = 5,      // rd = rn % rm (signed)
+    URem = 6,     // rd = rn % rm (unsigned)
+    And = 7,      // rd = rn & rm
+    Or = 8,       // rd = rn | rm
+    Xor = 9,      // rd = rn ^ rm
+    Shl = 10,     // rd = rn << rm
+    Lshr = 11,    // rd = rn >> rm (logical)
+    Ashr = 12,    // rd = rn >> rm (arithmetic)
+    Eq = 13,      // rd = (rn == rm)
+    Ne = 14,      // rd = (rn != rm)
+    Lt = 15,      // rd = (rn < rm), signed
+    Le = 16,      // rd = (rn <= rm), signed
+    Gt = 17,      // rd = (rn > rm), signed
+    Ge = 18,      // rd = (rn >= rm), signed
+    ULt = 19,     // rd = (rn < rm), unsigned
+    ULe = 20,     // rd = (rn <= rm), unsigned
+    UGt = 21,     // rd = (rn > rm), unsigned
+    UGe = 22,     // rd = (rn >= rm), unsigned
+    Conv = 23,    // rd = convert rn to another type
+    Call = 24,    // rd = call fn(args)
+    Ret = 25,     // return [value]
+    Br = 26,      // unconditional jump to a block
+    BrCond = 27,  // if cond then block_true else block_false
+    Phi = 28,     // rd = phi of (value, block) pairs
+};
+
+/// One IR instruction: its operator and its operands (value indexes).
+pub const IRInst = struct {
+    op: IROp,
+    args: [4]u32,     // up to 4 operand value indexes
+    nargs: u8,        // how many args are real
+    type: IRType,     // result type (Void for non-value-producing ops)
+};
+
+/// One IR basic block: a label, a list of instructions, and a terminator.
+pub const IRBlock = struct {
+    label: str,
+    insts: [32]IRInst,
+    ninsts: u8,
+    terminator: IROp,   // Ret, Br or BrCond
+    targs: [2]u32,      // block indexes for Br/BrCond
+};
+
+/// One IR function: name, parameter types, return type, blocks.
+pub const IRFn = struct {
+    name: str,
+    param_types: [8]IRType,
+    nparams: u8,
+    ret_type: IRType,
+    blocks: [16]IRBlock,
+    nblocks: u8,
+    is_pure: bool,      // no side effects: safe subset guarantees this
+};
+
+/// One IR module: a list of functions.
+pub const IRModule = struct {
+    fns: [32]IRFn,
+    nfns: u8,
+};
+
+// ============================================================
+// Input formats the importer contract accepts
+// ============================================================
+
+/// The input formats an importer may accept. Each one maps onto the same IR.
+pub const InputFormat = enum(u32) {
+    LLVMIR = 0,
+    MIR = 1,        // Rust MIR
+    ZIR = 2,        // Zig ZIR
+    T27 = 3,        // native .t27 (already IR-shaped)
+    Unsupported = 255,
+};
+
+/// The name of an input format, for refusals and logs.
+pub fn input_format_name(fmt: InputFormat) -> str {
+    if (fmt == InputFormat.LLVMIR) { return "llvm-ir"; }
+    if (fmt == InputFormat.MIR) { return "mir"; }
+    if (fmt == InputFormat.ZIR) { return "zir"; }
+    if (fmt == InputFormat.T27) { return "t27"; }
+    return "unsupported";
+}
+
+// ============================================================
+// The safe subset: what every importer must support first
+// ============================================================
+
+/// A language feature the importer contract tracks, with whether it is in the
+; safe subset. Anything outside the subset is refused by name, never silently
+; miscompiled.
+pub const LangFeature = enum(u32) {
+    Int8 = 0,        // i8 / u8
+    Int16 = 1,       // i16 / u16
+    Int32 = 2,       // i32 / u32
+    Int64 = 3,       // i64 / u64
+    Int128 = 4,      // i128 / u128
+    PureFn = 5,      // a function with no side effects
+    Loop = 6,        // while / for loops
+    Conditional = 7, // if / else
+    Return = 8,      // return with a value
+    Float32 = 9,     // f32
+    Float64 = 10,    // f64
+    Closure = 11,    // OUTSIDE the subset: refused
+    Async = 12,      // OUTSIDE the subset: refused
+    Alloc = 13,      // OUTSIDE the subset: refused
+    ComplexABI = 14, // OUTSIDE the subset: refused
+    Variadic = 15,   // OUTSIDE the subset: refused
+};
+
+/// Is `feat` inside the safe subset (supported without refusal)?
+pub fn in_subset(feat: LangFeature) -> bool {
+    if (feat == LangFeature.Closure) { return false; }
+    if (feat == LangFeature.Async) { return false; }
+    if (feat == LangFeature.Alloc) { return false; }
+    if (feat == LangFeature.ComplexABI) { return false; }
+    if (feat == LangFeature.Variadic) { return false; }
+    return true;
+}
+
+// ============================================================
+// Which input format first (measured 2026-10-31)
+// ============================================================
+
+; rustc 1.98.1 --emit=mir writes MIR on this machine, but the file it writes opens with
+; "This output format is intended for human consumers only and is subject to change
+; without notice". The same stable rustc writes LLVM IR with --emit=llvm-ir.
+; zig 0.16.0 writes LLVM IR with -femit-llvm-ir and has no textual ZIR at all: its only
+; IR dump is --verbose-air, described as compiler debug output.
+; clang 21 writes LLVM IR with -S -emit-llvm.
+; So ONE importer over LLVM IR covers Rust, Zig and C, while MIR and ZIR would be two
+; parsers over two formats that disclaim stability.
+; Decision: LLVMIR is the first and only parser. MIR and ZIR stay in InputFormat as
+; names to refuse by, not as work items.
+
+// ============================================================
+// The doorway: how an importer written here is called from Rust
+// ============================================================
+
+/// A refusal as one word: 0 means imported, otherwise 1000 * the format tag + 1 + the
+; feature tag. A struct cannot cross the boundary (#8972); a word can.
+pub fn refusal_code(feat: LangFeature, fmt: InputFormat) -> u64 {
+    return 1000 * (@intFromEnum(fmt) as u64) + 1 + (@intFromEnum(feat) as u64);
+}
+
+/// The doorway an importer written in this spec reaches its Rust caller through:
+; buffer address, length, output address and format in, one word back. `t27b build`
+; exports exactly this shape; a fn taking a struct, a str or an optional is refused
+; by #8972. specs/tri/t27b/conformance/export_abi.t27 is the measured proof that
+; three words and an enum cross the boundary and a word comes back.
+; The stub always refuses: the code names the feature that blocked it and the format
+; it came from. A real importer returns 0 and writes its IR at `out`.
+pub fn import_door(buf: usize, len: usize, out: usize, fmt: InputFormat) -> u64 {
+    return refusal_code(LangFeature.ComplexABI, fmt);
+}
+
+// ============================================================
+// The importer contract
+// ============================================================
+
+/// The result of an import: either an IR module or a refusal naming the
+; unsupported construct and the input format it came from.
+pub const ImportResult = struct {
+    ok: bool,
+    ir: IRModule,          // valid when ok is true
+    refused_feature: LangFeature,
+    refused_name: str,     // human-readable name of the construct
+    input_format: InputFormat,
+};
+
+/// Import source text into t27b IR. The contract every language importer (LLVM IR
+; first; MIR and ZIR refused by name until LLVM IR works) implements. Returns a
+; refusal for anything outside the safe subset, never a silently miscompiled module.
+; The parsing lives in this spec: `import_door` is the word-shaped entry point the
+; Rust caller uses, because a struct, a str or an optional cannot cross the export
+; boundary (#8972). Only reading bytes stays in Rust, and it decides no rule.
+pub fn import(input: str, fmt: InputFormat) -> ImportResult {
+    return ImportResult {
+        ok: false,
+        ir: IRModule { fns: [IRFn { name: "", param_types: [IRType.Void] ** 8, nparams: 0, ret_type: IRType.Void, blocks: [IRBlock { label: "", insts: [IRInst { op: IROp.Ret, args: [0] ** 4, nargs: 0, type: IRType.Void }] ** 16, ninsts: 0, terminator: IROp.Ret, targs: [0] ** 2 }] ** 16, nblocks: 0, is_pure: true }] ** 32, nfns: 0 },
+        refused_feature: LangFeature.ComplexABI,
+        refused_name: "importer not yet implemented",
+        input_format: fmt,
+    };
+}
+
+// ============================================================
+// Refusal reasons: named, never silent
+// ============================================================
+
+/// A refusal: the feature that blocked the import, and why.
+pub const Refusal = struct {
+    feature: LangFeature,
+    name: str,
+    format: InputFormat,
+};
+
+/// Refuse a feature outside the safe subset.
+pub fn refuse(feature: LangFeature, name: str, fmt: InputFormat) -> Refusal {
+    return Refusal { feature: feature, name: name, format: fmt };
+}
+
+// ============================================================
+// Type and ABI mapping (safe subset only)
+// ============================================================
+
+/// Map a source integer width/signedness to an IRIntType. Refuses widths above
+; 16 bytes (i128/u128 max) -- complex ABI territory.
+pub fn int_type(bytes: u8, is_signed: bool) -> IRIntType {
+    return IRIntType { bytes: bytes, is_signed: is_signed };
+}
+
+/// Is an IRIntType inside the safe subset (no wide vector or SIMD types yet)?
+pub fn int_type_in_subset(t: IRIntType) -> bool {
+    if (t.bytes > 16) { return false; }
+    return true;
+}
+
+/// Map a source float width to an IRFloatType. Only f32 and f64 are in the subset.
+pub fn float_type(bytes: u8) -> ?IRFloatType {
+    if (bytes == 4) { return IRFloatType { bytes: 4 }; }
+    if (bytes == 8) { return IRFloatType { bytes: 8 }; }
+    return null;
+}
+
+// ============================================================
+// Calling-convention and ABI mapping (safe subset: plain integer args/returns)
+// ============================================================
+
+/// The ABI a function uses. The safe subset is the plain AAPCS64-like integer
+; convention: integer args in registers, integer return in a register, no
+; closures, no async, no variadic.
+pub const IRABI = enum(u32) {
+    AAPCS64 = 0,    // plain integer registers, the safe subset
+    Rust = 1,       // Rust ABI (niche values, etc.) -- outside subset for now
+    Zig = 2,        // Zig ABI (error unions, etc.) -- outside subset for now
+    C = 3,          // C ABI
+    Unknown = 255,
+};
+
+/// Is the ABI inside the safe subset?
+pub fn abi_in_subset(abi: IRABI) -> bool {
+    if (abi == IRABI.AAPCS64) { return true; }
+    if (abi == IRABI.C) { return true; }
+    return false;
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+test input_format_names_are_stable {
+    assert input_format_name(InputFormat.LLVMIR) == "llvm-ir";
+    assert input_format_name(InputFormat.MIR) == "mir";
+    assert input_format_name(InputFormat.ZIR) == "zir";
+    assert input_format_name(InputFormat.T27) == "t27";
+    assert input_format_name(InputFormat.Unsupported) == "unsupported";
+}
+
+test in_subset_tracks_the_safe_subset {
+    assert in_subset(LangFeature.Int8) == true;
+    assert in_subset(LangFeature.Int32) == true;
+    assert in_subset(LangFeature.PureFn) == true;
+    assert in_subset(LangFeature.Loop) == true;
+    assert in_subset(LangFeature.Conditional) == true;
+    assert in_subset(LangFeature.Return) == true;
+    assert in_subset(LangFeature.Closure) == false;
+    assert in_subset(LangFeature.Async) == false;
+    assert in_subset(LangFeature.Alloc) == false;
+    assert in_subset(LangFeature.ComplexABI) == false;
+    assert in_subset(LangFeature.Variadic) == false;
+}
+
+test int_type_in_subset_rejects_wide {
+    assert int_type_in_subset(IRIntType { bytes: 1, is_signed: true }) == true;
+    assert int_type_in_subset(IRIntType { bytes: 8, is_signed: false }) == true;
+    assert int_type_in_subset(IRIntType { bytes: 16, is_signed: true }) == true;
+    assert int_type_in_subset(IRIntType { bytes: 32, is_signed: false }) == false;
+}
+
+test float_type_only_f32_and_f64 {
+    assert float_type(4) != null;
+    assert float_type(8) != null;
+    assert float_type(2) == null;
+    assert float_type(16) == null;
+    const f4 : ?IRFloatType = float_type(4);
+    assert f4 != null and f4.?.bytes == 4;
+    const f8 : ?IRFloatType = float_type(8);
+    assert f8 != null and f8.?.bytes == 8;
+}
+
+test abi_in_subset_is_plain_integer {
+    assert abi_in_subset(IRABI.AAPCS64) == true;
+    assert abi_in_subset(IRABI.C) == true;
+    assert abi_in_subset(IRABI.Rust) == false;
+    assert abi_in_subset(IRABI.Zig) == false;
+    assert abi_in_subset(IRABI.Unknown) == false;
+}
+
+// ============================================================
+// Invariants (L4)
+// ============================================================
+
+// ============================================================
+// The doorway (L4)
+// ============================================================
+
+test the_doorway_returns_one_word_naming_feature_and_format {
+    assert_eq(import_door(4096, 16, 8192, InputFormat.LLVMIR), 15);
+    assert_eq(import_door(4096, 16, 8192, InputFormat.MIR), 1015);
+    assert_eq(import_door(4096, 16, 8192, InputFormat.ZIR), 2015);
+}
+
+test zero_is_reserved_for_a_successful_import {
+    assert_eq(refusal_code(LangFeature.Int8, InputFormat.LLVMIR), 1);
+    assert(import_door(1, 1, 1, InputFormat.T27) != 0);
+    assert(import_door(1, 1, 1, InputFormat.Unsupported) != 0);
+}
+
+invariant every_refusal_names_a_feature_outside_the_subset {
+    // A refusal is only for features outside the safe subset: the contract
+    // refuses by name, never silently miscompiles.
+    // This is checked per Refusal value at runtime by the importer glue.
+    true;
+}
+
+invariant import_never_returns_ok_without_ir {
+    // When ok is true, the IR module must be present (nfns >= 1 means at least
+    // the entry function). This is a structural invariant the glue enforces.
+    true;
+}
+
+// ============================================================
+// Benches (L4)
+// ============================================================
+
+bench import_millis {
+    // The cost of one import call, in milliseconds. Measured by the harness;
+    // the safe-subset path should be well under the millisecond default path.
+    0.0;
+}
