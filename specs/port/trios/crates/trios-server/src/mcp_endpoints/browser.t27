@@ -1,0 +1,339 @@
+// Port of gHashTag/trios:crates/trios-server/src/mcp_endpoints/browser.rs
+// (223 lines) to .t27, roadmap stage 6 (t27c gen-rust; issue #9306).
+//
+// The file is the server side of the SR-03 browser-command queue:
+//   - `BrowserState::new` (lines 15-20) starts an empty queue and an empty
+//     poller map;
+//   - `active_agent` (lines 23-31) picks the most recent poller whose age is
+//     within the window, `record_poll` (lines 33-38) stamps `now` and drops
+//     entries stale for over an hour;
+//   - `browser_commands` (lines 51-58) records the caller's poll (when the
+//     agent id is non-empty) and drains the queue for that agent;
+//   - `browser_result` (lines 60-82) requires `command_id`, defaults `success`
+//     to false, `result` to null, `error` to absent, and records the result;
+//   - `enqueue_command` (lines 84-108) requires `agent_id`, rejects an unknown
+//     tool name, and answers queued or queue_full with depth/capacity;
+//   - `queue_stats` (lines 111-113) is the read-only depth/capacity snapshot.
+//
+// The Mutexes, the tokio awaits and the serde_json Values are plumbing and are
+// not modelled: every function here takes the facts the handler would read and
+// returns the decision the handler would make. The poller map is a fixed
+// 8-slot array (the original HashMap is unbounded; a full array refuses the new
+// entry), and `str` ids are borrowed byte slices.
+//
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module port::trios::crates::trios_server::src::mcp_endpoints::browser;
+
+pub const POLLER_CAPACITY: usize = 8;
+// Line 37: `at.elapsed() < Duration::from_secs(3600)`.
+pub const POLLER_STALE_SECS: u64 = 3600;
+
+pub struct Poller {
+    id: str,
+    age_s: u64,
+    used: bool,
+}
+
+pub struct BrowserState {
+    queue_depth: usize,
+    queue_capacity: usize,
+    pollers: [8]Poller,
+    poller_count: usize,
+}
+
+// Lines 15-20: both the queue and the poller map start empty.
+pub fn new() -> BrowserState {
+    return BrowserState {
+        queue_depth: 0,
+        queue_capacity: 64,
+        pollers: [_]Poller{Poller { id: "", age_s: 0, used: false }} ** POLLER_CAPACITY,
+        poller_count: 0,
+    };
+}
+
+// Lines 23-31: filter to `now - at <= window`, then take the maximum `at`
+// (the smallest age). A poller exactly on the window boundary is still inside
+// (`<=`). No poller inside the window answers the empty string instead of None.
+// Ties keep the earlier entry: the original's HashMap iteration order makes
+// ties unspecified, so the port fixes a deterministic one.
+pub fn active_agent(state: BrowserState, window_s: u64) -> str {
+    var best: str = "";
+    var best_age: u64 = 0;
+    var found: bool = false;
+    var i: usize = 0;
+    while (i < state.poller_count) {
+        const p = state.pollers[i];
+        if (p.used) {
+            if (p.age_s <= window_s) {
+                if (!found || p.age_s < best_age) {
+                    best = p.id;
+                    best_age = p.age_s;
+                    found = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    return best;
+}
+
+// Lines 33-38: insert `agent_id -> now`, replacing any previous stamp for that
+// agent, then retain only entries younger than one hour. `age_s` is the age the
+// observation had when it was recorded (0 for a poll happening now); it lets a
+// test drive the stale-entry rule without a clock.
+pub fn record_poll(state: BrowserState, agent_id: str, age_s: u64) -> BrowserState {
+    var out = state;
+    var found: bool = false;
+    var i: usize = 0;
+    while (i < out.poller_count) {
+        if (out.pollers[i].used) {
+            if (out.pollers[i].id == agent_id) {
+                out.pollers[i].age_s = age_s;
+                found = true;
+            }
+        }
+        i += 1;
+    }
+    if (!found && out.poller_count < POLLER_CAPACITY) {
+        out.pollers[out.poller_count] = Poller { id: agent_id, age_s: age_s, used: true };
+        out.poller_count += 1;
+    }
+    // retain(|_, at| at.elapsed() < 3600) -- boundary is excluded.
+    var kept: usize = 0;
+    var j: usize = 0;
+    while (j < out.poller_count) {
+        const p = out.pollers[j];
+        if (p.used && p.age_s < POLLER_STALE_SECS) {
+            out.pollers[kept] = p;
+            kept += 1;
+        }
+        j += 1;
+    }
+    out.poller_count = kept;
+    return out;
+}
+
+pub struct CommandsOutcome {
+    recorded_poll: bool,
+    commands: usize,
+    state: BrowserState,
+}
+
+// Lines 51-58: an empty agent id does not record a poll; the queue is polled
+// for the agent and every pending command is handed back, leaving the queue
+// empty (the original's `queue.poll(agent_id)`).
+pub fn browser_commands(state: BrowserState, agent_id: str) -> CommandsOutcome {
+    var out = state;
+    var recorded: bool = false;
+    if (agent_id != "") {
+        out = record_poll(out, agent_id, 0);
+        recorded = true;
+    }
+    const delivered: usize = out.queue_depth;
+    out.queue_depth = 0;
+    return CommandsOutcome { recorded_poll: recorded, commands: delivered, state: out };
+}
+
+pub struct ResultOutcome {
+    ok: bool,
+    error: str,
+    recorded_ok: bool,
+    reported_error: str,
+    state: BrowserState,
+}
+
+// Lines 60-82: `command_id` empty fails with `command_id is required`; success
+// defaults to false when absent (line 62), and a recorded result answers
+// {"ok": true, "command_id": ...}. `has_error` models `error` being Some.
+pub fn browser_result(state: BrowserState, command_id: str, success: bool, has_error: bool, error: str) -> ResultOutcome {
+    if (command_id == "") {
+        return ResultOutcome { ok: false, error: "command_id is required", recorded_ok: false, reported_error: "", state: state };
+    }
+    const out = state;
+    // queue.record_result(result) -- the queue keeps the verdict; depth is
+    // untouched by a result report. `error` is Some only when has_error.
+    const reported: str = if (has_error) error else "";
+    return ResultOutcome { ok: true, error: "", recorded_ok: success, reported_error: reported, state: out };
+}
+
+// Lines 84-108: agent_id is required before the tool name is looked up; an
+// unknown tool answers "unknown browser tool"; a full queue answers queue_full
+// with the depth and capacity; otherwise the command is queued.
+pub const KNOWN_TOOL_COUNT: usize = 12;
+
+pub fn is_known_tool(tool: str) -> bool {
+    if (tool == "browser_navigate") { return true; }
+    if (tool == "browser_get_url") { return true; }
+    if (tool == "browser_get_title") { return true; }
+    if (tool == "browser_get_dom") { return true; }
+    if (tool == "browser_query_selector") { return true; }
+    if (tool == "browser_click") { return true; }
+    if (tool == "browser_type") { return true; }
+    if (tool == "browser_scroll") { return true; }
+    if (tool == "browser_eval") { return true; }
+    if (tool == "browser_screenshot") { return true; }
+    if (tool == "browser_open_tab") { return true; }
+    if (tool == "browser_close_tab") { return true; }
+    return false;
+}
+
+pub struct EnqueueOutcome {
+    kind: str,
+    depth: usize,
+    capacity: usize,
+    state: BrowserState,
+}
+
+pub fn enqueue_command(state: BrowserState, tool: str, agent_id: str) -> EnqueueOutcome {
+    if (agent_id == "") {
+        return EnqueueOutcome { kind: "missing_agent_id", depth: state.queue_depth, capacity: state.queue_capacity, state: state };
+    }
+    if (!is_known_tool(tool)) {
+        return EnqueueOutcome { kind: "unknown_tool", depth: state.queue_depth, capacity: state.queue_capacity, state: state };
+    }
+    var out = state;
+    if (out.queue_depth >= out.queue_capacity) {
+        return EnqueueOutcome { kind: "queue_full", depth: out.queue_depth, capacity: out.queue_capacity, state: out };
+    }
+    out.queue_depth += 1;
+    return EnqueueOutcome { kind: "queued", depth: out.queue_depth, capacity: out.queue_capacity, state: out };
+}
+
+pub struct QueueStats {
+    depth: usize,
+    capacity: usize,
+}
+
+// Lines 111-113: the observability snapshot is just the queue's own counters.
+pub fn queue_stats(state: BrowserState) -> QueueStats {
+    return QueueStats { depth: state.queue_depth, capacity: state.queue_capacity };
+}
+
+// ---------------------------------------------------------------------------
+// Tests: each asserts a behaviour read in the original (lines refer to
+// crates/trios-server/src/mcp_endpoints/browser.rs).
+// ---------------------------------------------------------------------------
+
+test state_starts_empty {
+    // Lines 15-20.
+    const s = new();
+    assert(s.queue_depth == 0);
+    assert(s.poller_count == 0);
+    assert(active_agent(s, 60) == "");
+}
+
+test record_poll_inserts_and_replaces {
+    // Lines 33-38: the second poll by the same agent replaces its stamp.
+    const s0 = record_poll(new(), "agent-A", 10);
+    assert(s0.poller_count == 1);
+    const s1 = record_poll(s0, "agent-A", 0);
+    assert(s1.poller_count == 1);
+    assert(s1.pollers[0].age_s == 0);
+    const s2 = record_poll(s1, "agent-B", 5);
+    assert(s2.poller_count == 2);
+}
+
+test record_poll_drops_entries_stale_for_an_hour {
+    // Line 37: retain elapsed < 3600, so 3600 itself is dropped.
+    const s0 = record_poll(new(), "old", 3600);
+    assert(s0.poller_count == 0);
+    const s1 = record_poll(new(), "fresh", 3599);
+    assert(s1.poller_count == 1);
+    // A stale entry already in the map is pruned by the next poll.
+    const s2 = record_poll(new(), "old", 4000);
+    const s3 = record_poll(s2, "new", 0);
+    assert(s3.poller_count == 1);
+    assert(s3.pollers[0].id == "new");
+}
+
+test active_agent_window_and_recency {
+    // Lines 23-31: only pollers within the window; the most recent wins.
+    const s0 = record_poll(new(), "a", 30);
+    const s1 = record_poll(s0, "b", 5);
+    const s2 = record_poll(s1, "c", 120);
+    assert(active_agent(s2, 60) == "b");
+    // The boundary is inclusive (duration_since <= window).
+    assert(active_agent(s2, 30) == "b");
+    assert(active_agent(s2, 4) == "");
+    assert(active_agent(s2, 200) == "b");
+}
+
+test browser_commands_records_and_drains {
+    // Lines 51-58.
+    const s0 = new();
+    const e1 = enqueue_command(s0, "browser_navigate", "agent-A");
+    assert(e1.kind == "queued");
+    const e2 = enqueue_command(e1.state, "browser_get_url", "agent-A");
+    assert(e2.kind == "queued");
+    assert(e2.state.queue_depth == 2);
+    const polled = browser_commands(e2.state, "agent-A");
+    assert(polled.commands == 2);
+    assert(polled.recorded_poll);
+    assert(polled.state.queue_depth == 0);
+    assert(polled.state.poller_count == 1);
+    // An empty agent id still polls, it just is not recorded (line 52).
+    const anonymous = browser_commands(new(), "");
+    assert(!anonymous.recorded_poll);
+    assert(anonymous.commands == 0);
+}
+
+test browser_result_requires_command_id {
+    // Lines 66-68: an empty command_id is the first failure.
+    const missing = browser_result(new(), "", true, false, "");
+    assert(!missing.ok);
+    assert(missing.error == "command_id is required");
+    // Lines 69-82: a present id records the result and answers ok.
+    const good = browser_result(new(), "cmd-1", true, false, "");
+    assert(good.ok);
+    // A failed command is still recorded successfully (the original's
+    // test_browser_result_recording_failure pins ok == true).
+    const failed = browser_result(new(), "cmd-2", false, true, "tab not found");
+    assert(failed.ok);
+}
+
+test enqueue_requires_agent_and_known_tool {
+    // Lines 89-96 run in order: agent id first, then from_tool_name.
+    const no_agent = enqueue_command(new(), "browser_navigate", "");
+    assert(no_agent.kind == "missing_agent_id");
+    assert(no_agent.state.queue_depth == 0);
+    const unknown = enqueue_command(new(), "browser_nonexistent", "a1");
+    assert(unknown.kind == "unknown_tool");
+    assert(unknown.state.queue_depth == 0);
+    // All 12 SR-03 tool names are accepted.
+    assert(is_known_tool("browser_navigate"));
+    assert(is_known_tool("browser_get_url"));
+    assert(is_known_tool("browser_get_title"));
+    assert(is_known_tool("browser_get_dom"));
+    assert(is_known_tool("browser_query_selector"));
+    assert(is_known_tool("browser_click"));
+    assert(is_known_tool("browser_type"));
+    assert(is_known_tool("browser_scroll"));
+    assert(is_known_tool("browser_eval"));
+    assert(is_known_tool("browser_screenshot"));
+    assert(is_known_tool("browser_open_tab"));
+    assert(is_known_tool("browser_close_tab"));
+    assert(!is_known_tool("browser_nonexistent"));
+}
+
+test enqueue_reports_queue_full_with_depth_and_capacity {
+    // Lines 99-107: queue_full carries depth and capacity.
+    var s = new();
+    s.queue_capacity = 2;
+    const e1 = enqueue_command(s, "browser_navigate", "a1");
+    const e2 = enqueue_command(e1.state, "browser_navigate", "a1");
+    assert(e2.kind == "queued");
+    const full = enqueue_command(e2.state, "browser_navigate", "a1");
+    assert(full.kind == "queue_full");
+    assert(full.depth == 2);
+    assert(full.capacity == 2);
+    assert(full.state.queue_depth == 2);
+}
+
+test queue_stats_snapshot {
+    // Lines 111-113.
+    const s = enqueue_command(new(), "browser_navigate", "a1");
+    const stats = queue_stats(s.state);
+    assert(stats.depth == 1);
+    assert(stats.capacity == 64);
+}
