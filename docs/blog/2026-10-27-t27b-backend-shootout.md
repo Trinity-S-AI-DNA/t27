@@ -81,22 +81,24 @@ spec (.t27) --t27b test--> 5 ms verdict  (every tick)
 
 ## Infographics
 
-- [`t27b-backend-shootout.svg`](t27b-backend-shootout.svg) — Compile time | Size | Runtime | Metaprogramming calls, gold on all axes
+- [`t27b-backend-shootout.svg`](t27b-backend-shootout.svg) — Compile time | Size | Runtime Calls/s | Unrolling compile receipt
 - [`t27b-vs-c-comparison.svg`](t27b-vs-c-comparison.svg) — t27b vs clang/gcc/c++: compile time, artifact size, superiority
 - [`t27b-vs-native-languages.svg`](t27b-vs-native-languages.svg) — Runtime for 200M calls across 7 languages
 - [`science-under-the-shootout.svg`](science-under-the-shootout.svg) — Research foundations → t27b golden claims
+
+*Note:* The unrolling panel reports compile-time throughput only. Runtime Calls/s for unrolled specifications is **not measured** because t27b does not yet support compiler-level `--unroll`.
 
 ## Tri CLI: `tri shootout improve`
 
 Pareto-focused improvement loop (15m tick via `specs/crons/t27-backend-shootout-improvement-loop.t27`):
 
-- `tri shootout improve` — auto-fixes top 3 Pareto weaknesses, re-measures all languages with compile-time unrolling, regenerates infographics, syncs `site/index.html`, verifies golden chain (no breakage), auto-merges on green.
-- `specs/tri/shootout/bench.t27` — benchmark harness with Zig-style compile-time unrolling (1000× → 200B calls).
+- `tri shootout improve` — Pareto-ranks shootout gaps, applies measurable fixes, re-measures runtime Calls/s, regenerates infographics, verifies the golden chain, and merges only when CI is green.
+- `specs/tri/shootout/bench.t27` — benchmark harness and unrolling receipts. Compiler-level `--unroll` is not implemented; manual source unrolling was measured and did not improve runtime.
 - `specs/tri/shootout/improve.t27` — `tri shootout improve` command contract.
 
 ## Three Collaboration Options for Next Loop
 
-1. **Top-Priority Gap Remediation** — close all SVG gaps, sync site HTML, measure metaprogramming unroll, close RED_ON_MASTER. Expected: 1-2 iterations (15-30 min). [`specs/tri/shootout/option1_gap_remediation.t27`](specs/tri/shootout/option1_gap_remediation.t27)
+1. **Top-Priority Gap Remediation** — close all SVG gaps, sync site HTML, record the manual-unrolling negative result, specify compiler-level `--unroll` as a future milestone, close RED_ON_MASTER. Expected: 1-2 iterations (15-30 min). [`specs/tri/shootout/option1_gap_remediation.t27`](specs/tri/shootout/option1_gap_remediation.t27)
 2. **Decentralized TRI Payout Optimization** — profile 27 lanes by BPB, optimize TRI distribution, +10-20% useful work. [`specs/tri/shootout/option2_tri_payout.t27`](specs/tri/shootout/option2_tri_payout.t27)
 3. **Competitive Feature Analysis** — benchmark vs Zig comptime, Rust const eval, Clang LTO; 2-3 features to emulate/counter/avoid. [`specs/tri/shootout/option3_competitor_analysis.t27`](specs/tri/shootout/option3_competitor_analysis.t27)
 
