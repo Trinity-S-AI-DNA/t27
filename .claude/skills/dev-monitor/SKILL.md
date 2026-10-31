@@ -20,7 +20,7 @@ The law is `specs/t27os/dev_monitor.t27` (module `T27osDevMonitor`): the state m
 
 ## What dsh web is, as found on 2026-10-31
 
-- One launchd job, label `ai.t27.dsh-web` (plist in `~/Library/LaunchAgents`, WorkingDirectory `~/deepseek-harness`), runs `dsh web --no-open` from the pinned checkout and listens on `127.0.0.1:3080`. Its stdout and stderr append to `~/.dsh/web-service.log`.
+- One launchd job, label `ai.t27.dsh-web` (plist in `~/Library/LaunchAgents`, WorkingDirectory `~/deepseek-harness`). Its ProgramArguments, read from the plist with PlistBuddy on 2026-10-31, are `cd ~/deepseek-harness && exec ~/.t27os/bin/node --import tsx/esm apps/cli/src/bin.ts web --no-open` (`START_CMD` of the law); that is the command verified running as pid 97706. It listens on `127.0.0.1:3080`; stdout and stderr append to `~/.dsh/web-service.log`. The `pnpm dsh web --no-open` form from the dsh README is documented, not verified: nobody ran it here, and nobody may while the job is loaded (a second instance).
 - Each start mints ONE random launch token, kept in memory only. One GET of the ready URL (the `?token` query) mints a signed cookie; every other cookie-less GET answers `401` with `dsh web authentication required; reopen the URL printed by dsh web.`
 - The ready URL is printed once per start as a `dsh web: http...` line. The LAST such line in the log belongs to the running process. It is a credential: it is handed to `open`, never printed, quoted, screenshotted, pasted or saved.
 - The hint "terminal tab c42" in older notes is stale: that tab belonged to the hand restart of 2026-10-31 12:32 and is gone. The launchd job is the only home of dsh web now; `launchctl` is the discovery, not a terminal tab.
@@ -47,14 +47,14 @@ The open move of step 3 below was run against the running instance (launchd job 
    | set | the job pid | the browser itself asks for authentication | `S_AUTH_REQUIRED` | `A_SIGN_IN` |
 
 3. **Open once (`A_OPEN`).** Count the log, hand the last ready line to `open`, write the marker:
-   - `wc -l < ~/.dsh/web-service.log`
+   - `N=$(wc -l < ~/.dsh/web-service.log)` (the line count BEFORE the open; step 5 counts only the lines after it)
    - `open "$(/usr/bin/grep -o 'dsh web: http[^ ]*' ~/.dsh/web-service.log | tail -1 | cut -c10-)"`
    - `mkdir -p target && date -u +%FT%TZ > target/dev-monitor.opened`
    The marker lives under the gitignored `target/` tree of the worktree and is never committed. One marker per dev entry; a new dev entry (a new session, or the owner's word) removes it first. Do not open the URL in the in-app browser, Chrome, BrowserOS or any MCP browser: that puts the credential into the transcript.
 4. **Repeat entry (`A_FOCUS`).** Marker present: bring the default browser forward without a URL (`open -a` with the browser's name) or just report the state. No new tab, no new process, no second `open` of the ready URL.
-5. **Verify the workspace (heuristic).** Within 20 s of the open the UI fetches its model list and the log grows by a `model listing` line:
-   - `sleep 15; wc -l < ~/.dsh/web-service.log`
-   - `tail -n 40 ~/.dsh/web-service.log | /usr/bin/grep -v -i -E 'token[=:]|api.?key|secret|passw|sk-[a-z]|bearer' | /usr/bin/grep -c 'model listing'`
+5. **Verify the workspace (heuristic).** Within 20 s of the open the UI fetches its model list and the log grows by a `model listing` line. Count the NEW lines only, from the `N` taken in step 3 before the open; never `tail -n 40`, whose count can be nonzero from an earlier open (Traps):
+   - `F='token[=:]|api.?key|secret|passw|sk-[a-z]|bearer'`
+   - `sleep 15; sed -n "$((N+1)),\$p" ~/.dsh/web-service.log | /usr/bin/grep -v -i -E "$F" | /usr/bin/grep -c 'model listing'`
    A count of 1 or more is `UI_PASS_LOG`; the owner saying the workspace is on screen is `UI_PASS_EYE`; nothing is `UI_FAIL`. The server keeps no HTTP access log, so the line is the only machine-readable evidence; the report says "heuristic" unless the owner confirmed by eye. Never launch a model call to test that the page opens.
 6. **Prove no second instance.** The `lsof` line of step 1 again: the same listener pid as before, equal to the job pid (`pid_unchanged()` of the law).
 7. **Verdict** (`verdict()` and `reason()`): `healthy` = `S_RUNNING` and the check passed; `degraded` = the UI opened, or asked to sign in, but the check did not pass; `blocked` with its reason otherwise: `not running`, `port held`, `no answer`, `start denied`.
@@ -71,7 +71,7 @@ When `open` is unavailable (no desktop session, an SSH shell), ask the owner to 
 
 The default is DENY: report `blocked: start denied` with the `launchctl` state line and name who decides (the owner). Start only when the dev-mode startup policy says ALLOW in the owner's own words for this entry, and then only:
 - in the pinned checkout `~/deepseek-harness`, which stays read-only for the agent (nothing committed there, no second clone anywhere);
-- with the verified command `cd ~/deepseek-harness && pnpm dsh web --no-open`, in a terminal tab the owner can see;
+- with `START_CMD` of the law, the launchd plist's own command `cd ~/deepseek-harness && exec ~/.t27os/bin/node --import tsx/esm apps/cli/src/bin.ts web --no-open` (the one verified running), in a terminal tab the owner can see; not the documented-unverified `pnpm dsh web --no-open` form;
 - never `pnpm install`, never an upgrade, never another port.
 After a permitted start the first open is step 3 as usual: the new process prints a new ready line, and the old lines in the log are dead.
 
@@ -91,10 +91,10 @@ The window shows the actual dsh sessions and tool activity; the monitor invents 
 
 ## Traps
 
-- `t27c check specs/t27os/dev_monitor.t27` typechecks the law and `t27b test specs/t27os/dev_monitor.t27` runs its tests; `t27c test` only lists them. Both run from the terminal tool on this Mac (the heavy-run hook denies `t27b test` in Bash, and it denies any Bash command whose text merely contains the word).
+- `t27c check specs/t27os/dev_monitor.t27` typechecks the law and `t27b test specs/t27os/dev_monitor.t27` runs its tests; `t27c test` only lists them. Typecheck, tests and the seal (`t27c seal --save` by a master-built `t27c`) run on the lab or in a T27 OS pane (skill `t27os-orchestra`, load under 30, free disk over 4 GiB), never in this session's shell on the Mac. The heavy-run hook that denies them here is the owner's rule (2026-10-09, 2026-10-24), not an obstacle to route around.
 - The owner's launchd job (pid 97706 on 2026-10-31) and every other launchd job are the owner's: never kill or restart them.
 - 403 lines on `/auth-api/v0/users/current` in the log are the DeepSeek-account plugin talking to its own backend, not a dsh web authentication failure.
 - `grep -o 'dsh web: http[^ ]*'` prints the token; only the `open "$(...)"` form of step 3 may carry it. Everything else that reads the log counts (`grep -c`) or filters (`grep -v`).
 - Measured 2026-10-31: a second `open` four minutes after a first one (same running process, same browser) grew the log by 10 lines within 15 s, all of them the plugin's 403 blocks, and no `model listing` line; one such line arrived about two minutes later, outside the window, and this run cannot tell the open from a periodic refresh. The first open had produced two such lines. The heuristic then says `degraded`, and only the owner's eye upgrades it.
-- Count the NEW lines (`sed -n 'N,$p'` from the `wc -l` taken before the open), not `tail -n 40`: a `tail` count of `model listing` can be nonzero from an earlier open and pass the check for you.
+- Count the NEW lines (`sed -n "$((N+1)),\$p"` from the `N=$(wc -l ...)` of step 3, taken before the open), not `tail -n 40`: a `tail` count of `model listing` can be nonzero from an earlier open and pass the check for you. Step 5 is written that way; an earlier draft of it used `tail -n 40` and contradicted this line.
 - A clone of dsh anywhere but `~/deepseek-harness` is litter (CLAUDE.md, "Where t27 work lives"); do not make one to look at the UI.
