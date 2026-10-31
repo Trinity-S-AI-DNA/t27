@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 ; specs/t27os/godmode_tick.t27 -- the GODMODE tick decision spec for the DSH supervisor.
-; Owner, 2026-10-31: a pure decision spec that returns SKIP/HOLD/REPORT/RAN and writes JSON tick rows.
+; Owner, 2026-10-31: a pure decision spec that returns SKIP/HOLD/REPORT/RUN and writes JSON tick rows; a dead DSH is reported, never restarted.
 ; This spec never calls the host: it reads through crons::mac-dsh-godmode-supervisor::gm_action
 ; and expects the host to handle all file and system operations. Phase 0 is held by PR #13009;
 ; a real tick must output HOLD for phase 0 with another writer present.
-; Host inventory:
-; wrapper: tg_read fn tg_read(hb: []const u8, dir: []const u8, file: []const u8, dst: []u8) -> usize glass_window.t27:6209
-; wrapper: term_connect fn term_connect(hb: []const u8) -> i32 glass_window.t27:5367
-; GAP: @extern "getloadavg" -> void
-; GAP: @extern "statfs" -> bool
-; wrapper: unix_time fn unix_time(t: u64) -> u64 glass_window.t27:2328
-; GAP: @extern "append_one_line" -> bool
+; Host inventory (six needs, tick_host_needs() == 6):
+; (a) go file exists: wrapper tg_read fn tg_read(hb: []const u8, dir: []const u8, file: []const u8, dst: []u8) -> usize glass_window.t27:6209, with home_dir at :2342
+; (b) DSH loopback alive (127.0.0.1:3080): GAP, proposed fn dsh_alive(port: u32) -> bool (term_connect at :5367 reaches the pty server socket, not DSH)
+; (c) one-minute load: GAP, proposed fn load_avg_1m_x100() -> u32
+; (d) free disk GiB: GAP, proposed fn free_disk_gb(hb: []const u8) -> u32
+; (e) clock: wrapper unix_time fn unix_time(t: u64) -> u64 glass_window.t27:2328
+; (f) append one line to ~/.dsh/godmode/ticks.jsonl: GAP, proposed fn append_line(hb: []const u8, dir: []const u8, file: []const u8, line: []const u8) -> bool
 module T27osGodmodeTick;
 
 use t27os::session_store::put_dec;
@@ -33,95 +33,118 @@ pub fn tick_decide(go: bool, enabled: bool, dsh_alive: bool, free_gb: u32, load:
         return GM_A_SKIPPED;
     }
 
+    if (!enabled) {
+        return GM_A_SKIPPED;
+    }
+
+    if (!dsh_alive) {
+        // a dead DSH is reported, never restarted (card rule)
+        return gm_action(phase, other_writer, dsh_alive);
+    }
+
     if (!gm_tick_may_run(go, enabled, dsh_alive, free_gb, load)) {
+        // disk or load outside the Mac rule
         return GM_A_SKIPPED;
     }
 
     return gm_action(phase, other_writer, dsh_alive);
 }
 
+// Number of decimal digits of v (0 has one digit).
 fn dec_len(v: u64) -> usize {
-    var len : u32 = 1;
+    var n : usize = 1;
     var t : u64 = v;
     while (t >= 10) {
         t = t / 10;
-        len = len + 1;
+        n = n + 1;
     }
-    return len;
+    return n;
 }
 
+// Name of an action code; row_len and tick_row both use it.
+fn action_name(a: u32) -> []const u8 {
+    if (a == GM_A_HOLD) {
+        return "HOLD";
+    }
+    if (a == GM_A_RUN) {
+        return "RUN";
+    }
+    if (a == GM_A_REPORT) {
+        return "REPORT";
+    }
+    if (a == GM_A_SKIPPED) {
+        return "SKIP";
+    }
+    return "unknown";
+}
+
+// Name of an outcome code; row_len and tick_row both use it.
+fn outcome_name(o: u32) -> []const u8 {
+    if (o == GM_OUTCOME_HELD) {
+        return "held";
+    }
+    if (o == GM_OUTCOME_REPORTED) {
+        return "reported";
+    }
+    if (o == GM_OUTCOME_RAN) {
+        return "ran";
+    }
+    if (o == GM_OUTCOME_STALLED) {
+        return "stalled";
+    }
+    return "unknown";
+}
+
+// Exact byte count of the row tick_row writes, one term per piece written there:
+//   8   {"tick":
+//   9   ,"phase":
+//   11  ,"action":"
+//   39  ","model":"glm-4.5-flash","tool_calls":
+//   10  ,"tokens":
+//   11  ,"seconds":
+//   12  ,"outcome":"
+//   2   "}
+//   1   newline
+// fixed total 103, plus the digits of five numbers, plus the two names.
 fn row_len(tick: u32, phase: u32, action: u32, tool_calls: u32, tokens: u32, seconds: u32, outcome: u32) -> usize {
-    var len : usize = 2; // {
-    len += dec_len(@intCast(tick));
-    len += 1; // ,
-    len += dec_len(@intCast(phase));
-    len += 13; // ,"action":"X",
-    len += 19; // ,"model":"glm-4.5-flash",
-    len += 1; // :
-    len += dec_len(@intCast(tool_calls));
-    len += 1; // ,
-    len += 9; // ,"tokens":
-    len += 1; // :
-    len += dec_len(@intCast(tokens));
-    len += 1; // ,
-    len += 10; // ,"seconds":
-    len += 1; // :
-    len += dec_len(@intCast(seconds));
-    len += 1; // ,
-    len += 11; // ,"outcome":"X"}
-    len += 1; // \n
-    return len;
+    var n : usize = 103;
+    n = n + dec_len(@as(u64, tick));
+    n = n + dec_len(@as(u64, phase));
+    n = n + action_name(action).len;
+    n = n + dec_len(@as(u64, tool_calls));
+    n = n + dec_len(@as(u64, tokens));
+    n = n + dec_len(@as(u64, seconds));
+    n = n + outcome_name(outcome).len;
+    return n;
 }
 
+// Writes one tick row plus a newline into dst and returns the end position.
+// put_dec and put_bytes do not check bounds, so the size is checked first:
+// a dst that is too small gets 0 and no byte is touched.
 pub fn tick_row(dst: []u8, tick: u32, phase: u32, action: u32, tool_calls: u32, tokens: u32, seconds: u32, outcome: u32) -> usize {
-    var total_len : usize = row_len(tick, phase, action, tool_calls, tokens, seconds, outcome);
-    if (total_len > dst.len) {
+    var need : usize = row_len(tick, phase, action, tool_calls, tokens, seconds, outcome);
+    if (need > dst.len) {
         return 0;
     }
 
     var at : usize = 0;
-    at = put_bytes(dst, at, "{");
-    at = put_dec(dst, at, @intCast(tick));
-    at = put_bytes(dst, at, ",");
-    at = put_dec(dst, at, @intCast(phase));
-    at = put_bytes(dst, at, ",");
-    at = put_bytes(dst, at, "\"action\":\"");
-    if (action == GM_A_HOLD) {
-        at = put_bytes(dst, at, "HOLD");
-    } else if (action == GM_A_RUN) {
-        at = put_bytes(dst, at, "RUN");
-    } else if (action == GM_A_REPORT) {
-        at = put_bytes(dst, at, "REPORT");
-    } else if (action == GM_A_SKIPPED) {
-        at = put_bytes(dst, at, "SKIP");
-    } else {
-        at = put_bytes(dst, at, "unknown");
-    }
-    at = put_bytes(dst, at, "\",");
-    at = put_bytes(dst, at, "\"model\":\"glm-4.5-flash\",");
-    at = put_bytes(dst, at, "\"tool_calls\":");
-    at = put_dec(dst, at, @intCast(tool_calls));
-    at = put_bytes(dst, at, ",");
-    at = put_bytes(dst, at, "\"tokens\":");
-    at = put_dec(dst, at, @intCast(tokens));
-    at = put_bytes(dst, at, ",");
-    at = put_bytes(dst, at, "\"seconds\":");
-    at = put_dec(dst, at, @intCast(seconds));
-    at = put_bytes(dst, at, ",");
-    at = put_bytes(dst, at, "\"outcome\":\"");
-    if (outcome == GM_OUTCOME_HELD) {
-        at = put_bytes(dst, at, "held");
-    } else if (outcome == GM_OUTCOME_REPORTED) {
-        at = put_bytes(dst, at, "reported");
-    } else if (outcome == GM_OUTCOME_RAN) {
-        at = put_bytes(dst, at, "ran");
-    } else if (outcome == GM_OUTCOME_STALLED) {
-        at = put_bytes(dst, at, "stalled");
-    } else {
-        at = put_bytes(dst, at, "unknown");
-    }
+    at = put_bytes(dst, at, "{\"tick\":");
+    at = put_dec(dst, at, @as(u64, tick));
+    at = put_bytes(dst, at, ",\"phase\":");
+    at = put_dec(dst, at, @as(u64, phase));
+    at = put_bytes(dst, at, ",\"action\":\"");
+    at = put_bytes(dst, at, action_name(action));
+    at = put_bytes(dst, at, "\",\"model\":\"glm-4.5-flash\",\"tool_calls\":");
+    at = put_dec(dst, at, @as(u64, tool_calls));
+    at = put_bytes(dst, at, ",\"tokens\":");
+    at = put_dec(dst, at, @as(u64, tokens));
+    at = put_bytes(dst, at, ",\"seconds\":");
+    at = put_dec(dst, at, @as(u64, seconds));
+    at = put_bytes(dst, at, ",\"outcome\":\"");
+    at = put_bytes(dst, at, outcome_name(outcome));
     at = put_bytes(dst, at, "\"}");
-    at = put_bytes(dst, at, "\n");
+    dst[at] = 10;
+    at = at + 1;
     return at;
 }
 
@@ -129,31 +152,48 @@ pub fn tick_host_needs() -> u32 {
     return 6;
 }
 
-test "go absent -> skip" {
+test go_absent_skips {
     var action : u32 = tick_decide(false, true, true, 7, 30, false, 1);
     assert(action == GM_A_SKIPPED);
 }
 
-test "go present, dsh dead -> report" {
+test dsh_dead_reports {
     var action : u32 = tick_decide(true, true, false, 7, 30, false, 1);
     assert(action == gm_action(1, false, false));
+    assert(action == GM_A_REPORT);
 }
 
-test "phase 0 with another writer -> hold" {
+test phase0_other_writer_holds {
     var action : u32 = tick_decide(true, true, true, 7, 30, true, 0);
     assert(action == GM_A_HOLD);
 }
 
-test "phase 1 no other writer -> run" {
+test phase1_alone_runs {
     var action : u32 = tick_decide(true, true, true, 7, 30, false, 1);
     assert(action == GM_A_RUN);
 }
 
-test "HOLD row format exact" {
+test disabled_skips {
+    var action : u32 = tick_decide(true, false, true, 7, 30, false, 1);
+    assert(action == GM_A_SKIPPED);
+}
+
+test low_disk_skips {
+    var action : u32 = tick_decide(true, true, true, 5, 30, false, 1);
+    assert(action == GM_A_SKIPPED);
+}
+
+test high_load_skips {
+    var action : u32 = tick_decide(true, true, true, 7, 40, false, 1);
+    assert(action == GM_A_SKIPPED);
+}
+
+test hold_row_is_byte_exact {
     var buf : [160]u8 = undefined;
     var written : usize = tick_row(buf[0..160], 1, 0, GM_A_HOLD, 5, 1000, 10, GM_OUTCOME_HELD);
     assert(written == 120);
     const want : []const u8 = "{\"tick\":1,\"phase\":0,\"action\":\"HOLD\",\"model\":\"glm-4.5-flash\",\"tool_calls\":5,\"tokens\":1000,\"seconds\":10,\"outcome\":\"held\"}\n";
+    assert(want.len == 120);
     var i : usize = 0;
     while (i < want.len) {
         assert(buf[i] == want[i]);
@@ -161,28 +201,57 @@ test "HOLD row format exact" {
     }
 }
 
-test "buffer too small" {
-    var buf : [8]u8 = undefined;
-    var written : usize = tick_row(buf[0..8], 1, 0, GM_A_HOLD, 5, 1000, 10, GM_OUTCOME_HELD);
-    assert(written == 0);
-}
-
-test "RUN row format exact" {
+test run_row_is_byte_exact {
     var buf : [160]u8 = undefined;
     var written : usize = tick_row(buf[0..160], 2, 1, GM_A_RUN, 3, 500, 5, GM_OUTCOME_RAN);
-    assert(written == 118);
-    var at : usize = 0;
-    assert(buf[at] == '{'); at += 1;
-    assert(buf[at+9] == ',');
-    assert(buf[at+22] == 'R');
-    assert(buf[at+23] == 'U');
-    assert(buf[at+24] == 'N');
-    assert(buf[at+40] == 'r');
-    assert(buf[at+41] == 'a');
-    assert(buf[at+42] == 'n');
+    assert(written == 116);
+    const want : []const u8 = "{\"tick\":2,\"phase\":1,\"action\":\"RUN\",\"model\":\"glm-4.5-flash\",\"tool_calls\":3,\"tokens\":500,\"seconds\":5,\"outcome\":\"ran\"}\n";
+    assert(want.len == 116);
+    var i : usize = 0;
+    while (i < want.len) {
+        assert(buf[i] == want[i]);
+        i = i + 1;
+    }
 }
 
-test "host needs" {
+test small_buffer_writes_nothing {
+    var buf : [8]u8 = undefined;
+    var i : usize = 0;
+    while (i < 8) {
+        buf[i] = 7;
+        i = i + 1;
+    }
+    var written : usize = tick_row(buf[0..8], 1, 0, GM_A_HOLD, 5, 1000, 10, GM_OUTCOME_HELD);
+    assert(written == 0);
+    var j : usize = 0;
+    while (j < 8) {
+        assert(buf[j] == 7);
+        j = j + 1;
+    }
+}
+
+test row_len_matches_written {
+    var buf : [160]u8 = undefined;
+    var written : usize = tick_row(buf[0..160], 123456, 2, GM_A_REPORT, 0, 99999, 3600, GM_OUTCOME_STALLED);
+    assert(written == row_len(123456, 2, GM_A_REPORT, 0, 99999, 3600, GM_OUTCOME_STALLED));
+    assert(written == 133);
+    assert(buf[written - 1] == 10);
+}
+
+test skip_row_names_skip {
+    var buf : [160]u8 = undefined;
+    var written : usize = tick_row(buf[0..160], 1, 0, GM_A_SKIPPED, 0, 0, 0, GM_OUTCOME_HELD);
+    assert(written > 35);
+    // {"tick":1,"phase":0,"action":" is 30 bytes (indices 0..29), so the name is bytes 30..33.
+    assert(buf[29] == 34);
+    assert(buf[30] == 83);
+    assert(buf[31] == 75);
+    assert(buf[32] == 73);
+    assert(buf[33] == 80);
+    assert(buf[34] == 34);
+}
+
+test host_needs_is_six {
     var needs : u32 = tick_host_needs();
     assert(needs == 6);
 }
