@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/dev_monitor.t27 -- dev-mode entry opens the EXISTING DeepSeek
+// Harness (dsh) web UI once, verifies its workspace, and never starts a second
+// instance (lane #12976 of the Mother epic #12945; owner brief 2026-10-31).
+// --
+// The facts this law is written against (verified 2026-10-31). The live dsh
+// web is a launchd job, label JOB_LABEL, that listens on HOST:PORT. Each start
+// mints one random launch token, holds it in memory only, and prints exactly
+// one ready line `dsh web: http...` to the service log; one GET of that URL
+// mints a signed cookie, every other GET answers 401 "authentication
+// required". So the server is discovered by `launchctl print` (state, pid)
+// and `lsof` on the port (listener pid), and the UI is opened by handing the
+// LAST ready line of the log to `open`, never by printing it.
+// --
+// The state machine. From (job pid, listener pid, the code of one cookie-less
+// GET, whether the browser itself asked for authentication) the law yields one
+// STATE; with the once-marker and the start policy, one ACTION. The verdict is
+// HEALTHY only when the server answered and the workspace check passed,
+// DEGRADED when the UI opened but the check did not pass (authentication
+// required counts as opened-not-loaded), BLOCKED with a reason otherwise.
+// --
+// The once rule. A local marker under the gitignored target/ tree: absent ->
+// open the UI once and write it; present -> focus or report, never a new tab
+// or process. A port held by a pid that is not the job's -> stop and report,
+// no kill, no restart, no silent port change, whatever the policy says.
+// Not running -> report; start only under POLICY_ALLOW (the default is DENY)
+// with the pinned command in the pinned checkout; never install or upgrade.
+// --
+// What this law does not claim: external lanes and T27 OS actors are not
+// visible through dsh until an integration lands and is verified
+// (EXTERNAL_LANES_VISIBLE, T27OS_ACTORS_VISIBLE are false), and the render
+// check is a heuristic (the model-listing line within a short window after
+// `open`) unless the owner confirms by eye (UI_PASS_EYE).
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osDevMonitor;
+
+/// launchd label of the owner's dsh web service (plist under
+/// ~/Library/LaunchAgents, WorkingDirectory = the pinned checkout).
+pub const JOB_LABEL : str = "ai.t27.dsh-web";
+pub const HOST : str = "127.0.0.1";
+pub const PORT : u32 = 3080;
+/// The pinned checkout and the verified launch command; used only under
+/// POLICY_ALLOW, never `pnpm install`, never an upgrade.
+pub const CHECKOUT : str = "~/deepseek-harness";
+pub const START_CMD : str = "cd ~/deepseek-harness && pnpm dsh web --no-open";
+/// Where the running process appends stdout and stderr.
+pub const SERVICE_LOG : str = "~/.dsh/web-service.log";
+/// The ready line, printed once per start. `grep -o` with READY_PATTERN
+/// matches only the ready URL; the URL begins after READY_PREFIX_LEN bytes
+/// (`cut -c10-`). The matched text is handed to `open`, never printed.
+pub const READY_PATTERN : str = "dsh web: http[^ ]*";
+pub const READY_PREFIX_LEN : usize = 9;
+/// Every log excerpt passes `grep -v -i -E` with this filter before it
+/// reaches a transcript, note, issue or PR.
+pub const LOG_FILTER : str = "token[=:]|api.?key|secret|passw|sk-[a-z]|bearer";
+/// Files this skill never opens.
+pub const NEVER_OPEN : str = "~/.dsh/.credentials.yaml|~/.dsh/render-local.env";
+/// The line the UI leaves in the log once it has loaded far enough to list
+/// models; its appearance within UI_CHECK_WINDOW_S seconds after `open` is the
+/// heuristic workspace check.
+pub const UI_LOADED_LINE : str = "model listing";
+pub const UI_CHECK_WINDOW_S : u32 = 20;
+/// The once-per-dev-entry marker, under the gitignored target/ tree.
+pub const MARKER : str = "target/dev-monitor.opened";
+
+/// HTTP evidence from one GET of / without a cookie.
+pub const HTTP_NONE : u8 = 0;
+pub const HTTP_AUTH : u8 = 1;
+pub const HTTP_OK : u8 = 2;
+
+/// Start policy for a dev entry that finds no dsh. DENY is the default.
+pub const POLICY_DENY : u8 = 0;
+pub const POLICY_ALLOW : u8 = 1;
+
+/// States.
+pub const S_RUNNING : u8 = 0;
+pub const S_AUTH_REQUIRED : u8 = 1;
+pub const S_NOT_RUNNING : u8 = 2;
+pub const S_PORT_HELD : u8 = 3;
+pub const S_NO_ANSWER : u8 = 4;
+
+/// Actions.
+pub const A_OPEN : u8 = 0;
+pub const A_FOCUS : u8 = 1;
+pub const A_SIGN_IN : u8 = 2;
+pub const A_REPORT : u8 = 3;
+pub const A_START : u8 = 4;
+pub const A_STOP : u8 = 5;
+
+/// Verdicts.
+pub const V_HEALTHY : u8 = 0;
+pub const V_DEGRADED : u8 = 1;
+pub const V_BLOCKED : u8 = 2;
+
+/// Reasons written next to a BLOCKED verdict.
+pub const R_NONE : u8 = 0;
+pub const R_NOT_RUNNING : u8 = 1;
+pub const R_PORT_HELD : u8 = 2;
+pub const R_NO_ANSWER : u8 = 3;
+pub const R_START_DENIED : u8 = 4;
+
+/// Workspace check levels.
+pub const UI_FAIL : u8 = 0;
+pub const UI_PASS_LOG : u8 = 1;
+pub const UI_PASS_EYE : u8 = 2;
+
+/// Integrations that do not exist yet. A report may claim them only when the
+/// flag is true AND the integration was verified in that report.
+pub const EXTERNAL_LANES_VISIBLE : bool = false;
+pub const T27OS_ACTORS_VISIBLE : bool = false;
+
+/// Discovery -> state. job_pid is launchd's pid for JOB_LABEL (0 when the job
+/// is not running); listener_pid is lsof's LISTEN pid on PORT (0 when free);
+/// http is the code of one cookie-less GET; ui_auth_required is true only
+/// when the browser itself showed the dsh authentication-required message.
+/// A foreign listener wins over everything: it is checked first.
+pub fn state(job_pid : u32, listener_pid : u32, http : u8, ui_auth_required : bool) -> u8 {
+    if (listener_pid != 0 and listener_pid != job_pid) { return S_PORT_HELD; }
+    if (job_pid == 0) { return S_NOT_RUNNING; }
+    if (http == HTTP_NONE) { return S_NO_ANSWER; }
+    if (ui_auth_required) { return S_AUTH_REQUIRED; }
+    return S_RUNNING;
+}
+
+/// State -> action. The marker decides open vs focus; the policy decides
+/// start vs report; a held port always stops.
+pub fn action(s : u8, marker_present : bool, policy : u8) -> u8 {
+    if (s == S_PORT_HELD) { return A_STOP; }
+    if (s == S_NOT_RUNNING) {
+        if (policy == POLICY_ALLOW) { return A_START; }
+        return A_REPORT;
+    }
+    if (s == S_NO_ANSWER) { return A_REPORT; }
+    if (s == S_AUTH_REQUIRED) { return A_SIGN_IN; }
+    if (marker_present) { return A_FOCUS; }
+    return A_OPEN;
+}
+
+/// Verdict. HEALTHY needs a running server AND a passed check; DEGRADED is a
+/// server that answered (UI opened or asked for sign-in) whose workspace
+/// check did not pass; everything else is BLOCKED.
+pub fn verdict(s : u8, ui : u8) -> u8 {
+    if (s == S_RUNNING) {
+        if (ui >= UI_PASS_LOG) { return V_HEALTHY; }
+        return V_DEGRADED;
+    }
+    if (s == S_AUTH_REQUIRED) { return V_DEGRADED; }
+    return V_BLOCKED;
+}
+
+/// The reason next to a BLOCKED verdict; R_NONE for any other verdict.
+pub fn reason(s : u8, policy : u8) -> u8 {
+    if (s == S_NOT_RUNNING) {
+        if (policy == POLICY_DENY) { return R_START_DENIED; }
+        return R_NOT_RUNNING;
+    }
+    if (s == S_PORT_HELD) { return R_PORT_HELD; }
+    if (s == S_NO_ANSWER) { return R_NO_ANSWER; }
+    return R_NONE;
+}
+
+/// Does an action create a process or a tab? Only A_OPEN (one tab) and
+/// A_START (one process) do; the once rule forbids both on a repeat entry.
+pub fn creates_something(a : u8) -> bool {
+    if (a == A_OPEN) { return true; }
+    if (a == A_START) { return true; }
+    return false;
+}
+
+/// The pid check that proves no second instance started: the listener pid
+/// after the entry equals the pid before, and both are the job's.
+pub fn pid_unchanged(job_pid : u32, before : u32, after : u32) -> bool {
+    if (job_pid == 0) { return false; }
+    if (before != job_pid) { return false; }
+    return after == before;
+}
+
+/// May a report say that lanes or actors are visible? Only when the
+/// integration flag is true and it was verified in that very report.
+pub fn may_claim_visible(flag : bool, verified : bool) -> bool {
+    if (flag == false) { return false; }
+    return verified;
+}
+
+test the_consts_hold {
+    var p : u32 = PORT;
+    var k : usize = READY_PREFIX_LEN;
+    var w : u32 = UI_CHECK_WINDOW_S;
+    assert p == 3080;
+    assert k == 9;
+    assert w == 20;
+    assert POLICY_DENY == 0;
+    assert EXTERNAL_LANES_VISIBLE == false;
+    assert T27OS_ACTORS_VISIBLE == false;
+}
+
+test running_dsh_is_reused_and_its_ui_opened_once {
+    var s : u8 = state(97706, 97706, HTTP_AUTH, false);
+    assert s == S_RUNNING;
+    assert action(s, false, POLICY_DENY) == A_OPEN;
+    assert pid_unchanged(97706, 97706, 97706) == true;
+    assert verdict(s, UI_PASS_LOG) == V_HEALTHY;
+    assert verdict(s, UI_PASS_EYE) == V_HEALTHY;
+}
+
+test a_repeat_entry_focuses_and_creates_nothing {
+    var s : u8 = state(97706, 97706, HTTP_AUTH, false);
+    assert action(s, true, POLICY_DENY) == A_FOCUS;
+    assert action(s, true, POLICY_ALLOW) == A_FOCUS;
+    assert creates_something(A_FOCUS) == false;
+    assert creates_something(A_REPORT) == false;
+    assert creates_something(A_SIGN_IN) == false;
+    assert creates_something(A_STOP) == false;
+    assert creates_something(A_OPEN) == true;
+    assert creates_something(A_START) == true;
+}
+
+test authentication_required_means_sign_in_locally_and_never_healthy {
+    var s : u8 = state(97706, 97706, HTTP_AUTH, true);
+    assert s == S_AUTH_REQUIRED;
+    assert action(s, false, POLICY_DENY) == A_SIGN_IN;
+    assert action(s, true, POLICY_DENY) == A_SIGN_IN;
+    assert verdict(s, UI_FAIL) == V_DEGRADED;
+    assert verdict(s, UI_PASS_LOG) == V_DEGRADED;
+    assert verdict(s, UI_PASS_EYE) == V_DEGRADED;
+    assert reason(s, POLICY_DENY) == R_NONE;
+}
+
+test a_cookie_already_present_is_still_the_running_state {
+    assert state(97706, 97706, HTTP_OK, false) == S_RUNNING;
+}
+
+test dsh_absent_is_reported_and_started_only_under_the_policy {
+    var s : u8 = state(0, 0, HTTP_NONE, false);
+    assert s == S_NOT_RUNNING;
+    assert action(s, false, POLICY_DENY) == A_REPORT;
+    assert action(s, false, POLICY_ALLOW) == A_START;
+    assert verdict(s, UI_FAIL) == V_BLOCKED;
+    assert reason(s, POLICY_DENY) == R_START_DENIED;
+    assert reason(s, POLICY_ALLOW) == R_NOT_RUNNING;
+}
+
+test a_held_port_stops_without_a_kill_whatever_the_policy_or_marker_say {
+    var s : u8 = state(97706, 4242, HTTP_AUTH, false);
+    assert s == S_PORT_HELD;
+    assert action(s, false, POLICY_DENY) == A_STOP;
+    assert action(s, true, POLICY_DENY) == A_STOP;
+    assert action(s, false, POLICY_ALLOW) == A_STOP;
+    assert verdict(s, UI_PASS_EYE) == V_BLOCKED;
+    assert reason(s, POLICY_ALLOW) == R_PORT_HELD;
+}
+
+test a_held_port_with_no_job_is_held_not_absent {
+    var s : u8 = state(0, 4242, HTTP_AUTH, false);
+    assert s == S_PORT_HELD;
+    assert action(s, false, POLICY_ALLOW) == A_STOP;
+}
+
+test a_job_that_does_not_answer_is_reported {
+    var s : u8 = state(97706, 97706, HTTP_NONE, false);
+    assert s == S_NO_ANSWER;
+    assert action(s, false, POLICY_ALLOW) == A_REPORT;
+    assert verdict(s, UI_PASS_EYE) == V_BLOCKED;
+    assert reason(s, POLICY_ALLOW) == R_NO_ANSWER;
+}
+
+test a_job_that_does_not_answer_and_no_listener_is_no_answer_not_held {
+    assert state(97706, 0, HTTP_NONE, false) == S_NO_ANSWER;
+}
+
+test ui_opened_but_workspace_not_loaded_is_degraded_not_healthy {
+    var s : u8 = state(97706, 97706, HTTP_AUTH, false);
+    assert verdict(s, UI_FAIL) == V_DEGRADED;
+    assert reason(s, POLICY_DENY) == R_NONE;
+}
+
+test a_changed_pid_is_a_second_instance {
+    assert pid_unchanged(97706, 97706, 98001) == false;
+    assert pid_unchanged(97706, 4242, 4242) == false;
+    assert pid_unchanged(0, 0, 0) == false;
+}
+
+test lanes_and_actors_are_not_claimed_visible {
+    assert may_claim_visible(EXTERNAL_LANES_VISIBLE, true) == false;
+    assert may_claim_visible(T27OS_ACTORS_VISIBLE, true) == false;
+    assert may_claim_visible(true, false) == false;
+    assert may_claim_visible(true, true) == true;
+}
