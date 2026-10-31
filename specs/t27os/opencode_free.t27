@@ -1,0 +1,450 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/opencode_free.t27 -- the OpenCode free pool as a second executor: which models a lane may
+; use, which content a model may receive, which jobs go to the pool, and what a lane does when the pool
+; says "no more". Pure decisions only; the host that calls the catalog and the models is T27 OS, and
+; the cell, the key chain and the failover it extends are specs/t27os/agents.t27 (AG_OPENCODE, cell 3)
+; and specs/t27os/keys.t27 (RATE_COOLDOWN_S, imported below, not copied).
+; Owner request 2026-10-31 (translated): connect OpenCode as a second executor and use its free
+; models to raise the volume of work at the same paid budget; the free models are read from the live
+; catalog, never hardcoded; a model that needs a paid key or spends paid credits is not free. Owner
+; "go" 2026-10-31 (translated) with four conditions: no paid model in a lane; non-public content only
+; to glm-5.3-flash-free and deepseek-v4.1-flash-free; nothing is updated or installed; exactly one
+; probe per model, with no repository content. Issue: t27#12975 (Refs #12974, #12973, #12945, #7718).
+; --
+; THE CATALOG (the host reads it; this spec only judges what it read). GET /zen/v1/models on
+; opencode.ai answers 200 with no key; each record under .data carries the price of a million tokens
+; in .cost.text.input.price and .cost.text.output.price. A model is FREE when both prices are zero:
+; the suffix "-free" is not the test (big-pickle is free without it, and a "-free" name with a price is
+; not free), and the models.dev mirror is not the source (it is stale). The host converts each price
+; to nano-dollars per million tokens ROUNDED UP, so any nonzero price stays nonzero, and passes
+; PRICE_UNKNOWN for a missing field: an absent price is never zero. The list is read at run time and
+; stamped; no model id is a constant of this spec except the two the owner named and the data table
+; below, which only ever restricts.
+; --
+; RECEIPTS, 2026-10-31 (public-safe, no key and no repository content in any of it):
+; - Catalog: 8 of 78 models were free: big-pickle, beam-free, flint-40b-free, mimo-v2.6-flash-free,
+;   nemotron-3.5-super-vl-free, nemotron-3.5-lightning-free, deepseek-v4.1-flash-free,
+;   glm-5.3-flash-free. All speak chat-completions.
+; - Data use (docs.opencode.ai/zen, read the same day): glm-5.3-flash-free and deepseek-v4.1-flash-free
+;   keep no data and do not train; beam-free does not train but keeps data for 30 days and is closed
+;   to some regions; big-pickle, flint-40b-free and mimo-v2.6-flash-free may use data to improve the
+;   model; the two Nemotron free models are not established.
+; - Probe: one request per free model, the prompt "Reply with the single word ok.", the keyless public
+;   token, no repository content. All eight answered HTTP 429 with the error type FreeUsageLimitError
+;   ("Free usage limit reached") and the same Retry-After, about 62 220 s, i.e. one shared reset near
+;   2026-11-01T00:00:20Z. No x-ratelimit headers. So the limit is a property of the pool, not of a
+;   model: rotating from one free model to another buys nothing. The allowance was already used up
+;   when first probed; its size per day is not published and not measured. Measured free capacity at
+;   2026-10-31T06:43Z: zero until that reset.
+; --
+; THE RULES.
+; 1. A lane may use a model only if lane_ok(): provider opencode, both prices zero, and the content
+;    allowed for that model. No paid model is selectable, whatever the environment holds.
+; 2. Content has four classes. Nothing (a probe) and public text may go to any free model. Non-public
+;    text goes only to the two models the owner named. A secret goes to none: it never leaves the
+;    machine, and an unknown class is treated as a secret.
+; 3. A job goes to the pool, to Claude, or to the owner by its class (route_task). Security-critical
+;    work stays on Claude unless the owner approved it for the pool; secrets, credentials, deletion,
+;    upstream, publication and payment are the owner's and no lane starts them.
+; 4. A free-usage-limit answer puts the whole pool to wait for the time the server gave; any other
+;    429 puts that model to wait at least RATE_COOLDOWN_S. Nobody calls a waiting lane, nobody loops
+;    on a retry, and a probe is allowed only once per model and never while the pool waits.
+; 5. A model that leaves the catalog, or stops being free, is UNAVAILABLE and stays so until a fresh
+;    catalog lists it free again. A substitute is a new lane_ok() decision, never a silent swap.
+; 6. The card shows a free model as free, or as limited by quota; never as unlimited capacity.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osOpencodeFree;
+
+use t27os::editors::same_bytes;
+use t27os::keys::RATE_COOLDOWN_S;
+
+; --- prices --------------------------------------------------------------------------------------
+/// A price the catalog did not state: not zero, so not free.
+pub const PRICE_UNKNOWN : u32 = 4294967295;
+
+/// Free means both prices are zero. The name of a model plays no part.
+pub fn is_free(input_nano : u32, output_nano : u32) -> bool {
+    if (input_nano != 0) { return false; }
+    if (output_nano != 0) { return false; }
+    return true;
+}
+
+; --- providers -----------------------------------------------------------------------------------
+pub const PROVIDER_ZEN : str = "opencode";
+
+/// The lane's embedded config names this one provider and no other (owner condition 1; the global
+/// OpenCode config is not edited). Paid providers in the environment are not selectable.
+pub fn provider_allowed(provider : []const u8) -> bool {
+    return same_bytes(provider, PROVIDER_ZEN);
+}
+
+; --- content and data classes --------------------------------------------------------------------
+/// A probe: no repository content at all.
+pub const CC_NONE : u32 = 0;
+/// Text that is already public.
+pub const CC_PUBLIC : u32 = 1;
+/// Anything not yet public: unmerged work, private repositories, internal notes.
+pub const CC_NON_PUBLIC : u32 = 2;
+/// A key, a token, a password, a personal datum, a payment detail.
+pub const CC_SECRET : u32 = 3;
+
+/// What the model's operator says it does with data (docs.opencode.ai/zen, 2026-10-31).
+pub const DC_ZERO_RETENTION : u32 = 0;
+pub const DC_NO_TRAINING : u32 = 1;
+pub const DC_MAY_TRAIN : u32 = 2;
+pub const DC_UNKNOWN : u32 = 3;
+
+/// The two models the owner allowed to see non-public content (2026-10-31).
+pub const NONPUBLIC_MODEL_A : str = "glm-5.3-flash-free";
+pub const NONPUBLIC_MODEL_B : str = "deepseek-v4.1-flash-free";
+
+/// The data class of a model as the docs stated it on 2026-10-31. A model the table does not know is
+/// DC_UNKNOWN: new ids start restricted. This table is for the card's badge and the reviewer; the gate
+/// below is the owner's named list, so a docs change cannot widen what leaves the machine.
+pub fn data_class(model : []const u8) -> u32 {
+    if (same_bytes(model, NONPUBLIC_MODEL_A)) { return DC_ZERO_RETENTION; }
+    if (same_bytes(model, NONPUBLIC_MODEL_B)) { return DC_ZERO_RETENTION; }
+    if (same_bytes(model, "beam-free")) { return DC_NO_TRAINING; }
+    if (same_bytes(model, "big-pickle")) { return DC_MAY_TRAIN; }
+    if (same_bytes(model, "flint-40b-free")) { return DC_MAY_TRAIN; }
+    if (same_bytes(model, "mimo-v2.6-flash-free")) { return DC_MAY_TRAIN; }
+    return DC_UNKNOWN;
+}
+
+pub fn nonpublic_ok(model : []const u8) -> bool {
+    if (same_bytes(model, NONPUBLIC_MODEL_A)) { return true; }
+    if (same_bytes(model, NONPUBLIC_MODEL_B)) { return true; }
+    return false;
+}
+
+/// May this content go to this model? An unknown content class is a secret.
+pub fn may_receive(model : []const u8, content : u32) -> bool {
+    if (content == CC_NONE) { return true; }
+    if (content == CC_PUBLIC) { return true; }
+    if (content == CC_NON_PUBLIC) { return nonpublic_ok(model); }
+    return false;
+}
+
+/// The one gate for a lane: the provider, the price and the content must all pass at once.
+pub fn lane_ok(provider : []const u8, input_nano : u32, output_nano : u32, model : []const u8, content : u32) -> bool {
+    if (provider_allowed(provider) == false) { return false; }
+    if (is_free(input_nano, output_nano) == false) { return false; }
+    return may_receive(model, content);
+}
+
+; --- task classes and routing --------------------------------------------------------------------
+/// Where a job goes.
+pub const ROUTE_FREE : u32 = 0;
+pub const ROUTE_CLAUDE : u32 = 1;
+pub const ROUTE_OWNER : u32 = 2;
+
+/// Pool jobs: reading code, audits, docs, test drafts, small edits, UI drafts.
+pub const TC_READ : u32 = 0;
+pub const TC_AUDIT : u32 = 1;
+pub const TC_DOCS : u32 = 2;
+pub const TC_TEST_DRAFT : u32 = 3;
+pub const TC_SMALL_EDIT : u32 = 4;
+pub const TC_UI_DRAFT : u32 = 5;
+/// Claude jobs: architecture, security, edits across files, release, very long context.
+pub const TC_ARCH : u32 = 6;
+pub const TC_SECURITY : u32 = 7;
+pub const TC_MULTI_FILE : u32 = 8;
+pub const TC_RELEASE : u32 = 9;
+pub const TC_LONG_CONTEXT : u32 = 10;
+/// Owner jobs: no lane starts them.
+pub const TC_SECRET : u32 = 11;
+pub const TC_CREDENTIAL : u32 = 12;
+pub const TC_DELETE : u32 = 13;
+pub const TC_UPSTREAM : u32 = 14;
+pub const TC_PUBLISH : u32 = 15;
+pub const TC_PAYMENT : u32 = 16;
+
+/// The executor for a job. Only TC_SECURITY can be lifted to the pool, and only by the owner's
+/// approval; an unknown class goes to Claude, the accountable executor, never to the pool.
+pub fn route_task(task : u32, owner_approved_pool : bool) -> u32 {
+    if (task <= TC_UI_DRAFT) { return ROUTE_FREE; }
+    if (task >= TC_SECRET) {
+        if (task <= TC_PAYMENT) { return ROUTE_OWNER; }
+        return ROUTE_CLAUDE;
+    }
+    if (task == TC_SECURITY) {
+        if (owner_approved_pool) { return ROUTE_FREE; }
+    }
+    return ROUTE_CLAUDE;
+}
+
+; --- lane state and the quota wait ---------------------------------------------------------------
+pub const LS_AVAILABLE : u32 = 0;
+pub const LS_WAITING_QUOTA : u32 = 1;
+pub const LS_UNAVAILABLE : u32 = 2;
+
+/// 200 with a body.
+pub const EV_OK : u32 = 0;
+/// 429 with the error type FreeUsageLimitError: the whole pool, for the time the server gave.
+pub const EV_FREE_USAGE_LIMIT : u32 = 1;
+/// Any other 429: this model, at least RATE_COOLDOWN_S.
+pub const EV_RATE_LIMIT : u32 = 2;
+/// The model left the catalog or is no longer free.
+pub const EV_GONE : u32 = 3;
+/// A fresh catalog lists the model free again.
+pub const EV_LISTED_FREE : u32 = 4;
+/// Anything else (a 5xx, a timeout): the state does not change on a guess.
+pub const EV_OTHER : u32 = 5;
+
+/// Used when the server named no time. 3600 s, one hour, then a single new look.
+pub const POOL_DEFAULT_WAIT_S : u64 = 3600;
+/// No wait is taken longer than a week, whatever a header says.
+pub const POOL_MAX_WAIT_S : u64 = 604800;
+/// A model may be probed this many times, ever: the owner's word of 2026-10-31.
+pub const PROBES_PER_MODEL : u32 = 1;
+
+/// Does this event stop every model in the pool, not just the one that was called?
+pub fn pool_wide(ev : u32) -> bool {
+    return ev == EV_FREE_USAGE_LIMIT;
+}
+
+pub fn next_state(state : u32, ev : u32) -> u32 {
+    if (state == LS_UNAVAILABLE) {
+        if (ev == EV_LISTED_FREE) { return LS_AVAILABLE; }
+        return LS_UNAVAILABLE;
+    }
+    if (ev == EV_GONE) { return LS_UNAVAILABLE; }
+    if (ev == EV_FREE_USAGE_LIMIT) { return LS_WAITING_QUOTA; }
+    if (ev == EV_RATE_LIMIT) { return LS_WAITING_QUOTA; }
+    if (ev == EV_OK) { return LS_AVAILABLE; }
+    return state;
+}
+
+fn cap_wait(seconds : u64) -> u64 {
+    if (seconds > POOL_MAX_WAIT_S) { return POOL_MAX_WAIT_S; }
+    return seconds;
+}
+
+/// Seconds to wait after an event, given the server's Retry-After (0 when it gave none).
+pub fn wait_seconds(ev : u32, retry_after_s : u64) -> u64 {
+    if (ev == EV_FREE_USAGE_LIMIT) {
+        if (retry_after_s == 0) { return POOL_DEFAULT_WAIT_S; }
+        return cap_wait(retry_after_s);
+    }
+    if (ev == EV_RATE_LIMIT) {
+        const asked : u64 = cap_wait(retry_after_s);
+        if (asked < RATE_COOLDOWN_S) { return RATE_COOLDOWN_S; }
+        return asked;
+    }
+    return 0;
+}
+
+/// May a lane be called now? A waiting lane is called again only after its time; an unavailable
+/// one is not called at all.
+pub fn may_call(state : u32, now_s : u64, until_s : u64) -> bool {
+    if (state == LS_AVAILABLE) { return true; }
+    if (state == LS_WAITING_QUOTA) { return now_s >= until_s; }
+    return false;
+}
+
+/// May a probe be sent? Only the first for a model, only with no repository content, and never
+/// while the pool waits or the model is gone.
+pub fn probe_ok(done : u32, content : u32, state : u32) -> bool {
+    if (done >= PROBES_PER_MODEL) { return false; }
+    if (content != CC_NONE) { return false; }
+    return state == LS_AVAILABLE;
+}
+
+; --- what the card shows -------------------------------------------------------------------------
+pub const BADGE_FREE : u32 = 0;
+pub const BADGE_PAID : u32 = 1;
+pub const BADGE_QUOTA : u32 = 2;
+
+/// A paid model is shown paid; a free one is shown free, or limited by quota while it waits. Free
+/// never reads as unlimited.
+pub fn badge(free : bool, state : u32) -> u32 {
+    if (free == false) { return BADGE_PAID; }
+    if (state == LS_WAITING_QUOTA) { return BADGE_QUOTA; }
+    return BADGE_FREE;
+}
+
+; --- tests ---------------------------------------------------------------------------------------
+test free_means_both_prices_are_zero {
+    assert is_free(0, 0);
+    assert is_free(1, 0) == false;
+    assert is_free(0, 1) == false;
+    assert is_free(1, 1) == false;
+}
+
+test a_missing_price_is_not_zero {
+    assert is_free(PRICE_UNKNOWN, 0) == false;
+    assert is_free(0, PRICE_UNKNOWN) == false;
+    assert is_free(PRICE_UNKNOWN, PRICE_UNKNOWN) == false;
+}
+
+test the_name_does_not_make_a_model_free_or_paid {
+    assert lane_ok("opencode", 0, 0, "big-pickle", CC_PUBLIC);
+    assert lane_ok("opencode", 5, 0, "model-x-free", CC_PUBLIC) == false;
+    assert lane_ok("opencode", 0, 5, "model-x-free", CC_NONE) == false;
+}
+
+test only_the_zen_provider_is_selectable {
+    assert provider_allowed("opencode");
+    assert provider_allowed("openai") == false;
+    assert provider_allowed("anthropic") == false;
+    assert provider_allowed("openrouter") == false;
+    assert provider_allowed("") == false;
+    assert lane_ok("openai", 0, 0, "glm-5.3-flash-free", CC_PUBLIC) == false;
+}
+
+test non_public_content_goes_only_to_the_two_named_models {
+    assert may_receive("glm-5.3-flash-free", CC_NON_PUBLIC);
+    assert may_receive("deepseek-v4.1-flash-free", CC_NON_PUBLIC);
+    assert may_receive("big-pickle", CC_NON_PUBLIC) == false;
+    assert may_receive("flint-40b-free", CC_NON_PUBLIC) == false;
+    assert may_receive("mimo-v2.6-flash-free", CC_NON_PUBLIC) == false;
+    assert may_receive("beam-free", CC_NON_PUBLIC) == false;
+    assert may_receive("nemotron-3.5-super-vl-free", CC_NON_PUBLIC) == false;
+    assert may_receive("nemotron-3.5-lightning-free", CC_NON_PUBLIC) == false;
+    assert may_receive("a-model-nobody-has-seen", CC_NON_PUBLIC) == false;
+}
+
+test public_content_and_probes_may_go_to_any_free_model {
+    assert may_receive("big-pickle", CC_PUBLIC);
+    assert may_receive("beam-free", CC_PUBLIC);
+    assert may_receive("nemotron-3.5-lightning-free", CC_PUBLIC);
+    assert may_receive("a-model-nobody-has-seen", CC_NONE);
+    assert may_receive("big-pickle", CC_NONE);
+}
+
+test a_secret_goes_to_no_model_and_an_unknown_class_is_a_secret {
+    assert may_receive("glm-5.3-flash-free", CC_SECRET) == false;
+    assert may_receive("deepseek-v4.1-flash-free", CC_SECRET) == false;
+    assert may_receive("big-pickle", CC_SECRET) == false;
+    assert may_receive("glm-5.3-flash-free", 4) == false;
+    assert may_receive("glm-5.3-flash-free", 99) == false;
+}
+
+test the_named_models_keep_no_data_in_the_docs_table {
+    assert data_class(NONPUBLIC_MODEL_A) == DC_ZERO_RETENTION;
+    assert data_class(NONPUBLIC_MODEL_B) == DC_ZERO_RETENTION;
+    assert data_class("beam-free") == DC_NO_TRAINING;
+    assert data_class("big-pickle") == DC_MAY_TRAIN;
+    assert data_class("flint-40b-free") == DC_MAY_TRAIN;
+    assert data_class("mimo-v2.6-flash-free") == DC_MAY_TRAIN;
+    assert data_class("nemotron-3.5-super-vl-free") == DC_UNKNOWN;
+    assert data_class("a-model-nobody-has-seen") == DC_UNKNOWN;
+}
+
+test no_model_that_may_train_or_is_unknown_gets_non_public_content {
+    assert data_class("big-pickle") == DC_MAY_TRAIN;
+    assert nonpublic_ok("big-pickle") == false;
+    assert data_class("nemotron-3.5-lightning-free") == DC_UNKNOWN;
+    assert nonpublic_ok("nemotron-3.5-lightning-free") == false;
+}
+
+test the_pool_takes_reading_audit_docs_tests_edits_and_ui_drafts {
+    assert route_task(TC_READ, false) == ROUTE_FREE;
+    assert route_task(TC_AUDIT, false) == ROUTE_FREE;
+    assert route_task(TC_DOCS, false) == ROUTE_FREE;
+    assert route_task(TC_TEST_DRAFT, false) == ROUTE_FREE;
+    assert route_task(TC_SMALL_EDIT, false) == ROUTE_FREE;
+    assert route_task(TC_UI_DRAFT, false) == ROUTE_FREE;
+}
+
+test architecture_security_multi_file_release_and_long_context_stay_on_claude {
+    assert route_task(TC_ARCH, false) == ROUTE_CLAUDE;
+    assert route_task(TC_SECURITY, false) == ROUTE_CLAUDE;
+    assert route_task(TC_MULTI_FILE, false) == ROUTE_CLAUDE;
+    assert route_task(TC_RELEASE, false) == ROUTE_CLAUDE;
+    assert route_task(TC_LONG_CONTEXT, false) == ROUTE_CLAUDE;
+}
+
+test security_work_reaches_the_pool_only_with_the_owners_approval {
+    assert route_task(TC_SECURITY, true) == ROUTE_FREE;
+    assert route_task(TC_ARCH, true) == ROUTE_CLAUDE;
+    assert route_task(TC_RELEASE, true) == ROUTE_CLAUDE;
+}
+
+test the_owners_jobs_never_start_in_a_lane_approval_or_not {
+    assert route_task(TC_SECRET, false) == ROUTE_OWNER;
+    assert route_task(TC_CREDENTIAL, false) == ROUTE_OWNER;
+    assert route_task(TC_DELETE, false) == ROUTE_OWNER;
+    assert route_task(TC_UPSTREAM, false) == ROUTE_OWNER;
+    assert route_task(TC_PUBLISH, false) == ROUTE_OWNER;
+    assert route_task(TC_PAYMENT, false) == ROUTE_OWNER;
+    assert route_task(TC_SECRET, true) == ROUTE_OWNER;
+    assert route_task(TC_PAYMENT, true) == ROUTE_OWNER;
+}
+
+test an_unknown_job_goes_to_claude_never_to_the_pool {
+    assert route_task(17, false) == ROUTE_CLAUDE;
+    assert route_task(99, false) == ROUTE_CLAUDE;
+    assert route_task(99, true) == ROUTE_CLAUDE;
+}
+
+test the_probe_of_2026_10_31_puts_the_whole_pool_to_wait {
+    assert pool_wide(EV_FREE_USAGE_LIMIT);
+    assert pool_wide(EV_RATE_LIMIT) == false;
+    assert pool_wide(EV_GONE) == false;
+    assert next_state(LS_AVAILABLE, EV_FREE_USAGE_LIMIT) == LS_WAITING_QUOTA;
+    assert wait_seconds(EV_FREE_USAGE_LIMIT, 62220) == 62220;
+}
+
+test the_wait_follows_the_server_and_has_a_default_and_a_cap {
+    assert wait_seconds(EV_FREE_USAGE_LIMIT, 0) == POOL_DEFAULT_WAIT_S;
+    assert wait_seconds(EV_FREE_USAGE_LIMIT, 100) == 100;
+    assert wait_seconds(EV_FREE_USAGE_LIMIT, 999999999) == POOL_MAX_WAIT_S;
+}
+
+test an_ordinary_429_waits_at_least_the_key_masters_cooldown {
+    assert wait_seconds(EV_RATE_LIMIT, 0) == RATE_COOLDOWN_S;
+    assert wait_seconds(EV_RATE_LIMIT, 5) == RATE_COOLDOWN_S;
+    assert wait_seconds(EV_RATE_LIMIT, 120) == 120;
+    assert wait_seconds(EV_RATE_LIMIT, 999999999) == POOL_MAX_WAIT_S;
+    assert next_state(LS_AVAILABLE, EV_RATE_LIMIT) == LS_WAITING_QUOTA;
+}
+
+test events_that_are_not_limits_wait_for_nothing {
+    assert wait_seconds(EV_OK, 62220) == 0;
+    assert wait_seconds(EV_GONE, 62220) == 0;
+    assert wait_seconds(EV_LISTED_FREE, 10) == 0;
+    assert wait_seconds(EV_OTHER, 10) == 0;
+}
+
+test a_waiting_lane_is_called_only_after_its_time {
+    assert may_call(LS_AVAILABLE, 100, 0);
+    assert may_call(LS_WAITING_QUOTA, 100, 200) == false;
+    assert may_call(LS_WAITING_QUOTA, 200, 200);
+    assert may_call(LS_WAITING_QUOTA, 201, 200);
+    assert may_call(LS_UNAVAILABLE, 999999, 0) == false;
+}
+
+test a_model_that_leaves_the_catalog_is_unavailable_until_a_catalog_lists_it_free {
+    assert next_state(LS_AVAILABLE, EV_GONE) == LS_UNAVAILABLE;
+    assert next_state(LS_WAITING_QUOTA, EV_GONE) == LS_UNAVAILABLE;
+    assert next_state(LS_UNAVAILABLE, EV_OK) == LS_UNAVAILABLE;
+    assert next_state(LS_UNAVAILABLE, EV_RATE_LIMIT) == LS_UNAVAILABLE;
+    assert next_state(LS_UNAVAILABLE, EV_OTHER) == LS_UNAVAILABLE;
+    assert next_state(LS_UNAVAILABLE, EV_LISTED_FREE) == LS_AVAILABLE;
+}
+
+test a_good_answer_ends_a_wait_and_an_unclear_one_changes_nothing {
+    assert next_state(LS_WAITING_QUOTA, EV_OK) == LS_AVAILABLE;
+    assert next_state(LS_AVAILABLE, EV_OTHER) == LS_AVAILABLE;
+    assert next_state(LS_WAITING_QUOTA, EV_OTHER) == LS_WAITING_QUOTA;
+    assert next_state(LS_AVAILABLE, EV_LISTED_FREE) == LS_AVAILABLE;
+}
+
+test one_probe_per_model_with_no_repository_content_and_never_while_waiting {
+    assert PROBES_PER_MODEL == 1;
+    assert probe_ok(0, CC_NONE, LS_AVAILABLE);
+    assert probe_ok(1, CC_NONE, LS_AVAILABLE) == false;
+    assert probe_ok(0, CC_PUBLIC, LS_AVAILABLE) == false;
+    assert probe_ok(0, CC_NON_PUBLIC, LS_AVAILABLE) == false;
+    assert probe_ok(0, CC_NONE, LS_WAITING_QUOTA) == false;
+    assert probe_ok(0, CC_NONE, LS_UNAVAILABLE) == false;
+}
+
+test the_card_never_shows_a_free_model_as_unlimited {
+    assert badge(true, LS_AVAILABLE) == BADGE_FREE;
+    assert badge(true, LS_WAITING_QUOTA) == BADGE_QUOTA;
+    assert badge(false, LS_AVAILABLE) == BADGE_PAID;
+    assert badge(false, LS_WAITING_QUOTA) == BADGE_PAID;
+}
