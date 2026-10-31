@@ -34,7 +34,7 @@ The cron card `specs/crons/t27-pareto-improvement-loop.t27` runs every 15 minute
 | `specs/acceleration/decomposition_plan.t27` | Atomic units with `Closes #N` traceability, per-mille coverage, next-unit pick |
 | `specs/acceleration/auto_fix_self_heal.t27` | Deterministic fix per failing check kind, rollback decision, keep/watch/rollback verdict |
 | `specs/acceleration/coverage_hundred.t27` | Effective coverage: every spec tested, every change traced, no vacuous tests |
-| `specs/tri/commands/pareto_commands.t27` | `tri pareto audit|fix|verify|land|beat|self-heal`, `tri experience save` |
+| `specs/tri/commands/pareto_commands.t27` | `tri pareto audit|fix|verify|land|beat|self-heal` (proposed, not built yet), `tri experience save` |
 
 ## Rules that keep past work intact
 
@@ -45,7 +45,9 @@ The cron card `specs/crons/t27-pareto-improvement-loop.t27` runs every 15 minute
 - **Foreign-edits budget:** net-negative (added ≤ deleted), ≤40 lines/file, ≤80/PR; no `--no-verify`/`LEFTHOOK=0`.
 - **ASCII only** (L3): `bootstrap/build.rs` fails the build on any Cyrillic under `specs/`.
 
-## New `tri` commands
+## New `tri` commands (proposed, not built yet)
+
+The `tri pareto` contract is `specs/tri/commands/pareto_commands.t27`; no `tri` subcommand runs it yet.
 
 - `tri pareto audit` — list anomalies ranked by impact x frequency
 - `tri pareto fix <n>` — write the `.t27` fix for anomaly n, with test/invariant/bench
