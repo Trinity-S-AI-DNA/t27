@@ -83,6 +83,9 @@ mod gen_file_check;
 #[path = "../gen/rust/compiler/compile_output.rs"]
 #[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
 mod compile_output;
+#[path = "../gen/rust/compiler/gen_text.rs"]
+#[allow(dead_code, unused_parens, unused_mut, unused_assignments, unused_variables, non_snake_case, non_upper_case_globals, clippy::all)]
+mod gen_text;
 fn cr_sha(parts: &[&[u8]]) -> [u8; 32] { use sha2::Digest; parts.iter().fold(sha2::Sha256::new(), |h, p| h.chain_update(p)).finalize().into() }
 fn cr_root(l: &[String]) -> [u8; 32] { let k = cr::split_point(l.len() as u32) as usize;
     if l.len() < 2 { l.first().map_or(cr_sha(&[]), |x| cr_sha(&[&[cr::LEAF_PREFIX], x.as_bytes()])) } else { cr_sha(&[&[cr::NODE_PREFIX], &cr_root(&l[..k]), &cr_root(&l[k..])]) } }
@@ -1311,6 +1314,9 @@ enum Commands {
     /// Print the IGLA board event a .t27 spec states, as one JSON object
     #[command(name = "gen-json")]
     GenJson { input: String },
+    /// Write the bytes of a spec's `str` constant to gen/text/<spec>/NAME, or to -o (t27#13011)
+    #[command(name = "gen-text")]
+    GenText { input: String, #[arg(long = "const")] name: String, #[arg(short, long)] output: Option<String> },
 
     /// Compute deterministic test_vector_hash from conformance JSON
     Conformance {
@@ -5078,10 +5084,7 @@ fn run_gen_pipeline_stage2(
     write_verilog_to_output(&verilog, output, "pipeline_stage2")
 }
 
-fn run_gen_double_buffer_ctrl(
-    module_name: &str,
-    output: Option<&str>,
-) -> anyhow::Result<()> {
+fn run_gen_double_buffer_ctrl(module_name: &str, output: Option<&str>) -> anyhow::Result<()> {
     let verilog = bitnet_buffers::build_double_buffer_ctrl(module_name);
     write_verilog_to_output(&verilog, output, "double_buffer_ctrl")
 }
@@ -5104,26 +5107,17 @@ fn run_gen_axi_lite_slave(
     write_verilog_to_output(&verilog, output, "axi_lite_slave")
 }
 
-fn run_gen_dma_controller(
-    module_name: &str,
-    output: Option<&str>,
-) -> anyhow::Result<()> {
+fn run_gen_dma_controller(module_name: &str, output: Option<&str>) -> anyhow::Result<()> {
     let verilog = bitnet_dma::build_dma_controller(module_name);
     write_verilog_to_output(&verilog, output, "dma_controller")
 }
 
-fn run_gen_interrupt_controller(
-    module_name: &str,
-    output: Option<&str>,
-) -> anyhow::Result<()> {
+fn run_gen_interrupt_controller(module_name: &str, output: Option<&str>) -> anyhow::Result<()> {
     let verilog = bitnet_irq::build_interrupt_controller(module_name);
     write_verilog_to_output(&verilog, output, "interrupt_controller")
 }
 
-fn run_gen_bitnet_engine_top(
-    module_name: &str,
-    output: Option<&str>,
-) -> anyhow::Result<()> {
+fn run_gen_bitnet_engine_top(module_name: &str, output: Option<&str>) -> anyhow::Result<()> {
     let verilog = bitnet_top::build_bitnet_engine_top(module_name);
     write_verilog_to_output(&verilog, output, "bitnet_engine_top")
 }
@@ -5551,13 +5545,8 @@ fn ast_for_codegen(input_path: &str) -> anyhow::Result<(compiler::Node, String)>
 /// not the compiler, decided what the artifact said.
 fn run_gen_js(input_path: &str) -> anyhow::Result<()> {
     let (ast, name) = ast_for_codegen(input_path)?;
-    match codegen_js::generate(&ast, &name) {
-        Ok(code) => {
-            print!("{}", code);
-            Ok(())
-        }
-        Err(e) => anyhow::bail!("{}", e),
-    }
+    print!("{}", codegen_js::generate(&ast, &name).map_err(anyhow::Error::msg)?);
+    Ok(())
 }
 
 /// `gen-ts`: the same declarations, with the types the spec declared for them.
@@ -5568,13 +5557,8 @@ fn run_gen_js(input_path: &str) -> anyhow::Result<()> {
 /// types from the spec, so there is nothing left to hand-write.
 fn run_gen_ts(input_path: &str) -> anyhow::Result<()> {
     let (ast, name) = ast_for_codegen(input_path)?;
-    match codegen_ts::generate(&ast, &name) {
-        Ok(code) => {
-            print!("{}", code);
-            Ok(())
-        }
-        Err(e) => anyhow::bail!("{}", e),
-    }
+    print!("{}", codegen_ts::generate(&ast, &name).map_err(anyhow::Error::msg)?);
+    Ok(())
 }
 
 /// `gen-python`: the same declarations, in the language the analysis harnesses
@@ -5584,13 +5568,8 @@ fn run_gen_ts(input_path: &str) -> anyhow::Result<()> {
 /// the module from the spec, so the copy does not exist.
 fn run_gen_python(input_path: &str) -> anyhow::Result<()> {
     let (ast, name) = ast_for_codegen(input_path)?;
-    match codegen_python::generate(&ast, &name) {
-        Ok(code) => {
-            print!("{}", code);
-            Ok(())
-        }
-        Err(e) => anyhow::bail!("{}", e),
-    }
+    print!("{}", codegen_python::generate(&ast, &name).map_err(anyhow::Error::msg)?);
+    Ok(())
 }
 
 /// `gen-json` (#10050): the IGLA board event a spec states, as one JSON object. Every value comes
@@ -5615,6 +5594,22 @@ fn run_gen_json(input_path: &str) -> anyhow::Result<()> {
     let metrics = format!("{{{}:[{lens}],{}:[{}]}}", v("KEY_LENS")?, v("KEY_CELLS")?, cells.join(","));
     let (job, stage, msg, progress) = (v("JOB")?, v("STAGE")?, v("MSG")?, v("PROGRESS")?);
     println!("{{\"job\":{job},\"stage\":{stage},\"msg\":{msg},\"progress\":{progress},\"metrics\":{metrics}}}");
+    Ok(())
+}
+
+/// `gen-text` (t27#13011): the bytes of a spec's `str` const, unchanged, to gen/text/ or -o; the decisions are specs/compiler/gen_text.t27.
+fn run_gen_text(input: &str, name: &str, output: Option<&str>) -> anyhow::Result<()> {
+    let (ast, _) = ast_for_codegen(input)?;
+    let node = ast.children.iter().find(|n| n.kind == compiler::NodeKind::ConstDecl && n.name == name);
+    let lit = node.and_then(|n| n.children.first()).filter(|c| c.extra_kind == "string");
+    anyhow::ensure!(gen_text::text_check(node.is_some(), lit.is_some()) == gen_text::TEXT_WRITE, "gen-text: {input} declares no string const {name}");
+    let mut buf = [0u8; 512];
+    let n = gen_text::default_path(input.as_bytes(), name.as_bytes(), &mut buf);
+    anyhow::ensure!(output.is_some() || (0 < n && n <= buf.len()), "gen-text: {input} has no default path, pass -o");
+    let dest = output.map_or_else(|| String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned(), String::from);
+    if let Some(dir) = Path::new(&dest).parent() { fs::create_dir_all(dir)?; }
+    fs::write(&dest, lit.map_or_else(Vec::new, |l| l.value.chars().map(|c| c as u32 as u8).collect()))?;
+    eprintln!("gen-text: wrote {dest}");
     Ok(())
 }
 
@@ -11607,6 +11602,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::GenTs { input } => run_gen_ts(&input)?,
         Commands::GenPython { input } => run_gen_python(&input)?,
         Commands::GenJson { input } => run_gen_json(&input)?,
+        Commands::GenText { input, name, output } => run_gen_text(&input, &name, output.as_deref())?,
         Commands::Conformance { input } => run_conformance(&input)?,
         Commands::Path { input, synth } => {
             service::run_path(&std::env::current_dir()?, &input, synth)?
@@ -12047,6 +12043,7 @@ fn main() -> anyhow::Result<()> {
         Commands::GenTs { input } => run_gen_ts(&input)?,
         Commands::GenPython { input } => run_gen_python(&input)?,
         Commands::GenJson { input } => run_gen_json(&input)?,
+        Commands::GenText { input, name, output } => run_gen_text(&input, &name, output.as_deref())?,
         Commands::Conformance { input } => run_conformance(&input)?,
         Commands::Path { input, synth } => {
             service::run_path(&std::env::current_dir()?, &input, synth)?
