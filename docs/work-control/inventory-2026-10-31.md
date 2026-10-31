@@ -34,7 +34,7 @@ Reading rules used throughout:
 | Remote branches | 2741 (1904 under `fed/`, 625 flat, 42 `pr/`, 41 `lane/`) | `git for-each-ref refs/remotes/origin` |
 | Local branches with upstream | 1418 (1055 upstream gone) | `%(upstream:track)` |
 | Branches ahead of their own non-master upstream (truly unpushed) | 12 branches, 42 commits | `git rev-list --count @{u}..HEAD` |
-| Worktrees | 75 (74 measured, 1 hung) | `git worktree list --porcelain` |
+| Worktrees | 75 (all measured; the Codex tree answered late, see 1.3) | `git worktree list --porcelain` |
 | Worktrees with uncommitted tracked changes | 14 | `git status --porcelain -uno` |
 | Open PRs | 32 | `gh pr list --state open` |
 | Sessions reachable from this family | 16 (9 linked + 7 seen in the full list at 06:52Z) | app session list |
@@ -91,7 +91,7 @@ quiet (owner session idle, work uncommitted), done.
 | E#? | 21 port issues, e.g. #12573 (trios merkle.rs) | #12917 .. #12937 | `port/*` | UNSTABLE | dmitrii-f-t27 | 7 failed each (Corpus ratchet, emit-bitexact, gate-topology, coverage, spec-guards, Verilog widths, cli-tri on #12917) | red; the 7 failures are master's own (#12959, #12972) | land master's fixes, then re-run; map the port issues to an epic |
 | E#? | none | #12961 | `epic2-inline-decision-glue` | DIRTY | gHashTag | 22 failed, 2 cancelled, 49 passed | blocked: conflict, no issue | needs an issue or a close |
 
-### 1.3 Worktrees (75; 74 measured)
+### 1.3 Worktrees (75; all measured)
 
 Format of the measurement: branch, head, tracked dirty files, commits ahead of
 origin/master, upstream, commits ahead of upstream. "ahead of master" with a
@@ -137,8 +137,9 @@ tip as `lane/queen-band-graph`), `~/.codex/worktrees/0c4d/t27` (DETACHED
 (`fix/11420-ci-20261021`, 19 dirty, 3 ahead, no PR),
 `~/.local/share/opencode/worktree/751937/prfix` (`pr-l1-fix`, 3 ahead, no PR),
 `~/Documents/Codex/2026-09-01/new-chat-2/work/t27-wars-baseline-4328`
-(`codex/wars-baseline-4328`, no PR; `git status` hung more than 15 minutes:
-unknown).
+(`codex/wars-baseline-4328`, no PR, no upstream; `git status` answered after about
+an hour: 7 dirty paths with untracked counted, 33 commits ahead of master, last
+commit 2026-05-24).
 
 ## 2. Lists
 
@@ -237,7 +238,7 @@ Also `result-record-spec-608e45` 1 commit not on origin, `loving-kilby-0e85a7`
 - `fed/` remote prefix (1904 branches): sampled one, no documentation found.
 - Cloud sessions: not listed by the app's local session list.
 - DSH state and tokens: `~/.dsh/` was never read (owner rule); DSH availability is "unknown" here, the dev-monitor lane (#12976) is the probe.
-- `~/Documents/Codex/.../t27-wars-baseline-4328`: `git status` hung; not measured.
+- `~/Documents/Codex/.../t27-wars-baseline-4328`: `git status` answered after about an hour (first pass, untracked counted); the tracked-only second pass does not include it.
 - Branch-to-PR check covered 200 of 1725 local-only branches; 1525 unchecked.
 - Per-PR failing check names were read for one port PR (#12917) and the five session PRs' counts; not for all 32.
 - Sessions outside this family: seen once (06:52Z) through the full list with title, branch, PR, state only.
