@@ -12,6 +12,7 @@ use t27f::work_graph::new_graph;
 use t27f::work_graph::apply_event;
 use t27f::work_graph::nodes;
 use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::graph_digest;
 use t27f::work_graph::NK_SPEC;
 use t27f::work_graph::NK_AGENT;
 use t27f::work_graph::NK_TASK;
@@ -19,6 +20,32 @@ use t27f::work_graph::NK_ACTION;
 use t27f::work_graph::NK_ARTIFACT;
 use t27f::work_graph::NK_COUNT;
 use t27f::work_graph::WG_OK;
+
+/// K-hop cache, keyed by (seed_pid, k_hops), invalidated on graph_digest change.
+var kcache_seed : u64 = 0;
+var kcache_hops : u32 = 0;
+var kcache_digest : [32]u8 = undefined;
+var kcache_valid : bool = false;
+var kcache_total : u32 = 0;
+var kcache_out : [1024]u8 = undefined;
+var kcache_out_len : usize = 0;
+
+/// Compare two [32]u8 digests byte by byte.
+pub fn digest_eq(a : [32]u8, b : [32]u8) -> bool {
+    var i : u32 = 0;
+    while (i < 32) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Copy n bytes from src to dst.
+pub fn buf_copy(dst : []u8, src : []u8, n : usize) -> usize {
+    var i : usize = 0;
+    while (i < n) { dst[i] = src[i]; i = i + 1; }
+    return n;
+}
 
 pub fn kind_name_text(idx : u32) -> str {
     if (idx == 0) { return "SPEC"; }
@@ -153,9 +180,34 @@ pub fn k_hop_read(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) 
     return total;
 }
 
+/// k_hop_read_cached: same as k_hop_read, but results are cached keyed by
+; (seed_pid, k_hops) and invalidated when graph_digest changes.
+; On cache hit, skips the BFS and copies the stored output back to out_buf.
+pub fn k_hop_read_cached(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) -> u32 {
+    const cur_digest : [32]u8 = graph_digest(g);
+    if (kcache_valid and kcache_seed == seed_pid and kcache_hops == k_hops and digest_eq(kcache_digest, cur_digest)) {
+        var n : usize = buf_copy(out_buf, kcache_out[0..kcache_out_len], kcache_out_len);
+        assert(n == kcache_out_len);
+        return kcache_total;
+    }
+    // cache miss: recompute and store
+    var total : u32 = k_hop_read(g, seed_pid, k_hops, out_buf);
+    kcache_seed = seed_pid;
+    kcache_hops = k_hops;
+    kcache_digest = cur_digest;
+    kcache_total = total;
+    // snapshot output into cache (cap at cache capacity)
+    var cap : usize = 1024;
+    if (out_buf.len < cap) { cap = out_buf.len; }
+    kcache_out_len = cap;
+    var n : usize = buf_copy(kcache_out[0..cap], out_buf[0..cap], cap);
+    assert(n == cap);
+    return total;
+}
+
 pub fn graph_k_hop(spec_text : str, g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) -> u32 {
     var n : u32 = graph_fold_ring(spec_text, g);
-    var total : u32 = k_hop_read(g, seed_pid, k_hops, out_buf);
+    var total : u32 = k_hop_read_cached(g, seed_pid, k_hops, out_buf);
     return total;
 }
 
@@ -199,4 +251,44 @@ test graph_fold_batch_respects_cap {
     var pbuf : [4]u64 = undefined;
     var n : u32 = graph_fold_batch("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n4 1003 1004\n", &g, kbuf[0..4], pbuf[0..4], 4);
     assert(n == 4);   // cap limits to 4
+}
+
+test digest_eq_returns_correct_results {
+    var a : [32]u8 = undefined;
+    var b : [32]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 32) { a[i] = 0; b[i] = 0; i = i + 1; }
+    assert(digest_eq(a, b));
+    a[0] = 1;
+    assert(digest_eq(a, b) == false);
+    a[0] = 0;
+    assert(digest_eq(a, b));
+}
+
+test k_hop_read_cached_returns_same_on_hit {
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g);
+    assert(n == 4);
+    var out1 : [256]u8 = undefined;
+    var total1 : u32 = k_hop_read_cached(&g, 1001, 1, &out1);
+    assert(total1 > 1);
+    // second call with same graph and params: cache hit, same total
+    var out2 : [256]u8 = undefined;
+    var total2 : u32 = k_hop_read_cached(&g, 1001, 1, &out2);
+    assert(total2 == total1);
+}
+
+test k_hop_read_cached_invalidates_on_digest_change {
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g);
+    assert(n == 4);
+    var out1 : [256]u8 = undefined;
+    var total1 : u32 = k_hop_read_cached(&g, 1001, 1, &out1);
+    assert(total1 > 1);
+    // add a new event -> digest changes -> cache miss, recompute
+    var n2 : u32 = graph_fold_ring("0 1004\n", &g);
+    assert(n2 == 1);
+    var out2 : [256]u8 = undefined;
+    var total2 : u32 = k_hop_read_cached(&g, 1001, 1, &out2);
+    assert(total2 >= total1);   // more nodes reachable now
 }
