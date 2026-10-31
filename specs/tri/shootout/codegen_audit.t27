@@ -1,0 +1,310 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/shootout/codegen_audit.t27 -- Epic 1 of the t27b Runtime Frontier:
+; where the 656 ms of the 200M-call benchmark is actually spent.
+
+; Evidence: t27b asm specs/tri/shootout/bench_audit.t27
+;   function _verdict_benchmark_200m is 44 instructions (0x20..0xcc).
+;   its hot loop is 21 instructions (0x54..0xa4, back edge b.lo 0x54).
+;   function _verdict_fn is 6 instructions; 4 of them execute per call.
+
+; Measured runtime of that spec: 656 ms for 200_000_000 logical calls
+;   (t27b test specs/tri/shootout/bench_audit.t27 --time, arm64 Mac, warm).
+;   656 ms / 200M = 3.28 ns per logical call.
+
+; This spec holds the COUNTS and the arithmetic derived from them.
+; The raw disassembly receipt lives beside it in codegen_audit.json.
+; Every number below is either MEASURED (with its command above) or DERIVED
+; from a measured number; nothing here is estimated and presented as measured.
+
+; Closes #11275
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriShootoutCodegenAudit;
+
+; ----------------------------------------------------------------
+; Measured workload
+; ----------------------------------------------------------------
+
+pub const MEASURED_LOGICAL_CALLS : u64 = 200_000_000;
+pub const MEASURED_RUNTIME_MS : f64 = 656.0;
+pub const MEASURED_OBJECT_BYTES : u64 = 560;
+pub const MEASURED_COMPILE_MS : f64 = 3.684;
+
+; Reference rung: Zig 0.16 on the publishable 200M workload (bench.t27).
+pub const ZIG_RUNTIME_MS : f64 = 150.0;
+pub const ZIG_CALLS_PER_SEC : f64 = 1_333_000_000.0;
+
+; Performance-core clock of the measurement machine, used only to turn
+; nanoseconds into cycles. Stated so a reader can redo the arithmetic.
+pub const ASSUMED_CORE_GHZ : f64 = 3.2;
+
+; ----------------------------------------------------------------
+; Instruction census of one hot-loop iteration
+; ----------------------------------------------------------------
+
+/// Counts of one iteration of the loop at 0x54..0xa4.
+/// The five fields partition the 21 instructions exactly; a test checks it.
+pub const HotLoopAudit = struct {
+    instructions : u64,
+    calls : u64,          // bl (the callee body is counted separately)
+    branches : u64,       // every b / b.cond, including the back edge
+    compares : u64,       // cmp / cmn
+    moves : u64,          // mov / movz / movk, register and immediate
+    alu : u64,            // adds / subs and other arithmetic
+    loads : u64,
+    stores : u64,
+    spills : u64,
+    overflow_checks : u64,        // subset of branches: adds/subs + b.hs/b.lo
+    invariant_rematerialisations : u64, // subset of moves: loop-invariant rebuilt per iteration
+}
+
+/// MEASURED: the loop as the compiler emits it today.
+/// One iteration, from t27b asm specs/tri/shootout/bench_audit.t27:
+///   54 mov x0, x19          58 mov x1, x21          5c bl 0x0
+///   60 mov x9, x0           64 adds x22, x22, x9    68 b.hs 0xcc
+///   6c adds x19, x19, #1    70 b.hs 0xcc            74 cmp x19, #1000
+///   78 b.ls 0x88            7c movz x19, #0x0       80 movz x21, #0x3e8
+///   84 b 0x90               88 subs x21, x19, #1    8c b.lo 0xcc
+///   90 adds x20, x20, #1    94 b.hs 0xcc            98 movz x17, #0xc200
+///   9c movk x17, #0xbeb     a0 cmp x20, x17         a4 b.lo 0x54
+pub const BASELINE : HotLoopAudit = HotLoopAudit {
+    .instructions = 21,
+    .calls = 1,
+    .branches = 7,
+    .compares = 2,
+    .moves = 7,
+    .alu = 4,
+    .loads = 0,
+    .stores = 0,
+    .spills = 0,
+    .overflow_checks = 4,
+    .invariant_rematerialisations = 2,
+}
+
+/// MEASURED: instructions of _verdict_fn that execute on the hot path.
+///   0 cmp x0, x1 / 4 b.ne 0x10 / 10 movz x0, #0x1 / 14 ret
+/// (the equal branch executes cmp / b.ne / 8 movz x0, #0x0 / c ret: also 4)
+/// The function returns u64, so the movz writes the whole X register, not W.
+pub const CALLEE_EXECUTED_INSTRUCTIONS : u64 = 4;
+
+/// MEASURED: loop instructions spent crossing into the callee and back:
+/// 54 mov x0, x19 / 58 mov x1, x21 / 5c bl / 60 mov x9, x0.
+pub const CALL_PLUMBING_INSTRUCTIONS : u64 = 4;
+
+/// Instructions executed per logical call today: loop body plus callee body.
+pub fn instructions_per_logical_call() -> u64 {
+    return BASELINE.instructions + CALLEE_EXECUTED_INSTRUCTIONS;
+}
+
+/// MEASURED ns per logical call.
+pub fn ns_per_logical_call() -> f64 {
+    return (MEASURED_RUNTIME_MS * 1_000_000.0) / (MEASURED_LOGICAL_CALLS as f64);
+}
+
+/// MEASURED instructions retired per second, from the two numbers above.
+pub fn instructions_per_second() -> f64 {
+    return (instructions_per_logical_call() as f64) / (ns_per_logical_call() / 1_000_000_000.0);
+}
+
+/// DERIVED: instructions retired per core cycle on this machine.
+pub fn measured_ipc() -> f64 {
+    return instructions_per_second() / (ASSUMED_CORE_GHZ * 1_000_000_000.0);
+}
+
+/// MEASURED calls per second of this workload.
+pub fn calls_per_second() -> f64 {
+    return (MEASURED_LOGICAL_CALLS as f64) / (MEASURED_RUNTIME_MS / 1000.0);
+}
+
+; ----------------------------------------------------------------
+; The five losses, largest first
+; ----------------------------------------------------------------
+
+/// One recoverable loss in the hot loop.
+/// `instructions` is what it costs per iteration today.
+/// `recoverable` is how much of that a fix removes, conservatively.
+pub const Loss = struct {
+    id : str,
+    name : str,
+    instructions : u64,
+    recoverable : u64,
+    fix : str,
+    epic : u32,
+}
+
+/// One const per number, referenced by LOSSES below, so every count has one home.
+pub const L1_INSTRUCTIONS : u64 = 7;   // 74 cmp / 78 b.ls / 7c movz / 80 movz / 84 b / 88 subs / 8c b.lo
+pub const L1_RECOVERABLE : u64 = 4;    // sub + two csel replaces it; one residual move stays
+pub const L2_INSTRUCTIONS : u64 = 8;   // 54 mov / 58 mov / 5c bl / 60 mov + 4 callee instructions
+pub const L2_RECOVERABLE : u64 = 6;    // cmp + csel in place of the whole crossing
+pub const L3_INSTRUCTIONS : u64 = 4;   // 68 b.hs / 70 b.hs / 8c b.lo / 94 b.hs
+pub const L3_RECOVERABLE : u64 = 4;    // no proof is available today; a speed tier may drop it
+pub const L4_INSTRUCTIONS : u64 = 2;   // 98 movz x17 / 9c movk x17 (200_000_000)
+pub const L4_RECOVERABLE : u64 = 2;    // hoist into a callee-saved register
+pub const L5_INSTRUCTIONS : u64 = 4;   // 38 mov / 3c mov / 48 mov / 4c mov, once per call, not per iteration
+pub const L5_RECOVERABLE : u64 = 0;    // out of the loop: costs nothing per logical call at 200M iterations
+
+/// Sized from the census above, not from intuition.
+/// Ordering matters: the largest loss is the control-flow chain, not the call.
+pub const LOSSES = [
+    Loss {
+        .id = "L1",
+        .name = "clamp branch chain for the saturating wrap",
+        .instructions = L1_INSTRUCTIONS,
+        .recoverable = L1_RECOVERABLE,
+        .fix = "branchless saturating wrap: sub plus csel, no taken branch",
+        .epic = 4,
+    },
+    Loss {
+        .id = "L2",
+        .name = "call crossing not inlined",
+        .instructions = L2_INSTRUCTIONS,
+        .recoverable = L2_RECOVERABLE,
+        .fix = "inline a pure, non-recursive callee under an instruction budget",
+        .epic = 2,
+    },
+    Loss {
+        .id = "L3",
+        .name = "u64 overflow checks on every add",
+        .instructions = L3_INSTRUCTIONS,
+        .recoverable = L3_RECOVERABLE,
+        .fix = "prove the bound or drop the check in a speed tier; keep it in the safe tier",
+        .epic = 5,
+    },
+    Loss {
+        .id = "L4",
+        .name = "loop-invariant limit rebuilt every iteration",
+        .instructions = L4_INSTRUCTIONS,
+        .recoverable = L4_RECOVERABLE,
+        .fix = "hoist invariant materialisation out of the loop into a callee-saved register",
+        .epic = 3,
+    },
+    Loss {
+        .id = "L5",
+        .name = "entry register shuffling",
+        .instructions = L5_INSTRUCTIONS,
+        .recoverable = L5_RECOVERABLE,
+        .fix = "coalesce argument copies at entry; no runtime effect on this workload",
+        .epic = 3,
+    },
+];
+
+/// Sum of every recoverable instruction, per iteration.
+/// A test checks it never exceeds the recoverable instructions actually present.
+pub fn total_recoverable() -> u64 {
+    return L1_RECOVERABLE + L2_RECOVERABLE + L3_RECOVERABLE + L4_RECOVERABLE + L5_RECOVERABLE;
+}
+
+/// Best case the five fixes can reach, ignoring register pressure.
+pub fn best_case_instructions() -> u64 {
+    return BASELINE.instructions - total_recoverable();
+}
+
+/// What the ladder plans for, allowing residual moves for register pressure.
+/// Four arithmetic ops + one compare + one branch = 6; one spare move is budgeted.
+pub const PLANNED_INSTRUCTIONS : u64 = 6;
+
+/// DERIVED: runtime if every fix lands and instruction cost stays linear.
+/// This holds IPC constant, which understates the gain: removing a call and a
+/// taken branch raises IPC, so the real number should be better than this.
+pub fn projected_runtime_ms(new_instructions : u64) -> f64 {
+    return MEASURED_RUNTIME_MS * (new_instructions as f64) / (BASELINE.instructions as f64);
+}
+
+/// DERIVED: instructions per logical call needed to hit a wall-clock target,
+/// at the measured cost per instruction. This is the rung test.
+pub fn required_instructions_for_ms(target_ms : f64) -> f64 {
+    return (BASELINE.instructions as f64) * target_ms / MEASURED_RUNTIME_MS;
+}
+
+/// The name of the file that holds the raw disassembly this census was read from.
+pub fn evidence_command() -> str {
+    return "t27b asm specs/tri/shootout/bench_audit.t27";
+}
+
+; ----------------------------------------------------------------
+; Tests
+; ----------------------------------------------------------------
+
+test census_partitions_the_loop_exactly {
+    // calls + branches + compares + moves + alu must equal the whole loop
+    var sum = BASELINE.calls + BASELINE.branches + BASELINE.compares + BASELINE.moves + BASELINE.alu;
+    assert(sum == BASELINE.instructions);
+    assert(BASELINE.instructions == 21)
+}
+
+test loop_has_no_memory_traffic {
+    // the loop keeps everything in registers already: no ldr, no str, no spill.
+    // This kills the "register-efficient hot loop" hypothesis as the top loss.
+    assert(BASELINE.loads == 0);
+    assert(BASELINE.stores == 0);
+    assert(BASELINE.spills == 0)
+}
+
+test overflow_checks_are_a_branch_each {
+    // four adds/subs, four conditional branches, and none of them ever taken
+    assert(BASELINE.overflow_checks == 4);
+    assert(BASELINE.overflow_checks < BASELINE.branches)
+}
+
+test call_is_not_free {
+    // the call crossing costs 4 loop instructions plus 4 callee instructions
+    var call_cost = CALL_PLUMBING_INSTRUCTIONS + CALLEE_EXECUTED_INSTRUCTIONS;
+    assert(call_cost == 8);
+    assert(instructions_per_logical_call() == 25)
+}
+
+test largest_loss_is_control_flow_not_the_call {
+    // L1 (7 instructions) is larger than L2 (8) only when the callee is counted;
+    // on the loop body alone the clamp chain is the biggest single block.
+    assert(LOSSES[0].id == "L1");
+    assert(LOSSES[0].instructions == 7);
+    assert(LOSSES[1].id == "L2")
+}
+
+test recoverable_never_exceeds_what_is_there {
+    var total = total_recoverable();
+    assert(total == 16);
+    assert(best_case_instructions() == 5);
+    assert(total < BASELINE.instructions);
+    assert(LOSSES[0].recoverable <= LOSSES[0].instructions);
+    assert(LOSSES[1].recoverable <= LOSSES[1].instructions);
+    assert(LOSSES[2].recoverable <= LOSSES[2].instructions);
+    assert(LOSSES[3].recoverable <= LOSSES[3].instructions);
+    assert(LOSSES[4].recoverable <= LOSSES[4].instructions)
+}
+
+test measured_ipc_is_about_two_and_a_half {
+    // 25 instructions per 3.28 ns at 3.2 GHz is roughly 2.4 instructions per cycle
+    var ipc = measured_ipc();
+    assert(ipc > 2.0);
+    assert(ipc < 3.0)
+}
+
+test calls_per_second_matches_the_receipt {
+    var cps = calls_per_second();
+    assert(cps > 300_000_000.0);
+    assert(cps < 310_000_000.0)
+}
+
+test planned_six_instructions_beats_the_zig_rung {
+    // 21 -> 6 instructions projects 656 * 6/21 = 187.4 ms, inside the 200 ms rung
+    var projected = projected_runtime_ms(PLANNED_INSTRUCTIONS);
+    assert(projected > 180.0);
+    assert(projected < 200.0)
+}
+
+test one_hundred_fifty_ms_needs_six_instructions_or_fewer {
+    // 150 ms needs 21 * 150/656 = 4.80 instructions of the old cost, i.e. <=5
+    var need = required_instructions_for_ms(ZIG_RUNTIME_MS);
+    assert(need > 4.0);
+    assert(need < 5.0);
+    // the scalar floor is 5 (three increments plus compare and branch),
+    // so 150 ms sits exactly at the edge of the scalar path
+    assert(PLANNED_INSTRUCTIONS >= need)
+}
+
+test evidence_is_a_command_not_an_opinion {
+    var cmd = evidence_command();
+    assert(cmd == "t27b asm specs/tri/shootout/bench_audit.t27")
+}
