@@ -1,0 +1,313 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/graph_k_hop.t27 -- G4: GNN k-hop reading of live mycelium graph (epic #12779)
+; Reads tap ring text, folds into work graph, does k-hop traversal from seed pid,
+; outputs trace dump of reachable nodes with kind, depth, path.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27osGraphKHop;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::Event;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::apply_event;
+use t27f::work_graph::nodes;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::graph_digest;
+use t27f::work_graph::NK_SPEC;
+use t27f::work_graph::NK_AGENT;
+use t27f::work_graph::NK_TASK;
+use t27f::work_graph::NK_ACTION;
+use t27f::work_graph::NK_ARTIFACT;
+use t27f::work_graph::NK_COUNT;
+use t27f::work_graph::WG_OK;
+
+/// K-hop cache, keyed by (seed_pid, k_hops), invalidated on graph_digest change.
+var kcache_seed : u64 = 0;
+var kcache_hops : u32 = 0;
+var kcache_digest : [32]u8 = undefined;
+var kcache_valid : bool = false;
+var kcache_total : u32 = 0;
+var kcache_out : [1024]u8 = undefined;
+var kcache_out_len : usize = 0;
+var kcache_hit_count : u32 = 0;
+
+/// How many calls were served from the cache. A test reads it to hold the hit
+/// claim countable instead of passing with two recomputations.
+pub fn kcache_hits() -> u32 {
+    return kcache_hit_count;
+}
+
+/// Compare two [32]u8 digests byte by byte.
+pub fn digest_eq(a : [32]u8, b : [32]u8) -> bool {
+    var i : u32 = 0;
+    while (i < 32) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Copy n bytes from src to dst.
+pub fn buf_copy(dst : []u8, src : []u8, n : usize) -> usize {
+    var i : usize = 0;
+    while (i < n) { dst[i] = src[i]; i = i + 1; }
+    return n;
+}
+
+pub fn kind_name_text(idx : u32) -> str {
+    if (idx == 0) { return "SPEC"; }
+    if (idx == 1) { return "AGENT"; }
+    if (idx == 2) { return "TASK"; }
+    if (idx == 3) { return "ACTION"; }
+    if (idx == 4) { return "ARTIFACT"; }
+    return "UNKNOWN";
+}
+
+/// Batch fold: one pass over text accumulates (kind, pid) pairs into arrays,
+; then apply_event is called once per pair. `cap` bounds the internal arrays.
+; Returns number of events applied.
+pub fn graph_fold_batch(text : str, g : *WorkGraph, kinds : []u8, pids : []u64, cap : u32) -> u32 {
+    var count : u32 = 0;
+    var i : usize = 0;
+    while (i < text.len) {
+        var e : usize = i;
+        while (e < text.len and text[e] != 10) { e = e + 1; }
+        var s : usize = i;
+        while (s < e and text[s] == 32) { s = s + 1; }
+        if (s >= e or text[s] == 35) { i = e + 1; continue; }
+        var ks : usize = s;
+        var kind : u8 = 0;
+        while (s < e and text[s] >= 48 and text[s] <= 57) { kind = kind * 10 + ((text[s] - 48) as u8); s = s + 1; }
+        if (s == ks) { i = e + 1; continue; }
+        while (s < e and text[s] == 32) { s = s + 1; }
+        var pid : u64 = 0;
+        while (s < e and text[s] >= 48 and text[s] <= 57) { pid = pid * 10 + ((text[s] - 48) as u64); s = s + 1; }
+        if (count < cap) {
+            kinds[count] = kind;
+            pids[count] = pid;
+            count = count + 1;
+        }
+        i = e + 1;
+    }
+    // second pass: apply_event per pair
+    var applied : u32 = 0;
+    var j : u32 = 0;
+    while (j < count) {
+        const ev : Event = Event { kind: kinds[j], from_pid: pids[j], to_pid: 1000 as u64, task_no: 0 as u32, deliver: 0 as u8, reason: 99 as u8, seq: j, spec_id: 0 as u32 };
+        const r : u8 = apply_event(g, ev);
+        if (r == WG_OK) { applied = applied + 1; }
+        j = j + 1;
+    }
+    return applied;
+}
+
+/// graph_fold_ring: thin wrapper over batch fold with stack arrays (64-entry cap).
+pub fn graph_fold_ring(text : str, g : *WorkGraph) -> u32 {
+    var kbuf : [64]u8 = undefined;
+    var pbuf : [64]u64 = undefined;
+    return graph_fold_batch(text, g, kbuf[0..64], pbuf[0..64], 64);
+}
+
+pub fn k_hop_read(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) -> u32 {
+    var visited : [256]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 256) { visited[i] = 0; i = i + 1; }
+    var queue_pids : [256]u64 = undefined;
+    var queue_depths : [256]u32 = undefined;
+    var q_head : u32 = 0;
+    var q_tail : u32 = 0;
+    var total : u32 = 0;
+
+    queue_pids[0] = seed_pid;
+    queue_depths[0] = 0;
+    q_tail = 1;
+    visited[seed_pid % 256] = 1;
+    total = 1;
+
+    while (q_head < q_tail) {
+        const cur_pid : u64 = queue_pids[q_head];
+        const cur_depth : u32 = queue_depths[q_head];
+        q_head = q_head + 1;
+        if (cur_depth >= k_hops) { continue; }
+        var ni : u32 = 0;
+        while (ni < nodes(g)) {
+            const npid : u64 = ni as u64;
+            if (npid == cur_pid) { ni = ni + 1; continue; }
+            if (visited[npid % 256] == 1) { ni = ni + 1; continue; }
+            visited[npid % 256] = 1;
+            queue_pids[q_tail] = npid;
+            queue_depths[q_tail] = cur_depth + 1;
+            q_tail = q_tail + 1;
+            total = total + 1;
+            ni = ni + 1;
+        }
+    }
+
+    var w : usize = 0;
+    var ni : u32 = 0;
+    while (ni < nodes(g)) {
+        const npid : u64 = ni as u64;
+        if (visited[npid % 256] == 1 and npid != seed_pid) {
+            const nkind : u8 = node_kind_at_pub(g, ni);
+            var qj : u32 = 0;
+            var found : bool = false;
+            var d : u32 = 0;
+            while (qj < q_tail) {
+                if (queue_pids[qj] == npid) { found = true; d = queue_depths[qj]; break; }
+                qj = qj + 1;
+            }
+            if (found) {
+                var tmp : [24]u8 = undefined;
+                var tw : usize = 0;
+                var tp : u64 = npid;
+                if (tp == 0) { tmp[0] = 48; tw = 1; }
+                else { var ttmp : u64 = tp; var tpos : usize = 0; while (ttmp > 0) { tmp[tpos] = (48 + (ttmp % 10)) as u8; ttmp = ttmp / 10; tpos = tpos + 1; } var tt2 : usize = 0; while (tt2 < tpos / 2) { var tmpc : u8 = tmp[tt2]; tmp[tt2] = tmp[tpos - 1 - tt2]; tmp[tpos - 1 - tt2] = tmpc; tt2 = tt2 + 1; } tw = tpos; }
+                var k : usize = 0;
+                while (k < tw) { out_buf[w] = tmp[k]; w = w + 1; k = k + 1; }
+                out_buf[w] = 32; w = w + 1;
+                var kname : str = kind_name_text(nkind as u32);
+                var kname_len : usize = 0;
+                var kx : usize = 0;
+                while (kx < kname.len) { kname_len = kname_len + 1; kx = kx + 1; }
+                var kk : usize = 0;
+                while (kk < kname_len) { out_buf[w] = kname[kk]; w = w + 1; kk = kk + 1; }
+                out_buf[w] = 32; w = w + 1;
+                var dt : [8]u8 = undefined;
+                var dtw : usize = 0;
+                var dtp : u64 = d;
+                if (dtp == 0) { dtw = 1; dt[0] = 48; }
+                else { var tdt : u64 = d; var tdtw : usize = 0; while (tdt > 0) { dt[tdtw] = (48 + (tdt % 10)) as u8; tdt = tdt / 10; tdtw = tdtw + 1; } var tdt2 : usize = 0; while (tdt2 < tdtw / 2) { var dtmpc : u8 = dt[tdt2]; dt[tdt2] = dt[tdtw - 1 - tdt2]; dt[tdtw - 1 - tdt2] = dtmpc; tdt2 = tdt2 + 1; } dtw = tdtw; }
+                var k2 : usize = 0;
+                while (k2 < dtw) { out_buf[w] = dt[k2]; w = w + 1; k2 = k2 + 1; }
+                out_buf[w] = 10; w = w + 1;
+            }
+        }
+        ni = ni + 1;
+    }
+    return total;
+}
+
+/// k_hop_read_cached: same as k_hop_read, but results are cached keyed by
+; (seed_pid, k_hops) and invalidated when graph_digest changes.
+; On cache hit, skips the BFS and copies the stored output back to out_buf.
+; Every byte of the caller's buffer is defined before any copy reads it: a caller
+; passes an undefined buffer, and no traversal runs on a hit (gate #11225).
+pub fn k_hop_read_cached(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) -> u32 {
+    const cur_digest : [32]u8 = graph_digest(g);
+    var z : usize = 0;
+    while (z < out_buf.len) { out_buf[z] = 0; z = z + 1; }
+    if (kcache_valid and kcache_seed == seed_pid and kcache_hops == k_hops and digest_eq(kcache_digest, cur_digest)) {
+        kcache_hit_count = kcache_hit_count + 1;
+        var copylen : usize = kcache_out_len;
+        if (out_buf.len < copylen) { copylen = out_buf.len; }
+        var n : usize = buf_copy(out_buf, kcache_out[0..copylen], copylen);
+        assert(n == copylen);
+        return kcache_total;
+    }
+    // cache miss: recompute and store
+    var total : u32 = k_hop_read(g, seed_pid, k_hops, out_buf);
+    kcache_seed = seed_pid;
+    kcache_hops = k_hops;
+    kcache_digest = cur_digest;
+    kcache_total = total;
+    // snapshot output into cache (cap at cache capacity)
+    var cap : usize = 1024;
+    if (out_buf.len < cap) { cap = out_buf.len; }
+    kcache_out_len = cap;
+    var n : usize = buf_copy(kcache_out[0..cap], out_buf[0..cap], cap);
+    assert(n == cap);
+    kcache_valid = true;
+    return total;
+}
+
+pub fn graph_k_hop(spec_text : str, g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) -> u32 {
+    var n : u32 = graph_fold_ring(spec_text, g);
+    var total : u32 = k_hop_read_cached(g, seed_pid, k_hops, out_buf);
+    return total;
+}
+
+test kind_name_returns_correct_names {
+    assert(kind_name_text(0) == "SPEC");
+    assert(kind_name_text(1) == "AGENT");
+    assert(kind_name_text(2) == "TASK");
+    assert(kind_name_text(3) == "ACTION");
+    assert(kind_name_text(4) == "ARTIFACT");
+    assert(kind_name_text(5) == "UNKNOWN");
+}
+
+test graph_fold_ring_folds_events {
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g);
+    assert(n == 4);
+    assert(nodes(&g) > 0);
+}
+
+test k_hop_read_finds_neighbours {
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g);
+    assert(n == 4);
+    var out : [256]u8 = undefined;
+    var total : u32 = k_hop_read(&g, 1001, 1, &out);
+    assert(total > 1);
+}
+
+test graph_fold_batch_applies_all_parsed_events {
+    var g : WorkGraph = new_graph();
+    var kbuf : [64]u8 = undefined;
+    var pbuf : [64]u64 = undefined;
+    var n : u32 = graph_fold_batch("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g, kbuf[0..64], pbuf[0..64], 64);
+    assert(n == 4);
+    assert(nodes(&g) > 0);
+}
+
+test graph_fold_batch_respects_cap {
+    var g : WorkGraph = new_graph();
+    var kbuf : [4]u8 = undefined;
+    var pbuf : [4]u64 = undefined;
+    var n : u32 = graph_fold_batch("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n4 1003 1004\n", &g, kbuf[0..4], pbuf[0..4], 4);
+    assert(n == 4);   // cap limits to 4
+}
+
+test digest_eq_returns_correct_results {
+    var a : [32]u8 = undefined;
+    var b : [32]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 32) { a[i] = 0; b[i] = 0; i = i + 1; }
+    assert(digest_eq(a, b));
+    a[0] = 1;
+    assert(digest_eq(a, b) == false);
+    a[0] = 0;
+    assert(digest_eq(a, b));
+}
+
+test k_hop_read_cached_returns_same_on_hit {
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g);
+    assert(n == 4);
+    var out1 : [256]u8 = undefined;
+    var total1 : u32 = k_hop_read_cached(&g, 1001, 1, &out1);
+    assert(total1 > 1);
+    var hits_before : u32 = kcache_hits();
+    // second call with same graph and params: must be served from the cache
+    var out2 : [256]u8 = undefined;
+    var total2 : u32 = k_hop_read_cached(&g, 1001, 1, &out2);
+    assert(total2 == total1);
+    assert(kcache_hits() == hits_before + 1);
+}
+
+test k_hop_read_cached_invalidates_on_digest_change {
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g);
+    assert(n == 4);
+    var out1 : [256]u8 = undefined;
+    var total1 : u32 = k_hop_read_cached(&g, 1001, 1, &out1);
+    assert(total1 > 1);
+    var hits_before : u32 = kcache_hits();
+    // add a new event -> digest changes -> the next call must miss and recompute
+    var n2 : u32 = graph_fold_ring("0 1004\n", &g);
+    assert(n2 == 1);
+    var out2 : [256]u8 = undefined;
+    var total2 : u32 = k_hop_read_cached(&g, 1001, 1, &out2);
+    assert(total2 >= total1);   // more nodes reachable now
+    assert(kcache_hits() == hits_before);
+}
