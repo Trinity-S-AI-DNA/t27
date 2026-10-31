@@ -33,6 +33,12 @@
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
 use std::collections::HashMap;
+
+// t27b-generated inline decision source of truth:
+//   specs/tri/t27b/inline.t27 -> gen/rust/tri/t27b/inline.rs
+#[path = "../../../gen/rust/tri/t27b/inline.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod inline_decision;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -251,6 +257,31 @@ impl<'a> Gen<'a> {
     // ----------------------------------------------------------- emission
     fn emit(&mut self, w: u32) {
         self.code.push(w);
+    }
+
+    /// Decision boundary only; no hand-written executor.
+    /// Returns the spec's inline/reject verdict; execution stays with `call`.
+    fn try_inline(&mut self, _func: FuncId, args: &[Expr]) -> bool {
+        let _f = &self.prog.funcs[_func as usize];
+        let _cf = inline_decision::CalleeFacts {
+            is_test: _f.is_test,
+            is_invariant: _f.is_invariant,
+            ret_is_none: _f.ret.is_none(),
+            body_stmts: _f.body.len() as u32,
+            has_nested_call: _f.body.iter().any(|s| matches!(s, Stmt::Eval(e) if matches!(e.kind, ExprKind::Call { .. }))),
+            has_store: _f.body.iter().any(|s| matches!(s, Stmt::Store { .. })),
+            has_copy: _f.body.iter().any(|s| matches!(s, Stmt::Copy { .. })),
+            has_assert: _f.body.iter().any(|s| matches!(s, Stmt::Assert { .. } | Stmt::AssertEq { .. })),
+        };
+        let _sf = inline_decision::CallSiteFacts {
+            inside_loop: self.loops.last().is_some(),
+            constant_args: args.iter().all(|a| matches!(a.kind, ExprKind::Const(_))),
+            call_depth: self.loops.len() as u8,
+            caller_size: self.code.len() as u32,
+            result_used: true,
+        };
+        let _decision = inline_decision::should_inline_call(_cf, _sf);
+        false
     }
     fn new_label(&mut self) -> Label {
         self.labels.push(None);
@@ -747,6 +778,7 @@ impl<'a> Gen<'a> {
             }
             Stmt::Eval(e) => {
                 if let ExprKind::Call { func, args } = &e.kind {
+                    self.try_inline(*func, args);
                     self.call(*func, args, None, false);
                 } else {
                     let v = self.eval(e);
@@ -997,7 +1029,10 @@ impl<'a> Gen<'a> {
                 }
                 self.done(d, t)
             }
-            ExprKind::Call { func, args } => self.call(*func, args, dst, true),
+            ExprKind::Call { func, args } => {
+                self.try_inline(*func, args);
+                self.call(*func, args, dst, true)
+            }
             ExprKind::FArith { op, lhs, rhs } => {
                 let a = self.eval(lhs);
                 let b = self.eval(rhs);
