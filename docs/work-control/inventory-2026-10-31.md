@@ -242,14 +242,16 @@ Also `result-record-spec-608e45` 1 commit not on origin, `loving-kilby-0e85a7`
 - Per-PR failing check names were read for one port PR (#12917) and the five session PRs' counts; not for all 32.
 - Sessions outside this family: seen once (06:52Z) through the full list with title, branch, PR, state only.
 - gHashTag/trinity, trinity-fpga, igla, t27os, trios: not inspected.
-- Which checks are required on master: the memory says 4; not re-verified.
+- Which checks are required on master: `unknown` at 07:04Z; re-read at 07:40Z from the
+  active ruleset `t27-master-protection`: validate, check-linked-issue, parse-ratchet,
+  own-language (4). The other check names on a PR are not required.
 
 ## 3. Proposed chat titles (rename_pending; nothing renamed)
 
 Format: `<emoji> E#<epic> . #<issue> . <short outcome>`. This file is ASCII, so
 each emoji is written as its name in colons and the middle dot as a period; the
-exact Unicode titles are in the shared notes folder of the parent session
-(`proposed-titles-2026-10-31.md`). Session ids and model names are left out on
+ASCII form is the only committed form; the Unicode title is rendered from it (emoji
+from its name, period to a middle dot). Session ids and model names are left out on
 purpose.
 
 | Session (by current title) | Proposed title | Flag |
