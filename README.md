@@ -203,7 +203,7 @@ Every change follows the **PHI LOOP**:
 
 ```bash
 tri skill begin <task> --issue <N>
-tri spec edit <module>
+tri spec edit <module>   # NOT BUILT: edit the .t27 spec directly
 tri seal <file.t27> --save
 tri gen
 tri test
