@@ -1,0 +1,427 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/chat_log.t27 -- the durable conversation event log of the DSH to T27 OS migration
+// (Wave A1, issue #13069, refs #12884 and the tracking epic #13020).
+//
+// The audit of 2026-11-01 (docs/coordination/dsh-to-t27os-migration-2026-11-01.md) found no
+// conversation model in any .t27: queen_chats.t27 is one typed line sent as bytes to a CLI pane,
+// session_store.t27 is a session record with no message, live_chat.t27 is a 12-message panel over
+// the live stream. No message id, turn, role or event sequence existed. This spec is that model.
+//
+// The reference behaviour is the DSH session contract (deepseek-harness ce7073d512,
+// docs/subsystems/session.md): a session is an append-only event log with a stable id; seq is
+// monotonic and contiguous; five message roles (system, developer, user, assistant, tool); a turn
+// runs turn/start -> user/message -> assistant stream -> turn/end with a closed set of end reasons
+// (completed, aborted, blocked, error, max-tokens, interrupted, forked); a send carries a request
+// id that makes a retry idempotent (the one named mitigation for a double send).
+//
+// The spec is pure: integers, byte copies, no host call, no @extern, every loop inside a test.
+// The event kinds stay compatible with the live chat panel's three wire kinds (user line, token
+// delta, done) -- EV_MESSAGE, EV_TOKEN_DELTA and EV_TURN_END answer them -- without duplicating
+// its panel window. The host half (file I/O, the window) is a later issue.
+
+module T27osChatLog;
+
+// ---- message roles (FR-002: closed set) ----
+
+pub const ROLE_SYSTEM : u8 = 0;
+pub const ROLE_DEVELOPER : u8 = 1;
+pub const ROLE_USER : u8 = 2;
+pub const ROLE_ASSISTANT : u8 = 3;
+pub const ROLE_TOOL : u8 = 4;
+pub const ROLE_KINDS : u8 = 5;
+
+// ---- turn end reasons (FR-003: closed set) ----
+
+pub const END_COMPLETED : u8 = 0;
+pub const END_ABORTED : u8 = 1;
+pub const END_BLOCKED : u8 = 2;
+pub const END_ERROR : u8 = 3;
+pub const END_MAX_TOKENS : u8 = 4;
+pub const END_INTERRUPTED : u8 = 5;
+pub const END_FORKED : u8 = 6;
+pub const END_KINDS : u8 = 7;
+
+// ---- event kinds (FR-007: compatible with the live panel's user line, token delta, done) ----
+
+pub const EV_TURN_START : u8 = 0;
+pub const EV_MESSAGE : u8 = 1;
+pub const EV_TOKEN_DELTA : u8 = 2;
+pub const EV_TURN_END : u8 = 3;
+pub const EV_KINDS : u8 = 4;
+
+// ---- named outcomes (FR-008: every refusal is named, never silent) ----
+
+pub const OK : u8 = 0;
+pub const ERR_BAD_ROLE : u8 = 1;
+pub const ERR_BAD_REASON : u8 = 2;
+pub const ERR_TOO_LONG : u8 = 3;
+pub const ERR_NO_TURN : u8 = 4;
+pub const ERR_TURN_OPEN : u8 = 5;
+pub const ERR_LOG_FULL : u8 = 6;
+
+// ---- caps ----
+
+/// One message or delta, bytes; refused whole past this (the live panel's MAX_MSG).
+pub const MSG_CAP : u32 = 512;
+/// Events the log holds; a full log refuses the next append with ERR_LOG_FULL.
+pub const LOG_CAP : u32 = 64;
+/// The event flag bit: the turn ended interrupted with partial text kept.
+pub const F_INTERRUPTED : u8 = 1;
+
+// ---- the log: the recorded events plus the live state they must rebuild ----
+
+pub struct ChatLog {
+    count: u32,               // events recorded (<= LOG_CAP); seq of the next event is count+1
+    kind: [64]u8,
+    role: [64]u8,
+    reason: [64]u8,           // turn end reason, END_COMPLETED for non-end events
+    flags: [64]u8,
+    req: [64]u64,             // request id the event carries (user sends; 0 for none)
+    tlen: [64]u32,            // message length in bytes (<= MSG_CAP)
+    thash: [64]u64,           // FNV-1a (folded mod 2^32) of the message bytes
+    // live state, kept as the events are appended:
+    turn_open: bool,
+    last_req: u64,            // the last ACCEPTED send's request id (idempotency key)
+    last_role: u8,
+    last_len: u32,
+    last_hash: u64,
+}
+
+pub fn new_log() -> ChatLog {
+    return ChatLog {
+        count: 0,
+        kind: [0] ** 64,
+        role: [0] ** 64,
+        reason: [0] ** 64,
+        flags: [0] ** 64,
+        req: [0] ** 64,
+        tlen: [0] ** 64,
+        thash: [0] ** 64,
+        turn_open: false,
+        last_req: 0,
+        last_role: 0,
+        last_len: 0,
+        last_hash: 0,
+    };
+}
+
+/// FR-001: seq is contiguous and starts at 1; next_seq == count + 1 is the invariant.
+pub fn next_seq(count : u32) -> u32 {
+    return count + 1;
+}
+
+pub fn role_ok(r : u8) -> bool {
+    return r < ROLE_KINDS;
+}
+
+pub fn reason_ok(r : u8) -> bool {
+    return r < END_KINDS;
+}
+
+/// FNV-1a over the bytes; the language traps overflow, so fold mod 2^32 after every multiply
+/// (the same fold queen_live_graph.t27 uses).
+pub fn text_hash(text : []const u8) -> u64 {
+    var h : u64 = 2166136261;
+    var i : usize = 0;
+    while (i < text.len) {
+        h = ((h ^ @as(u64, text[i])) % 4294967296) * 16777619 % 4294967296;
+        i = i + 1;
+    }
+    return h % 4294967296;
+}
+
+/// The one append every event goes through: contiguity by construction, a full log is a named
+/// refusal (FR-008), and the live state advances with the record.
+fn add_event(log : *ChatLog, kind : u8, role : u8, reason : u8, flags : u8, req : u64,
+             tlen : u32, thash : u64) -> u8 {
+    if (log.count >= LOG_CAP) { return ERR_LOG_FULL; }
+    const i : u32 = log.count;
+    log.kind[i] = kind;
+    log.role[i] = role;
+    log.reason[i] = reason;
+    log.flags[i] = flags;
+    log.req[i] = req;
+    log.tlen[i] = tlen;
+    log.thash[i] = thash;
+    log.count = i + 1;
+    return OK;
+}
+
+/// The owner's line: turn/start when no turn is open, then the user message. A send whose request
+/// id equals the last accepted one appends 0 events and answers OK (FR-004, the double-send
+/// mitigation). The text is refused whole past MSG_CAP; the log stays byte-identical.
+pub fn send_user(log : *ChatLog, req : u64, text : []const u8) -> u8 {
+    if (@as(u32, @intCast(text.len)) > MSG_CAP) { return ERR_TOO_LONG; }
+    if (req == log.last_req and log.last_req != 0) { return OK; }
+    if (log.turn_open) { return ERR_TURN_OPEN; }
+    var r = add_event(log, EV_TURN_START, ROLE_SYSTEM, END_COMPLETED, 0, 0, 0, text_hash(""));
+    if (r != OK) { return r; }
+    r = add_event(log, EV_MESSAGE, ROLE_USER, END_COMPLETED, 0, req,
+                  @as(u32, @intCast(text.len)), text_hash(text));
+    if (r != OK) { return r; }
+    log.turn_open = true;
+    log.last_req = req;
+    log.last_role = ROLE_USER;
+    log.last_len = @as(u32, @intCast(text.len));
+    log.last_hash = text_hash(text);
+    return OK;
+}
+
+/// One assistant token delta of the open turn.
+pub fn stream_token(log : *ChatLog, delta : []const u8) -> u8 {
+    if (!log.turn_open) { return ERR_NO_TURN; }
+    if (@as(u32, @intCast(delta.len)) > MSG_CAP) { return ERR_TOO_LONG; }
+    const r = add_event(log, EV_TOKEN_DELTA, ROLE_ASSISTANT, END_COMPLETED, 0, 0,
+                        @as(u32, @intCast(delta.len)), text_hash(delta));
+    if (r != OK) { return r; }
+    log.last_role = ROLE_ASSISTANT;
+    log.last_len = @as(u32, @intCast(delta.len));
+    log.last_hash = text_hash(delta);
+    return r;
+}
+
+/// Close the open turn with a reason from the closed set; a reason outside it is refused.
+pub fn end_turn(log : *ChatLog, reason : u8) -> u8 {
+    if (!log.turn_open) { return ERR_NO_TURN; }
+    if (!reason_ok(reason)) { return ERR_BAD_REASON; }
+    var flags : u8 = 0;
+    // partial assistant text: a token delta is the last event before this end
+    if (reason == END_INTERRUPTED and log.count > 1 and log.kind[log.count - 1] == EV_TOKEN_DELTA) { flags = F_INTERRUPTED; }
+    const r = add_event(log, EV_TURN_END, ROLE_ASSISTANT, reason, flags, 0, log.last_len,
+                        log.last_hash);
+    if (r != OK) { return r; }
+    log.turn_open = false;
+    log.last_role = ROLE_ASSISTANT;
+    return OK;
+}
+
+/// A cancel of the open turn: turn/end carries interrupted and the partial text is kept with its
+/// interrupted flag set (the recorded tail still holds the delta events).
+pub fn cancel_turn(log : *ChatLog) -> u8 {
+    return end_turn(log, END_INTERRUPTED);
+}
+
+/// FR-005: replay of the recorded events rebuilds the live state (deterministic). The same fields
+/// the append path advances are re-derived here from the records alone, no live state read.
+pub struct ReplayState {
+    next_seq: u32,
+    turn_open: bool,
+    last_role: u8,
+    last_len: u32,
+    last_hash: u64,
+    last_req: u64,
+}
+
+pub fn replay_state(log : *ChatLog) -> ReplayState {
+    var s = ReplayState {
+        next_seq: 1,
+        turn_open: false,
+        last_role: 0,
+        last_len: 0,
+        last_hash: 0,
+        last_req: 0,
+    };
+    var i : u32 = 0;
+    while (i < log.count) {
+        s.next_seq = s.next_seq + 1;
+        if (log.kind[i] == EV_TURN_START) {
+            s.turn_open = true;
+        }
+        if (log.kind[i] == EV_MESSAGE) {
+            s.last_role = log.role[i];
+            s.last_len = log.tlen[i];
+            s.last_hash = log.thash[i];
+            s.last_req = log.req[i];
+        }
+        if (log.kind[i] == EV_TOKEN_DELTA) {
+            s.last_role = log.role[i];
+            s.last_len = log.tlen[i];
+            s.last_hash = log.thash[i];
+        }
+        if (log.kind[i] == EV_TURN_END) {
+            s.turn_open = false;
+            s.last_role = log.role[i];
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// The replayed state equals the live state?
+pub fn replay_matches(log : *ChatLog) -> bool {
+    const s = replay_state(log);
+    return s.next_seq == next_seq(log.count)
+        and s.turn_open == log.turn_open
+        and s.last_role == log.last_role
+        and s.last_len == log.last_len
+        and s.last_hash == log.last_hash
+        and s.last_req == log.last_req;
+}
+
+// ---- tests (at least 12, every public function hit) ----
+
+test "constants: closed sets of roles, end reasons and event kinds" {
+    assert ROLE_SYSTEM == 0 and ROLE_KINDS == 5;
+    assert ROLE_TOOL == ROLE_KINDS - 1;
+    assert END_COMPLETED == 0 and END_FORKED == END_KINDS - 1 and END_KINDS == 7;
+    assert EV_TURN_START == 0 and EV_TURN_END == EV_KINDS - 1;
+    assert MSG_CAP == 512 and LOG_CAP == 64;
+    assert OK == 0 and ERR_LOG_FULL != OK;
+}
+
+test "seq is contiguous and starts at one, the invariant holds after appends" {
+    assert next_seq(0) == 1;
+    assert next_seq(1) == 2;
+    var log = new_log();
+    const r = send_user(&log, 7, "hello");
+    assert r == OK;
+    assert log.count == 2;
+    assert log.kind[0] == EV_TURN_START and log.kind[1] == EV_MESSAGE;
+    assert next_seq(log.count - 1) == log.count;
+}
+
+test "roles outside the closed set are refused by the checker" {
+    assert role_ok(ROLE_SYSTEM) and role_ok(ROLE_TOOL);
+    assert !role_ok(ROLE_KINDS);
+    assert !role_ok(255);
+    assert reason_ok(END_COMPLETED) and reason_ok(END_FORKED);
+    assert !reason_ok(END_KINDS);
+}
+
+test "the first send opens the turn: turn/start at seq 1, user message at seq 2" {
+    var log = new_log();
+    assert send_user(&log, 100, "build the bench") == OK;
+    assert log.count == 2;
+    assert log.role[1] == ROLE_USER;
+    assert log.tlen[1] == 15;
+    assert log.thash[1] == text_hash("build the bench");
+    assert log.turn_open;
+    assert log.last_req == 100;
+}
+
+test "a second send with the same request id adds zero events and answers OK" {
+    var log = new_log();
+    assert send_user(&log, 5, "one line") == OK;
+    const before : u32 = log.count;
+    const bytes : u32 = log.tlen[1];
+    assert send_user(&log, 5, "one line") == OK;
+    assert log.count == before;
+    assert log.tlen[1] == bytes;
+    assert log.kind[before - 1] == EV_MESSAGE;
+    // a different id on the still-open turn is refused by name
+    assert send_user(&log, 6, "another line") == ERR_TURN_OPEN;
+    assert log.count == before;
+}
+
+test "a message past the cap is refused whole, the log byte-identical" {
+    var log = new_log();
+    const big : [513]u8 = [65] ** 513;
+    assert send_user(&log, 9, big[0..513]) == ERR_TOO_LONG;
+    assert log.count == 0;
+    assert log.turn_open == false;
+    assert next_seq(log.count) == 1;
+    // at the cap exactly, it lands
+    const fit : [512]u8 = [66] ** 512;
+    assert send_user(&log, 9, fit[0..512]) == OK;
+    assert log.tlen[1] == MSG_CAP;
+}
+
+test "token deltas ride the open turn; a delta with no turn is named" {
+    var log = new_log();
+    assert stream_token(&log, "pa") == ERR_NO_TURN;
+    assert send_user(&log, 3, "go") == OK;
+    assert stream_token(&log, "partial ") == OK;
+    assert stream_token(&log, "text") == OK;
+    assert log.count == 4;
+    assert log.role[2] == ROLE_ASSISTANT and log.role[3] == ROLE_ASSISTANT;
+    assert log.kind[2] == EV_TOKEN_DELTA and log.kind[3] == EV_TOKEN_DELTA;
+    assert log.tlen[3] == 4;
+    assert log.thash[3] == text_hash("text");
+    assert log.last_role == ROLE_ASSISTANT;
+}
+
+test "a turn ends with a reason from the closed set; a bad reason is refused" {
+    var log = new_log();
+    assert send_user(&log, 11, "q") == OK;
+    assert end_turn(&log, END_KINDS) == ERR_BAD_REASON;
+    assert log.turn_open;
+    assert end_turn(&log, END_COMPLETED) == OK;
+    assert !log.turn_open;
+    assert log.reason[log.count - 1] == END_COMPLETED;
+    // an end with no open turn is named, not silent
+    assert end_turn(&log, END_COMPLETED) == ERR_NO_TURN;
+}
+
+test "a cancel keeps the partial text with the interrupted flag set" {
+    var log = new_log();
+    assert send_user(&log, 12, "draw it") == OK;
+    assert stream_token(&log, "half a") == OK;
+    assert cancel_turn(&log) == OK;
+    const last : u32 = log.count - 1;
+    assert log.kind[last] == EV_TURN_END;
+    assert log.reason[last] == END_INTERRUPTED;
+    assert (log.flags[last] & F_INTERRUPTED) == F_INTERRUPTED;
+    // the partial text is kept: the tail records its length and hash
+    assert log.tlen[last] == 6;
+    assert log.thash[last] == text_hash("half a");
+    // no partial text, no flag
+    var log2 = new_log();
+    assert send_user(&log2, 13, "x") == OK;
+    assert cancel_turn(&log2) == OK;
+    assert (log2.flags[log2.count - 1] & F_INTERRUPTED) == 0;
+}
+
+test "a completed turn keeps no interrupted flag" {
+    var log = new_log();
+    assert send_user(&log, 14, "s") == OK;
+    assert stream_token(&log, "done") == OK;
+    assert end_turn(&log, END_MAX_TOKENS) == OK;
+    assert (log.flags[log.count - 1] & F_INTERRUPTED) == 0;
+    assert log.reason[log.count - 1] == END_MAX_TOKENS;
+}
+
+test "replay of a full turn rebuilds the live state, twice in a row" {
+    var log = new_log();
+    assert send_user(&log, 21, "replay me") == OK;
+    assert stream_token(&log, "a") == OK;
+    assert stream_token(&log, "b") == OK;
+    assert end_turn(&log, END_COMPLETED) == OK;
+    assert replay_matches(&log);
+    assert replay_matches(&log);
+    const s = replay_state(&log);
+    assert s.next_seq == next_seq(log.count);
+    assert s.turn_open == false;
+    assert s.last_req == 21;
+    assert s.last_hash == text_hash("b");
+}
+
+test "replay of an open interrupted turn matches the live state too" {
+    var log = new_log();
+    assert send_user(&log, 22, "still open") == OK;
+    assert stream_token(&log, "part") == OK;
+    assert replay_matches(&log);
+    assert replay_state(&log).turn_open;
+    assert replay_state(&log).last_len == 4;
+}
+
+test "a full log refuses the next append with the named error" {
+    var log = new_log();
+    var n : u32 = 0;
+    // whole turn cycles until the log is full; every append in a cycle is OK
+    while (n < 100 and log.count + 4 <= LOG_CAP) {
+        assert send_user(&log, 100 + n, "m") == OK;
+        assert stream_token(&log, "d") == OK;
+        assert end_turn(&log, END_COMPLETED) == OK;
+        n = n + 1;
+    }
+    assert log.count == LOG_CAP;
+    assert send_user(&log, 999, "one more") == ERR_LOG_FULL;
+    assert log.count == LOG_CAP;
+}
+
+test "the text hash separates texts and matches for equal texts" {
+    assert text_hash("") == 2166136261 % 4294967296;
+    assert text_hash("a") != text_hash("b");
+    assert text_hash("chat log") == text_hash("chat log");
+    assert text_hash("chat log") != text_hash("chat lag");
+}
