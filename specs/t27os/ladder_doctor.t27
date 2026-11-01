@@ -18,10 +18,21 @@
 //   6. RESOLUTION (FR-006): only a 200 from one turn-sized control request through the same path.
 //   7. FAIL CLOSED (FR-007): the walk goes forward once; a total refusal stays 503 with a body line that
 //      names every rung's class and the incident id.
-//   8. TIME (FR-010, FR-011): a response not complete within LD_DEADLINE_MS is SLOW, and a 200 after it counts
-//      as a failure for the breaker, not a success. One walk is bounded by LD_WALK_BUDGET_MS; when it is
+//   8. TIME (FR-010, FR-011): a response not complete within LD_DEADLINE_MS (30000) is SLOW; that is when it
+//      is named, not when it is cut. One walk is bounded by LD_WALK_BUDGET_MS (100000): a call may wait for
+//      all that the budget has left, an answer that completes inside it is served, and when the budget is
 //      spent the walk ends with the 503 body of 7. Measured cause: z.ai answered in 25-209 s against a 90 s
 //      glue timeout, so a Doctor that read statuses only would have called those turns healthy.
+//   9. A SLOW 200 IS STILL AN ANSWER (choice; the owner may overrule it). Its body is served: never dropped,
+//      never asked for again in the turn. For the breaker it is a strike (+1) and never a success (it does
+//      not reset the count), but strikes of this kind stop at CIRCUIT_FAILS - 1 = 2: slowness alone never
+//      opens a rung that still answers, since the rung-0 turns measured on 2026-11-01 (25-134 s, the only
+//      rung answering 200) would otherwise be skipped for CIRCUIT_COOLDOWN_S = 60 s. A missing answer (0 or
+//      5xx past the deadline, or a call cut by the budget) is SLOW too and counts like TRANSIENT, so it can
+//      open the breaker. Numbers: 40000 ms then 90000 ms, both 200 -> both served, strikes 1 then 2, rung
+//      still closed; one more strike with no answer -> 3, open. A 134000 ms answer is past the 100000 ms
+//      budget, so the walk cuts it at the budget and it is a missing answer, not a served one. The other
+//      choice, opening the rung on three slow 200s, is not taken; it would turn a working rung off.
 // The rung index is a plain u32 and the rung count a parameter, so this spec does not depend on the rung
 // table of ladder.t27 (which #13035 changes). Not here, on purpose: the node glue that feeds statuses in
 // and walks what this decides (regenerated from this spec, never edited by hand), a surface inside DSH, the
@@ -119,7 +130,8 @@ pub fn classify(status: u32, rung: u32, n: u32) -> u32 {
     return LC_UNKNOWN;
 }
 
-/// FR-010: the deadline for one rung's response to be complete, in ms. Chosen, not measured: below the 90 s
+/// FR-010: the time after which one rung's response is named SLOW, in ms. It is a threshold, not an abort:
+/// the glue keeps waiting while the walk budget lasts (walk_left_ms). Chosen, not measured: below the 90 s
 /// glue timeout and below the 25-209 s z.ai answers that were measured, so those turns are named SLOW instead
 /// of being called healthy. FR-011: the budget for the whole walk of one turn, in ms; it is larger than one
 /// deadline and under LD_WALK_CEILING_MS (120000, the ceiling the issue sets), so no turn waits 209 s for a
@@ -146,6 +158,16 @@ pub fn classify_timed(status: u32, rung: u32, n: u32, elapsed_ms: u64) -> u32 {
     }
     if (c == LC_TRANSIENT and is_slow(elapsed_ms)) { return LC_SLOW; }
     return c;
+}
+
+/// What happens to one response: a 200 is SERVED however long it took (its body reaches the caller; it is
+/// not dropped and not asked for again), anything else is a refusal and the recipe of section 2 decides.
+pub const LA_SERVE : u32 = 0;
+pub const LA_REFUSED : u32 = 1;
+
+pub fn response_action(status: u32) -> u32 {
+    if (status == 200) { return LA_SERVE; }
+    return LA_REFUSED;
 }
 
 /// A hard class says something no wait can change on its own.
@@ -234,8 +256,9 @@ pub fn breaker_state(fails: u32, opened: u64, now: u64) -> u32 {
 }
 
 /// Failures in a row after one more refusal. A hard class opens the breaker at once. TRANSIENT follows
-/// keys.t27's circuit_fails, and so does SLOW (FR-010: a late answer is a transport failure for the rung).
-/// RATE counts one. UNKNOWN changes nothing: it is not proof about the rung.
+/// keys.t27's circuit_fails, and so does SLOW without an answer (FR-010: a late or cut call is a transport
+/// failure for the rung); a SLOW 200 takes fails_after_slow_answer instead. RATE counts one. UNKNOWN changes
+/// nothing: it is not proof about the rung.
 pub fn fails_after(fails: u32, cls: u32) -> u32 {
     if (is_hard(cls)) {
         if (fails < LB_FAILS) { return LB_FAILS; }
@@ -267,12 +290,37 @@ pub fn breaker_ok(brk: []u64, rung: u32) -> u32 {
     return LB_CLOSED;
 }
 
-/// Record the outcome of one call on a rung from what the glue saw: the status and the ms the response took.
-/// A 200 after the deadline is a failure for the breaker, never a success (FR-010); only a 200 in time closes
-/// it. Returns the breaker state after.
+/// Strikes in a row after a SLOW 200: one more, but never past CIRCUIT_FAILS - 1, and a rung that was
+/// half-open comes back to that edge. A late answer is a strike and never a success (the count is not reset),
+/// yet slowness alone does not open a rung that still answers (header law 9).
+pub fn fails_after_slow_answer(fails: u32) -> u32 {
+    if (fails + 1 >= LB_FAILS) { return LB_FAILS - 1; }
+    return fails + 1;
+}
+
+/// Record a SLOW 200: the body is served, the rung takes a strike, and the breaker stays closed.
+pub fn breaker_slow_answer(brk: []u64, rung: u32) -> u32 {
+    if (rung >= LD_RUNGS_MAX) { return LB_CLOSED; }
+    const b : usize = @as(usize, rung) * BR_F;
+    brk[b + BR_FAILS] = @as(u64, fails_after_slow_answer(narrow(brk[b + BR_FAILS])));
+    brk[b + BR_PROBING] = 0;
+    return LB_CLOSED;
+}
+
+/// The strikes (failures in a row) of a rung, 0 past the table.
+pub fn breaker_fails(brk: []const u64, rung: u32) -> u32 {
+    if (rung >= LD_RUNGS_MAX) { return 0; }
+    return narrow(brk[@as(usize, rung) * BR_F + BR_FAILS]);
+}
+
+/// Record the outcome of one call on a rung from what the glue saw: the status and the ms the response took
+/// (for no answer, the ms until the glue gave up). A 200 after the deadline is a strike, never a success
+/// (FR-010); only a 200 in time closes the breaker. SLOW without an answer counts like TRANSIENT. Returns the
+/// breaker state after.
 pub fn breaker_record(brk: []u64, rung: u32, n: u32, status: u32, elapsed_ms: u64, now: u64) -> u32 {
     const cls : u32 = classify_timed(status, rung, n, elapsed_ms);
     if (cls == LC_OK) { return breaker_ok(brk, rung); }
+    if (cls == LC_SLOW and status == 200) { return breaker_slow_answer(brk, rung); }
     return breaker_fail(brk, rung, cls, now);
 }
 
@@ -533,12 +581,13 @@ pub fn walk_left_ms(spent_ms: u64) -> u32 {
     return LD_WALK_BUDGET_MS - narrow(spent_ms);
 }
 
-/// The timeout the glue gives the next call: the deadline, cut to what the walk budget has left, so the last
-/// call cannot run past the budget either. 0 means the budget is spent and no call is made.
-pub fn call_deadline_ms(spent_ms: u64) -> u32 {
-    const left : u32 = walk_left_ms(spent_ms);
-    if (left < LD_DEADLINE_MS) { return left; }
-    return LD_DEADLINE_MS;
+/// Did a call that took `took_ms` complete inside the walk budget? The glue's timeout for the next call is
+/// walk_left_ms(spent_ms), not the deadline: a response that completes inside the budget is served even if
+/// it is SLOW; one that does not is cut at the budget (no answer, so SLOW and a strike like TRANSIENT) and
+/// the walk ends. No call is made once the budget is spent, so then nothing completes inside it.
+pub fn within_budget(spent_ms: u64, took_ms: u64) -> bool {
+    const left : u64 = @as(u64, walk_left_ms(spent_ms));
+    return left > 0 and took_ms <= left;
 }
 
 /// walk_status with the time bound: 0 while a rung is left and budget remains; the 503 of FR-007 (its body
@@ -1073,36 +1122,115 @@ test a_response_past_the_deadline_is_slow_and_a_late_200_is_not_a_success {
     assert same_bytes(line[0..w], "ladder closed: 0=SLOW 1=TRANSIENT incident=4");
 }
 
-test a_late_200_counts_as_a_breaker_failure_like_transient_and_a_fast_200_closes_it {
+test a_late_200_is_a_strike_never_a_success_and_a_fast_200_closes_it {
     var brk : [24]u64 = undefined;
     const z : bool = cells_zero(brk[0..24], BR_CELLS);
     assert z;
     const dl : u64 = @as(u64, LD_DEADLINE_MS);
     assert fails_after(0, LC_SLOW) == fails_after(0, LC_TRANSIENT);
     assert fails_after(2, LC_SLOW) == CIRCUIT_FAILS;
+    assert fails_after_slow_answer(0) == 1;
+    assert fails_after_slow_answer(1) == 2;
+    assert fails_after_slow_answer(2) == 2;
+    assert fails_after_slow_answer(3) == 2;
+    assert fails_after_slow_answer(7) == 2;
+    var cap : u32 = CIRCUIT_FAILS - 1;
+    assert cap == 2;
     assert breaker_record(brk[0..24], 1, 3, 200, dl + 1, 100) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 1) == 1;
     assert breaker_record(brk[0..24], 1, 3, 200, dl + 1, 101) == LB_CLOSED;
-    assert breaker_record(brk[0..24], 1, 3, 200, dl + 1, 102) == LB_OPEN;
+    assert breaker_fails(brk[0..24], 1) == 2;
+    assert breaker_record(brk[0..24], 1, 3, 200, dl + 1, 102) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 1) == 2;
     var g : u32 = take_gate(brk[0..24], 1, 3, 103);
+    assert g == LG_PASS;
+    assert breaker_record(brk[0..24], 1, 3, 0, dl + 1, 104) == LB_OPEN;
+    g = take_gate(brk[0..24], 1, 3, 105);
     assert g == LG_SKIP;
-    const cool : u64 = 102 + CIRCUIT_COOLDOWN_S;
+    const cool : u64 = 104 + CIRCUIT_COOLDOWN_S;
     g = take_gate(brk[0..24], 1, 3, cool);
     assert g == LG_PROBE;
     assert breaker_record(brk[0..24], 1, 3, 200, 900, cool + 1) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 1) == 0;
     g = take_gate(brk[0..24], 1, 3, cool + 2);
     assert g == LG_PASS;
     assert breaker_record(brk[0..24], 2, 3, 200, dl + 1, 200) == LB_CLOSED;
     assert breaker_record(brk[0..24], 2, 3, 200, dl + 1, 201) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 2) == 2;
     assert breaker_record(brk[0..24], 2, 3, 200, 10, 202) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 2) == 0;
     assert breaker_record(brk[0..24], 2, 3, 200, dl + 1, 203) == LB_CLOSED;
-    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 10) == LB_CLOSED;
-    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 11) == LB_CLOSED;
-    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 12) == LB_OPEN;
+    assert breaker_fails(brk[0..24], 2) == 1;
+    assert breaker_record(brk[0..24], 0, 3, 0, dl + 1, 10) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 0, 3, 503, dl + 1, 11) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 0, 3, 0, dl + 1, 12) == LB_OPEN;
     g = take_gate(brk[0..24], 0, 3, 12 + CIRCUIT_COOLDOWN_S);
     assert g == LG_PROBE;
-    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 13 + CIRCUIT_COOLDOWN_S) == LB_OPEN;
+    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 13 + CIRCUIT_COOLDOWN_S) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 0) == 2;
     g = take_gate(brk[0..24], 0, 3, 14 + CIRCUIT_COOLDOWN_S);
+    assert g == LG_PASS;
+    assert breaker_fails(brk[0..24], LD_RUNGS_MAX) == 0;
+}
+
+test a_200_past_the_deadline_is_served_once_and_never_retried_or_dropped {
+    var brk : [24]u64 = undefined;
+    const z : bool = cells_zero(brk[0..24], BR_CELLS);
+    assert z;
+    assert classify_timed(200, 0, 3, 31000) == LC_SLOW;
+    assert response_action(200) == LA_SERVE;
+    assert response_action(0) == LA_REFUSED;
+    assert response_action(402) == LA_REFUSED;
+    assert response_action(429) == LA_REFUSED;
+    assert response_action(503) == LA_REFUSED;
+    var t : u32 = 0;
+    while (t < 5) {
+        assert may_retry(LC_SLOW, t, 0, LB_CLOSED) == false;
+        t = t + 1;
+    }
+    assert within_budget(0, 31000);
+    assert breaker_record(brk[0..24], 0, 3, 200, 31000, 100) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 0) == 1;
+    var g : u32 = take_gate(brk[0..24], 0, 3, 101);
+    assert g == LG_PASS;
+    assert classify_timed(200, 0, 3, 30000) == LC_OK;
+    assert breaker_record(brk[0..24], 0, 3, 200, 30000, 102) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 0) == 0;
+}
+
+test the_measured_rung_0_sequence_is_served_and_only_a_missing_answer_opens_the_breaker {
+    var brk : [24]u64 = undefined;
+    const z : bool = cells_zero(brk[0..24], BR_CELLS);
+    assert z;
+    var b64 : u64 = @as(u64, LD_WALK_BUDGET_MS);
+    assert within_budget(0, 40000);
+    assert within_budget(0, 90000);
+    assert within_budget(0, 134000) == false;
+    assert breaker_record(brk[0..24], 0, 3, 200, 40000, 100) == LB_CLOSED;
+    assert response_action(200) == LA_SERVE;
+    assert breaker_fails(brk[0..24], 0) == 1;
+    assert breaker_record(brk[0..24], 0, 3, 200, 90000, 200) == LB_CLOSED;
+    assert response_action(200) == LA_SERVE;
+    assert breaker_fails(brk[0..24], 0) == 2;
+    var g : u32 = take_gate(brk[0..24], 0, 3, 201);
+    assert g == LG_PASS;
+    assert breaker_record(brk[0..24], 0, 3, 200, 99000, 300) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 0, 3, 200, 90000, 400) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 0) == 2;
+    g = take_gate(brk[0..24], 0, 3, 401);
+    assert g == LG_PASS;
+    assert classify_timed(0, 0, 3, b64) == LC_SLOW;
+    assert response_action(0) == LA_REFUSED;
+    assert breaker_record(brk[0..24], 0, 3, 0, b64, 500) == LB_OPEN;
+    g = take_gate(brk[0..24], 0, 3, 501);
     assert g == LG_SKIP;
+    const cool : u64 = 500 + CIRCUIT_COOLDOWN_S;
+    g = take_gate(brk[0..24], 0, 3, cool);
+    assert g == LG_PROBE;
+    assert breaker_record(brk[0..24], 0, 3, 200, 90000, cool + 1) == LB_CLOSED;
+    assert breaker_fails(brk[0..24], 0) == 2;
+    g = take_gate(brk[0..24], 0, 3, cool + 2);
+    assert g == LG_PASS;
 }
 
 test a_slow_rung_is_walked_past_once_never_repeated_in_one_turn_and_has_its_own_incident {
@@ -1152,23 +1280,30 @@ test the_walk_budget_is_larger_than_one_deadline_and_smaller_than_120000 {
     assert bs * 1000 + dl <= bu;
     const b64 : u64 = @as(u64, LD_WALK_BUDGET_MS);
     const d64 : u64 = @as(u64, LD_DEADLINE_MS);
-    assert call_deadline_ms(0) == LD_DEADLINE_MS;
-    assert call_deadline_ms(b64 - d64) == LD_DEADLINE_MS;
-    assert call_deadline_ms(b64 - d64 + 1) == LD_DEADLINE_MS - 1;
-    assert call_deadline_ms(b64 - 1) == 1;
-    assert call_deadline_ms(b64) == 0;
-    assert call_deadline_ms(b64 + 109000) == 0;
     assert walk_left_ms(0) == LD_WALK_BUDGET_MS;
+    assert walk_left_ms(b64 - d64) == LD_DEADLINE_MS;
+    assert walk_left_ms(b64 - 1) == 1;
     assert walk_left_ms(b64) == 0;
+    assert walk_left_ms(b64 + 109000) == 0;
+    assert within_budget(0, b64);
+    assert within_budget(0, b64 + 1) == false;
+    assert within_budget(0, 134000) == false;
+    assert within_budget(b64 - d64, d64);
+    assert within_budget(b64 - d64, d64 + 1) == false;
+    assert within_budget(b64, 0) == false;
+    assert within_budget(b64 + 1, 1) == false;
     var spent : u64 = 0;
     var calls : u32 = 0;
-    while (walk_left_ms(spent) > 0 and calls < LD_RUNGS_MAX) {
-        spent = spent + @as(u64, call_deadline_ms(spent));
+    while (within_budget(spent, 31000) and calls < LD_RUNGS_MAX) {
+        spent = spent + 31000;
         calls = calls + 1;
     }
+    assert calls == 3;
+    assert spent == 93000;
     assert spent <= b64;
     assert spent > d64;
     assert spent < @as(u64, worst);
+    assert walk_left_ms(spent) == 7000;
 }
 
 test a_spent_walk_budget_ends_the_walk_with_the_503_body_even_with_a_rung_untried {
