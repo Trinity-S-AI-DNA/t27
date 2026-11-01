@@ -1,0 +1,346 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/actor_semantics.t27 -- what each actor-event kind REALLY means, and what may be read
+; from an envelope. One home for the semantics law (owner directive, actor graph fullscreen, §2-3).
+; Every row here is pinned from the sources, not invented:
+; - spawn/deliver/delivers/down/restart/exit: actors.t27 (the runtime: mailboxes, supervisors,
+;   generations, exit reasons) and events.t27 ACTOR_STREAM (the kinds).
+; - deliver vs delivers and the envelope fields: actor_events.t27 (what is written and thinned,
+;   gHashTag/trios#1744) and actor_view.t27 (what the view reads, #8615).
+; - result/accepted/rework/cancel: task_tree.t27 (the return protocol, task-7).
+; Laws pinned here that the sources imply but no card said out loud:
+; - deliver is a MAILBOX QUEUE event (depth + dropped verdict), never handler execution: the runtime
+;   deliver() returns D_QUEUED/D_DROPPED_DEAD/D_DROPPED_FULL and knows nothing of what the receiver
+;   does with the message afterwards (actors.t27 section 2).
+; - delivers is a per-(from,to)-window COUNT (count, dropped, max_depth, first_seq, last_seq), not an
+;   operation anyone performed (actor_events.t27 section 3).
+; - t (at_ms) is the logical time of the SOURCE: rows of one stream are non-decreasing in at_ms
+;   (actor_events.t27 REPLAY_AT_MS precedent; the feed draws lanes from that order).
+; - the owner-provided replay sequence (actor_view.t27 TE_*) is a named FIXTURE input: it may prove
+;   transformation and drawing laws, and must never be published or claimed as live traffic.
+; - no invented senders: an event with no from_pid (NO_PID) is a NODE-event on the receiver with an
+;   incomplete-data mark; it is never an edge. An edge needs both ends, named.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenActorSemantics;
+
+use queen::actors::NO_PID;
+use queen::actors::pid_of;
+use queen::actors::slot_of;
+use queen::actors::gen_of;
+use queen::actors::next_gen;
+use queen::actors::X_NONE;
+use queen::actors::X_NORMAL;
+use queen::actors::X_SHUTDOWN;
+use queen::actors::M_TASK_OFFER;
+use queen::actors::M_RESULT;
+use queen::events::EV_ACTOR_SPAWN;
+use queen::events::EV_ACTOR_RESTART;
+use queen::events::EV_ACTOR_EXIT;
+use queen::events::EV_ACTOR_DOWN;
+use queen::events::EV_ACTOR_DELIVER;
+use queen::events::EV_ACTOR_DELIVERS;
+use queen::events::EV_RESULT;
+use queen::events::EV_ACCEPTED;
+use queen::events::EV_REWORK;
+use queen::events::EV_CANCEL;
+use queen::events::ACTOR_KINDS;
+use queen::actor_events::RC_NORMAL;
+use queen::actor_events::RC_SHUTDOWN;
+use queen::actor_events::RC_CRASH;
+
+; --- 1. Per-kind semantics --------------------------------------------------------------------------
+
+/// spawn: a supervisor created a process. parent_pid names WHO created (the root's spawn has NO_PID
+/// as parent and is the one lawful NO_PID-parent event); to_pid is the NEW identity at its first
+/// generation; the child starts in its initial state (actor_view draws it running from the row).
+pub fn sem_spawn_ok(parent_pid: u64, child_pid: u64) -> bool {
+    if (child_pid == NO_PID) { return false; }
+    if (parent_pid == NO_PID) { return slot_of(child_pid) == 1; }
+    return true;
+}
+
+/// deliver: the message reached (or was refused by) the receiver's mailbox. `queued` is the
+/// runtime's verdict (D_QUEUED), `handled` would mean the receiver ran a handler -- which this
+/// event never says. The law: a deliver row is a queue event even when handled is unknown.
+pub fn sem_deliver_is_queue(queued: bool, handled_known: bool) -> bool {
+    if (queued == false) { return true; }
+    return handled_known == false;
+}
+
+/// delivers: an aggregated COUNT over one (from, to) pair window. Valid counts: at least one
+/// message, never more than the seq span it names, dropped never above count (actor_events.t27
+/// section 3 invariants, restated here as the semantics, not recomputed).
+pub fn sem_delivers_count_ok(count: u32, dropped: u32, first_seq: u32, last_seq: u32) -> bool {
+    if (count == 0) { return false; }
+    if (dropped > count) { return false; }
+    return count <= last_seq - first_seq + 1;
+}
+
+/// down: an OBSERVER (a supervisor or monitor) reports a process gone. from_pid is who observed,
+/// to_pid who died, and the reason must be a real reason (X_NONE names nothing).
+pub fn sem_down_ok(observer_pid: u64, gone_pid: u64, reason: u8) -> bool {
+    return observer_pid != NO_PID and gone_pid != NO_PID and reason != X_NONE;
+}
+
+/// restart: the supervisor started a new incarnation of the same logical actor: same slot, next
+/// generation. Identity is preserved (the slot and its role), the incarnation is distinguishable
+/// (the generation in the pid), and nothing the previous incarnation produced is inherited: a
+/// message addressed to the old pid reaches nobody (actors.t27, next_gen).
+pub fn sem_restart_ok(old_pid: u64, new_pid: u64) -> bool {
+    return slot_of(old_pid) == slot_of(new_pid) and gen_of(new_pid) == next_gen(gen_of(old_pid));
+}
+
+/// The no-inheritance law, positively stated: a result (or any state) of generation g belongs to g
+/// and is never carried into g+1. A restart row therefore transfers nothing, whatever the old
+/// incarnation had finished.
+pub fn sem_inherits_results(prev_gen: u64, new_gen: u64) -> bool {
+    return prev_gen == new_gen;
+}
+
+/// exit: the process itself ended. Three classes, actor_events.t27 reason_class: normal (X_NORMAL),
+/// requested (X_SHUTDOWN: a stop, a give-up, an auto-shutdown), error (everything else).
+pub const SEC_NORMAL : u8 = 0;
+pub const SEC_REQUESTED : u8 = 1;
+pub const SEC_ERROR : u8 = 2;
+
+pub fn sem_exit_class(reason: u8) -> u8 {
+    if (reason == X_NORMAL) { return SEC_NORMAL; }
+    if (reason == X_SHUTDOWN) { return SEC_REQUESTED; }
+    return SEC_ERROR;
+}
+
+/// t: at_ms is the logical time of the source. Within one stream it never goes backwards; a row
+/// older than the one before it is a broken feed, not a late event.
+pub fn sem_time_ok(prev_at_ms: u64, at_ms: u64) -> bool {
+    return at_ms >= prev_at_ms;
+}
+
+; --- 2. Edges, node-events, and no invented senders --------------------------------------------------
+
+/// An event is an EDGE only when both ends are named and distinct. Anything else drawn as an arrow
+/// would invent a sender or a receiver.
+pub fn sem_edge_ok(from_pid: u64, to_pid: u64) -> bool {
+    return from_pid != NO_PID and to_pid != NO_PID and from_pid != to_pid;
+}
+
+/// An event with no sender is a NODE-event on its receiver: it carries information about that one
+/// process (it went down, it was restarted by its supervisor as recorded elsewhere) and must be
+/// rendered with an incomplete-data mark, never as an arrow.
+pub fn sem_is_node_event(from_pid: u64) -> bool {
+    return from_pid == NO_PID;
+}
+
+/// The one lawful sender-less kind family: a root spawn (the tree grew its first process) and a
+/// down observed from outside every table. Everything else with NO_PID from is incomplete data.
+pub const INC_NONE : u8 = 0;
+pub const INC_NO_SENDER : u8 = 1;
+pub const INC_NO_RECEIVER : u8 = 2;
+pub const INC_SELF_EDGE : u8 = 3;
+
+pub fn sem_incomplete_mark(from_pid: u64, to_pid: u64) -> u8 {
+    if (from_pid != NO_PID and to_pid == NO_PID) { return INC_NO_RECEIVER; }
+    if (from_pid != NO_PID and to_pid == from_pid) { return INC_SELF_EDGE; }
+    if (from_pid == NO_PID) { return INC_NO_SENDER; }
+    return INC_NONE;
+}
+
+; --- 3. Envelope: event id, msg id, correlation ------------------------------------------------------
+
+/// Event id: the stream's own gapless number IS the event id. One home (events.t27 next_seq), no
+/// second counter. The envelope already carries it as seq; this names the law, not a new field.
+pub fn sem_event_id(stream_seq: u64) -> u64 {
+    return stream_seq;
+}
+
+/// Msg id: the runtime's per-message number IS the msg id (actor_events.t27 first_seq/last_seq/
+/// msg_seq). A counted delivers row names a span, not one id, so it has none.
+pub fn sem_msg_id_of_deliver(msg_seq: u32) -> u32 {
+    return msg_seq;
+}
+
+/// Correlation: a deliver that ANSWERS a request names the msg id it answers (the offer it
+/// consumes, M_TASK_OFFER, or the result it answers, M_RESULT). Lawful correlation: a real earlier
+/// message of the same runtime (0 < reply_to < msg_seq). 0 = uncorrelated, which an offer itself
+/// always is: the first message of a task answers nothing.
+pub fn sem_correlation_ok(msg_seq: u32, reply_to: u32) -> bool {
+    if (reply_to == 0) { return true; }
+    return reply_to < msg_seq;
+}
+
+/// Whether a message tag can be a correlation target at all: offers and results are requests or
+/// answers; a heartbeat-due is not something a later message answers.
+pub fn sem_reply_to_kind(tag: u64) -> bool {
+    return tag == M_TASK_OFFER or tag == M_RESULT;
+}
+
+; --- 4. Fixture vs live (truth law) ------------------------------------------------------------------
+
+/// Truth of an input sequence. FIXTURE: a named, hand-written or replayed test input (actor_view
+/// TE_*, actor_events REPLAY_*). LIVE: rows the runtime published on the bus. The two never mix in
+/// one claim: a fixture proves a transformation or a drawing law, never that work happened.
+pub const TRUTH_FIXTURE : u8 = 0;
+pub const TRUTH_LIVE : u8 = 1;
+
+/// The owner-provided replay sequence, pinned by name. It stays a fixture whoever reads it.
+pub const FIXTURE_TE_REPLAY : str = "actor_view.t27 TE_* replay";
+
+/// A fixture may never be published as live evidence.
+pub fn sem_publishable(truth: u8) -> bool {
+    return truth == TRUTH_LIVE;
+}
+
+/// A claim needs live truth; a law test may use a fixture.
+pub fn sem_claim_ok(truth: u8) -> bool {
+    return truth == TRUTH_LIVE;
+}
+
+; --- 5. Return kinds carry the attempt (task-7 tie) ---------------------------------------------------
+
+/// The four return-protocol kinds name an attempt (task_tree.t27 tt_attempt_id); the six original
+/// kinds do not (a spawn predates any attempt of a child task). The envelope carries it as
+/// attempt_id; 0 = the kind names none.
+pub fn sem_has_attempt(kind: u8) -> bool {
+    return kind == EV_RESULT or kind == EV_ACCEPTED or kind == EV_REWORK or kind == EV_CANCEL;
+}
+
+test spawn_names_its_creator {
+    // a root spawn has no parent and must be slot 1 (the tree's first process)
+    assert sem_spawn_ok(NO_PID, pid_of(1, 1)) == true;
+    assert sem_spawn_ok(NO_PID, pid_of(2, 1)) == false;
+    // every other spawn names a real creator and a real child
+    assert sem_spawn_ok(pid_of(1, 1), pid_of(2, 1)) == true;
+    assert sem_spawn_ok(pid_of(1, 1), NO_PID) == false;
+}
+
+test deliver_is_a_queue_event_not_an_execution {
+    // queued: the row says the mailbox took it; whether a handler ran is not part of the row
+    assert sem_deliver_is_queue(true, false) == true;
+    // refused (dead receiver or full mailbox): still a queue event, about the queue
+    assert sem_deliver_is_queue(false, false) == true;
+    // a row claiming queue-plus-handled would say more than deliver() knows
+    assert sem_deliver_is_queue(true, true) == false;
+}
+
+test delivers_is_a_window_count {
+    assert sem_delivers_count_ok(2, 0, 5, 6) == true;
+    assert sem_delivers_count_ok(2, 1, 5, 6) == true;
+    assert sem_delivers_count_ok(1, 1, 7, 7) == true;
+    assert sem_delivers_count_ok(0, 0, 5, 6) == false;
+    assert sem_delivers_count_ok(3, 0, 5, 6) == false;
+    assert sem_delivers_count_ok(2, 3, 5, 6) == false;
+}
+
+test down_names_observer_gone_and_reason {
+    assert sem_down_ok(pid_of(1, 1), pid_of(4, 2), 4) == true;
+    // no observer, or no gone pid, or no reason: not a down row
+    assert sem_down_ok(NO_PID, pid_of(4, 2), 4) == false;
+    assert sem_down_ok(pid_of(1, 1), NO_PID, 4) == false;
+    assert sem_down_ok(pid_of(1, 1), pid_of(4, 2), X_NONE) == false;
+}
+
+test restart_keeps_identity_and_changes_incarnation {
+    let old : u64 = pid_of(4, 2);
+    let new : u64 = pid_of(4, 3);
+    assert sem_restart_ok(old, new) == true;
+    // a different slot is a different actor, not a restart of this one
+    assert sem_restart_ok(old, pid_of(5, 3)) == false;
+    // the same generation is the same incarnation, not a restart
+    assert sem_restart_ok(old, pid_of(4, 2)) == false;
+    // a skipped generation is not the lawful next incarnation
+    assert sem_restart_ok(old, pid_of(4, 5)) == false;
+}
+
+test a_new_incarnation_inherits_nothing {
+    // the law, stated positively: inheritance requires the SAME generation
+    assert sem_inherits_results(2, 3) == false;
+    assert sem_inherits_results(2, 2) == true;
+    // so a lawful restart row transfers no result
+    let prev : u64 = gen_of(pid_of(4, 2));
+    assert sem_inherits_results(prev, next_gen(prev)) == false;
+}
+
+test exit_has_three_classes {
+    assert sem_exit_class(X_NORMAL) == SEC_NORMAL;
+    assert sem_exit_class(X_SHUTDOWN) == SEC_REQUESTED;
+    // every other reason (a kill, a crash, a lost node) is the error class
+    assert sem_exit_class(4) == SEC_ERROR;
+    assert sem_exit_class(99) == SEC_ERROR;
+}
+
+test the_source_time_never_runs_backwards {
+    assert sem_time_ok(1000, 1000) == true;
+    assert sem_time_ok(1000, 2000) == true;
+    assert sem_time_ok(2000, 1000) == false;
+}
+
+test an_edge_needs_both_ends_named {
+    assert sem_edge_ok(pid_of(1, 1), pid_of(2, 1)) == true;
+    assert sem_edge_ok(NO_PID, pid_of(2, 1)) == false;
+    assert sem_edge_ok(pid_of(1, 1), NO_PID) == false;
+    // a self-edge invents a conversation with oneself
+    assert sem_edge_ok(pid_of(2, 1), pid_of(2, 1)) == false;
+}
+
+test a_senderless_event_is_a_marked_node_event {
+    assert sem_is_node_event(NO_PID) == true;
+    assert sem_is_node_event(pid_of(2, 1)) == false;
+    // the mark names exactly what is missing; nothing is guessed
+    assert sem_incomplete_mark(NO_PID, pid_of(2, 1)) == INC_NO_SENDER;
+    assert sem_incomplete_mark(pid_of(2, 1), NO_PID) == INC_NO_RECEIVER;
+    assert sem_incomplete_mark(pid_of(2, 1), pid_of(2, 1)) == INC_SELF_EDGE;
+    assert sem_incomplete_mark(pid_of(2, 1), pid_of(3, 1)) == INC_NONE;
+}
+
+test the_event_id_is_the_stream_number {
+    assert sem_event_id(1) == 1;
+    assert sem_event_id(41) == 41;
+}
+
+test the_msg_id_is_the_runtime_message_number {
+    assert sem_msg_id_of_deliver(1) == 1;
+    assert sem_msg_id_of_deliver(17) == 17;
+}
+
+test correlation_names_an_earlier_message {
+    // a deliver answering the offer it consumed
+    assert sem_correlation_ok(8, 5) == true;
+    // 0 = uncorrelated (the offer itself answers nothing)
+    assert sem_correlation_ok(5, 0) == true;
+    // a forward or self reference names nothing real
+    assert sem_correlation_ok(5, 5) == false;
+    assert sem_correlation_ok(5, 6) == false;
+}
+
+test only_requests_and_answers_are_correlation_targets {
+    assert sem_reply_to_kind(M_TASK_OFFER) == true;
+    assert sem_reply_to_kind(M_RESULT) == true;
+    assert sem_reply_to_kind(3) == false;
+}
+
+test the_replay_fixture_is_never_live {
+    // the pinned fixture exists by name and is a fixture
+    assert FIXTURE_TE_REPLAY == "actor_view.t27 TE_* replay";
+    assert sem_publishable(TRUTH_FIXTURE) == false;
+    assert sem_claim_ok(TRUTH_FIXTURE) == false;
+    // live rows are the only publishable, claimable truth
+    assert sem_publishable(TRUTH_LIVE) == true;
+    assert sem_claim_ok(TRUTH_LIVE) == true;
+}
+
+test the_return_kinds_carry_the_attempt {
+    assert sem_has_attempt(EV_RESULT) == true;
+    assert sem_has_attempt(EV_ACCEPTED) == true;
+    assert sem_has_attempt(EV_REWORK) == true;
+    assert sem_has_attempt(EV_CANCEL) == true;
+    assert sem_has_attempt(EV_ACTOR_SPAWN) == false;
+    assert sem_has_attempt(EV_ACTOR_DELIVER) == false;
+    assert sem_has_attempt(EV_ACTOR_DELIVERS) == false;
+    assert sem_has_attempt(ACTOR_KINDS) == false;
+}
+
+invariant the_law_pins_one_class_per_exit {
+    assert SEC_NORMAL == RC_NORMAL and SEC_REQUESTED == RC_SHUTDOWN and SEC_ERROR == RC_CRASH;
+    assert ACTOR_KINDS == 10;
+    assert FIXTURE_TE_REPLAY.len > 0;
+}
