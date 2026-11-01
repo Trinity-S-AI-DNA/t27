@@ -102,6 +102,18 @@ DSH defects the owner met and the docs do not name: a double send, an unsent pas
 scrollback shown as current. Each gets a named test in #13069 (idempotent send) and #13071
 (draft survives reopen; resume from cursor yields no old frames as new).
 
+DSH defect measured on 2026-11-01, not named in its docs: DSH Web leaves
+`dsh-workspace-changes-*` snapshot trees in the user's temp folder and does not remove them.
+Ten trees held 34 GiB (oldest 2026-10-31 21:25, newest 2026-11-01 22:46 local), no process
+held a file in them (`lsof` count 0), and the disk reached 0 bytes free, so the app failed
+with ENOSPC. Source: `du`, `ls`, `lsof`; confidence high for size and age, unknown for what
+triggers a snapshot. T27 OS requirement: never copy the workspace per turn; a turn's change
+set is a TriGit virtual branch (refs and diffs) that is reclaimed when the turn is accepted
+or abandoned. Not filed as an issue yet (economy); it belongs to the TriGit change-set work.
+The trees grow while DSH runs: three were rewritten at 22:57, and free space fell from 1.2 GiB
+at 22:53 to 116 MB at 22:58. Each tree holds `captures` and `objects` folders, and the writer
+keeps no file open between writes, so `lsof` cannot name it.
+
 ## 4. Prioritised migration backlog, with executors
 
 Executor rule (`specs/claw/model_route.t27`, TIER_PANE; owner 2026-10-20): a sub-task starts in
@@ -112,7 +124,7 @@ thread = one issue), picked up by a DSH thread or the Queen when DSH boots again
 
 | Wave | Spec (Boundary) | Issue | What it gives | Executor | State 2026-11-01 |
 |---|---|---|---|---|---|
-| A1 | `specs/t27os/chat_log.t27` | #13069 | durable conversation event log: session id, contiguous seq, 5 roles, turn end reasons, idempotent send, cancel, replay | pane 13 (Claude Code, free tier, this worktree), brief `target/BRIEF-chat-log.md` | brief sent; gate = `t27c check` + `t27c test-report` FAIL 0, pane runs it; result not yet read |
+| A1 | `specs/t27os/chat_log.t27` | #13069 | durable conversation event log: session id, contiguous seq, 5 roles, turn end reasons, idempotent send, cancel, replay | pane 13 (Claude Code on glm-4.5-flash, free tier, this worktree); its brief and report sat in the gitignored scratch folder, which a process the cache-cleaner log does not name removed at 22:49, so round 2 went as a self-contained message | draft untracked, not committed; gate FAIL in rounds 1 and 2 (section 6); round 2 sent 22:56, attempts 2 of 3; the pane's own report claimed 327 lines, 19 tests and "implemented" while the file had 696 lines and 16 tests and no gate had run, so that report is not evidence |
 | A2 | `specs/t27os/tool_call.t27` | #13070 | tool call and structured result; read-only allowlist of real tri / MCP verbs; ALLOW / REFUSE / HOLD | pane or DSH thread | filed |
 | A3 | `specs/t27os/chat_history.t27` | #13071 | lossless record line, resume from cursor, snapshot, draft survives reopen, bad line counted | pane or DSH thread, after A1 | filed |
 | B1 | `specs/t27os/delegation.t27` | #13072 | subtask with stable child id, attempts, durable parent mailbox, accept / rework / abandon | pane or DSH thread, after A1 | filed |
@@ -186,7 +198,8 @@ Checks that actually ran for this package, and on what:
 |---|---|---|
 | issue-shape gate on #13069 .. #13074 | GitHub workflow `needs-boundary.yml` | read back with `gh issue view --json state,labels` after filing; see the commit message footer for the states at commit time |
 | home paths in the package | `grep -c` for the absolute home prefix on the three data files | 0, 0, 0 |
-| `t27c check` + `t27c test-report` on `chat_log.t27` | pane 13 on this Mac, single spec, as the brief orders | pending; the pane's report is `target/REPORT-chat-log.md`; the diff is reviewed before any commit of the spec |
+| `t27c check` + `t27c test-report` on `chat_log.t27` | shell cell 12 on this Mac (single spec, output to a file), because the hook refuses `t27c` inside the Claude Code pane | `t27c check` rc 1 twice: parse error 4:1 (a line holding only `;`), then, on a copy with those lines filled, 141:10 (`let`; the draft has 70 such lines in a Rust-like dialect); `t27c test-report`: pending / blocked by disk (about 1.1 GiB free, the gate wants 4) and by the pane hook, whose remedy names a lab script that no longer exists; attempts 2 |
+| disk use, read-only | `df`, `du`, `lsof` in the owner's terminal | 34 GiB in ten DSH snapshot trees (section 3), Docker data 31 GiB, Claude app data 25 GiB; free space 0, then 1.0, then 1.2 GiB after the owner's cache cleaner ran, then 116 MB at 22:58 while DSH rewrote three trees; nothing removed by this session |
 | any compiler sweep, seal re-save, build | none | not run (owner rule); seal and MCP columns are earlier ledgers |
 
 Not verified in this round: the trinity and t27os clone SHAs; whether the 2543 sealed files
@@ -201,3 +214,4 @@ still pass on today's `t27c`; every "medium" row of the DSH table (prose only, n
 | owner | a post-#13016 `T27OS.app` build and launch receipt (#13074): MAC_HEAVY_OK on this Mac, or a lab machine | one `make t27os` plus a 10-minute launch | compiler-level verification only until then | A1 .. B2 land as pure specs |
 | owner | priority labels on #13069 .. #13074 | `P1` on A1 .. A3 would make the Queen pick them first | unlabelled (picked last) | - |
 | owner | push of this package from a fresh branch off `7fb6bc2391` and a PR | one branch, one PR, no code | local commit only | the package is readable in this worktree |
+| owner | 34 GiB of DSH `dsh-workspace-changes-*` trees in the user's temp folder; no process holds them | (a) the owner removes them (command in the chat report), (b) the owner's cache cleaner learns the pattern with an age limit, (c) leave them | (c): this session deletes nothing; due now, the disk refills at about 1 GiB per 5 minutes | the cache cleaner cannot keep up (116 MB free at 22:58); every gate and most commands stay blocked |
