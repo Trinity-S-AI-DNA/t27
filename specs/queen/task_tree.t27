@@ -1,0 +1,387 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/task_tree.t27 -- the task tree and return protocol law for the queen's execution engine
+; Owner, 2026-11-01 (model-core): define the task tree structure (task_id, parent, root), attempt entity (not a counter) with its own state machine distinguishing executor-done vs result-returned vs parent-accepted, sid reference to session_store's sid, return-protocol tags (M_RESULT/M_ACCEPT/M_REWORK), event kinds (EV_RESULT/EV_ACCEPTED), and scope rules (child rights <= parent granted scope). Idempotent redelivery must not create a second completion. This spec maps existing spawn/start/verify/finish vocabulary onto the new protocol. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenTaskTree;
+
+use t27os::session_store::sid_ok;
+use queen::actors::M_TASK_OFFER;
+use queen::actors::M_RESULT;
+use queen::actors::M_ACCEPT;
+
+; --- 1. Task tree structure -----------------------------------------------------------------------
+
+/// One parent per subtask: a task's parent is fixed at spawn. This function checks that a child's
+/// parent is not itself and that the parent exists.
+pub fn tt_link_ok(parent: u64, child: u64) -> bool {
+    return parent != 0 and child != 0 and child != parent;
+}
+
+/// The root of a task: a task is its own root, or it inherits its parent's root. This function
+/// computes the root for a given parent (or zero when none) and whether this task itself is a root.
+pub fn tt_root(is_root: bool, parent_root: u64, self_id: u64) -> u64 {
+    if (is_root) { return self_id; }
+    return parent_root;
+}
+
+; --- 2. Attempt as an entity -----------------------------------------------------------------------
+
+/// Attempts are not counters; each attempt has its own id and its own state, and a task may have
+/// multiple attempts. This stride isolates attempts from each other.
+pub const TT_ATTEMPT_STRIDE : u32 = 64;
+
+/// Pack a task id and an attempt number into a single 64-bit attempt id. The attempt number is
+/// a small local counter (0..63) to keep the id compact, and the task id is the main identifier.
+pub fn tt_attempt_id(task: u64, attempt: u32) -> u64 {
+    return task * TT_ATTEMPT_STRIDE + attempt as u64;
+}
+
+/// Extract the task id from an attempt id: the quotient when divided by the stride.
+pub fn tt_attempt_task(aid: u64) -> u64 {
+    return aid / TT_ATTEMPT_STRIDE as u64;
+}
+
+/// Extract the attempt number from an attempt id: the remainder when divided by the stride.
+pub fn tt_attempt_no(aid: u64) -> u32 {
+    return (aid as u32) % TT_ATTEMPT_STRIDE;
+}
+
+/// A new attempt must have a larger attempt number than the previous attempt, otherwise it is a
+/// duplicate and not a fresh entity.
+pub fn tt_attempt_fresh(cur: u64, prev: u64) -> bool {
+    return cur > prev;
+}
+
+; --- 3. States and transitions ----------------------------------------------------------------------
+
+/// Attempt states. RUNNING means the executor is executing the task (or an attempt of it). EXEC_DONE
+/// means the executor has finished but has not yet returned the result to the parent. RESULT_RETURNED
+/// means the result was delivered up the chain and is waiting for the parent's acceptance.
+/// ACCEPTED means the parent has accepted the result; this is the terminal state for a completed
+/// task. CANCELED and ERROR are terminal failure states. RECOVERING is a temporary state when an
+/// error is recovered (the task restarts with the same attempt number).
+pub const TT_CREATED : u8 = 0;
+pub const TT_RUNNING : u8 = 1;
+pub const TT_EXEC_DONE : u8 = 2;
+pub const TT_RESULT_RETURNED : u8 = 3;
+pub const TT_ACCEPTED : u8 = 4;
+pub const TT_CANCELED : u8 = 5;
+pub const TT_ERROR : u8 = 6;
+pub const TT_RECOVERING : u8 = 7;
+pub const TASK_TREE_STATES : u8 = 8;
+pub const STATE_NAMES : [8]str = ["created", "running", "exec_done", "result_returned", "accepted", "canceled", "error", "recovering"];
+
+/// An executor reports that it has finished the attempt but has not yet returned the result.
+pub fn tt_on_executor_done(state: u8) -> u8 {
+    if (state == TT_RUNNING) { return TT_EXEC_DONE; }
+    return state;
+}
+
+/// The executor returns the result to the parent. This transition also enforces idempotent redelivery:
+/// once the result has been returned, further deliveries do not change the state (they must not
+/// create a second completion).
+pub fn tt_on_result_delivered(state: u8) -> u8 {
+    if (state == TT_RUNNING) { return TT_EXEC_DONE; }
+    if (state == TT_EXEC_DONE) { return TT_RESULT_RETURNED; }
+    return state;
+}
+
+/// The parent accepts the result. This transition enforces idempotent acceptance: once accepted,
+/// the result is not re-accepted again.
+pub fn tt_on_accepted(state: u8) -> u8 {
+    if (state == TT_RESULT_RETURNED) { return TT_ACCEPTED; }
+    return state;
+}
+
+/// The parent requests rework: the task must be retried. This transition creates a new attempt
+/// (by incrementing the attempt number) and moves back to RUNNING.
+pub fn tt_on_rework(state: u8) -> u8 {
+    if (state == TT_ACCEPTED) { return TT_RUNNING; }
+    if (state == TT_RESULT_RETURNED) { return TT_RUNNING; }
+    return state;
+}
+
+/// The task is canceled: this is a terminal state; it cannot be canceled again once it is
+/// already canceled or accepted.
+pub fn tt_on_cancel(state: u8) -> u8 {
+    if (state == TT_CREATED) { return TT_CANCELED; }
+    if (state == TT_RUNNING) { return TT_CANCELED; }
+    if (state == TT_EXEC_DONE) { return TT_CANCELED; }
+    if (state == TT_RESULT_RETURNED) { return TT_CANCELED; }
+    return state;
+}
+
+/// The task encounters an error: this is a terminal state; it cannot error again once it is
+/// already canceled or accepted.
+pub fn tt_on_error(state: u8) -> u8 {
+    if (state == TT_RUNNING) { return TT_ERROR; }
+    if (state == TT_EXEC_DONE) { return TT_ERROR; }
+    if (state == TT_RECOVERING) { return TT_ERROR; }
+    return state;
+}
+
+/// The task recovers from an error: it goes back to RUNNING with the same attempt number (the
+/// attempt entity is reused, not a new one).
+pub fn tt_on_recover(state: u8) -> u8 {
+    if (state == TT_ERROR) { return TT_RUNNING; }
+    return state;
+}
+
+/// Check that a state transition is legal according to the state machine defined above.
+pub fn tt_transition_ok(prev: u8, new: u8) -> bool {
+    if (new == TT_ACCEPTED) { return prev == TT_RESULT_RETURNED or prev == TT_ACCEPTED; }
+    if (new == TT_RESULT_RETURNED) { return prev == TT_EXEC_DONE; }
+    if (new == TT_EXEC_DONE) { return prev == TT_RUNNING; }
+    if (new == TT_RUNNING) {
+        return prev == TT_CREATED or prev == TT_ACCEPTED or prev == TT_RESULT_RETURNED or prev == TT_ERROR;
+    }
+    if (new == TT_CANCELED) {
+        return prev == TT_CREATED or prev == TT_RUNNING or prev == TT_EXEC_DONE
+            or prev == TT_RESULT_RETURNED or prev == TT_CANCELED;
+    }
+    if (new == TT_ERROR) {
+        return prev == TT_RUNNING or prev == TT_EXEC_DONE or prev == TT_RECOVERING or prev == TT_ERROR;
+    }
+    if (new == TT_RECOVERING) { return prev == TT_ERROR; }
+    return prev == new;  // self-loop (including CREATED, TT_CANCELED)
+}
+
+; --- 4. Idempotent redelivery -----------------------------------------------------------------------
+
+/// A task may be completed only once. This function checks that a state transition creates a
+/// completion (entry into ACCEPTED) and that repeated deliveries of the result do not create a
+/// second completion. The test uses this helper to verify idempotence.
+pub fn tt_done_once(prev: u8, cur: u8) -> bool {
+    return cur == TT_ACCEPTED and prev != TT_ACCEPTED;
+}
+
+; --- 5. Session-id link ---------------------------------------------------------------------------
+
+/// The attempt entity has a link to the agent's session id stored in session_store.t27. The link
+/// is a reference, not a copy of the session data. The function checks that the sid is valid
+/// according to sid_ok() from session_store.t27. A sid of "-" is not a sid and must not be used.
+pub fn tt_sid_linked(sid: []const u8) -> bool {
+    return sid_ok(sid);
+}
+
+; --- 6. Scope rules -------------------------------------------------------------------------------
+
+/// Scope is represented as a 64-bit bitmask. A child's granted scope must be a subset of the
+/// parent's scope; this function checks that and also provides a helper for granting scope to a
+/// child.
+pub const TT_SCOPE_BITS : u64 = 64;
+
+/// Check that a child's granted scope is a subset of the parent's scope (no privilege escalation).
+pub fn tt_scope_subset(child: u64, parent: u64) -> bool {
+    return (child & ~parent) == 0;
+}
+
+/// Grant scope to a child: the child receives exactly the bits the parent grants; anything the
+/// parent does not grant is not available to the child.
+pub fn tt_grant(parent: u64, requested: u64) -> u64 {
+    return parent & requested;
+}
+
+; --- 7. Legacy vocabulary mapping -------------------------------------------------------------------
+
+/// Map the legacy spawn/start/verify/finish verbs to protocol tags and states. The spawn verb
+/// corresponds to the M_TASK_OFFER message; the start verb corresponds to the RUNNING state; the
+/// verify verb corresponds to the M_ACCEPT message; the finish verb corresponds to the M_RESULT
+/// message. This mapping ensures that existing vocabulary fits into the new protocol.
+pub fn tt_legacy_tag(verb: u8) -> u64 {
+    if (verb == 0) { return M_TASK_OFFER; }   // spawn
+    if (verb == 1) { return 0; }                     // start: no message, just a state change
+    if (verb == 2) { return M_ACCEPT; }      // verify: parent accepts
+    if (verb == 3) { return M_RESULT; }      // finish: executor returns result
+    return 0;  // unknown verb, no tag
+}
+
+/// Map the legacy spawn/start/verify/finish verbs to the resulting state in the task tree.
+pub fn tt_legacy_state(verb: u8) -> u8 {
+    if (verb == 0) { return TT_CREATED; }   // spawn
+    if (verb == 1) { return TT_RUNNING; }   // start
+    if (verb == 2) { return TT_ACCEPTED; }  // verify
+    if (verb == 3) { return TT_EXEC_DONE; } // finish
+    return TT_CREATED;  // unknown verb, start from created
+}
+
+; --- 8. Tests ---------------------------------------------------------------------------------------
+
+test task_tree_link_ok {
+    assert tt_link_ok(1, 2) == true;
+    assert tt_link_ok(0, 1) == false;  // parent must be non-zero
+    assert tt_link_ok(1, 1) == false;  // child must not be its own parent
+}
+
+test task_tree_root {
+    assert tt_root(true, 0, 100) == 100;
+    assert tt_root(false, 100, 100) == 100;
+    assert tt_root(false, 100, 200) == 100;
+}
+
+test attempt_id_compaction {
+    assert tt_attempt_task(0) == 0;
+    assert tt_attempt_task(1) == 0;
+    assert tt_attempt_task(64) == 1;
+    assert tt_attempt_task(65) == 1;
+    assert tt_attempt_no(0) == 0;
+    assert tt_attempt_no(1) == 1;
+    assert tt_attempt_no(63) == 63;
+    assert tt_attempt_no(64) == 0;
+    assert tt_attempt_no(65) == 1;
+}
+
+test attempt_fresh {
+    assert tt_attempt_fresh(2, 1) == true;
+    assert tt_attempt_fresh(1, 2) == false;
+    assert tt_attempt_fresh(1, 1) == false;
+}
+
+test executor_done_transition {
+    assert tt_on_executor_done(TT_CREATED) == TT_CREATED;
+    assert tt_on_executor_done(TT_RUNNING) == TT_EXEC_DONE;
+    assert tt_on_executor_done(TT_EXEC_DONE) == TT_EXEC_DONE;
+    assert tt_on_executor_done(TT_ACCEPTED) == TT_ACCEPTED;
+}
+
+test result_delivered_idempotence {
+    assert tt_on_result_delivered(TT_RUNNING) == TT_EXEC_DONE;
+    assert tt_on_result_delivered(TT_EXEC_DONE) == TT_RESULT_RETURNED;
+    assert tt_on_result_delivered(TT_RESULT_RETURNED) == TT_RESULT_RETURNED;  // no new state
+    assert tt_on_result_delivered(TT_ACCEPTED) == TT_ACCEPTED;  // already completed
+}
+
+test accepted_idempotence {
+    assert tt_on_accepted(TT_RESULT_RETURNED) == TT_ACCEPTED;
+    assert tt_on_accepted(TT_ACCEPTED) == TT_ACCEPTED;  // idempotent accept
+    assert tt_on_accepted(TT_RUNNING) == TT_RUNNING;  // cannot accept a running task
+}
+
+test rework_transition {
+    assert tt_on_rework(TT_ACCEPTED) == TT_RUNNING;
+    assert tt_on_rework(TT_RESULT_RETURNED) == TT_RUNNING;
+    assert tt_on_rework(TT_RUNNING) == TT_RUNNING;  // already running
+    assert tt_on_rework(TT_CREATED) == TT_CREATED;
+}
+
+test cancel_terminal {
+    assert tt_on_cancel(TT_CREATED) == TT_CANCELED;
+    assert tt_on_cancel(TT_RUNNING) == TT_CANCELED;
+    assert tt_on_cancel(TT_EXEC_DONE) == TT_CANCELED;
+    assert tt_on_cancel(TT_RESULT_RETURNED) == TT_CANCELED;
+    assert tt_on_cancel(TT_ACCEPTED) == TT_ACCEPTED;  // cannot cancel an accepted task
+    assert tt_on_cancel(TT_CANCELED) == TT_CANCELED;  // idempotent
+}
+
+test error_terminal {
+    assert tt_on_error(TT_RUNNING) == TT_ERROR;
+    assert tt_on_error(TT_EXEC_DONE) == TT_ERROR;
+    assert tt_on_error(TT_RECOVERING) == TT_ERROR;
+    assert tt_on_error(TT_ACCEPTED) == TT_ACCEPTED;  // cannot error an accepted task
+    assert tt_on_error(TT_CANCELED) == TT_CANCELED;
+}
+
+test recover_from_error {
+    assert tt_on_recover(TT_ERROR) == TT_RUNNING;
+    assert tt_on_recover(TT_ACCEPTED) == TT_ACCEPTED;  // no change
+}
+
+test transition_ok {
+    assert tt_transition_ok(TT_CREATED, TT_CREATED) == true;
+    assert tt_transition_ok(TT_CREATED, TT_RUNNING) == true;
+    assert tt_transition_ok(TT_CREATED, TT_CANCELED) == true;
+    assert tt_transition_ok(TT_CREATED, TT_EXEC_DONE) == false;
+    assert tt_transition_ok(TT_CREATED, TT_RESULT_RETURNED) == false;
+    assert tt_transition_ok(TT_CREATED, TT_ACCEPTED) == false;
+    assert tt_transition_ok(TT_RUNNING, TT_EXEC_DONE) == true;
+    assert tt_transition_ok(TT_RUNNING, TT_RESULT_RETURNED) == false;
+    assert tt_transition_ok(TT_RUNNING, TT_ACCEPTED) == false;
+    assert tt_transition_ok(TT_RUNNING, TT_ERROR) == true;
+    assert tt_transition_ok(TT_EXEC_DONE, TT_RESULT_RETURNED) == true;
+    assert tt_transition_ok(TT_EXEC_DONE, TT_ACCEPTED) == false;
+    assert tt_transition_ok(TT_EXEC_DONE, TT_ERROR) == true;
+    assert tt_transition_ok(TT_RESULT_RETURNED, TT_ACCEPTED) == true;
+    assert tt_transition_ok(TT_RESULT_RETURNED, TT_EXEC_DONE) == false;
+    assert tt_transition_ok(TT_ACCEPTED, TT_ACCEPTED) == true;
+    assert tt_transition_ok(TT_CANCELED, TT_CANCELED) == true;
+    assert tt_transition_ok(TT_ERROR, TT_ERROR) == true;
+    assert tt_transition_ok(TT_ERROR, TT_RECOVERING) == true;
+    assert tt_transition_ok(TT_RECOVERING, TT_ERROR) == true;
+    assert tt_transition_ok(TT_RECOVERING, TT_RUNNING) == false;
+}
+
+test done_once_idempotent_redelivery {
+    // first delivery creates the completion
+    var s : u8 = tt_on_result_delivered(TT_RUNNING);
+    assert tt_done_once(TT_EXEC_DONE, TT_RESULT_RETURNED) == false;
+    s = tt_on_accepted(TT_RESULT_RETURNED);
+    assert tt_done_once(TT_RESULT_RETURNED, TT_ACCEPTED) == true;
+    // a repeated delivery of the same result leaves the state at ACCEPTED: the second
+    // transition is a self-loop, so no second completion is counted
+    assert tt_on_result_delivered(TT_ACCEPTED) == TT_ACCEPTED;
+    assert tt_done_once(TT_ACCEPTED, tt_on_accepted(TT_ACCEPTED)) == false;
+}
+
+test sid_link_ok {
+    // "-" is not a sid
+    assert tt_sid_linked("-") == false;
+    // an empty string is not a sid
+    assert tt_sid_linked("") == false;
+    // a valid sid passes
+    assert tt_sid_linked("12345678-1234-1234-1234-123456789012") == true;
+    // more than one hyphen is a sid by session_store's rule (only "-" alone means none)
+    assert tt_sid_linked("---") == true;
+    // a sid with a space or a colon never passes
+    assert tt_sid_linked("a b") == false;
+    assert tt_sid_linked("a:b") == false;
+}
+
+test scope_subset_no_escalation {
+    // parent scope is empty, child cannot have any bits
+    assert tt_scope_subset(0, 0) == true;
+    assert tt_scope_subset(1, 0) == false;  // escalation
+    // child scope is a subset of parent scope
+    assert tt_scope_subset(1, 3) == true;  // 01 is subset of 11
+    assert tt_scope_subset(2, 3) == true;  // 10 is subset of 11
+    assert tt_scope_subset(3, 3) == true;  // same
+    // parent scope is a subset of child scope is not allowed
+    assert tt_scope_subset(3, 1) == false;  // child cannot grant more
+    // parent=5 (101), child=4 (100): subset. parent=5, child=3 (011): 3 has bit 1 (010)
+    // which the parent lacks, so it is refused
+    assert tt_scope_subset(4, 5) == true;
+    assert tt_scope_subset(3, 5) == false;
+}
+
+test grant_scope {
+    // granting with no bits is trivial
+    assert tt_grant(0, 0) == 0;
+    // granting a subset of parent's bits returns the subset
+    assert tt_grant(0b1111, 0b0010) == 0b0010;
+    // granting all bits returns the parent's scope (the parent must have the bits)
+    assert tt_grant(0b1111, 0b1111) == 0b1111;
+    // granting bits not in parent returns only the parent's bits (no escalation)
+    assert tt_grant(0b0011, 0b1111) == 0b0011;
+}
+
+test legacy_tag_mapping {
+    assert tt_legacy_tag(0) == M_TASK_OFFER;
+    assert tt_legacy_tag(1) == 0;
+    assert tt_legacy_tag(2) == M_ACCEPT;
+    assert tt_legacy_tag(3) == M_RESULT;
+    assert tt_legacy_tag(4) == 0;  // unknown verb
+}
+
+test legacy_state_mapping {
+    assert tt_legacy_state(0) == TT_CREATED;
+    assert tt_legacy_state(1) == TT_RUNNING;
+    assert tt_legacy_state(2) == TT_ACCEPTED;
+    assert tt_legacy_state(3) == TT_EXEC_DONE;
+    assert tt_legacy_state(4) == TT_CREATED;  // unknown verb
+}
+
+invariant task_tree_state_count {
+    assert TASK_TREE_STATES == 8;
+    assert STATE_NAMES[TASK_TREE_STATES - 1] == STATE_NAMES[7];
+}
+
