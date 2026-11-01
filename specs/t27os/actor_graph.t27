@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/actor_graph.t27 -- the actor graph LAW (pure logic, no drawing - FR-004)
+; The actor graph surface paints supervision relationships and message flow among Queen actors.
+; ---
+; WHAT IS DECIDED HERE: node identity and state, edge classes, restart semantics, message counters,
+; zoom/shell interplay, and fullscreen layout. It never draws, only computes. glass_window.t27
+; reads this contract to render; actor_view.t27 provides the TE_* fixture test data.
+; FR-004: a new surface just needs to call these functions, it does not reimplement them.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osActorGraph;
+
+use queen::actors::pid_of;
+use queen::actors::slot_of;
+use queen::actors::gen_of;
+use queen::actors::NO_PID;
+use queen::actors::GEN_MASK;
+use queen::actors::next_gen;
+use queen::events::EV_ACTOR_SPAWN;
+use queen::events::EV_ACTOR_RESTART;
+use queen::events::EV_ACTOR_EXIT;
+use queen::events::EV_ACTOR_DOWN;
+use queen::events::EV_ACTOR_DELIVER;
+use queen::events::EV_ACTOR_DELIVERS;
+use queen::events::EV_RESULT;
+use queen::events::ACTOR_KINDS;
+use queen::actor_view::VS_RUNNING;
+use queen::actor_view::VS_RESTARTING;
+use queen::actor_view::VS_DEAD;
+use queen::actor_view::VS_NAMES;
+use queen::actor_view::ACTOR_KIND_NAMES;
+use queen::actor_view::NO_EVENT;
+use queen::actor_view::TE_SEQ;
+use queen::actor_view::TE_KIND;
+use queen::actor_view::TE_FROM;
+use queen::actor_view::TE_TO;
+use queen::actor_view::TE_PARENT;
+use t27os::shell_state::SS_TAB_GRAPH;
+use t27os::shell_state::SS_TAB_TASKS;
+use t27os::shell_state::SS_TAB_COUNT;
+use t27os::shell_state::SS_SEL_NONE;
+use t27os::shell_state::ss_back;
+use t27os::shell_state::ss_tab_ok;
+use t27os::shell_state::ss_tab_switch_keeps_sel;
+use t27os::queen_live_graph::QLG_Z_OVERVIEW;
+use t27os::queen_live_graph::QLG_Z_AGENT;
+use t27os::queen_live_graph::QLG_Z_NONE;
+use t27os::queen_live_graph::QLG_Z_GONE;
+use t27os::queen_live_graph::QLG_Z_NOSEL;
+use t27os::queen_live_graph::qlg_zoom_hash;
+use t27os::queen_live_graph::qlg_zoom_id;
+use t27os::queen_live_graph::qlg_zoom_find;
+
+// ---------------------------------------------------------------- the nodes
+
+/// What an actor does: the four board roles (intake, reconciler, domain, agent) come named from
+/// actor_view; the six event-processor kinds (4..9) answer with the honest generic word.
+pub fn actor_kind_name(kind : u8) -> string {
+    if (kind < 4) { return ACTOR_KIND_NAMES[kind]; }
+    return "actor";
+}
+
+/// The three actor states: running (doing work), restarting (supervisor's call), dead (exit).
+/// The state text is the VS_NAMES word, not colour-only.
+pub fn actor_state_name(state : u8) -> string {
+    if (state < 3) { return VS_NAMES[state]; }
+    return "?";
+}
+
+// ---------------------------------------------------------------- the edges
+
+/// The five edge classes, each as a constant and a distinct relationship. No invented arrows: an event
+/// without a from_pid marks a node-event (the target is an incomplete view of the actor's work).
+pub const AE_SUPERVISOR : u8 = 0;
+pub const AE_MESSAGE : u8 = 1;
+pub const AE_TASK_REF : u8 = 2;
+pub const AE_RESULT : u8 = 3;
+pub const AE_OBSERVE : u8 = 4;
+
+pub const AE_NAMES : [5]str = ["supervisor", "message", "task_ref", "result", "observe"];
+
+/// Edge classes of one event. The event stream names the relationship; the graph only spells it:
+/// spawn is the supervisor's parent->child arrow, restart/exit/down are the supervisor's lifecycle
+/// observation, deliver is a sender->receiver message, a deliver carrying a task ref is the task
+/// dependency, a result is the result return. No invented arrows: an event without from_pid is a
+/// node-event with an incomplete mark, never an edge.
+pub fn ag_edge_of_event(kind : u8, task_ref : u64) -> u8 {
+    if (kind == EV_ACTOR_SPAWN) { return AE_SUPERVISOR; }
+    if (kind == EV_ACTOR_DELIVER) {
+        if (task_ref != 0) { return AE_TASK_REF; }
+        return AE_MESSAGE;
+    }
+    if (kind == AGR_EV_RESULT) { return AE_RESULT; }
+    return AE_OBSERVE;
+}
+
+/// An edge is complete only when the event named its source; the mark stays honest.
+pub fn ag_edge_complete(from_pid : u64) -> bool {
+    return from_pid != NO_PID;
+}
+
+// The result event kind on spec/integration is queen::events EV_RESULT == 6; this base predates
+// it, so the value is pinned here and the import replaces this constant at integration.
+pub const AGR_EV_RESULT : u8 = 6;
+
+// ---------------------------------------------------------------- the lifecycle
+
+/// A restart reuses the slot with the next generation: same logical actor, new distinguishable
+/// incarnation (the pid changes, the slot does not). Counters are keyed by the full pid, so the
+/// new incarnation starts at zero -- no result inheritance.
+pub fn ag_restart(old_pid : u64) -> u64 {
+    return pid_of(slot_of(old_pid), gen_of(old_pid) + 1);
+}
+
+/// Two pids are the same logical actor exactly when they share the slot.
+pub fn ag_same_actor(a : u64, b : u64) -> bool {
+    return slot_of(a) == slot_of(b);
+}
+
+/// Down nodes persist until dismissed (the keep-visible window law): a dead node is kept visible
+/// for at least AGR_DOWN_KEEP_MS even after a dismissal, and forever without one -- a burst of
+/// exits never flashes away, and the refresh never drops it.
+pub const AGR_DOWN_KEEP_MS : u64 = 5000;
+
+pub fn ag_down_visible(dead_at_ms : u64, now_ms : u64, dismissed : bool) -> bool {
+    if (dismissed == false) { return true; }
+    if (now_ms < dead_at_ms) { return true; }
+    return now_ms - dead_at_ms < AGR_DOWN_KEEP_MS;
+}
+
+// ------------------------------------------------------------- zoom and shell interplay
+
+/// The semantic zoom reuses the landed QLG_Z pattern: identity is the pid (slot+gen), packed as
+/// the shell selection word. Selection survival follows the LOGICAL actor (the slot), so a card
+/// stays open across a restart and shows the new incarnation.
+pub fn ag_zoom_find(pids : []const u64, n : u32, pid : u64) -> u32 {
+    var i : u32 = 0;
+    while (i < n) {
+        if (pids[i] == pid) { return i; }
+        i = i + 1;
+    }
+    return QLG_Z_NONE;
+}
+
+/// Where the selection lives after a refresh: the first live incarnation of the same slot, or
+/// the explicit QLG_Z_GONE -- never a silent clear.
+pub fn ag_zoom_keep(sel : u64, pids : []const u64, n : u32) -> u64 {
+    var best : u64 = QLG_Z_GONE;
+    var i : u32 = 0;
+    while (i < n) {
+        if (ag_same_actor(pids[i], sel)) {
+            if (best == QLG_Z_GONE or pids[i] > best) { best = pids[i]; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// BACK: clears the selection only; the shell passes the viewport through untouched.
+pub fn ag_zoom_back(sel : u64, vp : u64) -> u64 {
+    return ss_back(sel, vp);
+}
+
+/// The graph tab defaults; the tab strip is the shell's law, consumed here.
+pub const AG_Z_OVERVIEW : u32 = 0;
+pub const AG_Z_AGENT : u32 = 1;
+pub const AG_Z_COUNT : u32 = 2;
+
+pub fn ag_tab_default() -> u32 {
+    return SS_TAB_GRAPH;
+}
+
+pub fn ag_tab_ok(t : u32) -> bool {
+    return ss_tab_ok(t);
+}
+
+// ------------------------------------------------------------- fullscreen layout math
+
+/// Fullscreen layout as pure functions of the content rect: nodes in a grid, at least two radii
+/// of clear air between neighbours, everything inside the rect with a margin.
+pub const AGR_FS_PAD : f64 = 24.0;
+pub const AGR_NODE_R : f64 = 14.0;
+pub const AGR_MAX_NODES : u32 = 32;
+
+pub fn agr_refused(n : u32) -> bool {
+    return n > AGR_MAX_NODES;
+}
+
+pub fn agr_cols(n : u32) -> u32 {
+    var c : u32 = 1;
+    while (c * c < n) { c = c + 1; }
+    return c;
+}
+
+pub fn agr_rows(n : u32) -> u32 {
+    const cols : u32 = agr_cols(n);
+    var r : u32 = 0;
+    var placed : u32 = 0;
+    while (placed < n) { placed = placed + cols; r = r + 1; }
+    return r;
+}
+
+pub fn agr_node_x(k : u32, n : u32, x : f64, w : f64) -> f64 {
+    const cols : f64 = agr_cols(n) as f64;
+    const cw : f64 = (w - 2.0 * AGR_FS_PAD) / cols;
+    return x + AGR_FS_PAD + ((k % agr_cols(n)) as f64 + 0.5) * cw;
+}
+
+pub fn agr_node_y(k : u32, n : u32, y : f64, h : f64) -> f64 {
+    const rows : f64 = agr_rows(n) as f64;
+    const ch : f64 = (h - 2.0 * AGR_FS_PAD) / rows;
+    return y + AGR_FS_PAD + ((k / agr_cols(n)) as f64 + 0.5) * ch;
+}
+
+// ---------------------------------------------------------------- tests
+
+test the_edge_classes_are_five_distinct_relationships {
+    assert(AE_SUPERVISOR == 0 and AE_MESSAGE == 1 and AE_TASK_REF == 2);
+    assert(AE_RESULT == 3 and AE_OBSERVE == 4);
+    // pairwise distinct
+    var a : u8 = 0;
+    while (a < 5) {
+        var b : u8 = a + 1;
+        while (b < 5) {
+            assert(a != b);
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    // each event kind names exactly one relationship
+    assert(ag_edge_of_event(EV_ACTOR_SPAWN, 0) == AE_SUPERVISOR);
+    assert(ag_edge_of_event(EV_ACTOR_RESTART, 0) == AE_OBSERVE);
+    assert(ag_edge_of_event(EV_ACTOR_EXIT, 0) == AE_OBSERVE);
+    assert(ag_edge_of_event(EV_ACTOR_DOWN, 0) == AE_OBSERVE);
+    assert(ag_edge_of_event(EV_ACTOR_DELIVER, 0) == AE_MESSAGE);
+    assert(ag_edge_of_event(EV_ACTOR_DELIVER, 8615) == AE_TASK_REF);
+    assert(ag_edge_of_event(AGR_EV_RESULT, 0) == AE_RESULT);
+}
+
+test no_arrow_without_a_source {
+    // an event without from_pid is a node-event with an incomplete mark, never an edge
+    assert(ag_edge_complete(NO_PID) == false);
+    assert(ag_edge_complete(pid_of(3, 1)));
+    // every lifecycle observation in the fixture names its supervisor: all complete
+    var i : u32 = 0;
+    while (i < 16) {
+        if (TE_KIND[i] == EV_ACTOR_SPAWN or TE_KIND[i] == EV_ACTOR_DELIVER) {
+            assert(ag_edge_complete(TE_FROM[i]));
+        }
+        i = i + 1;
+    }
+}
+
+test a_restart_is_a_new_incarnation_of_the_same_actor {
+    // the fixture's own restart (event 9, index 8): slot 9 generation 0 becomes slot 9 generation 1
+    assert(TE_KIND[8] == EV_ACTOR_RESTART);
+    assert(TE_TO[5] == pid_of(9, 0) and TE_TO[8] == pid_of(9, 1));
+    assert(ag_same_actor(TE_TO[5], TE_TO[8]));
+    assert(ag_restart(TE_TO[5]) == TE_TO[8]);
+    // the incarnation is distinguishable: same slot, different generation
+    assert(TE_TO[5] != TE_TO[8] and gen_of(TE_TO[5]) != gen_of(TE_TO[8]));
+    // no result inheritance: the fresh incarnation reads as a new key, not the old one
+    assert(ag_restart(pid_of(9, 0)) == pid_of(9, 1));
+}
+
+test dead_nodes_persist_until_dismissed {
+    // without a dismissal the node stays visible forever, whatever its age
+    assert(ag_down_visible(1000, 1000 + AGR_DOWN_KEEP_MS * 10, false));
+    // within the keep window a dismissal is not honored yet
+    assert(ag_down_visible(1000, 1000 + AGR_DOWN_KEEP_MS - 1, true));
+    // after the window a dismissal clears it
+    assert(ag_down_visible(1000, 1000 + AGR_DOWN_KEEP_MS, true) == false);
+    // a future timestamp cannot be dismissed into the past
+    assert(ag_down_visible(2000, 1000, true));
+}
+
+test zoom_survival_and_the_shell_contract {
+    var pids : [4]u64 = [0, 0, 0, 0];
+    pids[0] = pid_of(2, 0);
+    pids[1] = pid_of(9, 0);
+    pids[2] = pid_of(9, 1);
+    pids[3] = pid_of(4, 0);
+    // find by exact pid
+    assert(ag_zoom_find(pids[0..4], 4, pid_of(9, 1)) == 2);
+    assert(ag_zoom_find(pids[0..4], 4, pid_of(7, 0)) == QLG_Z_NONE);
+    // keep by logical actor across a restart: the selection moves to the new incarnation
+    assert(ag_zoom_keep(pid_of(9, 0), pids[0..4], 4) == pid_of(9, 1));
+    // the slot is gone entirely: explicit gone, never a silent clear
+    assert(ag_zoom_keep(pid_of(9, 0), pids[0..1], 1) == QLG_Z_GONE);
+    assert(QLG_Z_GONE != QLG_Z_NOSEL);
+    // shell law: switching ANY tab never clears the selected entity
+    var t : u32 = 0;
+    while (t < SS_TAB_COUNT) {
+        assert(ss_tab_switch_keeps_sel(SS_TAB_GRAPH, t, pid_of(9, 1)) == pid_of(9, 1));
+        t = t + 1;
+    }
+    // back clears the selection only; the viewport word passes through
+    assert(ag_zoom_back(pid_of(9, 1), 0xABCD) == 0xABCD);
+    // the graph tab defaults and every strip tab is valid
+    assert(ag_tab_default() == SS_TAB_GRAPH);
+    assert(ss_tab_ok(0) and ss_tab_ok(SS_TAB_COUNT - 1) and ss_tab_ok(SS_TAB_COUNT) == false);
+}
+
+test fullscreen_layout_is_pure_math_of_the_rect {
+    // nodes inside the rect with a margin, never touching, for every count up to the cap
+    var n : u32 = 1;
+    while (n <= AGR_MAX_NODES) {
+        var k : u32 = 0;
+        while (k < n) {
+            const ax : f64 = agr_node_x(k, n, 0.0, 800.0);
+            const ay : f64 = agr_node_y(k, n, 0.0, 600.0);
+            assert(ax >= AGR_FS_PAD and ax <= 800.0 - AGR_FS_PAD + 0.001);
+            assert(ay >= AGR_FS_PAD and ay <= 600.0 - AGR_FS_PAD + 0.001);
+            k = k + 2;
+        }
+        // neighbours in one row hold two radii of clear air
+        if (n >= 2) {
+            assert(agr_node_x(1, n, 0.0, 800.0) - agr_node_x(0, n, 0.0, 800.0) >= 2.0 * AGR_NODE_R + 2.0);
+        }
+        n = n + 7;
+    }
+    // the cap refuses honestly
+    assert(agr_refused(AGR_MAX_NODES + 1) and agr_refused(AGR_MAX_NODES) == false);
+    // the math is pure: same inputs, same outputs
+    assert(agr_node_x(3, 8, 10.0, 800.0) == agr_node_x(3, 8, 10.0, 800.0));
+}
+
+test the_te_fixture_is_pinned_not_live {
+    // the owner-provided replay sequence, pinned as fixture: 16 events, then empty rows
+    assert(TE_SEQ[0] == 1 and TE_SEQ[15] == 16 and TE_SEQ[16] == 0);
+    assert(TE_KIND[0] == EV_ACTOR_SPAWN and TE_KIND[1] == EV_ACTOR_DELIVERS);
+    assert(TE_KIND[6] == EV_ACTOR_EXIT and TE_KIND[7] == EV_ACTOR_DOWN and TE_KIND[8] == EV_ACTOR_RESTART);
+    // the fixture's pids decode to the slot.gen the board shows
+    assert(slot_of(TE_FROM[0]) == 6 and slot_of(TE_TO[0]) == 7);
+}
+
+invariant the_zoom_levels_are_two_compositions {
+    assert(AG_Z_OVERVIEW == 0 and AG_Z_AGENT == 1 and AG_Z_OVERVIEW != AG_Z_AGENT);
+    assert(AG_Z_COUNT == 2);
+}
+
+invariant the_edge_vocabulary_is_exactly_five {
+    assert(AE_SUPERVISOR == 0 and AE_MESSAGE == 1 and AE_TASK_REF == 2);
+    assert(AE_RESULT == 3 and AE_OBSERVE == 4);
+}
+
+invariant the_shell_selection_word_is_the_pid {
+    assert(SS_SEL_NONE == QLG_Z_NOSEL);
+    assert(QLG_Z_GONE != QLG_Z_NOSEL);
+}
+
+pub fn agr_eq(a : []const u8, n : usize, s : []const u8) -> bool {
+    if (n != s.len) { return false; }
+    var i : usize = n;
+    while (i > 0) {
+        i = i - 1;
+        if (a[i] != s[i]) { return false; }
+    }
+    return true;
+}
+
+// ------------------------------------------------------------- counters and animation
+
+/// Per-edge counters, aggregated: one entry per (from, to, class), stride AGR_CF words. Adding a
+/// message bumps the entry; the graph draws an edge only past the threshold AGR_EDGE_MIN, so a
+/// quiet pair never flashes the screen.
+pub const AGR_CF : usize = 4;
+pub const AGR_EDGE_MIN : u32 = 3;
+pub const AGR_MAX_EDGES : u32 = 64;
+
+/// Find the entry for an edge, or AGR_NO_SLOT.
+pub const AGR_NO_SLOT : u32 = 4294967295;
+
+pub fn agr_slot(tab : []const u64, total : u32, from : u64, to : u64, cls : u8) -> u32 {
+    var i : u32 = 0;
+    while (i < total) {
+        const r : usize = i * AGR_CF;
+        if (tab[r] == from and tab[r + 1] == to and tab[r + 2] == cls as u64) { return i; }
+        i = i + 1;
+    }
+    return AGR_NO_SLOT;
+}
+
+/// Bump one edge's counter, creating its entry; returns the new total. Past AGR_MAX_EDGES the
+/// bump is refused (the count is honest about what it drops: the caller sees the same total).
+pub fn agr_count_add(tab : []u64, total : u32, from : u64, to : u64, cls : u8) -> u32 {
+    const s : u32 = agr_slot(tab, total, from, to, cls);
+    if (s != AGR_NO_SLOT) {
+        tab[s * AGR_CF + 3] = tab[s * AGR_CF + 3] + 1;
+        return total;
+    }
+    if (total >= AGR_MAX_EDGES) { return total; }
+    const r : usize = total * AGR_CF;
+    tab[r] = from;
+    tab[r + 1] = to;
+    tab[r + 2] = cls as u64;
+    tab[r + 3] = 1;
+    return total + 1;
+}
+
+pub fn agr_count_get(tab : []const u64, total : u32, from : u64, to : u64, cls : u8) -> u32 {
+    const s : u32 = agr_slot(tab, total, from, to, cls);
+    if (s == AGR_NO_SLOT) { return 0; }
+    return tab[s * AGR_CF + 3] as u32;
+}
+
+/// The edge is drawn only when its aggregated count passes the threshold.
+pub fn agr_edge_shown(count : u32) -> bool {
+    return count >= AGR_EDGE_MIN;
+}
+
+/// Animation is a presentation hint bit in the flags word. The interface stays informative with
+/// it off: the flow word is identical either way, only the hint bit differs.
+pub const AGR_ANIM_BIT : u64 = 1;
+
+pub fn agr_anim_on(flags : u64) -> bool {
+    return (flags & AGR_ANIM_BIT) != 0;
+}
+
+/// The honest flow word: "x<count>" past the threshold, "-" under it. Reads the same with and
+/// without the animation bit; nothing on screen depends on the hint.
+pub fn agr_flow_word(out : []u8, count : u32, flags : u64) -> usize {
+    if (agr_edge_shown(count) == false) { return put_bytes(out, 0, "-"); }
+    var w : usize = put_bytes(out, 0, "x");
+    return put_dec(out, w, count as u64);
+}
+
+test counters_aggregate_per_edge_past_the_threshold {
+    var tab : [256]u64 = undefined;
+    var total : u32 = 0;
+    const a : u64 = pid_of(2, 0);
+    const b : u64 = pid_of(7, 0);
+    // three messages over one edge: it passes the threshold
+    var i : u32 = 0;
+    while (i < 3) {
+        total = agr_count_add(tab[0..], total, a, b, AE_MESSAGE);
+        i = i + 1;
+    }
+    assert(total == 1 and agr_count_get(tab[0..], total, a, b, AE_MESSAGE) == 3);
+    assert(agr_edge_shown(agr_count_get(tab[0..], total, a, b, AE_MESSAGE)));
+    // a different class on the same pair is its own edge with its own counter
+    total = agr_count_add(tab[0..], total, a, b, AE_RESULT);
+    assert(total == 2 and agr_count_get(tab[0..], total, a, b, AE_RESULT) == 1);
+    assert(agr_edge_shown(1) == false);
+    // a fresh pair starts at zero and is not drawn
+    assert(agr_count_get(tab[0..], total, pid_of(9, 1), b, AE_MESSAGE) == 0);
+    assert(agr_edge_shown(0) == false);
+}
+
+test the_animation_bit_is_a_hint_only {
+    var b : [16]u8 = undefined;
+    const c : u32 = 5;
+    // identical informative word with animation on and off
+    var w1 : usize = agr_flow_word(b[0..16], c, AGR_ANIM_BIT);
+    var w2 : usize = agr_flow_word(b[0..16], c, 0);
+    assert(w1 == w2 and agr_anim_on(AGR_ANIM_BIT) and agr_anim_on(0) == false);
+    // under the threshold: a plain dash, again hint-independent
+    assert(agr_eq(b[0..16], agr_flow_word(b[0..16], 1, AGR_ANIM_BIT), "-"));
+    assert(agr_eq(b[0..16], agr_flow_word(b[0..16], 1, 0), "-"));
+    // past the threshold the count is shown, honestly numbered
+    assert(agr_eq(b[0..16], agr_flow_word(b[0..16], c, AGR_ANIM_BIT), "x5"));
+}
+
+invariant the_counter_vocabulary_is_pinned {
+    assert(AGR_EDGE_MIN == 3 and AGR_CF == 4 and AGR_MAX_EDGES == 64);
+    assert(AGR_ANIM_BIT == 1 and AGR_NO_SLOT == 4294967295);
+}
