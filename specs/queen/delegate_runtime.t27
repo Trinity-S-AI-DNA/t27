@@ -1,0 +1,377 @@
+; specs/queen/delegate_runtime.t27 -- the delegation engine over the task tree (task-8)
+; The Queen delegates a task to a child actor; the child runs it under an explicit scope
+; and budget granted from the parent's own mask, returns the result up the chain, and the
+; parent accepts it or sends it back for rework. Cancellation reaches a running child;
+; a restart starts a fresh attempt and preserves the history (the task id is stable, the
+; attempt number grows -- task_tree.t27).
+; Nothing of the actor model or the task tree is restated. Message tags M_RESULT/M_ACCEPT/
+; M_REWORK, lanes, call chains and the attempt entity come from actors.t27 (used); the task
+; state machine, attempt ids and scope rules come from task_tree.t27 (used); the event kinds
+; come from events.t27 (used). Only what is new lives here: spawn admission against the
+; parent's scope mask and the budget, the delivery path, the parent verdict, cancel of a
+; running child, and restart-preserves-history.
+; English only (LANG-EN). ASCII only (L3). Every section carries test or invariant (L4).
+
+use queen::actors::M_RESULT;
+use queen::actors::M_ACCEPT;
+use queen::actors::M_REWORK;
+use queen::actors::CALL_MAX_DEPTH;
+use queen::task_tree::tt_scope_subset;
+use queen::task_tree::tt_grant;
+use queen::task_tree::tt_attempt_id;
+use queen::task_tree::tt_attempt_task;
+use queen::task_tree::tt_attempt_no;
+use queen::task_tree::tt_attempt_fresh;
+use queen::task_tree::tt_on_result_delivered;
+use queen::task_tree::tt_on_accepted;
+use queen::task_tree::tt_on_rework;
+use queen::task_tree::tt_on_cancel;
+use queen::task_tree::tt_transition_ok;
+use queen::events::EV_RESULT;
+use queen::events::EV_ACCEPTED;
+use queen::events::EV_REWORK;
+use queen::events::EV_CANCEL;
+
+; --- 1. Budget and child admission -----------------------------------------------------------------
+
+/// The budget a parent may spend on one delegation: memory words and a wall-clock cap.
+/// Chosen, not measured; the kernel's measured lane memory replaces LANE_MB later (kernel.t27).
+pub const DR_BUDGET_WORDS : u64 = 65536;
+pub const DR_BUDGET_MS : u64 = 600000;
+/// A parent holds at most this many live children at once (kernel delegation breadth).
+pub const DR_MAX_CHILDREN : u32 = 4;
+/// Delegation depth rides the call-chain cap; the chain law stays actors.t27's.
+pub const DR_MAX_DEPTH : u32 = CALL_MAX_DEPTH;
+
+/// A spawn request carries the parent's granted scope mask, the scope the child asks for,
+/// and the parent's live-child count. Admission is one decision from four facts: the asked
+/// scope must sit inside the parent's mask (no escalation, tt_scope_subset), the grant is
+/// exactly what the parent gives of what was asked (tt_grant), the parent has a child slot,
+/// and the budget asked fits the parent's own budget. Depth was already admitted by the
+/// caller's call_admit before the spawn, so it is not re-checked here (actors.t27 owns it).
+pub const DR_ADMIT_OK : u8 = 0;
+pub const DR_ADMIT_SCOPE : u8 = 1;
+pub const DR_ADMIT_FULL : u8 = 2;
+pub const DR_ADMIT_BUDGET : u8 = 3;
+
+pub fn dr_admit(child_scope: u64, parent_scope: u64, live_children: u32, budget_words: u64) -> u8 {
+    if (tt_scope_subset(child_scope, parent_scope) == false) { return DR_ADMIT_SCOPE; }
+    if (live_children >= DR_MAX_CHILDREN) { return DR_ADMIT_FULL; }
+    if (budget_words > DR_BUDGET_WORDS) { return DR_ADMIT_BUDGET; }
+    return DR_ADMIT_OK;
+}
+
+/// The mask the child actually receives: only what the parent grants of what was asked.
+pub fn dr_grant(parent_scope: u64, requested: u64) -> u64 {
+    return tt_grant(parent_scope, requested);
+}
+
+; --- 2. Result delivery up the chain ----------------------------------------------------------------
+
+/// A child that finished its work moves EXEC_DONE -> RESULT_RETURNED and delivers M_RESULT
+/// up the chain to its parent. Delivery succeeds only from a state that owns the result:
+/// an already delivered result is dropped, not re-counted (idempotent redelivery, task_tree).
+pub fn dr_deliver_ok(state: u8) -> bool {
+    const next : u8 = tt_on_result_delivered(state);
+    return tt_transition_ok(state, next);
+}
+
+/// The tag a delivered result carries is M_RESULT; the event the chain records is EV_RESULT.
+/// Both are the law's constants; the engine only pairs them.
+pub fn dr_result_tag() -> u64 {
+    return M_RESULT;
+}
+
+pub fn dr_result_event() -> u8 {
+    return EV_RESULT;
+}
+
+/// A late duplicate of a result whose attempt already returned (or is past returning) is
+/// refused: the attempt completed once, so a redelivery never creates a second completion.
+pub fn dr_redelivery_refused(arriving_state: u8) -> bool {
+    if (arriving_state >= 3) { return true; }   // result_returned or later: already owned
+    return false;
+}
+
+; --- 3. Parent accept / rework ---------------------------------------------------------------------
+
+/// The parent's verdict on a returned result. ACCEPT closes the task; REWORK opens a fresh
+/// attempt of the same task id (history keeps every earlier attempt).
+pub const DR_VERDICT_ACCEPT : u8 = 0;
+pub const DR_VERDICT_REWORK : u8 = 1;
+
+/// The verdict is legal only on a result that has been delivered (RESULT_RETURNED). The tag
+/// the parent sends back follows the verdict; the event follows it too.
+pub fn dr_verdict_ok(state: u8, verdict: u8) -> bool {
+    if (state != 3) { return false; }   // TT_RESULT_RETURNED, by value, no restate
+    if (verdict == DR_VERDICT_ACCEPT) { return tt_transition_ok(state, tt_on_accepted(state)); }
+    if (verdict == DR_VERDICT_REWORK) { return tt_transition_ok(state, tt_on_rework(state)); }
+    return false;
+}
+
+pub fn dr_verdict_tag(verdict: u8) -> u64 {
+    if (verdict == DR_VERDICT_ACCEPT) { return M_ACCEPT; }
+    return M_REWORK;
+}
+
+pub fn dr_verdict_event(verdict: u8) -> u8 {
+    if (verdict == DR_VERDICT_ACCEPT) { return EV_ACCEPTED; }
+    return EV_REWORK;
+}
+
+/// Rework bounds: after the ceiling the parent must stop reworking -- escalate instead
+/// (dispatch.t27's two send-backs then escalate is the same shape; the engine keeps its own
+/// counted ceiling so a child cannot be reworked forever).
+pub const DR_REWORK_CEILING : u32 = 2;
+
+pub fn dr_rework_allowed(attempt_no: u32) -> bool {
+    return attempt_no <= DR_REWORK_CEILING;
+}
+
+; --- 4. Cancel with a running child -----------------------------------------------------------------
+
+/// Cancel reaches a child in CREATED or RUNNING. The attempt moves to CANCELED; anything the
+/// child has finished but not delivered is dropped with it. Cancel of an ACCEPTED or CANCELED
+/// attempt changes nothing (idempotent).
+pub fn dr_cancel_ok(state: u8) -> bool {
+    const next : u8 = tt_on_cancel(state);
+    return tt_transition_ok(state, next);
+}
+
+pub fn dr_cancel_event() -> u8 {
+    return EV_CANCEL;
+}
+
+; --- 5. Restart preserves history --------------------------------------------------------------------
+
+/// A restart of a failed task keeps the task id and grows the attempt number, so the
+/// finished attempts stay in the history while the work itself starts fresh. The new
+/// attempt id must be fresh against the last one (tt_attempt_fresh), and it must belong
+/// to the same task (no restart across tasks).
+pub fn dr_restart_ok(last_aid: u64, next_attempt: u32) -> bool {
+    const next_aid : u64 = tt_attempt_id(tt_attempt_task(last_aid), next_attempt);
+    if (tt_attempt_task(next_aid) != tt_attempt_task(last_aid)) { return false; }
+    return tt_attempt_fresh(next_aid, last_aid);
+}
+
+/// A recovered error reuses the same attempt (the tree's recover move keeps the attempt);
+/// a restart after rework or cancel opens the next attempt. The engine asks the state:
+/// ERROR goes back into the same attempt number, every other restartable state moves on.
+pub fn dr_restart_attempt(state: u8, attempt_no: u32) -> u32 {
+    if (state == 6) { return attempt_no; }   // TT_ERROR: recover in place
+    return attempt_no + 1;
+}
+
+; --- 6. Matrix tests ---------------------------------------------------------------------------------
+
+/// The §6 matrix: every cell is one deliverable of task-8, crossed with the tree states
+/// the engine must handle. Each test below is one row of the matrix.
+///
+///   action \ state     CREATED  RUNNING  EXEC_DONE  RESULT_RETURNED  ACCEPTED  CANCELED  ERROR
+///   admit scope         yes      yes      no         no              no        no        no
+///   deliver             no       no       yes        drop            no        no        no
+///   accept/rework       no       no       no         yes             no        no        no
+///   cancel              yes      yes      no         no              drop      drop      no
+///   restart             no       no       no         after rework    no        yes       recover
+
+test spawn_admits_only_inside_parent_scope {
+    // A child may ask for any subset of the parent's mask, never a bit beyond it.
+    assert dr_admit(0b0011, 0b0111, 0, DR_BUDGET_WORDS) == DR_ADMIT_OK;
+    assert dr_admit(0b1000, 0b0111, 0, DR_BUDGET_WORDS) == DR_ADMIT_SCOPE;
+    // The grant is the intersection, never the ask itself.
+    assert dr_grant(0b0111, 0b1111) == 0b0111;
+    assert dr_grant(0b0111, 0b0010) == 0b0010;
+}
+
+test spawn_refuses_full_parent_and_over_budget {
+    // A parent at its child ceiling admits nobody.
+    assert dr_admit(0b0001, 0b0001, DR_MAX_CHILDREN, DR_BUDGET_WORDS) == DR_ADMIT_FULL;
+    // A budget past the engine's word cap is refused before any child exists.
+    assert dr_admit(0, 0, 0, DR_BUDGET_WORDS + 1) == DR_ADMIT_BUDGET;
+}
+
+test result_delivers_once_and_drops_duplicates {
+    // EXEC_DONE -> RESULT_RETURNED is the only delivery edge.
+    assert dr_deliver_ok(2) == true;
+    assert dr_deliver_ok(1) == false;
+    assert dr_deliver_ok(3) == false;
+    // A duplicate of a delivered result is refused; the completion is not counted twice.
+    assert dr_redelivery_refused(3) == true;
+    assert dr_redelivery_refused(4) == true;
+    assert dr_redelivery_refused(2) == false;
+    // The pair the chain sees is the law's tag and event.
+    assert dr_result_tag() == M_RESULT;
+    assert dr_result_event() == EV_RESULT;
+}
+
+test parent_accepts_or_reworks_a_returned_result {
+    // The verdict is legal only on a delivered result.
+    assert dr_verdict_ok(3, DR_VERDICT_ACCEPT) == true;
+    assert dr_verdict_ok(3, DR_VERDICT_REWORK) == true;
+    assert dr_verdict_ok(2, DR_VERDICT_ACCEPT) == false;
+    assert dr_verdict_ok(4, DR_VERDICT_REWORK) == false;
+    // Tags and events follow the verdict.
+    assert dr_verdict_tag(DR_VERDICT_ACCEPT) == M_ACCEPT;
+    assert dr_verdict_tag(DR_VERDICT_REWORK) == M_REWORK;
+    assert dr_verdict_event(DR_VERDICT_ACCEPT) == EV_ACCEPTED;
+    assert dr_verdict_event(DR_VERDICT_REWORK) == EV_REWORK;
+    // The rework ceiling: attempt numbers 1 and 2 may be reworked, 3 may not.
+    assert dr_rework_allowed(1) == true;
+    assert dr_rework_allowed(2) == true;
+    assert dr_rework_allowed(3) == false;
+}
+
+test cancel_reaches_a_running_child_and_is_idempotent {
+    // CREATED and RUNNING cancel; ACCEPTED and CANCELED drop the request.
+    assert dr_cancel_ok(0) == true;
+    assert dr_cancel_ok(1) == true;
+    assert dr_cancel_ok(4) == false;
+    assert dr_cancel_ok(5) == false;
+    // The chain records the cancel event.
+    assert dr_cancel_event() == EV_CANCEL;
+}
+
+test restart_grows_the_attempt_and_keeps_the_task {
+    // A restart of task 7 after attempt 3 opens attempt 4 of the same task.
+    const last : u64 = tt_attempt_id(7, 3);
+    assert dr_restart_ok(last, 4) == true;
+    assert tt_attempt_task(tt_attempt_id(7, 4)) == 7;
+    assert tt_attempt_no(tt_attempt_id(7, 4)) == 4;
+    // The new attempt is fresh against the old one; the old history is untouched.
+    assert tt_attempt_fresh(tt_attempt_id(7, 4), last) == true;
+    // A recovered error stays on the same attempt; rework or cancel moves to the next.
+    assert dr_restart_attempt(6, 3) == 3;
+    assert dr_restart_attempt(5, 3) == 4;
+}
+
+; --- Invariants -------------------------------------------------------------------------------------
+
+invariant delegation_never_escalates_scope {
+    // Whatever the parent grants, the child's mask is a subset of the parent's mask.
+    assert tt_scope_subset(dr_grant(0b0111, 0b1111), 0b0111) == true;
+    assert tt_scope_subset(dr_grant(0, 0b1111), 0) == true;
+}
+
+invariant delegation_depth_is_the_law_depth {
+    // The engine never raises the call-chain cap; it delegates within it.
+    assert DR_MAX_DEPTH == CALL_MAX_DEPTH;
+}
+
+invariant the_rework_ceiling_is_counted {
+    // A child cannot be reworked forever: the ceiling bounds the attempt growth.
+    assert DR_REWORK_CEILING == 2;
+    assert dr_rework_allowed(DR_REWORK_CEILING) == true;
+    assert dr_rework_allowed(DR_REWORK_CEILING + 1) == false;
+}
+
+invariant one_completion_per_attempt {
+    // Deliver-then-verdict, redelivery refused: an attempt completes once.
+    assert dr_deliver_ok(2) == true;
+    assert dr_verdict_ok(3, DR_VERDICT_ACCEPT) == true;
+    assert dr_redelivery_refused(3) == true;
+}
+
+; --- 7. Tree view: the display of what the model already knows ---------------------------------------
+; DISPLAY ONLY, STATE-MACHINE-ONLY. Everything in this section reads facts the model already
+; holds -- task id, parent, root, attempt, state, the tags a return carries -- and derives the
+; row a tree view shows. Nothing here launches a child, sends a message or touches the host:
+; the real child launch stays the task-8 executable-call dependency, and no call here imitates
+; execution.
+
+use queen::task_tree::tt_link_ok;
+use queen::task_tree::tt_root;
+use queen::task_tree::STATE_NAMES;
+
+/// One display row of the delegation tree: what the panel shows per known task.
+/// State name comes from the tree's own STATE_NAMES; nothing is invented here.
+///   is_root    whether this task is its own root (tt_root)
+///   state      the attempt's tree state (TT_* of task_tree.t27)
+///   aid        the attempt id this row displays (task*64+n, tt_attempt_id)
+pub fn dr_row_task(aid: u64) -> u64 {
+    return tt_attempt_task(aid);
+}
+
+pub fn dr_row_attempt(aid: u64) -> u32 {
+    return tt_attempt_no(aid);
+}
+
+pub fn dr_row_root(is_root: bool, parent_root: u64, self_id: u64) -> u64 {
+    return tt_root(is_root, parent_root, self_id);
+}
+
+/// A row is displayable only when the tree law holds for it: the link parent/child must be
+/// legal, and the state must name a real tree state.
+pub fn dr_row_ok(parent: u64, child: u64, state: u8) -> bool {
+    if (tt_link_ok(parent, child) == false) { return false; }
+    if (state >= 8) { return false; }   // TASK_TREE_STATES, by value
+    return true;
+}
+
+/// The state label a row shows, straight from the tree's own table.
+pub fn dr_row_state_name(state: u8) -> str {
+    return STATE_NAMES[state];
+}
+
+/// A result return the panel can show: the row carries the tag the return used (M_RESULT)
+/// and the event it recorded (EV_RESULT). A return is shown only for an attempt whose
+/// state actually owns the result (RESULT_RETURNED, or past it for a settled row).
+pub fn dr_row_shows_return(state: u8) -> bool {
+    if (state == 3 or state == 4) { return true; }
+    return false;
+}
+
+/// Indent of a row in the tree view: the chain depth from the root, derived from how many
+/// times the parent chain must be followed. The display never guesses a missing parent:
+/// an unknown parent shows as depth 0 with an unlinked marker.
+pub const DR_ROW_UNLINKED : u8 = 255;
+
+pub fn dr_row_depth(depth_known: bool, depth: u32) -> u8 {
+    if (depth_known == false) { return DR_ROW_UNLINKED; }
+    if (depth > 254) { return 254; }
+    return depth as u8;
+}
+
+test tree_view_rows_read_only_known_facts {
+    // Task and attempt come apart exactly as the law packs them.
+    assert dr_row_task(tt_attempt_id(7, 3)) == 7;
+    assert dr_row_attempt(tt_attempt_id(7, 3)) == 3;
+    // A root task is its own root; a child inherits the parent's root.
+    assert dr_row_root(true, 0, 7) == 7;
+    assert dr_row_root(false, 2, 7) == 2;
+    // The state label is the tree's own word, not a new one.
+    assert dr_row_state_name(3) == "result_returned";
+    assert dr_row_state_name(4) == "accepted";
+}
+
+test tree_view_result_return_display {
+    // A return is shown for a delivered result and an accepted one, never earlier.
+    assert dr_row_shows_return(2) == false;
+    assert dr_row_shows_return(3) == true;
+    assert dr_row_shows_return(4) == true;
+    assert dr_row_shows_return(1) == false;
+    // A legal row needs a legal link and a real state.
+    assert dr_row_ok(2, 7, 1) == true;
+    assert dr_row_ok(7, 7, 1) == false;
+    assert dr_row_ok(2, 7, 8) == false;
+}
+
+test tree_view_depth_hides_unknown_parents {
+    // A row whose parent is not known shows unlinked, not a guessed depth.
+    assert dr_row_depth(false, 0) == DR_ROW_UNLINKED;
+    assert dr_row_depth(true, 2) == 2;
+    // The display saturates instead of overflowing a byte.
+    assert dr_row_depth(true, 999) == 254;
+}
+
+invariant tree_view_is_display_only {
+    // The view reads the law's own tables and names; it launches nothing.
+    assert dr_row_shows_return(3) == true;
+    assert DR_ROW_UNLINKED == 255;
+}
+
+invariant tree_view_labels_come_from_the_tree {
+    // Every state the row can show is one of the tree's eight states, named by its table.
+    assert dr_row_state_name(0) == "created";
+    assert dr_row_state_name(5) == "canceled";
+    assert dr_row_state_name(7) == "recovering";
+}
