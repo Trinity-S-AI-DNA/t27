@@ -369,9 +369,13 @@ pub fn message_id_is(payload : []u8, plen : usize, id : u8) -> bool {
       if (payload[i + k] != (name[k]) as u8) { ok = false; }
       k = k + 1;
     }
-    if (ok and payload[i + name.len] == id) {
-      const nx : u8 = payload[i + name.len + 1];
-      return nx < 48 or nx > 57;
+    if (ok) {
+      var q : usize = i + name.len;
+      while (q < plen and payload[q] == 32) { q = q + 1; } // tolerate an OWS after the name
+      if (q < plen and payload[q] == id) {
+        const nx : u8 = payload[q + 1];
+        return nx < 48 or nx > 57;
+      }
     }
     i = i + 1;
   }
@@ -611,6 +615,36 @@ pub fn now_ms(mem : []u8) -> u64 {
   const usec : u64 = (mem[8] as u64) | (mem[9] as u64) << 8 | (mem[10] as u64) << 16 | (mem[11] as u64) << 24
     | (mem[12] as u64) << 32 | (mem[13] as u64) << 40 | (mem[14] as u64) << 48 | (mem[15] as u64) << 56;
   return sec * 1000 + usec / 1000;
+}
+
+/// The one wall-clock budget for a whole reader call (connect, HTTP, handshake, frames).
+pub const DEADLINE_MS : i32 = 15000;
+
+/// poll(2) readiness: 1 = POLLIN within ms, 0 = the timeout passed, 2 = the peer errored/hung up.
+pub fn poll_ready(fd : i32, ms : i32) -> u8 {
+  var pf : [8]u8;
+  pf[0] = fd as u8;
+  pf[1] = (fd >> 8) as u8;
+  pf[2] = (fd >> 16) as u8;
+  pf[3] = (fd >> 24) as u8;
+  pf[4] = 1; // POLLIN
+  pf[5] = 0;
+  pf[6] = 0;
+  pf[7] = 0;
+  const pr : i32 = sys_poll(pf[0..8], 1, ms);
+  if (pr <= 0) { return 0; }
+  const rev : u16 = pf[6] as u16 | ((pf[7] as u16) << 8);
+  if (rev & 0x0018 != 0) { return 2; } // POLLERR or POLLHUP
+  if (rev & 1 != 0) { return 1; }
+  return 0;
+}
+
+/// The remaining budget of a call that started at start_ms (the 15000 ms wall-clock budget).
+pub fn left_ms(tms : []u8, start_ms : u64) -> i32 {
+  const now : u64 = now_ms(tms);
+  const el : i64 = now as i64 - start_ms as i64;
+  if (el >= 15000) { return 0; }
+  return 15000 - el as i32;
 }
 
 /// A parameter value from the environment, into buf. Returns the byte count, or 0 when unset.
@@ -854,6 +888,8 @@ pub fn main() -> void {
   var guard : usize = 0;
   var tmb : [16]u8;
   const tms : []u8 = tmb[0..16];
+  var tmb2 : [16]u8;
+  const start_ms2 : u64 = now_ms(tmb2[0..16]);
   const start_ms : u64 = now_ms(tms);
   var deadline_left : i32 = deadline_ms;
   var frameb : [1024]u8;
@@ -937,6 +973,18 @@ pub fn main() -> void {
     }
     // a blocking read: the guard bounds garbage floods; a fully silent peer still hangs here
     // (documented limitation -- the poll-based deadline is the follow-up slice)
+    const left2 : i32 = left_ms(tmb2[0..16], start_ms2);
+    if (left2 <= 0) { refusal_code = R_NO_RESPONSE; break; }
+    const ready2 : u8 = poll_ready(fd, left2);
+    var d3b : [48]u8;
+    var d3w : usize = put_lit(d3b[0..48], 0, "dbg left=");
+    d3w = put_num(d3b[0..48], d3w, left2 as usize);
+    d3w = put_lit(d3b[0..48], d3w, " ready=");
+    d3w = put_num(d3b[0..48], d3w, ready2 as usize);
+    d3b[d3w] = 10;
+    d3w = d3w + 1;
+    sys_write(2, d3b[0..d3w], d3w as u64);
+    if (ready2 != 1) { refusal_code = R_NO_RESPONSE; break; } // the deadline: no frame in budget
     const r : i64 = sys_read(fd, bufk[got..bufk.len], bufk.len - got as u64);
     var dbg2 : [48]u8;
     var dw2 : usize = put_lit(dbg2[0..48], 0, "dbg r=");
@@ -1312,4 +1360,97 @@ test parse_snapshot_refuses_a_shape_without_digits {
   var er : [1]u8;
   const errb : []u8 = er[0..1];
   assert parse_snapshot(r[0..resp.len], resp.len, out, nn, errb) == 0;
+}
+
+// ---- message-id matching, staged (the peer repro of the live mid=N failure) -----------------
+
+test mid_minimal_payload {
+  // {"id":1} -- the smallest possible answer
+  var b : [16]u8;
+  const r : []u8 = b[0..16];
+  const s : string = "{\"id\":1}";
+  var i : usize = 0;
+  while (i < s.len) { r[i] = s[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..s.len], s.len, 49) == true;
+}
+
+test mid_with_result_object {
+  // {"id":1,"result":{}}
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  const s : string = "{\"id\":1,\"result\":{}}";
+  var i : usize = 0;
+  while (i < s.len) { r[i] = s[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..s.len], s.len, 49) == true;
+}
+
+test mid_id_at_the_end {
+  // {"result":{},"id":1}
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  const s : string = "{\"result\":{},\"id\":1}";
+  var i : usize = 0;
+  while (i < s.len) { r[i] = s[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..s.len], s.len, 49) == true;
+}
+
+test mid_event_without_id_is_skipped {
+  // {"method":"Event.x","params":{"x":1}} -- no id anywhere
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  const s : string = "{\"method\":\"Event.x\",\"params\":{\"x\":1}}";
+  var i : usize = 0;
+  while (i < s.len) { r[i] = s[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..s.len], s.len, 49) == false;
+  assert message_id_is(r[0..s.len], s.len, 50) == false;
+}
+
+test mid_digits_inside_strings_do_not_confuse {
+  // {"result":{"note":"id 10 times"},"id":1} -- the digits live inside a string value
+  var b : [96]u8;
+  const r : []u8 = b[0..96];
+  const s : string = "{\"result\":{\"note\":\"id 10 times\"},\"id\":1}";
+  var i : usize = 0;
+  while (i < s.len) { r[i] = s[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..s.len], s.len, 49) == true;
+}
+
+test mid_one_vs_ten_whole_digits {
+  // {"id":10} -- id '1' (49) is a prefix of 10 and must NOT match whole-digit
+  var b : [16]u8;
+  const r : []u8 = b[0..16];
+  const s : string = "{\"id\":10}";
+  var i : usize = 0;
+  while (i < s.len) { r[i] = s[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..s.len], s.len, 49) == false;
+  assert message_id_is(r[0..s.len], s.len, 50) == false; // '2'? no: 10 != 2 either
+  // the real check: id '1' at position, then '0' is a digit -> the scanner moves on
+  // and no other \"id\": exists, so both 1 and 2 refuse; the pair 49/50 documents it
+}
+
+test mid_two_messages_back_to_back {
+  // the foreign message first, the wanted answer second (one buffer, two JSON documents)
+  var b : [128]u8;
+  const r : []u8 = b[0..128];
+  const s1 : string = "{\"id\":9,\"method\":\"Event\"}";
+  const s2 : string = "{\"id\":2,\"result\":{\"value\":2}}";
+  var w : usize = 0;
+  var i : usize = 0;
+  while (i < s1.len) { r[w] = s1[i] as u8; w = w + 1; i = i + 1; }
+  i = 0;
+  while (i < s2.len) { r[w] = s2[i] as u8; w = w + 1; i = i + 1; }
+  assert message_id_is(r[0..s1.len], s1.len, 50) == false;
+  assert message_id_is(r[s1.len..w], s2.len, 50) == true;
+}
+
+test mid_tolerates_an_ows_after_the_name {
+  // {"id": 1} -- an OWS between the name and the value still matches (robustness, not required
+  // for the compact Chrome wire format, which the peer fixture uses)
+  var b : [16]u8;
+  const r : []u8 = b[0..16];
+  const s : string = "{\"id\": 1}";
+  var i : usize = 0;
+  while (i < s.len) { r[i] = s[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..s.len], s.len, 49) == true;
+  assert message_id_is(r[0..s.len], s.len, 50) == false;
 }
