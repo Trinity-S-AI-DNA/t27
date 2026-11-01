@@ -1,0 +1,2059 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/ladder_serve.t27 -- the t27-native serve loop of the T27 Ladder (gHashTag/t27#13039).
+// The Ladder is a loopback service in front of the free model pool: one POST /v1/chat/completions walks the
+// rung table of ladder.t27 until one rung answers 200, GET /health lists the table. Until now the running
+// service was a hand-written, untracked Node file, so a merged spec change (PR 13035 dropped DeepSeek) never
+// reached it. This file owns what that file did: the accept loop, the request parse, the per-call timeout and
+// the walk, and it reads the rung names, endpoints and models from ladder.t27 -- nothing here keeps a copy.
+//
+// Laws of ladder.t27 followed here: law 3 (the 503 names every rung that was tried, with its class), law 6
+// (thinking off on the zai GLM head unless the client asked for it), law 7 (service noise never demotes; only
+// 429/402 do), law 8 (a rung without a key or without a probed 200 makes no network call and is recorded as
+// unwired). ladder_speed.t27: the walk starts at the last good rung (sticky) and the first two wired rungs are
+// hedged -- both fire, the first 200 wins and the other call is killed.
+//
+// Shape: the pure fns below (ls_* , tested) own every byte decision -- the request head, the JSON member the
+// rewrite replaces, the curl config, the reply split, the key rotation, the health and 503 bodies. The host
+// half (ld_* , after them) only moves bytes: bind 127.0.0.1, poll, accept, spawn /usr/bin/curl for the
+// upstream call (t27 has no TLS client; glass_window.t27 and keys_host.t27 spawn tools the same way), read the
+// Keychain by account name through keys_host.kc_get_n. A key is read when a call needs it, goes to curl on a
+// pipe (never argv, never a file), and its copy is wiped at once; no key value is ever logged.
+//
+// Known limits, stated so they are not found by surprise: one client connection is served at a time (the
+// hedge runs two UPSTREAM calls at once, not two clients); a request body is capped at REQ_CAP and a reply at
+// REPLY_CAP; JSON is checked structurally (one object, balanced), not fully validated; a rung's noise rest
+// (NOISE_REST_S) is not kept -- a noisy rung is simply tried again on the next request; keys are rescanned
+// every KEY_RESCAN_MS, not live.
+//
+// Keys by Keychain account name only (service ai.t27.os; keys.t27 keychain_account_n). Never print one.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osLadderServe;
+
+use t27os::ladder::RUNG_COUNT;
+use t27os::ladder::RUNG_ZAI;
+use t27os::ladder::RUNG_NVIDIA;
+use t27os::ladder::RUNG_OPENROUTER;
+use t27os::ladder::PROBE_NONE;
+use t27os::ladder::PROBE_OK;
+use t27os::ladder::PROBE_REFUSED;
+use t27os::ladder::LADDER_PORT;
+use t27os::ladder::CALL_TIMEOUT_MS;
+use t27os::ladder::zai_thinking_off;
+use t27os::ladder::demotes_rung;
+use t27os::ladder::probe_after;
+use t27os::ladder::rung_wired;
+use t27os::ladder::next_named;
+use t27os::ladder::rung_name;
+use t27os::ladder::rung_url;
+use t27os::ladder::rung_keyless;
+use t27os::ladder::rung_model_count;
+use t27os::ladder::rung_model;
+use t27os::ladder::refusal_class;
+use t27os::ladder_speed::sticky_start;
+use t27os::router_sock::sockaddr_in_fill;
+use t27os::router_sock::AF_INET;
+use t27os::router_serve::request_method;
+use t27os::router_serve::request_path;
+use std::mem::bytes_eq;
+use t27os::keysync::kd_view_clear;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::keys::P_NVIDIA;
+use t27os::keys::P_ZAI;
+use t27os::keys::P_OPENROUTER;
+use t27os::keys::MAX_KEYS;
+use t27os::keys::scan_goes_on;
+use t27os::keys::sec_key_safe;
+use t27os::keys_host::kc_get_n;
+use t27os::pty_proto::get_u64;
+use t27os::pty_logic::put_pollfd;
+use t27os::pty_logic::poll_revents;
+use t27os::pty_logic::tv_ms;
+use t27os::pty_client::SOCK_STREAM;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_bind;
+use t27os::pty_sys::sys_listen;
+use t27os::pty_sys::sys_accept;
+use t27os::pty_sys::sys_poll;
+use t27os::pty_sys::sys_kill;
+use t27os::pty_sys::sys_waitpid;
+use t27os::pty_sys::sys_signal;
+use t27os::pty_sys::sys_gettimeofday;
+use t27os::pty_sys::sys_environ;
+use t27os::pty_sys::sys_exit;
+use t27os::ladder::recorded_status;
+use t27os::keys::sec_exit_code;
+
+// ---- limits ------------------------------------------------------------------------------------------------
+
+/// The largest request (head and body) the loop reads; a bigger one is answered 413.
+pub const REQ_CAP : usize = 28672;
+/// The largest upstream reply (body plus the status trailer) the loop keeps.
+pub const REPLY_CAP : usize = 24576;
+/// The most (model, key) attempts one rung gets before it counts as refused.
+pub const ATTEMPT_CAP : u32 = 6;
+/// A refused or unprobed rung is probed again after this long.
+pub const REPROBE_MS : u64 = 300000;
+/// The keys are read again after this long (idle ticks only).
+pub const KEY_RESCAN_MS : u64 = 300000;
+/// The backstop past CALL_TIMEOUT_MS after which a lane that curl did not end is killed.
+pub const LANE_SLACK_MS : u64 = 5000;
+pub const ROUTE_OTHER : u32 = 0;
+pub const ROUTE_HEALTH : u32 = 1;
+pub const ROUTE_CHAT : u32 = 2;
+
+// ---- bytes -------------------------------------------------------------------------------------------------
+
+pub fn ls_ws(c: u8) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13;
+}
+
+pub fn ls_lower(c: u8) -> u8 {
+    if (c >= 65 and c <= 90) { return c + 32; }
+    return c;
+}
+
+/// The index of the first copy of `needle` in `hay` at or after `from`; hay.len when there is none.
+pub fn ls_find(hay: []const u8, needle: []const u8, from: usize) -> usize {
+    var i : usize = from;
+    while (i + needle.len <= hay.len) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < needle.len and same) {
+            if (hay[i + j] != needle[j]) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return hay.len;
+}
+
+fn ls_match_ci(hay: []const u8, at: usize, lower_needle: []const u8) -> bool {
+    if (at + lower_needle.len > hay.len) { return false; }
+    var j : usize = 0;
+    while (j < lower_needle.len) {
+        if (ls_lower(hay[at + j]) != lower_needle[j]) { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+// ---- the request -------------------------------------------------------------------------------------------
+
+/// Just past the blank line that ends the head; 0 while the head is not complete.
+pub fn ls_header_end(req: []const u8) -> usize {
+    const blank : []const u8 = "\r\n\r\n";
+    const i : usize = ls_find(req, blank, 0);
+    if (i >= req.len) { return 0; }
+    return i + blank.len;
+}
+
+/// The Content-Length of a head (any case of the name); 0 when there is none.
+pub fn ls_content_length(head: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < head.len) {
+        if (head[i] == 10 and ls_match_ci(head, i + 1, "content-length:")) {
+            var j : usize = i + 16;
+            while (j < head.len and (head[j] == 32 or head[j] == 9)) { j = j + 1; }
+            var v : usize = 0;
+            while (j < head.len and head[j] >= 48 and head[j] <= 57 and v < 100000000) {
+                v = v * 10 + @as(usize, head[j] - 48);
+                j = j + 1;
+            }
+            return v;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Which of the two routes the request line asks for; everything else is ROUTE_OTHER.
+pub fn ls_route(head: []const u8) -> u32 {
+    const le : usize = ls_find(head, "\r\n", 0);
+    const line : []const u8 = head[0 .. le];
+    var m : [12]u8 = undefined;
+    var p : [64]u8 = undefined;
+    const mn : usize = request_method(line, m[0..12]);
+    const pn : usize = request_path(line, p[0..64]);
+    if (mn == 0 or pn == 0) { return ROUTE_OTHER; }
+    if (bytes_eq(m[0..mn], "GET") and bytes_eq(p[0..pn], "/health")) { return ROUTE_HEALTH; }
+    if (bytes_eq(m[0..mn], "POST") and bytes_eq(p[0..pn], "/v1/chat/completions")) { return ROUTE_CHAT; }
+    return ROUTE_OTHER;
+}
+
+/// The port to bind: the digits of `s` (the LADDER_PORT environment value), or 0 when they are not a port.
+pub fn ls_parse_port(s: []const u8) -> u32 {
+    if (s.len == 0 or s.len > 5) { return 0; }
+    var v : u32 = 0;
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] < 48 or s[i] > 57) { return 0; }
+        v = v * 10 + @as(u32, s[i] - 48);
+        i = i + 1;
+    }
+    if (v == 0 or v > 65535) { return 0; }
+    return v;
+}
+
+// ---- the body: one top-level member rewritten -----------------------------------------------------------------
+// The client names a model of its own; each rung serves ITS model, so the walk replaces the top-level "model"
+// member and, on the zai head, adds "thinking":{"type":"disabled"} unless the client sent a thinking member
+// (law 6). Only the top level is touched: a "model" inside a message is the client's text.
+
+fn ls_trim_end(b: []const u8, e: usize) -> usize {
+    var i : usize = e;
+    while (i > 0 and ls_ws(b[i - 1])) { i = i - 1; }
+    return i;
+}
+
+/// One pass over a JSON object. sp[0] = 1 when a top-level "model" member exists, sp[1]..sp[2] = the byte
+/// range to cut so that member (and one adjoining comma) is gone, sp[3] = 1 when a top-level "thinking"
+/// member exists, sp[4]..sp[5] = the text between the outer braces. False for anything that is not exactly
+/// one balanced object, and for a second "model" member.
+pub fn ls_scan_top(b: []const u8, sp: []u64) -> bool {
+    var i : usize = 0;
+    while (i < b.len and ls_ws(b[i])) { i = i + 1; }
+    if (i >= b.len or b[i] != 123) { return false; }
+    const inner_a : usize = i + 1;
+    var depth : u32 = 1;
+    var in_str : bool = false;
+    var esc : bool = false;
+    var want_key : bool = true;
+    var in_key : bool = false;
+    var ka : usize = 0;
+    var kq : usize = 0;
+    var in_mval : bool = false;
+    var model_found : u64 = 0;
+    var mq : usize = 0;
+    var mend : usize = 0;
+    var m_comma : usize = 0;
+    var m_comma_after : bool = false;
+    var m_prev : usize = 0;
+    var m_has_prev : bool = false;
+    var last_comma : usize = 0;
+    var have_comma : bool = false;
+    var has_think : u64 = 0;
+    var closed : bool = false;
+    var inner_b : usize = 0;
+    i = i + 1;
+    while (i < b.len and closed == false) {
+        const c : u8 = b[i];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (c == 92) {
+                esc = true;
+            } else if (c == 34) {
+                in_str = false;
+                if (in_key) {
+                    in_key = false;
+                    if (bytes_eq(b[ka .. i], "model")) {
+                        if (model_found == 1) { return false; }
+                        model_found = 1;
+                        mq = kq;
+                        in_mval = true;
+                        m_has_prev = have_comma;
+                        m_prev = last_comma;
+                    }
+                    if (bytes_eq(b[ka .. i], "thinking")) { has_think = 1; }
+                }
+            }
+        } else if (c == 34) {
+            in_str = true;
+            if (depth == 1 and want_key) {
+                in_key = true;
+                ka = i + 1;
+                kq = i;
+                want_key = false;
+            }
+        } else if (c == 123 or c == 91) {
+            depth = depth + 1;
+        } else if (c == 125 or c == 93) {
+            if (depth == 1) {
+                if (c != 125) { return false; }
+                if (in_mval) {
+                    mend = ls_trim_end(b, i);
+                    in_mval = false;
+                }
+                closed = true;
+                inner_b = i;
+            } else {
+                depth = depth - 1;
+            }
+        } else if (c == 44 and depth == 1) {
+            if (in_mval) {
+                mend = ls_trim_end(b, i);
+                in_mval = false;
+                m_comma = i;
+                m_comma_after = true;
+            }
+            last_comma = i;
+            have_comma = true;
+            want_key = true;
+        }
+        i = i + 1;
+    }
+    if (closed == false) { return false; }
+    while (i < b.len) {
+        if (ls_ws(b[i]) == false) { return false; }
+        i = i + 1;
+    }
+    var cut_a : usize = inner_a;
+    var cut_b : usize = inner_a;
+    if (model_found == 1) {
+        if (m_comma_after) {
+            cut_a = mq;
+            cut_b = m_comma + 1;
+        } else if (m_has_prev) {
+            cut_a = m_prev;
+            cut_b = mend;
+        } else {
+            cut_a = mq;
+            cut_b = mend;
+        }
+    }
+    sp[0] = model_found;
+    sp[1] = @as(u64, cut_a);
+    sp[2] = @as(u64, cut_b);
+    sp[3] = has_think;
+    sp[4] = @as(u64, inner_a);
+    sp[5] = @as(u64, inner_b);
+    return true;
+}
+
+fn ls_has_content(b: []const u8, a: usize, e: usize) -> bool {
+    var i : usize = a;
+    while (i < e) {
+        if (ls_ws(b[i]) == false) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// The body one rung is sent: {"model":"<model>"[,"thinking":{"type":"disabled"}][,<the other members>]}.
+/// `sp` is the ls_scan_top result of `body`. 0 when `out` is too small.
+pub fn ls_rewrite(body: []const u8, sp: []const u64, model: []const u8, think_off: bool, out: []u8) -> usize {
+    if (out.len < body.len + model.len + 96) { return 0; }
+    const inner_a : usize = @as(usize, sp[4]);
+    const inner_b : usize = @as(usize, sp[5]);
+    const cut_a : usize = @as(usize, sp[1]);
+    const cut_b : usize = @as(usize, sp[2]);
+    var n : usize = put_bytes(out, 0, "{\"model\":\"");
+    n = put_bytes(out, n, model);
+    n = put_bytes(out, n, "\"");
+    if (think_off) { n = put_bytes(out, n, ",\"thinking\":{\"type\":\"disabled\"}"); }
+    if (ls_has_content(body, inner_a, cut_a) or ls_has_content(body, cut_b, inner_b)) {
+        n = put_bytes(out, n, ",");
+        n = put_bytes(out, n, body[inner_a .. cut_a]);
+        n = put_bytes(out, n, body[cut_b .. inner_b]);
+    }
+    return put_bytes(out, n, "}");
+}
+
+/// The probe's request, before the model is put in: numbers 1 to 120 need more than PROBE_TOKENS of answer.
+pub fn ls_probe_base(out: []u8) -> usize {
+    return put_bytes(out, 0, "{\"max_tokens\":240,\"messages\":[{\"role\":\"user\",\"content\":\"Write the integers from 1 to 120 in plain text separated by single spaces and nothing else.\"}]}");
+}
+
+// ---- the upstream call -------------------------------------------------------------------------------------
+
+fn ls_clean_key(key: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < key.len) {
+        if (key[i] <= 32 or key[i] >= 127 or key[i] == 34 or key[i] == 39 or key[i] == 92) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The curl config one call is given on a pipe: the endpoint, the JSON headers, the key as a Bearer header
+/// when there is one, the body from standard input, the timeout of ladder.t27 and a trailer that ends the
+/// output with a newline and the HTTP status. 0 when the key is not one clean word or `out` is too small.
+pub fn ls_curl_config(url: []const u8, key: []const u8, out: []u8) -> usize {
+    if (ls_clean_key(key) == false) { return 0; }
+    if (out.len < url.len + key.len + 256) { return 0; }
+    var n : usize = put_bytes(out, 0, "silent\nurl = \"");
+    n = put_bytes(out, n, url);
+    n = put_bytes(out, n, "\"\nrequest = \"POST\"\nheader = \"Content-Type: application/json\"\n");
+    if (key.len > 0) {
+        n = put_bytes(out, n, "header = \"Authorization: Bearer ");
+        n = put_bytes(out, n, key);
+        n = put_bytes(out, n, "\"\n");
+    }
+    n = put_bytes(out, n, "data-binary = \"@-\"\nmax-time = ");
+    n = put_dec(out, n, CALL_TIMEOUT_MS / 1000);
+    return put_bytes(out, n, "\nwrite-out = \"\\n%{http_code}\"\n");
+}
+
+/// The HTTP status at the end of a curl reply (body, newline, three digits); 0 for no reply, a malformed
+/// trailer or curl's own 000 (no answer at all).
+pub fn ls_reply_status(reply: []const u8) -> u32 {
+    if (reply.len < 4) { return 0; }
+    const e : usize = reply.len;
+    if (reply[e - 4] != 10) { return 0; }
+    var v : u32 = 0;
+    var i : usize = e - 3;
+    while (i < e) {
+        if (reply[i] < 48 or reply[i] > 57) { return 0; }
+        v = v * 10 + @as(u32, reply[i] - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// The length of the body in a curl reply (everything before the newline and the status).
+pub fn ls_reply_body_len(reply: []const u8) -> usize {
+    if (reply.len < 4) { return 0; }
+    return reply.len - 4;
+}
+
+/// usage.completion_tokens of a chat reply; 0 when it is not there.
+pub fn ls_completion_tokens(body: []const u8) -> u32 {
+    const at : usize = ls_find(body, "\"completion_tokens\"", 0);
+    if (at >= body.len) { return 0; }
+    var j : usize = at + 19;
+    while (j < body.len and (ls_ws(body[j]) or body[j] == 58)) { j = j + 1; }
+    var v : u32 = 0;
+    var d : u32 = 0;
+    while (j < body.len and body[j] >= 48 and body[j] <= 57 and d < 9) {
+        v = v * 10 + @as(u32, body[j] - 48);
+        d = d + 1;
+        j = j + 1;
+    }
+    return v;
+}
+
+// ---- keys and attempts -------------------------------------------------------------------------------------
+
+/// The Keychain provider a rung's keys live under; 99 for a rung with none (ollama is keyless).
+pub fn ls_provider(r: usize) -> u32 {
+    if (r == RUNG_NVIDIA) { return P_NVIDIA; }
+    if (r == RUNG_ZAI) { return P_ZAI; }
+    if (r == RUNG_OPENROUTER) { return P_OPENROUTER; }
+    return 99;
+}
+
+pub fn ls_popcount(m: u32) -> u32 {
+    var c : u32 = 0;
+    var k : u32 = 0;
+    while (k < MAX_KEYS) {
+        if ((m >> k) % 2 == 1) { c = c + 1; }
+        k = k + 1;
+    }
+    return c;
+}
+
+/// The nth (0-based) key slot held in `mask`, counting cyclically from slot `from`; MAX_KEYS when the mask
+/// holds fewer than n + 1 keys.
+pub fn ls_key_slot(mask: u32, from: u32, nth: u32) -> u32 {
+    var seen : u32 = 0;
+    var j : u32 = 0;
+    while (j < MAX_KEYS) {
+        const k : u32 = (from + j) % MAX_KEYS;
+        if ((mask >> k) % 2 == 1) {
+            if (seen == nth) { return k; }
+            seen = seen + 1;
+        }
+        j = j + 1;
+    }
+    return MAX_KEYS;
+}
+
+/// How many attempts a rung gets: every (model, key) pair, but at most ATTEMPT_CAP.
+pub fn ls_attempt_cap(nm: usize, nk: u32) -> u32 {
+    const total : u32 = @as(u32, @intCast(nm)) * nk;
+    if (total > ATTEMPT_CAP) { return ATTEMPT_CAP; }
+    return total;
+}
+
+/// The model of attempt `att`: the sticky model, moving to the next one after every key has been tried.
+pub fn ls_plan_model(stm: usize, att: u32, nk: u32, nm: usize) -> usize {
+    if (nk == 0 or nm == 0) { return 0; }
+    return (stm + @as(usize, att / nk)) % nm;
+}
+
+/// After a non-200 answer, may the rung try another (model, key)? A quota, an unfunded or any other client
+/// refusal may be this key's or this model's; noise (5xx) and no answer (0) end the rung.
+pub fn ls_attempt_goes_on(status: u32) -> bool {
+    return status >= 400 and status < 500;
+}
+
+// ---- the answers -------------------------------------------------------------------------------------------
+
+pub fn ls_reason(code: u32) -> []const u8 {
+    if (code == 200) { return "OK"; }
+    if (code == 400) { return "Bad Request"; }
+    if (code == 404) { return "Not Found"; }
+    if (code == 413) { return "Payload Too Large"; }
+    if (code == 503) { return "Service Unavailable"; }
+    return "Error";
+}
+
+/// The head of an answer: the code, a JSON body of `body_len` bytes, the connection closed after it.
+pub fn ls_head(code: u32, body_len: usize, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "HTTP/1.1 ");
+    n = put_dec(out, n, @as(u64, code));
+    n = put_bytes(out, n, " ");
+    n = put_bytes(out, n, ls_reason(code));
+    n = put_bytes(out, n, "\r\nContent-Type: application/json\r\nContent-Length: ");
+    n = put_dec(out, n, @as(u64, body_len));
+    return put_bytes(out, n, "\r\nConnection: close\r\n\r\n");
+}
+
+pub fn ls_probe_name(p: u32) -> []const u8 {
+    if (p == PROBE_OK) { return "ok"; }
+    if (p == PROBE_REFUSED) { return "refused"; }
+    return "none";
+}
+
+fn ls_put_name(out: []u8, at: usize, r: usize) -> usize {
+    var n : usize = put_bytes(out, at, "\"");
+    n = put_bytes(out, n, rung_name(r));
+    return put_bytes(out, n, "\"");
+}
+
+/// GET /health: the rung names in table order, then per rung its key count, probe state and whether it is
+/// wired (law 8), then the last good rung (null before the first 200).
+pub fn ls_health(keys: []const u32, probe: []const u32, last_good: u32, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "{\"ok\":true,\"rungs\":[");
+    var r : usize = 0;
+    while (r < RUNG_COUNT) {
+        if (r > 0) { n = put_bytes(out, n, ","); }
+        n = ls_put_name(out, n, r);
+        r = r + 1;
+    }
+    n = put_bytes(out, n, "],\"detail\":[");
+    r = 0;
+    while (r < RUNG_COUNT) {
+        if (r > 0) { n = put_bytes(out, n, ","); }
+        n = put_bytes(out, n, "{\"rung\":");
+        n = ls_put_name(out, n, r);
+        n = put_bytes(out, n, ",\"keys\":");
+        n = put_dec(out, n, @as(u64, keys[r]));
+        n = put_bytes(out, n, ",\"probe\":\"");
+        n = put_bytes(out, n, ls_probe_name(probe[r]));
+        n = put_bytes(out, n, "\",\"wired\":");
+        if (rung_wired(rung_keyless(r) or keys[r] > 0, probe[r])) {
+            n = put_bytes(out, n, "true}");
+        } else {
+            n = put_bytes(out, n, "false}");
+        }
+        r = r + 1;
+    }
+    n = put_bytes(out, n, "],\"last_good\":");
+    if (@as(usize, last_good) < RUNG_COUNT) {
+        n = ls_put_name(out, n, @as(usize, last_good));
+    } else {
+        n = put_bytes(out, n, "null");
+    }
+    return put_bytes(out, n, "}");
+}
+
+/// The 503 body (law 3): every rung that was called and refused, in ladder order, with the status it
+/// recorded and its class; then the rungs that made no call. `tried` and `unwired` are rung bit masks,
+/// `rs` the recorded status per rung.
+pub fn ls_refusal_body(tried: u32, unwired: u32, rs: []const u32, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "{\"error\":\"all rungs refused\",\"tried\":[");
+    var from : u32 = 0;
+    var first : bool = true;
+    var live : bool = true;
+    while (live) {
+        const r : u32 = next_named(tried, from);
+        if (@as(usize, r) >= RUNG_COUNT) {
+            live = false;
+        } else {
+            if (first == false) { n = put_bytes(out, n, ","); }
+            first = false;
+            n = put_bytes(out, n, "{\"rung\":");
+            n = ls_put_name(out, n, @as(usize, r));
+            n = put_bytes(out, n, ",\"status\":");
+            n = put_dec(out, n, @as(u64, rs[@as(usize, r)]));
+            n = put_bytes(out, n, ",\"class\":\"");
+            n = put_bytes(out, n, refusal_class(rs[@as(usize, r)]));
+            n = put_bytes(out, n, "\"}");
+            from = r + 1;
+        }
+    }
+    n = put_bytes(out, n, "],\"unwired\":[");
+    first = true;
+    var u : usize = 0;
+    while (u < RUNG_COUNT) {
+        if ((unwired >> @as(u32, @intCast(u))) % 2 == 1) {
+            if (first == false) { n = put_bytes(out, n, ","); }
+            first = false;
+            n = ls_put_name(out, n, u);
+        }
+        u = u + 1;
+    }
+    return put_bytes(out, n, "]}");
+}
+
+// ---- the arena, the state and the small decisions of the host half ----------------------------------------------
+// One stack arena holds every buffer of the loop (ld_*), two small arrays hold its state (LS_* in u32, LT_* in
+// u64, lanes at LS_L0 with LF_* fields). The regions and indices are tested for fit below; nothing here moves
+// a byte, the host fns after this block do. The whole arena is one array and must stay within 131072 bytes: the
+// Verilog width gate (tools/check_verilog_widths.py) refuses a lowered width of 2^20 bits or more, which caps a
+// request at 28 KiB and a kept reply at 24 KiB until the lowering or a heap allocation carries a bigger array.
+
+pub const LD_REQ : usize = 0;
+pub const LD_WB : usize = 28672;
+pub const LD_WB_CAP : usize = 32768;
+pub const LD_REP0 : usize = 61440;
+pub const LD_REP1 : usize = 86016;
+pub const LD_OUT : usize = 110592;
+pub const LD_OUT_CAP : usize = 8192;
+pub const LD_CFG : usize = 118784;
+pub const LD_CFG_CAP : usize = 4096;
+pub const LD_PB : usize = 122880;
+pub const LD_PB_CAP : usize = 512;
+pub const LD_KEY : usize = 123392;
+pub const LD_KEY_CAP : usize = 256;
+pub const LD_TV : usize = 123648;
+pub const LD_TV_CAP : usize = 64;
+pub const LD_LOG : usize = 123712;
+pub const LD_LOG_CAP : usize = 256;
+pub const LD_BUF : usize = 123968;
+
+pub const LS_LISTEN : usize = 0;
+pub const LS_LAST : usize = 1;
+pub const LS_STM : usize = 2;
+pub const LS_STK : usize = 3;
+pub const LS_KM : usize = 4;
+pub const LS_PR : usize = 8;
+pub const LS_PORT : usize = 12;
+pub const LS_VIS : usize = 13;
+pub const LS_TRIED : usize = 14;
+pub const LS_UNW : usize = 15;
+pub const LS_RS : usize = 16;
+pub const LS_HEAD : usize = 20;
+pub const LS_BLEN : usize = 21;
+pub const LS_PBLEN : usize = 22;
+pub const LS_WIN : usize = 23;
+pub const LS_L0 : usize = 24;
+pub const LS_LSTEP : usize = 12;
+pub const LS_SIZE : usize = 64;
+pub const LF_ACT : usize = 0;
+pub const LF_RUNG : usize = 1;
+pub const LF_ATT : usize = 2;
+pub const LF_PID : usize = 3;
+pub const LF_RFD : usize = 4;
+pub const LF_GOT : usize = 5;
+pub const LF_MODEL : usize = 6;
+pub const LF_SLOT : usize = 7;
+pub const LF_STATUS : usize = 8;
+pub const LF_NK : usize = 9;
+pub const LF_CUT : usize = 10;
+pub const LT_PA : usize = 0;
+pub const LT_SCAN : usize = 4;
+pub const LT_DL : usize = 5;
+pub const LT_SP : usize = 8;
+pub const LT_PSP : usize = 16;
+pub const LT_ST : usize = 22;
+pub const LT_SIZE : usize = 24;
+pub const LANES : usize = 2;
+pub const LANE_IDLE : u32 = 0;
+pub const LANE_RUNNING : u32 = 1;
+pub const LANE_DONE : u32 = 2;
+/// Walk-loop guard: one request makes at most this many steps.
+pub const WALK_GUARD : u32 = 200;
+/// The longest wait of one poll in the pump, so a lane's deadline is looked at at least this often.
+pub const PUMP_MS : u64 = 30000;
+
+/// The arena offset where lane `lane` keeps its reply.
+pub fn ls_reply_at(lane: usize) -> usize {
+    if (lane == 0) { return LD_REP0; }
+    return LD_REP1;
+}
+
+/// The state index of a lane field.
+pub fn ls_lane_at(lane: usize, field: usize) -> usize {
+    return LS_L0 + lane * LS_LSTEP + field;
+}
+
+/// How long one poll waits: the time left to the earliest deadline, never more than PUMP_MS, 0 when it passed.
+pub fn ls_wait_ms(now: u64, deadline: u64) -> i32 {
+    if (deadline <= now) { return 0; }
+    const left : u64 = deadline - now;
+    if (left > PUMP_MS) { return @as(i32, @intCast(PUMP_MS)); }
+    return @as(i32, @intCast(left));
+}
+
+/// The status a finished lane is given: 0 when it was cut, curl exited with an error, the reply holds no
+/// trailer or filled the whole region; the trailer's HTTP status otherwise.
+pub fn ls_lane_status(cut: bool, code: u32, got: usize, reply: []const u8) -> u32 {
+    if (cut or code != 0 or got < 4 or got >= REPLY_CAP) { return 0; }
+    return ls_reply_status(reply[0 .. got]);
+}
+
+/// After a non-200 answer on attempt `att` (0-based): does the rung try the next (model, key)?
+pub fn ls_retry(status: u32, att: u32, nm: usize, nk: u32) -> bool {
+    return ls_attempt_goes_on(status) and att + 1 < ls_attempt_cap(nm, nk);
+}
+
+/// Is a rung due for a probe? It can be called (keyless or holding a key), is not proven yet, and its
+/// reprobe time has come.
+pub fn ls_probe_due(keyless: bool, keymask: u32, probe: u32, now: u64, probe_at: u64) -> bool {
+    if (keyless == false and keymask == 0) { return false; }
+    if (probe == PROBE_OK) { return false; }
+    return now >= probe_at;
+}
+
+/// The rungs the walk must not start again: tried, unwired or running.
+pub fn ls_consumed(tried: u32, unwired: u32, running: u32) -> u32 {
+    var m : u32 = 0;
+    var r : u32 = 0;
+    while (r < 4) {
+        if ((tried >> r) % 2 == 1 or (unwired >> r) % 2 == 1 or (running >> r) % 2 == 1) { m = m + (1 << r); }
+        r = r + 1;
+    }
+    return m;
+}
+
+/// One log line: [ladder] t=<secs> rung=<name> status=<n> <ms>ms, newline included.
+pub fn ls_log_line(secs: u64, rung: usize, status: u32, ms: u64, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "[ladder] t=");
+    n = put_dec(out, n, secs);
+    n = put_bytes(out, n, " rung=");
+    n = put_bytes(out, n, rung_name(rung));
+    n = put_bytes(out, n, " status=");
+    n = put_dec(out, n, @as(u64, status));
+    n = put_bytes(out, n, " ");
+    n = put_dec(out, n, ms);
+    return put_bytes(out, n, "ms\n");
+}
+
+/// Append one NUL-ended word to the packed argument words at `at`; the next free offset, 0 when it does not fit.
+fn ls_word(words: []u8, at: usize, text: []const u8) -> usize {
+    if (at + text.len + 1 > words.len) { return 0; }
+    const n : usize = put_bytes(words, at, text);
+    words[n] = 0;
+    return n + 1;
+}
+
+/// The words of the curl run: word 0 is the path, words 1..4 are argv: curl -q -K /dev/fd/3. offs[i] is where
+/// word i starts. The count of words (5), 0 when they do not fit. -q first so no ~/.curlrc is read.
+pub fn ls_curl_words(words: []u8, offs: []u32) -> u32 {
+    if (offs.len < 5) { return 0; }
+    var at : usize = 0;
+    var w : u32 = 0;
+    while (w < 5) {
+        offs[w] = @as(u32, @intCast(at));
+        if (w == 0) { at = ls_word(words, at, "/usr/bin/curl"); }
+        if (w == 1) { at = ls_word(words, at, "curl"); }
+        if (w == 2) { at = ls_word(words, at, "-q"); }
+        if (w == 3) { at = ls_word(words, at, "-K"); }
+        if (w == 4) { at = ls_word(words, at, "/dev/fd/3"); }
+        if (at == 0) { return 0; }
+        w = w + 1;
+    }
+    return 5;
+}
+
+// ---- the host half: libSystem calls, the key scan, the writes ------------------------------------------------------
+// Everything from here to the tests moves bytes through @extern calls. Under `t27b test` an @extern call does not
+// run ("import sys_getenv run outside an object"), so these fns are typechecked and built, never executed by the
+// tests; every decision they take is a tested ls_* fn above.
+
+pub const LD_SIG_PIPE : i32 = 13;
+pub const LD_SIG_CHLD : i32 = 20;
+pub const LD_HANDLER_DFL : u64 = 0;
+pub const LD_HANDLER_IGN : u64 = 1;
+pub const LD_SIGKILL : i32 = 9;
+/// posix_spawn attribute: every descriptor without a file action is closed in the child.
+pub const LD_SPAWN_CLOEXEC_DEFAULT : i32 = 16384;
+pub const LD_POLLOUT : u8 = 4;
+/// The most bytes one write to a pipe carries: POLLOUT on a pipe promises PIPE_BUF (512) bytes of room.
+pub const LD_PIPE_CHUNK : usize = 512;
+pub const LD_SOCK_CHUNK : usize = 16384;
+/// SOL_SOCKET and SO_REUSEADDR on this platform.
+pub const LD_SOL_SOCKET : i32 = 65535;
+pub const LD_SO_REUSEADDR : i32 = 4;
+
+fn ld_addr(dst: []u8, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn ld_pipe(fds: [2]u32) -> i32 { return @extern("pipe"); }
+fn ld_spawn(pid: [2]u32, path: []const u8, actions: []u8, attr: []u8, argv: [9]u64, envp: u64) -> i32 { return @extern("posix_spawn"); }
+fn ld_fa_init(fa: []u8) -> i32 { return @extern("posix_spawn_file_actions_init"); }
+fn ld_fa_destroy(fa: []u8) -> i32 { return @extern("posix_spawn_file_actions_destroy"); }
+fn ld_fa_dup2(fa: []u8, fd: i32, to: i32) -> i32 { return @extern("posix_spawn_file_actions_adddup2"); }
+fn ld_fa_close(fa: []u8, fd: i32) -> i32 { return @extern("posix_spawn_file_actions_addclose"); }
+fn ld_fa_open(fa: []u8, fd: i32, path: []const u8, flags: i32, mode: u32) -> i32 { return @extern("posix_spawn_file_actions_addopen"); }
+fn ld_attr_init(attr: []u8) -> i32 { return @extern("posix_spawnattr_init"); }
+fn ld_attr_flags(attr: []u8, flags: i32) -> i32 { return @extern("posix_spawnattr_setflags"); }
+fn ld_attr_destroy(attr: []u8) -> i32 { return @extern("posix_spawnattr_destroy"); }
+fn ld_setsockopt(fd: i32, level: i32, name: i32, val: []const u8, len: u32) -> i32 { return @extern("setsockopt"); }
+
+fn ld_close(fd: u32) -> void {
+    sys_close(@as(i32, @intCast(fd)));
+}
+
+fn ld_say(msg: []const u8) -> void {
+    sys_write(2, msg, @as(u64, msg.len));
+}
+
+/// The wall clock in milliseconds.
+fn ld_now(b: []u8) -> u64 {
+    sys_gettimeofday(b[LD_TV .. LD_TV + 16], 0);
+    return tv_ms(b[LD_TV .. LD_TV + 16]);
+}
+
+/// Write all of `data` to fd in chunks of at most `chunk` bytes, each after a POLLOUT poll of at most 5 s.
+/// False when the other end is gone or stalls (SIGPIPE is ignored by main, so a dead end is an error code).
+fn ld_write_all(fd: u32, data: []const u8, chunk: usize) -> bool {
+    var pf : [8]u8 = undefined;
+    var off : usize = 0;
+    var live : bool = true;
+    var spins : u32 = 0;
+    while (live and off < data.len) {
+        put_pollfd(pf[0..8], 0, fd);
+        pf[4] = LD_POLLOUT;
+        const r : i32 = sys_poll(pf[0..8], 1, 5000);
+        if (r == 0) {
+            live = false;
+        } else if (r < 0) {
+            spins = spins + 1;
+            if (spins > 4) { live = false; }
+        } else {
+            var n : usize = data.len - off;
+            if (n > chunk) { n = chunk; }
+            const wn : i64 = sys_write(@as(i32, @intCast(fd)), data[off .. off + n], @as(u64, n));
+            if (wn <= 0) {
+                live = false;
+            } else {
+                off = off + @as(usize, @intCast(wn));
+            }
+        }
+    }
+    return off >= data.len;
+}
+
+// ---- the keys ----------------------------------------------------------------------------------------------------
+
+/// Read the Keychain by account name: per rung the mask of key slots that hold a key (the keyless rung always
+/// holds slot 0). The key buffer is wiped after every read; no value is kept, logged or compared here.
+fn ld_scan_keys(b: []u8, s: []u32) -> void {
+    var r : usize = 0;
+    while (r < RUNG_COUNT) {
+        var mask : u32 = 0;
+        if (rung_keyless(r)) {
+            mask = 1;
+        } else {
+            const p : u32 = ls_provider(r);
+            var k : u32 = 0;
+            var misses : u32 = 0;
+            while (scan_goes_on(k, misses)) {
+                const n : usize = kc_get_n(p, k, b[LD_KEY .. LD_KEY + LD_KEY_CAP]);
+                kd_view_clear(b[LD_KEY .. LD_KEY + LD_KEY_CAP]);
+                if (n > 0) {
+                    mask = mask + (1 << k);
+                    misses = 0;
+                } else {
+                    misses = misses + 1;
+                }
+                k = k + 1;
+            }
+        }
+        s[LS_KM + r] = mask;
+        r = r + 1;
+    }
+}
+
+// ---- the upstream call: one lane = one /usr/bin/curl --------------------------------------------------------------
+
+/// Start the curl call of lane `lane` for `rung`, attempt `att`: pick the (model, key) the plan names, read that
+/// key from the Keychain, build the body (the `src_len` bytes at arena offset `src`, `sp_at` = where their
+/// ls_scan_top spans are in t) and the curl config, spawn `curl -q -K /dev/fd/3` with the body on its standard
+/// input, the config on descriptor 3 and its output on a pipe, and feed it both. The key lives in the arena only
+/// until the config is built, the config only until it is written; both are wiped at once. True when curl runs;
+/// false when nothing was started (no key, no room, no pipe, no spawn) -- then no network call was made.
+fn ld_start(b: []u8, s: []u32, t: []u64, lane: usize, rung: usize, att: u32, src: usize, src_len: usize, sp_at: usize) -> bool {
+    const la : usize = ls_lane_at(lane, 0);
+    s[la + LF_ACT] = LANE_IDLE;
+    s[la + LF_RUNG] = @as(u32, @intCast(rung));
+    s[la + LF_ATT] = att;
+    s[la + LF_PID] = 0;
+    s[la + LF_RFD] = 0;
+    s[la + LF_GOT] = 0;
+    s[la + LF_STATUS] = 0;
+    s[la + LF_CUT] = 0;
+    const km : u32 = s[LS_KM + rung];
+    const nk : u32 = ls_popcount(km);
+    const nm : usize = rung_model_count(rung);
+    s[la + LF_NK] = nk;
+    if (nk == 0 or nm == 0) { return false; }
+    const mi : usize = ls_plan_model(@as(usize, s[LS_STM]), att, nk, nm);
+    const slot : u32 = ls_key_slot(km, s[LS_STK], att % nk);
+    if (slot >= MAX_KEYS) { return false; }
+    s[la + LF_MODEL] = @as(u32, @intCast(mi));
+    s[la + LF_SLOT] = slot;
+    // the key, by account name; the keyless rung has none
+    var kn : usize = 0;
+    if (rung_keyless(rung) == false) {
+        kn = kc_get_n(ls_provider(rung), slot, b[LD_KEY .. LD_KEY + LD_KEY_CAP]);
+        if (kn == 0) {
+            kd_view_clear(b[LD_KEY .. LD_KEY + LD_KEY_CAP]);
+            return false;
+        }
+    }
+    const model : []const u8 = rung_model(rung, mi);
+    const think_off : bool = rung == RUNG_ZAI and zai_thinking_off(model, t[sp_at + 3] == 1);
+    const wn : usize = ls_rewrite(b[src .. src + src_len], t[sp_at .. sp_at + 6], model, think_off, b[LD_WB .. LD_WB + LD_WB_CAP]);
+    const cn : usize = ls_curl_config(rung_url(rung), b[LD_KEY .. LD_KEY + kn], b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+    kd_view_clear(b[LD_KEY .. LD_KEY + LD_KEY_CAP]);
+    if (wn == 0 or cn == 0) {
+        kd_view_clear(b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+        return false;
+    }
+    // the program and its argument words
+    var words : [64]u8 = undefined;
+    var offs : [5]u32 = undefined;
+    kd_view_clear(words[0..64]);
+    if (ls_curl_words(words[0..64], offs[0..5]) != 5) {
+        kd_view_clear(b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+        return false;
+    }
+    var argv : [9]u64 = undefined;
+    var a : usize = 0;
+    while (a < 9) {
+        argv[a] = 0;
+        a = a + 1;
+    }
+    const base : u64 = ld_addr(words[0..64], words[0..64], 0);
+    argv[0] = base + @as(u64, offs[1]);
+    argv[1] = base + @as(u64, offs[2]);
+    argv[2] = base + @as(u64, offs[3]);
+    argv[3] = base + @as(u64, offs[4]);
+    var ev : [8]u8 = undefined;
+    kd_view_clear(ev[0..8]);
+    sys_peek(ev[0..8], sys_environ(), 8);
+    const envp : u64 = get_u64(ev[0..8], 0);
+    // three pipes: the body (child fd 0), the output (child fd 1), the config (child fd 3)
+    var pb : [2]u32 = undefined;
+    var po : [2]u32 = undefined;
+    var pc : [2]u32 = undefined;
+    pb[0] = 0;
+    pb[1] = 0;
+    po[0] = 0;
+    po[1] = 0;
+    pc[0] = 0;
+    pc[1] = 0;
+    if (ld_pipe(pb) != 0) {
+        kd_view_clear(b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+        return false;
+    }
+    if (ld_pipe(po) != 0) {
+        ld_close(pb[0]);
+        ld_close(pb[1]);
+        kd_view_clear(b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+        return false;
+    }
+    if (ld_pipe(pc) != 0) {
+        ld_close(pb[0]);
+        ld_close(pb[1]);
+        ld_close(po[0]);
+        ld_close(po[1]);
+        kd_view_clear(b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+        return false;
+    }
+    // the child's descriptors: 0 = body, 1 = output, 2 = /dev/null, 3 = config; every other descriptor is closed
+    var dn : [16]u8 = undefined;
+    kd_view_clear(dn[0..16]);
+    put_bytes(dn[0..16], 0, "/dev/null");
+    var fa : [8]u8 = undefined;
+    var attr : [8]u8 = undefined;
+    kd_view_clear(fa[0..8]);
+    kd_view_clear(attr[0..8]);
+    const fa_ok : bool = ld_fa_init(fa[0..8]) == 0;
+    const attr_ok : bool = ld_attr_init(attr[0..8]) == 0;
+    var bad : bool = fa_ok == false or attr_ok == false;
+    if (bad == false) {
+        if (ld_attr_flags(attr[0..8], LD_SPAWN_CLOEXEC_DEFAULT) != 0) { bad = true; }
+        if (ld_fa_dup2(fa[0..8], @as(i32, @intCast(pb[0])), 0) != 0) { bad = true; }
+        if (ld_fa_dup2(fa[0..8], @as(i32, @intCast(po[1])), 1) != 0) { bad = true; }
+        if (ld_fa_open(fa[0..8], 2, dn[0..16], 1, 0) != 0) { bad = true; }
+        if (ld_fa_dup2(fa[0..8], @as(i32, @intCast(pc[0])), 3) != 0) { bad = true; }
+    }
+    var pid : [2]u32 = undefined;
+    pid[0] = 0;
+    pid[1] = 0;
+    var rc : i32 = 1;
+    if (bad == false) {
+        rc = ld_spawn(pid, words[@as(usize, offs[0]) .. 64], fa[0..8], attr[0..8], argv, envp);
+    }
+    if (fa_ok) { ld_fa_destroy(fa[0..8]); }
+    if (attr_ok) { ld_attr_destroy(attr[0..8]); }
+    ld_close(pb[0]);
+    ld_close(po[1]);
+    ld_close(pc[0]);
+    if (rc != 0) {
+        ld_close(pb[1]);
+        ld_close(po[0]);
+        ld_close(pc[1]);
+        kd_view_clear(b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+        return false;
+    }
+    const pidv : i32 = @as(i32, @intCast(pid[0]));
+    // the config first (curl reads it before the body), wiped as soon as it is written, then the body
+    var ok : bool = ld_write_all(pc[1], b[LD_CFG .. LD_CFG + cn], LD_PIPE_CHUNK);
+    kd_view_clear(b[LD_CFG .. LD_CFG + LD_CFG_CAP]);
+    ld_close(pc[1]);
+    if (ok) { ok = ld_write_all(pb[1], b[LD_WB .. LD_WB + wn], LD_PIPE_CHUNK); }
+    ld_close(pb[1]);
+    const now : u64 = ld_now(b);
+    s[la + LF_PID] = pid[0];
+    s[la + LF_RFD] = po[0];
+    s[la + LF_ACT] = LANE_RUNNING;
+    t[LT_DL + lane] = now + CALL_TIMEOUT_MS + LANE_SLACK_MS;
+    t[LT_ST + lane] = now;
+    if (ok == false) {
+        sys_kill(pidv, LD_SIGKILL);
+        s[la + LF_CUT] = 1;
+    }
+    return true;
+}
+
+/// End lane `lane`: close its read end, kill curl when the lane was cut, reap it (up to 4 waits), and settle the
+/// lane's status (ls_lane_status) and its log line. The lane is left LANE_DONE.
+fn ld_end(b: []u8, s: []u32, t: []u64, lane: usize) -> void {
+    const la : usize = ls_lane_at(lane, 0);
+    const pidv : i32 = @as(i32, @intCast(s[la + LF_PID]));
+    ld_close(s[la + LF_RFD]);
+    if (s[la + LF_CUT] == 1) { sys_kill(pidv, LD_SIGKILL); }
+    var ws : [2]u32 = undefined;
+    ws[0] = 0;
+    ws[1] = 0;
+    var wp : i32 = sys_waitpid(pidv, ws, 0);
+    var tries : u32 = 0;
+    while (wp != pidv and tries < 4) {
+        wp = sys_waitpid(pidv, ws, 0);
+        tries = tries + 1;
+    }
+    var code : u32 = 1;
+    if (wp == pidv) { code = sec_exit_code(ws[0]); }
+    const got : usize = @as(usize, s[la + LF_GOT]);
+    const at : usize = ls_reply_at(lane);
+    const st : u32 = ls_lane_status(s[la + LF_CUT] == 1, code, got, b[at .. at + got]);
+    s[la + LF_STATUS] = st;
+    s[la + LF_ACT] = LANE_DONE;
+    const now : u64 = ld_now(b);
+    var ms : u64 = 0;
+    if (now > t[LT_ST + lane]) { ms = now - t[LT_ST + lane]; }
+    const n : usize = ls_log_line(now / 1000, @as(usize, s[la + LF_RUNG]), st, ms, b[LD_LOG .. LD_LOG + LD_LOG_CAP]);
+    sys_write(2, b[LD_LOG .. LD_LOG + n], @as(u64, n));
+}
+
+/// Read what lane `lane` has ready into its reply region; the end of the stream (or a full region) ends the lane.
+fn ld_read_lane(b: []u8, s: []u32, t: []u64, lane: usize) -> void {
+    const la : usize = ls_lane_at(lane, 0);
+    const at : usize = ls_reply_at(lane);
+    const got : usize = @as(usize, s[la + LF_GOT]);
+    if (got >= REPLY_CAP) {
+        s[la + LF_CUT] = 1;
+        ld_end(b, s, t, lane);
+        return;
+    }
+    const rn : i64 = sys_read(@as(i32, @intCast(s[la + LF_RFD])), b[at + got .. at + REPLY_CAP], @as(u64, REPLY_CAP - got));
+    if (rn <= 0) {
+        ld_end(b, s, t, lane);
+        return;
+    }
+    s[la + LF_GOT] = s[la + LF_GOT] + @as(u32, @intCast(rn));
+    if (@as(usize, s[la + LF_GOT]) >= REPLY_CAP) {
+        s[la + LF_CUT] = 1;
+        ld_end(b, s, t, lane);
+    }
+}
+
+/// One wait over the running lanes: poll their read ends until the earliest deadline (never longer than PUMP_MS),
+/// read the ready ones, and cut every lane whose deadline has passed. A poll error is retried up to 4 times, then
+/// the running lanes are cut.
+fn ld_pump(b: []u8, s: []u32, t: []u64) -> void {
+    var pf : [16]u8 = undefined;
+    var who : [2]usize = undefined;
+    kd_view_clear(pf[0..16]);
+    var n : usize = 0;
+    var dl : u64 = 0;
+    var lane : usize = 0;
+    while (lane < LANES) {
+        if (s[ls_lane_at(lane, LF_ACT)] == LANE_RUNNING) {
+            put_pollfd(pf[0..16], n, s[ls_lane_at(lane, LF_RFD)]);
+            who[n] = lane;
+            if (n == 0 or t[LT_DL + lane] < dl) { dl = t[LT_DL + lane]; }
+            n = n + 1;
+        }
+        lane = lane + 1;
+    }
+    if (n == 0) { return; }
+    var now : u64 = ld_now(b);
+    var r : i32 = sys_poll(pf[0..16], @as(u64, n), ls_wait_ms(now, dl));
+    var spins : u32 = 0;
+    while (r < 0 and spins < 4) {
+        spins = spins + 1;
+        now = ld_now(b);
+        r = sys_poll(pf[0..16], @as(u64, n), ls_wait_ms(now, dl));
+    }
+    var k : usize = 0;
+    if (r < 0) {
+        while (k < n) {
+            s[ls_lane_at(who[k], LF_CUT)] = 1;
+            ld_end(b, s, t, who[k]);
+            k = k + 1;
+        }
+        return;
+    }
+    if (r > 0) {
+        while (k < n) {
+            if (poll_revents(pf[0..16], k) != 0) { ld_read_lane(b, s, t, who[k]); }
+            k = k + 1;
+        }
+    }
+    now = ld_now(b);
+    lane = 0;
+    while (lane < LANES) {
+        if (s[ls_lane_at(lane, LF_ACT)] == LANE_RUNNING and t[LT_DL + lane] <= now) {
+            s[ls_lane_at(lane, LF_CUT)] = 1;
+            ld_end(b, s, t, lane);
+        }
+        lane = lane + 1;
+    }
+}
+
+// ---- lane bookkeeping: what the state says (pure, tested) ------------------------------------------------------
+
+/// The rungs the running lanes are calling, as a rung bit mask.
+pub fn ls_running_mask(s: []const u32) -> u32 {
+    var m : u32 = 0;
+    var lane : usize = 0;
+    while (lane < LANES) {
+        if (s[ls_lane_at(lane, LF_ACT)] == LANE_RUNNING) {
+            const rg : u32 = s[ls_lane_at(lane, LF_RUNG)];
+            if ((m >> rg) % 2 == 0) { m = m + (1 << rg); }
+        }
+        lane = lane + 1;
+    }
+    return m;
+}
+
+/// Has any lane finished and not been settled yet?
+pub fn ls_any_done(s: []const u32) -> bool {
+    var lane : usize = 0;
+    while (lane < LANES) {
+        if (s[ls_lane_at(lane, LF_ACT)] == LANE_DONE) { return true; }
+        lane = lane + 1;
+    }
+    return false;
+}
+
+/// The first finished lane that holds a 200 -- either hedged lane wins, even when the other failed first;
+/// LANES when none does.
+pub fn ls_find_win(s: []const u32) -> usize {
+    var lane : usize = 0;
+    while (lane < LANES) {
+        if (s[ls_lane_at(lane, LF_ACT)] == LANE_DONE and s[ls_lane_at(lane, LF_STATUS)] == 200) { return lane; }
+        lane = lane + 1;
+    }
+    return LANES;
+}
+
+/// Law 8 on the state: the rung holds a key (or needs none) AND its probe proved it.
+pub fn ls_wired(s: []const u32, r: usize) -> bool {
+    return rung_wired(rung_keyless(r) or s[LS_KM + r] > 0, s[LS_PR + r]);
+}
+
+// ---- the walk: probe, hedge, sticky start, honest status ---------------------------------------------------------
+
+/// Wait until a lane has finished or none runs (each pump is bounded by the lane deadlines).
+fn ld_wait_any(b: []u8, s: []u32, t: []u64) -> void {
+    var spins : u32 = 0;
+    while (ls_running_mask(s) != 0 and ls_any_done(s) == false and spins < 100000) {
+        ld_pump(b, s, t);
+        spins = spins + 1;
+    }
+}
+
+/// Cut and reap every lane that still runs.
+fn ld_kill_running(b: []u8, s: []u32, t: []u64) -> void {
+    var lane : usize = 0;
+    while (lane < LANES) {
+        if (s[ls_lane_at(lane, LF_ACT)] == LANE_RUNNING) {
+            s[ls_lane_at(lane, LF_CUT)] = 1;
+            ld_end(b, s, t, lane);
+        }
+        lane = lane + 1;
+    }
+}
+
+/// Probe one rung on lane 0: one chat call that needs at least PROBE_TOKENS of answer; probe_after turns the
+/// status and the token count into the rung's state. A rung that is not proven waits REPROBE_MS for the next try.
+fn ld_probe(b: []u8, s: []u32, t: []u64, rung: usize) -> void {
+    const la : usize = ls_lane_at(0, 0);
+    s[la + LF_ACT] = LANE_IDLE;
+    if (ld_start(b, s, t, 0, rung, 0, LD_PB, @as(usize, s[LS_PBLEN]), LT_PSP) == false) {
+        t[LT_PA + rung] = ld_now(b) + REPROBE_MS;
+        return;
+    }
+    ld_wait_any(b, s, t);
+    if (s[la + LF_ACT] == LANE_RUNNING) {
+        s[la + LF_CUT] = 1;
+        ld_end(b, s, t, 0);
+    }
+    const st : u32 = s[la + LF_STATUS];
+    var tokens : u32 = 0;
+    if (st == 200) {
+        const got : usize = @as(usize, s[la + LF_GOT]);
+        const bl : usize = ls_reply_body_len(b[LD_REP0 .. LD_REP0 + got]);
+        tokens = ls_completion_tokens(b[LD_REP0 .. LD_REP0 + bl]);
+    }
+    const ps : u32 = probe_after(st, tokens);
+    s[LS_PR + rung] = ps;
+    if (ps != PROBE_OK) { t[LT_PA + rung] = ld_now(b) + REPROBE_MS; }
+    s[la + LF_ACT] = LANE_IDLE;
+}
+
+/// Probe the rungs that are due, at most `limit` of them.
+fn ld_probe_due(b: []u8, s: []u32, t: []u64, limit: u32) -> void {
+    var r : usize = 0;
+    var done : u32 = 0;
+    var now : u64 = ld_now(b);
+    while (r < RUNG_COUNT and done < limit) {
+        if (ls_probe_due(rung_keyless(r), s[LS_KM + r], s[LS_PR + r], now, t[LT_PA + r])) {
+            ld_probe(b, s, t, r);
+            done = done + 1;
+            now = ld_now(b);
+        }
+        r = r + 1;
+    }
+}
+
+/// Start the next free rung on `lane`: the sticky start over the rungs not yet consumed. A rung that is not
+/// wired (law 8), or whose call could not be started, makes NO network call and is recorded with the unwired
+/// status; the pick moves on. True when a lane now runs.
+fn ld_launch(b: []u8, s: []u32, t: []u64, lane: usize, src: usize, src_len: usize, sp_at: usize) -> bool {
+    var go : bool = true;
+    var started : bool = false;
+    var guard : u32 = 0;
+    while (go and guard < 8) {
+        guard = guard + 1;
+        const consumed : u32 = ls_consumed(s[LS_TRIED], s[LS_UNW], ls_running_mask(s));
+        const r : u32 = sticky_start(s[LS_LAST], consumed);
+        const ru : usize = @as(usize, r);
+        if (ru >= RUNG_COUNT) {
+            go = false;
+        } else if (ls_wired(s, ru) and ld_start(b, s, t, lane, ru, 0, src, src_len, sp_at)) {
+            started = true;
+            go = false;
+        } else {
+            s[LS_UNW] = s[LS_UNW] + (1 << r);
+            s[LS_RS + ru] = recorded_status(false, 0);
+        }
+    }
+    return started;
+}
+
+/// Settle a finished lane that did not answer 200: another (model, key) of the same rung while attempts are left
+/// and the refusal is a client one; otherwise record the rung as tried with its honest status, demote it on a
+/// quota or unfunded refusal (it is reprobed after REPROBE_MS) and free the lane.
+fn ld_settle(b: []u8, s: []u32, t: []u64, lane: usize, src: usize, src_len: usize, sp_at: usize) -> void {
+    const la : usize = ls_lane_at(lane, 0);
+    const rung : usize = @as(usize, s[la + LF_RUNG]);
+    const st : u32 = s[la + LF_STATUS];
+    const att : u32 = s[la + LF_ATT];
+    if (ls_retry(st, att, rung_model_count(rung), s[la + LF_NK])) {
+        if (ld_start(b, s, t, lane, rung, att + 1, src, src_len, sp_at)) { return; }
+    }
+    const rg : u32 = @as(u32, @intCast(rung));
+    if ((s[LS_TRIED] >> rg) % 2 == 0) { s[LS_TRIED] = s[LS_TRIED] + (1 << rg); }
+    s[LS_RS + rung] = recorded_status(true, st);
+    if (demotes_rung(st)) {
+        s[LS_PR + rung] = PROBE_REFUSED;
+        t[LT_PA + rung] = ld_now(b) + REPROBE_MS;
+    }
+    s[la + LF_ACT] = LANE_IDLE;
+}
+
+/// Walk the ladder for the request body (`src_len` bytes at arena offset `src`, spans at t[sp_at..]). Reset the
+/// walk, probe the due rungs, then run: the first two wired rungs from the sticky start are hedged, the first 200
+/// wins and the other lane is cut, the rest is sequential, and a 200 from either hedged lane wins even if the
+/// other failed first. True when a lane holds a 200 (its index is s[LS_WIN]); on false s[LS_TRIED], s[LS_UNW]
+/// and s[LS_RS..] hold the honest account for the 503.
+fn ld_walk(b: []u8, s: []u32, t: []u64, src: usize, src_len: usize, sp_at: usize) -> bool {
+    s[LS_TRIED] = 0;
+    s[LS_UNW] = 0;
+    s[LS_WIN] = @as(u32, @intCast(LANES));
+    var r : usize = 0;
+    while (r < RUNG_COUNT) {
+        s[LS_RS + r] = 0;
+        r = r + 1;
+    }
+    var lane : usize = 0;
+    while (lane < LANES) {
+        s[ls_lane_at(lane, LF_ACT)] = LANE_IDLE;
+        lane = lane + 1;
+    }
+    ld_probe_due(b, s, t, @as(u32, @intCast(RUNG_COUNT)));
+    var live : bool = true;
+    var won : bool = false;
+    var first : bool = true;
+    var round : u32 = 0;
+    while (live and round < WALK_GUARD) {
+        round = round + 1;
+        if (ls_running_mask(s) == 0) {
+            var started : u32 = 0;
+            if (ld_launch(b, s, t, 0, src, src_len, sp_at)) { started = started + 1; }
+            if (first and ld_launch(b, s, t, 1, src, src_len, sp_at)) { started = started + 1; }
+            first = false;
+            if (started == 0) { live = false; }
+        }
+        if (live) {
+            ld_wait_any(b, s, t);
+            const w : usize = ls_find_win(s);
+            if (w < LANES) {
+                const wa : usize = ls_lane_at(w, 0);
+                s[LS_LAST] = s[wa + LF_RUNG];
+                s[LS_STM] = s[wa + LF_MODEL];
+                s[LS_STK] = s[wa + LF_SLOT];
+                s[LS_WIN] = @as(u32, @intCast(w));
+                won = true;
+                live = false;
+            } else {
+                lane = 0;
+                while (lane < LANES) {
+                    if (s[ls_lane_at(lane, LF_ACT)] == LANE_DONE) { ld_settle(b, s, t, lane, src, src_len, sp_at); }
+                    lane = lane + 1;
+                }
+            }
+        }
+    }
+    ld_kill_running(b, s, t);
+    return won;
+}
+
+// ---- the connection: read a request, answer it ---------------------------------------------------------------------
+
+/// Read one request into the request region: poll 5000 ms per wait, read until the head is complete and
+/// head + Content-Length bytes are in. 1 = complete (s[LS_HEAD] = head length, s[LS_BLEN] = body length),
+/// 413 = it does not fit REQ_CAP, 0 = nothing usable (silent, closed or stalled).
+fn ld_read_request(b: []u8, s: []u32, cfd: u32) -> u32 {
+    var pf : [8]u8 = undefined;
+    var got : usize = 0;
+    var result : u32 = 0;
+    var live : bool = true;
+    var spins : u32 = 0;
+    while (live and spins < 4000) {
+        spins = spins + 1;
+        put_pollfd(pf[0..8], 0, cfd);
+        const r : i32 = sys_poll(pf[0..8], 1, 5000);
+        if (r <= 0) {
+            live = false;
+        } else if (got >= REQ_CAP) {
+            result = 413;
+            live = false;
+        } else {
+            const n : i64 = sys_read(@as(i32, @intCast(cfd)), b[LD_REQ + got .. LD_REQ + REQ_CAP], @as(u64, REQ_CAP - got));
+            if (n <= 0) {
+                live = false;
+            } else {
+                got = got + @as(usize, @intCast(n));
+                const he : usize = ls_header_end(b[LD_REQ .. LD_REQ + got]);
+                if (he > 0) {
+                    const cl : usize = ls_content_length(b[LD_REQ .. LD_REQ + he]);
+                    if (he + cl > REQ_CAP) {
+                        result = 413;
+                        live = false;
+                    } else if (got >= he + cl) {
+                        s[LS_HEAD] = @as(u32, @intCast(he));
+                        s[LS_BLEN] = @as(u32, @intCast(cl));
+                        result = 1;
+                        live = false;
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+/// Send one answer: the head (ls_head) built in the head region, then the `blen` body bytes at arena offset `boff`.
+fn ld_send(b: []u8, cfd: u32, code: u32, boff: usize, blen: usize) -> void {
+    const hn : usize = ls_head(code, blen, b[LD_OUT .. LD_OUT + 512]);
+    if (ld_write_all(cfd, b[LD_OUT .. LD_OUT + hn], LD_SOCK_CHUNK)) {
+        ld_write_all(cfd, b[boff .. boff + blen], LD_SOCK_CHUNK);
+    }
+}
+
+/// Send a short JSON text as the whole body (it is built after the head region, so the head fits before it).
+fn ld_send_text(b: []u8, cfd: u32, code: u32, text: []const u8) -> void {
+    const n : usize = put_bytes(b[LD_OUT + 512 .. LD_OUT + LD_OUT_CAP], 0, text);
+    ld_send(b, cfd, code, LD_OUT + 512, n);
+}
+
+/// POST /v1/chat/completions: a body that is not one JSON object is a 400; otherwise the walk; the winner's
+/// reply body goes back under a 200, and when no lane answered 200 the 503 names every tried rung with its
+/// honest recorded status (law 3) and the rungs that made no call.
+fn ld_chat(b: []u8, s: []u32, t: []u64, cfd: u32) -> void {
+    const at : usize = LD_REQ + @as(usize, s[LS_HEAD]);
+    const cl : usize = @as(usize, s[LS_BLEN]);
+    if (ls_scan_top(b[at .. at + cl], t[LT_SP .. LT_SP + 6]) == false) {
+        ld_send_text(b, cfd, 400, "{\"error\":\"bad json\"}");
+        return;
+    }
+    if (ld_walk(b, s, t, at, cl, LT_SP)) {
+        const wl : usize = @as(usize, s[LS_WIN]);
+        const ra : usize = ls_reply_at(wl);
+        const got : usize = @as(usize, s[ls_lane_at(wl, LF_GOT)]);
+        const bl : usize = ls_reply_body_len(b[ra .. ra + got]);
+        ld_send(b, cfd, 200, ra, bl);
+        return;
+    }
+    const n : usize = ls_refusal_body(s[LS_TRIED], s[LS_UNW], s[LS_RS .. LS_RS + RUNG_COUNT], b[LD_OUT + 512 .. LD_OUT + LD_OUT_CAP]);
+    ld_send(b, cfd, 503, LD_OUT + 512, n);
+}
+
+/// Serve one accepted connection: read, route, answer.
+fn ld_serve(b: []u8, s: []u32, t: []u64, cfd: u32) -> void {
+    const rr : u32 = ld_read_request(b, s, cfd);
+    if (rr == 0) { return; }
+    if (rr == 413) {
+        ld_send_text(b, cfd, 413, "{\"error\":\"request too large\"}");
+        return;
+    }
+    const route : u32 = ls_route(b[LD_REQ .. LD_REQ + @as(usize, s[LS_HEAD])]);
+    if (route == ROUTE_HEALTH) {
+        var kc : [4]u32 = undefined;
+        var r : usize = 0;
+        while (r < RUNG_COUNT) {
+            kc[r] = ls_popcount(s[LS_KM + r]);
+            r = r + 1;
+        }
+        const n : usize = ls_health(kc[0..4], s[LS_PR .. LS_PR + RUNG_COUNT], s[LS_LAST], b[LD_OUT + 512 .. LD_OUT + LD_OUT_CAP]);
+        ld_send(b, cfd, 200, LD_OUT + 512, n);
+        return;
+    }
+    if (route == ROUTE_CHAT) {
+        ld_chat(b, s, t, cfd);
+        return;
+    }
+    ld_send_text(b, cfd, 404, "{\"error\":\"post /v1/chat/completions\"}");
+}
+
+/// Between connections: rescan the keys when KEY_RESCAN_MS has passed, and probe one due rung.
+fn ld_idle(b: []u8, s: []u32, t: []u64) -> void {
+    const now : u64 = ld_now(b);
+    if (now >= t[LT_SCAN]) {
+        ld_scan_keys(b, s);
+        t[LT_SCAN] = now + KEY_RESCAN_MS;
+    }
+    ld_probe_due(b, s, t, 1);
+}
+
+/// The T27 Ladder: bind 127.0.0.1 on LADDER_PORT (the constant, or the environment value when it is a port),
+/// scan the keys, then serve one client at a time forever.
+pub fn main() -> void {
+    var buf : [LD_BUF]u8 = undefined;
+    var s : [LS_SIZE]u32 = undefined;
+    var t : [LT_SIZE]u64 = undefined;
+    kd_view_clear(buf[0 .. LD_BUF]);
+    var z : usize = 0;
+    while (z < LS_SIZE) {
+        s[z] = 0;
+        z = z + 1;
+    }
+    z = 0;
+    while (z < LT_SIZE) {
+        t[z] = 0;
+        z = z + 1;
+    }
+    s[LS_LAST] = @as(u32, @intCast(RUNG_COUNT));
+    sys_signal(LD_SIG_PIPE, LD_HANDLER_IGN);
+    sys_signal(LD_SIG_CHLD, LD_HANDLER_DFL);
+    var port : u32 = LADDER_PORT;
+    const ep : u64 = sys_getenv("LADDER_PORT");
+    if (ep != 0) {
+        var en : u64 = sys_strlen(ep);
+        if (en > 16) { en = 16; }
+        sys_peek(buf[LD_PB .. LD_PB + 16], ep, en);
+        const pv : u32 = ls_parse_port(buf[LD_PB .. LD_PB + @as(usize, @intCast(en))]);
+        if (pv > 0) { port = pv; }
+        kd_view_clear(buf[LD_PB .. LD_PB + 16]);
+    }
+    s[LS_PORT] = port;
+    const pbn : usize = ls_probe_base(buf[LD_PB .. LD_PB + LD_PB_CAP]);
+    if (ls_scan_top(buf[LD_PB .. LD_PB + pbn], t[LT_PSP .. LT_PSP + 6]) == false) {
+        ld_say("[ladder] cannot read its own probe body\n");
+        sys_exit(1);
+        return;
+    }
+    s[LS_PBLEN] = @as(u32, @intCast(pbn));
+    const lfd : i32 = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        ld_say("[ladder] socket failed\n");
+        sys_exit(1);
+        return;
+    }
+    var one : [4]u8 = undefined;
+    one[0] = 1;
+    one[1] = 0;
+    one[2] = 0;
+    one[3] = 0;
+    ld_setsockopt(lfd, LD_SOL_SOCKET, LD_SO_REUSEADDR, one[0..4], 4);
+    var addr : [16]u8 = undefined;
+    if (sockaddr_in_fill(@as(u16, @intCast(port)), "127.0.0.1", addr[0..16]) != 16) {
+        ld_say("[ladder] bad address\n");
+        sys_exit(1);
+        return;
+    }
+    if (sys_bind(lfd, addr[0..16], 16) != 0) {
+        ld_say("[ladder] bind failed\n");
+        sys_exit(1);
+        return;
+    }
+    if (sys_listen(lfd, 8) != 0) {
+        ld_say("[ladder] listen failed\n");
+        sys_exit(1);
+        return;
+    }
+    s[LS_LISTEN] = @as(u32, @intCast(lfd));
+    ld_scan_keys(buf[0 .. LD_BUF], s[0 .. LS_SIZE]);
+    t[LT_SCAN] = ld_now(buf[0 .. LD_BUF]) + KEY_RESCAN_MS;
+    var ln : usize = put_bytes(buf[LD_LOG .. LD_LOG + LD_LOG_CAP], 0, "[ladder] listening on 127.0.0.1:");
+    ln = put_dec(buf[LD_LOG .. LD_LOG + LD_LOG_CAP], ln, @as(u64, port));
+    ln = put_bytes(buf[LD_LOG .. LD_LOG + LD_LOG_CAP], ln, "\n");
+    sys_write(2, buf[LD_LOG .. LD_LOG + ln], @as(u64, ln));
+    var pf : [8]u8 = undefined;
+    while (true) {
+        put_pollfd(pf[0..8], 0, s[LS_LISTEN]);
+        const r : i32 = sys_poll(pf[0..8], 1, 1000);
+        if (r > 0 and poll_revents(pf[0..8], 0) != 0) {
+            const cfd : i32 = sys_accept(lfd, 0, 0);
+            if (cfd >= 0) {
+                ld_serve(buf[0 .. LD_BUF], s[0 .. LS_SIZE], t[0 .. LT_SIZE], @as(u32, @intCast(cfd)));
+                sys_close(cfd);
+            }
+        } else {
+            ld_idle(buf[0 .. LD_BUF], s[0 .. LS_SIZE], t[0 .. LT_SIZE]);
+        }
+    }
+}
+
+// ---- tests of the pure half ----------------------------------------------------------------------------------
+
+test "a_request_line_routes_health_and_chat_only" {
+    assert ls_route("GET /health HTTP/1.1\r\nHost: x\r\n\r\n") == ROUTE_HEALTH;
+    assert ls_route("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n") == ROUTE_CHAT;
+    assert ls_route("GET /v1/chat/completions HTTP/1.1\r\n\r\n") == ROUTE_OTHER;
+    assert ls_route("POST /health HTTP/1.1\r\n\r\n") == ROUTE_OTHER;
+    assert ls_route("POST /v1/messages HTTP/1.1\r\n\r\n") == ROUTE_OTHER;
+    assert ls_route("garbage") == ROUTE_OTHER;
+    assert ls_route("") == ROUTE_OTHER;
+}
+
+test "the_head_end_and_the_content_length_are_read_in_any_case" {
+    const req : []const u8 = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\ncontent-LENGTH:  17\r\n\r\n{\"model\":\"abc\"}";
+    const he : usize = ls_header_end(req);
+    assert he > 0;
+    assert he + 15 == req.len;
+    assert ls_content_length(req[0 .. he]) == 17;
+    assert ls_header_end("POST / HTTP/1.1\r\nHost: x\r\n") == 0;
+    assert ls_content_length("GET /health HTTP/1.1\r\nHost: x\r\n\r\n") == 0;
+    assert ls_content_length("POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n") == 4;
+}
+
+test "the_port_parses_or_is_zero" {
+    assert ls_parse_port("3131") == 3131;
+    assert ls_parse_port("3132") == 3132;
+    assert ls_parse_port("") == 0;
+    assert ls_parse_port("0") == 0;
+    assert ls_parse_port("65536") == 0;
+    assert ls_parse_port("31x1") == 0;
+    assert ls_parse_port("123456") == 0;
+    assert LADDER_PORT == 3131;
+}
+
+test "the_model_member_is_replaced_in_every_position" {
+    var sp : [6]u64 = undefined;
+    var out : [512]u8 = undefined;
+    const first : []const u8 = "{\"model\":\"x\",\"a\":1}";
+    assert ls_scan_top(first, sp[0..6]);
+    var n : usize = ls_rewrite(first, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\",\"a\":1}");
+    const middle : []const u8 = "{\"a\":1,\"model\":\"x\",\"c\":3}";
+    assert ls_scan_top(middle, sp[0..6]);
+    n = ls_rewrite(middle, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\",\"a\":1,\"c\":3}");
+    const last : []const u8 = "{\"a\":1,\"model\":\"x\"}";
+    assert ls_scan_top(last, sp[0..6]);
+    n = ls_rewrite(last, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\",\"a\":1}");
+    const lone : []const u8 = "{\"model\":\"x\"}";
+    assert ls_scan_top(lone, sp[0..6]);
+    n = ls_rewrite(lone, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\"}");
+    const none : []const u8 = "{\"a\":1}";
+    assert ls_scan_top(none, sp[0..6]);
+    assert sp[0] == 0;
+    n = ls_rewrite(none, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\",\"a\":1}");
+}
+
+test "only_the_top_level_member_counts_and_strings_hide_their_braces" {
+    var sp : [6]u64 = undefined;
+    var out : [512]u8 = undefined;
+    const deep : []const u8 = "{\"messages\":[{\"model\":\"z\"}],\"model\":\"x\"}";
+    assert ls_scan_top(deep, sp[0..6]);
+    var n : usize = ls_rewrite(deep, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\",\"messages\":[{\"model\":\"z\"}]}");
+    const spaced : []const u8 = "  { \"model\" : \"x\" , \"a\" : [1, {\"b\":\"}\"}] }  ";
+    assert ls_scan_top(spaced, sp[0..6]);
+    n = ls_rewrite(spaced, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\",  \"a\" : [1, {\"b\":\"}\"}] }");
+    const escaped : []const u8 = "{\"model\":\"a\\\"}\",\"b\":2}";
+    assert ls_scan_top(escaped, sp[0..6]);
+    n = ls_rewrite(escaped, sp[0..6], "M1", false, out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"M1\",\"b\":2}");
+}
+
+test "a_body_that_is_not_one_object_is_refused" {
+    var sp : [6]u64 = undefined;
+    assert ls_scan_top("", sp[0..6]) == false;
+    assert ls_scan_top("[1]", sp[0..6]) == false;
+    assert ls_scan_top("{", sp[0..6]) == false;
+    assert ls_scan_top("{\"model\":\"x\"", sp[0..6]) == false;
+    assert ls_scan_top("{\"a\":1}}", sp[0..6]) == false;
+    assert ls_scan_top("{\"a\":1} x", sp[0..6]) == false;
+    assert ls_scan_top("{\"model\":\"a\",\"model\":\"b\"}", sp[0..6]) == false;
+    assert ls_scan_top("{\"a\":[1}", sp[0..6]) == false;
+    assert ls_scan_top("{\"a\":1}  \n", sp[0..6]);
+}
+
+test "thinking_goes_off_on_the_zai_head_unless_the_client_asked" {
+    var sp : [6]u64 = undefined;
+    var out : [512]u8 = undefined;
+    const plain : []const u8 = "{\"model\":\"x\",\"a\":1}";
+    assert ls_scan_top(plain, sp[0..6]);
+    assert sp[3] == 0;
+    var n : usize = ls_rewrite(plain, sp[0..6], "glm-5.3-flash", zai_thinking_off("glm-5.3-flash", sp[3] == 1), out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"glm-5.3-flash\",\"thinking\":{\"type\":\"disabled\"},\"a\":1}");
+    const asked : []const u8 = "{\"model\":\"x\",\"thinking\":{\"type\":\"enabled\"}}";
+    assert ls_scan_top(asked, sp[0..6]);
+    assert sp[3] == 1;
+    n = ls_rewrite(asked, sp[0..6], "glm-5.3-flash", zai_thinking_off("glm-5.3-flash", sp[3] == 1), out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"glm-5.3-flash\",\"thinking\":{\"type\":\"enabled\"}}");
+    assert ls_scan_top(plain, sp[0..6]);
+    n = ls_rewrite(plain, sp[0..6], "gemma4:31b-cloud", zai_thinking_off("gemma4:31b-cloud", false), out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"gemma4:31b-cloud\",\"a\":1}");
+    var tiny : [8]u8 = undefined;
+    assert ls_rewrite(plain, sp[0..6], "M1", false, tiny[0..8]) == 0;
+}
+
+test "the_probe_request_is_turn_sized_and_rewrites_like_any_body" {
+    var base : [512]u8 = undefined;
+    var sp : [6]u64 = undefined;
+    var out : [768]u8 = undefined;
+    const bn : usize = ls_probe_base(base[0..512]);
+    assert bn > 100;
+    assert ls_scan_top(base[0..bn], sp[0..6]);
+    assert sp[0] == 0;
+    const n : usize = ls_rewrite(base[0..bn], sp[0..6], "M1", false, out[0..768]);
+    assert ls_find(out[0..n], "\"max_tokens\":240", 0) < n;
+    assert ls_find(out[0..n], "\"model\":\"M1\"", 0) == 1;
+}
+
+test "the_curl_config_carries_the_key_only_when_there_is_one" {
+    var out : [768]u8 = undefined;
+    const keyed : usize = ls_curl_config("https://example.test/v1/chat/completions", "k-ABC_123", out[0..768]);
+    assert keyed > 0;
+    assert ls_find(out[0..keyed], "url = \"https://example.test/v1/chat/completions\"", 0) < keyed;
+    assert ls_find(out[0..keyed], "header = \"Authorization: Bearer k-ABC_123\"", 0) < keyed;
+    assert ls_find(out[0..keyed], "data-binary = \"@-\"", 0) < keyed;
+    assert ls_find(out[0..keyed], "max-time = 90\n", 0) < keyed;
+    assert ls_find(out[0..keyed], "write-out = \"\\n%{http_code}\"", 0) < keyed;
+    const keyless : usize = ls_curl_config("http://127.0.0.1:11434/v1/chat/completions", "", out[0..768]);
+    assert keyless > 0;
+    assert ls_find(out[0..keyless], "Authorization", 0) == keyless;
+    assert ls_curl_config("http://x", "a\"b", out[0..768]) == 0;
+    assert ls_curl_config("http://x", "a b", out[0..768]) == 0;
+    assert ls_curl_config("http://x", "a\\b", out[0..768]) == 0;
+    var tiny : [64]u8 = undefined;
+    assert ls_curl_config("http://x", "k", tiny[0..64]) == 0;
+}
+
+test "the_reply_ends_with_a_newline_and_the_http_status" {
+    assert ls_reply_status("{\"a\":1}\n200") == 200;
+    assert ls_reply_status("oops\n429") == 429;
+    assert ls_reply_status("\n503") == 503;
+    assert ls_reply_status("\n000") == 0;
+    assert ls_reply_status("") == 0;
+    assert ls_reply_status("200") == 0;
+    assert ls_reply_status("no trailer") == 0;
+    assert ls_reply_status("x20x") == 0;
+    assert ls_reply_body_len("{\"a\":1}\n200") == 7;
+    assert ls_reply_body_len("\n200") == 0;
+}
+
+test "completion_tokens_are_read_from_usage" {
+    assert ls_completion_tokens("{\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":240,\"total_tokens\":252}}") == 240;
+    assert ls_completion_tokens("{\"usage\":{\"completion_tokens\" : 99}}") == 99;
+    assert ls_completion_tokens("{\"choices\":[]}") == 0;
+    assert ls_completion_tokens("{\"completion_tokens\":\"x\"}") == 0;
+}
+
+test "key_slots_rotate_over_the_mask_from_the_sticky_slot" {
+    assert ls_popcount(0) == 0;
+    assert ls_popcount(5) == 2;
+    assert ls_popcount(255) == 8;
+    assert ls_key_slot(5, 0, 0) == 0;
+    assert ls_key_slot(5, 0, 1) == 2;
+    assert ls_key_slot(5, 0, 2) == MAX_KEYS;
+    assert ls_key_slot(5, 1, 0) == 2;
+    assert ls_key_slot(5, 3, 0) == 0;
+    assert ls_key_slot(5, 3, 1) == 2;
+    assert ls_key_slot(0, 0, 0) == MAX_KEYS;
+}
+
+test "the_attempt_plan_walks_keys_first_then_models_and_stops_at_the_cap" {
+    assert ls_attempt_cap(3, 5) == ATTEMPT_CAP;
+    assert ls_attempt_cap(3, 1) == 3;
+    assert ls_attempt_cap(1, 1) == 1;
+    assert ls_attempt_cap(1, 0) == 0;
+    assert ls_plan_model(0, 0, 2, 3) == 0;
+    assert ls_plan_model(0, 1, 2, 3) == 0;
+    assert ls_plan_model(0, 2, 2, 3) == 1;
+    assert ls_plan_model(2, 2, 2, 3) == 0;
+    assert ls_plan_model(1, 5, 0, 3) == 0;
+    assert ls_plan_model(1, 5, 2, 0) == 0;
+}
+
+test "quota_and_client_refusals_try_the_next_key_but_noise_and_silence_end_the_rung" {
+    assert ls_attempt_goes_on(429);
+    assert ls_attempt_goes_on(402);
+    assert ls_attempt_goes_on(401);
+    assert ls_attempt_goes_on(403);
+    assert ls_attempt_goes_on(404) ;
+    assert ls_attempt_goes_on(500) == false;
+    assert ls_attempt_goes_on(503) == false;
+    assert ls_attempt_goes_on(529) == false;
+    assert ls_attempt_goes_on(0) == false;
+    assert ls_attempt_goes_on(200) == false;
+    assert demotes_rung(429);
+    assert demotes_rung(500) == false;
+}
+
+test "the_heads_carry_the_code_the_length_and_close_the_connection" {
+    var out : [256]u8 = undefined;
+    var n : usize = ls_head(200, 7, out[0..256]);
+    assert bytes_eq(out[0..n], "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\nConnection: close\r\n\r\n");
+    n = ls_head(503, 120, out[0..256]);
+    assert ls_find(out[0..n], "HTTP/1.1 503 Service Unavailable\r\n", 0) == 0;
+    assert ls_find(out[0..n], "Content-Length: 120\r\n", 0) < n;
+    n = ls_head(404, 0, out[0..256]);
+    assert ls_find(out[0..n], "404 Not Found", 0) < n;
+    n = ls_head(400, 0, out[0..256]);
+    assert ls_find(out[0..n], "400 Bad Request", 0) < n;
+    n = ls_head(413, 0, out[0..256]);
+    assert ls_find(out[0..n], "413 Payload Too Large", 0) < n;
+}
+
+test "health_lists_the_rungs_of_the_table_and_no_deepseek" {
+    var keys : [4]u32 = undefined;
+    var probe : [4]u32 = undefined;
+    var out : [1024]u8 = undefined;
+    keys[0] = 0;
+    keys[1] = 2;
+    keys[2] = 0;
+    keys[3] = 1;
+    probe[0] = PROBE_REFUSED;
+    probe[1] = PROBE_OK;
+    probe[2] = PROBE_OK;
+    probe[3] = PROBE_NONE;
+    const n : usize = ls_health(keys[0..4], probe[0..4], 1, out[0..1024]);
+    assert ls_find(out[0..n], "deepseek", 0) == n;
+    assert ls_find(out[0..n], "\"rungs\":[\"nvidia\",\"zai\",\"ollama\",\"openrouter\"]", 0) < n;
+    assert ls_find(out[0..n], "{\"rung\":\"nvidia\",\"keys\":0,\"probe\":\"refused\",\"wired\":false}", 0) < n;
+    assert ls_find(out[0..n], "{\"rung\":\"zai\",\"keys\":2,\"probe\":\"ok\",\"wired\":true}", 0) < n;
+    assert ls_find(out[0..n], "{\"rung\":\"ollama\",\"keys\":0,\"probe\":\"ok\",\"wired\":true}", 0) < n;
+    assert ls_find(out[0..n], "{\"rung\":\"openrouter\",\"keys\":1,\"probe\":\"none\",\"wired\":false}", 0) < n;
+    assert ls_find(out[0..n], "\"last_good\":\"zai\"}", 0) < n;
+    const m : usize = ls_health(keys[0..4], probe[0..4], 4, out[0..1024]);
+    assert ls_find(out[0..m], "\"last_good\":null}", 0) < m;
+    var seen : u32 = 0;
+    var at : usize = 0;
+    var live : bool = true;
+    while (live) {
+        const f : usize = ls_find(out[0..m], "{\"rung\":", at);
+        if (f >= m) {
+            live = false;
+        } else {
+            seen = seen + 1;
+            at = f + 1;
+        }
+    }
+    assert seen == 4;
+}
+
+test "the_503_names_every_tried_rung_with_its_class_and_lists_the_unwired" {
+    var rs : [4]u32 = undefined;
+    var out : [512]u8 = undefined;
+    rs[0] = 403;
+    rs[1] = 429;
+    rs[2] = 0;
+    rs[3] = 0;
+    var n : usize = ls_refusal_body(3, 12, rs[0..4], out[0..512]);
+    assert bytes_eq(out[0..n], "{\"error\":\"all rungs refused\",\"tried\":[{\"rung\":\"nvidia\",\"status\":403,\"class\":\"denied\"},{\"rung\":\"zai\",\"status\":429,\"class\":\"quota\"}],\"unwired\":[\"ollama\",\"openrouter\"]}");
+    rs[2] = 0;
+    rs[3] = 503;
+    n = ls_refusal_body(12, 3, rs[0..4], out[0..512]);
+    assert ls_find(out[0..n], "{\"rung\":\"ollama\",\"status\":0,\"class\":\"unreachable\"}", 0) < n;
+    assert ls_find(out[0..n], "{\"rung\":\"openrouter\",\"status\":503,\"class\":\"noise\"}", 0) < n;
+    assert ls_find(out[0..n], "\"unwired\":[\"nvidia\",\"zai\"]", 0) < n;
+    n = ls_refusal_body(0, 15, rs[0..4], out[0..512]);
+    assert bytes_eq(out[0..n], "{\"error\":\"all rungs refused\",\"tried\":[],\"unwired\":[\"nvidia\",\"zai\",\"ollama\",\"openrouter\"]}");
+}
+
+test "a_rung_maps_to_its_keychain_provider_and_ollama_has_none" {
+    assert ls_provider(RUNG_NVIDIA) == P_NVIDIA;
+    assert ls_provider(RUNG_ZAI) == P_ZAI;
+    assert ls_provider(RUNG_OPENROUTER) == P_OPENROUTER;
+    assert ls_provider(2) == 99;
+    assert sticky_start(1, 0) == 1;
+    assert sticky_start(1, 2) == 0;
+    assert sticky_start(4, 1) == 1;
+}
+
+test "the_arena_regions_do_not_overlap" {
+    assert LD_REQ + REQ_CAP <= LD_WB;
+    assert LD_WB + LD_WB_CAP <= LD_REP0;
+    assert LD_REP0 + REPLY_CAP <= LD_REP1;
+    assert LD_REP1 + REPLY_CAP <= LD_OUT;
+    assert LD_OUT + LD_OUT_CAP <= LD_CFG;
+    assert LD_CFG + LD_CFG_CAP <= LD_PB;
+    assert LD_PB + LD_PB_CAP <= LD_KEY;
+    assert LD_KEY + LD_KEY_CAP <= LD_TV;
+    assert LD_TV + LD_TV_CAP <= LD_LOG;
+    assert LD_LOG + LD_LOG_CAP <= LD_BUF;
+    assert LD_REP1 - LD_REP0 == REPLY_CAP;
+    assert LD_BUF == 123968;
+    // the Verilog lowering carries a width of at most 2^20 bits: one array of 131072 bytes is its ceiling
+    assert LD_BUF <= 131072;
+    // a rewritten body is at most the request plus the model and the thinking member
+    assert REQ_CAP + 256 <= LD_WB_CAP;
+    // the config needs the url, the key and 256 bytes of fixed text
+    assert 256 + LD_KEY_CAP + 256 <= LD_CFG_CAP;
+    // a probe base fits its region with room for the model
+    assert LD_PB_CAP >= 300;
+}
+
+test "the_state_indices_fit_and_do_not_overlap" {
+    assert LS_KM + 4 <= LS_PR;
+    assert LS_PR + 4 <= LS_PORT;
+    assert LS_RS + 4 <= LS_HEAD;
+    assert LS_WIN < LS_L0;
+    assert LS_L0 + LANES * LS_LSTEP <= LS_SIZE;
+    assert LF_CUT < LS_LSTEP;
+    assert LF_ACT == 0;
+    assert LF_NK < LF_CUT;
+    assert LT_PA + 4 <= LT_SCAN;
+    assert LT_SCAN < LT_DL;
+    assert LT_DL + LANES <= LT_SP;
+    assert LT_SP + 6 <= LT_PSP;
+    assert LT_PSP + 6 <= LT_ST;
+    assert LT_ST + LANES <= LT_SIZE;
+    assert ls_lane_at(0, LF_ACT) == 24;
+    assert ls_lane_at(1, LF_CUT) == 24 + 12 + 10;
+    assert ls_reply_at(0) == LD_REP0 and ls_reply_at(1) == LD_REP1;
+    assert RUNG_COUNT == 4;
+}
+
+test "the_log_line_names_the_rung_the_status_and_the_milliseconds" {
+    var out : [128]u8 = undefined;
+    var n : usize = ls_log_line(1700000000, RUNG_ZAI, 200, 1234, out[0..128]);
+    assert bytes_eq(out[0..n], "[ladder] t=1700000000 rung=zai status=200 1234ms\n");
+    n = ls_log_line(5, RUNG_NVIDIA, 0, 0, out[0..128]);
+    assert bytes_eq(out[0..n], "[ladder] t=5 rung=nvidia status=0 0ms\n");
+    n = ls_log_line(9, RUNG_OPENROUTER, 429, 90001, out[0..128]);
+    assert bytes_eq(out[0..n], "[ladder] t=9 rung=openrouter status=429 90001ms\n");
+}
+
+test "the_wait_is_the_time_left_capped_and_zero_when_it_passed" {
+    assert ls_wait_ms(100, 100) == 0;
+    assert ls_wait_ms(200, 100) == 0;
+    assert ls_wait_ms(100, 600) == 500;
+    assert ls_wait_ms(0, 90000) == 30000;
+    assert ls_wait_ms(0, 30000) == 30000;
+    assert ls_wait_ms(1, 30000) == 29999;
+}
+
+test "a_lane_status_is_the_trailer_unless_it_was_cut_or_failed" {
+    const reply : []const u8 = "{\"a\":1}\n200";
+    assert ls_lane_status(false, 0, reply.len, reply) == 200;
+    assert ls_lane_status(true, 0, reply.len, reply) == 0;
+    assert ls_lane_status(false, 28, reply.len, reply) == 0;
+    assert ls_lane_status(false, 256, reply.len, reply) == 0;
+    assert ls_lane_status(false, 0, 3, reply) == 0;
+    assert ls_lane_status(false, 0, 0, reply) == 0;
+    assert ls_lane_status(false, 0, REPLY_CAP, reply) == 0;
+    const refused : []const u8 = "{}\n429";
+    assert ls_lane_status(false, 0, refused.len, refused) == 429;
+    const nothing : []const u8 = "\n000";
+    assert ls_lane_status(false, 0, nothing.len, nothing) == 0;
+}
+
+test "a_retry_needs_a_client_refusal_and_an_attempt_left" {
+    assert ls_retry(429, 0, 2, 2);
+    assert ls_retry(402, 2, 2, 2);
+    assert ls_retry(404, 0, 1, 2);
+    assert ls_retry(429, 3, 2, 2) == false;
+    assert ls_retry(429, 5, 4, 4) == false;
+    assert ls_retry(429, 4, 4, 4);
+    assert ls_retry(500, 0, 2, 2) == false;
+    assert ls_retry(0, 0, 2, 2) == false;
+    assert ls_retry(200, 0, 2, 2) == false;
+    assert ls_retry(429, 0, 1, 1) == false;
+}
+
+test "a_probe_is_due_for_a_callable_unproven_rung_after_its_time" {
+    assert ls_probe_due(true, 1, PROBE_NONE, 10, 0);
+    assert ls_probe_due(false, 0, PROBE_NONE, 10, 0) == false;
+    assert ls_probe_due(false, 1, PROBE_NONE, 10, 0);
+    assert ls_probe_due(false, 4, PROBE_REFUSED, 10, 0);
+    assert ls_probe_due(false, 4, PROBE_REFUSED, 10, 11) == false;
+    assert ls_probe_due(false, 4, PROBE_REFUSED, 11, 11);
+    assert ls_probe_due(false, 4, PROBE_OK, 99999999, 0) == false;
+    assert ls_probe_due(true, 1, PROBE_OK, 99999999, 0) == false;
+}
+
+test "the_walk_consumed_mask_joins_tried_unwired_and_running" {
+    assert ls_consumed(0, 0, 0) == 0;
+    assert ls_consumed(1, 2, 4) == 7;
+    assert ls_consumed(9, 0, 0) == 9;
+    assert ls_consumed(0, 15, 0) == 15;
+    assert ls_consumed(255, 0, 0) == 15;
+    // the sticky start skips what is consumed and falls back to the lowest free rung
+    assert sticky_start(1, ls_consumed(0, 2, 0)) == 0;
+    assert sticky_start(1, ls_consumed(1, 0, 0)) == 1;
+    assert sticky_start(0, ls_consumed(1, 0, 0)) == 1;
+    assert sticky_start(3, ls_consumed(0, 8, 1)) == 1;
+    assert sticky_start(2, ls_consumed(1, 2, 12)) == 4;
+}
+
+test "the_curl_words_are_the_path_and_the_argv" {
+    var words : [64]u8 = undefined;
+    var offs : [5]u32 = undefined;
+    assert ls_curl_words(words[0..64], offs[0..5]) == 5;
+    assert offs[0] == 0;
+    assert bytes_eq(words[0..13], "/usr/bin/curl");
+    assert words[13] == 0;
+    assert offs[1] == 14;
+    assert bytes_eq(words[14..18], "curl");
+    assert words[18] == 0;
+    assert offs[2] == 19;
+    assert bytes_eq(words[19..21], "-q");
+    assert words[21] == 0;
+    assert offs[3] == 22;
+    assert bytes_eq(words[22..24], "-K");
+    assert words[24] == 0;
+    assert offs[4] == 25;
+    assert bytes_eq(words[25..34], "/dev/fd/3");
+    assert words[34] == 0;
+    assert ls_curl_words(words[0..34], offs[0..5]) == 0;
+    assert ls_curl_words(words[0..35], offs[0..5]) == 5;
+    assert ls_curl_words(words[0..64], offs[0..4]) == 0;
+}
+
+test "the_running_mask_names_the_rungs_of_the_running_lanes" {
+    var s : [64]u32 = undefined;
+    var z : usize = 0;
+    while (z < 64) {
+        s[z] = 0;
+        z = z + 1;
+    }
+    assert ls_running_mask(s[0..64]) == 0;
+    s[ls_lane_at(0, LF_ACT)] = LANE_RUNNING;
+    s[ls_lane_at(0, LF_RUNG)] = 1;
+    assert ls_running_mask(s[0..64]) == 2;
+    s[ls_lane_at(1, LF_ACT)] = LANE_RUNNING;
+    s[ls_lane_at(1, LF_RUNG)] = 3;
+    assert ls_running_mask(s[0..64]) == 10;
+    s[ls_lane_at(0, LF_ACT)] = LANE_DONE;
+    assert ls_running_mask(s[0..64]) == 8;
+    assert ls_any_done(s[0..64]);
+    s[ls_lane_at(0, LF_ACT)] = LANE_IDLE;
+    assert ls_any_done(s[0..64]) == false;
+}
+
+test "a_200_from_either_hedged_lane_wins_even_when_the_other_failed_first" {
+    var s : [64]u32 = undefined;
+    var z : usize = 0;
+    while (z < 64) {
+        s[z] = 0;
+        z = z + 1;
+    }
+    // nothing finished: no winner
+    assert ls_find_win(s[0..64]) == LANES;
+    // lane 0 finished with a refusal, lane 1 still runs: no winner yet
+    s[ls_lane_at(0, LF_ACT)] = LANE_DONE;
+    s[ls_lane_at(0, LF_STATUS)] = 429;
+    s[ls_lane_at(1, LF_ACT)] = LANE_RUNNING;
+    s[ls_lane_at(1, LF_STATUS)] = 0;
+    assert ls_find_win(s[0..64]) == LANES;
+    // lane 1 answers 200 after lane 0 failed: lane 1 wins
+    s[ls_lane_at(1, LF_ACT)] = LANE_DONE;
+    s[ls_lane_at(1, LF_STATUS)] = 200;
+    assert ls_find_win(s[0..64]) == 1;
+    // both 200: the first lane
+    s[ls_lane_at(0, LF_STATUS)] = 200;
+    assert ls_find_win(s[0..64]) == 0;
+    // a 200 that is still running is not a win
+    s[ls_lane_at(0, LF_ACT)] = LANE_RUNNING;
+    s[ls_lane_at(1, LF_STATUS)] = 503;
+    assert ls_find_win(s[0..64]) == LANES;
+}
+
+test "a_rung_is_wired_only_with_a_key_and_a_proven_probe" {
+    var s : [64]u32 = undefined;
+    var z : usize = 0;
+    while (z < 64) {
+        s[z] = 0;
+        z = z + 1;
+    }
+    // a keyed rung: no key, key unproven, key proven, key refused
+    assert ls_wired(s[0..64], RUNG_NVIDIA) == false;
+    s[LS_KM + RUNG_NVIDIA] = 1;
+    assert ls_wired(s[0..64], RUNG_NVIDIA) == false;
+    s[LS_PR + RUNG_NVIDIA] = PROBE_OK;
+    assert ls_wired(s[0..64], RUNG_NVIDIA);
+    s[LS_PR + RUNG_NVIDIA] = PROBE_REFUSED;
+    assert ls_wired(s[0..64], RUNG_NVIDIA) == false;
+    // a proven probe without a key proves nothing for a keyed rung
+    s[LS_KM + RUNG_ZAI] = 0;
+    s[LS_PR + RUNG_ZAI] = PROBE_OK;
+    assert ls_wired(s[0..64], RUNG_ZAI) == false;
+    // the keyless rung needs only the probe
+    assert ls_wired(s[0..64], 2) == false;
+    s[LS_PR + 2] = PROBE_OK;
+    assert ls_wired(s[0..64], 2);
+}
+
+test "the_503_names_the_tried_rungs_with_their_honest_status_and_the_unwired_ones" {
+    var rs : [4]u32 = undefined;
+    var out : [1024]u8 = undefined;
+    rs[0] = 0;
+    rs[1] = 429;
+    rs[2] = 0;
+    rs[3] = 502;
+    // zai and openrouter were called and refused; nvidia and ollama made no call
+    const n : usize = ls_refusal_body(10, 5, rs[0..4], out[0..1024]);
+    assert n > 0;
+    assert ls_find(out[0..n], "\"rung\":\"zai\",\"status\":429", 0) < n;
+    assert ls_find(out[0..n], "\"rung\":\"openrouter\",\"status\":502", 0) < n;
+    assert ls_find(out[0..n], "\"unwired\":[\"nvidia\",\"ollama\"]", 0) < n;
+    // the unwired rungs are not among the tried ones
+    assert ls_find(out[0..n], "\"rung\":\"nvidia\"", 0) >= n;
+    assert ls_find(out[0..n], "\"rung\":\"ollama\"", 0) >= n;
+}
