@@ -445,10 +445,10 @@ uint8_t reason(uint8_t kind, uint8_t* s, size_t from, size_t to) {
     if ((t <= f)) {
         return R_MALFORMED;
     }
-    if (policy_own_language__in_list(PROTECTED_PATHS, s, f, t, false)) {
-        return R_PROTECTED;
-    }
     if ((kind == 'D')) {
+        if (policy_own_language__in_list(PROTECTED_PATHS, s, f, t, false)) {
+            return R_PROTECTED;
+        }
         return R_DELETED;
     }
     if (has_prefix(GENERATED_PREFIXES, s, f, t)) {
