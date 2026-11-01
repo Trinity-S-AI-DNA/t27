@@ -34,6 +34,7 @@
 #define R_SCRIPT_NO_EXT 18
 #define R_MALFORMED 19
 #define R_PROTECTED 20
+#define R_EXCEPTIONS_EDITED 21
 #define OWN_EXTS "t27,tri,$"
 #define PROSE_EXTS "md,txt,rst,adoc,$"
 #define DATA_EXTS "json,jsonl,hjson,csv,tsv,lock,$"
@@ -47,7 +48,8 @@
 #define KINDS "ACDMRTUXB$"
 #define MSG_HEAD ": hand-written $"
 #define MSG_TAIL " is forbidden (owner rule 2026-10-05): write a .t27 spec and generate it with t27c; see AGENTS.md 'Only t27'$"
-#define MSG_PROTECTED ": the Only-t27 gate itself is owner-only (owner rule 2026-10-05): it needs the owner's label owner-approved-foreign; see AGENTS.md 'Only t27'$"
+#define MSG_PROTECTED ": deleting a file of the Only-t27 gate is refused (owner rule 2026-10-05): change the gate, never remove it; see AGENTS.md 'Only t27'$"
+#define MSG_EXCEPTIONS ": the owner's exception list grants foreign code, so a change to it needs the owner's label owner-approved-foreign on the pull request; see AGENTS.md 'Only t27'$"
 #define LIST_END 36
 #define LIST_SEP 44
 #define FOREIGN_ADDED_MAX 40
@@ -208,10 +210,10 @@ uint8_t reason(uint8_t kind, uint8_t* s, size_t from, size_t to) {
     if ((t <= f)) {
         return R_MALFORMED;
     }
-    if (in_list(PROTECTED_PATHS, s, f, t, false)) {
-        return R_PROTECTED;
-    }
     if ((kind == 'D')) {
+        if (in_list(PROTECTED_PATHS, s, f, t, false)) {
+            return R_PROTECTED;
+        }
         return R_DELETED;
     }
     if (has_prefix(GENERATED_PREFIXES, s, f, t)) {
@@ -351,7 +353,7 @@ uint8_t judge(uint8_t kind, uint8_t* buf, size_t from, size_t to, size_t ef, siz
         t -= 1;
     }
     if ((ci && in_list(EXCEPTIONS_FILE, buf, f, t, false))) {
-        return R_PROTECTED;
+        return R_EXCEPTIONS_EDITED;
     }
     if (((verdict(r) == DENY) && excepted(buf, ef, et, f, t))) {
         return R_EXCEPTION;
@@ -406,6 +408,8 @@ uint32_t check_all(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
                 w = put_range(out, w, cap, buf, p, t);
                 if ((r == R_PROTECTED)) {
                     w = put_msg(out, w, cap, MSG_PROTECTED);
+                } else if ((r == R_EXCEPTIONS_EDITED)) {
+                    w = put_msg(out, w, cap, MSG_EXCEPTIONS);
                 } else {
                     w = put_msg(out, w, cap, MSG_HEAD);
                     if ((r == R_FOREIGN_EXT)) {
@@ -430,16 +434,6 @@ uint32_t check_all(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
 bool counts_against_budget(uint8_t* s, size_t from, size_t to) {
     uint8_t r = reason('A', s, from, to);
     if ((((r == R_FOREIGN_EXT) || (r == R_FOREIGN_NAME)) || (r == R_SCRIPT_NO_EXT))) {
-        return true;
-    }
-    if ((r == R_PROTECTED)) {
-        if (has_prefix(GENERATED_PREFIXES, s, from, to)) {
-            return false;
-        }
-        size_t d = ext_dot(s, from, to);
-        if (((d < to) && in_list(OWN_EXTS, s, (d + 1), to, true))) {
-            return false;
-        }
         return true;
     }
     return false;
@@ -555,6 +549,7 @@ uint32_t check_budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_SCRIPT_NO_EXT) == DENY) */
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_MALFORMED) == DENY) */
 /* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_PROTECTED) == DENY) */
+/* invariant every_allow_reason_is_below_every_deny_reason is not a C constant expression: (verdict(R_EXCEPTIONS_EDITED) == DENY) */
 
 /* invariant: deletion_beats_every_extension */
 /* invariant deletion_beats_every_extension is not a C constant expression: (classify('D', "a.rs", 0, 4) == ALLOW) */
@@ -587,10 +582,31 @@ void test_a_new_foreign_file_still_needs_the_label(void) {
     assert((reason('T', "Dockerfile", 0, 10) == R_FOREIGN_NAME));
 }
 
-void test_the_most_important_files_still_need_the_label(void) {
-    assert((reason('M', "specs/policy/own_language.t27", 0, 29) == R_PROTECTED));
-    assert((reason('M', ".github/workflows/own-language.yml", 0, 34) == R_PROTECTED));
-    assert((judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_PROTECTED));
+void test_a_change_to_the_gate_needs_no_owner_label(void) {
+    assert((reason('M', "specs/policy/own_language.t27", 0, 29) == R_SPEC));
+    assert((reason('M', "gen/c/policy/own_language.c", 0, 27) == R_GENERATED));
+    assert((reason('M', ".github/workflows/own-language.yml", 0, 34) == R_MODIFIED));
+    assert((reason('M', "lefthook.yml", 0, 12) == R_MODIFIED));
+    assert((classify('M', ".github/workflows/own-language.yml", 0, 34) == ALLOW));
+    assert((classify('M', "lefthook.yml", 0, 12) == ALLOW));
+    assert((judge('M', ".github/workflows/own-language.yml", 0, 34, 0, 0, true) == R_MODIFIED));
+}
+
+void test_the_gate_files_are_not_a_way_to_add_foreign_files(void) {
+    assert((reason('A', ".github/workflows/own-language.yml", 0, 34) == R_FOREIGN_EXT));
+    assert((classify('A', "lefthook.yml", 0, 12) == DENY));
+    assert((classify('A', ".github/workflows/new-gate.yml", 0, 30) == DENY));
+}
+
+void test_the_exception_list_still_needs_the_label_in_ci(void) {
+    assert((judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_EXCEPTIONS_EDITED));
+}
+
+void test_a_scoped_repair_of_the_gate_workflow_passes_check_all_and_the_budget(void) {
+    uint8_t out[512] = {0};
+    assert((check_all("M\tlefthook.yml\nM\t.github/workflows/own-language.yml\nM\tspecs/policy/own_language.t27\nM\tgen/c/policy/own_language.c\n", 114, &out, 512) == 0));
+    assert((check_all("--ci\nM\t.github/workflows/own-language.yml\n", 42, &out, 512) == 0));
+    assert((check_budget("1\t1\t.github/workflows/own-language.yml\n", 39, &out, 512) == 0));
 }
 
 void test_a_modified_foreign_file_is_still_held_by_the_budget(void) {
@@ -618,11 +634,12 @@ void test_deleting_python_is_allowed(void) {
     assert((classify('D', "bootstrap/src/compiler.rs", 0, 25) == ALLOW));
 }
 
-void test_the_gate_itself_is_protected_even_from_deletion(void) {
-    assert((reason('M', "specs/policy/own_language.t27", 0, 29) == R_PROTECTED));
-    assert((reason('M', "gen/c/policy/own_language.c", 0, 27) == R_PROTECTED));
+void test_the_gate_itself_cannot_be_deleted(void) {
+    assert((reason('D', "specs/policy/own_language.t27", 0, 29) == R_PROTECTED));
+    assert((reason('D', "gen/c/policy/own_language.c", 0, 27) == R_PROTECTED));
     assert((reason('D', "lefthook.yml", 0, 12) == R_PROTECTED));
     assert((reason('D', ".github/workflows/own-language.yml", 0, 34) == R_PROTECTED));
+    assert((classify('D', "lefthook.yml", 0, 12) == DENY));
     assert((reason('A', "specs/policy/other.t27", 0, 22) == R_SPEC));
     assert((reason('D', "lefthook.yml.bak", 0, 16) == R_DELETED));
 }
@@ -696,12 +713,19 @@ void test_check_all_counts_and_names_the_denied(void) {
     assert((check_all("", 0, &out, 512) == 0));
 }
 
-void test_check_all_names_a_protected_path_with_its_own_line(void) {
+void test_check_all_names_a_deleted_gate_file_with_its_own_line(void) {
     uint8_t out[256] = {0};
-    assert((check_all("M\tlefthook.yml\n", 15, &out, 256) == 1));
+    assert((check_all("D\tlefthook.yml\n", 15, &out, 256) == 1));
     assert((out[12] == ':'));
-    assert((out[14] == 't'));
-    assert((out[18] == 'O'));
+    assert((out[14] == 'd'));
+    assert((out[37] == 'O'));
+}
+
+void test_check_all_names_an_edited_exception_list_with_its_own_line(void) {
+    uint8_t out[256] = {0};
+    assert((check_all("--ci\nM\ttools/policy/foreign-exceptions.txt\n", 43, &out, 256) == 1));
+    assert((out[35] == ':'));
+    assert((out[41] == 'o'));
 }
 
 void test_check_all_never_writes_past_cap(void) {
@@ -721,14 +745,14 @@ void test_an_empty_exception_line_matches_nothing(void) {
     assert((judge('A', "\n\ntools/x.py", 2, 12, 0, 2, false) == R_FOREIGN_EXT));
 }
 
-void test_an_exception_never_opens_the_gate_itself(void) {
-    assert((judge('M', "lefthook.yml\nlefthook.yml", 13, 25, 0, 13, false) == R_PROTECTED));
+void test_an_exception_never_opens_the_gate_deletion(void) {
+    assert((judge('D', "lefthook.yml\nlefthook.yml", 13, 25, 0, 13, false) == R_PROTECTED));
 }
 
 void test_the_exception_list_is_data_locally_and_owner_only_in_ci(void) {
     assert((judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, false) == R_PROSE));
-    assert((judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_PROTECTED));
-    assert((judge('D', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_PROTECTED));
+    assert((judge('M', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_EXCEPTIONS_EDITED));
+    assert((judge('D', "tools/policy/foreign-exceptions.txt", 0, 35, 0, 0, true) == R_EXCEPTIONS_EDITED));
 }
 
 void test_check_all_reads_the_list_before_the_separator(void) {
@@ -840,12 +864,15 @@ int main(void) {
     test_negative_control_hand_written_rust_is_denied();
     test_modifying_existing_foreign_code_needs_no_label();
     test_a_new_foreign_file_still_needs_the_label();
-    test_the_most_important_files_still_need_the_label();
+    test_a_change_to_the_gate_needs_no_owner_label();
+    test_the_gate_files_are_not_a_way_to_add_foreign_files();
+    test_the_exception_list_still_needs_the_label_in_ci();
+    test_a_scoped_repair_of_the_gate_workflow_passes_check_all_and_the_budget();
     test_a_modified_foreign_file_is_still_held_by_the_budget();
     test_generated_zig_is_allowed();
     test_a_generated_root_is_a_prefix_not_a_substring();
     test_deleting_python_is_allowed();
-    test_the_gate_itself_is_protected_even_from_deletion();
+    test_the_gate_itself_cannot_be_deleted();
     test_specs_are_allowed();
     test_prose_and_data_are_allowed();
     test_configuration_is_code();
@@ -856,11 +883,12 @@ int main(void) {
     test_quoted_paths_are_read_without_quotes();
     test_unreadable_input_fails_closed();
     test_check_all_counts_and_names_the_denied();
-    test_check_all_names_a_protected_path_with_its_own_line();
+    test_check_all_names_a_deleted_gate_file_with_its_own_line();
+    test_check_all_names_an_edited_exception_list_with_its_own_line();
     test_check_all_never_writes_past_cap();
     test_an_owner_exception_allows_its_paths_only();
     test_an_empty_exception_line_matches_nothing();
-    test_an_exception_never_opens_the_gate_itself();
+    test_an_exception_never_opens_the_gate_deletion();
     test_the_exception_list_is_data_locally_and_owner_only_in_ci();
     test_check_all_reads_the_list_before_the_separator();
     test_the_budget_is_forty_added_lines_per_foreign_file();
@@ -873,7 +901,7 @@ int main(void) {
     test_many_small_files_meet_the_total();
     test_a_binary_file_adds_nothing_and_garbage_fails_closed();
     test_check_budget_never_writes_past_cap();
-    printf("All %d tests passed.\n", 36);
+    printf("All %d tests passed.\n", 40);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
