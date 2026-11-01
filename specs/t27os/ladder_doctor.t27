@@ -1,0 +1,986 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/ladder_doctor.t27 -- the LADDER DOCTOR, decision half: what the T27 Ladder does with a
+// refusal. Owner, 2026-11-01 (translated): the Doctor must open by itself where an error happens and heal
+// it; the failing module is the Ladder, whose 503 hid the real refusals behind "deepseek unfunded".
+// Refs #13036 (tracker #13020, epic #12945, rung change #13034).
+//
+// One line of design: refusal, then class, then one incident, then a bounded recipe, then a control
+// request through the same path, then resolved with proof or escalated with the exact blocker.
+//   1. CLASS (FR-001): a table maps (status, rung) to UNFUNDED, CREDENTIAL, RATE, TRANSIENT, UNWIRED or
+//      UNKNOWN. An unrecognised status is UNKNOWN, never TRANSIENT.
+//   2. RETRY (FR-002): UNFUNDED, CREDENTIAL, UNWIRED and UNKNOWN are never retried on the same rung; RATE and
+//      TRANSIENT wait with a bounded backoff inside one per-turn budget.
+//   3. BREAKER (FR-003): closed, open, half-open per rung. The failure count and the cooldown are keys.t27's
+//      CIRCUIT_FAILS and CIRCUIT_COOLDOWN_S and its circuit_open, imported and pinned by test, never copied.
+//   4. INCIDENT (FR-004): one record per (rung, cause); a repeat raises its counter. Numbers only, so a key
+//      cannot be stored in it.
+//   5. RECIPES (FR-005): a closed list of four; the forbidden acts are constants outside it.
+//   6. RESOLUTION (FR-006): only a 200 from one turn-sized control request through the same path.
+//   7. FAIL CLOSED (FR-007): the walk goes forward once; a total refusal stays 503 with a body line that
+//      names every rung's class and the incident id.
+// The rung index is a plain u32 and the rung count a parameter, so this spec does not depend on the rung
+// table of ladder.t27 (which #13035 changes). Not here, on purpose: the node glue that feeds statuses in
+// and walks what this decides (regenerated from this spec, never edited by hand), a surface inside DSH, the
+// T27 OS DOCTOR panel and the host file that keeps an incident across a restart. This spec turns on no
+// conductor, no cron job, no scope gate BLOCK and no model switch, and starts no paid call.
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27OsLadderDoctor;
+
+use t27os::keys::CIRCUIT_FAILS;
+use t27os::keys::CIRCUIT_COOLDOWN_S;
+use t27os::keys::circuit_fails;
+use t27os::keys::circuit_open;
+use t27os::ladder::LAST_RESORT_STATUS;
+use t27os::ladder::PROBE_TOKENS;
+use t27os::ladder::transient;
+use t27os::ladder::demotes_rung;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::editors::same_bytes;
+
+/// The most rungs the tables hold. The rung count itself is always a parameter.
+pub const LD_RUNGS_MAX : u32 = 8;
+
+/// One u64 cell as a u32: every mask, count and state here is small.
+pub fn narrow(v: u64) -> u32 {
+    return @as(u32, @intCast(v));
+}
+
+/// 2 to the power i, for i below 32; bit masks of rungs and recipes are built from it.
+pub fn pow2(i: u32) -> u32 {
+    var p : u32 = 1;
+    var k : u32 = 0;
+    while (k < i and k < 31) {
+        p = p * 2;
+        k = k + 1;
+    }
+    return p;
+}
+
+pub fn has_bit(mask: u32, i: u32) -> bool {
+    if (i >= 32) { return false; }
+    return (mask / pow2(i)) % 2 == 1;
+}
+
+pub fn with_bit(mask: u32, i: u32) -> u32 {
+    if (i >= 32 or has_bit(mask, i)) { return mask; }
+    return mask + pow2(i);
+}
+
+/// Zero the first n cells of a table (breaker or incident).
+pub fn cells_zero(t: []u64, n: usize) -> bool {
+    var i : usize = 0;
+    while (i < n) {
+        t[i] = 0;
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- 1. The class of a refusal (FR-001) --------------------------------------------------------------------
+
+/// UNFUNDED: the account has no balance (402, z.ai 1113). CREDENTIAL: the key is refused (401, 403).
+/// RATE: a quota or rate limit (429, z.ai 1302). TRANSIENT: service noise, no answer (0), 5xx, 529, 1305
+/// (ladder.t27 law 7, its own `transient`). UNWIRED: the route or the model is not there (404, 405, 501) or
+/// the rung is past the rung count. UNKNOWN: anything else, which is reported and never retried.
+pub const LC_UNFUNDED : u32 = 0;
+pub const LC_CREDENTIAL : u32 = 1;
+pub const LC_RATE : u32 = 2;
+pub const LC_TRANSIENT : u32 = 3;
+pub const LC_UNWIRED : u32 = 4;
+pub const LC_UNKNOWN : u32 = 5;
+pub const LC_COUNT : u32 = 6;
+
+/// The table: CT_STATUS[i] is classed CT_CLASS[i] (0 UNFUNDED, 1 CREDENTIAL, 2 RATE, 4 UNWIRED).
+pub const CT_N : u32 = 9;
+pub const CT_STATUS : [9]u32 = [402, 1113, 401, 403, 404, 405, 501, 429, 1302];
+pub const CT_CLASS : [9]u32 = [0, 0, 1, 1, 4, 4, 4, 2, 2];
+
+/// The class of one refusal. `status` is the HTTP status of the rung (0 = no answer), `rung` the index of
+/// the rung that gave it, `n` the number of rungs the ladder has.
+pub fn classify(status: u32, rung: u32, n: u32) -> u32 {
+    if (rung >= n) { return LC_UNWIRED; }
+    var i : u32 = 0;
+    while (i < CT_N) {
+        if (CT_STATUS[i] == status) { return CT_CLASS[i]; }
+        i = i + 1;
+    }
+    if (status == 0 or transient(status)) { return LC_TRANSIENT; }
+    return LC_UNKNOWN;
+}
+
+/// A hard class says something no wait can change on its own.
+pub fn is_hard(cls: u32) -> bool {
+    return cls == LC_UNFUNDED or cls == LC_CREDENTIAL or cls == LC_UNWIRED;
+}
+
+/// Append the name of a class at `at`; returns the position after it.
+pub fn put_class(out: []u8, at: usize, cls: u32) -> usize {
+    if (cls == LC_UNFUNDED) { return put_bytes(out, at, "UNFUNDED"); }
+    if (cls == LC_CREDENTIAL) { return put_bytes(out, at, "CREDENTIAL"); }
+    if (cls == LC_RATE) { return put_bytes(out, at, "RATE"); }
+    if (cls == LC_TRANSIENT) { return put_bytes(out, at, "TRANSIENT"); }
+    if (cls == LC_UNWIRED) { return put_bytes(out, at, "UNWIRED"); }
+    return put_bytes(out, at, "UNKNOWN");
+}
+
+// ---- 2. Retry by class (FR-002) ----------------------------------------------------------------------------
+
+/// TRANSIENT retries per turn on one rung.
+pub const LD_TRANSIENT_RETRIES : u32 = 2;
+/// Backoff doubles from LD_BACKOFF_BASE_S and stops at LD_BACKOFF_CAP_S.
+pub const LD_BACKOFF_BASE_S : u32 = 2;
+pub const LD_BACKOFF_CAP_S : u32 = 30;
+/// All waiting of one turn on one rung stays inside this many seconds. Chosen, not measured: a turn the
+/// client sits behind should not wait longer than this for a rung that can be walked past.
+pub const LD_TURN_BUDGET_S : u32 = 20;
+
+/// The wait before retry number `attempt` (0 is the first retry).
+pub fn backoff_s(attempt: u32) -> u32 {
+    if (attempt >= 4) { return LD_BACKOFF_CAP_S; }
+    const w : u32 = LD_BACKOFF_BASE_S * pow2(attempt);
+    if (w > LD_BACKOFF_CAP_S) { return LD_BACKOFF_CAP_S; }
+    return w;
+}
+
+/// May the same rung be asked again in this turn? `tries` retries were made, `waited_s` seconds waited,
+/// `brk` is the breaker state of the rung after the refusal. Only a closed breaker retries; hard classes
+/// and UNKNOWN never do.
+pub fn may_retry(cls: u32, tries: u32, waited_s: u32, brk: u32) -> bool {
+    if (brk != LB_CLOSED) { return false; }
+    if (cls == LC_RATE) { return waited_s + backoff_s(tries) <= LD_TURN_BUDGET_S; }
+    if (cls == LC_TRANSIENT) {
+        return tries < LD_TRANSIENT_RETRIES and waited_s + backoff_s(tries) <= LD_TURN_BUDGET_S;
+    }
+    return false;
+}
+
+/// The recipe after one refusal: SKIP the rung (breaker open, or a hard class), WAIT and ask again, or
+/// take the NEXT rung.
+pub fn recipe_after_refusal(cls: u32, tries: u32, waited_s: u32, brk: u32) -> u32 {
+    if (brk == LB_OPEN or is_hard(cls)) { return LR_SKIP; }
+    if (may_retry(cls, tries, waited_s, brk)) { return LR_WAIT; }
+    return LR_NEXT;
+}
+
+// ---- 3. The breaker of a rung (FR-003) ---------------------------------------------------------------------
+
+pub const LB_CLOSED : u32 = 0;
+pub const LB_OPEN : u32 = 1;
+pub const LB_HALF_OPEN : u32 = 2;
+
+/// The failure count and the cooldown are keys.t27's, by name. A test pins them.
+pub const LB_FAILS : u32 = CIRCUIT_FAILS;
+pub const LB_COOLDOWN_S : u64 = CIRCUIT_COOLDOWN_S;
+
+/// A breaker table holds BR_F cells per rung: failures in a row, when it opened, and when the one probe
+/// began plus one (0 = no probe in flight).
+pub const BR_FAILS : usize = 0;
+pub const BR_OPENED : usize = 1;
+pub const BR_PROBING : usize = 2;
+pub const BR_F : usize = 3;
+pub const BR_CELLS : usize = 24;
+
+/// The state at `now`: open for the cooldown after the failure count was reached, half-open after it.
+pub fn breaker_state(fails: u32, opened: u64, now: u64) -> u32 {
+    if (circuit_open(fails, opened, now)) { return LB_OPEN; }
+    if (fails >= LB_FAILS) { return LB_HALF_OPEN; }
+    return LB_CLOSED;
+}
+
+/// Failures in a row after one more refusal. A hard class opens the breaker at once. TRANSIENT follows
+/// keys.t27's circuit_fails. RATE counts one. UNKNOWN changes nothing: it is not proof about the rung.
+pub fn fails_after(fails: u32, cls: u32) -> u32 {
+    if (is_hard(cls)) {
+        if (fails < LB_FAILS) { return LB_FAILS; }
+        return fails;
+    }
+    if (cls == LC_TRANSIENT) { return circuit_fails(fails, 0); }
+    if (cls == LC_RATE) { return fails + 1; }
+    return fails;
+}
+
+/// Record one refusal on a rung; returns the breaker state after it. A failure that reaches the failure
+/// count (also a failed probe) starts a fresh cooldown at `now` and ends the probe.
+pub fn breaker_fail(brk: []u64, rung: u32, cls: u32, now: u64) -> u32 {
+    if (rung >= LD_RUNGS_MAX) { return LB_CLOSED; }
+    const b : usize = @as(usize, rung) * BR_F;
+    const f : u32 = fails_after(narrow(brk[b + BR_FAILS]), cls);
+    brk[b + BR_FAILS] = @as(u64, f);
+    brk[b + BR_PROBING] = 0;
+    if (f >= LB_FAILS) { brk[b + BR_OPENED] = now; }
+    return breaker_state(f, brk[b + BR_OPENED], now);
+}
+
+/// Record a good answer on a rung: keys.t27's circuit_fails resets the count; the breaker closes.
+pub fn breaker_ok(brk: []u64, rung: u32) -> u32 {
+    if (rung >= LD_RUNGS_MAX) { return LB_CLOSED; }
+    const b : usize = @as(usize, rung) * BR_F;
+    brk[b + BR_FAILS] = @as(u64, circuit_fails(narrow(brk[b + BR_FAILS]), 200));
+    brk[b + BR_PROBING] = 0;
+    return LB_CLOSED;
+}
+
+/// What the walk does at a rung: PASS (closed, ask it), SKIP (open, or past the count: no network call),
+/// PROBE (half-open: exactly one request goes, the rung is then SKIP until it answers; a probe that never
+/// reports back is replaced after one more cooldown).
+pub const LG_PASS : u32 = 0;
+pub const LG_SKIP : u32 = 1;
+pub const LG_PROBE : u32 = 2;
+
+pub fn take_gate(brk: []u64, rung: u32, n: u32, now: u64) -> u32 {
+    if (rung >= n or rung >= LD_RUNGS_MAX) { return LG_SKIP; }
+    const b : usize = @as(usize, rung) * BR_F;
+    const st : u32 = breaker_state(narrow(brk[b + BR_FAILS]), brk[b + BR_OPENED], now);
+    if (st == LB_CLOSED) { return LG_PASS; }
+    if (st == LB_HALF_OPEN) {
+        const p : u64 = brk[b + BR_PROBING];
+        if (p == 0 or now + 1 >= p + LB_COOLDOWN_S) {
+            brk[b + BR_PROBING] = now + 1;
+            return LG_PROBE;
+        }
+    }
+    return LG_SKIP;
+}
+
+// ---- 4. The incident (FR-004) ------------------------------------------------------------------------------
+
+/// open: seen, nothing done. healing: a recipe step was taken. resolved: a 200 control request proved it.
+/// escalated: a control request failed after the recipe; the blocker is the class plus the evidence status.
+pub const LI_OPEN : u32 = 0;
+pub const LI_HEALING : u32 = 1;
+pub const LI_RESOLVED : u32 = 2;
+pub const LI_ESCALATED : u32 = 3;
+pub const LI_NONE : u32 = 9;
+
+/// An incident table: cell 0 is the last id handed out, then one record of IF_F cells per (rung, cause).
+/// Every cell is a number: an id, a state, a count, two times, two masks (rungs tried, recipe steps taken),
+/// the evidence status and the checkpoint pointer (the turn number of the last event; the host file that
+/// keeps it across a restart is not here). No key text can be held.
+pub const IF_ID : usize = 0;
+pub const IF_STATE : usize = 1;
+pub const IF_COUNT : usize = 2;
+pub const IF_FIRST : usize = 3;
+pub const IF_LAST : usize = 4;
+pub const IF_TRIED : usize = 5;
+pub const IF_STEPS : usize = 6;
+pub const IF_EVID : usize = 7;
+pub const IF_CKPT : usize = 8;
+pub const IF_F : usize = 9;
+pub const IN_HDR : usize = 1;
+pub const IN_SLOTS : usize = 48;
+pub const IN_CELLS : usize = 433;
+
+pub fn inc_at(rung: u32, cls: u32) -> usize {
+    return IN_HDR + (@as(usize, rung) * @as(usize, LC_COUNT) + @as(usize, cls)) * IF_F;
+}
+
+pub fn inc_field(inc: []const u64, rung: u32, cls: u32, f: usize) -> u64 {
+    if (rung >= LD_RUNGS_MAX or cls >= LC_COUNT) { return 0; }
+    return inc[inc_at(rung, cls) + f];
+}
+
+/// The state of the incident of (rung, cause); LI_NONE when there is none.
+pub fn inc_state(inc: []const u64, rung: u32, cls: u32) -> u32 {
+    if (inc_field(inc, rung, cls, IF_ID) == 0) { return LI_NONE; }
+    return narrow(inc_field(inc, rung, cls, IF_STATE));
+}
+
+pub fn inc_count(inc: []const u64, rung: u32, cls: u32) -> u32 {
+    return narrow(inc_field(inc, rung, cls, IF_COUNT));
+}
+
+/// Record one refusal of (rung, cause) at `now`, turn number `turn`. A live incident of the same pair gets
+/// its counter and last-seen time raised; otherwise (none yet, or the old one is resolved) a new one with
+/// the next id opens. Returns the incident id; 0 for a rung or cause out of range.
+pub fn inc_record(inc: []u64, rung: u32, cls: u32, now: u64, turn: u32) -> u32 {
+    if (rung >= LD_RUNGS_MAX or cls >= LC_COUNT) { return 0; }
+    const at : usize = inc_at(rung, cls);
+    if (inc[at + IF_ID] != 0 and inc[at + IF_STATE] != @as(u64, LI_RESOLVED)) {
+        inc[at + IF_COUNT] = inc[at + IF_COUNT] + 1;
+        inc[at + IF_LAST] = now;
+        inc[at + IF_CKPT] = @as(u64, turn);
+        return narrow(inc[at + IF_ID]);
+    }
+    inc[0] = inc[0] + 1;
+    inc[at + IF_ID] = inc[0];
+    inc[at + IF_STATE] = @as(u64, LI_OPEN);
+    inc[at + IF_COUNT] = 1;
+    inc[at + IF_FIRST] = now;
+    inc[at + IF_LAST] = now;
+    inc[at + IF_TRIED] = @as(u64, pow2(rung));
+    inc[at + IF_STEPS] = 0;
+    inc[at + IF_EVID] = 0;
+    inc[at + IF_CKPT] = @as(u64, turn);
+    return narrow(inc[0]);
+}
+
+/// The class of the rung as the table knows it: the cause of its newest live incident, UNKNOWN if none.
+pub fn rung_class(inc: []const u64, rung: u32) -> u32 {
+    var best : u32 = LC_UNKNOWN;
+    var best_id : u64 = 0;
+    var c : u32 = 0;
+    while (c < LC_COUNT) {
+        const id : u64 = inc_field(inc, rung, c, IF_ID);
+        if (id > best_id and inc_state(inc, rung, c) != LI_RESOLVED) {
+            best = c;
+            best_id = id;
+        }
+        c = c + 1;
+    }
+    return best;
+}
+
+/// The newest live incident id among rungs 0 .. n-1; 0 if none.
+pub fn newest_live(inc: []const u64, n: u32) -> u32 {
+    var best : u64 = 0;
+    var r : u32 = 0;
+    while (r < n and r < LD_RUNGS_MAX) {
+        var c : u32 = 0;
+        while (c < LC_COUNT) {
+            const id : u64 = inc_field(inc, r, c, IF_ID);
+            if (id > best and inc_state(inc, r, c) != LI_RESOLVED) { best = id; }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return narrow(best);
+}
+
+// ---- 5. The recipes (FR-005) -------------------------------------------------------------------------------
+
+/// The closed list. Nothing else is ever a step.
+pub const LR_SKIP : u32 = 0;
+pub const LR_PROBE : u32 = 1;
+pub const LR_NEXT : u32 = 2;
+pub const LR_WAIT : u32 = 3;
+pub const LR_COUNT : u32 = 4;
+
+/// The forbidden list, as constants that no recipe code can reach: a purchase or top-up, deleting a
+/// credential, adding a provider, changing a gate, switching the default model, a rung outside the ladder
+/// order, and turning on automation (conductor, cron).
+pub const LF_PURCHASE : u32 = 100;
+pub const LF_DELETE_CREDENTIAL : u32 = 101;
+pub const LF_ADD_PROVIDER : u32 = 102;
+pub const LF_CHANGE_GATE : u32 = 103;
+pub const LF_SWITCH_DEFAULT_MODEL : u32 = 104;
+pub const LF_OFF_ORDER_RUNG : u32 = 105;
+pub const LF_ENABLE_AUTOMATION : u32 = 106;
+pub const LF_FIRST : u32 = 100;
+pub const LF_COUNT : u32 = 7;
+
+pub fn recipe_allowed(r: u32) -> bool {
+    return r < LR_COUNT;
+}
+
+pub fn recipe_forbidden(r: u32) -> bool {
+    return r >= LF_FIRST and r < LF_FIRST + LF_COUNT;
+}
+
+/// Take one recipe step on the incident of (rung, cause). A forbidden or unknown act is refused and
+/// recorded nowhere. NEXT must name a later rung: the ladder order only goes forward. The first step turns
+/// an open incident into healing. Returns whether the step was recorded.
+pub fn inc_step(inc: []u64, rung: u32, cls: u32, recipe: u32, to_rung: u32, turn: u32) -> bool {
+    if (recipe_allowed(recipe) == false) { return false; }
+    if (rung >= LD_RUNGS_MAX or cls >= LC_COUNT) { return false; }
+    if (recipe == LR_NEXT and (to_rung <= rung or to_rung >= LD_RUNGS_MAX)) { return false; }
+    const at : usize = inc_at(rung, cls);
+    if (inc[at + IF_ID] == 0 or inc[at + IF_STATE] == @as(u64, LI_RESOLVED)) { return false; }
+    inc[at + IF_STEPS] = @as(u64, with_bit(narrow(inc[at + IF_STEPS]), recipe));
+    if (recipe == LR_NEXT) {
+        inc[at + IF_TRIED] = @as(u64, with_bit(narrow(inc[at + IF_TRIED]), to_rung));
+    }
+    if (inc[at + IF_STATE] == @as(u64, LI_OPEN)) { inc[at + IF_STATE] = @as(u64, LI_HEALING); }
+    inc[at + IF_CKPT] = @as(u64, turn);
+    return true;
+}
+
+// ---- 6. Resolution by a control request (FR-006) -----------------------------------------------------------
+
+/// A control request is ONE model request through the path where the error happened: one message, no
+/// tools, no history, turn-sized (ladder.t27 law 2: a one-token answer is not evidence). The Doctor never
+/// replays a whole agent task.
+pub const LD_CONTROL_MESSAGES : u32 = 1;
+
+/// RESOLVE: the evidence is in. REPORT: anything else, handed to the session as it is. There is no outcome
+/// that repeats the request.
+pub const LX_RESOLVE : u32 = 0;
+pub const LX_REPORT : u32 = 1;
+
+pub fn control_outcome(status: u32, tokens: u32, messages: u32, tools: u32, same_path: bool) -> u32 {
+    if (status != 200 or same_path == false) { return LX_REPORT; }
+    if (tokens < PROBE_TOKENS or messages != LD_CONTROL_MESSAGES or tools != 0) { return LX_REPORT; }
+    return LX_RESOLVE;
+}
+
+/// Apply a control outcome to the incident of (rung, cause). RESOLVE with status 200 resolves it from any
+/// state and stores the status as evidence. A REPORT with a status other than 200 after a recipe step
+/// escalates it and stores that status (the exact blocker is the class plus this status). Returns the state
+/// after; LI_NONE if there is no incident. Nothing but this function resolves an incident.
+pub fn inc_control(inc: []u64, rung: u32, cls: u32, status: u32, outcome: u32, now: u64, turn: u32) -> u32 {
+    if (rung >= LD_RUNGS_MAX or cls >= LC_COUNT) { return LI_NONE; }
+    const at : usize = inc_at(rung, cls);
+    if (inc[at + IF_ID] == 0) { return LI_NONE; }
+    if (inc[at + IF_STATE] == @as(u64, LI_RESOLVED)) { return LI_RESOLVED; }
+    inc[at + IF_CKPT] = @as(u64, turn);
+    if (outcome == LX_RESOLVE and status == 200) {
+        inc[at + IF_STATE] = @as(u64, LI_RESOLVED);
+        inc[at + IF_EVID] = @as(u64, status);
+        inc[at + IF_LAST] = now;
+        return LI_RESOLVED;
+    }
+    if (status != 200 and inc[at + IF_STATE] == @as(u64, LI_HEALING)) {
+        inc[at + IF_STATE] = @as(u64, LI_ESCALATED);
+        inc[at + IF_EVID] = @as(u64, status);
+    }
+    return narrow(inc[at + IF_STATE]);
+}
+
+/// A control answer proves the rung, not one cause: apply it to every live incident of the rung. Returns
+/// how many it resolved.
+pub fn inc_control_rung(inc: []u64, rung: u32, status: u32, outcome: u32, now: u64, turn: u32) -> u32 {
+    var healed : u32 = 0;
+    var c : u32 = 0;
+    while (c < LC_COUNT) {
+        const st : u32 = inc_state(inc, rung, c);
+        if (st != LI_NONE and st != LI_RESOLVED) {
+            if (inc_control(inc, rung, c, status, outcome, now, turn) == LI_RESOLVED) { healed = healed + 1; }
+        }
+        c = c + 1;
+    }
+    return healed;
+}
+
+// ---- 7. The walk and the fail-closed body (FR-007) ---------------------------------------------------------
+
+/// The first rung at or after `start` whose bit is not in `tried`; `n` when there is none. The walk asks
+/// next_from(r + 1) after rung r, so it only goes forward and one pass visits each rung at most once.
+pub fn next_from(start: u32, tried: u32, n: u32) -> u32 {
+    var r : u32 = start;
+    while (r < n) {
+        if (has_bit(tried, r) == false) { return r; }
+        r = r + 1;
+    }
+    return n;
+}
+
+/// 0 while a rung is left in this pass; ladder.t27's LAST_RESORT_STATUS (503) once none is: the walk ends,
+/// it is not started again.
+pub fn walk_status(start: u32, tried: u32, n: u32) -> u32 {
+    if (next_from(start, tried, n) >= n) { return LAST_RESORT_STATUS; }
+    return 0;
+}
+
+pub const LD_LINE_MAX : usize = 160;
+
+/// The body line of a total refusal: every rung's class and the incident id, e.g.
+/// "ladder closed: 0=UNFUNDED 1=RATE 2=UNWIRED incident=7". `classes[r]` is the class of rung r. Returns the
+/// length written; 0 (nothing written) when n is 0 or above LD_RUNGS_MAX or the buffer is under LD_LINE_MAX.
+pub fn refusal_line(out: []u8, n: u32, classes: []const u32, inc_id: u32) -> usize {
+    if (n == 0 or n > LD_RUNGS_MAX or out.len < LD_LINE_MAX) { return 0; }
+    var w : usize = put_bytes(out, 0, "ladder closed:");
+    var r : u32 = 0;
+    while (r < n) {
+        w = put_bytes(out, w, " ");
+        w = put_dec(out, w, @as(u64, r));
+        w = put_bytes(out, w, "=");
+        w = put_class(out, w, classes[@as(usize, r)]);
+        r = r + 1;
+    }
+    w = put_bytes(out, w, " incident=");
+    return put_dec(out, w, @as(u64, inc_id));
+}
+
+/// The same line built from the incident table: each rung's class is its newest live cause, the id the
+/// newest live incident.
+pub fn refusal_body(out: []u8, inc: []const u64, n: u32) -> usize {
+    if (n == 0 or n > LD_RUNGS_MAX) { return 0; }
+    var cl : [8]u32 = undefined;
+    var r : u32 = 0;
+    while (r < n) {
+        cl[@as(usize, r)] = rung_class(inc, r);
+        r = r + 1;
+    }
+    return refusal_line(out, n, cl[0..8], newest_live(inc, n));
+}
+
+/// Printable ASCII with no quote and no backslash, so the glue can put the line inside a JSON string.
+pub fn line_is_safe(line: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < line.len) {
+        if (line[i] < 32 or line[i] > 126 or line[i] == 34 or line[i] == 92) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- tests -------------------------------------------------------------------------------------------------
+
+test every_refusal_status_lands_in_one_class {
+    assert classify(402, 0, 3) == LC_UNFUNDED;
+    assert classify(1113, 1, 3) == LC_UNFUNDED;
+    assert classify(401, 0, 3) == LC_CREDENTIAL;
+    assert classify(403, 2, 3) == LC_CREDENTIAL;
+    assert classify(429, 0, 3) == LC_RATE;
+    assert classify(1302, 1, 3) == LC_RATE;
+    assert classify(404, 1, 3) == LC_UNWIRED;
+    assert classify(405, 1, 3) == LC_UNWIRED;
+    assert classify(501, 2, 3) == LC_UNWIRED;
+    assert classify(0, 0, 3) == LC_TRANSIENT;
+    assert classify(500, 0, 3) == LC_TRANSIENT;
+    assert classify(503, 2, 3) == LC_TRANSIENT;
+    assert classify(529, 0, 3) == LC_TRANSIENT;
+    assert classify(1305, 1, 3) == LC_TRANSIENT;
+    assert classify(503, 3, 3) == LC_UNWIRED;
+    assert classify(402, 7, 3) == LC_UNWIRED;
+}
+
+test an_unrecognised_status_is_unknown_never_transient {
+    assert classify(400, 0, 3) == LC_UNKNOWN;
+    assert classify(418, 0, 3) == LC_UNKNOWN;
+    assert classify(422, 1, 3) == LC_UNKNOWN;
+    assert classify(301, 0, 3) == LC_UNKNOWN;
+    assert classify(204, 0, 3) == LC_UNKNOWN;
+    assert classify(600, 0, 3) == LC_UNKNOWN;
+    assert classify(1000, 0, 3) == LC_UNKNOWN;
+    assert classify(1306, 2, 3) == LC_UNKNOWN;
+    assert classify(400, 0, 3) != LC_TRANSIENT;
+}
+
+test the_class_edges_agree_with_the_ladders_own_laws {
+    assert transient(1305);
+    assert classify(1305, 0, 3) == LC_TRANSIENT;
+    assert demotes_rung(1305) == false;
+    assert transient(502);
+    assert classify(502, 0, 3) == LC_TRANSIENT;
+    assert demotes_rung(502) == false;
+    assert demotes_rung(402);
+    assert classify(402, 0, 3) == LC_UNFUNDED;
+    assert transient(402) == false;
+    assert demotes_rung(429);
+    assert classify(429, 0, 3) == LC_RATE;
+    assert transient(429) == false;
+}
+
+test hard_classes_are_never_retried_on_the_same_rung {
+    var t : u32 = 0;
+    while (t < 6) {
+        assert may_retry(LC_UNFUNDED, t, 0, LB_CLOSED) == false;
+        assert may_retry(LC_CREDENTIAL, t, 0, LB_CLOSED) == false;
+        assert may_retry(LC_UNWIRED, t, 0, LB_CLOSED) == false;
+        assert may_retry(LC_UNKNOWN, t, 0, LB_CLOSED) == false;
+        t = t + 1;
+    }
+    assert may_retry(LC_TRANSIENT, 0, 0, LB_CLOSED);
+    assert may_retry(LC_TRANSIENT, 0, 0, LB_OPEN) == false;
+    assert may_retry(LC_TRANSIENT, 0, 0, LB_HALF_OPEN) == false;
+    assert may_retry(LC_RATE, 0, 0, LB_OPEN) == false;
+    assert recipe_after_refusal(LC_UNFUNDED, 0, 0, LB_CLOSED) == LR_SKIP;
+    assert recipe_after_refusal(LC_CREDENTIAL, 0, 0, LB_OPEN) == LR_SKIP;
+    assert recipe_after_refusal(LC_UNWIRED, 3, 9, LB_OPEN) == LR_SKIP;
+}
+
+test rate_waits_with_a_backoff_inside_the_turn_budget {
+    assert backoff_s(0) == 2;
+    assert backoff_s(1) == 4;
+    assert backoff_s(2) == 8;
+    assert backoff_s(3) == 16;
+    assert backoff_s(4) == LD_BACKOFF_CAP_S;
+    assert backoff_s(9) == LD_BACKOFF_CAP_S;
+    assert may_retry(LC_RATE, 0, 0, LB_CLOSED);
+    assert may_retry(LC_RATE, 1, 2, LB_CLOSED);
+    assert may_retry(LC_RATE, 2, 6, LB_CLOSED);
+    assert may_retry(LC_RATE, 3, 14, LB_CLOSED) == false;
+    assert recipe_after_refusal(LC_RATE, 0, 0, LB_CLOSED) == LR_WAIT;
+    assert recipe_after_refusal(LC_RATE, 3, 14, LB_CLOSED) == LR_NEXT;
+    var waited : u32 = 0;
+    var t : u32 = 0;
+    while (may_retry(LC_RATE, t, waited, LB_CLOSED)) {
+        waited = waited + backoff_s(t);
+        t = t + 1;
+    }
+    assert waited <= LD_TURN_BUDGET_S;
+    assert t == 3;
+}
+
+test transient_refusals_retry_a_bounded_number_of_times {
+    var waited : u32 = 0;
+    var t : u32 = 0;
+    while (may_retry(LC_TRANSIENT, t, waited, LB_CLOSED)) {
+        waited = waited + backoff_s(t);
+        t = t + 1;
+    }
+    var cap : u32 = LD_TRANSIENT_RETRIES;
+    assert t == cap;
+    assert waited <= LD_TURN_BUDGET_S;
+    assert recipe_after_refusal(LC_TRANSIENT, 0, 0, LB_CLOSED) == LR_WAIT;
+    assert recipe_after_refusal(LC_TRANSIENT, 2, 6, LB_CLOSED) == LR_NEXT;
+    assert recipe_after_refusal(LC_UNKNOWN, 0, 0, LB_CLOSED) == LR_NEXT;
+}
+
+test the_breaker_is_keys_own_rule_and_not_a_copy {
+    var fl : u32 = LB_FAILS;
+    var kf : u32 = CIRCUIT_FAILS;
+    assert fl == kf;
+    var cd : u64 = LB_COOLDOWN_S;
+    var kd : u64 = CIRCUIT_COOLDOWN_S;
+    assert cd == kd;
+    assert breaker_state(CIRCUIT_FAILS - 1, 100, 100) == LB_CLOSED;
+    assert breaker_state(CIRCUIT_FAILS, 100, 100) == LB_OPEN;
+    assert breaker_state(CIRCUIT_FAILS, 100, 100 + CIRCUIT_COOLDOWN_S - 1) == LB_OPEN;
+    assert breaker_state(CIRCUIT_FAILS, 100, 100 + CIRCUIT_COOLDOWN_S) == LB_HALF_OPEN;
+    var f : u32 = 0;
+    while (f < 6) {
+        var d : u64 = 0;
+        while (d < 130) {
+            assert (breaker_state(f, 100, 100 + d) == LB_OPEN) == circuit_open(f, 100, 100 + d);
+            d = d + 1;
+        }
+        f = f + 1;
+    }
+    assert fails_after(0, LC_TRANSIENT) == circuit_fails(0, 503);
+    assert fails_after(2, LC_TRANSIENT) == circuit_fails(2, 0);
+    assert fails_after(2, LC_TRANSIENT) == CIRCUIT_FAILS;
+}
+
+test three_transient_failures_open_the_breaker_and_a_good_answer_closes_it {
+    var brk : [24]u64 = undefined;
+    const z : bool = cells_zero(brk[0..24], BR_CELLS);
+    assert z;
+    assert breaker_fail(brk[0..24], 1, LC_TRANSIENT, 100) == LB_CLOSED;
+    assert breaker_fail(brk[0..24], 1, LC_TRANSIENT, 101) == LB_CLOSED;
+    assert breaker_fail(brk[0..24], 1, LC_TRANSIENT, 102) == LB_OPEN;
+    var g : u32 = take_gate(brk[0..24], 1, 3, 102 + CIRCUIT_COOLDOWN_S - 1);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 0, 3, 102);
+    assert g == LG_PASS;
+    g = take_gate(brk[0..24], 2, 3, 102);
+    assert g == LG_PASS;
+    g = take_gate(brk[0..24], 3, 3, 102);
+    assert g == LG_SKIP;
+    assert breaker_ok(brk[0..24], 1) == LB_CLOSED;
+    g = take_gate(brk[0..24], 1, 3, 103);
+    assert g == LG_PASS;
+    assert breaker_fail(brk[0..24], 1, LC_TRANSIENT, 104) == LB_CLOSED;
+}
+
+test an_unfunded_answer_opens_the_breaker_at_once_and_the_rung_is_skipped_with_no_call {
+    var brk : [24]u64 = undefined;
+    var inc : [433]u64 = undefined;
+    const z1 : bool = cells_zero(brk[0..24], BR_CELLS);
+    const z2 : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z1;
+    assert z2;
+    const cls : u32 = classify(402, 2, 3);
+    assert cls == LC_UNFUNDED;
+    assert breaker_fail(brk[0..24], 2, cls, 500) == LB_OPEN;
+    const id : u32 = inc_record(inc[0..433], 2, cls, 500, 1);
+    assert id == 1;
+    var g : u32 = take_gate(brk[0..24], 2, 3, 501);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 2, 3, 530);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 2, 3, 500 + CIRCUIT_COOLDOWN_S - 1);
+    assert g == LG_SKIP;
+    const ok : bool = inc_step(inc[0..433], 2, cls, LR_SKIP, 0, 2);
+    assert ok;
+    assert inc_state(inc[0..433], 2, cls) == LI_HEALING;
+    assert recipe_after_refusal(cls, 0, 0, LB_OPEN) == LR_SKIP;
+}
+
+test the_same_cause_ten_times_is_one_incident_with_a_counter_of_ten {
+    var inc : [433]u64 = undefined;
+    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z;
+    var k : u32 = 0;
+    var id : u32 = 0;
+    while (k < 10) {
+        id = inc_record(inc[0..433], 1, LC_RATE, 1000 + @as(u64, k), k + 1);
+        assert id == 1;
+        k = k + 1;
+    }
+    assert inc_count(inc[0..433], 1, LC_RATE) == 10;
+    assert inc_field(inc[0..433], 1, LC_RATE, IF_ID) == 1;
+    assert inc_field(inc[0..433], 1, LC_RATE, IF_FIRST) == 1000;
+    assert inc_field(inc[0..433], 1, LC_RATE, IF_LAST) == 1009;
+    assert inc_field(inc[0..433], 1, LC_RATE, IF_CKPT) == 10;
+    assert inc_state(inc[0..433], 1, LC_RATE) == LI_OPEN;
+    assert inc[0] == 1;
+}
+
+test another_cause_or_rung_is_another_incident_and_a_resolved_one_recurs_as_a_new_one {
+    var inc : [433]u64 = undefined;
+    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z;
+    var a : u32 = inc_record(inc[0..433], 0, LC_RATE, 10, 1);
+    assert a == 1;
+    a = inc_record(inc[0..433], 0, LC_TRANSIENT, 11, 2);
+    assert a == 2;
+    a = inc_record(inc[0..433], 1, LC_RATE, 12, 3);
+    assert a == 3;
+    a = inc_record(inc[0..433], 0, LC_RATE, 13, 4);
+    assert a == 1;
+    assert inc_count(inc[0..433], 0, LC_RATE) == 2;
+    assert inc_count(inc[0..433], 0, LC_TRANSIENT) == 1;
+    assert inc_count(inc[0..433], 1, LC_RATE) == 1;
+    const o : u32 = control_outcome(200, PROBE_TOKENS, LD_CONTROL_MESSAGES, 0, true);
+    assert inc_control(inc[0..433], 0, LC_RATE, 200, o, 14, 5) == LI_RESOLVED;
+    a = inc_record(inc[0..433], 0, LC_RATE, 15, 6);
+    assert a == 4;
+    assert inc_count(inc[0..433], 0, LC_RATE) == 1;
+    assert inc_state(inc[0..433], 0, LC_RATE) == LI_OPEN;
+    a = inc_record(inc[0..433], LD_RUNGS_MAX, LC_RATE, 16, 7);
+    assert a == 0;
+    a = inc_record(inc[0..433], 0, LC_COUNT, 16, 7);
+    assert a == 0;
+    assert inc_state(inc[0..433], 5, LC_RATE) == LI_NONE;
+}
+
+test a_cooled_breaker_sends_exactly_one_probe_and_one_200_closes_it_and_resolves {
+    var brk : [24]u64 = undefined;
+    var inc : [433]u64 = undefined;
+    const z1 : bool = cells_zero(brk[0..24], BR_CELLS);
+    const z2 : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z1;
+    assert z2;
+    assert breaker_fail(brk[0..24], 1, LC_UNFUNDED, 100) == LB_OPEN;
+    const id : u32 = inc_record(inc[0..433], 1, LC_UNFUNDED, 100, 1);
+    assert id == 1;
+    var g : u32 = take_gate(brk[0..24], 1, 3, 100 + CIRCUIT_COOLDOWN_S - 1);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 1, 3, 100 + CIRCUIT_COOLDOWN_S);
+    assert g == LG_PROBE;
+    g = take_gate(brk[0..24], 1, 3, 100 + CIRCUIT_COOLDOWN_S);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 1, 3, 100 + CIRCUIT_COOLDOWN_S + 5);
+    assert g == LG_SKIP;
+    const ok : bool = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_PROBE, 0, 2);
+    assert ok;
+    assert breaker_ok(brk[0..24], 1) == LB_CLOSED;
+    const o : u32 = control_outcome(200, PROBE_TOKENS, LD_CONTROL_MESSAGES, 0, true);
+    assert inc_control_rung(inc[0..433], 1, 200, o, 170, 3) == 1;
+    assert inc_state(inc[0..433], 1, LC_UNFUNDED) == LI_RESOLVED;
+    assert inc_field(inc[0..433], 1, LC_UNFUNDED, IF_EVID) == 200;
+    g = take_gate(brk[0..24], 1, 3, 171);
+    assert g == LG_PASS;
+}
+
+test a_failed_probe_reopens_the_breaker_and_a_lost_probe_is_replaced_after_a_cooldown {
+    var brk : [24]u64 = undefined;
+    var inc : [433]u64 = undefined;
+    const z1 : bool = cells_zero(brk[0..24], BR_CELLS);
+    const z2 : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z1;
+    assert z2;
+    assert breaker_fail(brk[0..24], 1, LC_UNFUNDED, 100) == LB_OPEN;
+    var g : u32 = take_gate(brk[0..24], 1, 3, 160);
+    assert g == LG_PROBE;
+    assert breaker_fail(brk[0..24], 1, LC_UNFUNDED, 160) == LB_OPEN;
+    g = take_gate(brk[0..24], 1, 3, 160 + CIRCUIT_COOLDOWN_S - 1);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 1, 3, 160 + CIRCUIT_COOLDOWN_S);
+    assert g == LG_PROBE;
+    assert breaker_fail(brk[0..24], 0, LC_TRANSIENT, 10) == LB_CLOSED;
+    assert breaker_fail(brk[0..24], 0, LC_TRANSIENT, 11) == LB_CLOSED;
+    assert breaker_fail(brk[0..24], 0, LC_TRANSIENT, 12) == LB_OPEN;
+    g = take_gate(brk[0..24], 0, 3, 72);
+    assert g == LG_PROBE;
+    assert breaker_fail(brk[0..24], 0, LC_TRANSIENT, 72) == LB_OPEN;
+    g = take_gate(brk[0..24], 0, 3, 73);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 0, 3, 72 + CIRCUIT_COOLDOWN_S);
+    assert g == LG_PROBE;
+    g = take_gate(brk[0..24], 0, 3, 72 + CIRCUIT_COOLDOWN_S + 1);
+    assert g == LG_SKIP;
+    g = take_gate(brk[0..24], 0, 3, 72 + CIRCUIT_COOLDOWN_S + CIRCUIT_COOLDOWN_S);
+    assert g == LG_PROBE;
+}
+
+test an_incident_resolves_only_on_a_200_control_request_through_the_same_path {
+    var inc : [433]u64 = undefined;
+    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z;
+    const id : u32 = inc_record(inc[0..433], 0, LC_TRANSIENT, 10, 1);
+    assert id == 1;
+    var ok : bool = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_WAIT, 0, 2);
+    assert ok;
+    ok = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_SKIP, 0, 3);
+    assert ok;
+    ok = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_PROBE, 0, 4);
+    assert ok;
+    ok = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_NEXT, 1, 5);
+    assert ok;
+    assert inc_state(inc[0..433], 0, LC_TRANSIENT) == LI_HEALING;
+    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_STEPS) == 15;
+    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_TRIED) == 3;
+    assert control_outcome(200, PROBE_TOKENS, 1, 0, true) == LX_RESOLVE;
+    assert control_outcome(200, PROBE_TOKENS, 1, 0, false) == LX_REPORT;
+    assert control_outcome(200, PROBE_TOKENS - 1, 1, 0, true) == LX_REPORT;
+    assert control_outcome(200, PROBE_TOKENS, 12, 0, true) == LX_REPORT;
+    assert control_outcome(200, PROBE_TOKENS, 1, 3, true) == LX_REPORT;
+    assert control_outcome(204, PROBE_TOKENS, 1, 0, true) == LX_REPORT;
+    assert control_outcome(429, PROBE_TOKENS, 1, 0, true) == LX_REPORT;
+    assert control_outcome(0, PROBE_TOKENS, 1, 0, true) == LX_REPORT;
+    var o : u32 = control_outcome(200, PROBE_TOKENS, 1, 0, false);
+    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 200, o, 20, 6) == LI_HEALING;
+    o = control_outcome(200, 1, 1, 0, true);
+    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 200, o, 21, 7) == LI_HEALING;
+    o = LX_RESOLVE;
+    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 500, o, 22, 8) == LI_ESCALATED;
+    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_EVID) == 500;
+    o = control_outcome(200, PROBE_TOKENS, 1, 0, true);
+    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 200, o, 23, 9) == LI_RESOLVED;
+    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_EVID) == 200;
+    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_CKPT) == 9;
+}
+
+test a_failed_control_request_escalates_and_is_never_repeated {
+    var inc : [433]u64 = undefined;
+    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z;
+    const id : u32 = inc_record(inc[0..433], 2, LC_UNFUNDED, 10, 1);
+    assert id == 1;
+    const o : u32 = control_outcome(402, PROBE_TOKENS, 1, 0, true);
+    assert o == LX_REPORT;
+    assert inc_control(inc[0..433], 2, LC_UNFUNDED, 402, o, 11, 2) == LI_OPEN;
+    const ok : bool = inc_step(inc[0..433], 2, LC_UNFUNDED, LR_SKIP, 0, 3);
+    assert ok;
+    assert inc_control(inc[0..433], 2, LC_UNFUNDED, 402, o, 12, 4) == LI_ESCALATED;
+    assert inc_field(inc[0..433], 2, LC_UNFUNDED, IF_EVID) == 402;
+    assert inc_control(inc[0..433], 2, LC_UNFUNDED, 402, o, 13, 5) == LI_ESCALATED;
+    assert inc_control(inc[0..433], 2, LC_RATE, 402, o, 13, 5) == LI_NONE;
+    var lx : u32 = LX_REPORT;
+    var rx : u32 = LX_RESOLVE;
+    assert lx != rx;
+    var m : u32 = LD_CONTROL_MESSAGES;
+    assert m == 1;
+}
+
+test the_recipe_list_is_closed_and_every_forbidden_act_is_a_constant_outside_it {
+    var r : u32 = 0;
+    while (r < LR_COUNT) {
+        assert recipe_allowed(r);
+        assert recipe_forbidden(r) == false;
+        r = r + 1;
+    }
+    var f : u32 = LF_FIRST;
+    while (f < LF_FIRST + LF_COUNT) {
+        assert recipe_forbidden(f);
+        assert recipe_allowed(f) == false;
+        f = f + 1;
+    }
+    assert recipe_allowed(LR_COUNT) == false;
+    assert recipe_forbidden(LF_FIRST - 1) == false;
+    assert recipe_forbidden(LF_FIRST + LF_COUNT) == false;
+    assert recipe_forbidden(LF_PURCHASE);
+    assert recipe_forbidden(LF_DELETE_CREDENTIAL);
+    assert recipe_forbidden(LF_ADD_PROVIDER);
+    assert recipe_forbidden(LF_CHANGE_GATE);
+    assert recipe_forbidden(LF_SWITCH_DEFAULT_MODEL);
+    assert recipe_forbidden(LF_OFF_ORDER_RUNG);
+    assert recipe_forbidden(LF_ENABLE_AUTOMATION);
+    var inc : [433]u64 = undefined;
+    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z;
+    const id : u32 = inc_record(inc[0..433], 1, LC_UNFUNDED, 10, 1);
+    assert id == 1;
+    var ok : bool = inc_step(inc[0..433], 1, LC_UNFUNDED, LF_PURCHASE, 0, 2);
+    assert ok == false;
+    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LF_OFF_ORDER_RUNG, 2, 2);
+    assert ok == false;
+    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, 50, 0, 2);
+    assert ok == false;
+    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_NEXT, 0, 2);
+    assert ok == false;
+    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_NEXT, 1, 2);
+    assert ok == false;
+    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_NEXT, LD_RUNGS_MAX, 2);
+    assert ok == false;
+    assert inc_field(inc[0..433], 1, LC_UNFUNDED, IF_STEPS) == 0;
+    assert inc_state(inc[0..433], 1, LC_UNFUNDED) == LI_OPEN;
+}
+
+test the_walk_goes_forward_once_and_ends_with_the_503 {
+    assert next_from(0, 0, 3) == 0;
+    assert next_from(1, 0, 3) == 1;
+    assert next_from(0, 1, 3) == 1;
+    assert next_from(0, 3, 3) == 2;
+    assert next_from(0, 7, 3) == 3;
+    assert next_from(3, 0, 3) == 3;
+    assert walk_status(0, 7, 3) == LAST_RESORT_STATUS;
+    assert walk_status(0, 3, 3) == 0;
+    assert walk_status(2, 0, 3) == 0;
+    assert walk_status(3, 0, 3) == LAST_RESORT_STATUS;
+    var st : u32 = LAST_RESORT_STATUS;
+    assert st == 503;
+    var r : u32 = 0;
+    while (r < 3) {
+        assert next_from(r + 1, 0, 3) > r;
+        r = r + 1;
+    }
+}
+
+test a_total_refusal_names_every_rung_class_and_the_incident_and_nothing_else {
+    var out : [192]u8 = undefined;
+    var cl : [8]u32 = undefined;
+    cl[0] = LC_UNFUNDED;
+    cl[1] = LC_RATE;
+    cl[2] = LC_UNWIRED;
+    const w : usize = refusal_line(out[0..192], 3, cl[0..8], 7);
+    assert w == 53;
+    assert same_bytes(out[0..w], "ladder closed: 0=UNFUNDED 1=RATE 2=UNWIRED incident=7");
+    assert line_is_safe(out[0..w]);
+    var tiny : [16]u8 = undefined;
+    assert refusal_line(tiny[0..16], 3, cl[0..8], 7) == 0;
+    assert refusal_line(out[0..192], 0, cl[0..8], 7) == 0;
+    assert refusal_line(out[0..192], 9, cl[0..8], 7) == 0;
+    assert line_is_safe("a\"b") == false;
+    assert line_is_safe("a\\b") == false;
+    assert line_is_safe("a b");
+}
+
+test the_refusal_body_is_built_from_the_incident_table {
+    var inc : [433]u64 = undefined;
+    var out : [192]u8 = undefined;
+    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    assert z;
+    var a : u32 = inc_record(inc[0..433], 0, LC_UNFUNDED, 10, 1);
+    assert a == 1;
+    a = inc_record(inc[0..433], 1, LC_RATE, 11, 2);
+    assert a == 2;
+    a = inc_record(inc[0..433], 1, LC_TRANSIENT, 12, 3);
+    assert a == 3;
+    assert rung_class(inc[0..433], 0) == LC_UNFUNDED;
+    assert rung_class(inc[0..433], 1) == LC_TRANSIENT;
+    assert rung_class(inc[0..433], 2) == LC_UNKNOWN;
+    assert newest_live(inc[0..433], 3) == 3;
+    assert newest_live(inc[0..433], 1) == 1;
+    const o : u32 = control_outcome(200, PROBE_TOKENS, 1, 0, true);
+    assert inc_control(inc[0..433], 1, LC_TRANSIENT, 200, o, 13, 4) == LI_RESOLVED;
+    assert rung_class(inc[0..433], 1) == LC_RATE;
+    assert newest_live(inc[0..433], 3) == 2;
+    const w : usize = refusal_body(out[0..192], inc[0..433], 3);
+    assert w == 53;
+    assert same_bytes(out[0..w], "ladder closed: 0=UNFUNDED 1=RATE 2=UNKNOWN incident=2");
+}
+
+test the_tables_are_sized_for_the_rung_and_cause_counts {
+    var slots : usize = IN_SLOTS;
+    var want : usize = @as(usize, LD_RUNGS_MAX) * @as(usize, LC_COUNT);
+    assert slots == want;
+    var cells : usize = IN_CELLS;
+    var need : usize = IN_HDR + IN_SLOTS * IF_F;
+    assert cells == need;
+    var bc : usize = BR_CELLS;
+    var bw : usize = @as(usize, LD_RUNGS_MAX) * BR_F;
+    assert bc == bw;
+    assert inc_at(LD_RUNGS_MAX - 1, LC_COUNT - 1) + IF_F == IN_CELLS;
+    assert pow2(0) == 1;
+    assert pow2(3) == 8;
+    assert has_bit(5, 0);
+    assert has_bit(5, 1) == false;
+    assert has_bit(5, 2);
+    assert with_bit(5, 1) == 7;
+    assert with_bit(7, 1) == 7;
+}
