@@ -781,6 +781,10 @@ use t27os::hot_reload::live_rev;
 use t27os::hot_reload::live_should_apply;
 use t27os::hot_reload::live_apply;
 use t27os::hot_reload::live_apply_rc;
+use t27os::hot_reload::apply_now_flag;
+use t27os::hot_reload::apply_rev;
+use t27os::hot_reload::KEY_APPLY_NOW;
+use t27os::hot_reload::KEY_APPLY_REV;
 use t27os::hot_reload::rc_candidate_ok;
 use t27os::hot_reload::rc_apply_atomic;
 use t27os::hot_reload::KEY_RC_SCHEMA;
@@ -7378,6 +7382,12 @@ pub const TPG_RC_REV : u32 = 287;
 /// A dev build neither replaces its own binary nor lets the release poll rewrite
 /// the local live data; local hot reload (live_load) still runs.
 pub const TPG_IS_DEV : u32 = 284;
+/// The explicit apply request parsed from the dev live module (slice 3):
+/// APPLY_NOW=1 for generation APPLY_REV; APPLIED_REV remembers what already
+/// ran, so one request fires exactly once (no post-exec livelock).
+pub const TPG_APPLY_NOW : u32 = 260;
+pub const TPG_APPLY_REV : u32 = 261;
+pub const TPG_APPLIED_REV : u32 = 262;
 /// Ownership fence state (hot_reload owner_gate): the applied live generation's
 /// writer hash and lease end; TPG_RC_LAST names the last reload outcome
 /// (1 applied, 2 stale revision, 3 invalid module, 4 fenced foreign writer).
@@ -7734,6 +7744,9 @@ fn live_load(tg: []u64, tb: []u8, hb: []const u8, kk: []u64) -> bool {
         tg[TPG_OWN_HASH] = owner_hash(t[cs..cs + cl2], cl2);
         tg[TPG_OWN_UNTIL] = cuntil;
     }
+    // the explicit apply request rides the same gated generation
+    tg[TPG_APPLY_NOW] = apply_now_flag(t, n);
+    tg[TPG_APPLY_REV] = apply_rev(t, n);
     tg[TPG_RC_LAST] = 1;
     var tbl : [15]u32 = undefined;
     thv_defaults(tbl[0..15]);
@@ -12578,6 +12591,9 @@ pub fn main() -> void {
     // module (live_load) moves them while the window runs, values only
     tgv[TPG_RC_OBS] = @as(u64, card_obs_mK());
     tgv[TPG_RC_REF] = @as(u64, card_ref_mK());
+    // the applied-apply generation persists across the re-exec, so one
+    // APPLY_NOW request fires exactly once
+    tgv[TPG_APPLIED_REV] = @as(u64, @intCast(msg1(defs, sel("integerForKey:"), cf("t27os.applied_rev"))));
     tgz = 0;
     while (tgz < 77312) {
         tbv[tgz] = 0;
@@ -14740,23 +14756,53 @@ pub fn main() -> void {
                 var argv : [2]u64 = undefined;
                 argv[0] = path;
                 argv[1] = 0;
-                // slice 3 executable path: validate the swapped-in bundle before
-                // exec - it must still be this dev channel (bundle id written by
-                // install.t27 plist_text_channel) and carry a parseable build;
-                // otherwise the CURRENT binary keeps running and the refusal is
-                // recorded (dev_swap.t27 swap_allowed, rules side)
-                const cb : u64 = msg1(cls("NSBundle"), sel("bundleWithPath:"), msg0(msg0(exe, sel("stringByDeletingLastPathComponent")), sel("stringByDeletingLastPathComponent")));
-                var cidb : [32]u8 = undefined;
-                const cdl : usize = ns_bytes(msg1(cb, sel("objectForInfoDictionaryKey:"), cf("CFBundleIdentifier")), cidb[0..32]);
-                var cvb : [16]u8 = undefined;
-                const cvl : usize = ns_bytes(msg1(cb, sel("objectForInfoDictionaryKey:"), cf("CFBundleVersion")), cvb[0..16]);
-                if (is_dev_bundle_id(cidb[0..cdl], cdl) and parse_build(cvb[0..cvl], cvl) != 0) {
-                    // exec failure handling: execv returning means THIS process
-                    // is still alive on the old binary - record it, keep serving
-                    const erc : i32 = exec_self(path, argv);
-                    if (erc != 0) { tgv[TPG_RC_LAST] = 6; }
-                } else {
-                    tgv[TPG_RC_LAST] = 5;
+                // slice 3 executable path: stage - validate - apply. The rebuild
+                // only PREPARES the candidate at the build path; this dev build
+                // never execs the mutable build path. Application happens only
+                // when the dev live module carries the explicit APPLY_NOW=1 for
+                // a generation newer than the last applied one, and binds to the
+                // STAGED copy - the exact artifact that passed validation.
+                if (tgv[TPG_IS_DEV] != 0 and tgv[TPG_APPLY_NOW] == 1 and tgv[TPG_APPLY_REV] > tgv[TPG_APPLIED_REV]) {
+                    const cdir : u64 = msg0(msg0(exe, sel("stringByDeletingLastPathComponent")), sel("stringByDeletingLastPathComponent"));
+                    const cb : u64 = msg1(cls("NSBundle"), sel("bundleWithPath:"), cdir);
+                    var cidb : [32]u8 = undefined;
+                    const cdl : usize = ns_bytes(msg1(cb, sel("objectForInfoDictionaryKey:"), cf("CFBundleIdentifier")), cidb[0..32]);
+                    var cvb : [16]u8 = undefined;
+                    const cvl : usize = ns_bytes(msg1(cb, sel("objectForInfoDictionaryKey:"), cf("CFBundleVersion")), cvb[0..16]);
+                    const cid_ok : bool = is_dev_bundle_id(cidb[0..cdl], cdl);
+                    const cver_ok : bool = parse_build(cvb[0..cvl], cvl) != 0;
+                    if (!cid_ok or !cver_ok) {
+                        tgv[TPG_RC_LAST] = 5;
+                    } else {
+                        // stage: copy the candidate beside this app, then
+                        // validate the STAGED copy - exec binds to the staged
+                        // path, so a later change at the build path cannot
+                        // replace the artifact being applied
+                        const fm : u64 = msg0(cls("NSFileManager"), sel("defaultManager"));
+                        const sapp : u64 = msg1(cdir, sel("stringByAppendingPathComponent:"), cf("../T27OS-dev-staged.app"));
+                        msg3(fm, sel("removeItemAtPath:error:"), sapp, 0, 0);
+                        const copied : u64 = msg3(fm, sel("copyItemAtPath:toPath:error:"), cdir, sapp, 0);
+                        const sb : u64 = msg1(cls("NSBundle"), sel("bundleWithPath:"), sapp);
+                        var sidb : [32]u8 = undefined;
+                        const sdl : usize = ns_bytes(msg1(sb, sel("objectForInfoDictionaryKey:"), cf("CFBundleIdentifier")), sidb[0..32]);
+                        var svb : [16]u8 = undefined;
+                        const svl : usize = ns_bytes(msg1(sb, sel("objectForInfoDictionaryKey:"), cf("CFBundleVersion")), svb[0..16]);
+                        if (copied != 0 and is_dev_bundle_id(sidb[0..sdl], sdl) and parse_build(svb[0..svl], svl) != 0) {
+                            const spath : u64 = msg0(msg0(sb, sel("executablePath")), sel("UTF8String"));
+                            // the applied generation persists before the exec:
+                            // one request fires exactly once even across the
+                            // re-exec; an exec failure still records itself
+                            msg2(defs, sel("setInteger:forKey:"), tgv[TPG_APPLY_REV], cf("t27os.applied_rev"));
+                            msg0(defs, sel("synchronize"));
+                            var sargv : [2]u64 = undefined;
+                            sargv[0] = spath;
+                            sargv[1] = 0;
+                            const erc : i32 = exec_self(spath, sargv);
+                            if (erc != 0) { tgv[TPG_RC_LAST] = 6; }
+                        } else {
+                            tgv[TPG_RC_LAST] = 5;
+                        }
+                    }
                 }
                 waited = RELOAD_IDLE;
             }
