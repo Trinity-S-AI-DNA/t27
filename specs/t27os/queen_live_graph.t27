@@ -26,6 +26,18 @@ use t27os::lanes_view::LVS_IDLE;
 use t27os::lanes_view::LVS_READY;
 use t27os::lanes_view::LVS_UNKNOWN;
 use t27os::lanes_view::LV_NOTE;
+use t27os::lanes_view::LV_NOT_MEASURED;
+use t27os::lanes_view::lv_elapsed_text;
+use t27os::lanes_view::lv_has;
+use t27os::lanes_view::lv_add;
+use t27os::lanes_view::lv_note_row;
+use t27os::lanes_view::LV_PANE;
+use t27os::lanes_view::LV_SCRIPT;
+use t27os::lanes_view::LV_QUEEN;
+use t27os::lanes_view::LV_KERNEL;
+use t27os::lanes_view::LVF_SRC;
+use t27os::lanes_view::LVF_STATE;
+use t27os::lanes_view::LVF_ELAPSED;
 
 // ---------------------------------------------------------------- the palette
 
@@ -133,6 +145,38 @@ pub fn qlg_step(w : f64, n : u32) -> f64 {
     return (w - 2.0 * QLG_PAD) / (qlg_shown(n) as f64);
 }
 
+// ------------------------------------------------------------- the state classes
+
+/// The six live-state classes of a lane row, finer than the five colours: a RUNNING lane is
+/// working while its heartbeat is fresh, connected while it runs with no timestamp, stale once
+/// the heartbeat goes quiet past QLG_STALE_S. Never call a stale pane live.
+pub const QLG_S_WORKING : u32 = 0;
+pub const QLG_S_CONNECTED : u32 = 1;
+pub const QLG_S_IDLE : u32 = 2;
+pub const QLG_S_BLOCKED : u32 = 3;
+pub const QLG_S_STALE : u32 = 4;
+pub const QLG_S_DONE : u32 = 5;
+pub const QLG_S_COUNT : u32 = 6;
+
+pub const QLG_STALE_S : u32 = 300;
+pub const QLG_QUIET_S : u32 = 600;
+
+/// The class of a lanes-table row (specs/t27os/lanes_view.t27). `elapsed` is the heartbeat age in
+/// seconds, LV_NOT_MEASURED when the pane gave no timestamp; `now` is the epoch second the class
+/// is asked at. The feed quiet law quotes QLG_QUIET_S (specs/t27f/live_fleet.t27): one constant,
+/// never re-derived.
+pub fn qlg_state_class(state : u32, elapsed : u32, now : u32) -> u32 {
+    if (state == LVS_RUNNING) {
+        if (elapsed == LV_NOT_MEASURED) { return QLG_S_CONNECTED; }
+        if (now < elapsed) { return QLG_S_WORKING; }
+        if (now - elapsed <= QLG_STALE_S) { return QLG_S_WORKING; }
+        return QLG_S_STALE;
+    }
+    if (state == LVS_BLOCKED) { return QLG_S_BLOCKED; }
+    if (state == LVS_DONE) { return QLG_S_DONE; }
+    return QLG_S_IDLE;
+}
+
 // ---------------------------------------------------------------- the texts
 
 pub const QLG_TITLE : str = "LIVE MYCELIUM";
@@ -152,6 +196,135 @@ pub fn qlg_more_line(out : []u8, hidden : u32) -> usize {
 pub fn qlg_empty_line(out : []u8, server_ok : bool, n : u32) -> usize {
     if (server_ok == false) { return put_bytes(out, 0, "pty server offline - the mycelium waits"); }
     return put_bytes(out, 0, "no lanes yet - spawn work and watch it grow");
+}
+
+/// The honest stat line: every nonzero class is named -- the six classes are mutually exclusive
+/// agent states, so the shown counts always sum to `n`. Counts come from qlg_state_class over the
+/// lanes table. "3 agents 2 working 1 idle 1 blocked".
+pub fn qlg_stat_line2(out : []u8, n : u32, working : u32, connected : u32, idle : u32, blocked : u32, stale : u32, done : u32) -> usize {
+    var w : usize = put_dec(out, 0, n as u64);
+    w = put_bytes(out, w, " agents");
+    if (working > 0) {
+        w = put_bytes(out, w, " ");
+        w = put_dec(out, w, working as u64);
+        w = put_bytes(out, w, " working");
+    }
+    if (connected > 0) {
+        w = put_bytes(out, w, " ");
+        w = put_dec(out, w, connected as u64);
+        w = put_bytes(out, w, " connected");
+    }
+    if (idle > 0) {
+        w = put_bytes(out, w, " ");
+        w = put_dec(out, w, idle as u64);
+        w = put_bytes(out, w, " idle");
+    }
+    if (blocked > 0) {
+        w = put_bytes(out, w, " ");
+        w = put_dec(out, w, blocked as u64);
+        w = put_bytes(out, w, " blocked");
+    }
+    if (stale > 0) {
+        w = put_bytes(out, w, " ");
+        w = put_dec(out, w, stale as u64);
+        w = put_bytes(out, w, " stale");
+    }
+    if (done > 0) {
+        w = put_bytes(out, w, " ");
+        w = put_dec(out, w, done as u64);
+        w = put_bytes(out, w, " done");
+    }
+    return w;
+}
+
+/// One node label: name, the issue it serves (a bare "-" when it serves none), the state word and
+/// the elapsed time; no elapsed word when the pane gave no timestamp.
+pub fn qlg_node_line(out : []u8, name : string, issue : u32, state_word : string, elapsed : u32) -> usize {
+    var w : usize = put_bytes(out, 0, name);
+    w = put_bytes(out, w, " #");
+    if (issue == 0) {
+        w = put_bytes(out, w, "-");
+    } else {
+        w = put_dec(out, w, issue as u64);
+    }
+    w = put_bytes(out, w, " ");
+    w = put_bytes(out, w, state_word);
+    if (elapsed != LV_NOT_MEASURED) {
+        w = put_bytes(out, w, " ");
+        var d : [16]u8 = undefined;
+        w = put_bytes(out, w, d[0 .. lv_elapsed_text(elapsed, d[0..16])]);
+    }
+    return w;
+}
+
+// ------------------------------------------------------------- the event ring
+
+/// The ring of lane events under the band: what happened, when, to whom. Four u32 words per
+/// entry (kind, time, lane, seq), at most QLEV_MAX entries; a newer entry overwrites the oldest.
+pub const QLEV_SPAWN : u32 = 0;
+pub const QLEV_START : u32 = 1;
+pub const QLEV_VERIFY : u32 = 2;
+pub const QLEV_BLOCK : u32 = 3;
+pub const QLEV_FINISH : u32 = 4;
+pub const QLEV_STALE : u32 = 5;
+pub const QLEV_KIND_COUNT : u32 = 6;
+pub const QLEV_KINDS : [6]str = ["spawn", "start", "verify", "block", "finish", "stale"];
+pub const QLEV_F : usize = 4;
+pub const QLEV_MAX : u32 = 32;
+
+/// Add one event; `total` is how many events were ever added. Returns the new total. The entry
+/// lands at slot total % QLEV_MAX, so the oldest is overwritten exactly when the ring is full.
+pub fn qlg_ev_add(buf : []u32, total : u32, kind : u32, time : u32, lane : u32, seq : u32) -> u32 {
+    const slot : usize = @as(usize, total % QLEV_MAX) * QLEV_F;
+    buf[slot] = kind;
+    buf[slot + 1] = time;
+    buf[slot + 2] = lane;
+    buf[slot + 3] = seq;
+    return total + 1;
+}
+
+/// Events visible now: everything added, capped at QLEV_MAX (the oldest were overwritten).
+pub fn qlg_ev_count(total : u32) -> u32 {
+    if (total > QLEV_MAX) { return QLEV_MAX; }
+    return total;
+}
+
+/// Word f (0 kind, 1 time, 2 lane, 3 seq) of event i of the ring, 0 = oldest.
+pub fn qlg_ev_at(buf : []const u32, total : u32, i : u32, f : u32) -> u32 {
+    const count : u32 = qlg_ev_count(total);
+    const slot : usize = @as(usize, (total - count + i) % QLEV_MAX) * QLEV_F + @as(usize, f);
+    return buf[slot];
+}
+
+/// One feed line: "17:22 spawn #1234 GLM FLASH" -- the event time as HH:MM (UTC), the kind word,
+/// the lane's issue and the model word the caller reads from the lanes table. "-" when the lane
+/// carries no issue.
+pub fn qlg_ev_line(out : []u8, buf : []const u32, total : u32, i : u32, model_word : string) -> usize {
+    const kind : u32 = qlg_ev_at(buf, total, i, 0);
+    const time : u32 = qlg_ev_at(buf, total, i, 1);
+    const lane : u32 = qlg_ev_at(buf, total, i, 2);
+    var w : usize = 0;
+    const hh : u32 = (time / 3600) % 24;
+    const mm : u32 = (time % 3600) / 60;
+    if (hh < 10) { w = put_bytes(out, w, "0"); }
+    w = put_dec(out, w, hh as u64);
+    w = put_bytes(out, w, ":");
+    if (mm < 10) { w = put_bytes(out, w, "0"); }
+    w = put_dec(out, w, mm as u64);
+    w = put_bytes(out, w, " ");
+    if (kind < QLEV_KIND_COUNT) {
+        w = put_bytes(out, w, QLEV_KINDS[kind]);
+    } else {
+        w = put_bytes(out, w, "?");
+    }
+    w = put_bytes(out, w, " #");
+    if (lane == 0) {
+        w = put_bytes(out, w, "-");
+    } else {
+        w = put_dec(out, w, lane as u64);
+    }
+    w = put_bytes(out, w, " ");
+    return put_bytes(out, w, model_word);
 }
 
 // ---------------------------------------------------------------- tests
@@ -249,6 +422,247 @@ test the_stat_line_carries_its_counts {
 invariant the_palette_holds_exactly_five_colours {
     assert(QLG_C_NEW == 0 and QLG_C_ACTIVE == 1 and QLG_C_DOWN == 2 and QLG_C_RESTART == 3 and QLG_C_EXIT == 4);
     assert(QLG_C_COUNT == 5);
+}
+
+test the_state_classes_split_running_by_its_heartbeat {
+    // `elapsed` is the last-output timestamp; a heartbeat fresh within the stale wall is working
+    assert(qlg_state_class(LVS_RUNNING, 1000, 1000) == QLG_S_WORKING);
+    assert(qlg_state_class(LVS_RUNNING, 1000, 1300) == QLG_S_WORKING);
+    assert(qlg_state_class(LVS_RUNNING, 1000, 1000 + QLG_STALE_S) == QLG_S_WORKING);
+    // past the stale wall: stale, never live
+    assert(qlg_state_class(LVS_RUNNING, 1000, 1000 + QLG_STALE_S + 1) == QLG_S_STALE);
+    assert(qlg_state_class(LVS_RUNNING, 1000, 11000) == QLG_S_STALE);
+    // no timestamp at all: connected (running, honestly unmeasured)
+    assert(qlg_state_class(LVS_RUNNING, LV_NOT_MEASURED, 1000) == QLG_S_CONNECTED);
+    // the other states pass through
+    assert(qlg_state_class(LVS_BLOCKED, 0, 1000) == QLG_S_BLOCKED);
+    assert(qlg_state_class(LVS_DONE, 0, 1000) == QLG_S_DONE);
+    assert(qlg_state_class(LVS_IDLE, 0, 1000) == QLG_S_IDLE);
+    assert(qlg_state_class(LVS_UNKNOWN, 0, 1000) == QLG_S_IDLE);
+    assert(qlg_state_class(LVS_STALLED, 0, 1000) == QLG_S_IDLE);
+    // a timestamp from the future cannot be trusted as stale; the lane still reads working
+    assert(qlg_state_class(LVS_RUNNING, 2000, 1000) == QLG_S_WORKING);
+}
+
+test the_stale_and_quiet_walls_hold_their_numbers {
+    assert(QLG_STALE_S == 300);
+    assert(QLG_QUIET_S == 600);
+    // the feed quiet law sits past the node stale law: one constant, never re-derived
+    assert(QLG_QUIET_S > QLG_STALE_S);
+}
+
+test the_honest_stat_line_names_every_nonzero_class {
+    var b : [96]u8 = undefined;
+    assert(qlg_eq(b[0..96], qlg_stat_line2(b[0..96], 3, 2, 0, 1, 0, 0, 0), "3 agents 2 working 1 idle"));
+    assert(qlg_eq(b[0..96], qlg_stat_line2(b[0..96], 4, 2, 0, 1, 1, 0, 0), "4 agents 2 working 1 idle 1 blocked"));
+    assert(qlg_eq(b[0..96], qlg_stat_line2(b[0..96], 2, 0, 0, 0, 0, 2, 0), "2 agents 2 stale"));
+    assert(qlg_eq(b[0..96], qlg_stat_line2(b[0..96], 1, 0, 1, 0, 0, 0, 0), "1 agents 1 connected"));
+    assert(qlg_eq(b[0..96], qlg_stat_line2(b[0..96], 2, 0, 0, 0, 0, 0, 2), "2 agents 2 done"));
+    assert(qlg_eq(b[0..96], qlg_stat_line2(b[0..96], 0, 0, 0, 0, 0, 0, 0), "0 agents"));
+    // every class at once, in class order
+    assert(qlg_eq(b[0..96], qlg_stat_line2(b[0..96], 6, 1, 1, 1, 1, 1, 1), "6 agents 1 working 1 connected 1 idle 1 blocked 1 stale 1 done"));
+}
+
+test the_state_classes_exhaust_the_agents_they_count {
+    // the six classes are mutually exclusive: for every mix of lanes-table states their counts
+    // over a table of n rows must sum to n -- no agent is counted twice, none is dropped
+    var states : [6]u32 = [LVS_RUNNING, LVS_DONE, LVS_BLOCKED, LVS_IDLE, LVS_UNKNOWN, LVS_STALLED];
+    var now : u32 = 10000;
+    var mix : u32 = 0;
+    while (mix < 64) {
+        var m : u32 = mix;
+        var n : u32 = 0;
+        var working : u32 = 0;
+        var connected : u32 = 0;
+        var idle : u32 = 0;
+        var blocked : u32 = 0;
+        var stale : u32 = 0;
+        var done : u32 = 0;
+        var k : u32 = 0;
+        while (k < 6) {
+            // two bits of the mix pick each row's heartbeat: fresh, none, old
+            const hb : u32 = (mix >> (k + k)) % 3;
+            var elapsed : u32 = LV_NOT_MEASURED;
+            if (hb == 1) { elapsed = now - 10; }
+            if (hb == 2) { elapsed = now - 4000; }
+            const c : u32 = qlg_state_class(states[k], elapsed, now);
+            if (c == QLG_S_WORKING) { working = working + 1; }
+            if (c == QLG_S_CONNECTED) { connected = connected + 1; }
+            if (c == QLG_S_IDLE) { idle = idle + 1; }
+            if (c == QLG_S_BLOCKED) { blocked = blocked + 1; }
+            if (c == QLG_S_STALE) { stale = stale + 1; }
+            if (c == QLG_S_DONE) { done = done + 1; }
+            n = n + 1;
+            k = k + 1;
+        }
+        assert(working + connected + idle + blocked + stale + done == n);
+        var b : [128]u8 = undefined;
+        const w : usize = qlg_stat_line2(b[0..128], n, working, connected, idle, blocked, stale, done);
+        // the rendered line names exactly the classes it counted: no word without agents behind it
+        assert(lv_has(b[0..w], "working") == (working > 0));
+        assert(lv_has(b[0..w], "connected") == (connected > 0));
+        assert(lv_has(b[0..w], "idle") == (idle > 0));
+        assert(lv_has(b[0..w], "blocked") == (blocked > 0));
+        assert(lv_has(b[0..w], "stale") == (stale > 0));
+        assert(lv_has(b[0..w], "done") == (done > 0));
+        mix = mix + 1;
+    }
+}
+
+test the_rendered_stat_line_carries_the_full_count {
+    // the numbers on the line, read back, sum to n
+    var b : [96]u8 = undefined;
+    var w : usize = qlg_stat_line2(b[0..96], 5, 2, 1, 0, 1, 1, 0);
+    assert(qlg_eq(b[0..96], w, "5 agents 2 working 1 connected 1 blocked 1 stale"));
+    w = qlg_stat_line2(b[0..96], 16, 16, 0, 0, 0, 0, 0);
+    assert(qlg_eq(b[0..96], w, "16 agents 16 working"));
+    w = qlg_stat_line2(b[0..96], 7, 0, 0, 3, 0, 0, 4);
+    assert(qlg_eq(b[0..96], w, "7 agents 3 idle 4 done"));
+}
+
+test n_counts_every_row_except_notes {
+    // the rule for n: every lanes-table row counts as an agent except the NOTE filler row --
+    // panes, script lanes, the queen, kernel services and own-git rows are agents; a NOTE is
+    // the honest empty marker, not a lane
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    var n : u32 = 0;
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_PANE, 0, 0, 0, LVS_RUNNING, 10, 0, "pane a");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_SCRIPT, 11324, 0, 0, LVS_BLOCKED, 20, 0, "script b");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_QUEEN, 0, 0, 0, LVS_IDLE, 30, 0, "queen");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_KERNEL, 0, 0, 0, LVS_RUNNING, 40, 1, "service");
+    assert(n == 4);
+    // the NOTE row joins the table but never the count
+    var m : u32 = lv_note_row(tab[0..512], txt[0..5120], n);
+    assert(m == n + 1);
+    var agents : u32 = 0;
+    var i : u32 = 0;
+    while (i < m) {
+        if (tab[@as(usize, i) * 8 + LVF_SRC] != LV_NOTE) { agents = agents + 1; }
+        i = i + 1;
+    }
+    assert(agents == n);
+}
+
+test every_included_row_maps_to_exactly_one_state_class {
+    // a walk over a real table: each non-NOTE row lands in exactly one of the six classes
+    // (counted once), the sum of the classes is n, and the NOTE row is skipped
+    var tab : [512]u32 = undefined;
+    var txt : [5120]u8 = undefined;
+    var n : u32 = 0;
+    const now : u32 = 9000;
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_PANE, 0, 0, 0, LVS_RUNNING, now - 10, 0, "pane fresh");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_PANE, 0, 0, 0, LVS_RUNNING, 4294967295, 0, "pane no beat");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_PANE, 0, 0, 0, LVS_RUNNING, now - 4000, 0, "pane quiet");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_SCRIPT, 11324, 0, 0, LVS_BLOCKED, 0, 0, "script blocked");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_QUEEN, 0, 0, 0, LVS_DONE, 0, 0, "queen done");
+    n = lv_add(tab[0..512], txt[0..5120], n, LV_KERNEL, 0, 0, 0, LVS_IDLE, 0, 1, "service idle");
+    const m : u32 = lv_note_row(tab[0..512], txt[0..5120], n);
+    var working : u32 = 0;
+    var connected : u32 = 0;
+    var idle : u32 = 0;
+    var blocked : u32 = 0;
+    var stale : u32 = 0;
+    var done : u32 = 0;
+    var i : u32 = 0;
+    while (i < m) {
+        const r : usize = @as(usize, i) * 8;
+        if (tab[r + LVF_SRC] == LV_NOTE) { i = i + 1; } else {
+            const c : u32 = qlg_state_class(tab[r + LVF_STATE], tab[r + LVF_ELAPSED], now);
+            if (c == QLG_S_WORKING) { working = working + 1; }
+            if (c == QLG_S_CONNECTED) { connected = connected + 1; }
+            if (c == QLG_S_IDLE) { idle = idle + 1; }
+            if (c == QLG_S_BLOCKED) { blocked = blocked + 1; }
+            if (c == QLG_S_STALE) { stale = stale + 1; }
+            if (c == QLG_S_DONE) { done = done + 1; }
+            i = i + 1;
+        }
+    }
+    assert(working == 1 and connected == 1 and stale == 1);
+    assert(blocked == 1 and done == 1 and idle == 1);
+    assert(working + connected + idle + blocked + stale + done == n);
+}
+
+test the_stale_wall_sits_exactly_between_fresh_and_quiet {
+    // on the wall itself the lane still reads working
+    assert(qlg_state_class(LVS_RUNNING, 1000, 1000 + QLG_STALE_S) == QLG_S_WORKING);
+    // one second past it, the lane is stale
+    assert(qlg_state_class(LVS_RUNNING, 1000, 1000 + QLG_STALE_S + 1) == QLG_S_STALE);
+    // a lane with no heartbeat never crosses the wall: it stays honestly connected
+    assert(qlg_state_class(LVS_RUNNING, LV_NOT_MEASURED, 1000 + QLG_STALE_S + 1) == QLG_S_CONNECTED);
+    assert(qlg_state_class(LVS_RUNNING, LV_NOT_MEASURED, 1000 + QLG_QUIET_S) == QLG_S_CONNECTED);
+}
+
+test an_empty_table_renders_the_honest_empty_line_and_zero_counts {
+    var b : [64]u8 = undefined;
+    // zero agents, zero in every class, all on one honest line
+    assert(qlg_eq(b[0..64], qlg_stat_line2(b[0..64], 0, 0, 0, 0, 0, 0, 0), "0 agents"));
+    // and the empty table's own line names why, not a fake count
+    assert(qlg_eq(b[0..64], qlg_empty_line(b[0..64], true, 0), "no lanes yet - spawn work and watch it grow"));
+}
+
+test the_node_label_carries_name_issue_state_and_elapsed {
+    var b : [64]u8 = undefined;
+    assert(qlg_eq(b[0..64], qlg_node_line(b[0..64], "GLM FLASH", 1234, "WORKING", 12), "GLM FLASH #1234 WORKING 12s"));
+    // no issue: a bare dash, never a lying 0
+    assert(qlg_eq(b[0..64], qlg_node_line(b[0..64], "GLM FLASH", 0, "IDLE", 5), "GLM FLASH #- IDLE 5s"));
+    // no timestamp: no elapsed word at all
+    assert(qlg_eq(b[0..64], qlg_node_line(b[0..64], "OPUS", 777, "CONNECTED", LV_NOT_MEASURED), "OPUS #777 CONNECTED"));
+    assert(qlg_eq(b[0..64], qlg_node_line(b[0..64], "SONNET", 42, "STALE", 3725), "SONNET #42 STALE 1h02"));
+}
+
+test the_event_ring_wraps_and_never_grows_past_its_cap {
+    var buf : [128]u32 = undefined;
+    var total : u32 = 0;
+    var s : u32 = 0;
+    while (s < QLEV_MAX) {
+        total = qlg_ev_add(buf[0..], total, QLEV_SPAWN, 1000 + s, 100 + s, s);
+        s = s + 1;
+    }
+    assert(total == QLEV_MAX);
+    assert(qlg_ev_count(total) == QLEV_MAX);
+    // the oldest is still the oldest before the wrap
+    assert(qlg_ev_at(buf[0..], total, 0, 0) == QLEV_SPAWN);
+    assert(qlg_ev_at(buf[0..], total, 0, 1) == 1000);
+    assert(qlg_ev_at(buf[0..], total, QLEV_MAX - 1, 1) == 1000 + QLEV_MAX - 1);
+    // one more overwrites the oldest, in place
+    total = qlg_ev_add(buf[0..], total, QLEV_VERIFY, 2000, 11324, QLEV_MAX);
+    assert(total == QLEV_MAX + 1);
+    assert(qlg_ev_count(total) == QLEV_MAX);
+    assert(qlg_ev_at(buf[0..], total, 0, 0) == QLEV_SPAWN);
+    assert(qlg_ev_at(buf[0..], total, 0, 1) == 1001);
+    assert(qlg_ev_at(buf[0..], total, QLEV_MAX - 1, 0) == QLEV_VERIFY);
+    assert(qlg_ev_at(buf[0..], total, QLEV_MAX - 1, 3) == QLEV_MAX);
+    // a tiny ring behaves exactly as it reads
+    assert(qlg_ev_count(0) == 0);
+    assert(qlg_ev_count(3) == 3);
+}
+
+test the_event_line_reads_time_kind_lane_model {
+    var buf : [128]u32 = undefined;
+    var total : u32 = 0;
+    total = qlg_ev_add(buf[0..], total, QLEV_SPAWN, 17 * 3600 + 22 * 60 + 5, 1234, 1);
+    total = qlg_ev_add(buf[0..], total, QLEV_BLOCK, 23 * 3600 + 4 * 60, 0, 2);
+    var b : [64]u8 = undefined;
+    assert(qlg_eq(b[0..64], qlg_ev_line(b[0..64], buf[0..], total, 0, "GLM FLASH"), "17:22 spawn #1234 GLM FLASH"));
+    // no issue on the lane: a bare dash
+    assert(qlg_eq(b[0..64], qlg_ev_line(b[0..64], buf[0..], total, 1, "OPUS"), "23:04 block #- OPUS"));
+    // every kind word is named, in order
+    assert(QLEV_KINDS[QLEV_START] == "start" and QLEV_KINDS[QLEV_VERIFY] == "verify");
+    assert(QLEV_KINDS[QLEV_FINISH] == "finish" and QLEV_KINDS[QLEV_STALE] == "stale");
+}
+
+invariant the_state_classes_are_six_distinct_names {
+    assert(QLG_S_WORKING == 0 and QLG_S_CONNECTED == 1 and QLG_S_IDLE == 2);
+    assert(QLG_S_BLOCKED == 3 and QLG_S_STALE == 4 and QLG_S_DONE == 5);
+    assert(QLG_S_COUNT == 6);
+}
+
+invariant the_event_ring_holds_four_words_per_entry_and_thirty_two_entries {
+    assert(QLEV_F == 4);
+    assert(QLEV_MAX == 32);
+    assert(QLEV_SPAWN == 0 and QLEV_START == 1 and QLEV_VERIFY == 2);
+    assert(QLEV_BLOCK == 3 and QLEV_FINISH == 4 and QLEV_STALE == 5);
 }
 
 invariant the_view_never_draws_past_its_cap {
