@@ -383,3 +383,203 @@ invariant tree_view_labels_come_from_the_tree {
     assert dr_row_state_name(5) == "canceled";
     assert dr_row_state_name(7) == "recovering";
 }
+
+; --- 8. Parent aggregation --------------------------------------------------------------------------
+; A root task fans out to children; the parent aggregates their outcomes. The law here covers
+; what checks-core's case 8 needs: one success beside one failure does not fail the root; a
+; partial result may be accepted when the spawn said so; cancelling the root cancels every
+; running child; a failed branch retries on its own attempt without touching a successful
+; sibling; a late result of an OLD attempt never attaches to the new one; and the parent may
+; close the root explicitly, cancelling whatever is still running.
+; STATE-MACHINE-ONLY, like every section of this file: pure functions over known facts.
+
+/// Aggregation strategies, chosen at spawn and stored with the delegation.
+/// ANY: one successful child settles the root (the others may fail or still run).
+/// ALL: every child must be settled and none failed.
+pub const DR_AGG_ANY : u8 = 0;
+pub const DR_AGG_ALL : u8 = 1;
+
+/// What the aggregation says about the root: keep waiting, close as success, close as failed.
+pub const DR_AGG_RUNNING : u8 = 0;
+pub const DR_AGG_SUCCESS : u8 = 1;
+pub const DR_AGG_FAILED : u8 = 2;
+
+pub fn dr_aggregate(strategy: u8, succeeded: u32, failed: u32, running: u32) -> u8 {
+    if (strategy == DR_AGG_ANY) {
+        if (succeeded >= 1) { return DR_AGG_SUCCESS; }   // branch failure does not fail the root
+        if (failed >= 1 and running == 0) { return DR_AGG_FAILED; }
+        return DR_AGG_RUNNING;
+    }
+    if (strategy == DR_AGG_ALL) {
+        if (running > 0) { return DR_AGG_RUNNING; }
+        if (failed > 0) { return DR_AGG_FAILED; }
+        if (succeeded >= 1) { return DR_AGG_SUCCESS; }
+        return DR_AGG_RUNNING;   // nothing yet: keep waiting
+    }
+    return DR_AGG_RUNNING;
+}
+
+/// A partial result: the parent may close on the children that reported, accepting the
+/// missing ones as absent -- but only when the spawn declared partials allowed.
+pub fn dr_partial_ok(allow_partial: bool, delivered: u32, expected: u32) -> bool {
+    if (allow_partial == false) { return delivered >= expected; }
+    return delivered >= 1 and delivered <= expected;
+}
+
+/// Cancelling the root cancels every running child at once; settled children are untouched.
+/// The count returned is how many children the cancel reaches.
+pub fn dr_root_cancel_reaches(running: u32) -> u32 {
+    return running;
+}
+
+/// A failed branch retries on a fresh attempt of its own task; a successful sibling keeps
+/// its settled attempt and its result. The retry is legal exactly when the engine's own
+/// restart rule says so (same task id, attempt number grows).
+pub fn dr_branch_retry_ok(failed_aid: u64, next_attempt: u32) -> bool {
+    return dr_restart_ok(failed_aid, next_attempt);
+}
+
+/// A late result arriving after a new attempt started must NOT attach to the new attempt:
+/// it binds only when task AND attempt number both match the current attempt.
+pub fn dr_late_binds(arriving_aid: u64, current_aid: u64) -> bool {
+    return arriving_aid == current_aid;
+}
+
+/// The parent's explicit close: legal at any time; whatever is still running is cancelled
+/// with the close (the children see dr_cancel_ok's rules, the root just ends).
+pub fn dr_root_close_ok(open_children: u32) -> bool {
+    if (open_children > DR_MAX_CHILDREN) { return false; }   // bookkeeping sanity only
+    return true;
+}
+
+test aggregation_any_survives_branch_failure {
+    // One child succeeded beside one that failed: the root closes as a success at once.
+    assert dr_aggregate(DR_AGG_ANY, 1, 1, 0) == DR_AGG_SUCCESS;
+    // The same while a third child still runs: already a success, no waiting.
+    assert dr_aggregate(DR_AGG_ANY, 1, 1, 1) == DR_AGG_SUCCESS;
+    // Failures alone never fail the root while a retry may still come.
+    assert dr_aggregate(DR_AGG_ANY, 0, 1, 1) == DR_AGG_RUNNING;
+    assert dr_aggregate(DR_AGG_ANY, 0, 1, 0) == DR_AGG_FAILED;
+}
+
+test aggregation_all_needs_every_child {
+    // ALL waits while anything runs, fails on any failure, succeeds only when all settled.
+    assert dr_aggregate(DR_AGG_ALL, 1, 0, 1) == DR_AGG_RUNNING;
+    assert dr_aggregate(DR_AGG_ALL, 1, 1, 0) == DR_AGG_FAILED;
+    assert dr_aggregate(DR_AGG_ALL, 2, 0, 0) == DR_AGG_SUCCESS;
+}
+
+test partial_result_only_when_declared {
+    // Partials not declared: every child must have reported.
+    assert dr_partial_ok(false, 2, 2) == true;
+    assert dr_partial_ok(false, 1, 2) == false;
+    // Partials declared: at least one report is enough, never more than exist.
+    assert dr_partial_ok(true, 1, 2) == true;
+    assert dr_partial_ok(true, 0, 2) == false;
+    assert dr_partial_ok(true, 3, 2) == false;
+}
+
+test root_cancel_reaches_exactly_the_running {
+    assert dr_root_cancel_reaches(2) == 2;
+    assert dr_root_cancel_reaches(0) == 0;
+    // The children the cancel reaches go through the engine's own cancel rules.
+    assert dr_cancel_ok(1) == true;    // RUNNING cancels
+    assert dr_cancel_ok(4) == false;   // a settled sibling is untouched
+}
+
+test branch_retry_leaves_siblings_alone {
+    // A failed branch of task 9 retries as attempt 3; the sibling's attempt 2 stands.
+    const failed : u64 = tt_attempt_id(9, 2);
+    assert dr_branch_retry_ok(failed, 3) == true;
+    assert dr_branch_retry_ok(failed, 2) == false;   // attempt numbers only grow
+    // A retry never crosses tasks.
+    assert dr_restart_ok(tt_attempt_id(9, 2), 3) == true;
+}
+
+test late_result_of_old_attempt_does_not_attach {
+    // Task 5 reworked: attempt 1 was reworked into attempt 2. Attempt 1's result arriving
+    // now must not attach to attempt 2.
+    const old_aid : u64 = tt_attempt_id(5, 1);
+    const current : u64 = tt_attempt_id(5, 2);
+    assert dr_late_binds(old_aid, current) == false;
+    // The current attempt's own result does bind.
+    assert dr_late_binds(current, current) == true;
+    // Even a redelivery of the OLD attempt's already-owned result stays refused twice
+    // over: wrong attempt (above) and the attempt is already past RESULT_RETURNED.
+    assert dr_redelivery_refused(3) == true;
+}
+
+test parent_closes_the_root_explicitly {
+    // The parent's word closes the root with running children; the children cancel.
+    assert dr_root_close_ok(2) == true;
+    assert dr_root_close_ok(0) == true;
+    assert dr_root_close_ok(DR_MAX_CHILDREN) == true;
+    assert dr_root_close_ok(DR_MAX_CHILDREN + 1) == false;   // bookkeeping sanity
+}
+
+invariant aggregation_any_fails_only_when_nothing_can_succeed {
+    // ANY closes failed only when every child is settled and none succeeded.
+    assert dr_aggregate(DR_AGG_ANY, 0, 1, 0) == DR_AGG_FAILED;
+    assert dr_aggregate(DR_AGG_ANY, 0, 0, 1) == DR_AGG_RUNNING;
+}
+
+invariant late_results_bind_to_their_own_attempt {
+    // An attempt id carries its task and number; a result binds only to the exact id.
+    assert dr_late_binds(tt_attempt_id(5, 1), tt_attempt_id(5, 2)) == false;
+    assert dr_late_binds(tt_attempt_id(5, 2), tt_attempt_id(5, 2)) == true;
+}
+
+; --- 9. Spawn gate: design record (PREPARED, NOT APPLIED) --------------------------------------------
+; Owner decision pending: nothing here is wired. The protected file stays untouched until
+; the owner approves the exception request. What is recorded below is the mapping against
+; the EXISTING pane spawn path -- the gate REUSES it with an adapter; no parallel
+; "delegation spawn" path is created.
+; MAP (owner order, checked before any diff was written):
+;   - A spawn entry ALREADY EXISTS: specs/t27os/pty_server.t27 OP_SPAWN (and the T27OS_CTL
+;     spawn verb over the same code). It parses agent + cwd from the payload
+;     (pty_logic.t27 spawn_cwd_len), builds the argv with launch_command(agent, plan, sid,
+;     model, home, cwd, out), forks with pty_sys.t27 sys_forkpty, execs with sys_execv,
+;     and answers spawn_ok (pty_proto.t27). The pane side is term_pane.t27 -> pty_client.t27
+;     client_spawn. Kill is OP_KILL; list is OP_LIST (pane ids, live flags).
+;   - The one lifecycle chain is therefore already present end to end:
+;     provider (agents.t27 AGENT_BINS + key) -> allowed workspace (cwd from the payload)
+;     -> task/attempt (this spec's aid) -> launch (OP_SPAWN) -> messages/tools (the pane's
+;     own stream) -> result (M_RESULT, section 2) -> parent accept (section 3).
+;     Provider differences stay adapters on AGENT_BINS entries, exactly as the editor pane
+;     already adapts T27OS_AGENT=9.
+; PACKAGE (decision-grade, for the owner):
+;   - Protected file: specs/t27os/pty_server.t27, base SHA 32040f0135 (master, last commit
+;     touching it: "t27os: fail over on a 402 screen row...", parent 7fb6bc2391).
+;   - Minimal diff: one adapter in the OP_SPAWN handler -- before launch(), call into the
+;     delegation gate (delegate_runtime.t27 dr_admit + actors.t27 call_admit, generated
+;     card, not hand-written) with the requested scope mask and budget carried in two new
+;     optional fields of the spawn payload; on DR_ADMIT_OK proceed exactly as today; on
+;     refusal answer a new pty_proto tag OP_SPAWN_REFUSED (no process is ever forked).
+;     Everything else in the file is unchanged: same fork, same argv, same scrollback.
+;   - Executable and argv: UNCHANGED -- pty_logic.t27 launch_command output for the
+;     requested AGENT_BINS entry; no new binary, no new flags.
+;   - Workspace and environment: UNCHANGED -- cwd from the spawn payload (spawn_cwd_len),
+;     environment from the pane's profile exactly as the OP_SPAWN handler sets it today
+;     (pty_server.t27 child-side profile variables, pty_logic launch_command).
+;   - Gate checks IN ORDER, all before fork: (1) call_admit(chain, depth, callee_slot)
+;     == CALL_PENDING -- actors.t27 owns the depth law; (2) dr_admit(child_scope,
+;     parent_scope, live_children, budget_words) == DR_ADMIT_OK -- scope subset, child
+;     ceiling, budget; (3) budget metering: the words are charged to the parent on spawn_ok
+;     and released on OP_KILL or child exit; a charge past DR_BUDGET_WORDS refuses.
+;   - Refusal / cancel / exit: refusal answers OP_SPAWN_REFUSED and charges nothing;
+;     cancel is the existing OP_KILL plus dr_cancel_ok on the attempt (section 4); exit
+;     follows the pane's existing exit handling and ends with a result via section 2's
+;     delivery path.
+;   - Binding to task/session/attempt: the spawn payload already carries the sid stream
+;     (session_store sid, task_tree tt_sid_linked); the adapter adds aid = tt_attempt_id
+;     (task, attempt) to the same payload, and the pane id returned by spawn_ok is stored
+;     beside aid so every later message, kill and result names both.
+;   - Proving tests (in this spec, before the diff lands): admission -- legal subset +
+;     free slot + fitting budget admits (existing test spawn_admits_only_inside_parent_
+;     scope); refusal -- out-of-scope bit, full parent, over-budget (existing test spawn_
+;     refusals...); depth -- call_admit CALL_CYCLE/CALL_TOO_DEEP before dr_admit; late
+;     result binding -- late_result_of_old_attempt_does_not_attach; cancel of a launched
+;     child -- cancel_reaches_a_running_child_and_is_idempotent.
+;   - What this record deliberately does NOT do: no code in this file calls the host, no
+;     executable call exists anywhere here, and pty_server.t27 is not edited. The diff is
+;     applied only on the owner's approval of the exception request.
