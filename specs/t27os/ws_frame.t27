@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27 OS WebSocket framing -- the RFC 6455 frame law for the CDP client, pure functions with tests.
+; A client frame is always masked with a fresh 4-byte key; a server frame is never masked (an
+; unmasked-bit server frame is the only kind this client accepts, and a masked one is refused).
+; Lengths: 7-bit in frame, then 126 marks a 16-bit length, 127 marks a 64-bit one -- the client
+; writes 126-form for payloads of 126..65535 and the parser refuses a 64-bit length outright: the
+; CDP answers this client never needs it, and a silent giant frame is how a read runs away.
+; The read law: frame_total(buf, got) names the whole frame once its header and payload have
+; arrived, and 0 while anything is still missing -- the socket loop reads until it is non-zero,
+; which is the same Content-Length-style completion the HTTP leg learned the hard way.
+; Opcodes used: 1 text, 8 close, 9 ping. A ping is answered with a pong (10) carrying the ping's
+; payload; every other opcode is skipped, not trusted.
+; No external calls here: the socket moves bytes, this file decides.
+
+module T27osWsFrame;
+
+pub const OP_TEXT : u8 = 1;
+pub const OP_CLOSE : u8 = 8;
+pub const OP_PING : u8 = 9;
+pub const OP_PONG : u8 = 10;
+
+/// Build one masked client text frame into out: FIN + text opcode, the mask bit, the length in
+/// the 7-bit or 126-form, the fresh mask key, and the payload xor-masked with it. Returns the
+/// byte count, or 0 when out is too small.
+pub fn text_frame(payload : []u8, mask : []u8, out : []u8) -> usize {
+  const plen : usize = payload.len;
+  var hdr : usize = 2;
+  if (plen > 125 and plen <= 65535) { hdr = 4; }
+  if (plen > 65535) { return 0; } // the 64-bit length form is refused, not written
+  if (out.len < hdr + plen) { return 0; }
+  if (mask.len < 4) { return 0; }
+  out[0] = 0x80 + OP_TEXT; // FIN + text
+  var lenbyte : u8 = 0x80; // the mask bit; the length joins it below
+  if (plen > 125) {
+    lenbyte = lenbyte + 126; // fits u8: 254
+    out[2] = (plen / 256) as u8;
+    out[3] = (plen % 256) as u8;
+  } else {
+    lenbyte = lenbyte + plen as u8;
+  }
+  out[1] = lenbyte;
+  var w : usize = hdr;
+  out[w] = mask[0]; out[w + 1] = mask[1]; out[w + 2] = mask[2]; out[w + 3] = mask[3];
+  w = w + 4;
+  var i : usize = 0;
+  while (i < plen) { out[w + i] = payload[i] ^ mask[i % 4]; i = i + 1; }
+  return w + plen;
+}
+
+/// Where the payload starts in a server frame, or 0 while the header has not fully arrived.
+pub fn payload_at(buf : []u8, got : usize) -> usize {
+  if (got < 2) { return 0; }
+  const len7 : usize = (buf[1] & 127) as usize;
+  var hdr : usize = 2;
+  if (len7 == 126) { hdr = 4; }
+  if (len7 == 127) { return 0; } // the 64-bit length form is refused outright
+  if (buf[1] & 128 != 0) { return 0; } // a masked server frame is refused, never unmasked
+  if (got < hdr) { return 0; }
+  return hdr;
+}
+
+/// The total frame size once complete: header plus payload, or 0 while incomplete.
+/// A payload longer than the buffer can never complete: it is refused by cap.
+pub fn frame_total(buf : []u8, got : usize, cap : usize) -> usize {
+  const at : usize = payload_at(buf, got);
+  if (at == 0) { return 0; }
+  const len7 : usize = (buf[1] & 127) as usize;
+  var plen : usize = len7;
+  if (len7 == 126) {
+    plen = (buf[2] as usize) * 256 + (buf[3] as usize);
+  }
+  if (plen > cap) { return 0; }
+  const total : usize = at + plen;
+  if (got < total) { return 0; }
+  return total;
+}
+
+/// The opcode of a complete frame header.
+pub fn opcode(buf : []u8) -> u8 {
+  return buf[0] & 15;
+}
+
+/// Is the FIN bit set on a frame header?
+pub fn is_fin(buf : []u8) -> bool {
+  return (buf[0] & 128) != 0;
+}
+
+/// Build an unmasked pong for a ping payload (server-to-client pongs are never masked either).
+pub fn pong_frame(payload : []u8, out : []u8) -> usize {
+  const plen : usize = payload.len;
+  if (plen > 125) { return 0; }
+  if (out.len < 2 + plen) { return 0; }
+  out[0] = 0x80 + OP_PONG;
+  out[1] = plen as u8;
+  var i : usize = 0;
+  while (i < plen) { out[2 + i] = payload[i]; i = i + 1; }
+  return 2 + plen;
+}
+
+/// Copy the payload text of a complete frame into out (bounded). Returns the copied count.
+pub fn payload_text(buf : []u8, total : usize, out : []u8) -> usize {
+  const at : usize = payload_at(buf, total);
+  if (at == 0) { return 0; }
+  const plen : usize = total - at;
+  var i : usize = 0;
+  while (i < plen and i < out.len) { out[i] = buf[at + i]; i = i + 1; }
+  if (plen > out.len) { return out.len; }
+  return plen;
+}
+
+// ---- tests ----------------------------------------------------------------------------------
+
+test a_small_text_frame_is_fin_text_masked_with_the_payload_masked_in_place {
+  var p : [4]u8;
+  p[0] = 104; p[1] = 105; p[2] = 33; p[3] = 33; // "hi!!"
+  var m : [4]u8;
+  m[0] = 1; m[1] = 2; m[2] = 3; m[3] = 4;
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  const n : usize = text_frame(p[0..4], m[0..4], out);
+  assert n == 10;
+  assert out[0] == 0x81; // FIN + text
+  assert out[1] == 0x84; // mask bit + length 4
+  assert out[2] == 1;
+  // payload byte 0: 104 ^ 1 = 105
+  assert out[6] == 105;
+  assert out[7] == 105 + 2 - 2 + 2; // 105 ^ 3 = 106 -- keep it simple below
+}
+
+test a_126_form_frame_carries_a_16bit_length {
+  var m : [4]u8;
+  m[0] = 9; m[1] = 9; m[2] = 9; m[3] = 9;
+  var p : [200]u8;
+  var o : [220]u8;
+  const out : []u8 = o[0..220];
+  const n : usize = text_frame(p[0..200], m[0..4], out);
+  assert n == 208; // 2 + 2 (16-bit length) + 4 (mask) + 200
+  assert out[1] == 0x80 + 126;
+  assert out[2] == 0;
+  assert out[3] == 200;
+}
+
+test a_too_big_payload_is_refused_not_written {
+  var m : [4]u8;
+  var o : [8]u8;
+  const out : []u8 = o[0..8];
+  var big : [70000]u8;
+  assert text_frame(big[0..70000], m[0..4], out) == 0;
+}
+
+test frame_total_needs_header_then_payload {
+  var b : [16]u8;
+  const buf : []u8 = b[0..16];
+  b[0] = 0x81;
+  b[1] = 4; // unmasked server frame, length 4
+  b[2] = 65; b[3] = 66; b[4] = 67; b[5] = 68;
+  assert frame_total(buf, 1, 64) == 0; // header incomplete
+  assert frame_total(buf, 2, 64) == 0; // payload incomplete
+  assert frame_total(buf, 6, 64) == 6; // complete
+}
+
+test a_masked_server_frame_and_a_64bit_length_are_refused {
+  var b : [16]u8;
+  const buf : []u8 = b[0..16];
+  b[0] = 0x81;
+  b[1] = 0x84; // mask bit set on a server frame
+  b[2] = 65;
+  assert frame_total(buf, 6, 64) == 0;
+  b[1] = 127; // the 64-bit length form
+  assert frame_total(buf, 10, 64) == 0;
+}
+
+test an_oversized_payload_never_completes {
+  var b : [16]u8;
+  const buf : []u8 = b[0..16];
+  b[0] = 0x81;
+  b[1] = 15; // says 15 bytes
+  assert frame_total(buf, 16, 16) == 0; // would need 17 bytes
+  assert frame_total(buf, 17, 16) == 17; // complete within the cap
+  b[1] = 200; // says 200 bytes: over the cap, never completes
+  assert frame_total(buf, 16, 16) == 0;
+}
+
+test opcode_and_fin_read_the_header {
+  var b : [4]u8;
+  const buf : []u8 = b[0..4];
+  b[0] = 0x81;
+  assert opcode(buf) == OP_TEXT;
+  assert is_fin(buf) == true;
+  b[0] = 0x01;
+  assert is_fin(buf) == false;
+  b[0] = 0x89;
+  assert opcode(buf) == OP_PING;
+}
+
+test a_ping_is_answered_with_an_pong_carrying_the_payload {
+  var p : [3]u8;
+  p[0] = 1; p[1] = 2; p[2] = 3;
+  var o : [8]u8;
+  const out : []u8 = o[0..8];
+  const n : usize = pong_frame(p[0..3], out);
+  assert n == 5;
+  assert out[0] == 0x8A;
+  assert out[1] == 3;
+  assert out[2] == 1;
+}
+
+test payload_text_copies_bounded {
+  var b : [8]u8;
+  const buf : []u8 = b[0..8];
+  buf[0] = 0x81;
+  buf[1] = 6;
+  buf[2] = 104; buf[3] = 101; buf[4] = 108; buf[5] = 108; buf[6] = 111; buf[7] = 33; // "hello!"
+  var o : [4]u8;
+  const out : []u8 = o[0..4];
+  assert payload_text(buf, 8, out) == 4; // capped
+  assert out[0] == 104;
+  var o2 : [8]u8;
+  const out2 : []u8 = o2[0..8];
+  assert payload_text(buf, 8, out2) == 6;
+  assert out2[5] == 33;
+}
+
+invariant the_client_text_frame_always_carries_the_mask_bit {
+  var m : [4]u8;
+  var p : [2]u8;
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  const n : usize = text_frame(p[0..2], m[0..4], out);
+  assert n == 8 and out[1] & 128 != 0;
+}
+
+// ---- refusals for the unsupported profile ---------------------------------------------------
+
+/// Refusal codes for a frame this client does not support.
+pub const R_NONE : u8 = 0;
+pub const R_FRAGMENTED : u8 = 1; // a text message with FIN=0: continuation frames are unsupported
+pub const R_MASKED : u8 = 2; // a masked server frame
+pub const R_LEN64 : u8 = 3; // the 64-bit length form
+pub const R_OVER_CAP : u8 = 4; // the payload is over the read cap
+
+/// Classify a frame header once its two length bytes have arrived. R_NONE means the frame law
+/// of this client accepts it; anything else must end the run with that code, never continue.
+pub fn refusal(buf : []u8, got : usize, cap : usize) -> u8 {
+  if (got < 2) { return R_NONE; }
+  const len7 : usize = (buf[1] & 127) as usize;
+  if (len7 == 127) { return R_LEN64; }
+  if (buf[1] & 128 != 0) { return R_MASKED; }
+  if (opcode(buf) == OP_TEXT and is_fin(buf) == false) { return R_FRAGMENTED; }
+  var plen : usize = len7;
+  if (len7 == 126) { plen = (buf[2] as usize) * 256 + (buf[3] as usize); }
+  if (plen > cap) { return R_OVER_CAP; }
+  return R_NONE;
+}
+
+test a_fragmented_text_header_is_a_named_refusal {
+  var b : [4]u8;
+  const buf : []u8 = b[0..4];
+  buf[0] = 0x01; // text, FIN=0: the first fragment
+  buf[1] = 5;
+  assert refusal(buf, 2, 64) == R_FRAGMENTED;
+  buf[0] = 0x81;
+  assert refusal(buf, 2, 64) == R_NONE;
+}
+
+test the_refusals_name_masked_len64_and_oversize {
+  var b : [8]u8;
+  const buf : []u8 = b[0..8];
+  buf[0] = 0x81;
+  buf[1] = 0x84;
+  assert refusal(buf, 2, 64) == R_MASKED;
+  buf[1] = 127;
+  assert refusal(buf, 2, 64) == R_LEN64;
+  buf[1] = 100;
+  assert refusal(buf, 2, 40) == R_OVER_CAP;
+  assert refusal(buf, 2, 120) == R_NONE;
+}
+
+/// The roundtrip guard law: a read loop that has spun past its budget must stop and report
+/// R_NO_RESPONSE upward rather than wait forever (the HTTP leg's hang, closed here by number).
+pub const GUARD_BUDGET : usize = 200;
+
+pub fn guard_exhausted(guard : usize) -> bool {
+  return guard >= GUARD_BUDGET;
+}
+
+test the_guard_expires_at_the_budget_and_not_before {
+  assert guard_exhausted(0) == false;
+  assert guard_exhausted(GUARD_BUDGET - 1) == false;
+  assert guard_exhausted(GUARD_BUDGET) == true;
+}

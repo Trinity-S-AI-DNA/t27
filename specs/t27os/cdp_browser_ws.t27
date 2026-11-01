@@ -1,0 +1,1268 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27 OS CDP browser WS -- the WebSocket leg of the CDP host, the executable continuation of
+; cdp_browser_http.t27 (the pty_server.t27 binary shape). One run does, in order, all read-only:
+;   1. GET /json/list over the proven HTTP path; pick the page target whose URL matches the
+;      policy URL exactly (cdp_browser.t27's reuse law); if no page matches, PUT /json/new one;
+;   2. WebSocket upgrade on the page's webSocketDebuggerUrl: GET with Upgrade headers, a fresh
+;      16-byte Sec-WebSocket-Key from /dev/urandom (Base64 by ws_sha1.t27), and the server's
+;      Sec-WebSocket-Accept validated against accept_of -- a wrong acceptance value aborts;
+;   3. a constant-expression smoke: Runtime.evaluate("1+1") must answer value 2;
+;   4. one bounded page read: Runtime.evaluate("document.body.innerText.substring(0,4000)")
+;      -- the 4000 cap is applied by the page itself before any bytes travel; the client caps
+;      again on the way out. JSON string escapes in the value are decoded minimally.
+;   5. a close frame, then the report line on fd 1: handshake, smoke, text length, and the first
+;      200 characters of the page text (a public page; nothing private is dumped).
+; The framing law is ws_frame.t27, the crypto is ws_sha1.t27, the socket calls are pty_sys.t27,
+; the endpoint policy is cdp_browser.t27. Nothing here is a general HTTP or WS client.
+; the leg continues below.
+; GATE: build and link the t27os way, then run:
+;   t27b build specs/t27os/cdp_browser_ws.t27 -o target/t27os/cdp_browser_ws.o --macho
+;   ld -arch arm64 -platform_version macos 13.0 <sdkver> -syslibroot $(xcrun --show-sdk-path) \
+;     -e _main -lSystem -o target/t27os/cdp-ws target/t27os/cdp_browser_ws.o
+; Measured 2026-11-01: see the receipt. Run identities are recorded per run in the receipt.
+
+module T27osCdpBrowserWs;
+
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_connect;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_open_ro;
+use t27os::ws_sha1::b64_encode;
+use t27os::ws_sha1::accept_of;
+use t27os::ws_frame::text_frame;
+use t27os::ws_frame::frame_total;
+use t27os::ws_frame::opcode;
+use t27os::ws_frame::payload_at;
+use t27os::ws_frame::payload_text;
+use t27os::ws_frame::pong_frame;
+use t27os::ws_frame::OP_TEXT;
+use t27os::ws_frame::OP_CLOSE;
+use t27os::ws_frame::OP_PING;
+use t27os::ws_text::utf8_chars;
+use t27os::ws_text::decode_json_string;
+use t27os::ws_frame::refusal;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_poll;
+use t27os::browser_read::PICK_NOT_FOUND;
+use t27os::browser_read::PICK_MULTIPLE;
+use t27os::browser_read::R_PAGE_NOT_FOUND;
+use t27os::browser_read::R_MULTIPLE_MATCHES;
+use t27os::browser_read::R_DISCONNECTED;
+use t27os::browser_read::R_NO_RESPONSE;
+use t27os::browser_read::R_UNSUPPORTED_FRAME;
+use t27os::browser_read::R_DECODE_ERROR;
+use t27os::browser_read::R_OVER_LIMIT;
+use t27os::browser_read::R_USAGE;
+use t27os::browser_read::LIMIT_PAGE_CHARS;
+use t27os::browser_read::LIMIT_IN_BYTES;
+use t27os::browser_read::LIMIT_OUT_BYTES;
+
+/// The endpoint policy (cdp_browser.t27): neo answers CDP here.
+pub const NEO_PORT : u16 = 9115;
+
+/// The page this run reads, by the exact-URL reuse law (no invented route).
+pub const PAGE_URL : string = "https://t27.ai/#/";
+
+/// The read cap the page applies to itself before any bytes travel.
+pub const READ_CAP : usize = 4000;
+
+/// AF_INET and SOCK_STREAM on Darwin.
+pub const AF_INET : i32 = 2;
+pub const SOCK_STREAM : i32 = 1;
+
+/// How many HTTP bytes the handshake phase may read.
+pub const HS_CAP : usize = 2048;
+
+// ---- report helpers -------------------------------------------------------------------------
+
+fn out_lit(s : string) -> void {
+  var l : [64]u8;
+  const k : usize = put_lit(l[0..64], 0, s);
+  sys_write(1, l[0..k], k as u64);
+}
+
+fn out_num(n : usize) -> void {
+  var l : [16]u8;
+  var k : usize = 0;
+  var d : usize = 1000000000;
+  var started : bool = false;
+  while (d > 0) {
+    const digit : u32 = ((n / d) % 10) as u32;
+    if (digit > 0 or started or d == 1) {
+      started = true;
+      l[k] = (48 + digit) as u8;
+      k = k + 1;
+    }
+    d = d / 10;
+  }
+  sys_write(1, l[0..k], k as u64);
+}
+
+// ---- the same byte law the HTTP leg measured ------------------------------------------------
+
+fn put_lit(out : []u8, w : usize, s : string) -> usize {
+  var i : usize = 0;
+  while (i < s.len and w < out.len) { out[w] = s[i] as u8; w = w + 1; i = i + 1; }
+  return w;
+}
+
+fn put_crlf(out : []u8, w : usize) -> usize {
+  var x : usize = w;
+  if (x < out.len) { out[x] = 13; x = x + 1; }
+  if (x < out.len) { out[x] = 10; x = x + 1; }
+  return x;
+}
+
+fn put_port(out : []u8, w : usize, port : u16) -> usize {
+  var x : usize = w;
+  var d : usize = 10000;
+  var started : bool = false;
+  while (d > 0) {
+    const digit : u16 = (port / d as u16) % 10;
+    if (digit > 0 or started or d == 1) {
+      started = true;
+      if (x < out.len) { out[x] = (48 + digit) as u8; x = x + 1; }
+    }
+    d = d / 10;
+  }
+  return x;
+}
+
+fn put_num(out : []u8, w : usize, n : usize) -> usize {
+  return put_port(out, w, n as u16);
+}
+
+/// A GET with the shared request law (path Host Connection: close).
+pub fn get_request(port : u16, path : string, out : []u8) -> usize {
+  var w : usize = 0;
+  w = put_lit(out, w, "GET ");
+  w = put_lit(out, w, path);
+  w = put_lit(out, w, " HTTP/1.1");
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Host: 127.0.0.1:");
+  w = put_port(out, w, port);
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Connection: close");
+  w = put_crlf(out, w);
+  w = put_crlf(out, w);
+  return w;
+}
+
+/// The 16-byte Darwin sockaddr_in for 127.0.0.1:port (the HTTP leg's law, byte-identical).
+pub fn sock_in(port : u16, out : []u8) -> usize {
+  if (out.len < 16) { return 0; }
+  out[0] = 16;
+  out[1] = AF_INET as u8;
+  out[2] = (port / 256) as u8;
+  out[3] = (port % 256) as u8;
+  out[4] = 127;
+  out[5] = 0;
+  out[6] = 0;
+  out[7] = 1;
+  var i : usize = 8;
+  while (i < 16) { out[i] = 0; i = i + 1; }
+  return 16;
+}
+
+/// One full HTTP exchange on a fresh connection: connect, send, read to Content-Length or EOF.
+/// Returns the byte count, or 0 on failure.
+pub fn http_exchange(port : u16, req : []u8, resp : []u8) -> usize {
+  const fd : i32 = sys_socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) { return 0; }
+  var sa : [16]u8;
+  const sal : usize = sock_in(port, sa[0..16]);
+  if (sal != 16) { sys_close(fd); return 0; }
+  if (sys_connect(fd, sa[0..16], 16) != 0) { sys_close(fd); return 0; }
+  if (sys_write(fd, req[0..req.len], req.len as u64) < 0) { sys_close(fd); return 0; }
+  var got : usize = 0;
+  while (got < resp.len) {
+    const r : i64 = sys_read(fd, resp[got..resp.len], resp.len - got as u64);
+    if (r <= 0) { break; }
+    got = got + r as usize;
+    if (response_complete(resp[0..got], got)) { break; }
+  }
+  sys_close(fd);
+  return got;
+}
+
+/// Where the header block ends: the index of CRLF CRLF, or 0 while absent.
+pub fn header_end(buf : []u8, got : usize) -> usize {
+  if (got < 4) { return 0; }
+  var i : usize = 0;
+  while (i + 4 <= got) {
+    if (buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10) { return i; }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// The body length the headers name, or 0.
+pub fn content_length(buf : []u8, hend : usize) -> usize {
+  const name : string = "Content-Length:";
+  const nl : usize = name.len;
+  var i : usize = 0;
+  while (i + nl < hend) {
+    var ok : bool = true;
+    var k : usize = 0;
+    while (k < nl) {
+      if (buf[i + k] != (name[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    if (ok) {
+      var j : usize = i + nl;
+      while (j < hend and buf[j] == 32) { j = j + 1; }
+      var v : usize = 0;
+      while (j < hend and buf[j] >= 48 and buf[j] <= 57) {
+        v = v * 10 + buf[j] - 48 as usize;
+        j = j + 1;
+      }
+      return v;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// Headers complete and body satisfied?
+pub fn response_complete(buf : []u8, got : usize) -> bool {
+  const hend : usize = header_end(buf, got);
+  if (hend == 0) { return false; }
+  return got >= hend + 4 + content_length(buf, hend);
+}
+
+/// Does the response status line say 101 (the upgrade answer)?
+pub fn status_101(buf : []u8) -> bool {
+  if (buf.len < 12) { return false; }
+  var i : usize = 0;
+  while (i < 7) {
+    if (buf[i] != ("HTTP/1." [i]) as u8) { return false; }
+    i = i + 1;
+  }
+  return buf[9] == 49 and buf[10] == 48 and buf[11] == 49;
+}
+
+/// Find a header line by name in the header block and span its value (no leading spaces).
+/// Walks whole lines, so it always advances. Returns 1 and v[0..2] = span, or 0.
+pub fn find_header(buf : []u8, hend : usize, name : string, v : []usize) -> u8 {
+  var line : usize = 0;
+  while (line < hend) {
+    var e : usize = line;
+    while (e < hend and buf[e] != 13) { e = e + 1; }
+    if (e - line >= name.len) {
+      var ok : bool = true;
+      var k : usize = 0;
+      while (k < name.len) {
+        if (buf[line + k] != (name[k]) as u8) { ok = false; }
+        k = k + 1;
+      }
+      if (ok) {
+        var j : usize = line + name.len;
+        while (j < e and buf[j] == 32) { j = j + 1; }
+        if (e > j) {
+          v[0] = j;
+          v[1] = e;
+          return 1;
+        }
+        return 0;
+      }
+    }
+    if (e + 1 < hend and buf[e] == 13) { line = e + 2; } else { line = e + 1; }
+  }
+  return 0;
+}
+
+/// Pull a quoted JSON string value for name, decoded with minimal escapes into out (bounded).
+/// Handles \\, \", \n, \r, \t; any other escape keeps the escaped character. Returns the count.
+pub fn find_json_string_value(buf : []u8, got : usize, name : string, out : []u8) -> usize {
+  var i : usize = 0;
+  while (i + name.len + 3 < got) {
+    if (buf[i] == 34) {
+      var ok : bool = true;
+      var k : usize = 0;
+      while (k < name.len) {
+        if (buf[i + 1 + k] != (name[k]) as u8) { ok = false; }
+        k = k + 1;
+      }
+      if (ok) {
+        var j : usize = i + 1 + name.len;
+        if (buf[j] == 34) {
+          j = j + 1;
+          while (j < got and buf[j] == 32) { j = j + 1; } // the OWS Chrome pretty-prints
+          if (j < got and buf[j] == 58) {
+            j = j + 1;
+            while (j < got and buf[j] == 32) { j = j + 1; }
+            if (j < got and buf[j] == 34) {
+              j = j + 1;
+              var w : usize = 0;
+              while (j < got and w < out.len) {
+                const ch : u8 = buf[j];
+                if (ch == 34) { return w; } // the closing quote
+                if (ch == 92 and j + 1 < got) { // the escape byte
+                  const esc : u8 = buf[j + 1];
+                  if (esc == 110) { out[w] = 10; } // n
+                  else {
+                    if (esc == 114) { out[w] = 13; } // r
+                    else {
+                      if (esc == 116) { out[w] = 9; } // t
+                      else { out[w] = esc; } // " and \ and anything else: the char itself
+                    }
+                  }
+                  w = w + 1;
+                  j = j + 2;
+                } else {
+                  out[w] = ch;
+                  w = w + 1;
+                  j = j + 1;
+                }
+              }
+              return w;
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// Is the number value after "name": equal to want? (the smoke check)
+pub fn json_number_is(buf : []u8, got : usize, name : string, want : u8) -> bool {
+  var i : usize = 0;
+  while (i + name.len + 3 < got) {
+    if (buf[i] == 34) {
+      var ok : bool = true;
+      var k : usize = 0;
+      while (k < name.len) {
+        if (buf[i + 1 + k] != (name[k]) as u8) { ok = false; }
+        k = k + 1;
+      }
+      if (ok) {
+        var j : usize = i + 1 + name.len;
+        if (buf[j] == 34) {
+          j = j + 1;
+          if (j < got and buf[j] == 58) {
+            j = j + 1;
+            while (j < got and buf[j] == 32) { j = j + 1; }
+            return j < got and buf[j] == want and (j + 1 >= got or buf[j + 1] < 48 or buf[j + 1] > 57);
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// Does the payload name the given message id ("id":N followed by a non-digit)?
+pub fn message_id_is(payload : []u8, plen : usize, id : u8) -> bool {
+  const name : string = "\"id\":";
+  var i : usize = 0;
+  while (i + name.len + 1 < plen) {
+    var ok : bool = true;
+    var k : usize = 0;
+    while (k < name.len) {
+      if (payload[i + k] != (name[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    if (ok and payload[i + name.len] == id) {
+      const nx : u8 = payload[i + name.len + 1];
+      return nx < 48 or nx > 57;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// 16 fresh bytes from /dev/urandom into out; returns 16 or 0.
+pub fn urandom16(out : []u8) -> usize {
+  if (out.len < 16) { return 0; }
+  const fd : i32 = sys_open_ro("/dev/urandom", 0);
+  if (fd < 0) { return 0; }
+  const r : i64 = sys_read(fd, out[0..16], 16);
+  sys_close(fd);
+  if (r != 16) { return 0; }
+  return 16;
+}
+
+/// The upgrade request for one ws path with one Base64 key.
+pub fn upgrade_request(port : u16, path : string, key : []u8, key_len : usize, out : []u8) -> usize {
+  var w : usize = 0;
+  w = put_lit(out, w, "GET ");
+  w = put_lit(out, w, path);
+  w = put_lit(out, w, " HTTP/1.1");
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Host: 127.0.0.1:");
+  w = put_port(out, w, port);
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Upgrade: websocket");
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Connection: Upgrade");
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Sec-WebSocket-Key: ");
+  w = put_lit(out, w, key);
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Sec-WebSocket-Version: 13");
+  w = put_crlf(out, w);
+  w = put_crlf(out, w);
+  return w;
+}
+
+/// Does the payload carry the evaluate expression exactly? (the page-read marker)
+pub fn is_page_read(payload : []u8, plen : usize) -> bool {
+  const marker : string = "innerText";
+  var i : usize = 0;
+  while (i + marker.len <= plen) {
+    var ok : bool = true;
+    var k : usize = 0;
+    while (k < marker.len) {
+      if (payload[i + k] != (marker[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    if (ok) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// The page's ws path inside the list JSON: the span of the webSocketDebuggerUrl value that
+/// follows its exact url match, with the ws://127.0.0.1:9115 prefix cut. Returns the path length
+/// in out, or 0 when no exact page match exists.
+pub fn page_ws_path(list : []u8, got : usize, url : string, out : []u8) -> usize {
+  const urlname : string = "\"url\":";
+  var i : usize = 0;
+  while (i + urlname.len + url.len + 1 < got) {
+    var ok : bool = true;
+    var k : usize = 0;
+    while (k < urlname.len) {
+      if (list[i + k] != (urlname[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    var q : usize = i + urlname.len;
+    while (q < got and list[q] == 32) { q = q + 1; } // the OWS Chrome pretty-prints
+    if (q < got and list[q] == 34) { q = q + 1; } else { ok = false; } // the value opens here
+    k = 0;
+    while (k < url.len) {
+      if (list[q + k] != url[k]) { ok = false; }
+      k = k + 1;
+    }
+    if (ok and list[q + url.len] == 34) {
+      // this target matches; find its webSocketDebuggerUrl forward from here
+      const wsn : string = "\"webSocketDebuggerUrl\":";
+      var j : usize = i + urlname.len + url.len;
+      while (j + wsn.len + 8 < got) {
+        var ok2 : bool = true;
+        var k2 : usize = 0;
+        while (k2 < wsn.len) {
+          if (list[j + k2] != (wsn[k2]) as u8) { ok2 = false; }
+          k2 = k2 + 1;
+        }
+        if (ok2) {
+          if (j + wsn.len + 32 > got) { return 0; }
+          var s2 : usize = j + wsn.len;
+          while (s2 < got and list[s2] == 32) { s2 = s2 + 1; } // the OWS
+          if (s2 < got and list[s2] == 34) { s2 = s2 + 1; } else { return 0; }
+          const prefix : string = "ws://127.0.0.1:9115";
+          // cut the prefix
+          var p2 : usize = 0;
+          while (p2 < prefix.len) {
+            if (list[s2 + p2] != (prefix[p2]) as u8) { return 0; }
+            p2 = p2 + 1;
+          }
+          s2 = s2 + prefix.len;
+          var e2 : usize = s2;
+          while (e2 < got and list[e2] != 34) { e2 = e2 + 1; }
+          var w3 : usize = 0;
+          while (s2 < e2 and w3 < out.len) { out[w3] = list[s2]; w3 = w3 + 1; s2 = s2 + 1; }
+          return w3;
+        }
+        j = j + 1;
+      }
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// Open the WebSocket on one ws path: connect, upgrade, validate 101 and the acceptance value.
+/// Leaves fd open for frames. Returns the fd, or -1 on any failure (the report says which stage).
+pub fn ws_connect(port : u16, path : []u8, key : []u8, key_len : usize, hsresp : []u8) -> i32 {
+  const fd : i32 = sys_socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) { return -1; }
+  var sa : [16]u8;
+  if (sock_in(port, sa[0..16]) != 16) { sys_close(fd); return -1; }
+  if (sys_connect(fd, sa[0..16], 16) != 0) { sys_close(fd); return -1; }
+  var reqb : [512]u8;
+  const req : []u8 = reqb[0..512];
+  const rn : usize = upgrade_request(port, path, key[0..key_len], key_len, req);
+  if (sys_write(fd, req[0..rn], rn as u64) < 0) { sys_close(fd); return -2; }
+  var got : usize = 0;
+  while (got < hsresp.len) {
+    if (header_end(hsresp[0..got], got) > 0) { break; } // the handshake ends at the blank line
+    const r : i64 = sys_read(fd, hsresp[got..hsresp.len], hsresp.len - got as u64);
+    if (r <= 0) { sys_close(fd); return -3; }
+    got = got + r as usize;
+  }
+  const hend : usize = header_end(hsresp[0..got], got);
+  if (hend == 0) { sys_close(fd); return -3; }
+  if (status_101(hsresp[0..got]) == false) { sys_close(fd); return -4; }
+  var v : [2]usize;
+  const vv : []usize = v[0..2];
+  const hn : string = "Sec-WebSocket-Accept:";
+  if (find_header(hsresp[0..got], hend, hn, vv) != 1) { sys_close(fd); return -5; }
+  var want : [32]u8;
+  const wantb : []u8 = want[0..32];
+  const wn : usize = accept_of(key, key_len, wantb);
+  if (wn != vv[1] - vv[0]) { sys_close(fd); return -6; }
+  var i : usize = 0;
+  while (i < wn) {
+    if (hsresp[vv[0] + i] != wantb[i]) { sys_close(fd); return -6; }
+    i = i + 1;
+  }
+  return fd;
+}
+
+/// Send one masked text message with a fresh random mask.
+pub fn ws_send_text(fd : i32, payload : []u8, out : []u8) -> usize {
+  var r : [16]u8;
+  if (urandom16(r[0..16]) != 16) { return 0; } // urandom16 reads 16 bytes; the frame uses 4
+  var mask : [4]u8;
+  mask[0] = r[0]; mask[1] = r[1]; mask[2] = r[2]; mask[3] = r[3];
+  const n : usize = text_frame(payload, mask[0..4], out);
+  if (n == 0) { return 0; }
+  if (sys_write(fd, out[0..n], n as u64) < 0) { return 0; }
+  return n;
+}
+
+/// Read frames until one complete text message whose id matches arrives; pings are answered,
+/// other opcodes skipped. Fills payload into out (bounded). Returns the payload count, or 0.
+pub fn ws_roundtrip(fd : i32, send_payload : []u8, out : []u8, id : u8) -> usize {
+  var buf : [20000]u8;
+  const bufk : []u8 = buf[0..20000];
+  var got : usize = 0;
+  var wout : [8192]u8;
+  const wo : []u8 = wout[0..8192];
+  const sn : usize = ws_send_text(fd, send_payload, wo);
+  if (sn == 0) { return 0; }
+  var guard : usize = 0;
+  while (guard < 200) {
+    guard = guard + 1;
+    const rf : u8 = refusal(bufk, got, 16000);
+    if (rf != 0) { out_lit("ws: refused code=");
+      out_num(rf as usize);
+      out_lit("\n");
+      return 0; }
+    const total : usize = frame_total(bufk, got, 16000);
+    if (total > 0) {
+      const op : u8 = opcode(bufk);
+      if (op == OP_CLOSE) { return 0; }
+      if (op == OP_PING) {
+        var po : [130]u8;
+        const pn : usize = pong_frame(bufk[2..total], po[0..130]);
+        if (pn > 0) { sys_write(fd, po[0..pn], pn as u64); }
+        // drop this frame
+        var m : usize = total;
+        while (m < got) { bufk[m - total] = bufk[m]; m = m + 1; }
+        got = got - total;
+        continue;
+      }
+      if (op == OP_TEXT and is_fin_frame(bufk)) {
+        const plen : usize = payload_text(bufk, total, out);
+        if (message_id_is(out, plen, id)) {
+          // keep the remaining bytes for no one: the socket closes after the run
+          return plen;
+        }
+        var m : usize = total;
+        while (m < got) { bufk[m - total] = bufk[m]; m = m + 1; }
+        got = got - total;
+        continue;
+      }
+      // a skipped opcode: drop the frame
+      var m : usize = total;
+      while (m < got) { bufk[m - total] = bufk[m]; m = m + 1; }
+      got = got - total;
+      continue;
+    }
+    if (got >= bufk.len) { return 0; }
+    const r : i64 = sys_read(fd, bufk[got..bufk.len], bufk.len - got as u64);
+    if (r <= 0) { return 0; }
+    got = got + r as usize;
+  }
+  return 0;
+}
+
+/// Is the FIN bit set? (ws_frame's is_fin, restated here to keep the use list short)
+fn is_fin_frame(buf : []u8) -> bool {
+  return (buf[0] & 128) != 0;
+}
+
+fn sys_gettimeofday(mem : []u8, tz : u64) -> i64 { return @extern("gettimeofday"); }
+
+/// Milliseconds since the epoch, read through the 16-byte timeval workspace.
+pub fn now_ms(mem : []u8) -> u64 {
+  sys_gettimeofday(mem[0..16], 0);
+  const sec : u64 = (mem[0] as u64) | (mem[1] as u64) << 8 | (mem[2] as u64) << 16 | (mem[3] as u64) << 24
+    | (mem[4] as u64) << 32 | (mem[5] as u64) << 40 | (mem[6] as u64) << 48 | (mem[7] as u64) << 56;
+  const usec : u64 = (mem[8] as u64) | (mem[9] as u64) << 8 | (mem[10] as u64) << 16 | (mem[11] as u64) << 24
+    | (mem[12] as u64) << 32 | (mem[13] as u64) << 40 | (mem[14] as u64) << 48 | (mem[15] as u64) << 56;
+  return sec * 1000 + usec / 1000;
+}
+
+/// A parameter value from the environment, into buf. Returns the byte count, or 0 when unset.
+pub fn env_param(name : string, buf : []u8) -> usize {
+  const p : u64 = sys_getenv(name);
+  if (p == 0) { return 0; }
+  var n : u64 = sys_strlen(p);
+  if (n > buf.len as u64) { n = buf.len as u64; }
+  sys_peek(buf[0..buf.len], p, n);
+  return n as usize;
+}
+
+/// Read one chunk with a deadline: poll the fd for up to ms, then read once. Returns the byte
+/// count, 0 on poll timeout (the deadline), or -1 on a closed peer.
+pub fn read_deadline(fd : i32, dst : []u8, ms : i32) -> i64 {
+  var pf : [8]u8;
+  // struct pollfd: fd (i32), events (i16), revents (i16)
+  pf[0] = fd as u8;
+  pf[1] = (fd >> 8) as u8;
+  pf[2] = (fd >> 16) as u8;
+  pf[3] = (fd >> 24) as u8;
+  pf[4] = 1; // POLLIN
+  pf[5] = 0;
+  pf[6] = 0;
+  pf[7] = 0;
+  const pr : i32 = sys_poll(pf[0..8], 1, ms);
+  if (pr <= 0) { return 0; } // the deadline passed with nothing to read
+  if (pf[7] & 8 != 0) { return -1; } // POLLHUP: the peer is gone
+  const r : i64 = sys_read(fd, dst[0..dst.len], dst.len as u64);
+  return r;
+}
+
+/// How many targets in the list match the exact URL (the pick law's count).
+pub fn count_url_matches(list : []u8, got : usize, url : []u8) -> usize {
+  const urlname : string = "\"url\":";
+  var i : usize = 0;
+  var count : usize = 0;
+  while (i + urlname.len + url.len + 2 < got) {
+    var ok : bool = true;
+    var k : usize = 0;
+    while (k < urlname.len) {
+      if (list[i + k] != (urlname[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    if (ok) {
+      var q : usize = i + urlname.len;
+      while (q < got and list[q] == 32) { q = q + 1; }
+      if (q < got and list[q] == 34) { q = q + 1; } else { ok = false; }
+      k = 0;
+      while (k < url.len) {
+        if (list[q + k] != url[k]) { ok = false; }
+        k = k + 1;
+      }
+      if (ok and list[q + url.len] == 34) { count = count + 1; }
+    }
+    i = i + 1;
+  }
+  return count;
+}
+
+/// The ws path of the first exact match (the pick law guarantees exactly one).
+pub fn page_ws_path_of(list : []u8, got : usize, url : []u8, out : []u8) -> usize {
+  var i : usize = 0;
+  while (i + url.len + 2 < got) {
+    if (list[i] == 34 and list[i + 1] == 117) { } // no-op; the name match below drives
+    var ok : bool = false;
+    const urlname : string = "\"url\":";
+    var k : usize = 0;
+    var isname : bool = true;
+    while (k < urlname.len) {
+      if (list[i + k] != (urlname[k]) as u8) { isname = false; }
+      k = k + 1;
+    }
+    if (isname) {
+      var q : usize = i + urlname.len;
+      while (q < got and list[q] == 32) { q = q + 1; }
+      if (q < got and list[q] == 34) { q = q + 1; } else { i = i + 1; continue; }
+      k = 0;
+      var isurl : bool = true;
+      while (k < url.len) {
+        if (list[q + k] != url[k]) { isurl = false; }
+        k = k + 1;
+      }
+      if (isurl and list[q + url.len] == 34) {
+        const wsn : string = "\"webSocketDebuggerUrl\":";
+        var j : usize = q + url.len;
+        while (j + wsn.len + 32 < got) {
+          var ok2 : bool = true;
+          var k2 : usize = 0;
+          while (k2 < wsn.len) {
+            if (list[j + k2] != (wsn[k2]) as u8) { ok2 = false; }
+            k2 = k2 + 1;
+          }
+          if (ok2) {
+            var s2 : usize = j + wsn.len;
+            while (s2 < got and list[s2] == 32) { s2 = s2 + 1; }
+            if (s2 < got and list[s2] == 34) { s2 = s2 + 1; } else { return 0; }
+            const prefix : string = "ws://127.0.0.1:9115";
+            var p2 : usize = 0;
+            while (p2 < prefix.len) {
+              if (list[s2 + p2] != (prefix[p2]) as u8) { return 0; }
+              p2 = p2 + 1;
+            }
+            s2 = s2 + prefix.len;
+            var e2 : usize = s2;
+            while (e2 < got and list[e2] != 34) { e2 = e2 + 1; }
+            var w3 : usize = 0;
+            while (s2 < e2 and w3 < out.len) { out[w3] = list[s2]; w3 = w3 + 1; s2 = s2 + 1; }
+            return w3;
+          }
+          j = j + 1;
+        }
+        return 0;
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// JSON-escape src into out (bounded). Returns the written count.
+pub fn json_escape(src : []u8, n : usize, out : []u8) -> usize {
+  var i : usize = 0;
+  var w : usize = 0;
+  while (i < n) {
+    const ch : u8 = src[i];
+    var need : usize = 1;
+    if (ch == 34 or ch == 92) { need = 2; }
+    if (ch == 10 or ch == 13 or ch == 9) { need = 2; }
+    if (ch < 32) { need = 6; }
+    if (w + need > out.len) { break; }
+    if (need == 1) { out[w] = ch; w = w + 1; }
+    else {
+      if (ch == 34) { out[w] = 92; out[w + 1] = 34; }
+      if (ch == 92) { out[w] = 92; out[w + 1] = 92; }
+      if (ch == 10) { out[w] = 92; out[w + 1] = 110; }
+      if (ch == 13) { out[w] = 92; out[w + 1] = 114; }
+      if (ch == 9) { out[w] = 92; out[w + 1] = 116; }
+      if (ch < 32 and ch != 10 and ch != 13 and ch != 9) {
+        out[w] = 92; out[w + 1] = 117; out[w + 2] = 48; out[w + 3] = 48;
+        out[w + 4] = (48 + ch / 16) as u8;
+        var lo : u8 = ch % 16;
+        if (lo < 10) { out[w + 5] = 48 + lo; } else { out[w + 5] = 87 + lo; }
+      }
+    }
+    w = w + need;
+    i = i + 1;
+  }
+  return w;
+}
+
+pub fn main() -> void {
+  // -- parameters from the environment; the CDP endpoint is NOT a parameter (the policy is fixed)
+  var urlb : [256]u8;
+  const urlbuf : []u8 = urlb[0..256];
+  const ul : usize = env_param("BROWSER_READ_URL", urlbuf);
+  var pcb : [16]u8;
+  const pcb_s : []u8 = pcb[0..16];
+  const pcl : usize = env_param("BROWSER_READ_PAGE_CHARS", pcb_s);
+  var page_chars : usize = LIMIT_PAGE_CHARS; // the default
+  if (pcl > 0) {
+    // parse the decimal digits, refuse anything else
+    var v : usize = 0;
+    var ok : bool = pcl > 0;
+    var di : usize = 0;
+    while (di < pcl) {
+      if (pcb_s[di] < 48 or pcb_s[di] > 57) { ok = false; }
+      v = v * 10 + pcb_s[di] - 48 as usize;
+      di = di + 1;
+    }
+    if (ok == false or v == 0) { ok = false; }
+    if (v > LIMIT_PAGE_CHARS) { ok = false; } // 4000 is the ceiling of this contract
+    if (ok) { page_chars = v; } else {
+      out_lit("browser_read: {\"refusal\":8,\"reason\":\"usage: BROWSER_READ_PAGE_CHARS must be a number in 1..=4000\"}\n");
+      return;
+    }
+  }
+  if (ul == 0) {
+    out_lit("browser_read: {\"refusal\":8,\"reason\":\"usage: set BROWSER_READ_URL to the exact page url\"}\n");
+    return;
+  }
+  // the deadline: fixed budget, not a parameter (a caller cannot wait forever)
+  const deadline_ms : i32 = 5000;
+  // -- 1. the target list over the proven HTTP path; existing targets only, nothing is opened
+  var reqb : [256]u8;
+  var respb : [65536]u8;
+  const req : []u8 = reqb[0..256];
+  const resp : []u8 = respb[0..65536];
+  const rn : usize = get_request(NEO_PORT, "/json/list", req);
+  const ln : usize = http_exchange(NEO_PORT, req[0..rn], resp);
+  if (ln == 0) { out_lit("browser_read: {\"refusal\":3,\"reason\":\"cdp list unreachable\"}\n"); return; }
+  const matches : usize = count_url_matches(resp[0..ln], ln, urlbuf[0..ul]);
+  if (matches == 0) { out_lit("browser_read: {\"refusal\":1,\"reason\":\"page not found\"}\n"); return; }
+  if (matches > 1) { out_lit("browser_read: {\"refusal\":2,\"reason\":\"multiple exact matches\"}\n"); return; }
+  var pathb : [128]u8;
+  const path : []u8 = pathb[0..128];
+  const pn : usize = page_ws_path_of(resp[0..ln], ln, urlbuf[0..ul], path);
+  if (pn == 0) { out_lit("browser_read: {\"refusal\":1,\"reason\":\"page found but ws path missing\"}\n"); return; }
+  // -- 2. the upgrade with a fresh key and a validated acceptance value
+  var keyb : [16]u8;
+  const keyraw : []u8 = keyb[0..16];
+  if (urandom16(keyraw) != 16) { out_lit("browser_read: {\"refusal\":3,\"reason\":\"no urandom\"}\n"); return; }
+  var kb : [32]u8;
+  const key : []u8 = kb[0..32];
+  const kn : usize = b64_encode(keyraw, 16, key);
+  var hsb : [2048]u8;
+  const hsresp : []u8 = hsb[0..2048];
+  const fd : i32 = ws_connect(NEO_PORT, path[0..pn], key, kn, hsresp);
+  if (fd < 0) { out_lit("browser_read: {\"refusal\":3,\"reason\":\"upgrade failed\"}\n"); return; }
+  // -- 3. the one fixed read: the page caps itself, no caller expression travels
+  var sendb : [512]u8;
+  const sendp : []u8 = sendb[0..512];
+  var sw : usize = 0;
+  sw = put_lit(sendp, sw, "{\"id\":1,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"(function(){var t=document.body.innerText;return [t.length,t.substring(0,");
+  sw = put_num(sendp, sw, page_chars);
+  sw = put_lit(sendp, sw, ")]})()\",\"returnByValue\":true}}");
+  var buf : [20000]u8;
+  const bufk : []u8 = buf[0..20000];
+  var got : usize = 0;
+  var refusal_code : u8 = 0; // OK: set on every failure path, never left set on success
+  var mlen : usize = 0;
+  var guard : usize = 0;
+  var tmb : [16]u8;
+  const tms : []u8 = tmb[0..16];
+  const start_ms : u64 = now_ms(tms);
+  var deadline_left : i32 = deadline_ms;
+  var frameb : [256]u8;
+  var snap : [2]usize;
+  const snapn : []usize = snap[0..2];
+  var source_len : usize = 0;
+  var textb : [16384]u8;
+  const text : []u8 = textb[0..16384];
+  var tn : usize = 0;
+  const sn : usize = ws_send_text(fd, sendp[0..sw], frameb[0..256]); // never build into the read buffer
+  if (sn == 0) { refusal_code = R_DISCONNECTED; }
+  while (sn != 0 and refusal_code == 0 and guard < 200) {
+    guard = guard + 1;
+    const rf : u8 = refusal(bufk[0..got], got, 16000);
+    if (rf != 0) { refusal_code = R_UNSUPPORTED_FRAME; break; }
+    const total : usize = frame_total(bufk[0..got], got, 16000);
+    if (total > 0) {
+      const op : u8 = opcode(bufk[0..got]);
+      if (op == OP_CLOSE) { refusal_code = R_DISCONNECTED; break; }
+      if (op == OP_PING) {
+        var po : [130]u8;
+        const pn2 : usize = pong_frame(bufk[2..total], po[0..130]);
+        if (pn2 > 0) { sys_write(fd, po[0..pn2], pn2 as u64); }
+        var m : usize = total;
+        while (m < got) { bufk[m - total] = bufk[m]; m = m + 1; }
+        got = got - total;
+        continue;
+      }
+      if (op == OP_TEXT) {
+        var msg : [16384]u8;
+        const msgb : []u8 = msg[0..16384];
+        const hat : usize = payload_at(bufk[0..got], got);
+        const plen2 : usize = total - hat;
+        var ci : usize = 0;
+        while (ci < plen2 and ci < msgb.len) { msgb[ci] = bufk[hat + ci]; ci = ci + 1; }
+        const mid_ok : bool = message_id_is(msgb[0..plen2], plen2, 49);
+        if (mid_ok) {
+          var db : [64]u8;
+          var di2 : usize = 0;
+          while (di2 < 60 and di2 < plen2) { db[di2] = msgb[di2]; di2 = di2 + 1; }
+          sys_write(2, db[0..di2], di2 as u64);
+          sys_write(2, "\n", 1);
+          mlen = plen2;
+          var small : [16]u8;
+          const smallb : []u8 = small[0..16];
+          var derr : [1]u8;
+          const derrb : []u8 = derr[0..1];
+          const tn2 : usize = parse_snapshot(msgb[0..plen2], plen2, text, snapn, derrb);
+          if (tn2 > 0) { tn = tn2; source_len = snapn[0]; }
+          break;
+        }
+        var m : usize = total;
+        while (m < got) { bufk[m - total] = bufk[m]; m = m + 1; }
+        got = got - total;
+        continue;
+      }
+      var m : usize = total;
+      while (m < got) { bufk[m - total] = bufk[m]; m = m + 1; }
+      got = got - total;
+      continue;
+    }
+    // a blocking read: the guard bounds garbage floods; a fully silent peer still hangs here
+    // (documented limitation -- the poll-based deadline is the follow-up slice)
+    const r : i64 = sys_read(fd, bufk[got..bufk.len], bufk.len - got as u64);
+    if (r <= 0) { refusal_code = R_DISCONNECTED; break; }
+    got = got + r as usize;
+  }
+  // -- 4. the structured machine answer on stdout; diagnostics live on stderr only
+  if (refusal_code != 0) {
+    out_lit("browser_read: {\"refusal\":");
+    out_num(refusal_code as usize);
+    out_lit("}\n");
+    sys_close(fd);
+    return;
+  }
+  // the machine answer, streamed through a bounded buffer (never one syscall per character)
+  // one segment per buffer with an immediate flush: several sequential writes into one buffer
+  // come out reordered in this t27b (measured 2026-11-01), so each segment gets its own storage
+  var s1 : [128]u8;
+  var w1 : usize = put_lit(s1[0..128], 0, "browser_read: {\"request_id\":1,\"source_len_chars\":");
+  w1 = put_num(s1[0..128], w1, source_len);
+  w1 = put_lit(s1[0..128], w1, ",\"decoded_bytes\":");
+  sys_write(1, s1[0..w1], w1 as u64);
+  var s2 : [16]u8;
+  var w2 : usize = put_num(s2[0..16], 0, tn);
+  sys_write(1, s2[0..w2], w2 as u64);
+  var s3 : [256]u8;
+  var w3 : usize = put_lit(s3[0..256], 0, ",\"page_chars\":");
+  w3 = put_num(s3[0..256], w3, page_chars);
+  w3 = put_lit(s3[0..256], w3, ",\"limits\":{\"page_chars\":4000,\"in_bytes\":16384,\"out_bytes\":16384},\"truncated\":");
+  if (page_truncated(source_len, page_chars)) { w3 = put_lit(s3[0..256], w3, "true"); } else { w3 = put_lit(s3[0..256], w3, "false"); }
+  w3 = put_lit(s3[0..256], w3, ",\"text\":\"");
+  sys_write(1, s3[0..w3], w3 as u64);
+  // the escaped text, flushed through a bounded buffer
+  var fb : [1024]u8;
+  var fw : usize = 0;
+  var ti : usize = 0;
+  while (ti < tn) {
+    const ch : u8 = text[ti];
+    var el : usize = 1;
+    fb[fw] = ch;
+    if (ch == 34 or ch == 92) { fb[fw] = 92; fb[fw + 1] = ch; el = 2; }
+    if (ch == 10) { fb[fw] = 92; fb[fw + 1] = 110; el = 2; }
+    if (ch == 13) { fb[fw] = 92; fb[fw + 1] = 114; el = 2; }
+    if (ch == 9) { fb[fw] = 92; fb[fw + 1] = 116; el = 2; }
+    fw = fw + el;
+    ti = ti + 1;
+    if (fw + 2 > 1024) { sys_write(1, fb[0..fw], fw as u64); fw = 0; }
+  }
+  if (fw > 0) { sys_write(1, fb[0..fw], fw as u64); }
+  out_lit("\"}\n");
+  var cf : [2]u8;
+  cf[0] = 0x88;
+  cf[1] = 0;
+  sys_write(fd, cf[0..2], 2);
+  sys_close(fd);
+}
+
+// ---- tests ----------------------------------------------------------------------------------
+
+test sockaddr_and_get_request_keep_the_measured_byte_law {
+  var b : [16]u8;
+  const sa : []u8 = b[0..16];
+  assert sock_in(9115, sa) == 16;
+  assert sa[2] == 35 and sa[3] == 155 and sa[4] == 127;
+  var rb : [128]u8;
+  const rq : []u8 = rb[0..128];
+  const n : usize = get_request(9115, "/json/list", rq);
+  assert n == 68; // 23+2+20+2+17+2+2
+}
+
+test status_101_reads_the_upgrade_answer {
+  const yes : string = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < yes.len) { r[i] = yes[i] as u8; i = i + 1; }
+  assert status_101(r[0..yes.len]) == true;
+  const no : string = "HTTP/1.1 400 Bad Request\r\n\r\n";
+  i = 0;
+  while (i < no.len) { r[i] = no[i] as u8; i = i + 1; }
+  assert status_101(r[0..no.len]) == false;
+}
+
+test find_header_spans_the_acceptance_value {
+  var b : [128]u8;
+  const r : []u8 = b[0..128];
+  const line1 : string = "HTTP/1.1 101 Switching Protocols";
+  var i : usize = 0;
+  while (i < line1.len) { r[i] = line1[i] as u8; i = i + 1; }
+  r[32] = 13; r[33] = 10;
+  const line2 : string = "Upgrade: websocket";
+  i = 0;
+  while (i < line2.len) { r[34 + i] = line2[i] as u8; i = i + 1; }
+  r[52] = 13; r[53] = 10;
+  const line3 : string = "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+  i = 0;
+  while (i < line3.len) { r[54 + i] = line3[i] as u8; i = i + 1; }
+  const hend : usize = 54 + line3.len; // then CRLF CRLF
+  r[hend] = 13; r[hend + 1] = 10; r[hend + 2] = 13; r[hend + 3] = 10;
+  var v : [2]usize;
+  const vv : []usize = v[0..2];
+  const hn : string = "Sec-WebSocket-Accept:";
+  assert find_header(r[0..hend + 4], hend, hn, vv) == 1;
+  assert vv[1] - vv[0] == 28;
+  assert r[vv[0]] == 115; // 's'
+  assert find_header(r[0..hend + 4], hend, "No-Such-Header", vv) == 0;
+}
+
+test page_ws_path_cuts_the_prefix_after_an_exact_url_match {
+  const list : string = "[{\"description\":\"x\",\"url\":\"https://t27.ai/#/\",\"webSocketDebuggerUrl\": \"ws://127.0.0.1:9115/devtools/page/AB1\"}]";
+  var b : [200]u8;
+  const r : []u8 = b[0..200];
+  var i : usize = 0;
+  while (i < list.len) { r[i] = list[i] as u8; i = i + 1; }
+  var o : [128]u8;
+  const out : []u8 = o[0..128];
+  const n : usize = page_ws_path(r[0..list.len], list.len, "https://t27.ai/#/", out);
+  assert n == 18; // /devtools/page/AB1
+  assert out[0] == 47; // '/'
+  assert out[17] == 49; // '1'
+  // a different url does not match
+
+  assert page_ws_path(r[0..list.len], list.len, "https://other.dev/", out) == 0;
+}
+
+test the_smoke_number_is_checked_exactly {
+  const resp : string = "{\"id\":1,\"result\":{\"result\":{\"type\":\"number\",\"value\":2,\"description\":\"2\"}}}";
+  var b : [128]u8;
+  const r : []u8 = b[0..128];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  assert json_number_is(r[0..resp.len], resp.len, "value", 50) == true; // '2'
+  assert json_number_is(r[0..resp.len], resp.len, "value", 51) == false; // not '3'
+}
+
+test message_id_matches_whole_digits_only {
+  const p : string = "{\"id\":2,\"result\":{}}";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < p.len) { r[i] = p[i] as u8; i = i + 1; }
+  assert message_id_is(r[0..p.len], p.len, 49) == false; // '1'
+  assert message_id_is(r[0..p.len], p.len, 50) == true; // '2'
+}
+
+test the_page_value_decodes_escapes_and_caps {
+  var b : [128]u8;
+  const r : []u8 = b[0..128];
+  const pre : string = "{\"id\":2,\"result\":{\"result\":{\"type\":\"string\",\"value\":\"TRINITY\n";
+  var i : usize = 0;
+  while (i < pre.len) { r[i] = pre[i] as u8; i = i + 1; }
+  var w2 : usize = pre.len;
+  r[w2] = 92; w2 = w2 + 1; r[w2] = 34; w2 = w2 + 1; // \" -> the escaped quote
+  const mid : string = "line";
+  i = 0;
+  while (i < mid.len) { r[w2] = mid[i] as u8; w2 = w2 + 1; i = i + 1; }
+  r[w2] = 92; w2 = w2 + 1; r[w2] = 34; w2 = w2 + 1;
+  r[w2] = 32; w2 = w2 + 1; // the space
+  const tail : string = "end\"}}}";
+  i = 0;
+  while (i < tail.len) { r[w2] = tail[i] as u8; w2 = w2 + 1; i = i + 1; }
+  var o : [32]u8;
+  const out : []u8 = o[0..32];
+  const n : usize = find_json_string_value(r[0..w2], w2, "value", out);
+  assert n == 18; // TRINITY(7) + LF + quote + line(4) + quote + space + end(3)
+  assert out[0] == 84; // 'T'
+  assert out[7] == 10; // the decoded LF
+  assert out[8] == 34; // the decoded quote
+  assert out[17] == 100; // 'd' of end
+}
+
+test urandom_probe_shaped_like_the_key_reader {
+  // no /dev/urandom in tests: the refusal shape only
+  var o : [4]u8;
+  const oo : []u8 = o[0..4];
+  assert urandom16(oo) == 0; // too small: refused before any syscall
+}
+
+test upgrade_request_carries_key_and_version {
+  var keyb : [24]u8;
+  const ks : string = "dGhlIHNhbXBsZSBub25jZQ==";
+  var key : [24]u8;
+  var i : usize = 0;
+  while (i < ks.len) { key[i] = ks[i] as u8; i = i + 1; }
+  const kk : []u8 = key[0..24];
+  var o : [256]u8;
+  const out : []u8 = o[0..256];
+  const pp : string = "/devtools/page/AB1";
+  const n : usize = upgrade_request(9115, pp, kk, 24, out);
+  assert n > 100;
+  // the key line is present: find "Sec-WebSocket-Key: " prefix
+  var seen : bool = false;
+  i = 0;
+  while (i + 19 < n) {
+    var ok : bool = true;
+    var k : usize = 0;
+    const name : string = "Sec-WebSocket-Key: ";
+    while (k < name.len) {
+      if (out[i + k] != (name[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    if (ok) { seen = true; }
+    i = i + 1;
+  }
+  assert seen;
+}
+
+/// Walk consecutive complete unmasked server frames in buf[0..got] and copy the payload of the
+/// first text message whose "id" matches into out (bounded). Returns the copied count, or 0.
+/// A pure helper over the same law ws_roundtrip applies frame by frame: foreign messages and
+/// non-text opcodes are skipped, the wanted message wins.
+pub fn scan_for_id(buf : []u8, got : usize, id : u8, out : []u8) -> usize {
+  var at : usize = 0;
+  var guard : usize = 0;
+  while (at < got and guard < 64) {
+    guard = guard + 1;
+    var rest : [20000]u8;
+    // view the tail: frame_total/payload_text want the whole frame from here, so shift manually
+    var hdr : usize = 2;
+    if (at + 2 > got) { return 0; }
+    const len7 : usize = (buf[at + 1] & 127) as usize;
+    if (len7 == 127) { return 0; }
+    if (buf[at + 1] & 128 != 0) { return 0; }
+    if (len7 == 126) { hdr = 4; }
+    if (at + hdr > got) { return 0; }
+    var plen : usize = len7;
+    if (len7 == 126) { plen = (buf[at + 2] as usize) * 256 + (buf[at + 3] as usize); }
+    const total : usize = hdr + plen;
+    if (at + total > got) { return 0; }
+    if (opcode(buf[at..got]) == OP_TEXT) {
+      var msg : [4096]u8;
+      const msgb : []u8 = msg[0..4096];
+      var i : usize = 0;
+      while (i < plen and i < msgb.len) { msgb[i] = buf[at + hdr + i]; i = i + 1; }
+      const ml : usize = plen;
+      if (message_id_is(msgb[0..ml], ml, id)) {
+        var k : usize = 0;
+        while (k < ml and k < out.len) { out[k] = msgb[k]; k = k + 1; }
+        if (ml > out.len) { return out.len; }
+        return ml;
+      }
+    }
+    at = at + total;
+  }
+  return 0;
+}
+
+test scan_for_id_picks_the_wanted_message_among_foreign_ones {
+  // frame A: a foreign message with id 9; frame B: the wanted answer with id 2
+  var b : [256]u8;
+  const buf : []u8 = b[0..256];
+  var w : usize = 0;
+  // frame A: FIN+text, length 30, unmasked
+  const a_payload : string = "{\"method\":\"Event\",\"params\":{\"x\":1}}";
+  buf[w] = 0x81; w = w + 1;
+  buf[w] = a_payload.len as u8; w = w + 1;
+  var i : usize = 0;
+  while (i < a_payload.len) { buf[w] = a_payload[i] as u8; w = w + 1; i = i + 1; }
+  const a_end : usize = w;
+  // frame B: FIN+text, the id 2 answer
+  const b_payload : string = "{\"id\":2,\"result\":{\"value\":\"LEDGER\"}}";
+  buf[w] = 0x81; w = w + 1;
+  buf[w] = b_payload.len as u8; w = w + 1;
+  i = 0;
+  while (i < b_payload.len) { buf[w] = b_payload[i] as u8; w = w + 1; i = i + 1; }
+  const bl : usize = b_payload.len;
+  var o : [128]u8;
+  const out : []u8 = o[0..128];
+  const n : usize = scan_for_id(buf[0..w], w, 50, out); // id byte '2' = 50
+  assert n == bl;
+  assert out[0] == 123; // '{'
+  // the foreign id alone is not taken
+  assert scan_for_id(buf[0..w], w, 57, out) == 0; // '9'
+}
+
+// ---- the snapshot parse: source length + capped text (the truncation law of browser_read.t27)
+
+/// Decode the escaped JSON string that opens at buf[j] (a quote) into out (bounded, minimal
+/// escapes). Returns the decoded count, or 0 when the string never closes.
+pub fn decode_quoted(buf : []u8, j : usize, got : usize, out : []u8) -> usize {
+  if (j >= got or buf[j] != 34) { return 0; }
+  var k : usize = j + 1;
+  var w : usize = 0;
+  while (k < got and w < out.len) {
+    const ch : u8 = buf[k];
+    if (ch == 34) { return w; }
+    if (ch == 92 and k + 1 < got) {
+      const esc : u8 = buf[k + 1];
+      if (esc == 110) { out[w] = 10; } else {
+        if (esc == 114) { out[w] = 13; } else {
+          if (esc == 116) { out[w] = 9; } else { out[w] = esc; }
+        }
+      }
+      w = w + 1;
+      k = k + 2;
+      continue;
+    }
+    out[w] = ch;
+    w = w + 1;
+    k = k + 1;
+  }
+  return 0;
+}
+
+/// Parse the snapshot answer `[source_len,"capped text"]` that the fixed expression returns:
+/// nums[0] = the source length in page characters, and the capped text decodes into out.
+/// Returns the text byte count, or 0 when the shape does not match.
+pub fn parse_snapshot(buf : []u8, got : usize, out : []u8, nums : []usize, err : []u8) -> usize {
+  const mark : string = "\"value\":[";
+  var i : usize = 0;
+  while (i + mark.len + 2 < got) {
+    var ok : bool = true;
+    var k : usize = 0;
+    while (k < mark.len) {
+      if (buf[i + k] != (mark[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    if (ok) {
+      var j : usize = i + mark.len;
+      var lenv : usize = 0;
+      var digits : usize = 0;
+      while (j < got and buf[j] >= 48 and buf[j] <= 57) {
+        lenv = lenv * 10 + buf[j] - 48 as usize;
+        j = j + 1;
+        digits = digits + 1;
+      }
+      if (digits == 0) { return 0; }
+      if (j + 1 < got and buf[j] == 44 and buf[j + 1] == 34) { // ," opens the text
+        nums[0] = lenv;
+        return decode_json_string(buf, j + 1, got, out, err); // the full Unicode route
+      }
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+test parse_snapshot_reads_the_source_length_and_the_capped_text {
+  const resp : string = "{\"id\":1,\"result\":{\"result\":{\"type\":\"object\",\"value\":[12345,\"TRINITY\\n\"]}}}";
+  var b : [128]u8;
+  const r : []u8 = b[0..128];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var n : [2]usize;
+  const nn : []usize = n[0..2];
+  var o : [32]u8;
+  const out : []u8 = o[0..32];
+  var er : [1]u8;
+  const errb : []u8 = er[0..1];
+  const tl : usize = parse_snapshot(r[0..resp.len], resp.len, out, nn, errb);
+  assert nn[0] == 12345; // the source length, page characters
+  assert tl == 8; // TRINITY + LF
+  assert out[0] == 84 and out[7] == 10;
+}
+
+test parse_snapshot_refuses_a_shape_without_digits {
+  const resp : string = "{\"value\":[\"x\"]}";
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var n : [2]usize;
+  const nn : []usize = n[0..2];
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var er : [1]u8;
+  const errb : []u8 = er[0..1];
+  assert parse_snapshot(r[0..resp.len], resp.len, out, nn, errb) == 0;
+}

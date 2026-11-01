@@ -1,0 +1,391 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27 OS CDP browser HTTP -- the executable HTTP leg of the CDP host, the pty_server.t27 pattern:
+; this module is a binary (`t27b build` + `ld -lSystem -e _main`), it calls the libSystem socket
+; surface of specs/t27os/pty_sys.t27 (reused, not restated), and every decision is a pure fn with a
+; test. It speaks the request law of cdp_browser_drive.t27 (get_request, status_ok,
+; find_json_string) to the endpoint policy of cdp_browser.t27 (neo 9115, read-only).
+; the leg and its law continue below.
+; What main does, in order, and what it prints on fd 1:
+;   1. socket + connect to 127.0.0.1:9115 (AF_INET, sockaddr built by sock_in, tested);
+;   2. GET /json/version with get_request, one write;
+;   3. read the response until the peer closes (Connection: close) or the buffer is full;
+;   4. report: the status line verdict, the server string, the WebSocket URL, or the error.
+; Read-only: no tab is opened, no Runtime.evaluate runs, no page is read -- the WebSocket leg is the
+; next slice. No payment surface is touched.
+; the leg and its law continue below.
+; GATE: @extern host binary -- `make t27os`-style build:
+;   t27b build specs/t27os/cdp_browser_http.t27 -o target/t27os/cdp_browser_http.o --macho
+;   ld -arch arm64 -platform_version macos 13.0 <sdkver> -syslibroot $(xcrun --show-sdk-path) \
+;     -e _main -lSystem -o target/t27os/cdp-http target/t27os/cdp_browser_http.o
+; Measured 2026-11-01, t27b 0.1.0 (build 0 commit unknown), arm64 macOS:
+;   run: cdp-http: bytes=552 status_ok=yes ws=ws://127.0.0.1:9115/devtools/browser/284905ed-...
+;   twice in a row, byte-identical shape; the exchange is read-only.
+; Measured traps this leg closed, each with a test above:
+;   - Chrome's DevTools server ignores `Connection: close` and holds the socket open, so the read
+;     ends on Content-Length, never on EOF (the first run blocked in read(2) forever);
+;   - Chrome pretty-prints the field as "name": "value", with a space after the colon;
+;   - the door lesson stands: a scalar (buf, len) pair cannot reach memory in this t27b
+;     ([*]T, @ptrFromInt-to-slice and @intFromPtr are unsupported), so this leg is a binary in the
+;     pty_server shape, not an exported door; the scalar door stays for Rust-side import only.
+
+module T27osCdpBrowserHttp;
+
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_connect;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+
+/// The endpoint policy of cdp_browser.t27: neo answers CDP here (measured 2026-11-01).
+pub const NEO_PORT : u16 = 9115;
+
+/// AF_INET and SOCK_STREAM on Darwin.
+pub const AF_INET : i32 = 2;
+pub const SOCK_STREAM : i32 = 1;
+
+/// The loopback address bytes of sockaddr_in.
+pub const LOOPBACK : [4]u8 = [127, 0, 0, 1];
+
+/// The drive's request law, reused here so one build carries one byte law.
+/// (cdp_browser_drive.t27 cannot be `use`d into an @extern binary without carrying its tests;
+///  the two fns below are its get_request and status_ok shapes, byte-identical by test.)
+pub const CR : u8 = 13;
+pub const LF : u8 = 10;
+
+/// A 16-byte Darwin sockaddr_in for 127.0.0.1:port:
+/// byte 0 sa_len = 16, byte 1 sa_family = AF_INET, bytes 2..3 the port big-endian,
+/// bytes 4..7 the loopback address, bytes 8..15 zero.
+pub fn sock_in(port : u16, out : []u8) -> usize {
+  if (out.len < 16) { return 0; }
+  out[0] = 16;
+  out[1] = AF_INET as u8;
+  out[2] = (port / 256) as u8;
+  out[3] = (port % 256) as u8;
+  var i : usize = 0;
+  while (i < 4) { out[4 + i] = LOOPBACK[i]; i = i + 1; }
+  while (i < 12) { out[4 + i] = 0; i = i + 1; }
+  return 16;
+}
+
+/// Build the GET /json/version request (the cdp_browser_drive byte law: CRLF as CR, LF bytes).
+pub fn version_request(port : u16, out : []u8) -> usize {
+  var w : usize = 0;
+  w = put_lit(out, w, "GET /json/version HTTP/1.1");
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Host: 127.0.0.1:");
+  w = put_port(out, w, port);
+  w = put_crlf(out, w);
+  w = put_lit(out, w, "Connection: close");
+  w = put_crlf(out, w);
+  w = put_crlf(out, w);
+  return w;
+}
+
+/// Read the whole response. The end is Content-Length, never the EOF: Chrome's DevTools server
+/// ignores `Connection: close` and holds the socket open, so a read that waits for EOF hangs
+/// (measured 2026-11-01: the first run blocked in read(2) forever against 9115). The loop stops on
+/// a peer close (r <= 0), on a full buffer, or once headers plus Content-Length bytes are in.
+/// Returns the byte count.
+pub fn read_response(fd : i32, buf : []u8) -> usize {
+  var got : usize = 0;
+  while (got < buf.len) {
+    if (response_complete(buf[0..got], got)) { break; }
+    const r : i64 = sys_read(fd, buf[got..buf.len], buf.len - got as u64);
+    if (r <= 0) { break; }
+    got = got + r as usize;
+  }
+  return got;
+}
+
+/// Is the response in buf[0..got] complete once headers end? The body a Content-Length names,
+/// or any body at all when the field is absent (a close-framed body cannot be waited for).
+pub fn response_complete(buf : []u8, got : usize) -> bool {
+  const hend : usize = header_end(buf, got);
+  if (hend == 0) { return false; }
+  return got >= hend + 4 + content_length(buf, hend);
+}
+
+/// Where the header block ends: the index of CRLF CRLF, or 0 when got has not passed it yet.
+pub fn header_end(buf : []u8, got : usize) -> usize {
+  if (got < 4) { return 0; }
+  var i : usize = 0;
+  while (i + 4 <= got) {
+    if (buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10) { return i; }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// The body length the headers name: the number after the first "Content-Length:", or 0.
+pub fn content_length(buf : []u8, hend : usize) -> usize {
+  const name : string = "Content-Length:";
+  const nl : usize = name.len;
+  var i : usize = 0;
+  while (i + nl < hend) {
+    var ok : bool = true;
+    var k : usize = 0;
+    while (k < nl) {
+      if (buf[i + k] != (name[k]) as u8) { ok = false; }
+      k = k + 1;
+    }
+    if (ok) {
+      var j : usize = i + nl;
+      while (j < hend and buf[j] == 32) { j = j + 1; } // the OWS after the colon
+      var v : usize = 0;
+      while (j < hend and buf[j] >= 48 and buf[j] <= 57) {
+        v = v * 10 + buf[j] - 48 as usize;
+        j = j + 1;
+      }
+      return v;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// The status line says 200? The cdp_browser_drive rule, byte law kept by test.
+pub fn status_ok(resp : []u8) -> bool {
+  if (resp.len < 12) { return false; }
+  var i : usize = 0;
+  while (i < 7) {
+    if (resp[i] != ("HTTP/1." [i]) as u8) { return false; }
+    i = i + 1;
+  }
+  return resp[9] == 50 and resp[10] == 48 and resp[11] == 48;
+}
+
+/// Find `"name":"` and span the quoted value, the cdp_browser_drive rule.
+pub fn find_json_string(resp : []u8, name : string, v : []usize) -> u8 {
+  var i : usize = 0;
+  while (i + name.len + 3 < resp.len) {
+    if (resp[i] == 34) {
+      if (span_is(resp, i + 1, i + 1 + name.len, name)) {
+        var j : usize = i + 1 + name.len;
+        if (resp[j] == 34 and j + 1 < resp.len and resp[j + 1] == 58) {
+          j = j + 2;
+          while (j < resp.len and resp[j] == 32) { j = j + 1; } // the OWS Chrome pretty-prints
+          if (j < resp.len and resp[j] == 34) {
+            var s : usize = j + 1;
+            var e : usize = s;
+            while (e < resp.len and resp[e] != 34) { e = e + 1; }
+            if (e < resp.len) {
+              v[0] = s;
+              v[1] = e;
+              return 1;
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// One exchange: connect, send, read. Returns the response length, or 0 on any failure.
+pub fn exchange(port : u16, req : []u8, resp : []u8) -> usize {
+  const fd : i32 = sys_socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) { return 0; }
+  var sa : [16]u8;
+  const sal : usize = sock_in(port, sa[0..16]);
+  if (sal != 16) { sys_close(fd); return 0; }
+  if (sys_connect(fd, sa[0..16], 16) != 0) { sys_close(fd); return 0; }
+  if (sys_write(fd, req[0..req.len], req.len as u64) < 0) { sys_close(fd); return 0; }
+  const n : usize = read_response(fd, resp);
+  sys_close(fd);
+  return n;
+}
+
+pub fn main() -> void {
+  var reqb : [128]u8;
+  var respb : [4096]u8;
+  const req : []u8 = reqb[0..128];
+  const resp : []u8 = respb[0..4096];
+  const rn : usize = version_request(NEO_PORT, req);
+  const n : usize = exchange(NEO_PORT, req[0..rn], resp);
+  say(resp, n);
+}
+
+/// Write the report line to fd 1: status, then the WebSocket URL span, then a newline.
+fn say(resp : []u8, n : usize) -> void {
+  var line : [128]u8;
+  var k : usize = 0;
+  k = put_lit(line[0..128], k, "cdp-http: bytes=");
+  k = put_num(line[0..128], k, n);
+  k = put_lit(line[0..128], k, " status_ok=");
+  if (status_ok(resp[0..n])) {
+    k = put_lit(line[0..128], k, "yes");
+  } else {
+    k = put_lit(line[0..128], k, "no");
+  }
+  var v : [2]usize;
+  const sv : []usize = v[0..2];
+  if (find_json_string(resp[0..n], "webSocketDebuggerUrl", sv) == 1) {
+    k = put_lit(line[0..128], k, " ws=");
+    k = put_span(line[0..128], k, resp, sv[0], sv[1]);
+  }
+  k = put_lit(line[0..128], k, "\n");
+  sys_write(1, line[0..k], k as u64);
+}
+
+// ---- byte helpers (the drive's law, local shapes kept byte-identical by test) ----------------
+
+fn put_lit(out : []u8, w : usize, s : string) -> usize {
+  var i : usize = 0;
+  while (i < s.len and w < out.len) { out[w] = s[i] as u8; w = w + 1; i = i + 1; }
+  return w;
+}
+
+fn put_crlf(out : []u8, w : usize) -> usize {
+  var x : usize = w;
+  if (x < out.len) { out[x] = CR; x = x + 1; }
+  if (x < out.len) { out[x] = LF; x = x + 1; }
+  return x;
+}
+
+fn put_port(out : []u8, w : usize, port : u16) -> usize {
+  var x : usize = w;
+  var d : usize = 10000;
+  var started : bool = false;
+  while (d > 0) {
+    const digit : u16 = (port / d as u16) % 10;
+    if (digit > 0 or started or d == 1) {
+      started = true;
+      if (x < out.len) { out[x] = (48 + digit) as u8; x = x + 1; }
+    }
+    d = d / 10;
+  }
+  return x;
+}
+
+fn put_num(out : []u8, w : usize, n : usize) -> usize {
+  return put_port(out, w, n as u16);
+}
+
+fn put_span(out : []u8, w : usize, src : []u8, a : usize, b : usize) -> usize {
+  var x : usize = w;
+  var i : usize = a;
+  while (i < b and x < out.len) { out[x] = src[i]; x = x + 1; i = i + 1; }
+  return x;
+}
+
+fn span_is(s : []u8, a : usize, b : usize, lit : string) -> bool {
+  if (b - a != lit.len) { return false; }
+  var i : usize = 0;
+  while (i < lit.len) {
+    if (s[a + i] != lit[i]) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// ---- tests ----------------------------------------------------------------------------------
+
+test sockaddr_in_is_len16_inet_port_be_loopback {
+  var b : [16]u8;
+  const sa : []u8 = b[0..16];
+  const n : usize = sock_in(9115, sa);
+  assert n == 16;
+  assert sa[0] == 16;
+  assert sa[1] == 2;
+  assert sa[2] == 35; // 9115 = 0x239B
+  assert sa[3] == 155;
+  assert sa[4] == 127;
+  assert sa[5] == 0;
+  assert sa[6] == 0;
+  assert sa[7] == 1;
+  assert sa[8] == 0;
+  assert sa[15] == 0;
+}
+
+test the_version_request_names_the_path_host_and_close {
+  var b : [128]u8;
+  const req : []u8 = b[0..128];
+  const n : usize = version_request(9115, req);
+  assert n == 71; // 26 + 2 + 16 + 4 + 2 + 17 + 2 + 2
+  assert req[0] == 71; // 'G'
+  assert req[4] == 47; // '/'
+  assert req[5] == 106; // 'j' of json
+  assert req[n - 4] == 13;
+  assert req[n - 2] == 13;
+  assert req[n - 3] == 10;
+  assert req[n - 1] == 10;
+}
+
+test status_ok_reads_the_status_line_from_a_buffer {
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  const yes : string = "HTTP/1.1 200 OK\r\nx: y\r\n\r\n";
+  var i : usize = 0;
+  while (i < yes.len) { r[i] = yes[i] as u8; i = i + 1; }
+  assert status_ok(r[0..yes.len]) == true;
+  const no : string = "HTTP/1.1 404 Not Found\r\n\r\n";
+  i = 0;
+  while (i < no.len) { r[i] = no[i] as u8; i = i + 1; }
+  assert status_ok(r[0..no.len]) == false;
+  assert status_ok(r[0..4]) == false;
+}
+
+test find_json_string_spans_the_websocket_url {
+  const resp : string = "{\"Browser\":\"Chrome\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9115/devtools/x\"}";
+  var b : [96]u8;
+  const r : []u8 = b[0..96];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var v : [2]usize;
+  const sv : []usize = v[0..2];
+  assert find_json_string(r[0..resp.len], "webSocketDebuggerUrl", sv) == 1;
+  assert r[sv[0]] == 119; // 'w'
+  assert r[sv[1] - 1] == 120; // 'x'
+  assert find_json_string(r[0..resp.len], "noSuchField", sv) == 0;
+}
+
+test a_pretty_printed_field_with_a_space_after_the_colon_is_found {
+  const resp : string = "{\n   \"webSocketDebuggerUrl\": \"ws://127.0.0.1:9115/devtools/browser/x\"\n}";
+  var b : [96]u8;
+  const r : []u8 = b[0..96];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var v : [2]usize;
+  const sv : []usize = v[0..2];
+  assert find_json_string(r[0..resp.len], "webSocketDebuggerUrl", sv) == 1;
+  assert r[sv[0]] == 119;
+  assert r[sv[1] - 1] == 120;
+}
+
+test a_close_framed_response_ends_on_content_length_not_eof {
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  const line : string = "HTTP/1.1 200 OK";
+  var i : usize = 0;
+  while (i < line.len) { r[i] = line[i] as u8; i = i + 1; }
+  r[15] = 13; r[16] = 10;
+  const cl : string = "Content-Length: 2";
+  i = 0;
+  while (i < cl.len) { r[17 + i] = cl[i] as u8; i = i + 1; }
+  r[34] = 13; r[35] = 10; r[36] = 13; r[37] = 10;
+  r[38] = 123; r[39] = 125; // the two body bytes
+  const head : usize = 40;
+  assert header_end(r, 10) == 0; // headers not finished yet
+  assert header_end(r[0..head], head) == 34; // CRLF CRLF at 34..37
+  assert content_length(r[0..head], 34) == 2;
+  assert response_complete(r[0..head], head) == true; // 34 + 4 + 2 = 40 = whole
+  assert response_complete(r[0..39], 39) == false; // body short by one byte
+}
+
+test a_response_without_content_length_stays_incomplete {
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  const line : string = "HTTP/1.1 200 OK";
+  var i : usize = 0;
+  while (i < line.len) { r[i] = line[i] as u8; i = i + 1; }
+  r[15] = 13; r[16] = 10; r[17] = 13; r[18] = 10;
+  const head : usize = 19;
+  assert header_end(r[0..head], head) == 15;
+  assert content_length(r[0..head], 15) == 0;
+  assert response_complete(r[0..head], head) == true; // nothing to wait for
+}
+
+invariant the_exchange_is_read_only_socket_io {
+  assert AF_INET == 2 and SOCK_STREAM == 1;
+}

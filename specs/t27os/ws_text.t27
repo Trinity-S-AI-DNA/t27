@@ -1,0 +1,481 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27 OS ws text -- the exact-JSON-string decoder for the CDP page reader (slice: Unicode without
+; loss). Pulls the quoted value of one JSON field out of a bounded response and decodes it to
+; UTF-8 bytes, with an explicit refusal for every input it does not fully understand:
+;   - the usual escapes: \" \\ \/ \b \f \n \r \t;
+;   - \uXXXX for BMP characters (Cyrillic included);
+;   - a surrogate pair \uD800..\uDBFF followed by \uDC00..\uDFFF, encoded as one 4-byte UTF-8 run;
+;   - refusals: truncated or non-hex escape, a lone surrogate, an over-cap result.
+; No silent loss: the \u041a-must-not-become-u041a rule is a named test. The input byte cap and
+; the decoded output cap are separate limits with separate refusal codes.
+; RECOVERY NOTE (2026-11-01, 21:15): this file was found truncated to zero bytes twice in one day
+; (the second truncation happened while the decode_json_string rename was being written; no other
+; file in the slice was touched). Both truncations are logged; the file below is the full
+; restoration, re-verified by its own suite and by the cdp_browser_ws suite that imports it.
+; Pure functions only; the socket and the frames live in cdp_browser_ws.t27 and ws_frame.t27.
+
+module T27osWsText;
+
+/// Refusal codes written to err[0] when a decode returns 0.
+pub const E_NONE : u8 = 0;
+pub const E_BAD_ESCAPE : u8 = 1; // a backslash followed by something undefined
+pub const E_TRUNCATED : u8 = 2; // the input ends inside an escape, or a non-hex \u digit
+pub const E_LONE_SURROGATE : u8 = 3; // a high half not followed by a low half (or vice versa)
+pub const E_OUT_CAP : u8 = 4; // the decoded result would not fit out
+pub const E_IN_CAP : u8 = 5; // the input is over the byte cap
+pub const E_NO_FIELD : u8 = 6; // the named quoted field is absent
+
+/// The input byte cap: a response larger than this is refused, never partially scanned.
+pub const IN_CAP : usize = 16384;
+
+// ---- UTF-8 and hex helpers ------------------------------------------------------------------
+
+/// One Unicode code point encoded as UTF-8 into out at w. Returns the new w, or w unchanged when
+/// the code point is invalid or out has no room for the full run (checked before writing).
+pub fn utf8_put(cp : u32, out : []u8, w : usize) -> usize {
+  var need : usize = 1;
+  if (cp >= 0x80 and cp < 0x800) { need = 2; }
+  if (cp >= 0x800 and cp < 0x10000) { need = 3; }
+  if (cp >= 0x10000 and cp <= 0x10FFFF) { need = 4; }
+  if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) { return w; }
+  if (w + need > out.len) { return w; }
+  if (need == 1) {
+    out[w] = cp as u8;
+    return w + 1;
+  }
+  if (need == 2) {
+    out[w] = (0xC0 + cp / 64) as u8;
+    out[w + 1] = (0x80 + cp % 64) as u8;
+    return w + 2;
+  }
+  if (need == 3) {
+    out[w] = (0xE0 + cp / 4096) as u8;
+    out[w + 1] = (0x80 + (cp / 64) % 64) as u8;
+    out[w + 2] = (0x80 + cp % 64) as u8;
+    return w + 3;
+  }
+  out[w] = (0xF0 + cp / 262144) as u8;
+  out[w + 1] = (0x80 + (cp / 4096) % 64) as u8;
+  out[w + 2] = (0x80 + (cp / 64) % 64) as u8;
+  out[w + 3] = (0x80 + cp % 64) as u8;
+  return w + 4;
+}
+
+/// One hex digit to its value, or 255.
+pub fn hex_val(c : u8) -> u8 {
+  if (c >= 48 and c <= 57) { return c - 48; }
+  if (c >= 97 and c <= 102) { return c - 87; } // a..f
+  if (c >= 65 and c <= 70) { return c - 55; } // A..F
+  return 255;
+}
+
+/// Four hex digits at buf[at] as a u16, or 0xFFFF when any digit is not hex or the input ends.
+pub fn hex4(buf : []u8, at : usize, got : usize) -> u16 {
+  if (at + 4 > got) { return 0xFFFF; }
+  var v : u16 = 0;
+  var k : usize = 0;
+  while (k < 4) {
+    const d : u8 = hex_val(buf[at + k]);
+    if (d == 255) { return 0xFFFF; }
+    v = (v << 4) + d as u16;
+    k = k + 1;
+  }
+  return v;
+}
+
+/// Count the UTF-8 characters of a decoded run: bytes 0..127 and 192..255 start a character,
+/// continuation bytes (128..191) do not. The truncated flag of the reader compares this count
+/// with the page's own character cap.
+pub fn utf8_chars(buf : []u8, n : usize) -> usize {
+  var c : usize = 0;
+  var i : usize = 0;
+  while (i < n) {
+    if (buf[i] < 128 or buf[i] >= 192) { c = c + 1; }
+    i = i + 1;
+  }
+  return c;
+}
+
+// ---- field decode ---------------------------------------------------------------------------
+
+/// Decode the quoted JSON string that names `field`, UTF-8 into out, refusal code into err[0].
+/// Returns the decoded byte count, or 0 with err[0] set on any refusal. The input byte cap
+/// applies: a response over IN_CAP is refused whole, never partially scanned.
+pub fn decode_value(buf : []u8, got : usize, field : string, out : []u8, err : []u8) -> usize {
+  err[0] = E_NONE;
+  if (got > IN_CAP) { err[0] = E_IN_CAP; return 0; }
+  const nl : usize = field.len;
+  var i : usize = 0;
+  var start : usize = 0;
+  var found : bool = false;
+  while (i + nl + 2 <= got) {
+    if (buf[i] == 34) {
+      var ok : bool = true;
+      var k : usize = 0;
+      while (k < nl) {
+        if (buf[i + 1 + k] != (field[k]) as u8) { ok = false; }
+        k = k + 1;
+      }
+      if (ok) {
+        var j : usize = i + 1 + nl;
+        if (j < got and buf[j] == 34) { j = j + 1; } else { ok = false; } // the name's closing quote
+        if (ok and j < got and buf[j] == 58) { // ':'
+          j = j + 1;
+          while (j < got and buf[j] == 32) { j = j + 1; }
+          if (j < got and buf[j] == 34) {
+            start = j + 1;
+            found = true;
+          }
+        }
+      }
+    }
+    if (found) { break; }
+    i = i + 1;
+  }
+  if (found == false) { err[0] = E_NO_FIELD; return 0; }
+  return decode_json_string(buf, start - 1, got, out, err); // pass the opening quote: the decoder skips it
+}
+
+/// Decode an escaped JSON string that opens at buf[j] (a quote) into UTF-8 out, with the same
+/// refusal law as decode_value: the usual escapes, \uXXXX, paired surrogates, and named refusals
+/// for truncated input, a lone surrogate, an over-cap result. The raw text passes through as
+/// UTF-8 bytes; \u escapes never reach the output as literal text. Returns the byte count, or 0
+/// with err[0] set.
+pub fn decode_json_string(buf : []u8, j : usize, got : usize, out : []u8, err : []u8) -> usize {
+  err[0] = E_NONE;
+  if (j >= got or buf[j] != 34) { err[0] = E_BAD_ESCAPE; return 0; }
+  var k : usize = j + 1;
+  var w : usize = 0;
+  while (k < got) {
+    const ch : u8 = buf[k];
+    if (ch == 34) { return w; } // the closing quote
+    if (ch != 92) { // raw UTF-8 bytes pass through one to one
+      if (w + 1 > out.len) { err[0] = E_OUT_CAP; return 0; }
+      out[w] = ch;
+      w = w + 1;
+      k = k + 1;
+      continue;
+    }
+    if (k + 1 >= got) { err[0] = E_TRUNCATED; return 0; }
+    const esc : u8 = buf[k + 1];
+    if (esc == 117) { // u
+      const hi : u16 = hex4(buf, k + 2, got);
+      if (hi == 0xFFFF) { err[0] = E_TRUNCATED; return 0; }
+      var cp : u32 = hi as u32;
+      var step : usize = 6;
+      if (hi >= 0xD800 and hi <= 0xDBFF) { // a high surrogate pairs with the next \uXXXX
+        if (k + 6 >= got or buf[k + 6] != 92 or buf[k + 7] != 117) { err[0] = E_LONE_SURROGATE; return 0; }
+        const lo : u16 = hex4(buf, k + 8, got);
+        if (lo == 0xFFFF) { err[0] = E_TRUNCATED; return 0; }
+        if (lo < 0xDC00 or lo > 0xDFFF) { err[0] = E_LONE_SURROGATE; return 0; }
+        cp = 0x10000 + ((hi as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00);
+        step = 12;
+      } else {
+        if (hi >= 0xDC00 and hi <= 0xDFFF) { err[0] = E_LONE_SURROGATE; return 0; }
+      }
+      const nw : usize = utf8_put(cp, out, w);
+      if (nw == w) { err[0] = E_OUT_CAP; return 0; }
+      w = nw;
+      k = k + step;
+      continue;
+    }
+    if (esc == 110) { if (w + 1 > out.len) { err[0] = E_OUT_CAP; return 0; } out[w] = 10; w = w + 1; k = k + 2; continue; }
+    if (esc == 114) { if (w + 1 > out.len) { err[0] = E_OUT_CAP; return 0; } out[w] = 13; w = w + 1; k = k + 2; continue; }
+    if (esc == 116) { if (w + 1 > out.len) { err[0] = E_OUT_CAP; return 0; } out[w] = 9; w = w + 1; k = k + 2; continue; }
+    if (esc == 98) { if (w + 1 > out.len) { err[0] = E_OUT_CAP; return 0; } out[w] = 8; w = w + 1; k = k + 2; continue; }
+    if (esc == 102) { if (w + 1 > out.len) { err[0] = E_OUT_CAP; return 0; } out[w] = 12; w = w + 1; k = k + 2; continue; }
+    if (esc == 34 or esc == 92 or esc == 47) { if (w + 1 > out.len) { err[0] = E_OUT_CAP; return 0; } out[w] = esc; w = w + 1; k = k + 2; continue; }
+    err[0] = E_BAD_ESCAPE;
+    return 0;
+  }
+  err[0] = E_TRUNCATED;
+  return 0;
+}
+
+// ---- tests ----------------------------------------------------------------------------------
+
+test cyrillic_escapes_decode_to_exact_utf8 {
+  // {"id":2,"result":{"value":"КАРТА"}} with the Cyrillic written as \u escapes
+  const resp : string = "{\"id\":2,\"result\":{\"value\":\"\\u041a\\u0410\\u0420\\u0422\\u0410\"}}";
+  var b : [96]u8;
+  const r : []u8 = b[0..96];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [64]u8;
+  const out : []u8 = o[0..64];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  const n : usize = decode_value(r[0..resp.len], resp.len, "value", out, ee);
+  assert n == 10; // five Cyrillic letters, two UTF-8 bytes each
+  // КАРТА = D0 9A D0 90 D0 A0 D0 A2 D0 90
+  assert out[0] == 0xD0;
+  assert out[1] == 0x9A;
+  assert out[2] == 0xD0;
+  assert out[3] == 0x90;
+  assert out[4] == 0xD0;
+  assert out[5] == 0xA0;
+  assert out[6] == 0xD0;
+  assert out[7] == 0xA2;
+  assert out[8] == 0xD0;
+  assert out[9] == 0x90;
+  assert ee[0] == E_NONE;
+}
+
+test u041a_never_becomes_the_literal_text_u041a {
+  const resp : string = "{\"value\":\"\\u041a\"}";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  const n : usize = decode_value(r[0..resp.len], resp.len, "value", out, ee);
+  assert n == 2; // not the six bytes of literal "u041a"
+  assert out[0] == 0xD0 and out[1] == 0x9A;
+  assert ee[0] == E_NONE;
+}
+
+test a_surrogate_pair_becomes_one_four_byte_utf8_run {
+  // 𝄞 U+1D11E as \uD834\uDD1E
+  const resp : string = "{\"value\":\"\\ud834\\udd1e\"}";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  const n : usize = decode_value(r[0..resp.len], resp.len, "value", out, ee);
+  assert n == 4; // F0 9D 84 9E
+  assert out[0] == 0xF0;
+  assert out[1] == 0x9D;
+  assert out[2] == 0x84;
+  assert out[3] == 0x9E;
+}
+
+test a_lone_high_surrogate_is_a_named_refusal {
+  const resp : string = "{\"value\":\"\\ud834x\"}";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  assert decode_value(r[0..resp.len], resp.len, "value", out, ee) == 0;
+  assert ee[0] == E_LONE_SURROGATE;
+}
+
+test a_bad_hex_digit_is_a_named_refusal {
+  const resp : string = "{\"value\":\"\\u04g1\"}";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  assert decode_value(r[0..resp.len], resp.len, "value", out, ee) == 0;
+  assert ee[0] == E_TRUNCATED;
+}
+
+test an_unknown_escape_is_a_named_refusal {
+  const resp : string = "{\"value\":\"\\q\"}";
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  assert decode_value(r[0..resp.len], resp.len, "value", out, ee) == 0;
+  assert ee[0] == E_BAD_ESCAPE;
+}
+
+test an_input_over_the_byte_cap_is_refused_whole {
+  var big : [20000]u8;
+  var i : usize = 0;
+  while (i < 20000) { big[i] = 65; i = i + 1; } // 'A' repeated
+  var o : [64]u8;
+  const out : []u8 = o[0..64];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  assert decode_value(big[0..20000], 20000, "value", out, ee) == 0;
+  assert ee[0] == E_IN_CAP;
+}
+
+test a_decoded_run_over_the_output_cap_is_refused_not_cut {
+  // four ASCII bytes decode to four bytes; out of three refuses
+  const resp : string = "{\"value\":\"abcd\"}";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [3]u8;
+  const out : []u8 = o[0..3];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  assert decode_value(r[0..resp.len], resp.len, "value", out, ee) == 0;
+  assert ee[0] == E_OUT_CAP;
+}
+
+test an_unterminated_value_is_a_named_refusal {
+  const resp : string = "{\"value\":\"abc";
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  assert decode_value(r[0..resp.len], resp.len, "value", out, ee) == 0;
+  assert ee[0] == E_TRUNCATED;
+}
+
+test ordinary_escapes_and_plain_text_pass_through {
+  // the response bytes: {"value":"a\nb\tc\/d\\e"} built numerically (t27b rewrites
+  // escape sequences inside string literals, so the fixtures carry them as raw bytes)
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var w : usize = 0;
+  const pre : string = "{\"value\":\"a";
+  var i : usize = 0;
+  while (i < pre.len) { r[w] = pre[i] as u8; w = w + 1; i = i + 1; }
+  r[w] = 92; w = w + 1; r[w] = 110; w = w + 1; // the LF escape
+  r[w] = 98; w = w + 1; // b
+  r[w] = 92; w = w + 1; r[w] = 116; w = w + 1; // the TAB escape
+  r[w] = 99; w = w + 1; // c
+  r[w] = 92; w = w + 1; r[w] = 47; w = w + 1; // the slash escape
+  r[w] = 100; w = w + 1; // d
+  r[w] = 92; w = w + 1; r[w] = 92; w = w + 1; // the backslash escape
+  r[w] = 101; w = w + 1; // e
+  r[w] = 34; w = w + 1; // the closing quote
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  const n : usize = decode_value(r[0..w], w, "value", out, ee);
+  assert n == 9; // a LF b TAB c / d backslash e
+  assert out[1] == 10;
+  assert out[3] == 9;
+  assert out[5] == 47; // /
+  assert out[7] == 92; // backslash
+  assert out[8] == 101; // e
+}
+
+test a_missing_field_is_a_named_refusal {
+  const resp : string = "{\"other\":1}";
+  var b : [32]u8;
+  const r : []u8 = b[0..32];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  assert decode_value(r[0..resp.len], resp.len, "value", out, ee) == 0;
+  assert ee[0] == E_NO_FIELD;
+}
+
+test utf8_chars_counts_two_byte_letters_as_one {
+  var b : [8]u8;
+  const r : []u8 = b[0..8];
+  // КАРТ: D0 9A D0 90 D0 A0 D0 A2 = 8 bytes, 4 characters
+  r[0] = 0xD0; r[1] = 0x9A; r[2] = 0xD0; r[3] = 0x90;
+  r[4] = 0xD0; r[5] = 0xA0; r[6] = 0xD0; r[7] = 0xA2;
+  assert utf8_chars(r, 8) == 4;
+  var a : [4]u8;
+  const aa : []u8 = a[0..4];
+  aa[0] = 65; aa[1] = 10; aa[2] = 66; aa[3] = 92;
+  assert utf8_chars(aa, 4) == 4; // ASCII and controls are one character each
+}
+
+test repeated_calls_carry_no_state_between_runs {
+  // the same buffers, two different fields in sequence: the second call must not see the first
+  const resp : string = "{\"first\":\"AAA\",\"value\":\"\\u0411\"}";
+  var b : [64]u8;
+  const r : []u8 = b[0..64];
+  var i : usize = 0;
+  while (i < resp.len) { r[i] = resp[i] as u8; i = i + 1; }
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  const n1 : usize = decode_value(r[0..resp.len], resp.len, "first", out, ee);
+  assert n1 == 3;
+  assert out[0] == 65 and out[1] == 65 and out[2] == 65;
+  const n2 : usize = decode_value(r[0..resp.len], resp.len, "value", out, ee);
+  assert n2 == 2; // the Cyrillic Б, freshly decoded over the old bytes
+  assert out[0] == 0xD0 and out[1] == 0x91;
+  assert out[2] == 65; // the stale byte from call one sits BEHIND the new length, not inside it
+  assert ee[0] == E_NONE;
+}
+
+test quoted_escapes_decode_cyrillic {
+  var b : [48]u8;
+  const r : []u8 = b[0..48];
+  r[0] = 34;
+  const e : [30]u8 = [92, 117, 48, 52, 49, 97, 92, 117, 48, 52, 49, 48, 92, 117, 48, 52, 50, 48, 92, 117, 48, 52, 50, 50, 92, 117, 48, 52, 49, 48];
+  var i : usize = 0;
+  while (i < 30) { r[1 + i] = e[i]; i = i + 1; }
+  r[31] = 34;
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var er : [1]u8;
+  const err : []u8 = er[0..1];
+  const n : usize = decode_json_string(r, 0, 32, out, err);
+  assert n == 10;
+  assert out[0] == 0xD0 and out[1] == 0x9A;
+  assert out[9] == 0x90;
+  assert err[0] == E_NONE;
+}
+
+test quoted_escapes_decode_a_surrogate_pair {
+  var b : [24]u8;
+  const r : []u8 = b[0..24];
+  r[0] = 34;
+  const e : [12]u8 = [92, 117, 100, 56, 51, 52, 92, 117, 100, 100, 49, 101];
+  var i : usize = 0;
+  while (i < 12) { r[1 + i] = e[i]; i = i + 1; }
+  r[13] = 34;
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var er : [1]u8;
+  const err : []u8 = er[0..1];
+  const n : usize = decode_json_string(r, 0, 14, out, err);
+  assert n == 4;
+  assert out[0] == 0xF0 and out[1] == 0x9D and out[2] == 0x84 and out[3] == 0x9E;
+}
+
+test quoted_escapes_refuse_a_lone_surrogate_by_name {
+  var b : [16]u8;
+  const r : []u8 = b[0..16];
+  r[0] = 34;
+  const e : [6]u8 = [92, 117, 100, 56, 51, 52]; // \ud834 alone
+  var i : usize = 0;
+  while (i < 6) { r[1 + i] = e[i]; i = i + 1; }
+  r[7] = 34;
+  var o : [16]u8;
+  const out : []u8 = o[0..16];
+  var er : [1]u8;
+  const err : []u8 = er[0..1];
+  assert decode_json_string(r, 0, 8, out, err) == 0;
+  assert err[0] == E_LONE_SURROGATE;
+}
+
+invariant a_refusal_never_returns_bytes {
+  var e : [1]u8;
+  const ee : []u8 = e[0..1];
+  var r : [16]u8;
+  const rr : []u8 = r[0..16];
+  var i : usize = 0;
+  while (i < 16) { rr[i] = 34; i = i + 1; } // quotes everywhere: no field found
+  assert decode_value(rr, 16, "v", rr, ee) == 0;
+}
