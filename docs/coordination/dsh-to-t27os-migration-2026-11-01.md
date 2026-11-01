@@ -112,7 +112,10 @@ set is a TriGit virtual branch (refs and diffs) that is reclaimed when the turn 
 or abandoned. Not filed as an issue yet (economy); it belongs to the TriGit change-set work.
 The trees grow while DSH runs: three were rewritten at 22:57, and free space fell from 1.2 GiB
 at 22:53 to 116 MB at 22:58. Each tree holds `captures` and `objects` folders, and the writer
-keeps no file open between writes, so `lsof` cannot name it.
+keeps no file open between writes, so `lsof` cannot name it. Not established: whether a
+restarted DSH Web writes new trees, and which action triggers one. Reproduction, when the
+owner restarts it for its own reasons: count `dsh-workspace-changes-*` in the temp folder, run
+one chat turn, count again. The headless route of section 8 does not need DSH Web.
 
 ## 4. Prioritised migration backlog, with executors
 
@@ -176,6 +179,12 @@ DSH as the delegation target, probed on this Mac (installed `@deepseek-ai/dsh` 0
 
 So the economical route today is the one taken: issues for DSH threads, one pane for A1.
 
+The DSH result that counts (owner, 2026-11-01 about 23:35) is one exchange over the route
+T27 OS -> installed DSH headless -> model -> reply, answered with the marker `DSH_T27OS_OK`. It
+needs neither DSH Web nor the `acp` profile; the only known blocker is the credentials schema
+above. State at 23:47: `DSH_T27OS_OK` not received; the route is owned by the DSH lane
+(section 8), not by this session.
+
 ## 6. Own diff, integration SHA, checks
 
 Files in this change (all prose or tool-written data; no code in any language):
@@ -198,20 +207,134 @@ Checks that actually ran for this package, and on what:
 |---|---|---|
 | issue-shape gate on #13069 .. #13074 | GitHub workflow `needs-boundary.yml` | read back with `gh issue view --json state,labels` after filing; see the commit message footer for the states at commit time |
 | home paths in the package | `grep -c` for the absolute home prefix on the three data files | 0, 0, 0 |
-| `t27c check` + `t27c test-report` on `chat_log.t27` | shell cell 12 on this Mac (single spec, output to a file), because the hook refuses `t27c` inside the Claude Code pane | `t27c check` rc 1 twice: parse error 4:1 (a line holding only `;`), then, on a copy with those lines filled, 141:10 (`let`; the draft has 70 such lines in a Rust-like dialect); `t27c test-report`: pending / blocked by disk (about 1.1 GiB free, the gate wants 4) and by the pane hook, whose remedy names a lab script that no longer exists; attempts 2 |
-| disk use, read-only | `df`, `du`, `lsof` in the owner's terminal | 34 GiB in ten DSH snapshot trees (section 3), Docker data 31 GiB, Claude app data 25 GiB; free space 0, then 1.0, then 1.2 GiB after the owner's cache cleaner ran, then 116 MB at 22:58 while DSH rewrote three trees; nothing removed by this session |
+| `t27c check` + `t27c test-report` on `chat_log.t27` | shell cell 12 on this Mac (single spec, output to a file), because the hook refuses `t27c` inside the Claude Code pane | `t27c check` rc 1 twice: parse error 4:1 (a line holding only `;`), then, on a copy with those lines filled, 141:10 (`let`; the draft has 70 such lines in a Rust-like dialect); `t27c test-report`: pending / blocked by disk (about 1.1 GiB free, the gate wants 4) and by the pane hook, whose remedy names a lab script that no longer exists; attempts 2. Round 3 (sent 23:08, same pane and model) changed nothing: the pane hit ENOSPC on its writes and reported "done" anyway; measured at 23:33 the draft is still 696 lines, mtime 22:34, 16 tests, 90 lines matching `let `, 3 lines holding only `;`. A1 is parked; the next attempt changes approach (exact-signature brief, another model), as the `next_step.t27` brief in section 7 does |
+| disk use, read-only | `df`, `du`, `lsof` in the owner's terminal | 34 GiB in ten DSH snapshot trees (section 3), Docker data 31 GiB, Claude app data 25 GiB; free space 0, then 1.0, then 1.2 GiB after the owner's cache cleaner ran, then 116 MB at 22:58 while DSH rewrote three trees; nothing removed by this session. At about 23:25 the owner stopped DSH Web (`launchctl bootout` of `ai.t27.dsh-web`) and removed the trees; at 23:33 `df -g` shows 27 GiB free and the 1-minute load is 6.9 |
+| `t27c check` + `t27c test-report` on `next_step.t27`, attempt 1 | shell cell 12 on this Mac, single spec, output to a file; 1-minute load 5.12, 27 GiB free at 23:39 | written by pane 15 (Claude Code on glm-4.7-flash, free tier) to the wide brief: 457 lines, 17 tests. `t27c check` rc 0 (typecheck OK). `t27c test-report` rc 1: 15 pass, 2 FAIL (`dominance`, `front_and_pick`), vacuous 0. Cause, from reading the diff: `dominates` tests `axis_no_worse(axis, b, a) == false` inside its loop, so it never returns true. Not committed; attempt 2 (narrowed brief, same pane, deadline 00:05) rewrites it to the first slice of section 7 |
+| `t27c check` + `t27c test-report` on `next_step.t27`, attempts 2 and 3, then this session's review | shell cell 12 on this Mac, single spec, each run to its own file under `target/next_step/` (gitignored) | attempt 2 (pane 15, narrowed brief, deadline 00:05) delivered no passing file; its writer was stopped before attempt 3 was briefed at 00:17. Attempt 3 (pane 14, Claude Code on glm-4.7-flash, deadline 00:39:30) passed its deadline with no report; one Escape at 00:40:06 stopped it (its transcript ends "Request interrupted by user"; by 00:40:51 the transcript and the file mtime had not changed). This session then checked the file itself. Revision `5345ab80`: `t27c check` rc 0, but `t27c test-report` BLOCKED rc 2 (leftover tests named deleted symbols such as `status_valid`; typecheck does not see test bodies). After deleting them, revision `a60f05d6`: check rc 0; tests 9, pass 8, FAIL 1 (`unread_report_does_not_change_pick` fed constant reasons, not computed ones). After that fix, revision `cba4384cd8f1ddf4` (200 lines): `t27c check` rc 0; `t27c test-report` rc 0, tests 9, pass 9, FAIL 0, invariants 1, vacuous 0 of 9. Negative control: with the `reason[i] == NS_OK` filter removed from `pick`, 4 tests FAIL (rc 1); file restored, hash re-checked. Not measured: any runtime; `pick` loops to `n`, not `min(n, 4)` (efficiency only) |
 | any compiler sweep, seal re-save, build | none | not run (owner rule); seal and MCP columns are earlier ledgers |
 
 Not verified in this round: the trinity and t27os clone SHAs; whether the 2543 sealed files
 still pass on today's `t27c`; every "medium" row of the DSH table (prose only, not source).
 
+## 7. Event-driven loop: the order mapped onto the Queen's specs
+
+Owner order 2026-11-01, evening (translated): change the execution model, not the polling rate.
+A finished agent records its result, the next useful permitted task is picked, and work goes on;
+the owner reading a report is never a condition for continuing. Align the proposed event types
+with the existing schema, do not create a second journal, do not build a new conductor next to
+the old one, and do not launch an uncontrolled background conductor: first a test replay, then
+isolated execution, then a confirmed enablement for one chosen program.
+
+The loop is already specified, as a contract with tests, in `specs/queen/control.t27`
+(QueenControl, #6657): ten event kinds wake the Queen, and the 300-second tick only repairs a
+lost event. Its own header says the rules are "not a measured runtime behaviour"; its runtime
+is the trios supervisor (Railway, leaving for the T27 OS kernel actors, #11377), and nothing in
+T27 OS executes it today. So the work is to fill the gaps, not to write a second driver.
+
+| Owner's type | Existing mechanism | Gap |
+|---|---|---|
+| `task.completed` | `EV_TASK_ENDED` -> `R_REVIEW` (control.t27) | none |
+| `result.returned` | `EV_EVIDENCE` -> `R_REVIEW` | none |
+| `result.accepted` | `EV_REVIEW` with verdict ACCEPT (dispatch.t27) | none |
+| `verification.failed` | `EV_REVIEW` with SENDBACK; two counted send-backs escalate (dispatch.t27 `RETRY_RULE`, review_valve.t27 `KIND_SEND_BACK_CEILING` 2) | escalation waits for a person; no change of approach |
+| `dependency.resolved` | `priority.t27` `eligible(open_blockers)`, read at every wake | no blocker -> dependent link; the 300 s tick catches it late |
+| `resource.available` | `EV_WORKER_IDLE`; `capacity()` recomputed at every wake | free disk and load are host GAPs (named in `general_conductor_tick.t27`) |
+| `approval.granted` / `approval.denied` | none: `EV_ASSIGN` / `EV_CANCEL` are not approvals (7.2) | missing; an extension is proposed for review (7.2) |
+| `session.disconnected` | `EV_LEASE_EXPIRED` -> `R_RECLAIM`; actor DOWN (`actor_events.t27`) | none |
+| `budget.exhausted` | none; the conductor caps only ticks per hour | missing |
+
+### 7.1 Reliability, as it stands
+
+The contract describes deduplication, fences, replay and the effects journal; runtime behaviour
+is not yet measured. What the specs say, read on 2026-11-01, and what nothing has tested:
+
+- Repeat or older event: `control.t27` `event_applies(last, seq)` is `seq > last`, so a repeat
+  or an older event changes nothing. The same rule applies an event that follows a gap (last 5,
+  seq 7), while `events.t27` `delta_action(5, 7)` answers RESYNC for that input: the two homes
+  disagree on a skipped event. No test feeds either one a reordered sequence; under
+  `event_applies`, 7 then 6 applies 7 and drops 6 for good. Untested: skipped and reordered
+  events, as opposed to redelivery.
+- External effect after a crash: section 7 of `control.t27` journals an intent before the request
+  and a done after it. A restarted holder that finds an intent without a done looks a push, PR or
+  comment up before acting (`effect_action` gives DO_LOOK) and runs a model call again (DO_RUN).
+  `effect_may_repeat` itself says a comment may repeat behind a partition. So this document does
+  not claim that a repeat publication is excluded. The case "external service accepted -> process
+  crashed before the local done -> handler restarted" is a contract test
+  (`a_restarted_holder_skips_what_landed_and_looks_up_what_may_have`), never a run.
+- Late attempt: the fence (`write_lands`) stops the old holder's journal writes, not its requests,
+  because GitHub never sees the fence.
+
+Gaps: (1) the five statuses (completed, verified, accepted, notified, read) are not separate, so
+nothing says that reading never blocks; (2) no parked-on-approval state; (3) the pick is
+lexicographic (`priority.t27`), the only Pareto front is 2-D over a fixed 7-row ledger
+(`specs/t27f/live_actors_loop.t27`); (4) repeated failure only escalates; (5) no budget check.
+The first slice closes (5) and the parked-for-approval refusal of (2), and tests the
+read-never-blocks part of (1); the rest of (1), (3) and (4) are proposed for later slices.
+
+First slice (narrowed by the owner, 2026-11-01 about 23:35): one pure module
+`specs/queen/next_step.t27` (QueenNextStep) that imports only `priority.t27` (`eligible`,
+`outranks`), changes no other spec and adds no event kind (`EVENT_KINDS` stays 10, which the
+supervisor checks at start). It holds (1) the availability filter, which names the first refusal
+reason (permission, parked for approval, open blockers, slots, budget, isolation); (2) the pick
+among admissible candidates by the Queen's own order; and three tests: A waits for approval while
+an independent B runs; an unread report does not block the next step; an exhausted budget refuses
+new execution, with every attempt spending from one shared budget. Not in the first slice: the
+seven-axis Pareto front, all five lifecycle statuses, event handling, and a change of approach
+after send-backs ("two failures -> three alternatives" is a proposed setting, not a requirement).
+Attempt 1 wrote all of those and failed its gate (section 6). The polling conductor
+(`general_conductor_tick.t27`, `ENABLED` false) stays off, and no background automation runs.
+
+### 7.2 Approval is not assign and cancel
+
+Mapping `approval.granted` to `EV_ASSIGN` and `approval.denied` to `EV_CANCEL` keeps the enum and
+loses what an approval is. Checked against `control.t27`:
+
+| Property an approval must keep | With `EV_ASSIGN` / `EV_CANCEL` |
+|---|---|
+| identity of the approval request | lost: the event names a task and an agent, no request |
+| the exact action and its scope | lost: assign means "run this task", not "push this ref" |
+| freshness of the attempt | lost: no attempt fence for the grant, so a grant for one attempt would unpark the next |
+| the approver's authority | asserted, not checked: the header says a person publishes it through the authenticated board; no role is tested |
+| denied operation vs cancelled task | lost: `EV_CANCEL` ends the dispatch (`fence_after_cancel`), so a denied push would cancel the whole task |
+
+So the mapping is not used, and attempt 2 of `next_step.t27` drops it. Proposed minimal compatible
+extension, for review only (not written, `control.t27` unchanged): a module of its own holding an
+approval request (request id, task id, attempt fence, action kind, scope as a hash of the exact
+target, requested by) and a decision (request id, granted or denied, approver id, approver role).
+A decision applies only when its request id names an open request, its fence equals the current
+attempt's fence, its action and scope equal the request's, and the approver's role may grant that
+action kind and is not the requesting agent (the `review_gate.t27` `may_merge(..., approver_is_author)`
+pattern). Denied ends that one operation, and the step returns to stage 1 without it; only
+`EV_CANCEL` ends a task. An expired request stays open and is never read as granted. Carrying it on
+the wire needs either a new event kind or the existing evidence channel; `EVENT_KINDS` is checked
+by the supervisor at start, so a new kind is a supervisor change and the owner's decision.
+
+Section-8 metrics of the order (latency from A done to B start, tool calls that change no state,
+owner interventions per task, cost per verified result, duplicates, accepted without rework,
+regressions): not measured; nothing ran. The only baseline is section 5: 0 real tasks through a
+T27 OS chat on 2026-11-01.
+
+## 8. Lanes and owners
+
+Two lanes, one owner each, so that no two sessions fix the credentials, start DSH Web or edit
+the same files at once (owner, 2026-11-01 about 23:35):
+
+| Lane | Result that closes it | Owner | Files and services it alone may touch |
+|---|---|---|---|
+| DSH in T27 OS (main priority) | the credentials load failure is gone and one headless exchange answers `DSH_T27OS_OK` | the Claude session "DSH" (`local_9f024a6d`, worktree `claude-code-key-rotation-9c2748`); confirmed by its reply at about 23:48; hand-off to the key master is #13079 | `~/.dsh/.credentials.yaml` and its writer, launchd `ai.t27.dsh-zai-rotate` (the key-master part), the installed dsh, any DSH probe |
+| Queen `next_step.t27` (bounded, parallel) | a checked pure module with tests; no background automation started | this session (`local_34d63a71`); executors pane 15 (attempts 1-2) and pane 14 (attempt 3), final two fixes by this session | `specs/queen/next_step.t27`, `target/next_step/`, this document |
+
+This session reads no key, runs no DSH probe and does not start DSH Web. The disk blocker is
+closed (the owner removed the trees at about 23:25); no further cleanup is run.
+
 ## Requests out
+
+Only three kinds stay here: a concrete credentials change once its lane owner has an exact safe
+plan, a protected change or build only when it is proven necessary, and the publication of an
+exact checked package. ACP, priority labels, DSH Web and the `T27OS.app` build (#13074, an issue
+and not a request) are not requested before the first headless answer.
 
 | To | What | Options and cost | Default and when | Meanwhile |
 |---|---|---|---|---|
-| owner | `~/.dsh/.credentials.yaml` schema: the rotation writes nested keys, rc.8 wants flat ref -> string | (a) teach the rotation the flat schema, (b) upgrade dsh to a build that reads `records`, (c) leave headless off | (c) from 2026-11-02 06:03Z | panes carry the lanes; DSH threads pick up #13069 .. #13073 when they boot |
-| owner | install the dsh `acp` profile plugin (`dsh plugin --profile acp add <package>`) or retire the ACP target of `dsh_mcp_bridge.t27` | one command, or one spec header edit | retire-not-yet: #13028 / #13047 stay pending | no bridge host is written |
-| owner | a post-#13016 `T27OS.app` build and launch receipt (#13074): MAC_HEAVY_OK on this Mac, or a lab machine | one `make t27os` plus a 10-minute launch | compiler-level verification only until then | A1 .. B2 land as pure specs |
-| owner | priority labels on #13069 .. #13074 | `P1` on A1 .. A3 would make the Queen pick them first | unlabelled (picked last) | - |
-| owner | push of this package from a fresh branch off `7fb6bc2391` and a PR | one branch, one PR, no code | local commit only | the package is readable in this worktree |
-| owner | 34 GiB of DSH `dsh-workspace-changes-*` trees in the user's temp folder; no process holds them | (a) the owner removes them (command in the chat report), (b) the owner's cache cleaner learns the pattern with an age limit, (c) leave them | (c): this session deletes nothing; due now, the disk refills at about 1 GiB per 5 minutes | the cache cleaner cannot keep up (116 MB free at 22:58); every gate and most commands stay blocked |
+| the DSH lane owner, then the owner | the credentials change that lets dsh rc.8 load `~/.dsh/.credentials.yaml`: an exact plan (which writer, which schema, how the rotation keeps working, how to roll back), handed by the DSH lane to the key master in #13079 (reader schema, writer of `records`, route, rollback, next rotation must not re-nest) | the plan names one change; this table does not choose it | nothing is changed until that plan exists; the DSH lane runs one headless smoke test after the ready signal | the headless route stays blocked; no session edits the file |
+| owner | publication of this package (this document and `docs/coordination/dsh-to-t27os-audit/`) from a fresh branch off `7fb6bc2391`, one PR, no code | one branch, one PR | local commit only | the package is readable in this worktree |
