@@ -6,10 +6,10 @@
 //
 // One line of design: refusal, then class, then one incident, then a bounded recipe, then a control
 // request through the same path, then resolved with proof or escalated with the exact blocker.
-//   1. CLASS (FR-001): a table maps (status, rung) to UNFUNDED, CREDENTIAL, RATE, TRANSIENT, UNWIRED or
-//      UNKNOWN. An unrecognised status is UNKNOWN, never TRANSIENT.
+//   1. CLASS (FR-001, FR-010): a table maps (status, rung) to UNFUNDED, CREDENTIAL, RATE, TRANSIENT, UNWIRED
+//      or UNKNOWN; the time a response took adds SLOW. An unrecognised status is UNKNOWN, never TRANSIENT.
 //   2. RETRY (FR-002): UNFUNDED, CREDENTIAL, UNWIRED and UNKNOWN are never retried on the same rung; RATE and
-//      TRANSIENT wait with a bounded backoff inside one per-turn budget.
+//      TRANSIENT wait with a bounded backoff inside one per-turn budget; SLOW is never repeated in one turn.
 //   3. BREAKER (FR-003): closed, open, half-open per rung. The failure count and the cooldown are keys.t27's
 //      CIRCUIT_FAILS and CIRCUIT_COOLDOWN_S and its circuit_open, imported and pinned by test, never copied.
 //   4. INCIDENT (FR-004): one record per (rung, cause); a repeat raises its counter. Numbers only, so a key
@@ -18,6 +18,10 @@
 //   6. RESOLUTION (FR-006): only a 200 from one turn-sized control request through the same path.
 //   7. FAIL CLOSED (FR-007): the walk goes forward once; a total refusal stays 503 with a body line that
 //      names every rung's class and the incident id.
+//   8. TIME (FR-010, FR-011): a response not complete within LD_DEADLINE_MS is SLOW, and a 200 after it counts
+//      as a failure for the breaker, not a success. One walk is bounded by LD_WALK_BUDGET_MS; when it is
+//      spent the walk ends with the 503 body of 7. Measured cause: z.ai answered in 25-209 s against a 90 s
+//      glue timeout, so a Doctor that read statuses only would have called those turns healthy.
 // The rung index is a plain u32 and the rung count a parameter, so this spec does not depend on the rung
 // table of ladder.t27 (which #13035 changes). Not here, on purpose: the node glue that feeds statuses in
 // and walks what this decides (regenerated from this spec, never edited by hand), a surface inside DSH, the
@@ -83,14 +87,19 @@ pub fn cells_zero(t: []u64, n: usize) -> bool {
 /// UNFUNDED: the account has no balance (402, z.ai 1113). CREDENTIAL: the key is refused (401, 403).
 /// RATE: a quota or rate limit (429, z.ai 1302). TRANSIENT: service noise, no answer (0), 5xx, 529, 1305
 /// (ladder.t27 law 7, its own `transient`). UNWIRED: the route or the model is not there (404, 405, 501) or
-/// the rung is past the rung count. UNKNOWN: anything else, which is reported and never retried.
+/// the rung is past the rung count. UNKNOWN: anything else, which is reported and never retried. SLOW: the
+/// response was not complete within LD_DEADLINE_MS (FR-010); it is handled like TRANSIENT for the breaker.
+/// LC_OK is not a class: it is what classify_timed says about a 200 inside the deadline, and it is outside
+/// the table range, so no incident can be opened for it.
 pub const LC_UNFUNDED : u32 = 0;
 pub const LC_CREDENTIAL : u32 = 1;
 pub const LC_RATE : u32 = 2;
 pub const LC_TRANSIENT : u32 = 3;
 pub const LC_UNWIRED : u32 = 4;
 pub const LC_UNKNOWN : u32 = 5;
-pub const LC_COUNT : u32 = 6;
+pub const LC_SLOW : u32 = 6;
+pub const LC_COUNT : u32 = 7;
+pub const LC_OK : u32 = 9;
 
 /// The table: CT_STATUS[i] is classed CT_CLASS[i] (0 UNFUNDED, 1 CREDENTIAL, 2 RATE, 4 UNWIRED).
 pub const CT_N : u32 = 9;
@@ -110,6 +119,35 @@ pub fn classify(status: u32, rung: u32, n: u32) -> u32 {
     return LC_UNKNOWN;
 }
 
+/// FR-010: the deadline for one rung's response to be complete, in ms. Chosen, not measured: below the 90 s
+/// glue timeout and below the 25-209 s z.ai answers that were measured, so those turns are named SLOW instead
+/// of being called healthy. FR-011: the budget for the whole walk of one turn, in ms; it is larger than one
+/// deadline and under LD_WALK_CEILING_MS (120000, the ceiling the issue sets), so no turn waits 209 s for a
+/// refusal. Backoff waits (LD_TURN_BUDGET_S) are spent from the same budget by the glue.
+pub const LD_DEADLINE_MS : u32 = 30000;
+pub const LD_WALK_BUDGET_MS : u32 = 100000;
+pub const LD_WALK_CEILING_MS : u32 = 120000;
+
+/// Did the response take longer than the deadline? A response complete exactly at the deadline is in time.
+pub fn is_slow(elapsed_ms: u64) -> bool {
+    return elapsed_ms > @as(u64, LD_DEADLINE_MS);
+}
+
+/// The class of one rung call from its status and the ms it took to complete (the whole response; for no
+/// answer at all, the ms until the glue gave up). A rung past the count is UNWIRED. A 200 is LC_OK in time and
+/// SLOW after the deadline. No answer (0) and 5xx noise become SLOW once past the deadline. A status that
+/// names a cause (402, 401, 429, ...) keeps its class however long it took, because that class says more.
+pub fn classify_timed(status: u32, rung: u32, n: u32, elapsed_ms: u64) -> u32 {
+    const c : u32 = classify(status, rung, n);
+    if (c == LC_UNWIRED) { return c; }
+    if (status == 200) {
+        if (is_slow(elapsed_ms)) { return LC_SLOW; }
+        return LC_OK;
+    }
+    if (c == LC_TRANSIENT and is_slow(elapsed_ms)) { return LC_SLOW; }
+    return c;
+}
+
 /// A hard class says something no wait can change on its own.
 pub fn is_hard(cls: u32) -> bool {
     return cls == LC_UNFUNDED or cls == LC_CREDENTIAL or cls == LC_UNWIRED;
@@ -122,6 +160,7 @@ pub fn put_class(out: []u8, at: usize, cls: u32) -> usize {
     if (cls == LC_RATE) { return put_bytes(out, at, "RATE"); }
     if (cls == LC_TRANSIENT) { return put_bytes(out, at, "TRANSIENT"); }
     if (cls == LC_UNWIRED) { return put_bytes(out, at, "UNWIRED"); }
+    if (cls == LC_SLOW) { return put_bytes(out, at, "SLOW"); }
     return put_bytes(out, at, "UNKNOWN");
 }
 
@@ -132,6 +171,10 @@ pub const LD_TRANSIENT_RETRIES : u32 = 2;
 /// Backoff doubles from LD_BACKOFF_BASE_S and stops at LD_BACKOFF_CAP_S.
 pub const LD_BACKOFF_BASE_S : u32 = 2;
 pub const LD_BACKOFF_CAP_S : u32 = 30;
+/// SLOW retries per turn on one rung: none. A second wait of a whole deadline on a rung that was just too
+/// slow spends the walk budget (FR-011) for nothing; the bound across turns is the breaker, which opens after
+/// LB_FAILS slow answers in a row and then lets one probe through per cooldown.
+pub const LD_SLOW_RETRIES : u32 = 0;
 /// All waiting of one turn on one rung stays inside this many seconds. Chosen, not measured: a turn the
 /// client sits behind should not wait longer than this for a rung that can be walked past.
 pub const LD_TURN_BUDGET_S : u32 = 20;
@@ -153,6 +196,7 @@ pub fn may_retry(cls: u32, tries: u32, waited_s: u32, brk: u32) -> bool {
     if (cls == LC_TRANSIENT) {
         return tries < LD_TRANSIENT_RETRIES and waited_s + backoff_s(tries) <= LD_TURN_BUDGET_S;
     }
+    if (cls == LC_SLOW) { return tries < LD_SLOW_RETRIES; }
     return false;
 }
 
@@ -190,13 +234,14 @@ pub fn breaker_state(fails: u32, opened: u64, now: u64) -> u32 {
 }
 
 /// Failures in a row after one more refusal. A hard class opens the breaker at once. TRANSIENT follows
-/// keys.t27's circuit_fails. RATE counts one. UNKNOWN changes nothing: it is not proof about the rung.
+/// keys.t27's circuit_fails, and so does SLOW (FR-010: a late answer is a transport failure for the rung).
+/// RATE counts one. UNKNOWN changes nothing: it is not proof about the rung.
 pub fn fails_after(fails: u32, cls: u32) -> u32 {
     if (is_hard(cls)) {
         if (fails < LB_FAILS) { return LB_FAILS; }
         return fails;
     }
-    if (cls == LC_TRANSIENT) { return circuit_fails(fails, 0); }
+    if (cls == LC_TRANSIENT or cls == LC_SLOW) { return circuit_fails(fails, 0); }
     if (cls == LC_RATE) { return fails + 1; }
     return fails;
 }
@@ -220,6 +265,15 @@ pub fn breaker_ok(brk: []u64, rung: u32) -> u32 {
     brk[b + BR_FAILS] = @as(u64, circuit_fails(narrow(brk[b + BR_FAILS]), 200));
     brk[b + BR_PROBING] = 0;
     return LB_CLOSED;
+}
+
+/// Record the outcome of one call on a rung from what the glue saw: the status and the ms the response took.
+/// A 200 after the deadline is a failure for the breaker, never a success (FR-010); only a 200 in time closes
+/// it. Returns the breaker state after.
+pub fn breaker_record(brk: []u64, rung: u32, n: u32, status: u32, elapsed_ms: u64, now: u64) -> u32 {
+    const cls : u32 = classify_timed(status, rung, n, elapsed_ms);
+    if (cls == LC_OK) { return breaker_ok(brk, rung); }
+    return breaker_fail(brk, rung, cls, now);
 }
 
 /// What the walk does at a rung: PASS (closed, ask it), SKIP (open, or past the count: no network call),
@@ -269,8 +323,8 @@ pub const IF_EVID : usize = 7;
 pub const IF_CKPT : usize = 8;
 pub const IF_F : usize = 9;
 pub const IN_HDR : usize = 1;
-pub const IN_SLOTS : usize = 48;
-pub const IN_CELLS : usize = 433;
+pub const IN_SLOTS : usize = 56;
+pub const IN_CELLS : usize = 505;
 
 pub fn inc_at(rung: u32, cls: u32) -> usize {
     return IN_HDR + (@as(usize, rung) * @as(usize, LC_COUNT) + @as(usize, cls)) * IF_F;
@@ -472,6 +526,28 @@ pub fn walk_status(start: u32, tried: u32, n: u32) -> u32 {
     return 0;
 }
 
+/// The ms of the walk budget (FR-011) not yet spent; `spent_ms` counts every call and every backoff wait of
+/// the turn so far.
+pub fn walk_left_ms(spent_ms: u64) -> u32 {
+    if (spent_ms >= @as(u64, LD_WALK_BUDGET_MS)) { return 0; }
+    return LD_WALK_BUDGET_MS - narrow(spent_ms);
+}
+
+/// The timeout the glue gives the next call: the deadline, cut to what the walk budget has left, so the last
+/// call cannot run past the budget either. 0 means the budget is spent and no call is made.
+pub fn call_deadline_ms(spent_ms: u64) -> u32 {
+    const left : u32 = walk_left_ms(spent_ms);
+    if (left < LD_DEADLINE_MS) { return left; }
+    return LD_DEADLINE_MS;
+}
+
+/// walk_status with the time bound: 0 while a rung is left and budget remains; the 503 of FR-007 (its body
+/// built by refusal_body) as soon as either runs out, even with rungs left untried.
+pub fn walk_status_timed(start: u32, tried: u32, n: u32, spent_ms: u64) -> u32 {
+    if (walk_left_ms(spent_ms) == 0) { return LAST_RESORT_STATUS; }
+    return walk_status(start, tried, n);
+}
+
 pub const LD_LINE_MAX : usize = 160;
 
 /// The body line of a total refusal: every rung's class and the incident id, e.g.
@@ -667,15 +743,15 @@ test three_transient_failures_open_the_breaker_and_a_good_answer_closes_it {
 
 test an_unfunded_answer_opens_the_breaker_at_once_and_the_rung_is_skipped_with_no_call {
     var brk : [24]u64 = undefined;
-    var inc : [433]u64 = undefined;
+    var inc : [505]u64 = undefined;
     const z1 : bool = cells_zero(brk[0..24], BR_CELLS);
-    const z2 : bool = cells_zero(inc[0..433], IN_CELLS);
+    const z2 : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z1;
     assert z2;
     const cls : u32 = classify(402, 2, 3);
     assert cls == LC_UNFUNDED;
     assert breaker_fail(brk[0..24], 2, cls, 500) == LB_OPEN;
-    const id : u32 = inc_record(inc[0..433], 2, cls, 500, 1);
+    const id : u32 = inc_record(inc[0..505], 2, cls, 500, 1);
     assert id == 1;
     var g : u32 = take_gate(brk[0..24], 2, 3, 501);
     assert g == LG_SKIP;
@@ -683,69 +759,69 @@ test an_unfunded_answer_opens_the_breaker_at_once_and_the_rung_is_skipped_with_n
     assert g == LG_SKIP;
     g = take_gate(brk[0..24], 2, 3, 500 + CIRCUIT_COOLDOWN_S - 1);
     assert g == LG_SKIP;
-    const ok : bool = inc_step(inc[0..433], 2, cls, LR_SKIP, 0, 2);
+    const ok : bool = inc_step(inc[0..505], 2, cls, LR_SKIP, 0, 2);
     assert ok;
-    assert inc_state(inc[0..433], 2, cls) == LI_HEALING;
+    assert inc_state(inc[0..505], 2, cls) == LI_HEALING;
     assert recipe_after_refusal(cls, 0, 0, LB_OPEN) == LR_SKIP;
 }
 
 test the_same_cause_ten_times_is_one_incident_with_a_counter_of_ten {
-    var inc : [433]u64 = undefined;
-    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    var inc : [505]u64 = undefined;
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z;
     var k : u32 = 0;
     var id : u32 = 0;
     while (k < 10) {
-        id = inc_record(inc[0..433], 1, LC_RATE, 1000 + @as(u64, k), k + 1);
+        id = inc_record(inc[0..505], 1, LC_RATE, 1000 + @as(u64, k), k + 1);
         assert id == 1;
         k = k + 1;
     }
-    assert inc_count(inc[0..433], 1, LC_RATE) == 10;
-    assert inc_field(inc[0..433], 1, LC_RATE, IF_ID) == 1;
-    assert inc_field(inc[0..433], 1, LC_RATE, IF_FIRST) == 1000;
-    assert inc_field(inc[0..433], 1, LC_RATE, IF_LAST) == 1009;
-    assert inc_field(inc[0..433], 1, LC_RATE, IF_CKPT) == 10;
-    assert inc_state(inc[0..433], 1, LC_RATE) == LI_OPEN;
+    assert inc_count(inc[0..505], 1, LC_RATE) == 10;
+    assert inc_field(inc[0..505], 1, LC_RATE, IF_ID) == 1;
+    assert inc_field(inc[0..505], 1, LC_RATE, IF_FIRST) == 1000;
+    assert inc_field(inc[0..505], 1, LC_RATE, IF_LAST) == 1009;
+    assert inc_field(inc[0..505], 1, LC_RATE, IF_CKPT) == 10;
+    assert inc_state(inc[0..505], 1, LC_RATE) == LI_OPEN;
     assert inc[0] == 1;
 }
 
 test another_cause_or_rung_is_another_incident_and_a_resolved_one_recurs_as_a_new_one {
-    var inc : [433]u64 = undefined;
-    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    var inc : [505]u64 = undefined;
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z;
-    var a : u32 = inc_record(inc[0..433], 0, LC_RATE, 10, 1);
+    var a : u32 = inc_record(inc[0..505], 0, LC_RATE, 10, 1);
     assert a == 1;
-    a = inc_record(inc[0..433], 0, LC_TRANSIENT, 11, 2);
+    a = inc_record(inc[0..505], 0, LC_TRANSIENT, 11, 2);
     assert a == 2;
-    a = inc_record(inc[0..433], 1, LC_RATE, 12, 3);
+    a = inc_record(inc[0..505], 1, LC_RATE, 12, 3);
     assert a == 3;
-    a = inc_record(inc[0..433], 0, LC_RATE, 13, 4);
+    a = inc_record(inc[0..505], 0, LC_RATE, 13, 4);
     assert a == 1;
-    assert inc_count(inc[0..433], 0, LC_RATE) == 2;
-    assert inc_count(inc[0..433], 0, LC_TRANSIENT) == 1;
-    assert inc_count(inc[0..433], 1, LC_RATE) == 1;
+    assert inc_count(inc[0..505], 0, LC_RATE) == 2;
+    assert inc_count(inc[0..505], 0, LC_TRANSIENT) == 1;
+    assert inc_count(inc[0..505], 1, LC_RATE) == 1;
     const o : u32 = control_outcome(200, PROBE_TOKENS, LD_CONTROL_MESSAGES, 0, true);
-    assert inc_control(inc[0..433], 0, LC_RATE, 200, o, 14, 5) == LI_RESOLVED;
-    a = inc_record(inc[0..433], 0, LC_RATE, 15, 6);
+    assert inc_control(inc[0..505], 0, LC_RATE, 200, o, 14, 5) == LI_RESOLVED;
+    a = inc_record(inc[0..505], 0, LC_RATE, 15, 6);
     assert a == 4;
-    assert inc_count(inc[0..433], 0, LC_RATE) == 1;
-    assert inc_state(inc[0..433], 0, LC_RATE) == LI_OPEN;
-    a = inc_record(inc[0..433], LD_RUNGS_MAX, LC_RATE, 16, 7);
+    assert inc_count(inc[0..505], 0, LC_RATE) == 1;
+    assert inc_state(inc[0..505], 0, LC_RATE) == LI_OPEN;
+    a = inc_record(inc[0..505], LD_RUNGS_MAX, LC_RATE, 16, 7);
     assert a == 0;
-    a = inc_record(inc[0..433], 0, LC_COUNT, 16, 7);
+    a = inc_record(inc[0..505], 0, LC_COUNT, 16, 7);
     assert a == 0;
-    assert inc_state(inc[0..433], 5, LC_RATE) == LI_NONE;
+    assert inc_state(inc[0..505], 5, LC_RATE) == LI_NONE;
 }
 
 test a_cooled_breaker_sends_exactly_one_probe_and_one_200_closes_it_and_resolves {
     var brk : [24]u64 = undefined;
-    var inc : [433]u64 = undefined;
+    var inc : [505]u64 = undefined;
     const z1 : bool = cells_zero(brk[0..24], BR_CELLS);
-    const z2 : bool = cells_zero(inc[0..433], IN_CELLS);
+    const z2 : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z1;
     assert z2;
     assert breaker_fail(brk[0..24], 1, LC_UNFUNDED, 100) == LB_OPEN;
-    const id : u32 = inc_record(inc[0..433], 1, LC_UNFUNDED, 100, 1);
+    const id : u32 = inc_record(inc[0..505], 1, LC_UNFUNDED, 100, 1);
     assert id == 1;
     var g : u32 = take_gate(brk[0..24], 1, 3, 100 + CIRCUIT_COOLDOWN_S - 1);
     assert g == LG_SKIP;
@@ -755,22 +831,22 @@ test a_cooled_breaker_sends_exactly_one_probe_and_one_200_closes_it_and_resolves
     assert g == LG_SKIP;
     g = take_gate(brk[0..24], 1, 3, 100 + CIRCUIT_COOLDOWN_S + 5);
     assert g == LG_SKIP;
-    const ok : bool = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_PROBE, 0, 2);
+    const ok : bool = inc_step(inc[0..505], 1, LC_UNFUNDED, LR_PROBE, 0, 2);
     assert ok;
     assert breaker_ok(brk[0..24], 1) == LB_CLOSED;
     const o : u32 = control_outcome(200, PROBE_TOKENS, LD_CONTROL_MESSAGES, 0, true);
-    assert inc_control_rung(inc[0..433], 1, 200, o, 170, 3) == 1;
-    assert inc_state(inc[0..433], 1, LC_UNFUNDED) == LI_RESOLVED;
-    assert inc_field(inc[0..433], 1, LC_UNFUNDED, IF_EVID) == 200;
+    assert inc_control_rung(inc[0..505], 1, 200, o, 170, 3) == 1;
+    assert inc_state(inc[0..505], 1, LC_UNFUNDED) == LI_RESOLVED;
+    assert inc_field(inc[0..505], 1, LC_UNFUNDED, IF_EVID) == 200;
     g = take_gate(brk[0..24], 1, 3, 171);
     assert g == LG_PASS;
 }
 
 test a_failed_probe_reopens_the_breaker_and_a_lost_probe_is_replaced_after_a_cooldown {
     var brk : [24]u64 = undefined;
-    var inc : [433]u64 = undefined;
+    var inc : [505]u64 = undefined;
     const z1 : bool = cells_zero(brk[0..24], BR_CELLS);
-    const z2 : bool = cells_zero(inc[0..433], IN_CELLS);
+    const z2 : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z1;
     assert z2;
     assert breaker_fail(brk[0..24], 1, LC_UNFUNDED, 100) == LB_OPEN;
@@ -798,22 +874,22 @@ test a_failed_probe_reopens_the_breaker_and_a_lost_probe_is_replaced_after_a_coo
 }
 
 test an_incident_resolves_only_on_a_200_control_request_through_the_same_path {
-    var inc : [433]u64 = undefined;
-    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    var inc : [505]u64 = undefined;
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z;
-    const id : u32 = inc_record(inc[0..433], 0, LC_TRANSIENT, 10, 1);
+    const id : u32 = inc_record(inc[0..505], 0, LC_TRANSIENT, 10, 1);
     assert id == 1;
-    var ok : bool = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_WAIT, 0, 2);
+    var ok : bool = inc_step(inc[0..505], 0, LC_TRANSIENT, LR_WAIT, 0, 2);
     assert ok;
-    ok = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_SKIP, 0, 3);
+    ok = inc_step(inc[0..505], 0, LC_TRANSIENT, LR_SKIP, 0, 3);
     assert ok;
-    ok = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_PROBE, 0, 4);
+    ok = inc_step(inc[0..505], 0, LC_TRANSIENT, LR_PROBE, 0, 4);
     assert ok;
-    ok = inc_step(inc[0..433], 0, LC_TRANSIENT, LR_NEXT, 1, 5);
+    ok = inc_step(inc[0..505], 0, LC_TRANSIENT, LR_NEXT, 1, 5);
     assert ok;
-    assert inc_state(inc[0..433], 0, LC_TRANSIENT) == LI_HEALING;
-    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_STEPS) == 15;
-    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_TRIED) == 3;
+    assert inc_state(inc[0..505], 0, LC_TRANSIENT) == LI_HEALING;
+    assert inc_field(inc[0..505], 0, LC_TRANSIENT, IF_STEPS) == 15;
+    assert inc_field(inc[0..505], 0, LC_TRANSIENT, IF_TRIED) == 3;
     assert control_outcome(200, PROBE_TOKENS, 1, 0, true) == LX_RESOLVE;
     assert control_outcome(200, PROBE_TOKENS, 1, 0, false) == LX_REPORT;
     assert control_outcome(200, PROBE_TOKENS - 1, 1, 0, true) == LX_REPORT;
@@ -823,33 +899,33 @@ test an_incident_resolves_only_on_a_200_control_request_through_the_same_path {
     assert control_outcome(429, PROBE_TOKENS, 1, 0, true) == LX_REPORT;
     assert control_outcome(0, PROBE_TOKENS, 1, 0, true) == LX_REPORT;
     var o : u32 = control_outcome(200, PROBE_TOKENS, 1, 0, false);
-    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 200, o, 20, 6) == LI_HEALING;
+    assert inc_control(inc[0..505], 0, LC_TRANSIENT, 200, o, 20, 6) == LI_HEALING;
     o = control_outcome(200, 1, 1, 0, true);
-    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 200, o, 21, 7) == LI_HEALING;
+    assert inc_control(inc[0..505], 0, LC_TRANSIENT, 200, o, 21, 7) == LI_HEALING;
     o = LX_RESOLVE;
-    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 500, o, 22, 8) == LI_ESCALATED;
-    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_EVID) == 500;
+    assert inc_control(inc[0..505], 0, LC_TRANSIENT, 500, o, 22, 8) == LI_ESCALATED;
+    assert inc_field(inc[0..505], 0, LC_TRANSIENT, IF_EVID) == 500;
     o = control_outcome(200, PROBE_TOKENS, 1, 0, true);
-    assert inc_control(inc[0..433], 0, LC_TRANSIENT, 200, o, 23, 9) == LI_RESOLVED;
-    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_EVID) == 200;
-    assert inc_field(inc[0..433], 0, LC_TRANSIENT, IF_CKPT) == 9;
+    assert inc_control(inc[0..505], 0, LC_TRANSIENT, 200, o, 23, 9) == LI_RESOLVED;
+    assert inc_field(inc[0..505], 0, LC_TRANSIENT, IF_EVID) == 200;
+    assert inc_field(inc[0..505], 0, LC_TRANSIENT, IF_CKPT) == 9;
 }
 
 test a_failed_control_request_escalates_and_is_never_repeated {
-    var inc : [433]u64 = undefined;
-    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    var inc : [505]u64 = undefined;
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z;
-    const id : u32 = inc_record(inc[0..433], 2, LC_UNFUNDED, 10, 1);
+    const id : u32 = inc_record(inc[0..505], 2, LC_UNFUNDED, 10, 1);
     assert id == 1;
     const o : u32 = control_outcome(402, PROBE_TOKENS, 1, 0, true);
     assert o == LX_REPORT;
-    assert inc_control(inc[0..433], 2, LC_UNFUNDED, 402, o, 11, 2) == LI_OPEN;
-    const ok : bool = inc_step(inc[0..433], 2, LC_UNFUNDED, LR_SKIP, 0, 3);
+    assert inc_control(inc[0..505], 2, LC_UNFUNDED, 402, o, 11, 2) == LI_OPEN;
+    const ok : bool = inc_step(inc[0..505], 2, LC_UNFUNDED, LR_SKIP, 0, 3);
     assert ok;
-    assert inc_control(inc[0..433], 2, LC_UNFUNDED, 402, o, 12, 4) == LI_ESCALATED;
-    assert inc_field(inc[0..433], 2, LC_UNFUNDED, IF_EVID) == 402;
-    assert inc_control(inc[0..433], 2, LC_UNFUNDED, 402, o, 13, 5) == LI_ESCALATED;
-    assert inc_control(inc[0..433], 2, LC_RATE, 402, o, 13, 5) == LI_NONE;
+    assert inc_control(inc[0..505], 2, LC_UNFUNDED, 402, o, 12, 4) == LI_ESCALATED;
+    assert inc_field(inc[0..505], 2, LC_UNFUNDED, IF_EVID) == 402;
+    assert inc_control(inc[0..505], 2, LC_UNFUNDED, 402, o, 13, 5) == LI_ESCALATED;
+    assert inc_control(inc[0..505], 2, LC_RATE, 402, o, 13, 5) == LI_NONE;
     var lx : u32 = LX_REPORT;
     var rx : u32 = LX_RESOLVE;
     assert lx != rx;
@@ -880,25 +956,25 @@ test the_recipe_list_is_closed_and_every_forbidden_act_is_a_constant_outside_it 
     assert recipe_forbidden(LF_SWITCH_DEFAULT_MODEL);
     assert recipe_forbidden(LF_OFF_ORDER_RUNG);
     assert recipe_forbidden(LF_ENABLE_AUTOMATION);
-    var inc : [433]u64 = undefined;
-    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    var inc : [505]u64 = undefined;
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z;
-    const id : u32 = inc_record(inc[0..433], 1, LC_UNFUNDED, 10, 1);
+    const id : u32 = inc_record(inc[0..505], 1, LC_UNFUNDED, 10, 1);
     assert id == 1;
-    var ok : bool = inc_step(inc[0..433], 1, LC_UNFUNDED, LF_PURCHASE, 0, 2);
+    var ok : bool = inc_step(inc[0..505], 1, LC_UNFUNDED, LF_PURCHASE, 0, 2);
     assert ok == false;
-    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LF_OFF_ORDER_RUNG, 2, 2);
+    ok = inc_step(inc[0..505], 1, LC_UNFUNDED, LF_OFF_ORDER_RUNG, 2, 2);
     assert ok == false;
-    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, 50, 0, 2);
+    ok = inc_step(inc[0..505], 1, LC_UNFUNDED, 50, 0, 2);
     assert ok == false;
-    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_NEXT, 0, 2);
+    ok = inc_step(inc[0..505], 1, LC_UNFUNDED, LR_NEXT, 0, 2);
     assert ok == false;
-    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_NEXT, 1, 2);
+    ok = inc_step(inc[0..505], 1, LC_UNFUNDED, LR_NEXT, 1, 2);
     assert ok == false;
-    ok = inc_step(inc[0..433], 1, LC_UNFUNDED, LR_NEXT, LD_RUNGS_MAX, 2);
+    ok = inc_step(inc[0..505], 1, LC_UNFUNDED, LR_NEXT, LD_RUNGS_MAX, 2);
     assert ok == false;
-    assert inc_field(inc[0..433], 1, LC_UNFUNDED, IF_STEPS) == 0;
-    assert inc_state(inc[0..433], 1, LC_UNFUNDED) == LI_OPEN;
+    assert inc_field(inc[0..505], 1, LC_UNFUNDED, IF_STEPS) == 0;
+    assert inc_state(inc[0..505], 1, LC_UNFUNDED) == LI_OPEN;
 }
 
 test the_walk_goes_forward_once_and_ends_with_the_503 {
@@ -941,28 +1017,180 @@ test a_total_refusal_names_every_rung_class_and_the_incident_and_nothing_else {
 }
 
 test the_refusal_body_is_built_from_the_incident_table {
-    var inc : [433]u64 = undefined;
+    var inc : [505]u64 = undefined;
     var out : [192]u8 = undefined;
-    const z : bool = cells_zero(inc[0..433], IN_CELLS);
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
     assert z;
-    var a : u32 = inc_record(inc[0..433], 0, LC_UNFUNDED, 10, 1);
+    var a : u32 = inc_record(inc[0..505], 0, LC_UNFUNDED, 10, 1);
     assert a == 1;
-    a = inc_record(inc[0..433], 1, LC_RATE, 11, 2);
+    a = inc_record(inc[0..505], 1, LC_RATE, 11, 2);
     assert a == 2;
-    a = inc_record(inc[0..433], 1, LC_TRANSIENT, 12, 3);
+    a = inc_record(inc[0..505], 1, LC_TRANSIENT, 12, 3);
     assert a == 3;
-    assert rung_class(inc[0..433], 0) == LC_UNFUNDED;
-    assert rung_class(inc[0..433], 1) == LC_TRANSIENT;
-    assert rung_class(inc[0..433], 2) == LC_UNKNOWN;
-    assert newest_live(inc[0..433], 3) == 3;
-    assert newest_live(inc[0..433], 1) == 1;
+    assert rung_class(inc[0..505], 0) == LC_UNFUNDED;
+    assert rung_class(inc[0..505], 1) == LC_TRANSIENT;
+    assert rung_class(inc[0..505], 2) == LC_UNKNOWN;
+    assert newest_live(inc[0..505], 3) == 3;
+    assert newest_live(inc[0..505], 1) == 1;
     const o : u32 = control_outcome(200, PROBE_TOKENS, 1, 0, true);
-    assert inc_control(inc[0..433], 1, LC_TRANSIENT, 200, o, 13, 4) == LI_RESOLVED;
-    assert rung_class(inc[0..433], 1) == LC_RATE;
-    assert newest_live(inc[0..433], 3) == 2;
-    const w : usize = refusal_body(out[0..192], inc[0..433], 3);
+    assert inc_control(inc[0..505], 1, LC_TRANSIENT, 200, o, 13, 4) == LI_RESOLVED;
+    assert rung_class(inc[0..505], 1) == LC_RATE;
+    assert newest_live(inc[0..505], 3) == 2;
+    const w : usize = refusal_body(out[0..192], inc[0..505], 3);
     assert w == 53;
     assert same_bytes(out[0..w], "ladder closed: 0=UNFUNDED 1=RATE 2=UNKNOWN incident=2");
+}
+
+test a_response_past_the_deadline_is_slow_and_a_late_200_is_not_a_success {
+    const dl : u64 = @as(u64, LD_DEADLINE_MS);
+    assert is_slow(0) == false;
+    assert is_slow(dl) == false;
+    assert is_slow(dl + 1);
+    assert classify_timed(200, 0, 3, 0) == LC_OK;
+    assert classify_timed(200, 1, 3, dl) == LC_OK;
+    assert classify_timed(200, 1, 3, dl + 1) == LC_SLOW;
+    assert classify_timed(200, 2, 3, 209000) == LC_SLOW;
+    assert classify_timed(0, 0, 3, dl + 1) == LC_SLOW;
+    assert classify_timed(503, 0, 3, dl + 1) == LC_SLOW;
+    assert classify_timed(0, 0, 3, 5) == LC_TRANSIENT;
+    assert classify_timed(503, 0, 3, dl) == LC_TRANSIENT;
+    assert classify_timed(402, 0, 3, 209000) == LC_UNFUNDED;
+    assert classify_timed(429, 1, 3, 209000) == LC_RATE;
+    assert classify_timed(400, 0, 3, 209000) == LC_UNKNOWN;
+    assert classify_timed(404, 1, 3, 0) == LC_UNWIRED;
+    assert classify_timed(200, 3, 3, 0) == LC_UNWIRED;
+    assert is_hard(LC_SLOW) == false;
+    var sl : u32 = LC_SLOW;
+    var cn : u32 = LC_COUNT;
+    var ok : u32 = LC_OK;
+    assert sl < cn;
+    assert ok >= cn;
+    var line : [192]u8 = undefined;
+    var cl : [8]u32 = undefined;
+    cl[0] = LC_SLOW;
+    cl[1] = LC_TRANSIENT;
+    const w : usize = refusal_line(line[0..192], 2, cl[0..8], 4);
+    assert same_bytes(line[0..w], "ladder closed: 0=SLOW 1=TRANSIENT incident=4");
+}
+
+test a_late_200_counts_as_a_breaker_failure_like_transient_and_a_fast_200_closes_it {
+    var brk : [24]u64 = undefined;
+    const z : bool = cells_zero(brk[0..24], BR_CELLS);
+    assert z;
+    const dl : u64 = @as(u64, LD_DEADLINE_MS);
+    assert fails_after(0, LC_SLOW) == fails_after(0, LC_TRANSIENT);
+    assert fails_after(2, LC_SLOW) == CIRCUIT_FAILS;
+    assert breaker_record(brk[0..24], 1, 3, 200, dl + 1, 100) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 1, 3, 200, dl + 1, 101) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 1, 3, 200, dl + 1, 102) == LB_OPEN;
+    var g : u32 = take_gate(brk[0..24], 1, 3, 103);
+    assert g == LG_SKIP;
+    const cool : u64 = 102 + CIRCUIT_COOLDOWN_S;
+    g = take_gate(brk[0..24], 1, 3, cool);
+    assert g == LG_PROBE;
+    assert breaker_record(brk[0..24], 1, 3, 200, 900, cool + 1) == LB_CLOSED;
+    g = take_gate(brk[0..24], 1, 3, cool + 2);
+    assert g == LG_PASS;
+    assert breaker_record(brk[0..24], 2, 3, 200, dl + 1, 200) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 2, 3, 200, dl + 1, 201) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 2, 3, 200, 10, 202) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 2, 3, 200, dl + 1, 203) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 10) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 11) == LB_CLOSED;
+    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 12) == LB_OPEN;
+    g = take_gate(brk[0..24], 0, 3, 12 + CIRCUIT_COOLDOWN_S);
+    assert g == LG_PROBE;
+    assert breaker_record(brk[0..24], 0, 3, 200, dl + 1, 13 + CIRCUIT_COOLDOWN_S) == LB_OPEN;
+    g = take_gate(brk[0..24], 0, 3, 14 + CIRCUIT_COOLDOWN_S);
+    assert g == LG_SKIP;
+}
+
+test a_slow_rung_is_walked_past_once_never_repeated_in_one_turn_and_has_its_own_incident {
+    var sr : u32 = LD_SLOW_RETRIES;
+    assert sr == 0;
+    var t : u32 = 0;
+    while (t < 5) {
+        assert may_retry(LC_SLOW, t, 0, LB_CLOSED) == false;
+        assert may_retry(LC_SLOW, t, 0, LB_HALF_OPEN) == false;
+        t = t + 1;
+    }
+    assert recipe_after_refusal(LC_SLOW, 0, 0, LB_CLOSED) == LR_NEXT;
+    assert recipe_after_refusal(LC_SLOW, 0, 0, LB_OPEN) == LR_SKIP;
+    var inc : [505]u64 = undefined;
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
+    assert z;
+    var a : u32 = inc_record(inc[0..505], 0, LC_SLOW, 10, 1);
+    assert a == 1;
+    a = inc_record(inc[0..505], 0, LC_SLOW, 40, 2);
+    assert a == 1;
+    a = inc_record(inc[0..505], 0, LC_TRANSIENT, 41, 3);
+    assert a == 2;
+    assert inc_count(inc[0..505], 0, LC_SLOW) == 2;
+    assert inc_count(inc[0..505], 0, LC_TRANSIENT) == 1;
+    const ok : bool = inc_step(inc[0..505], 0, LC_SLOW, LR_NEXT, 1, 4);
+    assert ok;
+    assert inc_state(inc[0..505], 0, LC_SLOW) == LI_HEALING;
+    assert inc_field(inc[0..505], 0, LC_SLOW, IF_TRIED) == 3;
+    const o : u32 = control_outcome(200, PROBE_TOKENS, 1, 0, true);
+    assert inc_control(inc[0..505], 0, LC_SLOW, 200, o, 50, 5) == LI_RESOLVED;
+    assert inc_state(inc[0..505], 0, LC_TRANSIENT) == LI_OPEN;
+    assert inc_record(inc[0..505], 0, LC_OK, 60, 6) == 0;
+    assert inc_state(inc[0..505], 0, LC_OK) == LI_NONE;
+}
+
+test the_walk_budget_is_larger_than_one_deadline_and_smaller_than_120000 {
+    var dl : u32 = LD_DEADLINE_MS;
+    var bu : u32 = LD_WALK_BUDGET_MS;
+    var ce : u32 = LD_WALK_CEILING_MS;
+    var bs : u32 = LD_TURN_BUDGET_S;
+    var worst : u32 = 209000;
+    assert bu > dl;
+    assert bu < 120000;
+    assert ce == 120000;
+    assert bu < ce;
+    assert bu < worst;
+    assert bs * 1000 + dl <= bu;
+    const b64 : u64 = @as(u64, LD_WALK_BUDGET_MS);
+    const d64 : u64 = @as(u64, LD_DEADLINE_MS);
+    assert call_deadline_ms(0) == LD_DEADLINE_MS;
+    assert call_deadline_ms(b64 - d64) == LD_DEADLINE_MS;
+    assert call_deadline_ms(b64 - d64 + 1) == LD_DEADLINE_MS - 1;
+    assert call_deadline_ms(b64 - 1) == 1;
+    assert call_deadline_ms(b64) == 0;
+    assert call_deadline_ms(b64 + 109000) == 0;
+    assert walk_left_ms(0) == LD_WALK_BUDGET_MS;
+    assert walk_left_ms(b64) == 0;
+    var spent : u64 = 0;
+    var calls : u32 = 0;
+    while (walk_left_ms(spent) > 0 and calls < LD_RUNGS_MAX) {
+        spent = spent + @as(u64, call_deadline_ms(spent));
+        calls = calls + 1;
+    }
+    assert spent <= b64;
+    assert spent > d64;
+    assert spent < @as(u64, worst);
+}
+
+test a_spent_walk_budget_ends_the_walk_with_the_503_body_even_with_a_rung_untried {
+    var inc : [505]u64 = undefined;
+    var out : [192]u8 = undefined;
+    const z : bool = cells_zero(inc[0..505], IN_CELLS);
+    assert z;
+    const b64 : u64 = @as(u64, LD_WALK_BUDGET_MS);
+    var a : u32 = inc_record(inc[0..505], 0, LC_SLOW, 10, 1);
+    assert a == 1;
+    a = inc_record(inc[0..505], 1, LC_SLOW, 40, 2);
+    assert a == 2;
+    assert next_from(2, 3, 3) == 2;
+    assert walk_status_timed(2, 3, 3, 70000) == 0;
+    assert walk_status_timed(2, 3, 3, b64 - 1) == 0;
+    assert walk_status_timed(2, 3, 3, b64) == LAST_RESORT_STATUS;
+    assert walk_status_timed(2, 3, 3, b64 + 5) == LAST_RESORT_STATUS;
+    assert walk_status_timed(3, 7, 3, 0) == LAST_RESORT_STATUS;
+    const w : usize = refusal_body(out[0..192], inc[0..505], 3);
+    assert w == 49;
+    assert same_bytes(out[0..w], "ladder closed: 0=SLOW 1=SLOW 2=UNKNOWN incident=2");
+    assert line_is_safe(out[0..w]);
 }
 
 test the_tables_are_sized_for_the_rung_and_cause_counts {
