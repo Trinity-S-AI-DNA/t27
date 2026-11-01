@@ -61,6 +61,10 @@ A claim with no edit for 6 hours and no push on its branch is stale. Another age
 - **A seal has a closure.** Editing a spec in the import closure of a sealed spec stales that seal. Before a caller or library edit, `grep -rlF <spec path> .trinity/seals` (seals store `spec_path` and a `closure` list); a spec with no seal at baseline stays unsealed.
 - **A bulk `use` fold is a diff of `use` lines only.** `use a::b::x;`, the brace form and the whole-module form `use a::b;` all pull the same declarations (the splice starts from every name the importer writes), except a listed name the importer never writes. Fold with one `sed` and `awk '!(/^use / && seen[$0]++)'`, then prove it: `git diff -U0` has no non-`use` line; `test-report` tables equal; `gen-js` byte-identical (save the edited files, `git checkout` them, generate the base, restore, `cmp`); a dead name only loses a `// t27c gen-js: fn X was not emitted` comment. Skip sealed, imported, blocked and `@extern` specs. A `use` line can sit far from `module`, and a spec may have no `module` line at all.
 - **A `cd` in a Bash call sticks.** Use absolute paths or `cd` back; a drifted cwd made `target/boiler/...` paths fail.
+- **`tri loop claim` lives only in the repo-built binary.** `~/t27/target/release/tri` has the `loop` subcommand; `~/.cargo/bin/tri` answers `unrecognized subcommand 'loop'` and `~/.local/bin/tri` does not exist at all. Exit 2 from one of those is the wrong binary, not "the claim could not be attempted": check `--who` with the repo-built `tri` before you report a claim as unattemptable, or you stop a tick that had no blocker.
+- **A stale claim can belong to a finished row.** `boiler-12449` was HELD for six days by the agent that had already merged its phase and never released. Before a `TAKEOVER:`, read the row's last comment and its PR: a `DONE:` comment plus a merged PR plus a deleted branch means the row is free and the next phase is yours, not that someone is working.
+- **The alpha ledger has no runnable path on this Mac, and no gate.** `tools/duplicate_bodies_alpha_baseline.txt` is checked only by the C the gate spec lowers to, and the `GATE:` command in the header of `specs/policy/dupe_bodies.t27` is refused three separate ways here: the Bash tool's MAC LOAD hook denies `cc` outright; the Terminal hook reads `1<<26` as a here-document (write `67108864`, `1048576`, `16777216`), reads the identifier `r` as the shell's history command (write `rc`), and then reads the `{...}` of `int main` as a glued zsh brace list, which no respelling of C avoids. The lab the Bash hook recommends, the `fs-lab.sh` under the old `t27-lanes` home, no longer exists. So the alpha key row E delivered is unverifiable until it is wired (phase 3) or built somewhere the hooks allow. Do not materialise the shim as a `.c` file to get around this: the gate spec's design is printf'd command text precisely so no foreign file exists, and `only-t27` forbids the scratch file too.
+- **The gate spec is sealed, so its header is not a free edit.** `.trinity/seals/policy_policy::dupe_bodies.json` covers `specs/policy/dupe_bodies.t27`; correcting even a comment line there stales the seal and needs a re-save this Mac cannot legitimately do. Record a command correction in this skill instead, and leave the spec for a tick that has the seal route.
 
 ## Commands
 
@@ -68,9 +72,11 @@ A claim with no edit for 6 hours and no push on its branch is stale. Another age
 |---|---|
 | does a helper of this name exist | `tri dupes --name <fn>` and `grep -rn -A3 -E '^(pub )?fn <fn>' specs` |
 | duplicate census | `python3 tools/dupe_scan.py --report` |
+| does the plain ledger still hold | `python3 tools/dupe_scan.py` with no argument (there is no `--check` flag; it exits 0 and says "ok: no new duplicate body") |
+| does the alpha ledger still hold | nothing runnable on this Mac; see the self-correction above |
 | counts before and after | `t27c test-report <spec>` (Terminal tab) |
 | seal one spec | `t27c seal <spec> --save` (master-built t27c) |
-| claim, who, release | `tri loop claim boiler-<n>` / `--who` / `--release` |
+| claim, who, release | `~/t27/target/release/tri loop claim boiler-<n>` / `--who` / `--release` (only this binary has `loop`) |
 
 ## Rows
 
