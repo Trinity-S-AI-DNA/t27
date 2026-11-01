@@ -53,7 +53,7 @@ MAIN = (
 
 
 def fail(msg):
-    print(f"::error::L2 GENERATION: {msg}. Not checked is not a pass.")
+    print(f"::error::L2 GENERATION: {msg}. Not checked is not a pass.", file=sys.stderr)
     sys.exit(1)
 
 
