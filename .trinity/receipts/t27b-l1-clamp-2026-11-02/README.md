@@ -752,4 +752,40 @@ cancelled, 4 skipped** -- 41 runs, 4 red. The bot's snapshot was taken while the
 run was still starting; its counting method is not read here, and the direct
 count is what section 12b is built on.
 
+### 12d. At head `5f00009553` the four reds read exactly as master's
+
+Section 12c was written while two of the four checks were still running, so it
+reported one red where the finished set is four. The correction matters only in
+one direction: with every check finished, **none of the four is this branch's
+any more**, and each says so in master's own words.
+
+| check | run at `5f00009553` | what it prints | master's own run |
+|---|---|---|---|
+| Corpus ratchet (type names) | `41416539691`, job `125181657226` | `ledger 141 name(s), observed 142` / `+ ParsedCommand  NEW conflict` | `41403284655`, head `0215bd7223` -- byte-identical two lines |
+| coverage | `41416539406`, job `125181655035` | `FAIL: 1 seal(s) newly do not hold` / `policy_PolicyOwnLanguage.json  [stale]` | `41403284547`, same seal named |
+| spec-guards | `41416539467`, job `125181655813` | `STALE generated-code hash : 1`, all four gen_hashes of the same seal (`gen_hash_rust sealed=6c3c4413c396 current=d9104fe0bd51`, and the zig/c/verilog rows) | `41401435163`, head `783f18b4f8` |
+| loop-tools-tracked | `41416539485`, job `125181655709` | the 12c log shape, unchanged | `41172959400` + three older, and green in #13097 |
+
+Two things are now established rather than argued:
+
+- **The `Cell` rename held.** The type-name ratchet observed 143 names while
+  `Cell` was in the tree and observes **142** now, and the only name it lists is
+  `ParsedCommand`, which is #13059 / #13087's. The arithmetic closes: master
+  observes 142 too.
+- **The seal is not reachable from here.**
+  `git diff <merge-base> HEAD -- specs/policy/ .trinity/seals/` prints nothing,
+  so this branch changed neither `specs/policy/own_language.t27` nor any seal.
+  Its repair is PR #13096 (`seals: re-seal policy_PolicyOwnLanguage from a
+  master-built t27c`), and re-saving a seal here would need both another PR's
+  file and a builder this worktree does not have. Not done.
+
+So the event's three names are discharged without a fix, because there is
+nothing here to fix: one red of mine existed, it was the `Cell` name, and it is
+gone. The two review comments the same event carried are the PR-dashboard bot's
+own PR-level comments (`6572951369`, `6573032868`), with no inline thread and
+nothing asked of this branch; nothing was acted on, so nothing was replied to.
+Their per-PR counts (`30 failing / 34 total`, then `28 failing / 33 total`,
+four minutes apart, for a PR whose finished set is 4 red of 41) are two more
+mid-run snapshots of the kind 12c already corrected.
+
 Refs #12877.
