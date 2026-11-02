@@ -580,6 +580,40 @@ What this does not change: there is no second conductor and no Queen, GODMODE st
 session cron stays the read-only duty tick. The contract describes deduplication, fences, replay
 and the effect journal; the runtime behaviour is not measured yet.
 
+### 7.6 Evidence by origin (2026-11-02)
+
+Each result above comes from one of four origins, and a result of one origin is never cited as
+another.
+
+1. Real observations (read from the live system, nothing changed in it):
+   - LIST snapshots of pane 15, each taken by a typed command, and the live snapshot taken 663 s
+     after the cursor that gave GAP;
+   - a shell cell's shown state follows its output, not its process (`sleep 12` read IDLE, `ping`
+     read WORKING);
+   - the PTY server source: keys loaded at the start and at a spawn, a fixed router port, paths
+     derived from `$HOME`;
+   - the installed client against an empty test HOME: "no server", exit 10.
+2. Fixtures and modified copies (inputs made or changed by this lane):
+   - byte copies of the real snapshots in a fresh directory with no cursor;
+   - an edited snapshot with state 5 (refused as UNKNOWN), and `run/` given as the feed directory;
+   - the lease on pane 14, which the run itself named: it is not an observed change of a live
+     slot by its owner, and a real change in another task's slot was never observed;
+   - spec copies: the stage-1 copy, the isolation copy, the group-kill copy, and every negative
+     control.
+3. Pure tests (`t27b test`, `t27c test-report`): `next_step` 14, `next_step_run` 11,
+   `next_step_main` 6, `pane_feed` 13; the isolation copy 26 and the group-kill copy 25. They show
+   that the functions answer as their asserts say. They show nothing about a live server, a live
+   pane or an executor.
+4. Measured one-shot runtime (one binary, one run, started by hand in pane 15):
+   - the bridge on one hand-injected event (7.3), and its replay that gave D_STALE;
+   - the feed runs: the first one (its decision reading withdrawn), the replay of the copies with
+     `checks_asked=1 decisions=0 launches=0`, and the restart over the kept cursor.
+   None of these is an automatic arrival of events, a background loop or an autonomous runtime.
+
+Two limits hold across all four. The feed cursor is this adapter's own position in its snapshot
+directory, not a saved position of an upstream journal; the server keeps no such journal. A task
+chosen by hand after reading a function's result is not automatic wiring.
+
 ## 8. Lanes and owners
 
 Two lanes, one owner each, so that no two sessions fix the credentials, start DSH Web or edit
