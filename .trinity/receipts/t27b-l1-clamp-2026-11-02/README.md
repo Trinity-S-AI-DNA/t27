@@ -17,7 +17,8 @@ Rust file in this branch is touched.**
 | `specs/tri/shootout/acceptance_matrix.t27` at that HEAD | sha256 `7a17bdec33728434...`, blob `64d5333dc58b530b` |
 | `specs/tri/shootout/acceptance_matrix.t27` after this round's edit | sha256 `cf89bee8c554189d...`, 16 tests, uncommitted when written |
 | `specs/tri/shootout/l1_clamp.t27` (new) | sha256 `96dc940bd28a8fe9...` |
-| `specs/tri/t27b/ifconv_plan.t27` (new) | sha256 `8e4b07b8b1d0b860...` |
+| `specs/tri/t27b/ifconv_plan.t27` (new) as sections 1-8 read it | sha256 `8e4b07b8b1d0b860...`, 13 functions, 15 tests |
+| `specs/tri/t27b/ifconv_plan.t27` after section 9's additions | sha256 `0e690948987d82d5...`, 17 functions, 19 tests |
 
 Binaries used for every command in this receipt:
 
