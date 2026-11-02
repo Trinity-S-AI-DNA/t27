@@ -28,6 +28,10 @@ pub(crate) mod inline_decision;
 #[path = "../../../gen/rust/tri/t27b/narrow_law.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod narrow_law;
+// t27b-generated home-plan source of truth: specs/tri/t27b/home_plan.t27.
+#[path = "../../../gen/rust/tri/t27b/home_plan.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod home_plan;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -347,54 +351,37 @@ impl<'a> Gen<'a> {
             }
         }
         self.has_call = has_call;
-        self.stack_params = Program::stack_args(&Program::arg_regs(f)).1 > 0;
+        let regs = Program::arg_regs(f);
+        self.stack_params = Program::stack_args(&regs).1 > 0;
         let mut order: Vec<usize> = (0..f.vars.len()).collect();
         order.sort_by(|&a, &b| w[b].cmp(&w[a]).then(a.cmp(&b)));
-        let mut callee = CALLEE_SAVED.iter().copied();
         let mut slots = 0u32;
         for &v in order.iter().filter(|&&v| f.vars[v].ty == Ty::I128) { // i128_plan.t27: 16 frame bytes, laid out first (16-aligned)
             if w[v] > 0 { (self.homes[v], w[v], slots) = (Home::Slot(8 * slots), 0, slots + ip::HOME_WORDS); }
         }
-        if !has_call {
-            // Leaf: parameters stay in their argument registers; the free
-            // argument registers are homes too.
-            // An F64 parameter arrives in a d register; it gets a home like
-            // any other variable and the prologue moves it there.
-            let regs = Program::arg_regs(f);
-            let nint = regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0);
-            let mut caller: Vec<Reg> = ((nint as Reg)..8).collect();
-            caller.reverse();
-            for (p, &(fp, k)) in regs.iter().enumerate() {
-                if !fp && k < 8 && f.vars[p].ty != Ty::I128 { // a pair parameter is homed in the frame
-                    self.homes[p] = Home::Reg(k as Reg);
-                }
+        // The home pools are home_plan.t27's: a leaf's free argument registers
+        // (nint..8) first, then the callee-saved registers, then the slots.
+        let nint = if has_call { 8 } else { regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0) };
+        let mut taken_caller = 0u32;
+        let mut taken_callee = 0usize;
+        for (p, &(fp, k)) in regs.iter().enumerate() {
+            if home_plan::param_keeps_arg_reg(fp, k as u64, f.vars[p].ty == Ty::I128) {
+                self.homes[p] = Home::Reg(k as Reg); // a pair parameter is homed in the frame
             }
-            for &v in &order {
-                if (v < f.nparams && !regs[v].0 && regs[v].1 < 8) || w[v] == 0 {
-                    continue;
-                }
-                self.homes[v] = if let Some(r) = caller.pop() {
-                    Home::Reg(r)
-                } else if let Some(r) = callee.next() {
-                    self.used_callee.push(r);
-                    Home::Reg(r)
-                } else {
-                    slots += 1;
-                    Home::Slot(8 * (slots - 1))
-                };
+        }
+        for &v in &order {
+            if w[v] == 0 || (!has_call && v < f.nparams && !regs[v].0 && regs[v].1 < 8) {
+                continue; // never read, or already homed in its argument register
             }
-        } else {
-            for &v in &order {
-                if w[v] == 0 {
-                    continue;
-                }
-                self.homes[v] = if let Some(r) = callee.next() {
-                    self.used_callee.push(r);
-                    Home::Reg(r)
-                } else {
-                    slots += 1;
-                    Home::Slot(8 * (slots - 1))
-                };
+            let home = home_plan::next_home(
+                !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64),
+                home_plan::callee_pool_has(CALLEE_SAVED.len() as u64, taken_callee as u64),
+                slots as u64,
+            );
+            match home >> 32 {
+                home_plan::HOME_CALLER => { self.homes[v] = Home::Reg((nint + taken_caller) as Reg); taken_caller += 1; }
+                home_plan::HOME_CALLEE => { let r = CALLEE_SAVED[taken_callee]; taken_callee += 1; self.used_callee.push(r); self.homes[v] = Home::Reg(r); }
+                _ => { self.homes[v] = Home::Slot(8 * (home & 0xFFFFFFFF) as u32); slots += 1; }
             }
         }
         self.nvar_slots = slots;
