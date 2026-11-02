@@ -250,3 +250,16 @@ Pilot v2 on v0.3-real TRAIN-SPLIT-ONLY trainpack (7.06M tokens available,
 - Pilot v3 (task-format pack, 274 docs, 0x00 masked separator): honest val
   bpb 3.9503 vs v2 4.2976 (format hypothesis CONFIRMED on LM metric).
   Fair task-metric bench with separator-aware prompts: RUNNING in background.
+
+## DIRECTIVE COMPLIANCE + EVIDENCE PACK (2026-11-02 evening)
+
+Owner directive applied: R0 gate 20 prompts/seed/logits-sha256-both-sides
+(rewrite_plan.t27 now 8/8 t27b, was 6/6); NOT_MEASURED #457 flagged false in
+spec law; foreign actor (synth-recovery lane) respected - zero path overlap
+verified, their staged foreign files untouched, pathspec commits only.
+Full hashes: t27 0c6c901e353a00e9a8d27613b27c3fc152c91fd5,
+2e8065e8c13c8d3353c667500d4972cb78e0bdc2; igla-coder-gpu 6c8433f72a82bd826ea7673b08ceb5380b364205,
+7a9ae6110f900eecd7f0aa81539ccc5f59c8d07a,
+e6f50771fd02af9115cc5f9ecf2b422fc9fe36b2,
+1d062f090118adf0729eaf8182f8b2649643db09,
+5ea9a9285f3f6341575c915add9f69519e8bb319.

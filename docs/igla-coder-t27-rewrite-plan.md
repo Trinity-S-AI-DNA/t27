@@ -78,9 +78,10 @@ Export `final.pt` weights -> `gen-json` -> .t27 const banks -> forward in .t27
 Runs under `--backend ml` with host_read for the weight file (or literal banks
 for the 4.49M/vocab-256 fixture: wte 65,536 + blocks 4.43M f64... too big for
 literals — file path it is; no argv: path is a string literal, documented trap).
-**Gate R0:** logits match the torch reference on 3 fixed prompts within f32
-tolerance (max abs diff < 1e-4 on <=256-vocab logits); tok/s recorded.
-Evidence: receipt file + hashes.
+**Gate R0 (strengthened by owner directive 2026-11-02):** logits match the
+torch reference on **20 fixed prompts** (was 3), fixed seed recorded, and the
+receipt carries the **sha256 of the logits from BOTH sides** (t27 reference and
+torch reference); tok/s recorded. Evidence: receipt file + hashes.
 
 ### R1 — Training step in .t27
 Hand-composed backward through the pilot net (per-op backwards exist: dense,
@@ -120,3 +121,25 @@ R0/R1 proceed NOW on CPU (no GPU, no new foreign files in t27 — new specs +
 `--backend ml` binaries under gen/). The Python runner stays the experiment
 backend until R2 supersedes it; every phase's evidence lands as receipts, not
 prose. INT8 stays a separate experiment per owner E-phase rule.
+
+## 7. Directive compliance (owner, 2026-11-02 evening)
+
+- **R0 gate strengthened:** 20 fixed prompts + fixed seed + logits sha256 from
+  both sides (spec consts `R0_PROMPT_COUNT/R0_SEED_FIXED/R0_LOGITS_SHA256_BOTH`,
+  tests 8/8 t27b).
+- **NOT_MEASURED #457:** `INT8_PACKED_TRITS_MEASURED = false` in spec law; no R3
+  forecast may cite int8 x packed-trits until measured.
+- **Foreign actor:** a parallel lane (synth-spec-recovery / corpus-ratchet
+  repair, PR #13121 lineage) committed on the same branch while this lane
+  worked (c8de1bf5, a782877e, 64d2fd97 - specs/scratch + docs/reviews paths,
+  zero overlap with igla-coder files, verified `git diff` empty on our paths).
+  Our commits are pathspec-only; their staged foreign files (cli/tri/src/fpga.rs
+  etc.) were left staged untouched; no force-push; conflicts escalate to owner.
+- **Evidence pack 2026-11-02:** t27 branch
+  `golden-training/prepared-artifacts` -> 0c6c901e35 (plan+spec+inventory,
+  301 insertions) and 2e8065e8c1 (datasets+specs+receipts, 167+ files);
+  igla-coder-gpu branch `feat/int8-mm-optin` -> 6c8433f (int8, 40 lines),
+  7a9ae61 (probe, 70), e6f5077 (bench+results, 824), 1d062f0 (pilot v2),
+  5ea9a92 (pilot v3). Raw t27b tails: rewrite_plan 8 passed 0 failed
+  (strengthened), bench_t27_tasks 5/0, rollback_plan 6/0, gpu_reservation
+  5/0, p4_budget 4/0.
