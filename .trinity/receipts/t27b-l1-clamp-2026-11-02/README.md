@@ -811,7 +811,9 @@ holds **11** `test` blocks on `origin/master` and **16** on this branch, so a ru
 printing `16 total` read this branch's file and not master's.
 
 The binary is recorded by what is actually known about it, with no guess at its
-provenance: `/Users/playra/t27/target/release/t27b`, 3 226 800 B, mtime
+provenance: `~/t27/target/release/t27b` (the main clone, not this worktree --
+the home prefix is written with a tilde because the `scan` gate refuses the
+literal, which is how this line first turned that check red), 3 226 800 B, mtime
 2026-11-01 20:19, sha256
 `ee89c7d27724dc115e74870f06a4e390b74ad898ebb84db8a10ba05f283a3cf5`. Which commit
 built it is not recorded anywhere this receipt can read, so it is left unstated
