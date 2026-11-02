@@ -1,0 +1,1267 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/ladder_task.t27 -- the LADDER TASK: the state of one task while the T27 Ladder walks its rungs.
+// Owner, 2026-11-02 (translated): a step down the provider ladder must show "switching" or "waiting for the
+// limit to come back", not end the task with a red error; when another allowed key or provider can go on, the
+// agent goes on. A red final refusal only when the task really cannot continue.
+// Refs #13036 (Ladder Doctor; its classes, its walk and its control check are imported here, never copied).
+//
+// The Doctor decides what one refusal is (its class) and when a rung is healed (a control request through the
+// same path). This spec keeps what the Doctor does not: the task. One record of TF_F u64 cells per task, six
+// states, one line for the owner per state, and the point a task resumes from after a break.
+//   1. STATES (FR-001): RUNNING, SWITCHING_PROVIDER, WAITING_CAPACITY, WAITING_CREDENTIALS, FAILED, CANCELLED.
+//      A step down the ladder is SWITCHING_PROVIDER, never FAILED. The first and the last refusal (rung,
+//      status, class) are kept in the record and in diag_line as they came; no refusal is renamed.
+//   2. THE WAIT (FR-002): when no allowed rung is left, a task with a rung whose last refusal is a class that
+//      time clears (RATE, TRANSIENT, SLOW) waits for capacity; a task whose rungs all refused with a class
+//      that needs the owner (UNFUNDED, CREDENTIAL, UNWIRED, UNKNOWN) waits for credentials.
+//   3. FAILED ONLY ON GIVE_UP: no status of any rung makes a task FAILED. Only a tool action that ran
+//      EFFECT_RUN_LIMIT times and left no result does (control.t27 DO_GIVE_UP).
+//   4. MESSAGES (FR-003): status_line gives one line per state, under LT_MSG_MAX and safe inside a JSON
+//      string. It names the cause, the rung and the next step. A reset time is shown only when the provider
+//      gave one. No line promises that a key, a balance or a limit fixes a cause that is not established,
+//      and no line calls a refusal a lack of tokens.
+//   5. RESUME BY EVENT (FR-004): an event (capacity back, key added) wakes one check through the same path,
+//      the Doctor's control_outcome decides it, and only a pass resumes the saved task. Without events the
+//      capacity wait is checked on the bounded schedule of waits.t27 (30, 60, 120, then every 240 s) and the
+//      checks stop at WAIT_MAX_SECONDS. A resume sends the saved request; it never restarts the task.
+//   6. RESULTS ARE NOT LOST (FR-005): a partial answer is counted and kept for diagnostics, never glued to
+//      another rung's answer; the rung that takes over gets the saved request fresh. A break during a tool
+//      call resumes through the effect journal of control.t27: a done action is skipped, a journaled one is
+//      looked up, and an external action that may have run is held for the owner, never repeated.
+//   7. STOP (FR-006): the owner's Stop is final. A CANCELLED task answers nothing: no event, check or
+//      resume moves it again.
+//   8. ROUTES (FR-007): only rungs in the task's allowed mask are sent, checked or woken. No rung is added,
+//      no account is changed, and no request goes to a rung outside the mask.
+// CHOICES (each a choice; the owner may overrule it):
+//   C1. There is no REQUEST class: 400 and 413 stay the Doctor's UNKNOWN, so the task waits for the owner.
+//   C2. A capacity wait that reaches WAIT_MAX_SECONDS is not FAILED: it waits for the owner (cause
+//       EXPIRED). A key added, or capacity back on a rung that is not hard, still wakes one check.
+//   C3. An EXTERNAL tool action with an intent and no result is held (RP_HOLD), although it may not have
+//       run: a repeat could act twice.
+//   C4. A reset time from the provider is shown but does not plan the checks. Only the latest refusal's
+//       reset is kept; a refusal without one clears it.
+//   C5. After a resume or an answer the task stays on the rung that answered; it does not climb back.
+//   C6. A 200 that is not proof (control_outcome REPORT) keeps the wait. A refused check counts in
+//       TF_CHECKS, not in TF_REFUSALS.
+//   C7. The switching line names the class (UNFUNDED, RATE, ...) instead of "the provider limited
+//       requests", because a refusal is not always a limit.
+//   C8. A 200 past the Doctor's call ceiling (240000 ms) is a refusal with no answer (SLOW), never a served
+//       result.
+// Not here, on purpose: an event source (keys.t27 has no key-added event, and the PTY journal waits on
+// #13088), the glue that feeds calls in and acts on the TA_* actions, the T27 OS window that shows
+// status_line, and any conductor, cron job or service. This spec is a contract; nothing runs it yet.
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27OsLadderTask;
+
+use t27os::ladder_doctor::LC_UNFUNDED;
+use t27os::ladder_doctor::LC_CREDENTIAL;
+use t27os::ladder_doctor::LC_RATE;
+use t27os::ladder_doctor::LC_TRANSIENT;
+use t27os::ladder_doctor::LC_UNWIRED;
+use t27os::ladder_doctor::LC_SLOW;
+use t27os::ladder_doctor::LD_RUNGS_MAX;
+use t27os::ladder_doctor::LX_RESOLVE;
+use t27os::ladder_doctor::LA_SERVE;
+use t27os::ladder_doctor::narrow;
+use t27os::ladder_doctor::pow2;
+use t27os::ladder_doctor::has_bit;
+use t27os::ladder_doctor::with_bit;
+use t27os::ladder_doctor::cells_zero;
+use t27os::ladder_doctor::classify;
+use t27os::ladder_doctor::classify_timed;
+use t27os::ladder_doctor::timed_status;
+use t27os::ladder_doctor::action_after_call;
+use t27os::ladder_doctor::put_class;
+use t27os::ladder_doctor::next_from;
+use t27os::ladder_doctor::control_outcome;
+use t27os::ladder_doctor::line_is_safe;
+use t27os::ladder::PROBE_TOKENS;
+use queen::waits::WAIT_MAX_SECONDS;
+use queen::waits::recheck_in_seconds;
+use queen::control::EFF_NONE;
+use queen::control::EFF_INTENT;
+use queen::control::EFF_DONE;
+use queen::control::EK_MODEL_CALL;
+use queen::control::EK_PUSH;
+use queen::control::DO_RUN;
+use queen::control::DO_SKIP;
+use queen::control::DO_LOOK;
+use queen::control::DO_GIVE_UP;
+use queen::control::EFFECT_RUN_LIMIT;
+use queen::control::effect_action;
+use queen::control::after_look;
+use queen::control::write_lands;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::editors::same_bytes;
+use t27os::keysync::contains;
+
+// ---- 1. States, causes, actions, events (FR-001) ----------------------------------------------------------
+
+/// The six states of a task. FAILED and CANCELLED are the only ends.
+pub const LT_RUNNING : u32 = 0;
+pub const LT_SWITCHING_PROVIDER : u32 = 1;
+pub const LT_WAITING_CAPACITY : u32 = 2;
+pub const LT_WAITING_CREDENTIALS : u32 = 3;
+pub const LT_FAILED : u32 = 4;
+pub const LT_CANCELLED : u32 = 5;
+pub const LT_STATES : u32 = 6;
+
+/// Why a task waits or ended. LADDER: every allowed rung refused. NO_ROUTE: no rung is allowed. EFFECT_UNKNOWN:
+/// a tool action may have run (C3). EXPIRED: the capacity wait reached WAIT_MAX_SECONDS (C2). GIVE_UP: a tool
+/// action ran EFFECT_RUN_LIMIT times. OWNER_STOP: the owner's Stop.
+pub const CAUSE_NONE : u32 = 0;
+pub const CAUSE_LADDER : u32 = 1;
+pub const CAUSE_NO_ROUTE : u32 = 2;
+pub const CAUSE_EFFECT_UNKNOWN : u32 = 3;
+pub const CAUSE_EXPIRED : u32 = 4;
+pub const CAUSE_GIVE_UP : u32 = 5;
+pub const CAUSE_OWNER_STOP : u32 = 6;
+
+/// What the glue does next. SEND: send the saved request to TF_RUNG. CHECK: one control request through
+/// TF_CHECK_RUNG. WAIT: nothing until an event or wake_at. REPORT: show status_line, the task ended.
+/// DELIVER: hand the answer over. TOOL: run the journaled tool action. LOOK: look the effect up first.
+pub const TA_NONE : u32 = 0;
+pub const TA_SEND : u32 = 1;
+pub const TA_CHECK : u32 = 2;
+pub const TA_WAIT : u32 = 3;
+pub const TA_REPORT : u32 = 4;
+pub const TA_DELIVER : u32 = 5;
+pub const TA_TOOL : u32 = 6;
+pub const TA_LOOK : u32 = 7;
+
+/// Events that wake a waiting task (FR-004). RECHECK is the bounded timer, the only one that needs no source.
+pub const LE_CAPACITY_BACK : u32 = 0;
+pub const LE_KEY_ADDED : u32 = 1;
+pub const LE_RECHECK : u32 = 2;
+
+/// The record: TF_F u64 cells. Masks have one bit per rung. TIME: rungs whose last refusal time clears. HARD:
+/// rungs whose last refusal needs the owner. WAIT_FROM, DUE_AT, RESET_AT are seconds; PARTIAL and LAST_PARTIAL
+/// are bytes. Those five are read as u64; every other cell is small and read through lt_get.
+pub const TF_STATE : usize = 0;
+pub const TF_RUNG : usize = 1;
+pub const TF_TRIED : usize = 2;
+pub const TF_ALLOWED : usize = 3;
+pub const TF_N : usize = 4;
+pub const TF_HARD : usize = 5;
+pub const TF_TIME : usize = 6;
+pub const TF_FIRST_RUNG : usize = 7;
+pub const TF_FIRST_STATUS : usize = 8;
+pub const TF_FIRST_CLASS : usize = 9;
+pub const TF_LAST_RUNG : usize = 10;
+pub const TF_LAST_STATUS : usize = 11;
+pub const TF_LAST_CLASS : usize = 12;
+pub const TF_REFUSALS : usize = 13;
+pub const TF_WAIT_FROM : usize = 14;
+pub const TF_CHECKS : usize = 15;
+pub const TF_CHECK_RUNG : usize = 16;
+pub const TF_RESET_AT : usize = 17;
+pub const TF_CAUSE : usize = 18;
+pub const TF_PARTIAL : usize = 19;
+pub const TF_LAST_PARTIAL : usize = 20;
+pub const TF_SWITCHES : usize = 21;
+pub const TF_FROM : usize = 22;
+pub const TF_DUE_AT : usize = 23;
+pub const TF_F : usize = 24;
+
+/// Tool kinds (FR-005). READ changes nothing outside. JOURNALED writes its effect to the journal of
+/// control.t27. EXTERNAL acts outside and has no journal.
+pub const TK_READ : u32 = 0;
+pub const TK_JOURNALED : u32 = 1;
+pub const TK_EXTERNAL : u32 = 2;
+
+/// Where a task resumes after a break. FRESH: the saved request again, the partial answer unused.
+/// WITH_RESULT: the saved request with the tool result. LOOK: look the effect up. RUN: run the action.
+/// HOLD: wait for the owner (C3). GIVE_UP: the task fails. NOTHING: a stale writer, nothing changes.
+pub const RP_FRESH : u32 = 0;
+pub const RP_WITH_RESULT : u32 = 1;
+pub const RP_LOOK : u32 = 2;
+pub const RP_RUN : u32 = 3;
+pub const RP_HOLD : u32 = 4;
+pub const RP_GIVE_UP : u32 = 5;
+pub const RP_NOTHING : u32 = 6;
+
+/// The size of the buffer status_line and diag_line need; every line is shorter.
+pub const LT_MSG_MAX : usize = 320;
+
+pub fn lt_get(rec: []u64, f: usize) -> u32 {
+    return narrow(rec[f]);
+}
+
+pub fn lt_put(rec: []u64, f: usize, v: u32) -> void {
+    rec[f] = @as(u64, v);
+}
+
+pub fn task_ended(st: u32) -> bool {
+    return st == LT_FAILED or st == LT_CANCELLED;
+}
+
+pub fn task_waits(st: u32) -> bool {
+    return st == LT_WAITING_CAPACITY or st == LT_WAITING_CREDENTIALS;
+}
+
+pub fn task_on_ladder(st: u32) -> bool {
+    return st == LT_RUNNING or st == LT_SWITCHING_PROVIDER;
+}
+
+/// The classes that time alone can clear (law 2). Every other class waits for the owner.
+pub fn clears_with_time(cls: u32) -> bool {
+    return cls == LC_RATE or cls == LC_TRANSIENT or cls == LC_SLOW;
+}
+
+pub fn without_bit(mask: u32, i: u32) -> u32 {
+    if (has_bit(mask, i) == false) { return mask; }
+    return mask - pow2(i);
+}
+
+// ---- 2. Rungs and the allowed mask (FR-007) ---------------------------------------------------------------
+
+/// The rungs below n a task may not use: the tried ones and every one outside the allowed mask.
+pub fn closed_mask(tried: u32, allowed: u32, n: u32) -> u32 {
+    var m : u32 = tried;
+    var r : u32 = 0;
+    while (r < n) {
+        if (has_bit(allowed, r) == false) { m = with_bit(m, r); }
+        r = r + 1;
+    }
+    return m;
+}
+
+/// The first allowed rung not yet tried, through the Doctor's own walk; n when none is left.
+pub fn next_allowed(tried: u32, allowed: u32, n: u32) -> u32 {
+    return next_from(0, closed_mask(tried, allowed, n), n);
+}
+
+/// The next rung after `after`, going round, whose bit is in `mask`; n when the mask is empty.
+pub fn next_in(mask: u32, after: u32, n: u32) -> u32 {
+    if (n == 0) { return 0; }
+    var k : u32 = 1;
+    var r : u32 = 0;
+    while (k <= n) {
+        r = (after + k) % n;
+        if (has_bit(mask, r)) { return r; }
+        k = k + 1;
+    }
+    return n;
+}
+
+// ---- 3. The wait (FR-002, FR-004) -------------------------------------------------------------------------
+
+/// Put a rung in TIME or in HARD by the class of its last refusal.
+pub fn mark_class(rec: []u64, rung: u32, cls: u32) -> void {
+    if (clears_with_time(cls)) {
+        lt_put(rec, TF_TIME, with_bit(lt_get(rec, TF_TIME), rung));
+        lt_put(rec, TF_HARD, without_bit(lt_get(rec, TF_HARD), rung));
+    }
+    if (clears_with_time(cls) == false) {
+        lt_put(rec, TF_HARD, with_bit(lt_get(rec, TF_HARD), rung));
+        lt_put(rec, TF_TIME, without_bit(lt_get(rec, TF_TIME), rung));
+    }
+}
+
+/// C4: the reset the provider named with the latest refusal, as a time; 0 when it named none.
+pub fn set_reset(rec: []u64, reset_s: u64, now: u64) -> void {
+    rec[TF_RESET_AT] = 0;
+    if (reset_s > 0) { rec[TF_RESET_AT] = now + reset_s; }
+}
+
+/// Seconds left before the capacity wait reaches WAIT_MAX_SECONDS.
+pub fn wait_left(rec: []u64, now: u64) -> u32 {
+    const opened : u64 = rec[TF_WAIT_FROM];
+    const limit : u64 = @as(u64, WAIT_MAX_SECONDS);
+    if (now < opened) { return WAIT_MAX_SECONDS; }
+    if (now - opened >= limit) { return 0; }
+    return narrow(limit - (now - opened));
+}
+
+/// The next check on the bounded schedule of waits.t27, never after the end of the wait.
+pub fn plan_check(rec: []u64, now: u64) -> void {
+    const gap : u32 = recheck_in_seconds(lt_get(rec, TF_CHECKS), wait_left(rec, now));
+    rec[TF_DUE_AT] = now + @as(u64, gap);
+}
+
+pub fn note_refusal(rec: []u64, rung: u32, status: u32, cls: u32, reset_s: u64, now: u64) -> void {
+    lt_put(rec, TF_LAST_RUNG, rung);
+    lt_put(rec, TF_LAST_STATUS, status);
+    lt_put(rec, TF_LAST_CLASS, cls);
+    set_reset(rec, reset_s, now);
+    mark_class(rec, rung, cls);
+}
+
+/// No allowed rung is left: wait for capacity when a rung's last refusal time clears, else for the owner.
+pub fn open_wait(rec: []u64, now: u64) -> void {
+    const n : u32 = lt_get(rec, TF_N);
+    const timed : u32 = lt_get(rec, TF_TIME);
+    rec[TF_WAIT_FROM] = now;
+    lt_put(rec, TF_CHECKS, 0);
+    lt_put(rec, TF_CAUSE, CAUSE_LADDER);
+    if (timed != 0) {
+        lt_put(rec, TF_STATE, LT_WAITING_CAPACITY);
+        lt_put(rec, TF_CHECK_RUNG, next_in(timed, lt_get(rec, TF_LAST_RUNG), n));
+        plan_check(rec, now);
+    }
+    if (timed == 0) {
+        lt_put(rec, TF_STATE, LT_WAITING_CREDENTIALS);
+        rec[TF_DUE_AT] = 0;
+        lt_put(rec, TF_CHECK_RUNG, n);
+    }
+}
+
+// ---- 4. The walk of one task (FR-001, FR-005, FR-007) -----------------------------------------------------
+
+/// A new task on the rungs of `allowed` below n (at most LD_RUNGS_MAX). TA_NONE when the record is too small.
+pub fn task_start(rec: []u64, allowed: u32, n: u32, now: u64) -> u32 {
+    if (rec.len < TF_F) { return TA_NONE; }
+    const z : bool = cells_zero(rec, TF_F);
+    if (z == false) { return TA_NONE; }
+    var m : u32 = n;
+    if (m > LD_RUNGS_MAX) { m = LD_RUNGS_MAX; }
+    lt_put(rec, TF_N, m);
+    lt_put(rec, TF_ALLOWED, allowed);
+    lt_put(rec, TF_CHECK_RUNG, m);
+    const head : u32 = next_allowed(0, allowed, m);
+    if (head >= m) {
+        lt_put(rec, TF_RUNG, m);
+        lt_put(rec, TF_STATE, LT_WAITING_CREDENTIALS);
+        lt_put(rec, TF_CAUSE, CAUSE_NO_ROUTE);
+        rec[TF_WAIT_FROM] = now;
+        return TA_WAIT;
+    }
+    lt_put(rec, TF_STATE, LT_RUNNING);
+    lt_put(rec, TF_RUNG, head);
+    return TA_SEND;
+}
+
+/// The saved request reached the rung the task switched to.
+pub fn task_sent(rec: []u64, rung: u32) -> u32 {
+    const st : u32 = lt_get(rec, TF_STATE);
+    if (st == LT_SWITCHING_PROVIDER and rung == lt_get(rec, TF_RUNG)) {
+        lt_put(rec, TF_FROM, st);
+        lt_put(rec, TF_STATE, LT_RUNNING);
+    }
+    return TA_NONE;
+}
+
+/// A call on the current rung ended without a served answer: before the answer (partial 0) or after
+/// `partial` bytes. The partial bytes are counted, never used (law 6). The next allowed rung gets the saved
+/// request (SWITCHING_PROVIDER); with none left the task waits (law 2). A served 200 or a stale rung: TA_NONE.
+pub fn task_refused(rec: []u64, rung: u32, status: u32, elapsed_ms: u64, partial: u64, reset_s: u64, now: u64) -> u32 {
+    const st : u32 = lt_get(rec, TF_STATE);
+    const n : u32 = lt_get(rec, TF_N);
+    if (task_on_ladder(st) == false or rung != lt_get(rec, TF_RUNG)) { return TA_NONE; }
+    if (action_after_call(status, elapsed_ms) == LA_SERVE) { return TA_NONE; }
+    const ts : u32 = timed_status(status, elapsed_ms);
+    const cls : u32 = classify_timed(ts, rung, n, elapsed_ms);
+    if (lt_get(rec, TF_REFUSALS) == 0) {
+        lt_put(rec, TF_FIRST_RUNG, rung);
+        lt_put(rec, TF_FIRST_STATUS, ts);
+        lt_put(rec, TF_FIRST_CLASS, cls);
+    }
+    note_refusal(rec, rung, ts, cls, reset_s, now);
+    lt_put(rec, TF_REFUSALS, lt_get(rec, TF_REFUSALS) + 1);
+    rec[TF_PARTIAL] = rec[TF_PARTIAL] + partial;
+    rec[TF_LAST_PARTIAL] = partial;
+    lt_put(rec, TF_TRIED, with_bit(lt_get(rec, TF_TRIED), rung));
+    lt_put(rec, TF_FROM, st);
+    const nx : u32 = next_allowed(lt_get(rec, TF_TRIED), lt_get(rec, TF_ALLOWED), n);
+    if (nx < n) {
+        lt_put(rec, TF_STATE, LT_SWITCHING_PROVIDER);
+        lt_put(rec, TF_RUNG, nx);
+        lt_put(rec, TF_SWITCHES, lt_get(rec, TF_SWITCHES) + 1);
+        return TA_SEND;
+    }
+    open_wait(rec, now);
+    return TA_WAIT;
+}
+
+/// The current rung served the answer (C5: the task stays on it). Rungs that time clears are open again.
+pub fn task_answered(rec: []u64, rung: u32) -> u32 {
+    const st : u32 = lt_get(rec, TF_STATE);
+    if (task_on_ladder(st) == false or rung != lt_get(rec, TF_RUNG)) { return TA_NONE; }
+    lt_put(rec, TF_TRIED, lt_get(rec, TF_HARD));
+    lt_put(rec, TF_TIME, 0);
+    lt_put(rec, TF_FROM, st);
+    lt_put(rec, TF_STATE, LT_RUNNING);
+    return TA_DELIVER;
+}
+
+/// A check passed on `rung`: the saved task goes on there (law 5).
+pub fn resume_on(rec: []u64, rung: u32, st: u32) -> u32 {
+    const hard : u32 = without_bit(lt_get(rec, TF_HARD), rung);
+    lt_put(rec, TF_HARD, hard);
+    lt_put(rec, TF_TRIED, hard);
+    lt_put(rec, TF_FROM, st);
+    lt_put(rec, TF_STATE, LT_RUNNING);
+    lt_put(rec, TF_RUNG, rung);
+    lt_put(rec, TF_TIME, 0);
+    lt_put(rec, TF_CHECKS, 0);
+    rec[TF_DUE_AT] = 0;
+    rec[TF_RESET_AT] = 0;
+    lt_put(rec, TF_CAUSE, CAUSE_NONE);
+    lt_put(rec, TF_CHECK_RUNG, lt_get(rec, TF_N));
+    return TA_SEND;
+}
+
+/// The bounded timer of a capacity wait: CHECK when due and re-armed; at WAIT_MAX_SECONDS the checks stop and
+/// the task waits for the owner (C2).
+pub fn wait_recheck(rec: []u64, now: u64) -> u32 {
+    if (lt_get(rec, TF_STATE) != LT_WAITING_CAPACITY or now < rec[TF_DUE_AT]) { return TA_WAIT; }
+    const left : u32 = wait_left(rec, now);
+    if (left == 0) {
+        lt_put(rec, TF_FROM, LT_WAITING_CAPACITY);
+        lt_put(rec, TF_STATE, LT_WAITING_CREDENTIALS);
+        lt_put(rec, TF_CAUSE, CAUSE_EXPIRED);
+        rec[TF_DUE_AT] = 0;
+        lt_put(rec, TF_CHECK_RUNG, lt_get(rec, TF_N));
+        return TA_WAIT;
+    }
+    rec[TF_DUE_AT] = now + @as(u64, recheck_in_seconds(lt_get(rec, TF_CHECKS) + 1, left));
+    return TA_CHECK;
+}
+
+/// An event for a waiting task (law 5). It only asks for one check; it never resumes a task by itself.
+/// A held tool action (EFFECT_UNKNOWN) is woken by no event: the owner checks it.
+pub fn task_wake(rec: []u64, ev: u32, rung: u32, now: u64) -> u32 {
+    const st : u32 = lt_get(rec, TF_STATE);
+    const cz : u32 = lt_get(rec, TF_CAUSE);
+    if (task_waits(st) == false) { return TA_NONE; }
+    if (ev == LE_RECHECK) { return wait_recheck(rec, now); }
+    if (rung >= lt_get(rec, TF_N) or has_bit(lt_get(rec, TF_ALLOWED), rung) == false) { return TA_NONE; }
+    if (ev == LE_CAPACITY_BACK) {
+        var may_check : bool = st == LT_WAITING_CAPACITY;
+        if (st == LT_WAITING_CREDENTIALS and cz == CAUSE_EXPIRED) { may_check = true; }
+        if (may_check == false or has_bit(lt_get(rec, TF_HARD), rung)) { return TA_NONE; }
+        lt_put(rec, TF_CHECK_RUNG, rung);
+        return TA_CHECK;
+    }
+    if (ev == LE_KEY_ADDED) {
+        if (cz == CAUSE_EFFECT_UNKNOWN) { return TA_NONE; }
+        lt_put(rec, TF_HARD, without_bit(lt_get(rec, TF_HARD), rung));
+        lt_put(rec, TF_CHECK_RUNG, rung);
+        return TA_CHECK;
+    }
+    return TA_NONE;
+}
+
+/// The answer to one check through TF_CHECK_RUNG. Only the Doctor's control_outcome RESOLVE resumes the task
+/// (C6). A refusal is recorded and the wait goes on, on the next rung that time clears, or with the owner.
+pub fn task_checked(rec: []u64, rung: u32, status: u32, tokens: u32, messages: u32, tools: u32, same_path: bool, reset_s: u64, now: u64) -> u32 {
+    const st : u32 = lt_get(rec, TF_STATE);
+    const n : u32 = lt_get(rec, TF_N);
+    if (task_waits(st) == false or rung >= n) { return TA_NONE; }
+    if (has_bit(lt_get(rec, TF_ALLOWED), rung) == false or rung != lt_get(rec, TF_CHECK_RUNG)) { return TA_NONE; }
+    if (lt_get(rec, TF_CAUSE) == CAUSE_EFFECT_UNKNOWN) { return TA_NONE; }
+    if (control_outcome(status, tokens, messages, tools, same_path) == LX_RESOLVE) { return resume_on(rec, rung, st); }
+    lt_put(rec, TF_CHECKS, lt_get(rec, TF_CHECKS) + 1);
+    if (status == 200) {
+        if (st == LT_WAITING_CAPACITY) { plan_check(rec, now); }
+        return TA_WAIT;
+    }
+    const cls : u32 = classify(status, rung, n);
+    note_refusal(rec, rung, status, cls, reset_s, now);
+    if (clears_with_time(cls)) {
+        if (st == LT_WAITING_CREDENTIALS) {
+            lt_put(rec, TF_FROM, st);
+            lt_put(rec, TF_STATE, LT_WAITING_CAPACITY);
+            lt_put(rec, TF_CAUSE, CAUSE_LADDER);
+            rec[TF_WAIT_FROM] = now;
+            lt_put(rec, TF_CHECKS, 0);
+            lt_put(rec, TF_CHECK_RUNG, rung);
+        }
+        if (st == LT_WAITING_CAPACITY) { lt_put(rec, TF_CHECK_RUNG, next_in(lt_get(rec, TF_TIME), rung, n)); }
+        plan_check(rec, now);
+        return TA_WAIT;
+    }
+    if (st == LT_WAITING_CAPACITY and lt_get(rec, TF_TIME) != 0) {
+        lt_put(rec, TF_CHECK_RUNG, next_in(lt_get(rec, TF_TIME), rung, n));
+        plan_check(rec, now);
+        return TA_WAIT;
+    }
+    lt_put(rec, TF_FROM, st);
+    lt_put(rec, TF_STATE, LT_WAITING_CREDENTIALS);
+    lt_put(rec, TF_CAUSE, CAUSE_LADDER);
+    rec[TF_DUE_AT] = 0;
+    lt_put(rec, TF_CHECK_RUNG, n);
+    return TA_WAIT;
+}
+
+/// The owner's Stop (law 7): final from any state that has not ended.
+pub fn task_stop(rec: []u64) -> u32 {
+    const st : u32 = lt_get(rec, TF_STATE);
+    if (task_ended(st)) { return TA_NONE; }
+    lt_put(rec, TF_FROM, st);
+    lt_put(rec, TF_STATE, LT_CANCELLED);
+    lt_put(rec, TF_CAUSE, CAUSE_OWNER_STOP);
+    rec[TF_DUE_AT] = 0;
+    return TA_REPORT;
+}
+
+/// When the bounded timer wants LE_RECHECK; 0 when no timer runs.
+pub fn wake_at(rec: []u64) -> u64 {
+    if (lt_get(rec, TF_STATE) == LT_WAITING_CAPACITY) { return rec[TF_DUE_AT]; }
+    return 0;
+}
+
+// ---- 5. Where a break resumes (FR-005) --------------------------------------------------------------------
+
+pub fn from_effect(d: u8) -> u32 {
+    if (d == DO_RUN) { return RP_RUN; }
+    if (d == DO_SKIP) { return RP_WITH_RESULT; }
+    if (d == DO_LOOK) { return RP_LOOK; }
+    if (d == DO_GIVE_UP) { return RP_GIVE_UP; }
+    return RP_NOTHING;
+}
+
+/// The resume point after a break. `entry`, `kind`, `runs` and the fences are the journal of control.t27;
+/// `emitted_whole` says the model had emitted the whole tool call before the break. A stale writer changes
+/// nothing; a tool call never emitted whole is sent fresh; a READ runs again; a JOURNALED action follows
+/// effect_action; an EXTERNAL action with an intent and no result is held (C3). An unknown kind is EXTERNAL.
+pub fn resume_point(tk: u32, entry: u8, kind: u8, runs: u32, fence: u64, my_fence: u64, emitted_whole: bool) -> u32 {
+    if (write_lands(fence, my_fence) == false) { return RP_NOTHING; }
+    if (emitted_whole == false and entry == EFF_NONE) { return RP_FRESH; }
+    if (tk == TK_READ) {
+        if (entry == EFF_DONE) { return RP_WITH_RESULT; }
+        return RP_RUN;
+    }
+    if (tk == TK_JOURNALED) { return from_effect(effect_action(entry, kind, runs, fence, my_fence)); }
+    if (entry == EFF_DONE) { return RP_WITH_RESULT; }
+    if (entry == EFF_NONE) { return RP_RUN; }
+    return RP_HOLD;
+}
+
+/// After a LOOK: a found effect is skipped, a missing one runs again inside EFFECT_RUN_LIMIT.
+pub fn resume_after_look(found: bool, runs: u32) -> u32 {
+    return from_effect(after_look(found, runs));
+}
+
+/// Apply a resume point to the task. GIVE_UP is the only road to FAILED (law 3). HOLD waits for the owner.
+/// Clearing a hold puts the task back where it was: on its rung, or in the ladder wait if that rung refused.
+pub fn apply_resume(rec: []u64, rp: u32, now: u64) -> u32 {
+    const st : u32 = lt_get(rec, TF_STATE);
+    if (task_ended(st) or rp >= RP_NOTHING) { return TA_NONE; }
+    if (rp == RP_GIVE_UP) {
+        lt_put(rec, TF_FROM, st);
+        lt_put(rec, TF_STATE, LT_FAILED);
+        lt_put(rec, TF_CAUSE, CAUSE_GIVE_UP);
+        rec[TF_DUE_AT] = 0;
+        return TA_REPORT;
+    }
+    if (rp == RP_HOLD) {
+        lt_put(rec, TF_FROM, st);
+        lt_put(rec, TF_STATE, LT_WAITING_CREDENTIALS);
+        lt_put(rec, TF_CAUSE, CAUSE_EFFECT_UNKNOWN);
+        rec[TF_WAIT_FROM] = now;
+        lt_put(rec, TF_CHECKS, 0);
+        rec[TF_DUE_AT] = 0;
+        lt_put(rec, TF_CHECK_RUNG, lt_get(rec, TF_N));
+        return TA_WAIT;
+    }
+    if (lt_get(rec, TF_CAUSE) == CAUSE_EFFECT_UNKNOWN) {
+        // The line says running: access never went away, only the tool action was held.
+        lt_put(rec, TF_FROM, LT_RUNNING);
+        lt_put(rec, TF_CAUSE, CAUSE_NONE);
+        lt_put(rec, TF_STATE, LT_RUNNING);
+        if (has_bit(lt_get(rec, TF_TRIED), lt_get(rec, TF_RUNG))) { open_wait(rec, now); }
+    }
+    if (rp == RP_RUN) { return TA_TOOL; }
+    if (rp == RP_LOOK) { return TA_LOOK; }
+    if (task_waits(lt_get(rec, TF_STATE))) { return TA_WAIT; }
+    return TA_SEND;
+}
+
+// ---- 6. One line for the owner (FR-003) -------------------------------------------------------------------
+
+pub fn lt_put_status(out: []u8, at: usize, status: u32) -> usize {
+    if (status == 0) { return put_bytes(out, at, "no answer"); }
+    return put_dec(out, at, @as(u64, status));
+}
+
+pub fn put_cause_part(out: []u8, at: usize, cls: u32, status: u32) -> usize {
+    var p : usize = put_class(out, at, cls);
+    p = put_bytes(out, p, " (");
+    p = lt_put_status(out, p, status);
+    return put_bytes(out, p, ")");
+}
+
+pub fn lt_put_refusal(out: []u8, at: usize, rung: u32, cls: u32, status: u32) -> usize {
+    var p : usize = put_bytes(out, at, "rung ");
+    p = put_dec(out, p, @as(u64, rung));
+    p = put_bytes(out, p, " ");
+    return put_cause_part(out, p, cls, status);
+}
+
+fn switching_line(out: []u8, rec: []u64) -> usize {
+    const part : u64 = rec[TF_LAST_PARTIAL];
+    var p : usize = put_bytes(out, 0, "Rung ");
+    p = put_dec(out, p, @as(u64, lt_get(rec, TF_LAST_RUNG)));
+    if (part > 0) {
+        p = put_bytes(out, p, " broke after ");
+        p = put_dec(out, p, part);
+        p = put_bytes(out, p, " bytes: ");
+    }
+    if (part == 0) { p = put_bytes(out, p, " refused: "); }
+    p = put_cause_part(out, p, lt_get(rec, TF_LAST_CLASS), lt_get(rec, TF_LAST_STATUS));
+    p = put_bytes(out, p, ".");
+    if (part > 0) { p = put_bytes(out, p, " The partial answer is kept in diagnostics, not used."); }
+    p = put_bytes(out, p, " Switching to rung ");
+    p = put_dec(out, p, @as(u64, lt_get(rec, TF_RUNG)));
+    return put_bytes(out, p, ". The task continues.");
+}
+
+fn capacity_line(out: []u8, rec: []u64, now: u64) -> usize {
+    const due : u64 = rec[TF_DUE_AT];
+    const reset_at : u64 = rec[TF_RESET_AT];
+    var p : usize = put_bytes(out, 0, "All allowed rungs are unavailable now. ");
+    p = put_bytes(out, p, "The task is saved and waits for access to come back. Last refusal: ");
+    p = lt_put_refusal(out, p, lt_get(rec, TF_LAST_RUNG), lt_get(rec, TF_LAST_CLASS), lt_get(rec, TF_LAST_STATUS));
+    if (due > now) {
+        p = put_bytes(out, p, ". Next check in ");
+        p = put_dec(out, p, due - now);
+        p = put_bytes(out, p, " s.");
+    }
+    if (due <= now) { p = put_bytes(out, p, ". Next check: now."); }
+    if (reset_at > now) {
+        p = put_bytes(out, p, " The provider names a reset in ");
+        p = put_dec(out, p, reset_at - now);
+        p = put_bytes(out, p, " s.");
+    }
+    return p;
+}
+
+fn put_owner_cause(out: []u8, at: usize, cls: u32, status: u32) -> usize {
+    var p : usize = at;
+    if (cls == LC_CREDENTIAL) {
+        p = put_bytes(out, p, ": the provider rejected the key (");
+        p = lt_put_status(out, p, status);
+        p = put_bytes(out, p, "). Check or replace it in the settings. ");
+        return put_bytes(out, p, "There is no need to send the secret in the chat. The task is saved.");
+    }
+    if (cls == LC_UNFUNDED) {
+        p = put_bytes(out, p, ": the provider reports no balance (");
+        p = lt_put_status(out, p, status);
+        p = put_bytes(out, p, "). The task is saved and waits for the owner; ");
+        return put_bytes(out, p, "it resumes only after a check through that rung passes.");
+    }
+    if (cls == LC_UNWIRED) {
+        p = put_bytes(out, p, ": the route or the model is not there (");
+        p = lt_put_status(out, p, status);
+        return put_bytes(out, p, "). The task is saved and waits for the owner to fix the route.");
+    }
+    p = put_bytes(out, p, " refused with a cause that is not established (");
+    p = lt_put_status(out, p, status);
+    p = put_bytes(out, p, "). The task is saved and waits for the owner. ");
+    return put_bytes(out, p, "A new key or a higher limit is not known to fix it.");
+}
+
+fn owner_line(out: []u8, rec: []u64) -> usize {
+    const cz : u32 = lt_get(rec, TF_CAUSE);
+    var p : usize = 0;
+    if (cz == CAUSE_NO_ROUTE) {
+        p = put_bytes(out, 0, "No allowed rung is configured for this task. ");
+        return put_bytes(out, p, "The task is saved and waits for the owner to allow a route.");
+    }
+    if (cz == CAUSE_EFFECT_UNKNOWN) {
+        p = put_bytes(out, 0, "A tool action may have run before the break. It is not repeated. ");
+        return put_bytes(out, p, "The task is saved and waits for the owner to check its result.");
+    }
+    if (cz == CAUSE_EXPIRED) {
+        p = put_bytes(out, 0, "No allowed rung came back within ");
+        p = put_dec(out, p, @as(u64, WAIT_MAX_SECONDS));
+        return put_bytes(out, p, " s. Automatic checks have stopped. The task is saved and waits for the owner.");
+    }
+    p = put_bytes(out, 0, "No allowed rung can answer without the owner. Rung ");
+    p = put_dec(out, p, @as(u64, lt_get(rec, TF_LAST_RUNG)));
+    return put_owner_cause(out, p, lt_get(rec, TF_LAST_CLASS), lt_get(rec, TF_LAST_STATUS));
+}
+
+fn failed_line(out: []u8, rec: []u64) -> usize {
+    var p : usize = put_bytes(out, 0, "The task cannot continue: a tool action ran ");
+    p = put_dec(out, p, @as(u64, EFFECT_RUN_LIMIT));
+    p = put_bytes(out, p, " times and left no result. It is not run again.");
+    if (lt_get(rec, TF_REFUSALS) > 0) {
+        p = put_bytes(out, p, " First refusal: ");
+        p = lt_put_refusal(out, p, lt_get(rec, TF_FIRST_RUNG), lt_get(rec, TF_FIRST_CLASS), lt_get(rec, TF_FIRST_STATUS));
+        p = put_bytes(out, p, ".");
+    }
+    return p;
+}
+
+fn running_line(out: []u8, rec: []u64) -> usize {
+    var p : usize = 0;
+    if (task_waits(lt_get(rec, TF_FROM))) {
+        p = put_bytes(out, 0, "Access is back on rung ");
+        p = put_dec(out, p, @as(u64, lt_get(rec, TF_RUNG)));
+        return put_bytes(out, p, ". The saved task continues.");
+    }
+    p = put_bytes(out, 0, "Running on rung ");
+    p = put_dec(out, p, @as(u64, lt_get(rec, TF_RUNG)));
+    return put_bytes(out, p, ".");
+}
+
+/// The owner's line for the task as it stands at `now`. 0 when the buffer is under LT_MSG_MAX, the record is
+/// short, or the state is not one of the six.
+pub fn status_line(out: []u8, rec: []u64, now: u64) -> usize {
+    if (out.len < LT_MSG_MAX or rec.len < TF_F) { return 0; }
+    const st : u32 = lt_get(rec, TF_STATE);
+    if (st == LT_RUNNING) { return running_line(out, rec); }
+    if (st == LT_SWITCHING_PROVIDER) { return switching_line(out, rec); }
+    if (st == LT_WAITING_CAPACITY) { return capacity_line(out, rec, now); }
+    if (st == LT_WAITING_CREDENTIALS) { return owner_line(out, rec); }
+    if (st == LT_FAILED) { return failed_line(out, rec); }
+    if (st == LT_CANCELLED) { return put_bytes(out, 0, "Stopped by the owner. Nothing is resumed."); }
+    return 0;
+}
+
+// ---- 7. Diagnostics: the refusals as they came (FR-001) ---------------------------------------------------
+
+pub fn put_state(out: []u8, at: usize, st: u32) -> usize {
+    if (st == LT_RUNNING) { return put_bytes(out, at, "RUNNING"); }
+    if (st == LT_SWITCHING_PROVIDER) { return put_bytes(out, at, "SWITCHING_PROVIDER"); }
+    if (st == LT_WAITING_CAPACITY) { return put_bytes(out, at, "WAITING_CAPACITY"); }
+    if (st == LT_WAITING_CREDENTIALS) { return put_bytes(out, at, "WAITING_CREDENTIALS"); }
+    if (st == LT_FAILED) { return put_bytes(out, at, "FAILED"); }
+    if (st == LT_CANCELLED) { return put_bytes(out, at, "CANCELLED"); }
+    return put_bytes(out, at, "INVALID");
+}
+
+pub fn put_cause(out: []u8, at: usize, cz: u32) -> usize {
+    if (cz == CAUSE_NONE) { return put_bytes(out, at, "NONE"); }
+    if (cz == CAUSE_LADDER) { return put_bytes(out, at, "LADDER"); }
+    if (cz == CAUSE_NO_ROUTE) { return put_bytes(out, at, "NO_ROUTE"); }
+    if (cz == CAUSE_EFFECT_UNKNOWN) { return put_bytes(out, at, "EFFECT_UNKNOWN"); }
+    if (cz == CAUSE_EXPIRED) { return put_bytes(out, at, "EXPIRED"); }
+    if (cz == CAUSE_GIVE_UP) { return put_bytes(out, at, "GIVE_UP"); }
+    if (cz == CAUSE_OWNER_STOP) { return put_bytes(out, at, "OWNER_STOP"); }
+    return put_bytes(out, at, "INVALID");
+}
+
+pub fn put_rung(out: []u8, at: usize, rec: []u64) -> usize {
+    const r : u32 = lt_get(rec, TF_RUNG);
+    if (r >= lt_get(rec, TF_N)) { return put_bytes(out, at, "none"); }
+    return put_dec(out, at, @as(u64, r));
+}
+
+/// rung:CLASS:status, the status as the raw decimal the rung gave (0 = no answer).
+pub fn put_diag_refusal(out: []u8, at: usize, rung: u32, cls: u32, status: u32) -> usize {
+    var p : usize = put_dec(out, at, @as(u64, rung));
+    p = put_bytes(out, p, ":");
+    p = put_class(out, p, cls);
+    p = put_bytes(out, p, ":");
+    return put_dec(out, p, @as(u64, status));
+}
+
+pub fn diag_line(out: []u8, rec: []u64) -> usize {
+    if (out.len < LT_MSG_MAX or rec.len < TF_F) { return 0; }
+    var p : usize = put_bytes(out, 0, "state=");
+    p = put_state(out, p, lt_get(rec, TF_STATE));
+    p = put_bytes(out, p, " rung=");
+    p = put_rung(out, p, rec);
+    if (lt_get(rec, TF_REFUSALS) > 0) {
+        p = put_bytes(out, p, " first=");
+        p = put_diag_refusal(out, p, lt_get(rec, TF_FIRST_RUNG), lt_get(rec, TF_FIRST_CLASS), lt_get(rec, TF_FIRST_STATUS));
+        p = put_bytes(out, p, " last=");
+        p = put_diag_refusal(out, p, lt_get(rec, TF_LAST_RUNG), lt_get(rec, TF_LAST_CLASS), lt_get(rec, TF_LAST_STATUS));
+    }
+    p = put_bytes(out, p, " refusals=");
+    p = put_dec(out, p, rec[TF_REFUSALS]);
+    p = put_bytes(out, p, " switches=");
+    p = put_dec(out, p, rec[TF_SWITCHES]);
+    p = put_bytes(out, p, " partial=");
+    p = put_dec(out, p, rec[TF_PARTIAL]);
+    p = put_bytes(out, p, " cause=");
+    return put_cause(out, p, lt_get(rec, TF_CAUSE));
+}
+
+// ---- tests -------------------------------------------------------------------------------------------------
+
+/// A line the owner may see: safe inside a JSON string and never calling a refusal a lack of tokens.
+pub fn lt_line_ok(line: []const u8) -> bool {
+    if (line_is_safe(line) == false) { return false; }
+    return contains(line, "token") == false and contains(line, "Token") == false;
+}
+
+/// Every refusal status the Doctor's table names, its noise and unknowns, and no answer (0).
+pub const LT_SAMPLE : [13]u32 = [402, 401, 403, 404, 429, 500, 529, 1113, 1302, 1305, 400, 413, 0];
+
+test a_refusal_before_the_answer_switches_and_resends_the_saved_request {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 7, 3, 100);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_RUNG) == 0;
+    a = task_refused(rec[0..24], 0, 402, 300, 0, 0, 101);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_STATE) == LT_SWITCHING_PROVIDER;
+    assert lt_get(rec[0..24], TF_RUNG) == 1;
+    var w : usize = status_line(out[0..320], rec[0..24], 101);
+    assert same_bytes(out[0..w], "Rung 0 refused: UNFUNDED (402). Switching to rung 1. The task continues.");
+    a = task_refused(rec[0..24], 0, 429, 300, 0, 0, 102);
+    assert a == TA_NONE;
+    a = task_answered(rec[0..24], 0);
+    assert a == TA_NONE;
+    a = task_sent(rec[0..24], 1);
+    assert a == TA_NONE;
+    assert lt_get(rec[0..24], TF_STATE) == LT_RUNNING;
+    w = status_line(out[0..320], rec[0..24], 103);
+    assert same_bytes(out[0..w], "Running on rung 1.");
+    a = task_answered(rec[0..24], 1);
+    assert a == TA_DELIVER;
+    assert lt_get(rec[0..24], TF_TRIED) == 1;
+    w = diag_line(out[0..320], rec[0..24]);
+    assert same_bytes(out[0..w], "state=RUNNING rung=1 first=0:UNFUNDED:402 last=0:UNFUNDED:402 refusals=1 switches=1 partial=0 cause=NONE");
+    a = task_refused(rec[0..24], 1, 200, 500, 0, 0, 104);
+    assert a == TA_NONE;
+    assert lt_get(rec[0..24], TF_REFUSALS) == 1;
+}
+
+test a_break_after_a_partial_answer_keeps_the_part_in_diagnostics_and_sends_fresh {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    a = task_refused(rec[0..24], 0, 503, 31000, 612, 0, 40);
+    assert a == TA_SEND;
+    var w : usize = status_line(out[0..320], rec[0..24], 40);
+    assert same_bytes(out[0..w], "Rung 0 broke after 612 bytes: SLOW (503). The partial answer is kept in diagnostics, not used. Switching to rung 1. The task continues.");
+    w = diag_line(out[0..320], rec[0..24]);
+    assert same_bytes(out[0..w], "state=SWITCHING_PROVIDER rung=1 first=0:SLOW:503 last=0:SLOW:503 refusals=1 switches=1 partial=612 cause=NONE");
+    assert resume_point(TK_READ, EFF_NONE, EK_MODEL_CALL, 0, 1, 1, false) == RP_FRESH;
+    a = task_sent(rec[0..24], 1);
+    assert a == TA_NONE;
+    a = task_answered(rec[0..24], 1);
+    assert a == TA_DELIVER;
+    assert rec[TF_PARTIAL] == 612;
+    var cut : [24]u64 = undefined;
+    a = task_start(cut[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    a = task_refused(cut[0..24], 0, 200, 240001, 900, 0, 10);
+    assert a == TA_SEND;
+    w = status_line(out[0..320], cut[0..24], 10);
+    assert same_bytes(out[0..w], "Rung 0 broke after 900 bytes: SLOW (no answer). The partial answer is kept in diagnostics, not used. Switching to rung 1. The task continues.");
+    var kept : [24]u64 = undefined;
+    a = task_start(kept[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    a = task_refused(kept[0..24], 0, 200, 240000, 900, 0, 10);
+    assert a == TA_NONE;
+    assert lt_get(kept[0..24], TF_STATE) == LT_RUNNING;
+}
+
+test a_break_during_a_tool_call_never_runs_an_action_that_may_have_run {
+    var rp : u32 = resume_point(TK_EXTERNAL, EFF_INTENT, EK_PUSH, 1, 1, 1, true);
+    assert rp == RP_HOLD;
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    a = apply_resume(rec[0..24], rp, 50);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CREDENTIALS;
+    assert lt_get(rec[0..24], TF_CAUSE) == CAUSE_EFFECT_UNKNOWN;
+    a = task_wake(rec[0..24], LE_KEY_ADDED, 0, 51);
+    assert a == TA_NONE;
+    a = task_wake(rec[0..24], LE_CAPACITY_BACK, 0, 52);
+    assert a == TA_NONE;
+    a = task_checked(rec[0..24], 0, 200, PROBE_TOKENS, 1, 0, true, 0, 53);
+    assert a == TA_NONE;
+    assert wake_at(rec[0..24]) == 0;
+    var w : usize = status_line(out[0..320], rec[0..24], 54);
+    assert same_bytes(out[0..w], "A tool action may have run before the break. It is not repeated. The task is saved and waits for the owner to check its result.");
+    a = apply_resume(rec[0..24], RP_WITH_RESULT, 60);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_STATE) == LT_RUNNING;
+    assert lt_get(rec[0..24], TF_CAUSE) == CAUSE_NONE;
+    rp = resume_point(TK_JOURNALED, EFF_INTENT, EK_PUSH, 1, 1, 1, true);
+    assert rp == RP_LOOK;
+    a = apply_resume(rec[0..24], rp, 70);
+    assert a == TA_LOOK;
+    assert resume_after_look(true, 1) == RP_WITH_RESULT;
+    assert resume_after_look(false, 1) == RP_RUN;
+    assert resume_point(TK_JOURNALED, EFF_INTENT, EK_MODEL_CALL, 2, 1, 1, true) == RP_RUN;
+    assert resume_point(TK_JOURNALED, EFF_INTENT, EK_MODEL_CALL, 3, 1, 1, true) == RP_GIVE_UP;
+    a = apply_resume(rec[0..24], RP_RUN, 80);
+    assert a == TA_TOOL;
+    assert resume_point(TK_EXTERNAL, EFF_DONE, EK_PUSH, 1, 1, 1, true) == RP_WITH_RESULT;
+    assert resume_point(TK_READ, EFF_DONE, EK_MODEL_CALL, 1, 1, 1, true) == RP_WITH_RESULT;
+    assert resume_point(TK_READ, EFF_INTENT, EK_MODEL_CALL, 1, 1, 1, true) == RP_RUN;
+    assert resume_point(TK_EXTERNAL, EFF_NONE, EK_PUSH, 0, 1, 1, true) == RP_RUN;
+    assert resume_point(TK_EXTERNAL, EFF_NONE, EK_PUSH, 0, 1, 1, false) == RP_FRESH;
+    rp = resume_point(TK_JOURNALED, EFF_DONE, EK_PUSH, 1, 8, 7, true);
+    assert rp == RP_NOTHING;
+    a = apply_resume(rec[0..24], rp, 90);
+    assert a == TA_NONE;
+    a = apply_resume(rec[0..24], RP_GIVE_UP, 100);
+    assert a == TA_REPORT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_FAILED;
+    assert lt_get(rec[0..24], TF_CAUSE) == CAUSE_GIVE_UP;
+    w = status_line(out[0..320], rec[0..24], 101);
+    assert same_bytes(out[0..w], "The task cannot continue: a tool action ran 3 times and left no result. It is not run again.");
+    a = apply_resume(rec[0..24], RP_RUN, 102);
+    assert a == TA_NONE;
+}
+
+test an_exhausted_ladder_waits_for_capacity_and_resumes_on_the_rung_that_passes_a_check {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 3, 2, 5000);
+    assert a == TA_SEND;
+    a = task_refused(rec[0..24], 0, 429, 300, 0, 0, 5001);
+    assert a == TA_SEND;
+    a = task_sent(rec[0..24], 1);
+    assert a == TA_NONE;
+    a = task_refused(rec[0..24], 1, 529, 400, 0, 120, 5002);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CAPACITY;
+    assert lt_get(rec[0..24], TF_CHECK_RUNG) == 0;
+    assert wake_at(rec[0..24]) == 5032;
+    var w : usize = status_line(out[0..320], rec[0..24], 5002);
+    assert same_bytes(out[0..w], "All allowed rungs are unavailable now. The task is saved and waits for access to come back. Last refusal: rung 1 TRANSIENT (529). Next check in 30 s. The provider names a reset in 120 s.");
+    assert lt_line_ok(out[0..w]);
+    a = task_wake(rec[0..24], LE_RECHECK, 0, 5031);
+    assert a == TA_WAIT;
+    a = task_wake(rec[0..24], LE_RECHECK, 0, 5032);
+    assert a == TA_CHECK;
+    a = task_checked(rec[0..24], 0, 429, 0, 1, 0, true, 0, 5033);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_CHECK_RUNG) == 1;
+    assert wake_at(rec[0..24]) == 5093;
+    w = status_line(out[0..320], rec[0..24], 5033);
+    assert same_bytes(out[0..w], "All allowed rungs are unavailable now. The task is saved and waits for access to come back. Last refusal: rung 0 RATE (429). Next check in 60 s.");
+    a = task_checked(rec[0..24], 1, 200, 5, 1, 0, true, 0, 5035);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CAPACITY;
+    a = task_checked(rec[0..24], 1, 200, PROBE_TOKENS, 1, 0, true, 0, 5040);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_STATE) == LT_RUNNING;
+    assert lt_get(rec[0..24], TF_RUNG) == 1;
+    assert wake_at(rec[0..24]) == 0;
+    assert lt_get(rec[0..24], TF_REFUSALS) == 2;
+    w = status_line(out[0..320], rec[0..24], 5040);
+    assert same_bytes(out[0..w], "Access is back on rung 1. The saved task continues.");
+}
+
+test a_working_key_added_during_the_wait_resumes_after_one_passing_check {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    a = task_refused(rec[0..24], 0, 1113, 200, 0, 0, 10);
+    assert a == TA_SEND;
+    a = task_sent(rec[0..24], 1);
+    assert a == TA_NONE;
+    a = task_refused(rec[0..24], 1, 401, 200, 0, 0, 20);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CREDENTIALS;
+    assert lt_get(rec[0..24], TF_CHECK_RUNG) == 2;
+    var w : usize = status_line(out[0..320], rec[0..24], 20);
+    assert same_bytes(out[0..w], "No allowed rung can answer without the owner. Rung 1: the provider rejected the key (401). Check or replace it in the settings. There is no need to send the secret in the chat. The task is saved.");
+    assert lt_line_ok(out[0..w]);
+    a = task_wake(rec[0..24], LE_RECHECK, 0, 25);
+    assert a == TA_WAIT;
+    a = task_wake(rec[0..24], LE_CAPACITY_BACK, 1, 26);
+    assert a == TA_NONE;
+    a = task_checked(rec[0..24], 1, 200, PROBE_TOKENS, 1, 0, true, 0, 27);
+    assert a == TA_NONE;
+    a = task_wake(rec[0..24], LE_KEY_ADDED, 1, 28);
+    assert a == TA_CHECK;
+    a = task_checked(rec[0..24], 1, 401, 0, 1, 0, true, 0, 30);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CREDENTIALS;
+    a = task_wake(rec[0..24], LE_KEY_ADDED, 1, 35);
+    assert a == TA_CHECK;
+    a = task_checked(rec[0..24], 1, 200, PROBE_TOKENS, 1, 0, true, 0, 40);
+    assert a == TA_SEND;
+    w = status_line(out[0..320], rec[0..24], 40);
+    assert same_bytes(out[0..w], "Access is back on rung 1. The saved task continues.");
+    a = task_answered(rec[0..24], 1);
+    assert a == TA_DELIVER;
+    assert lt_get(rec[0..24], TF_REFUSALS) == 2;
+}
+
+test a_manual_stop_is_final_and_nothing_resumes_it {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    a = task_refused(rec[0..24], 0, 429, 100, 0, 0, 1);
+    assert a == TA_SEND;
+    a = task_sent(rec[0..24], 1);
+    assert a == TA_NONE;
+    a = task_refused(rec[0..24], 1, 429, 100, 0, 0, 2);
+    assert a == TA_WAIT;
+    a = task_stop(rec[0..24]);
+    assert a == TA_REPORT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_CANCELLED;
+    assert lt_get(rec[0..24], TF_CAUSE) == CAUSE_OWNER_STOP;
+    assert wake_at(rec[0..24]) == 0;
+    var w : usize = status_line(out[0..320], rec[0..24], 3);
+    assert same_bytes(out[0..w], "Stopped by the owner. Nothing is resumed.");
+    var moved : u32 = 0;
+    if (task_refused(rec[0..24], 1, 429, 100, 0, 0, 4) != TA_NONE) { moved = moved + 1; }
+    if (task_answered(rec[0..24], 1) != TA_NONE) { moved = moved + 1; }
+    if (task_sent(rec[0..24], 1) != TA_NONE) { moved = moved + 1; }
+    if (task_wake(rec[0..24], LE_CAPACITY_BACK, 0, 5) != TA_NONE) { moved = moved + 1; }
+    if (task_wake(rec[0..24], LE_KEY_ADDED, 0, 6) != TA_NONE) { moved = moved + 1; }
+    if (task_wake(rec[0..24], LE_RECHECK, 0, 100000) != TA_NONE) { moved = moved + 1; }
+    if (task_checked(rec[0..24], 0, 200, PROBE_TOKENS, 1, 0, true, 0, 7) != TA_NONE) { moved = moved + 1; }
+    if (apply_resume(rec[0..24], RP_RUN, 8) != TA_NONE) { moved = moved + 1; }
+    if (task_stop(rec[0..24]) != TA_NONE) { moved = moved + 1; }
+    assert moved == 0;
+    assert lt_get(rec[0..24], TF_STATE) == LT_CANCELLED;
+    w = diag_line(out[0..320], rec[0..24]);
+    assert same_bytes(out[0..w], "state=CANCELLED rung=1 first=0:RATE:429 last=1:RATE:429 refusals=2 switches=1 partial=0 cause=OWNER_STOP");
+    var live : [24]u64 = undefined;
+    a = task_start(live[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    a = task_stop(live[0..24]);
+    assert a == TA_REPORT;
+    assert lt_get(live[0..24], TF_STATE) == LT_CANCELLED;
+}
+
+test a_rung_outside_the_allowed_mask_is_never_sent_checked_or_woken {
+    var rec : [24]u64 = undefined;
+    var a : u32 = task_start(rec[0..24], 5, 3, 0);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_RUNG) == 0;
+    a = task_refused(rec[0..24], 0, 429, 100, 0, 0, 1);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_RUNG) == 2;
+    a = task_sent(rec[0..24], 2);
+    assert a == TA_NONE;
+    a = task_refused(rec[0..24], 2, 429, 100, 0, 0, 2);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CAPACITY;
+    assert lt_get(rec[0..24], TF_CHECK_RUNG) == 0;
+    a = task_wake(rec[0..24], LE_CAPACITY_BACK, 1, 3);
+    assert a == TA_NONE;
+    a = task_wake(rec[0..24], LE_KEY_ADDED, 1, 4);
+    assert a == TA_NONE;
+    a = task_wake(rec[0..24], LE_KEY_ADDED, 3, 4);
+    assert a == TA_NONE;
+    a = task_checked(rec[0..24], 1, 200, PROBE_TOKENS, 1, 0, true, 0, 5);
+    assert a == TA_NONE;
+    a = task_checked(rec[0..24], 0, 429, 0, 1, 0, true, 0, 40);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_CHECK_RUNG) == 2;
+    assert lt_get(rec[0..24], TF_SWITCHES) == 1;
+}
+
+test no_allowed_rung_waits_for_the_owner_and_the_rung_count_is_clamped {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 0, 3, 10);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CREDENTIALS;
+    assert lt_get(rec[0..24], TF_CAUSE) == CAUSE_NO_ROUTE;
+    var w : usize = status_line(out[0..320], rec[0..24], 10);
+    assert same_bytes(out[0..w], "No allowed rung is configured for this task. The task is saved and waits for the owner to allow a route.");
+    w = diag_line(out[0..320], rec[0..24]);
+    assert same_bytes(out[0..w], "state=WAITING_CREDENTIALS rung=none refusals=0 switches=0 partial=0 cause=NO_ROUTE");
+    a = task_wake(rec[0..24], LE_KEY_ADDED, 0, 11);
+    assert a == TA_NONE;
+    a = task_start(rec[0..24], 8, 3, 0);
+    assert a == TA_WAIT;
+    a = task_start(rec[0..24], 65535, 20, 0);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_N) == 8;
+    var k : u32 = 0;
+    var sends : u32 = 0;
+    while (k < 8) {
+        a = task_refused(rec[0..24], k, 429, 100, 0, 0, @as(u64, k) + 1);
+        if (a == TA_SEND) {
+            sends = sends + 1;
+            a = task_sent(rec[0..24], k + 1);
+        }
+        k = k + 1;
+    }
+    assert sends == 7;
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CAPACITY;
+    assert lt_get(rec[0..24], TF_SWITCHES) == 7;
+}
+
+test no_refusal_status_ever_ends_a_task_as_failed {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = 0;
+    var s : u32 = 0;
+    var w : usize = 0;
+    var i : u32 = 0;
+    var sweep : u32 = 0;
+    var ms : u64 = 100;
+    var failed : u32 = 0;
+    var waiting : u32 = 0;
+    var bad : u32 = 0;
+    while (sweep < 2) {
+        i = 0;
+        while (i < 13) {
+            s = LT_SAMPLE[i];
+            a = task_start(rec[0..24], 3, 2, 0);
+            if (a != TA_SEND) { bad = bad + 1; }
+            a = task_refused(rec[0..24], 0, s, ms, 0, 0, 1);
+            if (a != TA_SEND) { bad = bad + 1; }
+            a = task_sent(rec[0..24], 1);
+            a = task_refused(rec[0..24], 1, s, ms, 0, 0, 2);
+            if (a != TA_WAIT) { bad = bad + 1; }
+            if (lt_get(rec[0..24], TF_STATE) == LT_FAILED) { failed = failed + 1; }
+            if (task_waits(lt_get(rec[0..24], TF_STATE))) { waiting = waiting + 1; }
+            w = status_line(out[0..320], rec[0..24], 2);
+            if (w == 0 or lt_line_ok(out[0..w]) == false) { bad = bad + 1; }
+            i = i + 1;
+        }
+        ms = 240001;
+        sweep = sweep + 1;
+    }
+    assert failed == 0;
+    assert waiting == 26;
+    assert bad == 0;
+}
+
+test an_unknown_or_unwired_refusal_waits_for_the_owner_and_promises_no_fix {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 1, 1, 0);
+    assert a == TA_SEND;
+    a = task_refused(rec[0..24], 0, 400, 100, 0, 0, 1);
+    assert a == TA_WAIT;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CREDENTIALS;
+    assert wake_at(rec[0..24]) == 0;
+    var w : usize = status_line(out[0..320], rec[0..24], 1);
+    assert same_bytes(out[0..w], "No allowed rung can answer without the owner. Rung 0 refused with a cause that is not established (400). The task is saved and waits for the owner. A new key or a higher limit is not known to fix it.");
+    assert lt_line_ok(out[0..w]);
+    a = task_start(rec[0..24], 1, 1, 0);
+    a = task_refused(rec[0..24], 0, 404, 100, 0, 0, 1);
+    assert a == TA_WAIT;
+    w = status_line(out[0..320], rec[0..24], 1);
+    assert same_bytes(out[0..w], "No allowed rung can answer without the owner. Rung 0: the route or the model is not there (404). The task is saved and waits for the owner to fix the route.");
+    assert lt_line_ok(out[0..w]);
+    a = task_start(rec[0..24], 1, 1, 0);
+    a = task_refused(rec[0..24], 0, 1113, 100, 0, 0, 1);
+    assert a == TA_WAIT;
+    w = status_line(out[0..320], rec[0..24], 1);
+    assert same_bytes(out[0..w], "No allowed rung can answer without the owner. Rung 0: the provider reports no balance (1113). The task is saved and waits for the owner; it resumes only after a check through that rung passes.");
+    assert lt_line_ok(out[0..w]);
+    assert lt_line_ok("The tokens ran out.") == false;
+}
+
+test a_capacity_wait_is_checked_on_a_bounded_schedule_and_ends_at_the_wait_limit {
+    var rec : [24]u64 = undefined;
+    var out : [320]u8 = undefined;
+    var a : u32 = task_start(rec[0..24], 1, 1, 0);
+    assert a == TA_SEND;
+    a = task_refused(rec[0..24], 0, 429, 100, 0, 0, 0);
+    assert a == TA_WAIT;
+    var due : u64 = wake_at(rec[0..24]);
+    assert due == 30;
+    var checks : u32 = 0;
+    var rounds : u32 = 0;
+    var d1 : u64 = 0;
+    var d2 : u64 = 0;
+    var d3 : u64 = 0;
+    var d4 : u64 = 0;
+    var last_due : u64 = 0;
+    var refused_ok : u32 = 0;
+    while (due > 0 and rounds < 400) {
+        a = task_wake(rec[0..24], LE_RECHECK, 0, due);
+        if (a == TA_CHECK) {
+            if (checks == 1) { d1 = due; }
+            if (checks == 2) { d2 = due; }
+            if (checks == 3) { d3 = due; }
+            if (checks == 4) { d4 = due; }
+            last_due = due;
+            a = task_checked(rec[0..24], 0, 429, 0, 1, 0, true, 0, due);
+            if (a == TA_WAIT) { refused_ok = refused_ok + 1; }
+            checks = checks + 1;
+        }
+        due = wake_at(rec[0..24]);
+        rounds = rounds + 1;
+    }
+    assert d1 == 90;
+    assert d2 == 210;
+    assert d3 == 450;
+    assert d4 == 690;
+    assert last_due == 86370;
+    assert checks == 362;
+    assert refused_ok == 362;
+    assert rounds == 363;
+    assert lt_get(rec[0..24], TF_CHECKS) == 362;
+    assert lt_get(rec[0..24], TF_STATE) == LT_WAITING_CREDENTIALS;
+    assert lt_get(rec[0..24], TF_CAUSE) == CAUSE_EXPIRED;
+    var w : usize = status_line(out[0..320], rec[0..24], 86400);
+    assert same_bytes(out[0..w], "No allowed rung came back within 86400 s. Automatic checks have stopped. The task is saved and waits for the owner.");
+    a = task_wake(rec[0..24], LE_CAPACITY_BACK, 0, 86500);
+    assert a == TA_CHECK;
+    a = task_checked(rec[0..24], 0, 200, PROBE_TOKENS, 1, 0, true, 0, 86500);
+    assert a == TA_SEND;
+    assert lt_get(rec[0..24], TF_STATE) == LT_RUNNING;
+}
+
+test the_record_and_the_line_buffer_have_fixed_sizes {
+    var tiny : [8]u64 = undefined;
+    var a : u32 = task_start(tiny[0..8], 3, 2, 0);
+    assert a == TA_NONE;
+    var rec : [24]u64 = undefined;
+    a = task_start(rec[0..24], 3, 2, 0);
+    assert a == TA_SEND;
+    var tline : [64]u8 = undefined;
+    var w : usize = status_line(tline[0..64], rec[0..24], 0);
+    assert w == 0;
+    w = diag_line(tline[0..64], rec[0..24]);
+    assert w == 0;
+    var cells : usize = TF_F;
+    assert cells == 24;
+    var room : usize = LT_MSG_MAX;
+    assert room == 320;
+    var states : u32 = LT_STATES;
+    assert states == 6;
+    var big : u64 = 4294967295;
+    big = big * big;
+    lt_put(rec[0..24], TF_N, 4294967295);
+    lt_put(rec[0..24], TF_RUNG, 4294967294);
+    lt_put(rec[0..24], TF_FIRST_RUNG, 4294967295);
+    lt_put(rec[0..24], TF_LAST_RUNG, 4294967295);
+    lt_put(rec[0..24], TF_FIRST_STATUS, 4294967295);
+    lt_put(rec[0..24], TF_LAST_STATUS, 4294967295);
+    lt_put(rec[0..24], TF_REFUSALS, 4294967295);
+    lt_put(rec[0..24], TF_SWITCHES, 4294967295);
+    lt_put(rec[0..24], TF_FROM, LT_WAITING_CAPACITY);
+    rec[TF_PARTIAL] = big;
+    rec[TF_LAST_PARTIAL] = big;
+    rec[TF_DUE_AT] = big;
+    rec[TF_RESET_AT] = big;
+    var out : [320]u8 = undefined;
+    var st : u32 = 0;
+    var cz : u32 = 0;
+    var cl : u32 = 0;
+    var longest : usize = 0;
+    var bad : u32 = 0;
+    while (st < LT_STATES) {
+        cz = 0;
+        while (cz < 7) {
+            cl = 0;
+            while (cl < 7) {
+                lt_put(rec[0..24], TF_STATE, st);
+                lt_put(rec[0..24], TF_CAUSE, cz);
+                lt_put(rec[0..24], TF_FIRST_CLASS, cl);
+                lt_put(rec[0..24], TF_LAST_CLASS, cl);
+                w = status_line(out[0..320], rec[0..24], 0);
+                if (w > longest) { longest = w; }
+                if (w == 0 or lt_line_ok(out[0..w]) == false) { bad = bad + 1; }
+                w = diag_line(out[0..320], rec[0..24]);
+                if (w > longest) { longest = w; }
+                if (w == 0 or lt_line_ok(out[0..w]) == false) { bad = bad + 1; }
+                cl = cl + 1;
+            }
+            cz = cz + 1;
+        }
+        st = st + 1;
+    }
+    assert bad == 0;
+    assert longest < LT_MSG_MAX;
+    assert longest > 200;
+    rec[TF_STATE] = 9;
+    w = status_line(out[0..320], rec[0..24], 0);
+    assert w == 0;
+    w = diag_line(out[0..320], rec[0..24]);
+    assert contains(out[0..w], "state=INVALID");
+}
