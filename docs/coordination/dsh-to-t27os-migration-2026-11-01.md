@@ -316,6 +316,209 @@ owner interventions per task, cost per verified result, duplicates, accepted wit
 regressions): not measured; nothing ran. The only baseline is section 5: 0 real tasks through a
 T27 OS chat on 2026-11-01.
 
+### 7.3 The measured bridge: what it shows and what it does not (2026-11-02)
+
+The one-shot bridge (`specs/queen/next_step_run.t27`, host `specs/t27os/next_step_main.t27`,
+binary `target/next_step/nsm`) ran in pane 15 on one event injected by hand. The contract
+describes deduplication, fences, replay and the effect journal; runtime behaviour is not measured
+beyond the runs listed here (evidence: `target/next_step/evidence.txt` section 6, gitignored).
+
+Shown by those runs:
+
+- decide picked B while A waited for approval (decision 1; A's reason was NS_PARKED);
+- one attempt was journaled before its launch, executed once and verified;
+- a replay of the same sequence number gave D_STALE (253): no relaunch, state hash unchanged;
+- WAIT (255) came after the check, not before it;
+- the passed deadline became AP_EXPIRED, which refuses A; it never became approval;
+- a negative control (the NR_ATTEMPTED guard removed) failed 3 tests.
+
+Not shown, and not claimed:
+
+- automatic arrival of live events: the event was given by hand (`NS_MODE=e NS_KIND=2 NS_SEQ=1`);
+- recovery from a crash between the launch and the commit of the result: the record says
+  JOURNALED before the launch, but no run was killed inside that window;
+- safety of several concurrent handlers: the record is one file renamed into place, with no lock,
+  and only one handler ever ran;
+- the whole `t27c suite` on the extern path: `next_step_main.t27` uses `@extern`, which `t27c`
+  cannot compile; it was tested with `t27b` only (3 tests).
+
+What "verified" covered:
+
+- the verifier (`t27b`) reran the 14 tests of `specs/queen/next_step.t27` into its own file
+  `a1.ver`; `on_verify` read only that file's pass and fail counts and did not read `a1.out`;
+- `a1.out`, the executor's artifact (`t27c test-report`), was read by the bridge parser
+  `report_ok_t27c`;
+- both checks compared against `want` (14), written into the run record at JOURNALED, before the
+  launch, and read from the record, never from an artifact;
+- the attempt was bound only through the artifact path `a<id>`, with the id from the record;
+- the task was not checked: `on_verify` did not compare the record's task with B, and its report
+  line "task_id=B attempt_id=1" was a literal. The fix is section 7.4.
+
+A passing suite does not prove a specific artifact. The verifier's 14 of 14 is its own run of the
+same tests; it says nothing about the executor's bytes. The one comparison of those bytes with a
+separately produced report (`diff` empty) was made by hand, once.
+
+### 7.4 The verifier binds task and spec; the event source (2026-11-02)
+
+The verifier fix (`on_verify` in `specs/t27os/next_step_main.t27`):
+
+- a record whose task is not B is refused before any verifier starts, because B is the only task
+  with a criterion;
+- `a<id>.out` must begin with the header `--- test report: specs/queen/next_step.t27 ---`, so a
+  report of another spec, or a file that only holds the right totals, is not the artifact;
+- the report line is built from the record (`put_report`), not written as a literal.
+
+`want` is still fixed at JOURNALED, before the launch, and the attempt is still bound by `a<id>`.
+
+Checks of the fix (pane 15, evidence section 8):
+
+- `t27b test` gave 6 of 6. A negative control that forces the spec check to `true` failed
+  exactly `the_artifact_must_name_the_spec`;
+- one bounded bridge run on a fresh record printed `names_spec=yes verify_ok=yes` and the line
+  `report task_id=B attempt_id=1`, then WAIT;
+- the same record copied with task A and EXECUTED was refused (`task=0`, rc 3), and no verifier
+  started.
+
+The event source. The source is the PTY server's pane table, read through `T27OS_CTL=list`.
+The server's `live_events.txt` was rejected: it is telemetry, stale since 10-27, and has no
+sequence, no task and no cursor; its counter also saturates at 127. Telemetry is never permission
+to launch.
+
+The adapter is `specs/t27os/pane_feed.t27` (module `T27osPaneFeed`):
+
+- it parses and normalises a snapshot;
+- it refuses a missing header, a bad line, a value out of range, an unknown state or flag, a slot
+  listed twice, and a table that fills the read buffer;
+- it keeps its own cursor, never the server's, and acts on it as follows:
+
+| Case | Action |
+|---|---|
+| repeated snapshot | DUP |
+| same time, different table | CLASH |
+| older snapshot | OLD |
+| more than 600 s since the cursor | GAP, a resync with no decision |
+| no cursor | BASE |
+| the lease no longer holds | LEASE_LOST |
+
+- it counts changes in another task's slot but never decides on them;
+- only an applied WORKING to IDLE edge of the leased pane becomes `EV_WORKER_IDLE`.
+
+Its tests: `t27b` 12 of 12; `t27c test-report` 12 of 12 with 0 vacuous. A negative control with
+the GAP line removed failed `a_gap_resyncs_without_a_decision`.
+
+The host mode `NS_MODE=feed` reads at most 8 snapshot files and journals each decision as
+"intended: recorded, not launched". It has no executor call and never opens `run/`. On real
+snapshots of pane 15:
+
+- the first run gave BASE, an idle edge, a decision of B, then DUP and OLD: 1 intended decision,
+  0 launches;
+- a restart over the same directory found its kept cursor and answered OLD and DUP only, with 0
+  decisions;
+- a lease on pane 14 gave LEASE_LOST;
+- an edited state 5 was refused as UNKNOWN;
+- `run/` given as the feed directory was refused;
+- the state hash of `run/` stayed the same throughout.
+
+A real gap was observed later (evidence section 9): a live snapshot taken 663 s after the cursor
+gave GAP, no decision, and a new base at that snapshot. A real change in another task's slot was
+not observed on real data; only the unit test covers it. Every snapshot was taken by a typed
+command.
+
+A measured property of the source: a shell cell's shown state follows its output, not its
+process. `sleep 12` read IDLE while it ran, and `ping` read WORKING while it printed. An idle edge
+therefore means the output went quiet, not that the command ended.
+
+The gates in the adapter answer no today (`autonomy_allowed` is false):
+
+- the server has no lease, so a shared cell can be written by anyone;
+- the spawn client prints "spawned pane N" without checking the server's reply, so success text
+  on a full table does not confirm an attempt;
+- `stop_pane_process` kills the direct child only, so a budget cannot be promised by kill alone.
+
+The way to enable it, with these executor limits, is section 7.5.
+
+### 7.5 The way to enable it, and the executor limits (2026-11-02)
+
+Nothing in this section is enabled. It is the exact package that an owner's word would turn on,
+one item at a time.
+
+**Hook point.**
+
+- Stage A (no server change): `NS_MODE=feed`, run once after a `T27OS_CTL=list` snapshot by the
+  session that owns the leased pane. Its only output is intended decisions in `<dir>/journal`.
+- Stage B (a design, not a patch): the server publishes its own events, through a new op with a
+  sequence number and a per-slot generation, read with the cursor rules of `specs/queen/events.t27`. The LIST
+  format stays as it is: the adapter's row parser refuses extra fields, and other LIST readers
+  exist.
+- Event-driven first. A LIST snapshot remains only as a bounded safety reconciliation: one snapshot
+  when the stream reports an overflow or a gap, or when the adapter restarts. It is never a loop.
+
+**Executor limits.** Each limit is a gate in `pane_feed.t27`. All three are false today, so
+`autonomy_allowed` answers no.
+
+1. Lease (`PTY_HAS_LEASE`): no autonomous work on a shared cell. Until the server has a lease, the
+   only cell a feed decision may act on is one the adapter spawned itself. `spawn_confirmed`
+   compares the table before and after and wants a new slot, the agent asked for, and a state that
+   is not EXITED. The cell is then identified by its child's real pid, not by the slot number,
+   because a respawn in the same slot is invisible in LIST.
+2. Spawn reply (`PTY_SPAWN_REPLY_CHECKED`): stage-1 patch item 3 below.
+3. Group kill (`PTY_KILL_ENDS_GROUP`): stage-1 patch item 1 below. A descendant that calls `setsid`
+   or `setpgid` leaves the group. A budget is therefore promised only as a deadline enforced by the
+   group kill, and only for descendants that stay in the group.
+
+**The stage-1 patch** is `target/next_step/stage1-pty.diff`: 21 lines added and 2 removed, against
+`specs/t27os/pty_server.t27`. It was checked on a copy only (evidence section 9).
+
+1. `stop_pane_process` signals the pane's process group before the child itself. The forkpty child
+   leads its own group; the SIGWINCH path already relies on that.
+2. `ctl_reply_ok(n, op)` counts a CTL reply only with a whole header and op `RE_OK`.
+3. `T27OS_CTL=spawn` prints `spawn refused` and exits 1 on `RE_ERR` (a full table), instead of
+   `spawned pane 0`. `T27OS_CTL=kill` prints `kill refused` and exits 1, instead of `killed`.
+4. A new test, `a_refused_ctl_reply_is_not_success`.
+
+Checks, `t27b` only, because the server spec has `@extern`:
+
+- the spec as it is: 25 of 25;
+- the patched copy: 26 of 26;
+- a negative control without the op check failed `a_refused_ctl_reply_is_not_success`.
+
+Not shown: the group kill on a live pane, and a refused spawn on a real full table.
+
+**Permissions.** Each is a separate owner's word, in this order:
+
+1. land the stage-1 patch in `specs/t27os/pty_server.t27`. It is a protected change, because that
+   file is the live server's source;
+2. build a new `t27os-pty` binary and install it. That is an installation;
+3. restart the server (pid 30009) so that it takes the server half, the group kill. The client half,
+   the reply checks, takes effect with the new binary and needs no restart, because the CTL client
+   is the same binary run with `T27OS_CTL`;
+4. switch the working route: wire a feed decision to the executor path (`on_event`). This comes only
+   after 1 to 3, and only for a dedicated owned cell.
+
+**Budgets:**
+
+- at most `FEED_MAX_SNAPS` (8) snapshots per run;
+- one decision per applied edge;
+- at most `RUN_CAP` (1) launch per record;
+- the approval deadline is fixed in the record at init, and a passed deadline is EXPIRED, never
+  approval.
+
+**Stop.** There is no daemon, cron or conductor. Each run is one-shot and ends after at most 8
+snapshots, so stopping means not starting the next run. After stage 1, an attempt is stopped by the
+group kill of its pane.
+
+**Rollback:**
+
+- the patch is one diff; reverting it restores the spec;
+- before an install, the old binary is kept beside the new one: copied, not overwritten;
+- the feed directories and cursors are this session's scratch under `target/next_step/`, removed
+  only by name;
+- `run-s6/` and `state-s7.bak` are kept.
+
+What this does not change: there is no second conductor and no Queen, GODMODE stays off, and the
+session cron stays the read-only duty tick. The contract describes deduplication, fences, replay
+and the effect journal; the runtime behaviour is not measured yet.
+
 ## 8. Lanes and owners
 
 Two lanes, one owner each, so that no two sessions fix the credentials, start DSH Web or edit

@@ -3,13 +3,17 @@
 ; queen::next_step::decide (through queen::next_step_run::run_decide), a check of the decision, at
 ; most one executor launch, an independent check of its artifact, then the next decision.
 ; A one-shot program: no daemon, no conductor, no cron, no network, no credentials, no shared
-; service. Every file it writes is under target/next_step/run/ (gitignored scratch) in the cwd.
+; service. Every file it writes is under target/next_step/ (gitignored scratch) in the cwd.
 ; The contract describes deduplication, fences, replay and the effect journal; the runtime
 ; behaviour is measured only by the journal of a run, not by this file.
 ; From the repo root:
 ;   NS_MODE=event NS_KIND=2 NS_SEQ=1 NS_EXEC=<absolute t27c> [NS_VERIFY=<absolute t27b>] next_step_main
 ;   NS_MODE=verify NS_VERIFY=<absolute t27b> next_step_main
+;   NS_MODE=feed NS_FEED_DIR=target/next_step/<dir> [NS_LEASE=<pane>] next_step_main
 ; With NS_VERIFY set, an executed attempt goes straight on to the verifier and the next decision.
+; NS_MODE=feed reads at most FEED_MAX_SNAPS pane-table snapshots <dir>/s1, s2, ... (t27os::pane_feed),
+; keeps its own cursor in <dir>/cursor and journals each intended decision in <dir>/journal. It has no
+; executor: nothing is launched, and target/next_step/run/ is neither read nor written.
 ; phi^2 + 1/phi^2 = 3 | TRINITY
 
 module T27osNextStepMain;
@@ -60,6 +64,24 @@ use queen::next_step::NS_BLOCKED;
 use queen::next_step::ST_DONE;
 use queen::next_step::budget_after;
 use queen::control::EV_REVIEW;
+use t27os::pane_feed::AGENT_SHELL;
+use t27os::pane_feed::FC_LEN;
+use t27os::pane_feed::FC_TIME;
+use t27os::pane_feed::FC_TABLE;
+use t27os::pane_feed::FT_LEN;
+use t27os::pane_feed::FA_APPLY;
+use t27os::pane_feed::FEED_MAX_SNAPS;
+use t27os::pane_feed::FEED_NO_EVENT;
+use t27os::pane_feed::snap_time;
+use t27os::pane_feed::snap_parse;
+use t27os::pane_feed::feed_action;
+use t27os::pane_feed::cursor_after;
+use t27os::pane_feed::cursor_clear;
+use t27os::pane_feed::cursor_ok;
+use t27os::pane_feed::lease_edge;
+use t27os::pane_feed::foreign_changes;
+use t27os::pane_feed::feed_event;
+use t27os::pane_feed::autonomy_allowed;
 use t27os::pty_proto::get_u64;
 use t27os::pty_proto::put_u64;
 use t27os::session_store::put_dec;
@@ -92,6 +114,10 @@ pub const LAUNCH_FAILED : u32 = 512;
 pub const APPROVAL_WINDOW : u64 = 2;
 pub const ART_CAP : usize = 8192;
 pub const LINE_CAP : usize = 256;
+/// Bytes of one snapshot a feed run reads; a file that fills it is refused as cut (SN_OVERFLOW).
+pub const FEED_BUF : usize = 2048;
+/// The longest NS_FEED_DIR, so that "<dir>/cursor.tmp" and its 0 fit a 128-byte path.
+pub const FEED_DIR_CAP : usize = 96;
 
 /// posix_spawn(3) with three argument words and a 0; the file actions are the 8-byte object.
 fn ns_spawn(pid: [2]u32, path: []const u8, actions: []u8, attr: u64, argv: [4]u64, envp: u64) -> i32 { return @extern("posix_spawn"); }
@@ -110,6 +136,48 @@ pub fn artifact_path(p: []u8, id: u64, verifier: bool) -> usize {
     } else {
         at = put_bytes(p, at, ".out");
     }
+    p[at] = 0;
+    return at;
+}
+
+/// The executor's artifact is the t27c report of the spec the attempt named: its first line says so.
+/// A report of any other spec, or a file that only contains the right totals, is not the artifact.
+pub fn report_names_spec(text: []const u8, n: usize) -> bool {
+    return find_from(text, n, 0, "--- test report: specs/queen/next_step.t27 ---\n") == 0;
+}
+
+/// The report line, built from the record: the task and the attempt the verifier checked.
+pub fn put_report(out: []u8, rec: []const u8) -> usize {
+    var k : usize = put_bytes(out, 0, "report task_id=");
+    out[k] = 65 + rec[SR_TASK];
+    k = put_bytes(out, k + 1, " attempt_id=");
+    k = put_dec(out, k, @as(u64, rec[SR_ATTEMPT]));
+    k = put_bytes(out, k, " verified: notified, read=no");
+    return k;
+}
+
+/// A feed directory is scratch under target/next_step/, not the bridge's run/, with no "..".
+pub fn feed_dir_ok(dir: []const u8, dn: usize) -> bool {
+    if (dn <= 17 or dn > FEED_DIR_CAP) { return false; }
+    if (find_from(dir, dn, 0, "target/next_step/") != 0) { return false; }
+    if (find_from(dir, dn, 0, "..") != NOT_FOUND) { return false; }
+    return find_from(dir, dn, 0, "target/next_step/run") != 0;
+}
+
+/// "<dir>/<name>" and a 0; the length without the 0.
+pub fn feed_path(p: []u8, dir: []const u8, dn: usize, name: []const u8) -> usize {
+    var at : usize = put_bytes(p, 0, dir[0..dn]);
+    p[at] = 47;
+    at = put_bytes(p, at + 1, name);
+    p[at] = 0;
+    return at;
+}
+
+/// "<dir>/s<i>" and a 0: the i-th snapshot of a feed run.
+pub fn snap_path(p: []u8, dir: []const u8, dn: usize, i: u64) -> usize {
+    var at : usize = put_bytes(p, 0, dir[0..dn]);
+    at = put_bytes(p, at, "/s");
+    at = put_dec(p, at, i);
     p[at] = 0;
     return at;
 }
@@ -162,17 +230,21 @@ fn now_secs() -> u64 {
     return get_u64(tv[0..16], 0);
 }
 
-/// Writes line[0..n] and a newline to stdout and appends it to target/next_step/run/journal.
-fn say(line: []u8, n: usize) -> void {
+/// Writes line[0..n] and a newline to stdout and appends it to the journal at path.
+fn say_in(path: []const u8, line: []u8, n: usize) -> void {
     line[n] = 10;
     const len : u64 = @as(u64, n + 1);
     sys_write(1, line, len);
-    var fd : i32 = sys_open_ro("target/next_step/run/journal", OPEN_APPEND);
-    if (fd < 0) { fd = sys_creat("target/next_step/run/journal", FILE_MODE); }
+    var fd : i32 = sys_open_ro(path, OPEN_APPEND);
+    if (fd < 0) { fd = sys_creat(path, FILE_MODE); }
     if (fd >= 0) {
         sys_write(fd, line, len);
         sys_close(fd);
     }
+}
+
+fn say(line: []u8, n: usize) -> void {
+    say_in("target/next_step/run/journal", line, n);
 }
 
 fn load_record(rec: []u8) -> bool {
@@ -385,6 +457,12 @@ fn on_verify() -> u32 {
         say(line[0..256], k);
         return 3;
     }
+    if (rec[SR_TASK] != TASK_B) {
+        k = put_bytes(line[0..256], 0, "verify refused: the attempt's task has no criterion, task=");
+        k = put_dec(line[0..256], k, @as(u64, rec[SR_TASK]));
+        say(line[0..256], k);
+        return 3;
+    }
     var tool : [256]u8 = undefined;
     const tn : usize = env_into("NS_VERIFY", tool[0..256], 256);
     if (tn == 0) {
@@ -403,7 +481,9 @@ fn on_verify() -> u32 {
     var vbuf : [8192]u8 = undefined;
     const nv : usize = read_into(ver[0..64], vbuf[0..8192], ART_CAP);
     const want : u64 = @as(u64, rec[SR_WANT]);
-    const exec_ok : bool = report_ok_t27c(abuf[0..8192], na, want);
+    const names_ok : bool = report_names_spec(abuf[0..8192], na);
+    var exec_ok : bool = report_ok_t27c(abuf[0..8192], na, want);
+    if (names_ok == false) { exec_ok = false; }
     var verify_ok : bool = report_ok_t27b(vbuf[0..8192], nv, want);
     if (vcode != 0) { verify_ok = false; }
     const st : u8 = attempt_after_verify(@as(u32, rec[SR_CODE]), exec_ok, verify_ok);
@@ -415,6 +495,8 @@ fn on_verify() -> u32 {
     k = put_dec(line[0..256], k, want);
     k = put_bytes(line[0..256], k, " artifact_bytes=");
     k = put_dec(line[0..256], k, @as(u64, na));
+    k = put_bytes(line[0..256], k, " names_spec=");
+    k = put_flag(line[0..256], k, names_ok);
     k = put_bytes(line[0..256], k, " exec_ok=");
     k = put_flag(line[0..256], k, exec_ok);
     k = put_bytes(line[0..256], k, " verifier_exit=");
@@ -427,7 +509,7 @@ fn on_verify() -> u32 {
     k = put_dec(line[0..256], k, @as(u64, st));
     say(line[0..256], k);
     if (st == AT_VERIFIED) {
-        k = put_bytes(line[0..256], 0, "report task_id=B attempt_id=1 verified: notified, read=no");
+        k = put_report(line[0..256], rec[0..32]);
         say(line[0..256], k);
     }
     const now : u64 = now_secs();
@@ -449,17 +531,181 @@ fn on_verify() -> u32 {
     return r;
 }
 
+/// cursor.tmp, then rename(2) over cursor, like save_record.
+fn save_cursor(c: []const u8, tmp: []const u8, path: []const u8) -> bool {
+    const fd : i32 = sys_creat(tmp, FILE_MODE);
+    if (fd < 0) { return false; }
+    const put : i64 = sys_write(fd, c, @as(u64, FC_LEN));
+    sys_close(fd);
+    if (put != @as(i64, FC_LEN)) { return false; }
+    return sys_rename(tmp, path) == 0;
+}
+
+/// NS_MODE=feed: each snapshot is parsed and checked against the cursor (t27os::pane_feed); an idle
+/// edge of the leased pane is decided with the reasons of a fresh run record, and the decision is
+/// journaled as intended. No executor is called on this path, whatever the decision names.
+fn on_feed() -> u32 {
+    var line : [256]u8 = undefined;
+    var k : usize = 0;
+    var dir : [128]u8 = undefined;
+    const dn : usize = env_into("NS_FEED_DIR", dir[0..128], 128);
+    if (feed_dir_ok(dir[0..128], dn) == false) {
+        k = put_bytes(line[0..256], 0, "feed refused: NS_FEED_DIR must be target/next_step/<dir>, not run/\n");
+        sys_write(1, line[0..256], @as(u64, k));
+        return 2;
+    }
+    var jp : [128]u8 = undefined;
+    feed_path(jp[0..128], dir[0..128], dn, "journal");
+    var cp : [128]u8 = undefined;
+    feed_path(cp[0..128], dir[0..128], dn, "cursor");
+    var tp : [128]u8 = undefined;
+    feed_path(tp[0..128], dir[0..128], dn, "cursor.tmp");
+    var nb : [16]u8 = undefined;
+    const ln : usize = env_into("NS_LEASE", nb[0..16], 16);
+    var pane64 : u64 = 15;
+    if (ln > 0) { pane64 = number_at(nb[0..16], ln, 0); }
+    if (pane64 >= 16) {
+        k = put_bytes(line[0..256], 0, "feed refused: NS_LEASE is not a pane");
+        say_in(jp[0..128], line[0..256], k);
+        return 2;
+    }
+    const pane : u32 = @as(u32, @intCast(pane64));
+    var c : [80]u8 = undefined;
+    cursor_clear(c[0..80]);
+    if (read_into(cp[0..128], c[0..80], FC_LEN) != FC_LEN) { cursor_clear(c[0..80]); }
+    k = put_bytes(line[0..256], 0, "feed start lease_pane=");
+    k = put_dec(line[0..256], k, pane64);
+    k = put_bytes(line[0..256], k, " agent=");
+    k = put_dec(line[0..256], k, @as(u64, AGENT_SHELL));
+    k = put_bytes(line[0..256], k, " cursor_kept=");
+    k = put_flag(line[0..256], k, cursor_ok(c[0..80]));
+    k = put_bytes(line[0..256], k, " autonomy_allowed=");
+    k = put_flag(line[0..256], k, autonomy_allowed(true, true));
+    say_in(jp[0..128], line[0..256], k);
+    var rec : [32]u8 = undefined;
+    const now : u64 = now_secs();
+    record_init(rec[0..32], now + APPROVAL_WINDOW);
+    const ap : u8 = approval_after(rec[SR_APPROVAL], now >= get_u64(rec[0..32], SR_DEADLINE), false);
+    var sp : [128]u8 = undefined;
+    var buf : [2048]u8 = undefined;
+    var tab : [64]u8 = undefined;
+    var i : u32 = 1;
+    var decided : u64 = 0;
+    var more : bool = true;
+    while (more and i <= FEED_MAX_SNAPS) {
+        snap_path(sp[0..128], dir[0..128], dn, @as(u64, i));
+        const nr : usize = read_into(sp[0..128], buf[0..2048], FEED_BUF);
+        if (nr == 0) {
+            more = false;
+        } else {
+            const t : u64 = snap_time(buf[0..2048], nr);
+            const s : u32 = snap_parse(buf[0..2048], nr, FEED_BUF, tab[0..64]);
+            const last : u64 = get_u64(c[0..80], FC_TIME);
+            const a : u32 = feed_action(c[0..80], s, t, tab[0..64], pane, AGENT_SHELL);
+            var edge : u32 = 0;
+            var foreign : u32 = 0;
+            if (a == FA_APPLY) {
+                edge = lease_edge(c[FC_TABLE .. FC_TABLE + FT_LEN], tab[0..64], pane);
+                foreign = foreign_changes(c[FC_TABLE .. FC_TABLE + FT_LEN], tab[0..64], pane);
+            }
+            const ev : u8 = feed_event(a, edge);
+            k = put_bytes(line[0..256], 0, "feed snap=");
+            k = put_dec(line[0..256], k, @as(u64, i));
+            k = put_bytes(line[0..256], k, " time=");
+            k = put_dec(line[0..256], k, t);
+            k = put_bytes(line[0..256], k, " parse=");
+            k = put_dec(line[0..256], k, @as(u64, s));
+            k = put_bytes(line[0..256], k, " action=");
+            k = put_dec(line[0..256], k, @as(u64, a));
+            k = put_bytes(line[0..256], k, " edge=");
+            k = put_dec(line[0..256], k, @as(u64, edge));
+            k = put_bytes(line[0..256], k, " foreign=");
+            k = put_dec(line[0..256], k, @as(u64, foreign));
+            k = put_bytes(line[0..256], k, " event=");
+            k = put_dec(line[0..256], k, @as(u64, ev));
+            say_in(jp[0..128], line[0..256], k);
+            if (ev != FEED_NO_EVENT) {
+                const d : u32 = run_decide(ev, last, t, reason_now(rec[0..32], ap, TASK_A), reason_now(rec[0..32], ap, TASK_B), reason_now(rec[0..32], ap, TASK_C));
+                k = put_decision(line[0..256], t, ev, last, ap, rec[0..32], d);
+                say_in(jp[0..128], line[0..256], k);
+                k = put_bytes(line[0..256], 0, "intended: recorded, not launched (feed mode has no executor)");
+                say_in(jp[0..128], line[0..256], k);
+                decided = decided + 1;
+            }
+            if (cursor_after(c[0..80], a, t, tab[0..64], pane, AGENT_SHELL)) {
+                if (save_cursor(c[0..80], tp[0..128], cp[0..128]) == false) {
+                    k = put_bytes(line[0..256], 0, "feed stopped: cursor not saved");
+                    say_in(jp[0..128], line[0..256], k);
+                    return 3;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    k = put_bytes(line[0..256], 0, "feed end snapshots=");
+    k = put_dec(line[0..256], k, @as(u64, i - 1));
+    k = put_bytes(line[0..256], k, " intended_decisions=");
+    k = put_dec(line[0..256], k, decided);
+    k = put_bytes(line[0..256], k, " launches=0");
+    say_in(jp[0..128], line[0..256], k);
+    return 0;
+}
+
 pub fn main() -> void {
     sys_mkdir("target/next_step", DIR_MODE);
-    sys_mkdir("target/next_step/run", DIR_MODE);
     var mode : [16]u8 = undefined;
     const mn : usize = env_into("NS_MODE", mode[0..16], 16);
     var r : u32 = 2;
     if (mn > 0) {
-        if (mode[0] == 101) { r = on_event(); }
-        if (mode[0] == 118) { r = on_verify(); }
+        if (mode[0] == 102) {
+            r = on_feed();
+        } else {
+            sys_mkdir("target/next_step/run", DIR_MODE);
+            if (mode[0] == 101) { r = on_event(); }
+            if (mode[0] == 118) { r = on_verify(); }
+        }
     }
     sys_exit(@as(i32, @intCast(r)));
+}
+
+test the_artifact_must_name_the_spec {
+    const good : []const u8 = "--- test report: specs/queen/next_step.t27 ---\n\n  tests       14\n";
+    const other : []const u8 = "--- test report: specs/t27os/pane_feed.t27 ---\n\n  tests       14\n";
+    assert report_names_spec(good, good.len);
+    assert report_names_spec(other, other.len) == false;
+    assert report_names_spec("  tests       14\n", 17) == false;
+    assert report_names_spec(good, 20) == false;
+}
+
+test the_report_line_comes_from_the_record {
+    var rec : [32]u8 = undefined;
+    record_init(rec[0..32], 100);
+    rec[SR_TASK] = TASK_B;
+    rec[SR_ATTEMPT] = 2;
+    var out : [256]u8 = undefined;
+    const n : usize = put_report(out[0..256], rec[0..32]);
+    assert find_from(out[0..256], n, 0, "report task_id=B attempt_id=2 verified") == 0;
+    rec[SR_TASK] = TASK_A;
+    rec[SR_ATTEMPT] = 1;
+    const m : usize = put_report(out[0..256], rec[0..32]);
+    assert find_from(out[0..256], m, 0, "report task_id=A attempt_id=1 ") == 0;
+}
+
+test feed_files_stay_in_scratch {
+    assert feed_dir_ok("target/next_step/feed1", 22);
+    assert feed_dir_ok("target/next_step/run", 20) == false;
+    assert feed_dir_ok("target/next_step/run2", 21) == false;
+    assert feed_dir_ok("target/next_step/", 17) == false;
+    assert feed_dir_ok("target/next_step/../x", 21) == false;
+    assert feed_dir_ok("/tmp/target/next_step/x", 23) == false;
+    var p : [128]u8 = undefined;
+    const n : usize = snap_path(p[0..128], "target/next_step/feed1", 22, 3);
+    assert n == 25;
+    assert p[n] == 0;
+    assert find_from(p[0..128], n, 0, "feed1/s3") == 17;
+    const m : usize = feed_path(p[0..128], "target/next_step/feed1", 22, "cursor.tmp");
+    assert m == 33;
+    assert find_from(p[0..128], m, 0, "/cursor.tmp") == 22;
 }
 
 test artifact_paths_name_the_attempt {

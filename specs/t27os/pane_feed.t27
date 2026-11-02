@@ -1,0 +1,589 @@
+// SPDX-License-Identifier: Apache-2.0
+; A test adapter from the PTY server's pane table to the next-step law (Refs #12884). Pure half; the
+; host half is NS_MODE=feed in specs/t27os/next_step_main.t27, which launches nothing.
+; Source: the LIST snapshot of the running PTY server (T27OS_CTL=list, run_ctl in pty_server.t27), one
+; line "pane P agent A state S flags F" per used slot: S = shown state + 64 * light (keys.t27
+; shown_with_light), F = bit 0 live, bit 1 needs you, bit 2 unseen, plus 16 * (key + 1) (pty_logic.t27
+; list_flags_key). The server moves every slot through pane_step (pane_state.t27) on each hook, output,
+; quiet, key, seen, exit and spawn event; LIST is a level snapshot of that table, with no sequence
+; number, no generation and no task.
+; Why not live_events.txt: glass_window.t27 folds a shell diff of LIST (queen_dash.t27 QD_TAP_CMD) into
+; counts that saturate at 127 and keeps no cursor, and the file has not been written since 2026-10-27.
+; It is drawing telemetry, never launch permission.
+; A snapshot here is a header line "time <unix seconds>" and then the LIST lines. The adapter keeps its
+; own cursor (time and table of the last baseline) and never changes the server or another reader:
+;   same time, same table -> FA_DUP, nothing changes;
+;   same time, other table -> FA_CLASH, refused, nothing changes;
+;   older than the cursor -> FA_OLD, refused;
+;   more than FEED_GAP_MAX seconds after the cursor -> FA_GAP, resync: new baseline, no decision;
+;   no cursor, a corrupt one, or one for another lease (adapter restart from nothing) -> FA_BASE, resync;
+;   an unparsable, out-of-range, unknown, twice-listed, over-long or cut table -> FA_BAD, refused;
+;   the leased pane gone, not live or holding another agent -> FA_LEASE_LOST, refused;
+;   otherwise FA_APPLY: a WORKING -> IDLE or DONE edge of the leased pane is EV_WORKER_IDLE for decide,
+;   with the snapshot time as the event's sequence number. A change of any other pane belongs to
+;   another task: it is counted and never decided on.
+; Limits that stay: LIST is level-triggered, so a state that comes and goes between two snapshots is
+; not seen; a slot respawned between two snapshots with the same agent is not seen (no generation).
+; The executor gates at the end hold three defects of pty_server.t27 (read 2026-11-02) as refusals.
+; The contract describes deduplication, fences, replay and the effect journal; the runtime behaviour is
+; not measured by this file.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osPaneFeed;
+
+use t27os::pty_proto::MAX_PANES;
+use t27os::pty_proto::get_u64;
+use t27os::pty_proto::put_u64;
+use t27os::agents::AGENT_COUNT;
+use t27os::agents::S_WORKING;
+use t27os::agents::S_IDLE;
+use t27os::agents::S_DONE;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use std::mem::bytes_eq;
+use std::mem::bytes_starts_with;
+use queen::control::EV_WORKER_IDLE;
+use queen::next_step::D_STALE;
+use queen::next_step_run::TASK_A;
+use queen::next_step_run::TASK_B;
+use queen::next_step_run::TASK_C;
+use queen::next_step_run::AP_WAITING;
+use queen::next_step_run::NOT_FOUND;
+use queen::next_step_run::find_from;
+use queen::next_step_run::reason_of;
+use queen::next_step_run::run_decide;
+use queen::next_step_run::has_executor;
+
+/// The shell cell: the agent number after the last agent (agents.t27 AGENT_COUNT).
+pub const AGENT_SHELL : u32 = 9;
+/// One slot of a table: present, agent, state byte, flags byte.
+pub const FT_SLOT : usize = 4;
+pub const FT_LEN : usize = 64;
+/// The cursor: time of the baseline, magic, lease pane, lease agent, then the baseline table.
+pub const FC_TIME : usize = 0;
+pub const FC_MAGIC : usize = 8;
+pub const FC_PANE : usize = 9;
+pub const FC_AGENT : usize = 10;
+pub const FC_TABLE : usize = 16;
+pub const FC_LEN : usize = 80;
+/// Not the run record's 27, so one file can never be read as the other.
+pub const FC_MAGIC_VALUE : u8 = 72;
+/// Seconds between two snapshots above which the baseline is no longer trusted.
+pub const FEED_GAP_MAX : u64 = 600;
+/// Snapshots one host run reads at most.
+pub const FEED_MAX_SNAPS : u32 = 8;
+/// No header, or a header without a number.
+pub const NO_TIME : u64 = 0;
+/// feed_event when nothing is decided.
+pub const FEED_NO_EVENT : u8 = 255;
+
+/// snap_parse answers.
+pub const SN_OK : u32 = 0;
+pub const SN_NO_HEADER : u32 = 1;
+pub const SN_BAD_LINE : u32 = 2;
+pub const SN_RANGE : u32 = 3;
+pub const SN_UNKNOWN : u32 = 4;
+pub const SN_TWICE : u32 = 5;
+pub const SN_OVERFLOW : u32 = 6;
+
+/// feed_action answers.
+pub const FA_APPLY : u32 = 0;
+pub const FA_DUP : u32 = 1;
+pub const FA_CLASH : u32 = 2;
+pub const FA_OLD : u32 = 3;
+pub const FA_GAP : u32 = 4;
+pub const FA_BASE : u32 = 5;
+pub const FA_BAD : u32 = 6;
+pub const FA_LEASE_LOST : u32 = 7;
+
+/// lease_edge answers.
+pub const FE_NONE : u32 = 0;
+pub const FE_IDLE : u32 = 1;
+pub const FE_BUSY : u32 = 2;
+
+/// pty_server.t27 stop_pane_process sends SIGKILL to the direct child only and waits for it; whatever
+/// that child started keeps running.
+pub const PTY_KILL_ENDS_GROUP : bool = false;
+/// The T27OS_CTL=spawn client prints "spawned pane N" without reading the reply, so on a full table it
+/// names a pane the server refused (OP_SPAWN answers RE_ERR when pane_alloc finds no slot).
+pub const PTY_SPAWN_REPLY_CHECKED : bool = false;
+/// The server has no lease: any client may send keys to any pane.
+pub const PTY_HAS_LEASE : bool = false;
+
+/// The end of the digit run at text[at..n] (at itself when there is none), or NOT_FOUND when the run
+/// is longer than cap.
+pub fn digits_end(text: []const u8, n: usize, at: usize, cap: usize) -> usize {
+    var p : usize = at;
+    var more : bool = p < n;
+    while (more) {
+        const ch : u8 = text[p];
+        if (ch < 48 or ch > 57) {
+            more = false;
+        } else {
+            p = p + 1;
+            more = p < n;
+        }
+    }
+    if (p - at > cap) { return NOT_FOUND; }
+    return p;
+}
+
+/// The value of the digits text[at..end], end from digits_end with cap at most 19.
+pub fn digits_value(text: []const u8, at: usize, end: usize) -> u64 {
+    var v : u64 = 0;
+    var p : usize = at;
+    while (p < end) {
+        v = v * 10 + @as(u64, text[p] - 48);
+        p = p + 1;
+    }
+    return v;
+}
+
+/// text[at..n] starts with word: the position after it, else NOT_FOUND.
+pub fn word_at(text: []const u8, n: usize, at: usize, word: []const u8) -> usize {
+    if (at > n) { return NOT_FOUND; }
+    if (bytes_starts_with(text[at..n], word) == false) { return NOT_FOUND; }
+    return at + word.len;
+}
+
+/// The header "time <seconds>" and its newline: the seconds, or NO_TIME. A unix time has 10 digits;
+/// next_step_run's number_at stops at 9, so this reads up to 19.
+pub fn snap_time(text: []const u8, n: usize) -> u64 {
+    const at : usize = word_at(text, n, 0, "time ");
+    if (at == NOT_FOUND) { return NO_TIME; }
+    const end : usize = digits_end(text, n, at, 19);
+    if (end == NOT_FOUND or end == at or end >= n) { return NO_TIME; }
+    if (text[end] != 10) { return NO_TIME; }
+    return digits_value(text, at, end);
+}
+
+/// `word` and then 1 to 3 digits at text[at..n]: the value into row[k], the answer is the position
+/// after the digits, or NOT_FOUND (also when at is NOT_FOUND, so calls chain).
+pub fn field_at(text: []const u8, n: usize, at: usize, word: []const u8, row: []u32, k: usize) -> usize {
+    if (at == NOT_FOUND) { return NOT_FOUND; }
+    const p : usize = word_at(text, n, at, word);
+    if (p == NOT_FOUND) { return NOT_FOUND; }
+    const end : usize = digits_end(text, n, p, 3);
+    if (end == NOT_FOUND or end == p) { return NOT_FOUND; }
+    row[k] = @as(u32, @intCast(digits_value(text, p, end)));
+    return end;
+}
+
+/// One LIST line at text[at..n] into row (pane, agent, state, flags): the position after its newline,
+/// or NOT_FOUND when the line is not exactly "pane P agent A state S flags F".
+pub fn row_parse(text: []const u8, n: usize, at: usize, row: []u32) -> usize {
+    var p : usize = field_at(text, n, at, "pane ", row, 0);
+    p = field_at(text, n, p, " agent ", row, 1);
+    p = field_at(text, n, p, " state ", row, 2);
+    p = field_at(text, n, p, " flags ", row, 3);
+    if (p == NOT_FOUND or p >= n) { return NOT_FOUND; }
+    if (text[p] != 10) { return NOT_FOUND; }
+    return p + 1;
+}
+
+/// SN_RANGE for a slot or agent no server has, or a byte above 255; SN_UNKNOWN for a shown state
+/// above S_DONE or flag bit 3, which no server sets.
+pub fn row_status(row: []const u32) -> u32 {
+    if (row[0] >= MAX_PANES) { return SN_RANGE; }
+    if (row[1] > AGENT_SHELL) { return SN_RANGE; }
+    if (row[2] > 255 or row[3] > 255) { return SN_RANGE; }
+    if (row[2] % 64 > S_DONE) { return SN_UNKNOWN; }
+    if ((row[3] & 8) != 0) { return SN_UNKNOWN; }
+    return SN_OK;
+}
+
+/// A whole snapshot into table (FT_LEN bytes, cleared first): SN_OK or the first refusal. cap is the
+/// size of the host's read buffer; text that fills it may be cut, so that is SN_OVERFLOW too.
+pub fn snap_parse(text: []const u8, n: usize, cap: usize, table: []u8) -> u32 {
+    var i : usize = 0;
+    while (i < FT_LEN) {
+        table[i] = 0;
+        i = i + 1;
+    }
+    if (n >= cap) { return SN_OVERFLOW; }
+    if (snap_time(text, n) == NO_TIME) { return SN_NO_HEADER; }
+    var at : usize = find_from(text, n, 0, "\n") + 1;
+    var rows : u32 = 0;
+    var row : [4]u32 = [0, 0, 0, 0];
+    while (at < n) {
+        if (rows >= MAX_PANES) { return SN_OVERFLOW; }
+        const next : usize = row_parse(text, n, at, row[0..4]);
+        if (next == NOT_FOUND) { return SN_BAD_LINE; }
+        const s : u32 = row_status(row[0..4]);
+        if (s != SN_OK) { return s; }
+        const b : usize = @as(usize, row[0]) * FT_SLOT;
+        if (table[b] != 0) { return SN_TWICE; }
+        table[b] = 1;
+        table[b + 1] = @as(u8, @intCast(row[1]));
+        table[b + 2] = @as(u8, @intCast(row[2]));
+        table[b + 3] = @as(u8, @intCast(row[3]));
+        rows = rows + 1;
+        at = next;
+    }
+    return SN_OK;
+}
+
+pub fn slot_present(t: []const u8, pane: u32) -> bool {
+    return t[@as(usize, pane) * FT_SLOT] != 0;
+}
+
+pub fn slot_agent(t: []const u8, pane: u32) -> u32 {
+    return @as(u32, t[@as(usize, pane) * FT_SLOT + 1]);
+}
+
+/// The shown state without the light (keys.t27 shown_state_of).
+pub fn slot_shown(t: []const u8, pane: u32) -> u32 {
+    return @as(u32, t[@as(usize, pane) * FT_SLOT + 2]) % 64;
+}
+
+pub fn slot_live(t: []const u8, pane: u32) -> bool {
+    return (@as(u32, t[@as(usize, pane) * FT_SLOT + 3]) & 1) != 0;
+}
+
+/// How many slots of table t are used; MAX_PANES means a spawn can only be refused.
+pub fn slots_used(t: []const u8) -> u32 {
+    var k : u32 = 0;
+    var i : u32 = 0;
+    while (i < MAX_PANES) {
+        if (slot_present(t, i)) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+/// The leased pane is still the one we hold in table t: present, live, the agent the lease names.
+pub fn lease_holds(t: []const u8, pane: u32, agent: u32) -> bool {
+    if (pane >= MAX_PANES) { return false; }
+    if (slot_present(t, pane) == false) { return false; }
+    if (slot_live(t, pane) == false) { return false; }
+    return slot_agent(t, pane) == agent;
+}
+
+/// The edge of the leased pane from table old to table new: FE_IDLE when it was WORKING and now is
+/// IDLE or DONE (a turn or a command ended), FE_BUSY when it starts WORKING, else FE_NONE.
+pub fn lease_edge(old: []const u8, new: []const u8, pane: u32) -> u32 {
+    const a : u32 = slot_shown(old, pane);
+    const b : u32 = slot_shown(new, pane);
+    if (a == S_WORKING and (b == S_IDLE or b == S_DONE)) { return FE_IDLE; }
+    if (a != S_WORKING and b == S_WORKING) { return FE_BUSY; }
+    return FE_NONE;
+}
+
+/// How many slots other than the leased one differ between old and new: another task's events,
+/// counted and never decided on.
+pub fn foreign_changes(old: []const u8, new: []const u8, pane: u32) -> u32 {
+    var k : u32 = 0;
+    var i : u32 = 0;
+    while (i < MAX_PANES) {
+        const b : usize = @as(usize, i) * FT_SLOT;
+        if (i != pane and bytes_eq(old[b .. b + FT_SLOT], new[b .. b + FT_SLOT]) == false) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+/// No cursor: every byte 0, so cursor_ok answers false.
+pub fn cursor_clear(c: []u8) -> usize {
+    var k : usize = c.len;
+    while (k > 0) {
+        k = k - 1;
+        c[k] = 0;
+    }
+    return c.len;
+}
+
+/// The cursor has the magic byte and its lease names a slot.
+pub fn cursor_ok(c: []const u8) -> bool {
+    if (c[FC_MAGIC] != FC_MAGIC_VALUE) { return false; }
+    return @as(u32, c[FC_PANE]) < MAX_PANES;
+}
+
+/// What to do with the snapshot taken at t whose parse answered s and whose table is new, given the
+/// cursor c and the lease (pane, agent).
+pub fn feed_action(c: []const u8, s: u32, t: u64, new: []const u8, pane: u32, agent: u32) -> u32 {
+    if (s != SN_OK) { return FA_BAD; }
+    var known : bool = cursor_ok(c);
+    if (known) {
+        if (@as(u32, c[FC_PANE]) != pane or @as(u32, c[FC_AGENT]) != agent) { known = false; }
+    }
+    if (known) {
+        const last : u64 = get_u64(c, FC_TIME);
+        if (t < last) { return FA_OLD; }
+        if (t == last) {
+            if (bytes_eq(c[FC_TABLE .. FC_TABLE + FT_LEN], new[0..FT_LEN])) { return FA_DUP; }
+            return FA_CLASH;
+        }
+    }
+    if (lease_holds(new, pane, agent) == false) { return FA_LEASE_LOST; }
+    if (known == false) { return FA_BASE; }
+    if (t - get_u64(c, FC_TIME) > FEED_GAP_MAX) { return FA_GAP; }
+    return FA_APPLY;
+}
+
+/// The cursor after action a for the snapshot (t, new): APPLY, GAP and BASE make it the baseline;
+/// every other action leaves the cursor as it was. Answers whether the cursor changed.
+pub fn cursor_after(c: []u8, a: u32, t: u64, new: []const u8, pane: u32, agent: u32) -> bool {
+    if (a != FA_APPLY and a != FA_GAP and a != FA_BASE) { return false; }
+    put_u64(c, FC_TIME, t);
+    c[FC_MAGIC] = FC_MAGIC_VALUE;
+    c[FC_PANE] = @as(u8, @intCast(pane));
+    c[FC_AGENT] = @as(u8, @intCast(agent));
+    var i : usize = 0;
+    while (i < FT_LEN) {
+        c[FC_TABLE + i] = new[i];
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The event kind a snapshot gives decide: EV_WORKER_IDLE for an applied idle edge of the leased
+/// pane; FEED_NO_EVENT for a busy edge, no edge, and every refusal or resync.
+pub fn feed_event(a: u32, edge: u32) -> u8 {
+    if (a == FA_APPLY and edge == FE_IDLE) { return EV_WORKER_IDLE; }
+    return FEED_NO_EVENT;
+}
+
+/// Work may be handed only to the leased pane, and only while the lease holds in the latest table.
+pub fn cell_may_take(t: []const u8, target: u32, pane: u32, agent: u32) -> bool {
+    if (target != pane) { return false; }
+    return lease_holds(t, pane, agent);
+}
+
+/// A spawn is confirmed by the two tables alone: the slot was free before and holds the asked agent,
+/// live, after. The client's "spawned pane N" text is never read.
+pub fn spawn_confirmed(before: []const u8, after: []const u8, pane: u32, agent: u32) -> bool {
+    if (pane >= MAX_PANES) { return false; }
+    if (slot_present(before, pane)) { return false; }
+    return lease_holds(after, pane, agent);
+}
+
+/// A budget can be enforced only with a deadline and a stop that ends the whole process group;
+/// killing the direct child alone is not a budget.
+pub fn budget_enforceable(has_deadline: bool, stop_ends_group: bool) -> bool {
+    if (has_deadline == false) { return false; }
+    return stop_ends_group;
+}
+
+/// The gate before any launch from a feed decision with nobody watching. It answers false while the
+/// server has no lease, does not check the spawn reply, or stops a pane by killing its child only.
+pub fn autonomy_allowed(lease_ok: bool, has_deadline: bool) -> bool {
+    if (lease_ok == false or PTY_HAS_LEASE == false) { return false; }
+    if (PTY_SPAWN_REPLY_CHECKED == false) { return false; }
+    return budget_enforceable(has_deadline, PTY_KILL_ENDS_GROUP);
+}
+
+test the_layout_matches_the_server {
+    assert AGENT_SHELL == AGENT_COUNT;
+    assert FT_LEN == @as(usize, MAX_PANES) * FT_SLOT;
+    assert FC_TABLE + FT_LEN == FC_LEN;
+    assert FC_MAGIC_VALUE != 27;
+}
+
+test the_time_header_reads_ten_digits {
+    const s : []const u8 = "time 1793660000\npane 15 agent 9 state 3 flags 1\n";
+    assert snap_time(s, s.len) == 1793660000;
+    assert snap_time("time \n", 6) == NO_TIME;
+    assert snap_time("time 17936\n", 11) == 17936;
+    assert snap_time("time 1793660000", 15) == NO_TIME;
+    assert snap_time("tim 1793660000\n", 15) == NO_TIME;
+    assert digits_end("12345678901234567890x", 21, 0, 19) == NOT_FOUND;
+}
+
+test a_repeated_snapshot_is_a_duplicate {
+    const s : []const u8 = "time 1793660000\npane 4 agent 9 state 3 flags 1\npane 15 agent 9 state 3 flags 1\n";
+    var t : [64]u8 = undefined;
+    assert snap_parse(s, s.len, 2048, t[0..64]) == SN_OK;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert feed_action(c[0..80], SN_OK, 1793660000, t[0..64], 15, AGENT_SHELL) == FA_BASE;
+    assert cursor_after(c[0..80], FA_BASE, 1793660000, t[0..64], 15, AGENT_SHELL);
+    assert feed_action(c[0..80], SN_OK, 1793660000, t[0..64], 15, AGENT_SHELL) == FA_DUP;
+    assert cursor_after(c[0..80], FA_DUP, 1793660000, t[0..64], 15, AGENT_SHELL) == false;
+    assert get_u64(c[0..80], FC_TIME) == 1793660000;
+}
+
+test an_older_snapshot_or_a_clash_is_refused {
+    const a : []const u8 = "time 1793660004\npane 15 agent 9 state 3 flags 1\n";
+    const b : []const u8 = "time 1793660000\npane 15 agent 9 state 3 flags 1\n";
+    const d : []const u8 = "time 1793660004\npane 15 agent 9 state 1 flags 1\n";
+    var ta : [64]u8 = undefined;
+    var tb : [64]u8 = undefined;
+    var td : [64]u8 = undefined;
+    assert snap_parse(a, a.len, 2048, ta[0..64]) == SN_OK;
+    assert snap_parse(b, b.len, 2048, tb[0..64]) == SN_OK;
+    assert snap_parse(d, d.len, 2048, td[0..64]) == SN_OK;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert cursor_after(c[0..80], FA_BASE, 1793660004, ta[0..64], 15, AGENT_SHELL);
+    assert feed_action(c[0..80], SN_OK, 1793660000, tb[0..64], 15, AGENT_SHELL) == FA_OLD;
+    assert feed_action(c[0..80], SN_OK, 1793660004, td[0..64], 15, AGENT_SHELL) == FA_CLASH;
+    assert cursor_after(c[0..80], FA_OLD, 1793660000, tb[0..64], 15, AGENT_SHELL) == false;
+    assert cursor_after(c[0..80], FA_CLASH, 1793660004, td[0..64], 15, AGENT_SHELL) == false;
+    assert get_u64(c[0..80], FC_TIME) == 1793660004;
+}
+
+test a_gap_resyncs_without_a_decision {
+    const a : []const u8 = "time 1793660000\npane 15 agent 9 state 1 flags 1\n";
+    const b : []const u8 = "time 1793660601\npane 15 agent 9 state 3 flags 1\n";
+    var ta : [64]u8 = undefined;
+    var tb : [64]u8 = undefined;
+    assert snap_parse(a, a.len, 2048, ta[0..64]) == SN_OK;
+    assert snap_parse(b, b.len, 2048, tb[0..64]) == SN_OK;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert cursor_after(c[0..80], FA_BASE, 1793660000, ta[0..64], 15, AGENT_SHELL);
+    const act : u32 = feed_action(c[0..80], SN_OK, 1793660601, tb[0..64], 15, AGENT_SHELL);
+    assert act == FA_GAP;
+    // the edge is there, and still nothing is decided: the baseline was not current
+    assert lease_edge(ta[0..64], tb[0..64], 15) == FE_IDLE;
+    assert feed_event(act, FE_IDLE) == FEED_NO_EVENT;
+    assert cursor_after(c[0..80], act, 1793660601, tb[0..64], 15, AGENT_SHELL);
+    assert get_u64(c[0..80], FC_TIME) == 1793660601;
+}
+
+test an_over_long_or_cut_table_is_refused {
+    var buf : [1024]u8 = undefined;
+    var k : usize = put_bytes(buf[0..1024], 0, "time 1793660000\n");
+    var i : u64 = 0;
+    while (i < 17) {
+        k = put_bytes(buf[0..1024], k, "pane ");
+        k = put_dec(buf[0..1024], k, i % 16);
+        k = put_bytes(buf[0..1024], k, " agent 9 state 3 flags 1\n");
+        i = i + 1;
+    }
+    var t : [64]u8 = undefined;
+    assert snap_parse(buf[0..1024], k, 1024, t[0..64]) == SN_OVERFLOW;
+    // a read that filled the host buffer may be cut: refused even when what is there parses
+    const s : []const u8 = "time 1793660000\npane 15 agent 9 state 3 flags 1\n";
+    assert snap_parse(s, s.len, s.len, t[0..64]) == SN_OVERFLOW;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert feed_action(c[0..80], SN_OVERFLOW, 1793660000, t[0..64], 15, AGENT_SHELL) == FA_BAD;
+}
+
+test an_unknown_line_or_state_is_refused {
+    var t : [64]u8 = undefined;
+    assert snap_parse("time 1793660000\nno server\n", 26, 2048, t[0..64]) == SN_BAD_LINE;
+    assert snap_parse("pane 15 agent 9 state 3 flags 1\n", 32, 2048, t[0..64]) == SN_NO_HEADER;
+    assert snap_parse("time 1793660000\npane 16 agent 9 state 3 flags 1\n", 48, 2048, t[0..64]) == SN_RANGE;
+    assert snap_parse("time 1793660000\npane 15 agent 10 state 3 flags 1\n", 49, 2048, t[0..64]) == SN_RANGE;
+    assert snap_parse("time 1793660000\npane 15 agent 9 state 133 flags 1\n", 50, 2048, t[0..64]) == SN_UNKNOWN;
+    assert snap_parse("time 1793660000\npane 15 agent 9 state 3 flags 9\n", 48, 2048, t[0..64]) == SN_UNKNOWN;
+    assert snap_parse("time 1793660000\npane 15 agent 9 state 3 flags 1\npane 15 agent 9 state 3 flags 1\n", 80, 2048, t[0..64]) == SN_TWICE;
+    assert snap_parse("time 1793660000\npane 15 agent 9 state 3 flags 1", 47, 2048, t[0..64]) == SN_BAD_LINE;
+    // the light is not a state: 131 is IDLE with light 2
+    assert snap_parse("time 1793660000\npane 15 agent 9 state 131 flags 1\n", 50, 2048, t[0..64]) == SN_OK;
+    assert slot_shown(t[0..64], 15) == S_IDLE;
+}
+
+test another_tasks_pane_is_counted_never_decided {
+    const a : []const u8 = "time 1793660000\npane 3 agent 0 state 129 flags 33\npane 15 agent 9 state 3 flags 1\n";
+    const b : []const u8 = "time 1793660009\npane 3 agent 0 state 131 flags 37\npane 15 agent 9 state 3 flags 1\n";
+    var ta : [64]u8 = undefined;
+    var tb : [64]u8 = undefined;
+    assert snap_parse(a, a.len, 2048, ta[0..64]) == SN_OK;
+    assert snap_parse(b, b.len, 2048, tb[0..64]) == SN_OK;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert cursor_after(c[0..80], FA_BASE, 1793660000, ta[0..64], 15, AGENT_SHELL);
+    const act : u32 = feed_action(c[0..80], SN_OK, 1793660009, tb[0..64], 15, AGENT_SHELL);
+    assert act == FA_APPLY;
+    // pane 3 went from WORKING to IDLE: that is its own task's edge, not ours
+    assert foreign_changes(ta[0..64], tb[0..64], 15) == 1;
+    assert lease_edge(ta[0..64], tb[0..64], 15) == FE_NONE;
+    assert feed_event(act, lease_edge(ta[0..64], tb[0..64], 15)) == FEED_NO_EVENT;
+}
+
+test a_restart_from_nothing_resyncs {
+    const s : []const u8 = "time 1793660000\npane 15 agent 9 state 3 flags 1\n";
+    var t : [64]u8 = undefined;
+    assert snap_parse(s, s.len, 2048, t[0..64]) == SN_OK;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert feed_action(c[0..80], SN_OK, 1793660000, t[0..64], 15, AGENT_SHELL) == FA_BASE;
+    assert cursor_after(c[0..80], FA_BASE, 1793660000, t[0..64], 15, AGENT_SHELL);
+    // a kept cursor: the same snapshot again after a restart is a duplicate
+    assert feed_action(c[0..80], SN_OK, 1793660000, t[0..64], 15, AGENT_SHELL) == FA_DUP;
+    // a corrupt cursor is no cursor
+    c[FC_MAGIC] = 27;
+    assert feed_action(c[0..80], SN_OK, 1793660009, t[0..64], 15, AGENT_SHELL) == FA_BASE;
+    // a cursor kept for another lease is no cursor either
+    c[FC_MAGIC] = FC_MAGIC_VALUE;
+    c[FC_PANE] = 12;
+    assert feed_action(c[0..80], SN_OK, 1793660009, t[0..64], 15, AGENT_SHELL) == FA_BASE;
+}
+
+test a_lost_lease_refuses {
+    const gone : []const u8 = "time 1793660009\npane 14 agent 9 state 3 flags 1\n";
+    const dead : []const u8 = "time 1793660009\npane 15 agent 9 state 3 flags 0\n";
+    const other : []const u8 = "time 1793660009\npane 15 agent 0 state 3 flags 1\n";
+    var t : [64]u8 = undefined;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert snap_parse(gone, gone.len, 2048, t[0..64]) == SN_OK;
+    assert feed_action(c[0..80], SN_OK, 1793660009, t[0..64], 15, AGENT_SHELL) == FA_LEASE_LOST;
+    assert snap_parse(dead, dead.len, 2048, t[0..64]) == SN_OK;
+    assert feed_action(c[0..80], SN_OK, 1793660009, t[0..64], 15, AGENT_SHELL) == FA_LEASE_LOST;
+    assert snap_parse(other, other.len, 2048, t[0..64]) == SN_OK;
+    assert feed_action(c[0..80], SN_OK, 1793660009, t[0..64], 15, AGENT_SHELL) == FA_LEASE_LOST;
+    assert cursor_after(c[0..80], FA_LEASE_LOST, 1793660009, t[0..64], 15, AGENT_SHELL) == false;
+    assert cursor_ok(c[0..80]) == false;
+}
+
+test an_idle_edge_of_the_leased_pane_reaches_decide {
+    const a : []const u8 = "time 1793660000\npane 15 agent 9 state 1 flags 1\n";
+    const b : []const u8 = "time 1793660004\npane 15 agent 9 state 3 flags 1\n";
+    var ta : [64]u8 = undefined;
+    var tb : [64]u8 = undefined;
+    assert snap_parse(a, a.len, 2048, ta[0..64]) == SN_OK;
+    assert snap_parse(b, b.len, 2048, tb[0..64]) == SN_OK;
+    var c : [80]u8 = undefined;
+    assert cursor_clear(c[0..80]) == FC_LEN;
+    assert cursor_after(c[0..80], FA_BASE, 1793660000, ta[0..64], 15, AGENT_SHELL);
+    const act : u32 = feed_action(c[0..80], SN_OK, 1793660004, tb[0..64], 15, AGENT_SHELL);
+    assert act == FA_APPLY;
+    assert lease_edge(ta[0..64], tb[0..64], 15) == FE_IDLE;
+    assert lease_edge(tb[0..64], ta[0..64], 15) == FE_BUSY;
+    const kind : u8 = feed_event(act, FE_IDLE);
+    assert kind == EV_WORKER_IDLE;
+    const ra : u8 = reason_of(TASK_A, AP_WAITING, false, 0, 1);
+    const rb : u8 = reason_of(TASK_B, AP_WAITING, false, 0, 1);
+    const rc : u8 = reason_of(TASK_C, AP_WAITING, false, 0, 1);
+    const d : u32 = run_decide(kind, 0, 1793660004, ra, rb, rc);
+    assert d == @as(u32, TASK_B);
+    assert has_executor(d);
+    // the same observation decided again is stale for decide as well
+    assert run_decide(kind, 1793660004, 1793660004, ra, rb, rc) == D_STALE;
+}
+
+test the_executor_gates_refuse_today {
+    var buf : [1024]u8 = undefined;
+    var k : usize = put_bytes(buf[0..1024], 0, "time 1793660000\n");
+    var i : u64 = 0;
+    while (i < 16) {
+        k = put_bytes(buf[0..1024], k, "pane ");
+        k = put_dec(buf[0..1024], k, i);
+        k = put_bytes(buf[0..1024], k, " agent 9 state 3 flags 1\n");
+        i = i + 1;
+    }
+    var full : [64]u8 = undefined;
+    assert snap_parse(buf[0..1024], k, 1024, full[0..64]) == SN_OK;
+    assert slots_used(full[0..64]) == MAX_PANES;
+    // a full table: "spawned pane 15" can only be a refused spawn
+    assert spawn_confirmed(full[0..64], full[0..64], 15, AGENT_SHELL) == false;
+    var before : [64]u8 = undefined;
+    var after : [64]u8 = undefined;
+    assert snap_parse("time 1793660000\npane 15 agent 9 state 3 flags 1\n", 48, 2048, before[0..64]) == SN_OK;
+    assert snap_parse("time 1793660003\npane 14 agent 0 state 3 flags 1\npane 15 agent 9 state 3 flags 1\n", 80, 2048, after[0..64]) == SN_OK;
+    assert spawn_confirmed(before[0..64], after[0..64], 14, 0);
+    assert spawn_confirmed(before[0..64], before[0..64], 14, 0) == false;
+    assert spawn_confirmed(before[0..64], after[0..64], 14, AGENT_SHELL) == false;
+    // a shared cell never takes work; the leased one only while the lease holds
+    assert cell_may_take(after[0..64], 14, 15, AGENT_SHELL) == false;
+    assert cell_may_take(after[0..64], 15, 15, AGENT_SHELL);
+    assert budget_enforceable(true, false) == false;
+    assert budget_enforceable(false, true) == false;
+    assert budget_enforceable(true, true);
+    assert autonomy_allowed(true, true) == false;
+    assert PTY_KILL_ENDS_GROUP == false and PTY_SPAWN_REPLY_CHECKED == false and PTY_HAS_LEASE == false;
+}
