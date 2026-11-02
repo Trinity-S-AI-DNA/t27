@@ -332,6 +332,11 @@ use t27os::pty_logic::tv_ms;
 use t27os::pty_logic::put_pollfd;
 use t27os::pty_logic::poll_revents;
 use t27os::pty_logic::exit_event;
+use t27os::pty_logic::WNOHANG;
+use t27os::pty_logic::RO_WAIT;
+use t27os::pty_logic::reap_outcome;
+use t27os::pty_logic::STOP_WAIT_TRIES;
+use t27os::pty_logic::STOP_WAIT_MS;
 use t27os::pty_logic::hooked_status;
 use t27os::pty_logic::list_flags;
 use t27os::pty_logic::launch_command;
@@ -662,37 +667,78 @@ fn pane_path_first(st: []const u64, mem: []u8) -> void {
     sys_setenv("PATH", mem[O_TMP2 + 6000 .. O_TMP2 + 6000 + l + 1], 1);
 }
 
-fn reap(st: []u64, mem: []u8, i: usize) -> void {
+/// Pane i's process has been collected with status word `status`: relaunch a resume that failed at once,
+/// otherwise step the pane's state to its exit.
+fn pane_exited(st: []u64, mem: []u8, i: usize, status: u32) -> void {
     const base : usize = i * PF;
-    var ws : [2]u32 = undefined;
-    ws[0] = 0;
-    ws[1] = 0;
-    sys_waitpid(@as(i32, @intCast(st[base + PF_PID])), ws, 0);
-    sys_close(@as(i32, @intCast(st[base + PF_FD])));
-    st[base + PF_LIVE] = 0;
-    if (resume_failed(@as(u32, @intCast(st[base + PF_PLAN])), st[base + PF_BORN], now_ms(mem), ws[0])) {
+    if (resume_failed(@as(u32, @intCast(st[base + PF_PLAN])), st[base + PF_BORN], now_ms(mem), status)) {
         // nothing to resume: start the agent fresh in the same cwd
         launch(st, mem, i, R_RELAUNCH, false);
         save_pane(st, mem, i);
         return;
     }
     // WIFEXITED with code 0 is a zero status word
-    st[base + PF_STATUS] = @as(u64, pane_step(@as(u32, @intCast(st[base + PF_STATUS])), exit_event(ws[0])));
+    st[base + PF_STATUS] = @as(u64, pane_step(@as(u32, @intCast(st[base + PF_STATUS])), exit_event(status)));
     save_pane(st, mem, i);
 }
 
-/// Stop pane i's process (SIGKILL, wait, close the master); the pane's record and slot stay.
+/// Collect pane i's exited process without waiting (WNOHANG). A process that has not finished exiting keeps
+/// its pid and is collected by late_reap on a later loop turn; the server's one thread never blocks on it.
+fn collect(st: []u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    if (st[base + PF_PID] == 0) { return; }
+    var ws : [2]u32 = undefined;
+    ws[0] = 0;
+    ws[1] = 0;
+    const r : i32 = sys_waitpid(@as(i32, @intCast(st[base + PF_PID])), ws, WNOHANG);
+    if (reap_outcome(r) == RO_WAIT) { return; }
+    st[base + PF_PID] = 0;
+    pane_exited(st, mem, i, ws[0]);
+}
+
+/// Pane i's terminal hung up: close it and collect the process now or later.
+fn reap(st: []u64, mem: []u8, i: usize) -> void {
+    const base : usize = i * PF;
+    sys_close(@as(i32, @intCast(st[base + PF_FD])));
+    st[base + PF_LIVE] = 0;
+    collect(st, mem, i);
+}
+
+/// Once a loop turn: collect the panes whose terminal hung up before their process finished exiting.
+fn late_reap(st: []u64, mem: []u8) -> void {
+    var i : usize = 0;
+    while (i < MAX_PANES) {
+        const base : usize = i * PF;
+        if (st[base + PF_USED] != 0 and st[base + PF_LIVE] == 0 and st[base + PF_PID] != 0) { collect(st, mem, i); }
+        i = i + 1;
+    }
+}
+
+/// Stop pane i's process (SIGKILL, close the master, wait at most STOP_WAIT_TRIES * STOP_WAIT_MS); the pane's
+/// record and slot stay. A process still not collected after that is left alone (init collects it when the
+/// server exits) and its pid is forgotten, so late_reap never steps a stopped pane.
 fn stop_pane_process(st: []u64, i: usize) -> void {
     const base : usize = i * PF;
-    if (st[base + PF_LIVE] != 0) {
-        sys_kill(@as(i32, @intCast(st[base + PF_PID])), 9);
-        var ws : [2]u32 = undefined;
-        ws[0] = 0;
-        ws[1] = 0;
-        sys_waitpid(@as(i32, @intCast(st[base + PF_PID])), ws, 0);
-        sys_close(@as(i32, @intCast(st[base + PF_FD])));
-    }
+    if (st[base + PF_PID] != 0) { sys_kill(@as(i32, @intCast(st[base + PF_PID])), 9); }
+    if (st[base + PF_LIVE] != 0) { sys_close(@as(i32, @intCast(st[base + PF_FD]))); }
     st[base + PF_LIVE] = 0;
+    if (st[base + PF_PID] != 0) {
+        var ws : [2]u32 = undefined;
+        var nap : [8]u8 = undefined;
+        var tries : u32 = 0;
+        var done : bool = false;
+        while (done == false and tries < STOP_WAIT_TRIES) {
+            ws[0] = 0;
+            ws[1] = 0;
+            if (reap_outcome(sys_waitpid(@as(i32, @intCast(st[base + PF_PID])), ws, WNOHANG)) != RO_WAIT) {
+                done = true;
+            } else {
+                sys_poll(nap[0..8], 0, STOP_WAIT_MS);
+            }
+            tries = tries + 1;
+        }
+    }
+    st[base + PF_PID] = 0;
 }
 
 fn kill_pane(st: []u64, mem: []u8, i: usize) -> void {
@@ -1720,6 +1766,7 @@ fn serve_loop(st: []u64, mem: []u8) -> void {
         if (st[G_RBACKOFF] > 0) { st[G_RBACKOFF] = st[G_RBACKOFF] - 1; }
         quiet_tick(st, mem);
         wait_tick(st, mem);
+        late_reap(st, mem);
         sup_tick(st, mem, sup[0..16]);
     }
 }

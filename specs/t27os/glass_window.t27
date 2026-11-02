@@ -1365,6 +1365,11 @@ use t27os::term_pane::tp_btn_y;
 use t27os::term_pane::tp_retry_hit;
 use t27os::term_pane::tp_server_step;
 use t27os::term_pane::tp_server_spawn_due;
+use t27os::term_pane::SRV_HUNG;
+use t27os::term_pane::TFD_HUNG;
+use t27os::term_pane::TP_SRV_HUNG;
+use t27os::term_pane::tp_hung_probe_due;
+use t27os::keys_host::PUSH_DEAD;
 use t27os::term_pane::tp_server_cmd;
 use t27os::term_pane::TP_RETRY;
 use t27os::term_pane::PANE_LIVE;
@@ -5517,13 +5522,27 @@ fn ns_bytes(s: u64, out: []u8) -> usize {
     return @as(usize, n);
 }
 
-/// Connect to the server under the home directory; the fd, -1 when nothing listens. A new connection means a
-/// server that may have restarted and forgotten its keys, so every stored key is handed over again.
+/// Connect to the server under the home directory; the fd, -1 when nothing listens, TFD_HUNG when it accepts
+/// and does not answer a LIST (each reply waits at most RECV_MS, so a stuck server costs one frame, not the
+/// window). A new connection means a server that may have restarted and forgotten its keys, so every stored key
+/// is handed over again.
 fn term_connect(hb: []u8) -> i32 {
     const hn : usize = ns_bytes(home_dir(), hb);
     const fd : i32 = client_connect(hb[0 .. hn]);
-    if (fd >= 0) { push_keys(fd); }
+    if (fd < 0) { return -1; }
+    var lb : [4100]u8 = undefined;
+    if (client_list(fd, lb[0..4100]) == 0 or push_keys(fd) == PUSH_DEAD) {
+        sys_close(fd);
+        return TFD_HUNG;
+    }
     return fd;
+}
+
+/// A call on `fd` got no reply: close it and dial again, so the next frame sees a dead server (-1, refused)
+/// apart from a hung one (TFD_HUNG). Setting the fd to -1 alone read a hung server as dead and started a second.
+fn term_redial(fd: i32, hb: []u8) -> i32 {
+    if (fd >= 0) { sys_close(fd); }
+    return term_connect(hb);
 }
 
 /// The server pane for chat `cur`: the k-th pane of its agent when the server has one (a reopened
@@ -5589,6 +5608,8 @@ fn draw_srv_banner(c: u64, kit: [48]u64, phase: u32, ox: f64, oy: f64, pw: f64, 
     cg_fill_rgba(c, 1.0, 1.0, 1.0, lv(kit, THV_TEXT_WHITE) * a);
     if (phase == SRV_FAILED) {
         draw_bytes(c, kit, TP_SRV_FAILED, 30, bx + 24.0, by + 36.0, 13.0, WEIGHT_SEMIBOLD, false);
+    } else if (phase == SRV_HUNG) {
+        draw_bytes(c, kit, TP_SRV_HUNG, 32, bx + 24.0, by + 36.0, 13.0, WEIGHT_SEMIBOLD, false);
     } else {
         draw_bytes(c, kit, TP_SRV_STARTING, 23, bx + 24.0, by + 36.0, 13.0, WEIGHT_SEMIBOLD, false);
     }
@@ -5902,9 +5923,10 @@ fn keys_refresh(stored: []u32, mask: []u8, mlen: []u32) -> void {
 
 /// Hand the server every stored key with its number (keys_host push_keys), then take back each key whose last
 /// check failed (keys.t27 key_withheld), as the check button does: a refresh must not undo that. kst holds one
-/// status per key (keys.t27 key_index).
+/// status per key (keys.t27 key_index). A server that stops answering ends it at once: each further call would
+/// wait RECV_MS again.
 fn keys_sync(fd: i32, kst: []const u32, out: []u8) -> void {
-    push_keys(fd);
+    if (push_keys(fd) == PUSH_DEAD) { return; }
     var p : u32 = 0;
     while (p < PROVIDER_COUNT) {
         var k : u32 = 0;
@@ -14619,8 +14641,17 @@ pub fn main() -> void {
         if (srvpid != 0 and tg_done(srvpid) != 0) { srvpid = 0; }
         if (screen) {
             srvw = srvw + 1;
-            if (tfd < 0 and srvp != SRV_FAILED and srvw % TP_START_POLL == 1) { tfd = term_connect(thome[0..256]); }
-            var snp : u32 = tp_server_step(srvp, tfd >= 0, srvw);
+            // Retry on a HUNG server asks it again now; it never starts a second one
+            if (srvretry and srvp == SRV_HUNG) {
+                srvretry = false;
+                srvw = 1;
+            }
+            if (tfd == -1 and srvp != SRV_FAILED and srvp != SRV_HUNG and srvw % TP_START_POLL == 1) { tfd = term_connect(thome[0..256]); }
+            if (tfd < 0 and srvp == SRV_HUNG and tp_hung_probe_due(srvw)) { tfd = term_connect(thome[0..256]); }
+            var snp : u32 = tp_server_step(srvp, tfd >= 0, tfd == TFD_HUNG, srvw);
+            // while HUNG the fd word stays TFD_HUNG, so only the probe above connects
+            if (snp == SRV_HUNG and tfd < 0) { tfd = TFD_HUNG; }
+            if (snp == SRV_HUNG and srvp != SRV_HUNG) { srvw = 1; }
             if (srvretry) {
                 srvretry = false;
                 srvp = SRV_FAILED;
@@ -14671,7 +14702,7 @@ pub fn main() -> void {
                 ttry = ttry + 1;
                 if (tp_retry_due(ttry)) {
                     ttry = 0;
-                    if (tfd < 0) { tfd = term_connect(thome[0..256]); }
+                    if (tfd == -1) { tfd = term_connect(thome[0..256]); }
                     if (tfd >= 0) { tgo = true; }
                 }
             }
@@ -14684,7 +14715,7 @@ pub fn main() -> void {
                 if (dk_len(dk, tcwd) == 0) { tcwd = home_dir(); }
                 if (topen != want or tlink != PANE_LIVE) {
                     tpid = PANE_NONE;
-                    if (tfd < 0) { tfd = term_connect(thome[0..256]); }
+                    if (tfd == -1) { tfd = term_connect(thome[0..256]); }
                     if (tfd >= 0) {
                         if (want == VIEW_EDITOR) { tpid = epane; } else { tpid = term_open(tfd, ss, cur, tcwd, tout[0..4100], tdir[0..512]); }
                     }
@@ -14696,8 +14727,7 @@ pub fn main() -> void {
                         epane = PANE_NONE;
                     }
                     if (tpid == PANE_NONE and tfd >= 0) {
-                        sys_close(tfd);
-                        tfd = -1;
+                        tfd = term_redial(tfd, thome[0..256]);
                     }
                 }
                 // the pty takes the new grid before the replay, so the program redraws at the full width
@@ -14714,11 +14744,10 @@ pub fn main() -> void {
                 while (tmore) {
                     const rn : usize = client_read(tfd, tpid, tcursor, tout[0..4100]);
                     if (rn == 0) {
-                        // the server went away: drop the socket; the retry finds it again after a restart
+                        // the server went away or stopped answering: dial again; the step sees which
                         tmore = false;
                         tlink = PANE_OFFLINE;
-                        sys_close(tfd);
-                        tfd = -1;
+                        tfd = term_redial(tfd, thome[0..256]);
                     } else {
                         const dn : usize = tp_data_len(tout[0..4100], rn);
                         if (dn > 0) {
@@ -14744,6 +14773,11 @@ pub fn main() -> void {
         // the rows of the agents dialog show the state the server lists (pane state, live flag), refreshed twice a second
         if (tfd >= 0 and frame % 15 == 0) {
             const sln : usize = client_list(tfd, tout[0..4100]);
+            // no reply frame (a frame has a header even for no panes): dial again, so the
+            // server step tells a dead server (refused) from a hung one (TFD_HUNG)
+            if (sln == 0) {
+                tfd = term_redial(tfd, thome[0..256]);
+            }
             var sj : u32 = 0;
             while (sj < 32 and sj < session_count(ss)) {
                 sst[sj] = tp_state_of(tout[0..4100], sln, session_agent(ss, sj), tp_ordinal(ss, sj));
@@ -14811,7 +14845,7 @@ pub fn main() -> void {
             const idn : usize = ns_bytes(idirs, kdir[0..512]);
             edone = edit_mark(edone, space);
             if (itg == OT_INSIDE) {
-                if (tfd < 0) { tfd = term_connect(thome[0..256]); }
+                if (tfd == -1) { tfd = term_connect(thome[0..256]); }
                 var iep : u32 = PANE_NONE;
                 if (tfd >= 0) { iep = edit_open(tfd, epane, espace, space, ktpick, kdir[0..idn], tout[0..4100]); }
                 epane = iep;

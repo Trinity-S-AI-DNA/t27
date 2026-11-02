@@ -84,6 +84,7 @@ pub const TP_LINE_OFFLINE : str = "offline: no t27os pty server on ~/.t27os/pty.
 /// What the pane server banner says (owner, 2026-10-20): never the raw offline line.
 pub const TP_SRV_STARTING : str = "Starting pane server...";
 pub const TP_SRV_FAILED : str = "The pane server did not start";
+pub const TP_SRV_HUNG : str = "The pane server is not answering";
 pub const TP_SRV_RETRY : str = "Retry";
 pub const TP_PROMPT : str = "> ";
 /// The directory buffer the host fills for TP_LINE_CWD.
@@ -576,10 +577,25 @@ pub const TP_START_POLL : u32 = 15;
 pub const SERVER_NAME : str = "t27os-pty";
 pub const TP_SRV_HEAD_B : str = "\"; export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin; ";
 
-/// The next phase. A socket that answers is UP. A socket that does not answer while UP starts the server. A start
-/// that has waited TP_START_WAIT frames has FAILED; FAILED stays until the Retry button.
-pub fn tp_server_step(phase: u32, connected: bool, waited: u32) -> u32 {
+/// The socket accepts a connection but the server does not answer a request (2026-11-02: its one thread sat in
+/// a blocking waitpid on a pane that never finished exiting). The server still holds every pane, so the app
+/// neither starts a second one nor stops it; it says so and asks again every TP_HUNG_POLL frames.
+pub const SRV_HUNG : u32 = 3;
+/// The window's pane-server fd while the server is HUNG: closed, and not -1, so no connect site but the HUNG
+/// probe connects again (each attempt on a stuck server costs the frame up to RECV_MS).
+pub const TFD_HUNG : i32 = -2;
+/// Frames between two HUNG probes (30 fps: thirty seconds); each probe may hold one frame for RECV_MS.
+pub const TP_HUNG_POLL : u32 = 900;
+
+/// The next phase. A socket that answers is UP. A socket that accepts and does not answer is HUNG, whatever
+/// the phase. HUNG ends only with an answer: a refused connect may be the stuck server's full listen queue
+/// (pty_server listens with a backlog of 8), and a server started then would find no answer, unlink the socket
+/// and take it from the server that holds the panes. A socket that does not answer while UP starts the server.
+/// A start that has waited TP_START_WAIT frames has FAILED; FAILED stays until the Retry button.
+pub fn tp_server_step(phase: u32, connected: bool, hung: bool, waited: u32) -> u32 {
     if (connected) { return SRV_UP; }
+    if (hung) { return SRV_HUNG; }
+    if (phase == SRV_HUNG) { return SRV_HUNG; }
     if (phase == SRV_UP) { return SRV_STARTING; }
     if (phase == SRV_STARTING and waited >= TP_START_WAIT) { return SRV_FAILED; }
     return phase;
@@ -588,11 +604,15 @@ pub fn tp_server_step(phase: u32, connected: bool, waited: u32) -> u32 {
 /// Start the server job on this step? Only when the phase turns into STARTING.
 pub fn tp_server_spawn_due(old: u32, new: u32) -> bool { return new == SRV_STARTING and old != SRV_STARTING; }
 
-/// The Retry button: a failed start starts again; anything else is unchanged.
+/// The Retry button: a failed start starts again; a HUNG server is only asked again (tp_hung_probe_due), never
+/// started a second time; anything else is unchanged.
 pub fn tp_server_retry(phase: u32) -> u32 {
     if (phase == SRV_FAILED) { return SRV_STARTING; }
     return phase;
 }
+
+/// Ask a HUNG server again on this frame? `waited` counts frames since it went HUNG (or since Retry).
+pub fn tp_hung_probe_due(waited: u32) -> bool { return waited % TP_HUNG_POLL == 1; }
 
 /// Poll the socket this frame while starting (and every TP_START_POLL frames).
 pub fn tp_server_poll_due(phase: u32, waited: u32) -> bool {
@@ -688,21 +708,42 @@ pub fn tp_retry_hit(mx: f64, my: f64, ox: f64, oy: f64, pw: f64, ph: f64) -> boo
 }
 
 test the_server_phase_walks_up_starting_failed_and_back {
-    assert tp_server_step(SRV_UP, true, 0) == SRV_UP;
-    assert tp_server_step(SRV_UP, false, 0) == SRV_STARTING;
+    assert tp_server_step(SRV_UP, true, false, 0) == SRV_UP;
+    assert tp_server_step(SRV_UP, false, false, 0) == SRV_STARTING;
     assert tp_server_spawn_due(SRV_UP, SRV_STARTING);
     assert tp_server_spawn_due(SRV_STARTING, SRV_STARTING) == false;
-    assert tp_server_step(SRV_STARTING, false, 10) == SRV_STARTING;
-    assert tp_server_step(SRV_STARTING, true, 10) == SRV_UP;
-    assert tp_server_step(SRV_STARTING, false, TP_START_WAIT) == SRV_FAILED;
-    assert tp_server_step(SRV_FAILED, false, 999) == SRV_FAILED;
-    assert tp_server_step(SRV_FAILED, true, 0) == SRV_UP;
+    assert tp_server_step(SRV_STARTING, false, false, 10) == SRV_STARTING;
+    assert tp_server_step(SRV_STARTING, true, false, 10) == SRV_UP;
+    assert tp_server_step(SRV_STARTING, false, false, TP_START_WAIT) == SRV_FAILED;
+    assert tp_server_step(SRV_FAILED, false, false, 999) == SRV_FAILED;
+    assert tp_server_step(SRV_FAILED, true, false, 0) == SRV_UP;
     // Retry starts again, and spawns again
     assert tp_server_retry(SRV_FAILED) == SRV_STARTING;
     assert tp_server_spawn_due(SRV_FAILED, tp_server_retry(SRV_FAILED));
     assert tp_server_retry(SRV_UP) == SRV_UP and tp_server_retry(SRV_STARTING) == SRV_STARTING;
     assert tp_server_poll_due(SRV_STARTING, 0) and tp_server_poll_due(SRV_STARTING, 7) == false;
     assert tp_server_poll_due(SRV_UP, 0) == false;
+}
+
+test a_hung_server_is_never_started_twice {
+    // a socket that accepts and never answers is HUNG from every phase, and HUNG never spawns
+    assert tp_server_step(SRV_UP, false, true, 0) == SRV_HUNG;
+    assert tp_server_step(SRV_STARTING, false, true, 5) == SRV_HUNG;
+    assert tp_server_step(SRV_FAILED, false, true, 999) == SRV_HUNG;
+    assert tp_server_spawn_due(SRV_UP, SRV_HUNG) == false;
+    // it stays HUNG while its socket is held and nothing answers, however long that is
+    assert tp_server_step(SRV_HUNG, false, true, 100000) == SRV_HUNG;
+    // Retry on HUNG is one more probe, not a start
+    assert tp_server_retry(SRV_HUNG) == SRV_HUNG;
+    assert tp_hung_probe_due(1) and tp_hung_probe_due(TP_HUNG_POLL + 1);
+    assert tp_hung_probe_due(0) == false and tp_hung_probe_due(2) == false;
+    // the server answers again: UP; a refused connect (a full listen queue looks the same as no server)
+    // keeps HUNG, so the app never starts a second server over the panes' owner
+    assert tp_server_step(SRV_HUNG, true, false, 3) == SRV_UP;
+    assert tp_server_step(SRV_HUNG, false, false, 3) == SRV_HUNG;
+    assert tp_server_spawn_due(SRV_HUNG, tp_server_step(SRV_HUNG, false, false, 100000)) == false;
+    assert TFD_HUNG < 0 and TFD_HUNG != -1;
+    assert tp_quit_leaves(SRV_HUNG) == SRV_HUNG;
 }
 
 test the_app_never_stops_the_server_on_quit {
