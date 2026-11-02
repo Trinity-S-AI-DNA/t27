@@ -1,0 +1,766 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/shell_dock.t27 -- the shell docks of T27 OS: a right dock that is the Queen
+; (the assistant) and a bottom dock that is a native terminal. Layout law slice (Refs #12779).
+; Owner, 2026-11-02: "the chat on the right pushes the content aside, do the same in T27 OS; the
+; chat there does not work and is a window on top; make the chat on the right so it does not jump
+; when switching screens; the chat on the right is the assistant, the Queen, above the assistant;
+; she has the context of all the user's moves; animate the shift of the centre; and a bottom dock
+; with a native terminal."
+; --
+; WHAT WAS WRONG (read in queen_chats.t27 and glass_window.t27, nothing run):
+;   1. rc_docked(dock_open, cur, agent) is true only while the CURRENT SESSION is the Queen's, so
+;      the dock follows the session and disappears or jumps when the screen changes;
+;   2. the dock is drawn OVER the centre; only the terminal grid uses content_right, the other
+;      screens are not re-laid-out, and there is no animation;
+;   3. while the Queen's pane is stopped the dock prints "opening the Queen's chat" for ever;
+;   4. there is no bottom dock; 5. nothing tells the Queen where the user is.
+; --
+; THE LAW OF THIS MODULE. The dock belongs to the SHELL, not to a screen or a session:
+;   - state = which docks are open and how wide; sd_set_screen records the screen for the
+;     Queen's context and NEVER starts an animation or moves a rect;
+;   - the right dock is full height; the bottom dock sits under the CENTRE column only;
+;   - PUSH when the centre keeps at least SD_CENTER_MIN_W, else OVER (a small window). The mode
+;     is decided from the dock's TARGET width, so it cannot flip in the middle of a motion;
+;   - only a deliberate toggle animates (SD_DUR, ease-out cubic, none under reduced motion); a
+;     drag follows the pointer with no easing; a re-target starts from the value on screen;
+;   - the terminal grids come from the TARGET rects, so cols and rows do not change per frame;
+;   - the Queen's context is a bounded ring of moves (screen, select, focus, dock, the LENGTH of
+;     an ask, never its text, never a key); the header chip and the text handed to her are the
+;     same string, so the user sees what she sees.
+; --
+; BEST PRACTICE read for this (web, 2026-11-02): VS Code keeps Chat in a Secondary Side Bar on
+; the right and the terminal in the bottom Panel, and restores the layout on restart; push on a
+; wide window, overlay on a small one; a rail resizable roughly 280..420 px, collapsing when
+; dragged far enough; animate deliberate toggles only, not navigation; honour reduced motion;
+; about 160..280 ms ease-out. AppKit NSSplitViewController (sidebar and inspector items that
+; collapse through the animator) is from memory, NOT read from Apple's pages. The numbers
+; below are this spec's choices, not measurements.
+; --
+; NOT DONE HERE. glass_window.t27 does not import this module; the dock drawing, the pane
+; spawn and the pty resize stay there. No build, no launch, no rendered frame.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27osShellDock;
+
+use t27f::petal_glass::fmin;
+use t27f::petal_glass::fmax;
+use t27os::queen_chats::rc_grid_cols;
+use t27os::queen_chats::rc_grid_rows;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+// ---------------------------------------------------------------- limits
+
+pub const SD_RIGHT_MIN : f64 = 280.0;
+pub const SD_RIGHT_DEFAULT : f64 = 360.0;
+pub const SD_RIGHT_MAX : f64 = 560.0;
+pub const SD_BOTTOM_MIN : f64 = 120.0;
+pub const SD_BOTTOM_DEFAULT : f64 = 260.0;
+/// The bottom dock never takes more than this share of the body height.
+pub const SD_BOTTOM_FRAC : f64 = 0.6;
+pub const SD_CENTER_MIN_W : f64 = 480.0;
+pub const SD_CENTER_MIN_H : f64 = 240.0;
+/// A drag released below this share of the minimum closes the dock.
+pub const SD_SNAP : f64 = 0.5;
+pub const SD_DUR : f64 = 0.24;
+pub const SD_PAD : f64 = 12.0;
+pub const SD_HEAD_H : f64 = 40.0;
+pub const SD_IN_H : f64 = 40.0;
+/// How long the Queen's chat may say "starting" before it offers START.
+pub const SD_START_WAIT : f64 = 10.0;
+
+// ---------------------------------------------------------------- the animator
+
+/// Ease-out cubic of a progress, clamped to 0..1.
+pub fn sd_ease(p : f64) -> f64 {
+    if (p <= 0.0) { return 0.0; }
+    if (p >= 1.0) { return 1.0; }
+    const q : f64 = 1.0 - p;
+    return 1.0 - q * q * q;
+}
+
+/// The value of a scalar motion at `now`: from at t0, to at t0 + dur. No duration jumps to `to`.
+pub fn sd_val(from : f64, to : f64, t0 : f64, dur : f64, now : f64) -> f64 {
+    if (dur <= 0.0 or now >= t0 + dur) { return to; }
+    if (now <= t0) { return from; }
+    return from + (to - from) * sd_ease((now - t0) / dur);
+}
+
+// ---------------------------------------------------------------- the shell state
+
+pub struct SdShell {
+    pub right_open : bool,
+    pub right_w : f64,
+    pub bottom_open : bool,
+    pub bottom_h : f64,
+    pub screen : u32,
+    pub reduced : bool,
+    pub rx_from : f64,
+    pub rx_to : f64,
+    pub rx_t0 : f64,
+    pub rx_dur : f64,
+    pub bx_from : f64,
+    pub bx_to : f64,
+    pub bx_t0 : f64,
+    pub bx_dur : f64,
+}
+
+/// A fresh shell: the Queen's dock open and settled (nothing animates on load), the terminal
+/// closed. `reduced` is the system's reduce-motion switch.
+pub fn sd_new(reduced : bool) -> SdShell {
+    return SdShell {
+        right_open: true, right_w: SD_RIGHT_DEFAULT,
+        bottom_open: false, bottom_h: SD_BOTTOM_DEFAULT,
+        screen: 0, reduced: reduced,
+        rx_from: SD_RIGHT_DEFAULT, rx_to: SD_RIGHT_DEFAULT, rx_t0: 0.0, rx_dur: 0.0,
+        bx_from: 0.0, bx_to: 0.0, bx_t0: 0.0, bx_dur: 0.0,
+    };
+}
+
+fn sd_dur(s : *SdShell) -> f64 {
+    if (s.reduced) { return 0.0; }
+    return SD_DUR;
+}
+
+/// The width the right dock can have in a window: never more than the max, never wider than the
+/// space right of the left rail.
+pub fn sd_right_cap(sw : f64, left : f64) -> f64 { return fmin(SD_RIGHT_MAX, sw - left); }
+
+/// The bottom dock's cap: a share of the body height, and the centre keeps its minimum height.
+pub fn sd_bottom_cap(body_h : f64) -> f64 {
+    return fmax(0.0, fmin(SD_BOTTOM_FRAC * body_h, body_h - SD_CENTER_MIN_H));
+}
+
+/// The right dock's preferred width in this window (the user's width, clamped).
+pub fn sd_right_pref(s : *SdShell, sw : f64, left : f64) -> f64 {
+    return fmax(SD_RIGHT_MIN, fmin(s.right_w, sd_right_cap(sw, left)));
+}
+
+/// Where the right dock is going: its preferred width, or 0 when closed.
+pub fn sd_right_target(s : *SdShell, sw : f64, left : f64) -> f64 {
+    if (s.right_open == false) { return 0.0; }
+    return sd_right_pref(s, sw, left);
+}
+
+/// Where the bottom dock is going: its height clamped to the cap, or 0 when closed.
+pub fn sd_bottom_target(s : *SdShell, body_h : f64) -> f64 {
+    if (s.bottom_open == false) { return 0.0; }
+    return fmax(SD_BOTTOM_MIN, fmin(s.bottom_h, sd_bottom_cap(body_h)));
+}
+
+pub fn sd_right_now(s : *SdShell, now : f64) -> f64 {
+    return sd_val(s.rx_from, s.rx_to, s.rx_t0, s.rx_dur, now);
+}
+
+pub fn sd_bottom_now(s : *SdShell, now : f64) -> f64 {
+    return sd_val(s.bx_from, s.bx_to, s.bx_t0, s.bx_dur, now);
+}
+
+/// True when the right dock takes any width on screen. It reads no session and no screen.
+pub fn sd_right_visible(s : *SdShell, now : f64) -> bool { return sd_right_now(s, now) > 0.0; }
+
+/// True when both motions have ended: the moment to re-fit the pty grids once.
+pub fn sd_settled(s : *SdShell, now : f64) -> bool {
+    return now >= s.rx_t0 + s.rx_dur and now >= s.bx_t0 + s.bx_dur;
+}
+
+fn sd_go_right(s : *SdShell, to : f64, now : f64, dur : f64) -> void {
+    const cur : f64 = sd_right_now(s, now);
+    s.rx_from = cur;
+    s.rx_to = to;
+    s.rx_t0 = now;
+    s.rx_dur = dur;
+}
+
+fn sd_go_bottom(s : *SdShell, to : f64, now : f64, dur : f64) -> void {
+    const cur : f64 = sd_bottom_now(s, now);
+    s.bx_from = cur;
+    s.bx_to = to;
+    s.bx_t0 = now;
+    s.bx_dur = dur;
+}
+
+/// Open or close the Queen's dock with the animation. A window too narrow for the minimum width
+/// refuses to open it (returns false).
+pub fn sd_toggle_right(s : *SdShell, sw : f64, left : f64, now : f64) -> bool {
+    if (s.right_open) {
+        s.right_open = false;
+        sd_go_right(s, 0.0, now, sd_dur(s));
+        return true;
+    }
+    if (sw - left < SD_RIGHT_MIN) { return false; }
+    s.right_open = true;
+    sd_go_right(s, sd_right_pref(s, sw, left), now, sd_dur(s));
+    return true;
+}
+
+/// Open or close the terminal dock. A body too short for the minimum refuses to open it.
+pub fn sd_toggle_bottom(s : *SdShell, body_h : f64, now : f64) -> bool {
+    if (s.bottom_open) {
+        s.bottom_open = false;
+        sd_go_bottom(s, 0.0, now, sd_dur(s));
+        return true;
+    }
+    if (sd_bottom_cap(body_h) < SD_BOTTOM_MIN) { return false; }
+    s.bottom_open = true;
+    sd_go_bottom(s, sd_bottom_target(s, body_h), now, sd_dur(s));
+    return true;
+}
+
+/// The pointer drags the right dock's left edge to x: the width follows it at once (no easing);
+/// released far enough right, the dock closes with the animation and keeps its last width.
+pub fn sd_drag_right(s : *SdShell, x : f64, sw : f64, left : f64, now : f64) -> void {
+    const w : f64 = sw - x;
+    if (w < SD_SNAP * SD_RIGHT_MIN) {
+        s.right_open = false;
+        sd_go_right(s, 0.0, now, sd_dur(s));
+        return;
+    }
+    s.right_open = true;
+    s.right_w = fmax(SD_RIGHT_MIN, fmin(w, sd_right_cap(sw, left)));
+    s.rx_from = s.right_w;
+    s.rx_to = s.right_w;
+    s.rx_t0 = now;
+    s.rx_dur = 0.0;
+}
+
+/// The same for the bottom dock's top edge at y (`bottom` = the body's bottom edge).
+pub fn sd_drag_bottom(s : *SdShell, y : f64, bottom : f64, body_h : f64, now : f64) -> void {
+    const h : f64 = bottom - y;
+    if (h < SD_SNAP * SD_BOTTOM_MIN or sd_bottom_cap(body_h) < SD_BOTTOM_MIN) {
+        s.bottom_open = false;
+        sd_go_bottom(s, 0.0, now, sd_dur(s));
+        return;
+    }
+    s.bottom_open = true;
+    s.bottom_h = fmax(SD_BOTTOM_MIN, fmin(h, sd_bottom_cap(body_h)));
+    s.bx_from = s.bottom_h;
+    s.bx_to = s.bottom_h;
+    s.bx_t0 = now;
+    s.bx_dur = 0.0;
+}
+
+/// The screen the user is on. It feeds the Queen's context and nothing else: no rect moves, no
+/// motion starts, whatever the screen id is (4294967295 = none).
+pub fn sd_set_screen(s : *SdShell, screen : u32) -> void { s.screen = screen; }
+
+// ---------------------------------------------------------------- the layout
+
+/// PUSH keeps the centre at least SD_CENTER_MIN_W wide; otherwise the dock lies OVER it. Decided
+/// from the target width, not from the width on screen, so it never flips during a motion.
+pub fn sd_right_over(sw : f64, left : f64, target_w : f64) -> bool {
+    return sw - left - target_w < SD_CENTER_MIN_W;
+}
+
+fn sd_sel(c : bool, a : f64, b : f64) -> f64 {
+    if (c) { return a; }
+    return b;
+}
+
+/// Writes 12 numbers: the centre (x, y, w, h) at 0, the right dock at 4 (full height), the bottom
+/// dock at 8 (under the centre column, never under the right dock). `top` is the workspace top,
+/// `foot` the status bar height, `left` the left rail width. Returns false when the centre has
+/// no area left.
+pub fn sd_layout(s : *SdShell, sw : f64, sh : f64, top : f64, foot : f64, left : f64, now : f64, out : []f64) -> bool {
+    const body_h : f64 = sh - foot - top;
+    const rw : f64 = fmin(sd_right_now(s, now), sd_right_cap(sw, left));
+    const bh : f64 = fmin(sd_bottom_now(s, now), sd_bottom_cap(body_h));
+    const full_w : f64 = sw - left;
+    const col_w : f64 = full_w - rw;
+    const over : bool = sd_right_over(sw, left, sd_right_pref(s, sw, left));
+    const cw : f64 = sd_sel(over, full_w, col_w);
+    const ch : f64 = body_h - bh;
+    out[0] = left;
+    out[1] = top;
+    out[2] = cw;
+    out[3] = ch;
+    out[4] = sw - rw;
+    out[5] = top;
+    out[6] = rw;
+    out[7] = body_h;
+    out[8] = left;
+    out[9] = top + ch;
+    out[10] = col_w;
+    out[11] = bh;
+    return cw > 0.0 and ch > 0.0;
+}
+
+/// Inside a right dock rect (x, y, w, h at panel[0..4]): the transcript at out[0..4] and the
+/// input line at out[4..8]. False when the dock is too small to hold a transcript.
+pub fn sd_chat_rects(panel : []const f64, out : []f64) -> bool {
+    out[0] = panel[0] + SD_PAD;
+    out[1] = panel[1] + SD_HEAD_H;
+    out[2] = panel[2] - 2.0 * SD_PAD;
+    out[3] = panel[3] - SD_HEAD_H - SD_IN_H - 2.0 * SD_PAD;
+    out[4] = panel[0] + SD_PAD;
+    out[5] = panel[1] + panel[3] - SD_PAD - SD_IN_H;
+    out[6] = panel[2] - 2.0 * SD_PAD;
+    out[7] = SD_IN_H;
+    return out[2] > 0.0 and out[3] > 0.0;
+}
+
+/// Inside a bottom dock rect: the terminal grid area at out[0..4].
+pub fn sd_term_rect(panel : []const f64, out : []f64) -> bool {
+    out[0] = panel[0] + SD_PAD;
+    out[1] = panel[1] + SD_HEAD_H;
+    out[2] = panel[2] - 2.0 * SD_PAD;
+    out[3] = panel[3] - SD_HEAD_H - SD_PAD;
+    return out[2] > 0.0 and out[3] > 0.0;
+}
+
+// The pty grids come from the TARGET rects, so they do not change on every frame of a motion.
+
+pub fn sd_chat_cols(s : *SdShell, sw : f64, left : f64) -> u32 {
+    return rc_grid_cols(sd_right_target(s, sw, left) - 2.0 * SD_PAD);
+}
+
+pub fn sd_chat_rows(body_h : f64) -> u32 {
+    return rc_grid_rows(body_h - SD_HEAD_H - SD_IN_H - 2.0 * SD_PAD);
+}
+
+pub fn sd_term_cols(s : *SdShell, sw : f64, left : f64) -> u32 {
+    return rc_grid_cols(sw - left - sd_right_target(s, sw, left) - 2.0 * SD_PAD);
+}
+
+pub fn sd_term_rows(s : *SdShell, body_h : f64) -> u32 {
+    return rc_grid_rows(sd_bottom_target(s, body_h) - SD_HEAD_H - SD_PAD);
+}
+
+// ---------------------------------------------------------------- the Queen's chat state
+
+pub const CH_LIVE : u8 = 0;
+pub const CH_STARTING : u8 = 1;
+pub const CH_STOPPED : u8 = 2;
+pub const CH_FAILED : u8 = 3;
+
+/// What the dock says about her pane. Pane states: 0 stopped, 1 working, 2 blocked, 3 idle,
+/// 4 done. A pane known to be stopped or done is STOPPED at once; no pane yet is STARTING for
+/// SD_START_WAIT seconds and then STOPPED, so "opening the Queen's chat" cannot last for ever.
+pub fn sd_chat_state(have_pane : bool, pane_state : u32, waited : f64, spawn_failed : bool) -> u8 {
+    if (spawn_failed) { return CH_FAILED; }
+    if (have_pane) {
+        if (pane_state == 0 or pane_state == 4) { return CH_STOPPED; }
+        return CH_LIVE;
+    }
+    if (waited < SD_START_WAIT) { return CH_STARTING; }
+    return CH_STOPPED;
+}
+
+/// True when the dock shows a START QUEEN button instead of a transcript.
+pub fn sd_chat_action(state : u8) -> bool { return state == CH_STOPPED or state == CH_FAILED; }
+
+// ---------------------------------------------------------------- the Queen's context
+
+pub const CX_SCREEN : u32 = 1;
+pub const CX_SELECT : u32 = 2;
+pub const CX_FOCUS : u32 = 3;
+pub const CX_ASK : u32 = 4;
+pub const CX_DOCK : u32 = 5;
+pub const SD_CTX_SLOTS : u32 = 32;
+/// Two header words (next slot, count) and four words per slot (kind, a, b, seconds).
+pub const SD_CTX_LEN : usize = 130;
+pub const SD_CTX_SHOW : u32 = 6;
+pub const SD_CTX_ROOM : usize = 48;
+
+pub fn sd_ctx_reset(ring : []u32) -> void {
+    ring[0] = 0;
+    ring[1] = 0;
+}
+
+/// Record one move at time `t` (whole seconds). Kinds are the CX_ constants; anything else, a
+/// key press included, is dropped (returns false). The same screen, selection, focus or dock
+/// state twice in a row is one entry whose time moves on; an ask is always its own entry and
+/// carries only the length of the question.
+pub fn sd_ctx_push(ring : []u32, kind : u32, a : u32, b : u32, t : u32) -> bool {
+    if (kind < CX_SCREEN or kind > CX_DOCK) { return false; }
+    const head : u32 = ring[0];
+    const count : u32 = ring[1];
+    if (count > 0 and kind != CX_ASK) {
+        const prev : usize = @intCast((head + SD_CTX_SLOTS - 1) % SD_CTX_SLOTS);
+        const pat : usize = 2 + prev * 4;
+        if (ring[pat] == kind and ring[pat + 1] == a and (kind != CX_DOCK or ring[pat + 2] == b)) {
+            ring[pat + 3] = t;
+            return true;
+        }
+    }
+    const slot : usize = @intCast(head);
+    const at : usize = 2 + slot * 4;
+    ring[at] = kind;
+    ring[at + 1] = a;
+    ring[at + 2] = b;
+    ring[at + 3] = t;
+    ring[0] = (head + 1) % SD_CTX_SLOTS;
+    if (count < SD_CTX_SLOTS) { ring[1] = count + 1; }
+    return true;
+}
+
+fn sd_age(now : u32, t : u32) -> u32 {
+    if (now >= t) { return now - t; }
+    return 0;
+}
+
+/// The chip in the dock header, and the first words of the text the Queen gets: "sees N moves".
+pub fn sd_ctx_chip(ring : []const u32, out : []u8) -> usize {
+    if (out.len < 16) { return 0; }
+    var n : usize = put_bytes(out, 0, "sees ");
+    n = put_dec(out, n, @as(u64, ring[1]));
+    return put_bytes(out, n, " moves");
+}
+
+fn sd_put_event(out : []u8, at : usize, kind : u32, a : u32, b : u32) -> usize {
+    var n : usize = at;
+    if (kind == CX_SCREEN) {
+        n = put_bytes(out, n, "screen ");
+        return put_dec(out, n, @as(u64, a));
+    }
+    if (kind == CX_SELECT) {
+        n = put_bytes(out, n, "select ");
+        return put_dec(out, n, @as(u64, a));
+    }
+    if (kind == CX_FOCUS) {
+        n = put_bytes(out, n, "pane ");
+        return put_dec(out, n, @as(u64, a));
+    }
+    if (kind == CX_ASK) {
+        n = put_bytes(out, n, "ask ");
+        n = put_dec(out, n, @as(u64, a));
+        return put_bytes(out, n, " chars");
+    }
+    n = put_bytes(out, n, "dock ");
+    if (a == 1) { n = put_bytes(out, n, "right "); } else { n = put_bytes(out, n, "bottom "); }
+    if (b == 1) { return put_bytes(out, n, "open"); }
+    return put_bytes(out, n, "closed");
+}
+
+/// The text of the Queen's context, newest move first, at most SD_CTX_SHOW moves, never past the
+/// end of `out` (a move is written only when SD_CTX_ROOM bytes are left). Returns the length.
+pub fn sd_ctx_frame(ring : []const u32, now : u32, out : []u8) -> usize {
+    var n : usize = sd_ctx_chip(ring, out);
+    if (n == 0) { return 0; }
+    var i : u32 = 0;
+    while (i < ring[1] and i < SD_CTX_SHOW and n + SD_CTX_ROOM <= out.len) {
+        const slot : usize = @intCast((ring[0] + SD_CTX_SLOTS - 1 - i) % SD_CTX_SLOTS);
+        const at : usize = 2 + slot * 4;
+        n = put_bytes(out, n, "; ");
+        n = sd_put_event(out, n, ring[at], ring[at + 1], ring[at + 2]);
+        n = put_bytes(out, n, ", ");
+        n = put_dec(out, n, @as(u64, sd_age(now, ring[at + 3])));
+        n = put_bytes(out, n, " s ago");
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------- tests
+
+fn sd_near(a : f64, b : f64) -> bool { return @abs(a - b) < 0.000001; }
+
+fn sd_same(got : []const u8, want : []const u8) -> bool {
+    if (got.len != want.len) { return false; }
+    var i : usize = 0;
+    while (i < got.len) {
+        if (got[i] != want[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test ease_runs_from_zero_to_one_and_leads {
+    assert(sd_ease(0.0) == 0.0);
+    assert(sd_ease(1.0) == 1.0);
+    assert(sd_ease(-3.0) == 0.0);
+    assert(sd_ease(7.0) == 1.0);
+    assert(sd_ease(0.5) > 0.5);
+    assert(sd_near(sd_ease(0.5), 0.875));
+    var prev : f64 = 0.0;
+    var i : u32 = 1;
+    while (i <= 20) {
+        const p : f64 = @as(f64, @floatFromInt(i)) / 20.0;
+        assert(sd_ease(p) >= prev);
+        prev = sd_ease(p);
+        i = i + 1;
+    }
+}
+
+test a_new_shell_has_the_queen_open_and_settled {
+    var s : SdShell = sd_new(false);
+    assert(s.right_open and s.bottom_open == false);
+    assert(sd_right_now(&s, 0.0) == SD_RIGHT_DEFAULT);
+    assert(sd_right_now(&s, 99.0) == SD_RIGHT_DEFAULT);
+    assert(sd_bottom_now(&s, 99.0) == 0.0);
+    assert(sd_right_visible(&s, 0.0));
+    assert(sd_settled(&s, 0.0));
+}
+
+test closing_the_queen_dock_eases_to_zero {
+    var s : SdShell = sd_new(false);
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 10.0));
+    assert(s.right_open == false);
+    assert(sd_near(sd_right_now(&s, 10.0), 360.0));
+    assert(sd_near(sd_right_now(&s, 10.12), 45.0));
+    assert(sd_right_now(&s, 10.24) == 0.0);
+    assert(sd_right_now(&s, 11.0) == 0.0);
+    assert(sd_right_visible(&s, 11.0) == false);
+    assert(sd_settled(&s, 10.1) == false);
+    assert(sd_settled(&s, 10.25));
+}
+
+test a_new_target_starts_from_the_value_on_screen {
+    var s : SdShell = sd_new(false);
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 10.0));
+    const before : f64 = sd_right_now(&s, 10.06);
+    assert(sd_near(before, 151.875));
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 10.06));
+    assert(s.right_open);
+    assert(sd_near(sd_right_now(&s, 10.06), before));
+    assert(sd_right_now(&s, 10.2) > before);
+    assert(sd_right_now(&s, 10.3) == 360.0);
+}
+
+test reduced_motion_jumps_without_a_motion {
+    var s : SdShell = sd_new(true);
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 5.0));
+    assert(sd_right_now(&s, 5.0) == 0.0);
+    assert(sd_toggle_bottom(&s, 832.0, 6.0));
+    assert(sd_bottom_now(&s, 6.0) == SD_BOTTOM_DEFAULT);
+    assert(sd_settled(&s, 6.0));
+}
+
+test a_screen_switch_moves_nothing {
+    var s : SdShell = sd_new(false);
+    assert(sd_toggle_bottom(&s, 832.0, 1.0));
+    var base : [12]f64 = undefined;
+    assert(sd_layout(&s, 1440.0, 900.0, 44.0, 24.0, 0.0, 3.0, base[0..12]));
+    const rx0 : f64 = s.rx_to;
+    const bx0 : f64 = s.bx_to;
+    var i : u32 = 0;
+    while (i < 17) {
+        var screen : u32 = i;
+        if (i == 16) { screen = 4294967295; }
+        sd_set_screen(&s, screen);
+        assert(s.screen == screen);
+        var now : [12]f64 = undefined;
+        assert(sd_layout(&s, 1440.0, 900.0, 44.0, 24.0, 0.0, 3.0, now[0..12]));
+        var k : usize = 0;
+        while (k < 12) {
+            assert(now[k] == base[k]);
+            k = k + 1;
+        }
+        assert(s.rx_to == rx0 and s.bx_to == bx0);
+        assert(sd_right_visible(&s, 3.0));
+        i = i + 1;
+    }
+}
+
+test push_mode_gives_the_centre_what_the_dock_takes {
+    var s : SdShell = sd_new(false);
+    var r : [12]f64 = undefined;
+    assert(sd_right_over(1440.0, 0.0, 360.0) == false);
+    assert(sd_layout(&s, 1440.0, 900.0, 44.0, 24.0, 0.0, 0.0, r[0..12]));
+    assert(r[0] == 0.0 and r[1] == 44.0 and r[2] == 1080.0 and r[3] == 832.0);
+    assert(r[4] == 1080.0 and r[6] == 360.0 and r[7] == 832.0);
+    assert(r[0] + r[2] == r[4]);
+    assert(r[11] == 0.0);
+}
+
+test the_centre_edge_is_continuous_and_monotone_while_the_dock_opens {
+    var s : SdShell = sd_new(false);
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 0.0));
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 20.0));
+    var prev_edge : f64 = 0.0;
+    var i : u32 = 0;
+    while (i <= 12) {
+        const now : f64 = 20.0 + 0.02 * @as(f64, @floatFromInt(i));
+        var r : [12]f64 = undefined;
+        assert(sd_layout(&s, 1440.0, 900.0, 44.0, 24.0, 0.0, now, r[0..12]));
+        const edge : f64 = r[0] + r[2];
+        assert(edge == r[4]);
+        if (i > 0) { assert(edge <= prev_edge); }
+        prev_edge = edge;
+        i = i + 1;
+    }
+    assert(sd_near(prev_edge, 1080.0));
+}
+
+test a_small_window_lays_the_dock_over_the_centre_for_the_whole_motion {
+    var s : SdShell = sd_new(false);
+    assert(sd_right_over(800.0, 240.0, 360.0));
+    assert(sd_toggle_right(&s, 800.0, 240.0, 0.0));
+    assert(sd_toggle_right(&s, 800.0, 240.0, 30.0));
+    var i : u32 = 0;
+    while (i <= 12) {
+        const now : f64 = 30.0 + 0.02 * @as(f64, @floatFromInt(i));
+        var r : [12]f64 = undefined;
+        assert(sd_layout(&s, 800.0, 900.0, 44.0, 24.0, 240.0, now, r[0..12]));
+        assert(r[2] == 560.0);
+        assert(r[4] + r[6] == 800.0);
+        i = i + 1;
+    }
+}
+
+test the_bottom_dock_sits_under_the_centre_column_only {
+    var s : SdShell = sd_new(false);
+    assert(sd_toggle_bottom(&s, 832.0, 20.0));
+    var r : [12]f64 = undefined;
+    assert(sd_layout(&s, 1440.0, 900.0, 44.0, 24.0, 0.0, 21.0, r[0..12]));
+    assert(r[11] == SD_BOTTOM_DEFAULT);
+    assert(r[3] == 832.0 - SD_BOTTOM_DEFAULT);
+    assert(r[9] == 44.0 + r[3]);
+    assert(r[8] == r[0] and r[10] == r[2]);
+    assert(r[8] + r[10] <= r[4]);
+    assert(r[7] == 832.0);
+    assert(r[9] + r[11] == 44.0 + r[7]);
+}
+
+test a_short_body_refuses_the_bottom_dock {
+    var s : SdShell = sd_new(false);
+    assert(sd_bottom_cap(300.0) < SD_BOTTOM_MIN);
+    assert(sd_toggle_bottom(&s, 300.0, 1.0) == false);
+    assert(s.bottom_open == false);
+    assert(sd_bottom_now(&s, 2.0) == 0.0);
+    assert(sd_bottom_cap(600.0) == 360.0);
+    assert(sd_bottom_cap(832.0) == 0.6 * 832.0);
+}
+
+test a_narrow_window_refuses_the_right_dock {
+    var s : SdShell = sd_new(false);
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 1.0));
+    assert(sd_toggle_right(&s, 300.0, 100.0, 2.0) == false);
+    assert(s.right_open == false);
+}
+
+test a_drag_follows_the_pointer_and_snaps_shut_when_far_enough {
+    var s : SdShell = sd_new(false);
+    sd_drag_right(&s, 1020.0, 1440.0, 0.0, 30.0);
+    assert(s.right_w == 420.0 and s.right_open);
+    assert(sd_right_now(&s, 30.0) == 420.0);
+    sd_drag_right(&s, 540.0, 1440.0, 0.0, 31.0);
+    assert(s.right_w == SD_RIGHT_MAX);
+    assert(sd_right_now(&s, 31.0) == SD_RIGHT_MAX);
+    sd_drag_right(&s, 1100.0, 1440.0, 0.0, 32.0);
+    assert(s.right_w == 340.0);
+    sd_drag_right(&s, 1360.0, 1440.0, 0.0, 33.0);
+    assert(s.right_open == false);
+    assert(s.right_w == 340.0);
+    assert(sd_right_now(&s, 40.0) == 0.0);
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 41.0));
+    assert(sd_right_now(&s, 42.0) == 340.0);
+    sd_drag_bottom(&s, 700.0, 876.0, 832.0, 50.0);
+    assert(s.bottom_open and s.bottom_h == 176.0);
+    sd_drag_bottom(&s, 100.0, 876.0, 832.0, 51.0);
+    assert(s.bottom_h == sd_bottom_cap(832.0));
+    sd_drag_bottom(&s, 850.0, 876.0, 832.0, 52.0);
+    assert(s.bottom_open == false);
+}
+
+test the_pty_grids_come_from_the_target_not_the_frame {
+    var s : SdShell = sd_new(false);
+    assert(sd_toggle_bottom(&s, 832.0, 5.0));
+    assert(sd_chat_cols(&s, 1440.0, 0.0) == rc_grid_cols(336.0));
+    assert(sd_chat_cols(&s, 1440.0, 0.0) == 46);
+    assert(sd_chat_rows(832.0) == rc_grid_rows(832.0 - 40.0 - 40.0 - 24.0));
+    assert(sd_term_cols(&s, 1440.0, 0.0) == rc_grid_cols(1080.0 - 24.0));
+    assert(sd_term_rows(&s, 832.0) == rc_grid_rows(260.0 - 40.0 - 12.0));
+    assert(sd_term_rows(&s, 832.0) == 13);
+    assert(sd_toggle_right(&s, 1440.0, 0.0, 6.0));
+    assert(sd_term_cols(&s, 1440.0, 0.0) == rc_grid_cols(1440.0 - 24.0));
+}
+
+test the_dock_rects_hold_a_transcript_and_a_terminal {
+    var panel : [4]f64 = [1080.0, 44.0, 360.0, 832.0];
+    var c : [8]f64 = undefined;
+    assert(sd_chat_rects(panel[0..4], c[0..8]));
+    assert(c[0] == 1092.0 and c[1] == 84.0 and c[2] == 336.0);
+    assert(c[1] + c[3] <= c[5]);
+    assert(c[5] + c[7] + SD_PAD == 44.0 + 832.0);
+    var tight : [4]f64 = [0.0, 0.0, 20.0, 100.0];
+    assert(sd_chat_rects(tight[0..4], c[0..8]) == false);
+    var bp : [4]f64 = [0.0, 616.0, 1080.0, 260.0];
+    var t : [4]f64 = undefined;
+    assert(sd_term_rect(bp[0..4], t[0..4]));
+    assert(t[0] == 12.0 and t[1] == 656.0 and t[2] == 1056.0 and t[3] == 208.0);
+}
+
+test the_queen_chat_never_waits_for_ever {
+    assert(sd_chat_state(true, 3, 0.0, false) == CH_LIVE);
+    assert(sd_chat_state(true, 1, 99.0, false) == CH_LIVE);
+    assert(sd_chat_state(true, 2, 99.0, false) == CH_LIVE);
+    assert(sd_chat_state(true, 0, 0.0, false) == CH_STOPPED);
+    assert(sd_chat_state(true, 4, 0.0, false) == CH_STOPPED);
+    assert(sd_chat_state(false, 0, 0.0, false) == CH_STARTING);
+    assert(sd_chat_state(false, 0, 9.9, false) == CH_STARTING);
+    assert(sd_chat_state(false, 0, 10.0, false) == CH_STOPPED);
+    assert(sd_chat_state(false, 0, 1.0, true) == CH_FAILED);
+    assert(sd_chat_action(CH_STOPPED) and sd_chat_action(CH_FAILED));
+    assert(sd_chat_action(CH_LIVE) == false and sd_chat_action(CH_STARTING) == false);
+}
+
+test the_context_ring_coalesces_drops_keys_and_wraps {
+    var ring : [130]u32 = undefined;
+    sd_ctx_reset(ring[0..130]);
+    assert(sd_ctx_push(ring[0..130], CX_SCREEN, 4, 0, 100));
+    assert(sd_ctx_push(ring[0..130], CX_SCREEN, 4, 0, 105));
+    assert(ring[1] == 1 and ring[5] == 105);
+    assert(sd_ctx_push(ring[0..130], CX_SELECT, 7, 0, 110));
+    assert(sd_ctx_push(ring[0..130], CX_ASK, 41, 0, 120));
+    assert(sd_ctx_push(ring[0..130], CX_ASK, 41, 0, 121));
+    assert(ring[1] == 4);
+    assert(sd_ctx_push(ring[0..130], 6, 65, 0, 122) == false);
+    assert(sd_ctx_push(ring[0..130], 0, 0, 0, 122) == false);
+    assert(ring[1] == 4 and ring[0] == 4);
+    var i : u32 = 0;
+    while (i < 40) {
+        assert(sd_ctx_push(ring[0..130], CX_FOCUS, 1000 + i, 0, 200 + i));
+        i = i + 1;
+    }
+    assert(ring[1] == SD_CTX_SLOTS);
+    assert(ring[0] == 12);
+    const newest : usize = 2 + 11 * 4;
+    assert(ring[newest] == CX_FOCUS and ring[newest + 1] == 1039);
+}
+
+test the_context_text_is_newest_first_and_names_what_the_user_did {
+    var ring : [130]u32 = undefined;
+    sd_ctx_reset(ring[0..130]);
+    assert(sd_ctx_push(ring[0..130], CX_SCREEN, 4, 0, 100));
+    assert(sd_ctx_push(ring[0..130], CX_SELECT, 7, 0, 110));
+    assert(sd_ctx_push(ring[0..130], CX_DOCK, 1, 1, 115));
+    var out : [200]u8 = undefined;
+    const n : usize = sd_ctx_frame(ring[0..130], 120, out[0..200]);
+    assert(sd_same(out[0..n], "sees 3 moves; dock right open, 5 s ago; select 7, 10 s ago; screen 4, 20 s ago"));
+    var chip : [32]u8 = undefined;
+    const m : usize = sd_ctx_chip(ring[0..130], chip[0..32]);
+    assert(sd_same(chip[0..m], "sees 3 moves"));
+    assert(sd_same(out[0..m], "sees 3 moves"));
+}
+
+test an_ask_keeps_its_length_only {
+    var ring : [130]u32 = undefined;
+    sd_ctx_reset(ring[0..130]);
+    assert(sd_ctx_push(ring[0..130], CX_ASK, 41, 0, 50));
+    assert(sd_ctx_push(ring[0..130], CX_DOCK, 2, 0, 55));
+    assert(sd_ctx_push(ring[0..130], CX_FOCUS, 3, 0, 58));
+    var out : [200]u8 = undefined;
+    const n : usize = sd_ctx_frame(ring[0..130], 60, out[0..200]);
+    assert(sd_same(out[0..n], "sees 3 moves; pane 3, 2 s ago; dock bottom closed, 5 s ago; ask 41 chars, 10 s ago"));
+}
+
+test the_context_text_never_passes_the_end_of_its_buffer {
+    var ring : [130]u32 = undefined;
+    sd_ctx_reset(ring[0..130]);
+    var i : u32 = 0;
+    while (i < 40) {
+        assert(sd_ctx_push(ring[0..130], CX_SELECT, i, 0, i));
+        i = i + 1;
+    }
+    var small : [40]u8 = undefined;
+    assert(sd_ctx_frame(ring[0..130], 100, small[0..40]) == 13);
+    var tiny : [8]u8 = undefined;
+    assert(sd_ctx_frame(ring[0..130], 100, tiny[0..8]) == 0);
+    var big : [400]u8 = undefined;
+    const n : usize = sd_ctx_frame(ring[0..130], 100, big[0..400]);
+    assert(n <= 400);
+    assert(n > 13);
+}
+
+invariant the_dock_limits_are_ordered : SD_RIGHT_MIN < SD_RIGHT_DEFAULT and SD_RIGHT_DEFAULT < SD_RIGHT_MAX and SD_BOTTOM_MIN < SD_BOTTOM_DEFAULT and SD_CENTER_MIN_W > SD_RIGHT_MIN;
