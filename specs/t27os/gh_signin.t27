@@ -1,0 +1,533 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/gh_signin.t27 -- the GitHub sign-in of the T27 OS window: the device flow of the tri-claw GitHub App,
+; read as decisions. What is sent, how an answer is read, which values are accepted, which state comes next, and
+; what the PROFILE panel shows and offers in each state.
+; Owner, 2026-11-02, in Russian, rendered in English: "there must be a GitHub icon there, finish the sign-in" -- the
+; header circle showed the letter of the typed nickname because no picture existed. profile.t27 (2026-10-23) already
+; says where the picture comes from: the GitHub account of the sign-in. This module is that sign-in, so the circle
+; draws the account's avatar and the nickname is the account's login.
+; THE FLOW  1. POST GSI_CODE_URL with client_id: device_code, user_code, interval, expires_in. 2. The panel shows the
+;   user_code and opens GSI_DEVICE_URL on the person's own click; the person types the code there themself. 3. The
+;   window polls GSI_TOKEN_URL every interval seconds (+5 s after each slow_down) until a token, a refusal or the
+;   clock ends it. 4. The token goes to the Keychain only (share.t27 token_home_ok), then GET GSI_USER_URL gives
+;   login and avatar_url, and the avatar is fetched at 256 px into the profile through profile_host's existing
+;   checks and atomic files. Nothing here holds or prints a token; every test value is fake.
+; LOGIN, NOT NAME  the nickname is the login: a GitHub "name" may be null, may hold escapes, and "plan" carries a
+;   second "name" key. A login is 1..39 of [A-Za-z0-9-].
+; SAME TABLE  share.t27 owns the full login-to-game table; the window cannot import share (its names collide when
+;   the window build flattens every module), so the states and events used here are a subset with the same numbers
+;   and the same transitions. keysync_rules.t27 asserts the two agree.
+; Flat namespace: every fn and const here starts with gsi_ / GSI_. Reuse: editors::same_bytes,
+;   session_store::put_bytes (unchecked, so every caller checks the room first). ASCII only (L3).
+; Refs gHashTag/t27#11560 gHashTag/t27#13086.
+
+module T27osGhSignin;
+
+use t27os::editors::same_bytes;
+use t27os::session_store::put_bytes;
+
+// ---------------------------------------------------------------- 1. addresses
+
+/// The tri-claw GitHub App's public client id (APP_ID 5166765). A device flow needs no client secret.
+pub const GSI_CLIENT_ID : str = "Iv23li6bsbm4g1TECuIh";
+pub const GSI_CODE_URL : str = "https://github.com/login/device/code";
+pub const GSI_TOKEN_URL : str = "https://github.com/login/oauth/access_token";
+pub const GSI_USER_URL : str = "https://api.github.com/user";
+pub const GSI_DEVICE_URL : str = "https://github.com/login/device";
+pub const GSI_AVATAR_PREFIX : str = "https://avatars.githubusercontent.com/";
+/// The Keychain account of the user token (service keys.t27 KEYCHAIN_SERVICE).
+pub const GSI_KC_ACCOUNT : str = "github-signin";
+/// grant_type for the token poll, form-encoded.
+pub const GSI_GRANT : str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code";
+
+/// GitHub's code lives 900 s; poll every 5 s, +5 s for each slow_down; a longer interval GitHub asks for wins.
+pub const GSI_EXPIRES_S : u32 = 900;
+pub const GSI_POLL_BASE_S : u32 = 5;
+pub const GSI_POLL_SLOW_ADD : u32 = 5;
+pub const GSI_POLL_MAX_S : u32 = 60;
+
+// ---------------------------------------------------------------- 2. request bodies
+
+/// The body of the code request: "client_id=<id>". 0 when out has no room.
+pub fn gsi_code_body(out: []u8) -> usize {
+    if (10 + GSI_CLIENT_ID.len > out.len) { return 0; }
+    var at : usize = put_bytes(out, 0, "client_id=");
+    at = put_bytes(out, at, GSI_CLIENT_ID);
+    return at;
+}
+
+/// The body of one token poll for device code dc. 0 when dc is not a device code or out has no room.
+pub fn gsi_token_body(dc: []const u8, out: []u8) -> usize {
+    if (!gsi_device_code_ok(dc)) { return 0; }
+    const need : usize = 10 + GSI_CLIENT_ID.len + 13 + dc.len + 12 + GSI_GRANT.len;
+    if (need > out.len) { return 0; }
+    var at : usize = put_bytes(out, 0, "client_id=");
+    at = put_bytes(out, at, GSI_CLIENT_ID);
+    at = put_bytes(out, at, "&device_code=");
+    at = put_bytes(out, at, dc);
+    at = put_bytes(out, at, "&grant_type=");
+    at = put_bytes(out, at, GSI_GRANT);
+    return at;
+}
+
+// ---------------------------------------------------------------- 3. reading an answer
+
+fn gsi_space(c: u8) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13;
+}
+
+/// Where the value of "key" starts in json: the first byte after the colon and its spaces. json.len when the key is
+/// absent. A key counts only when its opening quote is not escaped and a colon follows it, so the same word inside a
+/// string value is not taken for the key.
+pub fn gsi_json_at(json: []const u8, key: []const u8) -> usize {
+    var i : usize = 0;
+    while (i + key.len + 2 <= json.len) {
+        var hit : bool = json[i] == 34 and json[i + key.len + 1] == 34;
+        if (hit and i > 0) {
+            if (json[i - 1] == 92) { hit = false; }
+        }
+        if (hit) { hit = same_bytes(json[i + 1 .. i + 1 + key.len], key); }
+        if (hit) {
+            var j : usize = i + key.len + 2;
+            while (j < json.len and gsi_space(json[j])) { j = j + 1; }
+            if (j < json.len and json[j] == 58) {
+                j = j + 1;
+                while (j < json.len and gsi_space(json[j])) { j = j + 1; }
+                return j;
+            }
+        }
+        i = i + 1;
+    }
+    return json.len;
+}
+
+/// The index of the closing quote of a plain string that opens at json[at]. 0 when json[at] is not a quote, the
+/// string has an escape or a control byte, or it never closes: every value this module takes is plain ASCII.
+pub fn gsi_str_end(json: []const u8, at: usize) -> usize {
+    if (at >= json.len) { return 0; }
+    if (json[at] != 34) { return 0; }
+    var k : usize = at + 1;
+    while (k < json.len) {
+        const c : u8 = json[k];
+        if (c == 34) { return k; }
+        if (c == 92 or c < 32) { return 0; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// Copy the plain string value of key into out; its length. 0 when absent, not plain, empty or longer than out.
+pub fn gsi_json_str(json: []const u8, key: []const u8, out: []u8) -> usize {
+    const at : usize = gsi_json_at(json, key);
+    const e : usize = gsi_str_end(json, at);
+    if (e == 0) { return 0; }
+    const n : usize = e - at - 1;
+    if (n > out.len) { return 0; }
+    _ = put_bytes(out, 0, json[at + 1 .. e]);
+    return n;
+}
+
+/// The plain string value of key is exactly want.
+pub fn gsi_json_is(json: []const u8, key: []const u8, want: []const u8) -> bool {
+    const at : usize = gsi_json_at(json, key);
+    const e : usize = gsi_str_end(json, at);
+    if (e == 0) { return false; }
+    return same_bytes(json[at + 1 .. e], want);
+}
+
+/// The unsigned number value of key, at most 100000; 0 when absent or not a number.
+pub fn gsi_json_num(json: []const u8, key: []const u8) -> u32 {
+    var k : usize = gsi_json_at(json, key);
+    var v : u32 = 0;
+    while (k < json.len and json[k] >= 48 and json[k] <= 57) {
+        v = v * 10 + @as(u32, json[k] - 48);
+        if (v > 100000) { return 100000; }
+        k = k + 1;
+    }
+    return v;
+}
+
+pub const GSI_A_PENDING : u32 = 0;
+pub const GSI_A_SLOW : u32 = 1;
+pub const GSI_A_GRANTED : u32 = 2;
+pub const GSI_A_EXPIRED : u32 = 3;
+pub const GSI_A_DENIED : u32 = 4;
+pub const GSI_A_OTHER : u32 = 5;
+
+/// What one token-poll answer says. A token counts only when it is a plain string.
+pub fn gsi_answer(json: []const u8) -> u32 {
+    if (gsi_json_is(json, "error", "authorization_pending")) { return GSI_A_PENDING; }
+    if (gsi_json_is(json, "error", "slow_down")) { return GSI_A_SLOW; }
+    if (gsi_json_is(json, "error", "expired_token")) { return GSI_A_EXPIRED; }
+    if (gsi_json_is(json, "error", "access_denied")) { return GSI_A_DENIED; }
+    if (gsi_str_end(json, gsi_json_at(json, "access_token")) > 0) { return GSI_A_GRANTED; }
+    return GSI_A_OTHER;
+}
+
+// ---------------------------------------------------------------- 4. accepted values
+
+/// 1 digit, 2 upper-case letter, 4 lower-case letter, 0 anything else.
+fn gsi_cls(c: u8) -> u32 {
+    if (c >= 48 and c <= 57) { return 1; }
+    if (c >= 65 and c <= 90) { return 2; }
+    if (c >= 97 and c <= 122) { return 4; }
+    return 0;
+}
+
+/// A device code: 1..64 of [A-Za-z0-9_-]. It goes into a form body, so nothing else may pass.
+pub fn gsi_device_code_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > 64) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        if (gsi_cls(s[i]) == 0 and s[i] != 45 and s[i] != 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A user code as GitHub shows it: XXXX-XXXX of [A-Z0-9].
+pub fn gsi_user_code_ok(s: []const u8) -> bool {
+    if (s.len != 9) { return false; }
+    var i : usize = 0;
+    while (i < 9) {
+        if (i == 4) {
+            if (s[i] != 45) { return false; }
+        } else {
+            if (gsi_cls(s[i]) != 1 and gsi_cls(s[i]) != 2) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A user token: 20..255 of [A-Za-z0-9_]. Anything else is not written to the Keychain.
+pub fn gsi_token_ok(s: []const u8) -> bool {
+    if (s.len < 20 or s.len > 255) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        if (gsi_cls(s[i]) == 0 and s[i] != 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A GitHub login: 1..39 of [A-Za-z0-9-], no hyphen first, last or twice in a row.
+pub fn gsi_login_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > 39) { return false; }
+    if (s[0] == 45 or s[s.len - 1] == 45) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] == 45) {
+            if (i > 0 and s[i - 1] == 45) { return false; }
+        } else {
+            if (gsi_cls(s[i]) == 0) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// An avatar address: GSI_AVATAR_PREFIX, then at most 200 bytes in all of [A-Za-z0-9/?=&._%-].
+pub fn gsi_avatar_ok(url: []const u8) -> bool {
+    const p : usize = GSI_AVATAR_PREFIX.len;
+    if (url.len <= p or url.len > 200) { return false; }
+    if (!same_bytes(url[0..p], GSI_AVATAR_PREFIX)) { return false; }
+    var i : usize = p;
+    while (i < url.len) {
+        const c : u8 = url[i];
+        const mark : bool = c == 47 or c == 63 or c == 61 or c == 38 or c == 46 or c == 95 or c == 37 or c == 45;
+        if (gsi_cls(c) == 0 and !mark) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The avatar address asking for 256 px: "&s=256" after a query, "?s=256" without one. 0 when url is not an avatar
+/// address or out has no room.
+pub fn gsi_avatar_sized(url: []const u8, out: []u8) -> usize {
+    if (!gsi_avatar_ok(url)) { return 0; }
+    if (url.len + 6 > out.len) { return 0; }
+    var q : bool = false;
+    var i : usize = 0;
+    while (i < url.len) {
+        if (url[i] == 63) { q = true; }
+        i = i + 1;
+    }
+    var at : usize = put_bytes(out, 0, url);
+    if (q) { at = put_bytes(out, at, "&s=256"); } else { at = put_bytes(out, at, "?s=256"); }
+    return at;
+}
+
+// ---------------------------------------------------------------- 5. states (a subset of share.t27 section 4)
+
+pub const GSI_L_OUT : u32 = 0;
+pub const GSI_L_REQUESTING : u32 = 1;
+pub const GSI_L_CODE_SHOWN : u32 = 2;
+pub const GSI_L_AUTHORIZED : u32 = 3;
+pub const GSI_L_EXPIRED : u32 = 8;
+pub const GSI_L_DENIED : u32 = 9;
+pub const GSI_L_FAILED : u32 = 10;
+
+pub const GSI_E_START : u32 = 0;
+pub const GSI_E_CODE_OK : u32 = 1;
+pub const GSI_E_CODE_FAIL : u32 = 2;
+pub const GSI_E_PENDING : u32 = 3;
+pub const GSI_E_SLOW : u32 = 4;
+pub const GSI_E_TOKEN_STORED : u32 = 5;
+pub const GSI_E_TOKEN_REFUSED : u32 = 6;
+pub const GSI_E_EXPIRED : u32 = 7;
+pub const GSI_E_DENIED : u32 = 8;
+pub const GSI_E_SIGN_OUT : u32 = 14;
+
+/// The next state. An event that makes no sense in a state leaves it unchanged.
+pub fn gsi_step(state: u32, ev: u32) -> u32 {
+    if (ev == GSI_E_SIGN_OUT) { return GSI_L_OUT; }
+    const again : bool = state == GSI_L_OUT or state == GSI_L_EXPIRED or state == GSI_L_DENIED or state == GSI_L_FAILED;
+    if (ev == GSI_E_START and again) { return GSI_L_REQUESTING; }
+    if (state == GSI_L_REQUESTING) {
+        if (ev == GSI_E_CODE_OK) { return GSI_L_CODE_SHOWN; }
+        if (ev == GSI_E_CODE_FAIL) { return GSI_L_FAILED; }
+    }
+    if (state == GSI_L_CODE_SHOWN) {
+        if (ev == GSI_E_TOKEN_STORED) { return GSI_L_AUTHORIZED; }
+        if (ev == GSI_E_TOKEN_REFUSED) { return GSI_L_FAILED; }
+        if (ev == GSI_E_EXPIRED) { return GSI_L_EXPIRED; }
+        if (ev == GSI_E_DENIED) { return GSI_L_DENIED; }
+    }
+    return state;
+}
+
+/// The event for one poll answer at time now (seconds). The clock wins: past the code's life every answer is an
+/// expiry. stored: the token is in the Keychain AND the profile was taken from the account.
+pub fn gsi_poll_event(now: u64, issued: u64, expires_in: u64, answer: u32, stored: bool) -> u32 {
+    if (now >= issued + expires_in) { return GSI_E_EXPIRED; }
+    if (answer == GSI_A_GRANTED) {
+        if (stored) { return GSI_E_TOKEN_STORED; }
+        return GSI_E_TOKEN_REFUSED;
+    }
+    if (answer == GSI_A_SLOW) { return GSI_E_SLOW; }
+    if (answer == GSI_A_PENDING) { return GSI_E_PENDING; }
+    if (answer == GSI_A_EXPIRED) { return GSI_E_EXPIRED; }
+    if (answer == GSI_A_DENIED) { return GSI_E_DENIED; }
+    return GSI_E_CODE_FAIL;
+}
+
+/// Seconds to the next poll: the interval GitHub gave (at least 5, at most 60) plus 5 for each slow_down so far.
+pub fn gsi_next_poll_s(interval: u32, slow_downs: u32) -> u64 {
+    var b : u32 = interval;
+    if (b < GSI_POLL_BASE_S) { b = GSI_POLL_BASE_S; }
+    if (b > GSI_POLL_MAX_S) { b = GSI_POLL_MAX_S; }
+    var s : u32 = slow_downs;
+    if (s > 11) { s = 11; }
+    return @as(u64, b + GSI_POLL_SLOW_ADD * s);
+}
+
+/// The code's life in seconds: what GitHub gave, else 900; never more than 900.
+pub fn gsi_life_s(expires_in: u32) -> u64 {
+    if (expires_in == 0 or expires_in > GSI_EXPIRES_S) { return @as(u64, GSI_EXPIRES_S); }
+    return @as(u64, expires_in);
+}
+
+// ---------------------------------------------------------------- 6. what the panel shows
+
+pub const GSI_F_NONE : u32 = 0;
+pub const GSI_F_NET : u32 = 1;
+pub const GSI_F_DISABLED : u32 = 2;
+pub const GSI_F_ANSWER : u32 = 3;
+pub const GSI_F_KEYCHAIN : u32 = 4;
+pub const GSI_F_USER : u32 = 5;
+pub const GSI_F_AVATAR : u32 = 6;
+pub const GSI_F_TOKEN : u32 = 7;
+
+/// Why a code request failed, from its answer: the App may have the device flow switched off.
+pub fn gsi_code_fail(json: []const u8) -> u32 {
+    if (gsi_json_is(json, "error", "device_flow_disabled")) { return GSI_F_DISABLED; }
+    return GSI_F_ANSWER;
+}
+
+/// One fixed English line for a failure; no address, no OS message, no value from the answer.
+pub fn gsi_fail_text(fail: u32) -> str {
+    if (fail == GSI_F_NET) { return "GitHub did not answer. Try again."; }
+    if (fail == GSI_F_DISABLED) { return "Device sign-in is off for the tri-claw App."; }
+    if (fail == GSI_F_ANSWER) { return "GitHub sent an answer T27 OS cannot read."; }
+    if (fail == GSI_F_KEYCHAIN) { return "The Keychain did not keep the sign-in."; }
+    if (fail == GSI_F_USER) { return "GitHub did not give the account name."; }
+    if (fail == GSI_F_AVATAR) { return "The GitHub picture could not be saved."; }
+    if (fail == GSI_F_TOKEN) { return "GitHub sent a sign-in T27 OS cannot keep."; }
+    return "";
+}
+
+/// The status line under the GitHub button for a state.
+pub fn gsi_status_text(state: u32, fail: u32) -> str {
+    if (state == GSI_L_REQUESTING) { return "Asking GitHub for a code..."; }
+    if (state == GSI_L_CODE_SHOWN) { return "Open github.com/login/device and type this code."; }
+    if (state == GSI_L_AUTHORIZED) { return "Signed in with GitHub."; }
+    if (state == GSI_L_EXPIRED) { return "The code expired. Sign in again."; }
+    if (state == GSI_L_DENIED) { return "The sign-in was refused on GitHub."; }
+    if (state == GSI_L_FAILED) {
+        if (fail != GSI_F_NONE) { return gsi_fail_text(fail); }
+        return "The sign-in did not finish. Try again.";
+    }
+    return "Sign in to take the name and picture from GitHub.";
+}
+
+pub const GSI_ACT_NONE : u32 = 0;
+pub const GSI_ACT_START : u32 = 1;
+pub const GSI_ACT_CANCEL : u32 = 2;
+pub const GSI_ACT_SIGN_OUT : u32 = 3;
+
+/// What a click on the GitHub button does in a state.
+pub fn gsi_button_action(state: u32) -> u32 {
+    if (state == GSI_L_REQUESTING) { return GSI_ACT_NONE; }
+    if (state == GSI_L_CODE_SHOWN) { return GSI_ACT_CANCEL; }
+    if (state == GSI_L_AUTHORIZED) { return GSI_ACT_SIGN_OUT; }
+    return GSI_ACT_START;
+}
+
+/// The word on the GitHub button in a state.
+pub fn gsi_button_text(state: u32) -> str {
+    if (state == GSI_L_REQUESTING) { return "ASKING GITHUB..."; }
+    if (state == GSI_L_CODE_SHOWN) { return "CANCEL SIGN-IN"; }
+    if (state == GSI_L_AUTHORIZED) { return "SIGN OUT OF GITHUB"; }
+    return "SIGN IN WITH GITHUB";
+}
+
+/// The panel shows the user code, large, only while it waits for the person to type it.
+pub fn gsi_shows_code(state: u32) -> bool {
+    return state == GSI_L_CODE_SHOWN;
+}
+
+/// The window polls only while a code is shown.
+pub fn gsi_polls(state: u32) -> bool {
+    return state == GSI_L_CODE_SHOWN;
+}
+
+// ---------------------------------------------------------------- 7. tests (fake values only)
+
+test gsi_the_code_request_names_only_the_public_client_id {
+    var b : [64]u8 = undefined;
+    const n : usize = gsi_code_body(b[0..64]);
+    assert n == 30 and same_bytes(b[0..n], "client_id=Iv23li6bsbm4g1TECuIh");
+    assert gsi_code_body(b[0..29]) == 0;
+    assert GSI_CLIENT_ID.len == 20;
+}
+
+test gsi_a_token_poll_carries_the_device_code_and_the_grant {
+    var b : [256]u8 = undefined;
+    const n : usize = gsi_token_body("abc123", b[0..256]);
+    assert same_bytes(b[0..n], "client_id=Iv23li6bsbm4g1TECuIh&device_code=abc123&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code");
+    // a device code that could break the form body is refused, and so is a buffer one byte short
+    assert gsi_token_body("abc&x=1", b[0..256]) == 0;
+    assert gsi_token_body("", b[0..256]) == 0;
+    assert gsi_token_body("abc123", b[0..(n - 1)]) == 0;
+    assert gsi_token_body("abc123", b[0..n]) == n;
+}
+
+test gsi_a_key_is_found_only_as_a_key {
+    const j : []const u8 = "{\"note\":\"error\", \"error\" : \"slow_down\",\"interval\":10}";
+    assert gsi_json_is(j, "error", "slow_down");
+    assert !gsi_json_is(j, "error", "error");
+    assert gsi_json_num(j, "interval") == 10;
+    assert gsi_json_at(j, "missing") == j.len;
+    // an escaped quote is not the start of a key
+    const e : []const u8 = "{\"x\":\"a\\\"error\\\":\\\"slow_down\"}";
+    assert !gsi_json_is(e, "error", "slow_down");
+}
+
+test gsi_only_plain_strings_are_taken {
+    var o : [16]u8 = undefined;
+    assert gsi_json_str("{\"login\":\"octo-cat\"}", "login", o[0..16]) == 8;
+    assert same_bytes(o[0..8], "octo-cat");
+    assert gsi_json_str("{\"login\":\"oc\\u0074o\"}", "login", o[0..16]) == 0;
+    assert gsi_json_str("{\"login\":null}", "login", o[0..16]) == 0;
+    assert gsi_json_str("{\"login\":\"open", "login", o[0..16]) == 0;
+    assert gsi_json_str("{\"login\":\"abcdefghijklmnopq\"}", "login", o[0..16]) == 0;
+}
+
+test gsi_every_poll_answer_has_its_reading {
+    assert gsi_answer("{\"error\":\"authorization_pending\"}") == GSI_A_PENDING;
+    assert gsi_answer("{\"error\":\"slow_down\",\"interval\":10}") == GSI_A_SLOW;
+    assert gsi_answer("{\"error\":\"expired_token\"}") == GSI_A_EXPIRED;
+    assert gsi_answer("{\"error\":\"access_denied\"}") == GSI_A_DENIED;
+    assert gsi_answer("{\"access_token\":\"fake_token_for_tests_only_1\",\"token_type\":\"bearer\"}") == GSI_A_GRANTED;
+    assert gsi_answer("{\"access_token\":null}") == GSI_A_OTHER;
+    assert gsi_answer("{\"error\":\"incorrect_client_credentials\"}") == GSI_A_OTHER;
+    assert gsi_answer("") == GSI_A_OTHER;
+    assert gsi_code_fail("{\"error\":\"device_flow_disabled\"}") == GSI_F_DISABLED;
+    assert gsi_code_fail("{\"error\":\"unauthorized_client\"}") == GSI_F_ANSWER;
+}
+
+test gsi_each_value_check_holds_at_its_boundary {
+    assert gsi_user_code_ok("WDJB-MJHT") and gsi_user_code_ok("1234-AB9Z");
+    assert !gsi_user_code_ok("WDJBMJHT") and !gsi_user_code_ok("wdjb-mjht") and !gsi_user_code_ok("WDJB_MJHT");
+    assert gsi_device_code_ok("3584d83530557fdd1f46af8289938c8ef79f9dc5") and !gsi_device_code_ok("a b");
+    assert gsi_token_ok("fake_token_for_tests_1") and !gsi_token_ok("fake_token_for_test") and !gsi_token_ok("fake-token-for-tests-1");
+    assert gsi_login_ok("a") and gsi_login_ok("octo-cat") and gsi_login_ok("abcdefghijklmnopqrstuvwxyz0123456789ABC");
+    assert !gsi_login_ok("") and !gsi_login_ok("-octo") and !gsi_login_ok("octo-") and !gsi_login_ok("octo--cat");
+    assert !gsi_login_ok("abcdefghijklmnopqrstuvwxyz0123456789ABCD") and !gsi_login_ok("octo cat") and !gsi_login_ok("octo_cat");
+}
+
+test gsi_only_a_github_avatar_address_is_fetched_and_it_asks_for_256_px {
+    var o : [256]u8 = undefined;
+    var n : usize = gsi_avatar_sized("https://avatars.githubusercontent.com/u/123?v=4", o[0..256]);
+    assert same_bytes(o[0..n], "https://avatars.githubusercontent.com/u/123?v=4&s=256");
+    n = gsi_avatar_sized("https://avatars.githubusercontent.com/u/123", o[0..256]);
+    assert same_bytes(o[0..n], "https://avatars.githubusercontent.com/u/123?s=256");
+    assert gsi_avatar_sized("https://example.com/u/123?v=4", o[0..256]) == 0;
+    assert gsi_avatar_sized("https://avatars.githubusercontent.com/", o[0..256]) == 0;
+    assert gsi_avatar_sized("https://avatars.githubusercontent.com/u/1 2", o[0..256]) == 0;
+    assert gsi_avatar_sized("https://avatars.githubusercontent.com/u/123", o[0..48]) == 0;
+    assert gsi_avatar_sized("https://avatars.githubusercontent.com/u/123", o[0..49]) == 49;
+}
+
+test gsi_the_sign_in_walks_its_table {
+    var s : u32 = GSI_L_OUT;
+    s = gsi_step(s, GSI_E_START);
+    assert s == GSI_L_REQUESTING;
+    assert gsi_step(s, GSI_E_CODE_FAIL) == GSI_L_FAILED;
+    s = gsi_step(s, GSI_E_CODE_OK);
+    assert s == GSI_L_CODE_SHOWN and gsi_shows_code(s) and gsi_polls(s);
+    assert gsi_step(s, GSI_E_PENDING) == GSI_L_CODE_SHOWN and gsi_step(s, GSI_E_SLOW) == GSI_L_CODE_SHOWN;
+    assert gsi_step(s, GSI_E_EXPIRED) == GSI_L_EXPIRED and gsi_step(s, GSI_E_DENIED) == GSI_L_DENIED;
+    assert gsi_step(s, GSI_E_TOKEN_REFUSED) == GSI_L_FAILED;
+    // a start while a code is shown changes nothing; a failure can start again
+    assert gsi_step(s, GSI_E_START) == GSI_L_CODE_SHOWN;
+    assert gsi_step(GSI_L_FAILED, GSI_E_START) == GSI_L_REQUESTING and gsi_step(GSI_L_EXPIRED, GSI_E_START) == GSI_L_REQUESTING;
+    s = gsi_step(s, GSI_E_TOKEN_STORED);
+    assert s == GSI_L_AUTHORIZED and !gsi_shows_code(s) and !gsi_polls(s);
+    assert gsi_step(s, GSI_E_START) == GSI_L_AUTHORIZED;
+    assert gsi_step(s, GSI_E_SIGN_OUT) == GSI_L_OUT and gsi_step(GSI_L_CODE_SHOWN, GSI_E_SIGN_OUT) == GSI_L_OUT;
+}
+
+test gsi_the_clock_ends_a_code_whatever_github_says {
+    assert gsi_poll_event(1000, 100, 900, GSI_A_GRANTED, true) == GSI_E_EXPIRED;
+    assert gsi_poll_event(999, 100, 900, GSI_A_GRANTED, true) == GSI_E_TOKEN_STORED;
+    assert gsi_poll_event(999, 100, 900, GSI_A_GRANTED, false) == GSI_E_TOKEN_REFUSED;
+    assert gsi_poll_event(500, 100, 900, GSI_A_PENDING, false) == GSI_E_PENDING;
+    assert gsi_poll_event(500, 100, 900, GSI_A_SLOW, false) == GSI_E_SLOW;
+    assert gsi_poll_event(500, 100, 900, GSI_A_DENIED, false) == GSI_E_DENIED;
+    assert gsi_poll_event(500, 100, 900, GSI_A_EXPIRED, false) == GSI_E_EXPIRED;
+    assert gsi_poll_event(500, 100, 900, GSI_A_OTHER, false) == GSI_E_CODE_FAIL;
+    assert gsi_life_s(0) == 900 and gsi_life_s(600) == 600 and gsi_life_s(5000) == 900;
+}
+
+test gsi_polls_slow_down_by_five_seconds_each_time {
+    assert gsi_next_poll_s(5, 0) == 5 and gsi_next_poll_s(5, 1) == 10 and gsi_next_poll_s(5, 2) == 15;
+    assert gsi_next_poll_s(0, 0) == 5 and gsi_next_poll_s(8, 0) == 8 and gsi_next_poll_s(500, 0) == 60;
+    assert gsi_next_poll_s(5, 1000) == 60;
+}
+
+test gsi_the_panel_says_one_line_and_offers_one_action_per_state {
+    assert gsi_button_text(GSI_L_OUT) == "SIGN IN WITH GITHUB" and gsi_button_action(GSI_L_OUT) == GSI_ACT_START;
+    assert gsi_button_text(GSI_L_REQUESTING) == "ASKING GITHUB..." and gsi_button_action(GSI_L_REQUESTING) == GSI_ACT_NONE;
+    assert gsi_button_text(GSI_L_CODE_SHOWN) == "CANCEL SIGN-IN" and gsi_button_action(GSI_L_CODE_SHOWN) == GSI_ACT_CANCEL;
+    assert gsi_button_text(GSI_L_AUTHORIZED) == "SIGN OUT OF GITHUB" and gsi_button_action(GSI_L_AUTHORIZED) == GSI_ACT_SIGN_OUT;
+    assert gsi_button_action(GSI_L_FAILED) == GSI_ACT_START and gsi_button_action(GSI_L_DENIED) == GSI_ACT_START;
+    assert gsi_status_text(GSI_L_OUT, GSI_F_NONE) == "Sign in to take the name and picture from GitHub.";
+    assert gsi_status_text(GSI_L_CODE_SHOWN, GSI_F_NONE) == "Open github.com/login/device and type this code.";
+    assert gsi_status_text(GSI_L_FAILED, GSI_F_DISABLED) == "Device sign-in is off for the tri-claw App.";
+    assert gsi_status_text(GSI_L_FAILED, GSI_F_NONE) == "The sign-in did not finish. Try again.";
+    assert gsi_status_text(GSI_L_EXPIRED, GSI_F_NONE) == "The code expired. Sign in again.";
+    assert gsi_fail_text(GSI_F_NONE) == "" and gsi_fail_text(8) == "";
+    assert gsi_fail_text(GSI_F_KEYCHAIN) == "The Keychain did not keep the sign-in.";
+}

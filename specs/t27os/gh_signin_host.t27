@@ -1,0 +1,361 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS gh_signin_host: where the GitHub sign-in of the window (gh_signin.t27) touches the machine -- the HTTPS
+// requests of the device flow, the Keychain item that keeps the token, and the account's picture handed to
+// profile_host's own checks. No decision lives here: what is sent, how an answer reads, which values pass and which
+// state comes next are tested fns of gh_signin.t27; which picture and nickname a profile may hold are profile.t27's.
+//
+// The token is read out of one answer into a stack buffer of this module, checked (gsi_token_ok), written to the
+// Keychain under service "ai.t27.os", account "github-signin" through `security -i` on stdin (keys.t27 sec_add_line,
+// keysync_host kc_run; never on argv), used once for GET /user and wiped. It never goes to a file, a log, a URL or
+// the window's memory (share.t27 token_home_ok: the Keychain only). Foundation copies a request header into its own
+// objects; those are released, they cannot be wiped. The device code lives in the window only while it is shown.
+//
+// Every call here blocks its caller for at most GSIH_TIMEOUT_S; the window polls at most once per interval.
+//
+// Specs holding @extern cannot run tests under t27c; gh_signin.t27 carries the tests of every rule used here.
+// Flat namespace: every name here starts with gsih_ / GSIH_. Only the window imports this module. ASCII only (L3).
+//
+// Refs gHashTag/t27#13086.
+module T27osGhSigninHost;
+
+use t27os::gh_signin::GSI_CODE_URL;
+use t27os::gh_signin::GSI_TOKEN_URL;
+use t27os::gh_signin::GSI_USER_URL;
+use t27os::gh_signin::GSI_DEVICE_URL;
+use t27os::gh_signin::GSI_KC_ACCOUNT;
+use t27os::gh_signin::GSI_A_PENDING;
+use t27os::gh_signin::GSI_A_GRANTED;
+use t27os::gh_signin::GSI_A_OTHER;
+use t27os::gh_signin::GSI_F_NONE;
+use t27os::gh_signin::GSI_F_NET;
+use t27os::gh_signin::GSI_F_ANSWER;
+use t27os::gh_signin::GSI_F_KEYCHAIN;
+use t27os::gh_signin::GSI_F_USER;
+use t27os::gh_signin::GSI_F_AVATAR;
+use t27os::gh_signin::GSI_F_TOKEN;
+use t27os::gh_signin::gsi_code_body;
+use t27os::gh_signin::gsi_token_body;
+use t27os::gh_signin::gsi_json_str;
+use t27os::gh_signin::gsi_json_num;
+use t27os::gh_signin::gsi_answer;
+use t27os::gh_signin::gsi_code_fail;
+use t27os::gh_signin::gsi_device_code_ok;
+use t27os::gh_signin::gsi_user_code_ok;
+use t27os::gh_signin::gsi_token_ok;
+use t27os::gh_signin::gsi_login_ok;
+use t27os::gh_signin::gsi_avatar_sized;
+use t27os::keys::KEYCHAIN_SERVICE;
+use t27os::keys::SEC_OP_READ;
+use t27os::keys::SEC_OP_WRITE;
+use t27os::keys::SEC_OP_DELETE;
+use t27os::keys::SEC_OK;
+use t27os::keys::sec_gone;
+use t27os::keys::sec_add_line;
+use t27os::keysync_host::wipe;
+use t27os::keysync_host::kc_run;
+use t27os::profile::PRF_OK;
+use t27os::profile::prf_nick_check;
+use t27os::profile_host::PRFH_PATH_CAP;
+use t27os::profile_host::prfh_fetch_path;
+use t27os::profile_host::prfh_adopt;
+use t27os::pty_proto::get_u64;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_unlink;
+use t27os::session_store::put_bytes;
+use t27os::editors::same_bytes;
+
+pub const GSIH_TIMEOUT_S : f64 = 10.0;
+/// One device-flow answer (code or token) is a few hundred bytes; /user is about two KiB.
+pub const GSIH_ANS_CAP : usize = 2048;
+pub const GSIH_USER_CAP : usize = 8192;
+const GSIH_UTF8 : u32 = 134217984;
+
+fn gsih_cf_str(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn gsih_cf_data(alloc: u64, bytes: []const u8, n: u64) -> u64 { return @extern("CFDataCreate"); }
+fn gsih_cf_release(o: u64) -> void { @extern("CFRelease"); }
+fn gsih_class_named(name: u64) -> u64 { return @extern("NSClassFromString"); }
+fn gsih_sel_named(name: u64) -> u64 { return @extern("NSSelectorFromString"); }
+fn gsih_msg0(o: u64, s: u64) -> u64 { return @extern("objc_msgSend"); }
+fn gsih_msg1(o: u64, s: u64, a: u64) -> u64 { return @extern("objc_msgSend"); }
+fn gsih_msg2(o: u64, s: u64, a: u64, b: u64) -> u64 { return @extern("objc_msgSend"); }
+fn gsih_msg3(o: u64, s: u64, a: u64, b: u64, c: u64) -> u64 { return @extern("objc_msgSend"); }
+fn gsih_msg_f(o: u64, s: u64, t: f64) -> u64 { return @extern("objc_msgSend"); }
+
+fn gsih_cf(s: []const u8) -> u64 {
+    return gsih_cf_str(0, s, s.len, GSIH_UTF8, false);
+}
+
+fn gsih_cls(s: []const u8) -> u64 {
+    const n : u64 = gsih_cf(s);
+    const k : u64 = gsih_class_named(n);
+    gsih_cf_release(n);
+    return k;
+}
+
+fn gsih_sel(s: []const u8) -> u64 {
+    const n : u64 = gsih_cf(s);
+    const k : u64 = gsih_sel_named(n);
+    gsih_cf_release(n);
+    return k;
+}
+
+fn gsih_header(req: u64, name: []const u8, value: []const u8) -> void {
+    const n : u64 = gsih_cf(name);
+    const v : u64 = gsih_cf(value);
+    gsih_msg2(req, gsih_sel("setValue:forHTTPHeaderField:"), v, n);
+    gsih_cf_release(n);
+    gsih_cf_release(v);
+}
+
+fn gsih_url(s: []const u8) -> u64 {
+    const us : u64 = gsih_cf(s);
+    const u : u64 = gsih_msg1(gsih_cls("NSURL"), gsih_sel("URLWithString:"), us);
+    gsih_cf_release(us);
+    return u;
+}
+
+/// "Bearer " and the token into out; its length, 0 when there is no token or no room. Pure (tested below).
+pub fn gsih_bearer(tok: []const u8, out: []u8) -> usize {
+    if (tok.len == 0 or 7 + tok.len > out.len) { return 0; }
+    const at : usize = put_bytes(out, 0, "Bearer ");
+    return put_bytes(out, at, tok);
+}
+
+// ---------------------------------------------------------------- one HTTPS exchange
+
+/// One exchange with url: a form POST when body is not empty, else a GET; the token as a bearer header when tok
+/// is not empty. When save is empty the answer is asked as JSON and its bytes go to out, res[0] their count (0 when
+/// longer than out); otherwise the answer is written to the file save and res[0] is 1 when it was. The HTTP status,
+/// 0 when nothing answered (no network, timeout) or the request could not be made.
+fn gsih_http(url: []const u8, body: []const u8, tok: []const u8, save: []const u8, out: []u8, res: []u32) -> u32 {
+    res[0] = 0;
+    const nsurl : u64 = gsih_url(url);
+    if (nsurl == 0) { return 0; }
+    const req : u64 = gsih_msg1(gsih_cls("NSMutableURLRequest"), gsih_sel("requestWithURL:"), nsurl);
+    if (req == 0) { return 0; }
+    gsih_msg_f(req, gsih_sel("setTimeoutInterval:"), GSIH_TIMEOUT_S);
+    if (save.len == 0) { gsih_header(req, "Accept", "application/json"); }
+    gsih_header(req, "User-Agent", "t27os");
+    if (tok.len > 0) {
+        var line : [300]u8 = undefined;
+        wipe(line[0..300]);
+        const ln : usize = gsih_bearer(tok, line[0..300]);
+        if (ln == 0) { return 0; }
+        gsih_header(req, "Authorization", line[0..ln]);
+        wipe(line[0..300]);
+    }
+    if (body.len > 0) {
+        const data : u64 = gsih_cf_data(0, body, @as(u64, body.len));
+        const post : u64 = gsih_cf("POST");
+        gsih_msg1(req, gsih_sel("setHTTPMethod:"), post);
+        gsih_msg1(req, gsih_sel("setHTTPBody:"), data);
+        gsih_header(req, "Content-Type", "application/x-www-form-urlencoded");
+        gsih_cf_release(post);
+        gsih_cf_release(data);
+    }
+    var resp : [8]u8 = undefined;
+    var err : [8]u8 = undefined;
+    var i : usize = 0;
+    while (i < 8) {
+        resp[i] = 0;
+        err[i] = 0;
+        i = i + 1;
+    }
+    const got : u64 = gsih_msg3(gsih_cls("NSURLConnection"), gsih_sel("sendSynchronousRequest:returningResponse:error:"), req, sys_addr(resp[0..8], resp[0..8], 0), sys_addr(err[0..8], err[0..8], 0));
+    const r : u64 = get_u64(resp[0..8], 0);
+    if (r == 0) { return 0; }
+    const status : u32 = @as(u32, @intCast(gsih_msg0(r, gsih_sel("statusCode")) & 65535));
+    if (got == 0) { return status; }
+    if (save.len > 0) {
+        const ps : u64 = gsih_cf(save);
+        if ((gsih_msg2(got, gsih_sel("writeToFile:atomically:"), ps, 1) & 255) != 0) { res[0] = 1; }
+        gsih_cf_release(ps);
+        return status;
+    }
+    const n : u64 = gsih_msg0(got, gsih_sel("length"));
+    if (n == 0 or n > @as(u64, out.len)) { return status; }
+    sys_peek(out, gsih_msg0(got, gsih_sel("bytes")), n);
+    res[0] = @as(u32, @intCast(n));
+    return status;
+}
+
+// ---------------------------------------------------------------- the device flow
+
+/// Ask GitHub for a device code. GSI_F_NONE with dc and uc filled and res = {dc length, uc length, interval,
+/// expires_in}; else why not, with dc wiped. The answer is wiped before the return.
+pub fn gsih_ask_code(dc: []u8, uc: []u8, res: []u32) -> u32 {
+    res[0] = 0;
+    res[1] = 0;
+    res[2] = 0;
+    res[3] = 0;
+    var body : [64]u8 = undefined;
+    const bn : usize = gsi_code_body(body[0..64]);
+    if (bn == 0) { return GSI_F_ANSWER; }
+    var ans : [GSIH_ANS_CAP]u8 = undefined;
+    wipe(ans[0..GSIH_ANS_CAP]);
+    var got : [1]u32 = undefined;
+    got[0] = 0;
+    const st : u32 = gsih_http(GSI_CODE_URL, body[0..bn], "", "", ans[0..GSIH_ANS_CAP], got[0..1]);
+    if (st == 0) { return GSI_F_NET; }
+    const an : usize = @as(usize, got[0]);
+    const dn : usize = gsi_json_str(ans[0..an], "device_code", dc);
+    const un : usize = gsi_json_str(ans[0..an], "user_code", uc);
+    var f : u32 = GSI_F_NONE;
+    if (st != 200 or !gsi_device_code_ok(dc[0..dn]) or !gsi_user_code_ok(uc[0..un])) {
+        f = gsi_code_fail(ans[0..an]);
+        wipe(dc);
+    } else {
+        res[0] = @as(u32, @intCast(dn));
+        res[1] = @as(u32, @intCast(un));
+        res[2] = gsi_json_num(ans[0..an], "interval");
+        res[3] = gsi_json_num(ans[0..an], "expires_in");
+    }
+    wipe(ans[0..GSIH_ANS_CAP]);
+    return f;
+}
+
+/// Open github.com/login/device in the person's browser (the click on SIGN IN WITH GITHUB is theirs).
+pub fn gsih_open_device_page() -> bool {
+    const u : u64 = gsih_url(GSI_DEVICE_URL);
+    if (u == 0) { return false; }
+    const ws : u64 = gsih_msg0(gsih_cls("NSWorkspace"), gsih_sel("sharedWorkspace"));
+    if (ws == 0) { return false; }
+    return (gsih_msg1(ws, gsih_sel("openURL:"), u) & 255) != 0;
+}
+
+/// Delete the kept token; true when it is gone (or was never there).
+pub fn gsih_forget() -> bool {
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = kc_run(SEC_OP_DELETE, GSI_KC_ACCOUNT, "", raw[0..256], res[0..2]);
+    wipe(raw[0..256]);
+    return sec_gone(st);
+}
+
+/// Replace the kept token with tok: the old item goes first (the add never replaces one, keys.t27 sec_add_line).
+fn gsih_keep(tok: []const u8) -> bool {
+    if (!gsih_forget()) { return false; }
+    var line : [400]u8 = undefined;
+    wipe(line[0..400]);
+    const ln : usize = sec_add_line(KEYCHAIN_SERVICE, GSI_KC_ACCOUNT, tok, line[0..400]);
+    if (ln == 0) { return false; }
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = kc_run(SEC_OP_WRITE, GSI_KC_ACCOUNT, line[0..ln], raw[0..256], res[0..2]);
+    wipe(line[0..400]);
+    wipe(raw[0..256]);
+    return st == SEC_OK;
+}
+
+/// A token is kept in the Keychain. Its bytes are read into a stack buffer and wiped at once.
+pub fn gsih_signed_in() -> bool {
+    var raw : [256]u8 = undefined;
+    wipe(raw[0..256]);
+    var res : [2]u32 = undefined;
+    res[0] = 0;
+    res[1] = 0;
+    const st : u32 = kc_run(SEC_OP_READ, GSI_KC_ACCOUNT, "", raw[0..256], res[0..2]);
+    wipe(raw[0..256]);
+    return st == SEC_OK and res[0] > 1;
+}
+
+/// Take the account's login and picture with tok: GET /user, the avatar at 256 px into the fetch file, then
+/// profile_host's own checks and files (prfh_adopt). GSI_F_NONE when the profile now holds both.
+fn gsih_take_account(tok: []const u8, had: bool) -> u32 {
+    var user : [GSIH_USER_CAP]u8 = undefined;
+    var got : [1]u32 = undefined;
+    got[0] = 0;
+    const st : u32 = gsih_http(GSI_USER_URL, "", tok, "", user[0..GSIH_USER_CAP], got[0..1]);
+    if (st == 0) { return GSI_F_NET; }
+    if (st != 200) { return GSI_F_USER; }
+    const un : usize = @as(usize, got[0]);
+    var login : [39]u8 = undefined;
+    const ln : usize = gsi_json_str(user[0..un], "login", login[0..39]);
+    if (!gsi_login_ok(login[0..ln])) { return GSI_F_USER; }
+    if (prf_nick_check(login[0..ln]) != PRF_OK) { return GSI_F_USER; }
+    var av : [200]u8 = undefined;
+    const avn : usize = gsi_json_str(user[0..un], "avatar_url", av[0..200]);
+    var sized : [210]u8 = undefined;
+    const sn : usize = gsi_avatar_sized(av[0..avn], sized[0..210]);
+    if (sn == 0) { return GSI_F_AVATAR; }
+    var path : [PRFH_PATH_CAP]u8 = undefined;
+    const pn : usize = prfh_fetch_path(path[0..PRFH_PATH_CAP]);
+    if (pn == 0) { return GSI_F_AVATAR; }
+    var saved : [1]u32 = undefined;
+    saved[0] = 0;
+    const ast : u32 = gsih_http(sized[0..sn], "", "", path[0..pn], user[0..GSIH_USER_CAP], saved[0..1]);
+    if (ast != 200 or saved[0] != 1) {
+        sys_unlink(path[0..PRFH_PATH_CAP]);
+        return GSI_F_AVATAR;
+    }
+    if (prfh_adopt(login[0..ln], had) != PRF_OK) { return GSI_F_AVATAR; }
+    return GSI_F_NONE;
+}
+
+/// One token poll for device code dc; the answer (GSI_A_*). On GSI_A_GRANTED res[0] is 1 when the token is kept and
+/// the profile was taken from the account, else res[1] says why not and the Keychain item is gone again. A poll
+/// that nothing answered counts as pending: the clock in gsi_poll_event still ends the code.
+pub fn gsih_poll(dc: []const u8, had: bool, res: []u32) -> u32 {
+    res[0] = 0;
+    res[1] = GSI_F_NONE;
+    var body : [200]u8 = undefined;
+    const bn : usize = gsi_token_body(dc, body[0..200]);
+    if (bn == 0) {
+        res[1] = GSI_F_ANSWER;
+        return GSI_A_OTHER;
+    }
+    var ans : [GSIH_ANS_CAP]u8 = undefined;
+    wipe(ans[0..GSIH_ANS_CAP]);
+    var got : [1]u32 = undefined;
+    got[0] = 0;
+    const st : u32 = gsih_http(GSI_TOKEN_URL, body[0..bn], "", "", ans[0..GSIH_ANS_CAP], got[0..1]);
+    wipe(body[0..200]);
+    if (st == 0) { return GSI_A_PENDING; }
+    const an : usize = @as(usize, got[0]);
+    const answer : u32 = gsi_answer(ans[0..an]);
+    if (answer != GSI_A_GRANTED) {
+        wipe(ans[0..GSIH_ANS_CAP]);
+        return answer;
+    }
+    var tok : [255]u8 = undefined;
+    wipe(tok[0..255]);
+    const tn : usize = gsi_json_str(ans[0..an], "access_token", tok[0..255]);
+    wipe(ans[0..GSIH_ANS_CAP]);
+    var f : u32 = GSI_F_NONE;
+    if (!gsi_token_ok(tok[0..tn])) {
+        f = GSI_F_TOKEN;
+    } else {
+        if (!gsih_keep(tok[0..tn])) {
+            f = GSI_F_KEYCHAIN;
+        } else {
+            f = gsih_take_account(tok[0..tn], had);
+        }
+    }
+    wipe(tok[0..255]);
+    if (f != GSI_F_NONE) {
+        _ = gsih_forget();
+        res[1] = f;
+        return answer;
+    }
+    res[0] = 1;
+    return answer;
+}
+
+// ---------------------------------------------------------------- tests (the pure fn only; the host calls are not run)
+
+test gsih_the_bearer_line_holds_the_token_once {
+    var b : [40]u8 = undefined;
+    const n : usize = gsih_bearer("fake-token", b[0..40]);
+    assert n == 17 and same_bytes(b[0..n], "Bearer fake-token");
+    assert gsih_bearer("", b[0..40]) == 0;
+    var s : [16]u8 = undefined;
+    assert gsih_bearer("fake-token", s[0..16]) == 0;
+    assert gsih_bearer("fake-toke", s[0..16]) == 16;
+}
