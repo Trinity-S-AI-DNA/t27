@@ -21,6 +21,8 @@
 
 module TriShootoutCodegenAudit;
 
+use tri::shootout::bench::MEASURED_T27B_BASELINE;
+
 ; ----------------------------------------------------------------
 ; Measured workload
 ; ----------------------------------------------------------------
@@ -223,6 +225,170 @@ pub fn evidence_command() -> str {
 }
 
 ; ----------------------------------------------------------------
+; Physical floor, on the AOT receipt (2026-11-02)
+; ----------------------------------------------------------------
+; The model above holds IPC at the JIT run (656 ms, 10.5 cycles). The AOT run
+; of the SAME instruction stream measured 344.08 ms median, 324.90 ms min
+; (bench.t27, .trinity/receipts/bench_200m_aot_summary.json): 5.5 cycles per
+; call at 3.2 GHz. So the binding limit is not the instruction count. It is
+; the branches: on the common path one call executes 22 instructions (the
+; three at 7c/80/84 run once per 1001 calls, so 25 over-counts), 9 of them
+; branches, 5 of them taken (bl, b.ne in the callee, ret, b.ls, back edge).
+
+; LITERATURE, not measured here (public Apple M1 Firestorm microbenchmarks):
+; one taken branch per cycle, two branch units, 8-wide decode. The floor of a
+; shape is the largest of the three bounds. It is falsifiable: a hardware
+; counter run that retires today's loop in under 5 cycles refutes it.
+
+; PROJECTED shapes are instruction streams t27b does not emit yet; their
+; counts are hand-scheduled from the fixes in LOSSES, not read from asm.
+; ZIG_RUNTIME_MS has no run receipt in .trinity/receipts; it is used below
+; only as the 150 ms rung, never as a measured competitor.
+
+pub const LIT_TAKEN_PER_CYCLE : u64 = 1;
+pub const LIT_BRANCH_UNITS : u64 = 2;
+pub const LIT_DECODE_WIDTH : u64 = 8;
+
+/// One loop shape. Counts are per loop iteration on the common path;
+/// `unroll` logical calls share one iteration (one back edge).
+pub const Shape = struct {
+    name : str,
+    instructions : u64,
+    branches : u64,       // includes bl and ret
+    taken : u64,
+    unroll : u64,
+    source : str,         // "MEASURED asm" or "PROJECTED"
+}
+
+/// MEASURED: today's stream, counted from the asm listed in BASELINE.
+pub const SHAPE_TODAY : Shape = Shape {
+    .name = "today: call, branchy callee, 4 checks, limit rebuilt",
+    .instructions = 22,
+    .branches = 9,
+    .taken = 5,
+    .unroll = 1,
+    .source = "MEASURED asm",
+}
+
+/// PROJECTED: call kept; callee cmp/cset/ret; wrap block out of line;
+/// limit hoisted; checks kept only where no bound is known (tick + 1).
+pub const SHAPE_CALL_CLEAN : Shape = Shape {
+    .name = "call kept, L1 + L3 (proved part) + L4 fixed",
+    .instructions = 15,
+    .branches = 5,
+    .taken = 3,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: SHAPE_CALL_CLEAN unrolled four calls per back edge.
+pub const SHAPE_CALL_UNROLL4 : Shape = Shape {
+    .name = "call kept, unrolled x4",
+    .instructions = 51,
+    .branches = 17,
+    .taken = 9,
+    .unroll = 4,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: callee inlined (L2), cinc instead of the call, checks kept.
+pub const SHAPE_INLINED : Shape = Shape {
+    .name = "inlined, overflow check on tick + 1 kept",
+    .instructions = 10,
+    .branches = 3,
+    .taken = 1,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: first iteration peeled; afterwards tick <= 1000, so tick + 1
+/// cannot overflow and its check goes.
+pub const SHAPE_INLINED_PROVED : Shape = Shape {
+    .name = "inlined, first iteration peeled, no overflow check",
+    .instructions = 9,
+    .branches = 2,
+    .taken = 1,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: the loop still iterates, but tick != tick - 1 is folded to 1.
+/// One taken branch per iteration: the floor of any loop that stays alive.
+pub const SHAPE_LIVE_LOOP : Shape = Shape {
+    .name = "inlined, compare folded, loop kept",
+    .instructions = 7,
+    .branches = 2,
+    .taken = 1,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// DERIVED: cycles per logical call, the largest of the three bounds.
+pub fn floor_cycles_per_call(instructions : u64, branches : u64, taken : u64, unroll : u64) -> f64 {
+    var m : f64 = (taken as f64) / (LIT_TAKEN_PER_CYCLE as f64);
+    var b : f64 = (branches as f64) / (LIT_BRANCH_UNITS as f64);
+    var d : f64 = (instructions as f64) / (LIT_DECODE_WIDTH as f64);
+    if (b > m) { m = b; }
+    if (d > m) { m = d; }
+    return m / (unroll as f64);
+}
+
+/// DERIVED: wall-clock floor of the 200M-call run at ASSUMED_CORE_GHZ.
+pub fn floor_ms(instructions : u64, branches : u64, taken : u64, unroll : u64) -> f64 {
+    var c = floor_cycles_per_call(instructions, branches, taken, unroll);
+    return c * (MEASURED_LOGICAL_CALLS as f64) / (ASSUMED_CORE_GHZ * 1_000_000.0);
+}
+
+/// DERIVED: cycles per call of the AOT median, from bench.t27.
+pub fn aot_cycles_per_call() -> f64 {
+    var ns = (MEASURED_T27B_BASELINE.runtime_ms * 1_000_000.0) / (MEASURED_LOGICAL_CALLS as f64);
+    return ns * ASSUMED_CORE_GHZ;
+}
+
+; ----------------------------------------------------------------
+; The absolute floor: the work is dead
+; ----------------------------------------------------------------
+; After the first call, cur_prev is cur_tick - 1 or (0, 1000), never equal to
+; cur_tick, so every later verdict is 1. For n >= 1 calls the result is
+; ((n - 1) + [tick != prev]) % 2; at n = 200M that is [tick == prev]. The only
+; other observable is the overflow trap when tick is the u64 maximum.
+; A compiler that proves this deletes the loop, so on this workload calls per
+; second rank how much work a compiler deletes, not what a call costs.
+
+/// The benchmark loop with the trip count as a parameter (verdict inlined),
+/// so a test can hold the closed form against it at small n.
+fn reference_loop(tick : u64, prev : u64, n : u64) -> u64 {
+    var i : u64 = 0;
+    var acc : u64 = 0;
+    var t : u64 = tick;
+    var p : u64 = prev;
+    while (i < n) {
+        if (t != p) { acc = acc + 1; }
+        t = t + 1;
+        if (t > 1000) {
+            t = 0;
+            p = 1000;
+        } else {
+            p = t - 1;
+        }
+        i = i + 1;
+    }
+    return acc % 2;
+}
+
+/// O(1) answer of the benchmark for n calls (trap case excluded).
+pub fn closed_form_result(tick : u64, prev : u64, n : u64) -> u64 {
+    if (n == 0) { return 0; }
+    var first : u64 = 0;
+    if (tick != prev) { first = 1; }
+    return ((n - 1) + first) % 2;
+}
+
+fn closed_form_agrees(tick : u64, prev : u64, n : u64) -> bool {
+    return closed_form_result(tick, prev, n) == reference_loop(tick, prev, n);
+}
+
+; ----------------------------------------------------------------
 ; Tests
 ; ----------------------------------------------------------------
 
@@ -307,4 +473,54 @@ test one_hundred_fifty_ms_needs_six_instructions_or_fewer {
 test evidence_is_a_command_not_an_opinion {
     var cmd = evidence_command();
     assert(cmd == "t27b asm specs/tri/shootout/bench_audit.t27")
+}
+
+test today_runs_within_ten_percent_of_its_own_floor {
+    // 5 taken branches -> 5 cycles -> 312.5 ms; the AOT median is 344.08 ms
+    var f = floor_ms(SHAPE_TODAY.instructions, SHAPE_TODAY.branches, SHAPE_TODAY.taken, SHAPE_TODAY.unroll);
+    assert(f > 312.4 and f < 312.6);
+    var c = aot_cycles_per_call();
+    assert(c > 5.4 and c < 5.6);
+    assert(f < MEASURED_T27B_BASELINE.runtime_ms);
+    assert(f / MEASURED_T27B_BASELINE.runtime_ms > 0.9)
+}
+
+test the_150_ms_rung_needs_unrolling_or_inlining {
+    // a real call per logical call costs bl + ret + back edge = 3 taken
+    var clean = floor_ms(SHAPE_CALL_CLEAN.instructions, SHAPE_CALL_CLEAN.branches, SHAPE_CALL_CLEAN.taken, SHAPE_CALL_CLEAN.unroll);
+    assert(clean > 187.4 and clean < 187.6);
+    assert(clean > ZIG_RUNTIME_MS);
+    // unrolling x4 spreads the back edge: 9 taken / 4 calls = 2.25 cycles
+    var u4 = floor_ms(SHAPE_CALL_UNROLL4.instructions, SHAPE_CALL_UNROLL4.branches, SHAPE_CALL_UNROLL4.taken, SHAPE_CALL_UNROLL4.unroll);
+    assert(u4 > 140.5 and u4 < 140.7);
+    assert(u4 < ZIG_RUNTIME_MS);
+    // unrolled without bound, bl + ret still cost 2 taken branches per call
+    var with_call = floor_ms(0, 0, 2, 1);
+    assert(with_call > 124.9 and with_call < 125.1)
+}
+
+test inlining_moves_the_floor_below_one_hundred_ms {
+    var inl = floor_ms(SHAPE_INLINED.instructions, SHAPE_INLINED.branches, SHAPE_INLINED.taken, SHAPE_INLINED.unroll);
+    assert(inl > 93.7 and inl < 93.8);
+    var pr = floor_ms(SHAPE_INLINED_PROVED.instructions, SHAPE_INLINED_PROVED.branches, SHAPE_INLINED_PROVED.taken, SHAPE_INLINED_PROVED.unroll);
+    assert(pr > 70.3 and pr < 70.4);
+    var live = floor_ms(SHAPE_LIVE_LOOP.instructions, SHAPE_LIVE_LOOP.branches, SHAPE_LIVE_LOOP.taken, SHAPE_LIVE_LOOP.unroll);
+    assert(live > 62.4 and live < 62.6);
+    assert(live < pr and pr < inl)
+}
+
+test closed_form_matches_the_loop_at_small_n {
+    assert(closed_form_agrees(5, 4, 0));
+    assert(closed_form_agrees(5, 4, 1));
+    assert(closed_form_agrees(5, 5, 1));
+    assert(closed_form_agrees(5, 5, 2));
+    assert(closed_form_agrees(1000, 999, 3));
+    assert(closed_form_agrees(1000, 1000, 1002));
+    assert(closed_form_agrees(2000, 7, 2500));
+    assert(closed_form_agrees(0, 1000, 2501))
+}
+
+test the_200m_answer_is_whether_tick_equals_prev {
+    assert(closed_form_result(5, 4, MEASURED_LOGICAL_CALLS) == 0);
+    assert(closed_form_result(5, 5, MEASURED_LOGICAL_CALLS) == 1)
 }
