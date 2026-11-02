@@ -348,4 +348,20 @@ disassembly is wanted, it needs a path the gate accepts -- a generator with a
 - Register allocation: the shape above assumes two scratch registers are free at
   that point in the loop. t27b's allocator has not been asked.
 
+## 8. What this round committed, and where the branch stands
+
+| commit | what |
+|---|---|
+| `cf503a566abd18ec24c1f88a6dfdc646616c7c9b` | the two new specs, the matrix's noisy-row rule, this receipt |
+| `df4daec11661d0eeffefbf9a7cf049b0ca02a379` | `pr-body.md`, the text of the publication request |
+| the head commit | this section (a commit cannot carry its own hash; read it with `git log -1`) |
+
+`git merge-tree --write-tree HEAD origin/master` returns rc 0 against
+`origin/master` = `0215bd7223c646ceb57d1a468b16a263018aba3c`, so GitHub can
+squash the branch with no conflict. Every commit on the branch carries
+`Refs #12877`, which is what the L1 check greps for.
+
+Nothing is pushed. The branch is published, and the draft PR opened, only on the
+owner's confirmation of the exact request recorded in `pr-body.md`.
+
 Refs #12877.
