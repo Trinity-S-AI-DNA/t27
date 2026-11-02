@@ -821,4 +821,108 @@ One boundary stays where it was: the owner ran this, not the session. Builds,
 tests and sweeps on this Mac remain off-limits to the agent, and the owner
 running a command himself is his own call rather than a route around that rule.
 
+### 12f. The same engine disagrees on the second spec, and the cause is not established
+
+The owner ran the second spec on the same binary, and it did **not** reprint the
+runner's counts:
+
+```
+t27b test specs/tri/shootout/acceptance_matrix.t27 --check --quiet
+  TriShootoutAcceptanceMatrix: runtime asserts 85
+  TriShootoutAcceptanceMatrix: ct-verified 0
+  TriShootoutAcceptanceMatrix: 13 passed, 0 failed, 13 total
+```
+
+What `ubuntu-24.04-arm` recorded for that same file, read from the artifact of
+run 41412031594 rather than from memory (`target/ci/nat/run.json`):
+
+```json
+"file": "specs/tri/shootout/acceptance_matrix.t27",
+"reference": "pass",
+"t27b": "pass",
+"tests": 16,
+"invariants": 0,
+"asserts": 94,
+"blockers": [],
+```
+
+The gap is not a rounding of anything. It is **three tests and nine asserts**,
+and both numbers land on named lines. The file's last three `test` blocks are
+`the_aot_receipt_row_is_unstable_not_re_run_away` (4 asserts),
+`a_second_series_never_shrinks_a_row_s_spread` (2) and
+`the_limit_is_a_percent_of_the_median` (3): 4 + 2 + 3 = 9. They are the three
+blocks commit `cf503a566a` added, and they are the only three in the file with no
+loop in them, so for them a static count and a runtime count are the same number
+(the file's static total is 49 against a runtime 94 because the table-driven
+tests execute one `assert` once per cell).
+
+**Reading one: the run read an older copy of the file.** The first committed
+version, `6b7725af98`, carries exactly the current file's first thirteen `test`
+blocks, in the same order, with 40 static asserts and the same 13-row `CELLS`
+table; the diff from it to this head adds 80 lines, deletes 19, and touches no
+existing `assert` line. A tree sitting at that commit therefore prints
+`13 passed, 0 failed, 13 total` and `runtime asserts 85` -- the owner's output,
+exactly, with nothing left over.
+
+What that reading costs is a tree nobody can find. Every worktree this repository
+knows about was listed and checked, not sampled:
+
+```
+git worktree list --porcelain | awk '/^worktree /{print $2"/specs/tri/shootout/acceptance_matrix.t27"}'
+```
+
+70 worktrees, and `ls` answers for exactly one of them -- this one, 28 592 B,
+mtime 2026-11-02 15:25. The same sweep over `codegen_audit.t27` answers for 30
+worktrees, of which 29 hold master's **11** `test` blocks and one holds **16**:
+again this one. `find` over `~/t27`, `~/t27os`, `~/trinity`, `~/trios`,
+`~/t27-mcp`, `~/.dsh`, `$TMPDIR` and `/tmp` finds no second copy of either file.
+So the older-copy reading needs an unregistered checkout outside all of those,
+standing at a commit inside the 36 minutes between 13:52:28 and 14:28:17.
+
+**Reading two: the binary dropped the three tests and said nothing.** The item
+loop that builds the test list is `cli/t27b/src/lower.rs:827`:
+
+```rust
+    for item in &items {
+        match item.kind {
+            NodeKind::TestBlock => {
+                if let Ok(f) = l.test(item, false) {
+                    funcs.push(f);
+                }
+            }
+```
+
+A test whose lowering returns `Err` is skipped, and nothing is printed for it.
+The summary line is `cli/t27b/src/main.rs:390` -- `passed + failed` -- so the
+printed total is the number of tests that *reached* the runtime, not the number
+the file contains. An invariant in the same position is loud: `lower.rs:845`
+records it and `main.rs:352` prints `INVARIANT NOT CHECKED <name>: the front-end
+discarded its body`. Tests have no such line. Under this reading both of the
+owner's runs were made in the one tree whose `codegen_audit.t27` has 16 blocks,
+and the second printed a total three smaller than the file.
+
+What that reading costs is a difference between two builds of one crate. CI's
+t27b was built from a `cli/t27b` unchanged since `d0cd902cf3`, 2026-10-27, and it
+lowered all sixteen; the owner's binary would have to differ from that crate.
+Whether it does cannot be read: `t27b --version` prints `t27b 0.1.0` and
+`build 0 commit unknown`, which is also why §12e left its provenance unstated.
+
+**Neither reading is established here.** Settling it means either running that
+binary on this Mac, which the agent does not do, or knowing which directory the
+command ran in, which is the owner's to say and not this receipt's to assume. So
+the disagreement is recorded as a disagreement. §12e's sentence -- "Different
+machine, different build of the compiler, same counts" -- is true of
+`codegen_audit.t27` and does not generalise to this branch's second spec; it is
+corrected here rather than quietly rewritten there, and the earlier reading stays
+on the page.
+
+One consequence stands whichever reading is right, and it bites this round's own
+method: **`N passed, 0 failed, N total` is not a receipt for N unless N is known
+independently.** Four specs were accepted in §12 on exactly that line. The arm64
+ratchet measures vacuity -- a spec with no tests at all -- and does not measure a
+total that shrank, so a silently dropped test is invisible to it too. An
+acceptance matrix that cannot see three of its own rows go missing is not yet a
+ruler, and the fix is cheap in both directions: a `TEST NOT RUN` line for a
+discarded test, and an expected count per spec that the matrix itself asserts.
+
 Refs #12877.
