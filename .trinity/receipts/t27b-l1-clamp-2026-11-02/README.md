@@ -166,9 +166,11 @@ quoted again as sound.
 ## 4. Correctness conditions, and where they are written down
 
 `specs/tri/t27b/ifconv_plan.t27` (module `T27bIfconvPlan`) is the decision, in
-t27, with 14 tests. `t27c parse` rc 0; `t27b asm` rc 0, 1157 lines
-(`ifconv_plan.asm` here, sha256 `447fdb0b309ecc89...`). Not executed anywhere.
-Nothing in `cli/t27b` calls it.
+t27, with 19 tests (15 when section 4 was first written, before section 9 added
+the emission-order rule). `t27c parse` rc 0; `t27b asm` rc 0. The line count and
+hash of that lowering live in section 6c's table, with the spec hash that
+produced them, and are not repeated here. Not executed anywhere. Nothing in
+`cli/t27b` calls it.
 
 1. **Integers in registers only.** No float, no i128 (`all_int`).
 2. **The arms touch nothing but registers.** `arm_speculable` accepts an absent
@@ -327,10 +329,17 @@ would be getting past a refusal by changing the form of presentation. So they
 stay out of the commit, and the part that carries the argument -- the
 `wrap_pair` chain of section 2 -- is quoted in this file instead.
 
-| artifact | lines | sha256 | how to reproduce it byte for byte |
-|---|---|---|---|
-| `l1_clamp.before.asm` | 217 | `92713df74a025198...` | `~/t27/target/release/t27b asm specs/tri/shootout/l1_clamp.t27` |
-| `ifconv_plan.asm` | 1157 | `447fdb0b309ecc89...` | `~/t27/target/release/t27b asm specs/tri/t27b/ifconv_plan.t27` |
+Each row names the sha256 of its **input** as well as its output, because an
+`.asm` hash on its own goes stale the moment the spec is edited, and then the
+reproduce command silently disagrees with the hash beside it. That happened
+once here: `ifconv_plan.asm` was 1157 lines / `447fdb0b309ecc89...` from the
+spec as section 4 first described it, and section 9's additions made both
+numbers wrong. The input column is what makes that visible instead of silent.
+
+| artifact | lines | sha256 | input spec, sha256 | how to reproduce it byte for byte |
+|---|---|---|---|---|
+| `l1_clamp.before.asm` | 217 | `92713df74a025198...` | `specs/tri/shootout/l1_clamp.t27`, `96dc940bd28a8fe9...` | `~/t27/target/release/t27b asm specs/tri/shootout/l1_clamp.t27` |
+| `ifconv_plan.asm` | 1329 | `0179d4b597ac0f53...` | `specs/tri/t27b/ifconv_plan.t27`, `0e690948987d82d5...` | `~/t27/target/release/t27b asm specs/tri/t27b/ifconv_plan.t27` |
 
 Both with the snapshot's `t27b` (sha256 `ee89c7d27724dc11`). If a committed
 disassembly is wanted, it needs a path the gate accepts -- a generator with a
