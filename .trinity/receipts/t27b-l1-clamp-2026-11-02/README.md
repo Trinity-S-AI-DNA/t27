@@ -345,8 +345,8 @@ disassembly is wanted, it needs a path the gate accepts -- a generator with a
   344.08 ms median is the older AOT receipt.
 - The "after" assembly is hand-derived. Until the glue exists and a
   disassembler can print `csel`, there is no emitted after-shape to compare.
-- Register allocation: the shape above assumes two scratch registers are free at
-  that point in the loop. t27b's allocator has not been asked.
+- Register allocation: answered in section 9 below. The shape needs one scratch
+  register, not the two the hand-written listing in section 3 spends.
 
 ## 8. What this round committed, and where the branch stands
 
@@ -365,3 +365,60 @@ Nothing is pushed. The branch is published, and the draft PR opened, only on the
 owner's confirmation of the exact request recorded in `pr-body.md`.
 
 Refs #12877.
+
+## 9. The register question, answered -- and one scratch register, not two
+
+Section 7 left the allocator unasked. It is answered here from t27b's own
+register map and the `csel` encoder, without running anything.
+
+The map is documented at `cli/t27b/src/codegen.rs` lines 10-15: x0-x7 arguments,
+the result, and variable homes in leaf functions; **x8 the operation scratch**;
+x9-x15 the expression temp stack, spilling to the frame from temp 7; **x16/x17
+scratch for spilled temps and materialised constants**; x18 untouched; x19-x28
+variable homes by loop-weighted use count. `wrap_pair` is a leaf, so its locals
+live in x0-x7 -- which is what the emitted bytes show: x1 is `tick`, x2 is
+`prev`, and x8/x9/x17 are already used as scratch by the multiply.
+
+What the conversion actually needs at the selects:
+
+| value | where it comes from | register cost |
+|---|---|---|
+| `tick = 0` | `csel rd, xzr, x1, hi` | **none** -- `csel` takes a register number for its first source and 31 is ZR (`specs/tri/t27b/a64.t27` `csel`, whose own comment says so). No `movz`, no register |
+| `prev = 1000` | one `movz` into a scratch | one register, loop-invariant, hoistable |
+| `prev = t - 1` | the speculated `subs` | none -- it may be written straight into `prev`'s home, which is what t27b already does at `0x6c` (`subs x2, x1, #1`) |
+
+So **one** scratch register, and x8 or x16/x17 holds it. The listing in section 3
+spends two (x9 for the speculated subtraction and x10 for the constant); x9 is
+unnecessary, because `csel rd, rn, rm` is legal with `rd == rm`, and the
+destination is written unconditionally in either case, so letting the
+speculation land in `prev`'s home clobbers nothing the select does not
+immediately overwrite. The instruction counts in section 3's table are
+unaffected -- 6 instructions, 5 with the `movz` hoisted -- because dropping x9
+removes no instruction, only a register.
+
+### The flag order is now a rule with a negative control
+
+Section 3 already said the order is forced, in prose: `subs` writes the flags
+its trap check reads, so it must precede the `cmp` the selects read. This round
+makes that checkable rather than asserted, because getting it backwards is not a
+slower shape but a **silently wrong** one -- a select emitted after a speculated
+`subs` chooses on the subtraction's flags, takes the other arm, and traps
+nowhere. Nothing in the trap-disjointness rule catches that.
+
+`specs/tri/t27b/ifconv_plan.t27` gained four functions and four tests:
+
+| name | what it decides |
+|---|---|
+| `arm_clobbers_flags(kind)` | true for `AK_SUB_IMM` and `AK_ADD_IMM`, which lower to flag-setting `subs` / `adds`; false for a constant or a local move |
+| `clobbering_arms(then, else)` | how many of the two arms write flags when speculated: 0, 1 or 2 |
+| `emit_order_ok(total, before_cmp)` | the guard compare must be the last writer of NZCV before the selects, so every clobbering arm must already be emitted. `emit_order_ok(1, 0)` is the bug, and it is asserted false |
+| `scratch_for_const(k)` | 0 for a zero arm, 1 otherwise -- the register finding above |
+
+The spec is now 17 functions and 19 tests, sha256
+`0e690948987d82d568495961b59936ec89d6d0844160a99e215105e957a0cd99`.
+`t27c parse` rc 0; `t27b asm` rc 0, 1329 lines, empty stderr. That is parse and
+lowering. **None of the 19 tests has been executed**, and nothing in `cli/t27b`
+reads any of them.
+
+The `pr-body.md` count was wrong and is corrected in the same commit: it claimed
+16 functions and 14 tests where the file had 13 and 15.

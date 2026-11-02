@@ -9,7 +9,7 @@ opened so that a runner that is allowed to execute tests does execute them.
 | file | what it is |
 |---|---|
 | `specs/tri/shootout/l1_clamp.t27` (new) | the saturating wrap on its own, 3 functions, 5 tests pinning the edges of the wrap: 1, the limit, the limit + 1, the largest u64. The regression gate: the same values must hold after the transform |
-| `specs/tri/t27b/ifconv_plan.t27` (new) | when an `if` may become a select, 16 functions, 14 tests. Nothing in `cli/t27b` calls it yet |
+| `specs/tri/t27b/ifconv_plan.t27` (new) | when an `if` may become a select, and in what order the emitter may write it: 17 functions, 19 tests. Nothing in `cli/t27b` calls it yet |
 | `specs/tri/shootout/acceptance_matrix.t27` | the one-line spread rule replaced by three functions and three tests (below) |
 | `.trinity/receipts/t27b-l1-clamp-2026-11-02/README.md` | the snapshot, the emitted assembly today, the hand-derived after-shape, the numeric edges, the prepared-not-applied Rust glue, and a correction owed to `codegen_audit.t27` |
 
@@ -27,6 +27,27 @@ benchmark. The negative controls are in the spec: a subtraction and an addition
 whose trap falls inside the other side's guard are both refused, as are memory
 arms, control-flow arms, non-integer values, a compound condition, and anything
 over the select budget.
+
+## A second condition, found while reading the emitted bytes
+
+Soundness is not enough: the order the emitter writes the shape in is also part
+of correctness, and it is not implied by anything above. t27b lowers the checked
+subtraction to `subs x2, x1, #1` + `b.lo` and the guard to `cmp x1, #1000`.
+Both write NZCV, and CSEL reads NZCV. So a select emitted after a speculated
+`subs` chooses on the subtraction's flags: it takes the other arm, and nothing
+traps. A silently wrong answer, which the trap-disjointness rule cannot catch.
+
+`arm_clobbers_flags`, `clobbering_arms` and `emit_order_ok` make it checkable --
+every flag-clobbering speculated arm before the guard compare, so that compare
+is the last writer of NZCV before the selects -- with the wrong order as the
+negative control.
+
+The same reading corrects a register claim. The conversion needs **one** scratch
+register, not two: `csel` takes a register number for its first source and 31 is
+ZR, so `tick = 0` needs no `movz` and no register, and only the `1000` is
+materialised. `cli/t27b/src/codegen.rs` lines 10-15 keep x8 as the operation
+scratch and x16/x17 for materialised constants, so that one constant has a home
+no arm's value is living in. `scratch_for_const` records it.
 
 ## The noisy-row rule
 
