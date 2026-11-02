@@ -925,4 +925,13 @@ acceptance matrix that cannot see three of its own rows go missing is not yet a
 ruler, and the fix is cheap in both directions: a `TEST NOT RUN` line for a
 discarded test, and an expected count per spec that the matrix itself asserts.
 
+The first half of that fix is filed as its own issue, #13101, so it is not left
+as a remark inside a receipt: `specs/tri/t27b/run_report.t27` is to own what a
+run reports, and `lower.rs:830` is to name the test it discards the way
+`lower.rs:845` already names a discarded invariant. The issue is OPEN and
+nothing of it is implemented here; it is out of this lane's scope and its Rust
+half needs the foreign gate, which this session does not hold. Filing it is not
+a claim that either reading above has been settled -- the drop path is real in
+the source whether or not it fired on the owner's machine.
+
 Refs #12877.
