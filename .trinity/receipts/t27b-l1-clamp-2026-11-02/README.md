@@ -940,4 +940,73 @@ half needs the foreign gate, which this session does not hold. Filing it is not
 a claim that either reading above has been settled -- the drop path is real in
 the source whether or not it fired on the owner's machine.
 
+### 12g. The fifth red was this receipt's own line, and the method that hid it
+
+Sections 12b and 12d separated four reds and found all four master's. A later
+event named a fifth, `scan`, which those sections never mention, and the first
+reading of it was wrong in a way worth writing down: it was filed as "not among
+the four verified, so possibly master's". It was mine, and it was this file.
+
+`scan` is `.github/workflows/secret-scan.yml`, step **"Block hardcoded
+`$HOME` paths"** at line 60 -- the step name spells the literal prefix, which is
+the one thing this file may not do. The first draft of this very section quoted
+it in full and would have turned the check red a second time; it never reached
+CI, because `grep -rn <prefix> .trinity specs docs` was run before the push,
+which is the whole discipline in one command. It greps the whole tree -- `.trinity/` receipts included
+-- and exempts exactly eight paths, each of which must give an absolute path at
+run time (the workflow's own comment says so). A receipt is not one of them. The
+job named this file and the line: section 12e recorded the owner's binary as an
+absolute `/Users/...` path, and that one sentence turned the check red in 13 s.
+Fixed in `4d6c19e642` by writing the prefix as `~` -- the provenance it carries
+is unchanged, size, mtime and sha256 all stand, and which commit built the
+binary is still unstated. The fix is in the sentence, not in a ninth allowlist
+entry. Verified rather than assumed: at head `a393c15e2d`, `scan` **passes**
+(run `41422794662`, job `125202124239`, 13 s).
+
+The method that produced the wrong reading is the part that generalises. Most of
+these workflows are paths-filtered, so `gh api repos/.../commits/master/check-runs`
+does not list `scan` or `loop-tools-tracked` **at all**; an empty
+`select(.name==...)` reads as "clean on master" and is evidence of nothing in
+either direction. The route that answers is two calls: `gh run view <id> --json
+workflowName`, then `gh run list --workflow <workflowName> --branch master`. The
+job name and the workflow name differ -- `loop-tools-tracked` is a job inside
+`loop-tools-gate` -- so filtering runs by the job name returns an empty list that
+looks like the same false clean. And `gh run view <id> --log-failed` answers
+"still in progress" while sibling jobs are queued, so a fresh red often cannot be
+read at all; attribute from master's history instead of waiting for it.
+
+Run that way, `loop-tools-tracked` is firmer than section 12c's four runs:
+`gh run list --workflow loop-tools-gate --branch master --limit 6` is `failure`
+six times consecutively -- `4cfd2f2b` (2026-10-31T05:31:53Z), `82de5086`
+(10-30T09:31:25Z), `1e23fc3d`, `841def1e`, `4125e290`, `1a8da6fe` (all 10-27,
+12:14Z..13:32Z) -- and it still passes on PR #13097. Nothing here to fix.
+
+Two of section 12d's four discharged themselves, which is what that section
+predicted and is now measurable. `coverage` and `spec-guards` **pass** at
+`a393c15e2d` (jobs `125202308941`, `125202293803`) with the lane's seals
+untouched: `git diff origin/master..HEAD -- .trinity/seals/ specs/policy/` prints
+nothing and `git log --merges` shows no master merge on this branch. What changed
+is master: PR #13096, the own-language re-seal, merged at 2026-11-02T09:32:10Z as
+`380544ec8d`, four minutes before this run started. A `pull_request` check reads
+head-merged-into-base, so master's repair is in the tree those two checks walk --
+standard GitHub behaviour, named here as the mechanism rather than separately
+measured. The lane did not act, and did not need to.
+
+The direct count at `a393c15e2d`, for the record: **30 pass, 1 fail, 4 pending,
+4 skipping, 39 rows**. The dashboard bot's two comments from the same event read
+`28 failing / 32 total` (09:39:50Z) and `26 failing / 29 total` (09:42:14Z) for
+that same PR. It counts pending as failing, which section 12c already corrected
+once; the ratio is not a red count and is not quoted as one. Neither comment has
+an inline thread and neither asks anything of this branch, so nothing was acted
+on and nothing was replied to.
+
+Still open, and named rather than implied: `Corpus ratchet`, `emit-bitexact`,
+`t27b-native-macos` and `t27b-native-ratchet` are **pending** at this head, so
+the two tests commit `a684a5a831` added to the matrix (lines 769 and 779) --
+`a_total_that_shrank_is_not_a_pass` and
+`a_total_with_nothing_to_compare_is_no_reading` -- have **not** executed anywhere
+yet. Attempts 0; blocked by nothing but the queue. Their counts go in 12h when
+the arm64 job reports them, and until then this receipt claims nothing about
+them.
+
 Refs #12877.
