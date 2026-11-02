@@ -244,9 +244,15 @@ be needed, and all three are inside the foreign-code gate:
 1. `cli/t27b/src/codegen.rs`, in `Stmt::If` (line 694) and `ExprKind::Select`
    (line 1315): read each arm's kind and immediate, read the condition's
    comparison and constant, count the selects and speculated ops, ask the
-   generated `may_if_convert`, and on `true` emit the arms into scratch
-   registers followed by `a64::csel` per result instead of
-   `branch` + `jump`. On `false` keep today's path byte for byte.
+   generated `may_if_convert`, and on `true` emit `a64::csel` per result
+   instead of `branch` + `jump`. On `false` keep today's path byte for byte.
+   Two constraints on that emission, both from section 9 and neither optional:
+   the order is fixed -- every flag-clobbering speculated arm goes out **before**
+   the guard compare, so that compare is the last writer of NZCV before the
+   selects (`emit_order_ok`), and getting it wrong is a silently wrong answer,
+   not a slower one; and a zero arm is `xzr` rather than a materialised
+   constant, so the clamp needs one scratch register, not one per arm
+   (`scratch_for_const`).
 2. `cli/t27b/src/codegen.rs` or a new module: a `#[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"]`
    include, in the same shape as `cli/t27b/src/a64.rs:14` uses for `a64.rs`.
 3. `cli/t27b/src/a64.rs`, the disassembler at line 209: it matches conditional
