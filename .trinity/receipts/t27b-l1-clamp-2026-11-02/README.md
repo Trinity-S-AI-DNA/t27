@@ -496,3 +496,28 @@ settles only *where* each file would be executed and *which* red is
 pre-existing. Nothing has been run.
 
 Refs #12877.
+
+## 11. Which runner could execute the 16 + 13 tests: every route, checked
+
+"Blocked on a runner" is a claim, so here is the claim's basis: five routes,
+each checked with one command, on 2026-11-02.
+
+| route | checked with | state |
+|---|---|---|
+| `t27-lanes/fs-lab.sh`, the route the Mac load hook's own refusal message names | `ls` | **does not exist.** The hook refuses a heavy command and points at a script the 2026-10-25 disk cleanup removed |
+| `ssh t27c-lab` / `ssh t27b-lab`, the hosts the `t27b-loop` skill uses | `grep -i '^Host' ~/.ssh/config` | **not configured.** Five hosts, none of them a lab |
+| this Mac | the hook itself | **refused**, by the owner's rule of 2026-10-09 after four watchdog panics. Not appealed, and not worked around |
+| a T27 OS pane, the route earlier rounds of this program used to run 21/21 and 23/23 | `pgrep -fl t27os-pty`, then `T27OS_CTL=list` | **server live** (pid 30009, with glm-4.5-flash panes attached), **but the documented listing command is broken**: it produced no output for 120 s and started a *second* `t27os-pty`, which is the one thing the note on this trap says must never happen. The second process was stopped and only pid 30009 remains. Driving panes from this session is therefore unsafe until a listing command that does not spawn a server is found |
+| GitHub Actions | section 10 | **available, and gated on the publication confirmation.** Both workflows fire on a draft PR; nothing else is needed |
+
+So the answer to "which allowed arm64 runner" is: the only reachable one is CI,
+and reaching it is the confirmation the request asks for. The other four are not
+unwilling, they are measurably absent -- which is a different thing from the
+word `WAITING_RESOURCE`, and it is why that word is not used here.
+
+One correction to a note of my own, since it cost a process: the recorded
+mitigation for this binary was "never run `t27os-pty` bare; use `T27OS_CTL=list`".
+On the build running today, `T27OS_CTL=list` behaves like the bare command. The
+mitigation is not a mitigation.
+
+Refs #12877.
