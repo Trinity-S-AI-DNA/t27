@@ -401,17 +401,31 @@ The adapter is `specs/t27os/pane_feed.t27` (module `T27osPaneFeed`):
 | the lease no longer holds | LEASE_LOST |
 
 - it counts changes in another task's slot but never decides on them;
-- only an applied WORKING to IDLE edge of the leased pane becomes `EV_WORKER_IDLE`.
+- an applied WORKING to IDLE edge of the leased pane is `FEED_QUIET` (254): a request for one
+  extra check. It is not a `control.t27` event kind, so `decide` answers it with no dispatch, and
+  it is never an assignment into the same cell.
 
-Its tests: `t27b` 12 of 12; `t27c test-report` 12 of 12 with 0 vacuous. A negative control with
-the GAP line removed failed `a_gap_resyncs_without_a_decision`.
+`T27OS_CTL=list` is a source of snapshots of observed state, not a journal of execution events
+(owner, 2026-11-02). A WORKING to IDLE edge is possible output silence: not the end of a process,
+not a released executor and not permission to send the next command. The adapter therefore stays
+an observation adapter. What an assignment needs, and LIST cannot give, is an explicit end of the
+attempt (`task_id`, `attempt_id`, exit code) and a confirmed right to use the cell; that is the
+next technical slice. No new heuristic is added to raise trust in snapshots.
 
-The host mode `NS_MODE=feed` reads at most 8 snapshot files and journals each decision as
-"intended: recorded, not launched". It has no executor call and never opens `run/`. On real
-snapshots of pane 15:
+Its tests (evidence section 11): `t27b` 13 of 13; `t27c test-report` 13 tests, 0 FAIL, 0
+vacuous. Two negative controls failed as they should: with the GAP line removed,
+`a_gap_resyncs_without_a_decision` (earlier, 12 tests); with `feed_signal` returning `EV_WORKER_IDLE`,
+`an_idle_edge_asks_a_check_and_decides_nothing` (1 FAIL, rc 1).
 
-- the first run gave BASE, an idle edge, a decision of B, then DUP and OLD: 1 intended decision,
-  0 launches;
+The host mode `NS_MODE=feed` reads at most 8 snapshot files. It journals an idle edge as one
+extra check asked, never as a decision: it does not call `decide`, has no executor call and never
+opens `run/`. On real snapshots of pane 15:
+
+- the first run, before this change, gave BASE, an idle edge, a decision of B, then DUP and OLD:
+  1 intended decision, 0 launches. That reading of the idle edge is withdrawn;
+- the same snapshots, copied byte for byte to a fresh directory with no cursor, replayed by the
+  changed binary: BASE, an idle edge journaled as "quiet: one extra check asked, not run", DUP,
+  OLD; `checks_asked=1 decisions=0 launches=0`, rc 0 (section 11);
 - a restart over the same directory found its kept cursor and answered OLD and DUP only, with 0
   decisions;
 - a lease on pane 14 gave LEASE_LOST;
@@ -428,12 +442,20 @@ A measured property of the source: a shell cell's shown state follows its output
 process. `sleep 12` read IDLE while it ran, and `ping` read WORKING while it printed. An idle edge
 therefore means the output went quiet, not that the command ended.
 
-The gates in the adapter answer no today (`autonomy_allowed` is false):
+The gates in the adapter answer no today (`autonomy_allowed` is false). There are five, and
+`autonomy_gates` needs every one:
 
-- the server has no lease, so a shared cell can be written by anyone;
-- the spawn client prints "spawned pane N" without checking the server's reply, so success text
-  on a full table does not confirm an attempt;
-- `stop_pane_process` kills the direct child only, so a budget cannot be promised by kill alone.
+- `PTY_HAS_LEASE`: the server has no lease, so a shared cell can be written by anyone;
+- `PTY_SPAWN_REPLY_CHECKED`: the spawn client prints "spawned pane N" without checking the
+  server's reply, so success text on a full table does not confirm an attempt;
+- `PTY_KILL_ENDS_GROUP`: `stop_pane_process` kills the direct child only;
+- `PTY_STOP_REACHES_DETACHED`: a descendant that calls `setsid` or `setpgid` leaves the group, and
+  no stop reaches it, so a budget cannot be promised by kill alone, group kill included;
+- `PTY_ENDS_ARE_NAMED`: no end record names `task_id`, `attempt_id` and an exit code.
+
+The stage-1 patch closes only the second and the third. The test
+`one_stage1_fix_keeps_autonomy_closed` asserts that those two alone leave `autonomy_gates` false,
+that each single missing gate gives false, and that only all six inputs true give true.
 
 The way to enable it, with these executor limits, is section 7.5.
 
@@ -445,7 +467,8 @@ one item at a time.
 **Hook point.**
 
 - Stage A (no server change): `NS_MODE=feed`, run once after a `T27OS_CTL=list` snapshot by the
-  session that owns the leased pane. Its only output is intended decisions in `<dir>/journal`.
+  session that owns the leased pane. Its only output is observations and checks asked in
+  `<dir>/journal`; it decides nothing and assigns nothing.
 - Stage B (a design, not a patch): the server publishes its own events, through a new op with a
   sequence number and a per-slot generation, read with the cursor rules of `specs/queen/events.t27`. The LIST
   format stays as it is: the adapter's row parser refuses extra fields, and other LIST readers
@@ -453,8 +476,8 @@ one item at a time.
 - Event-driven first. A LIST snapshot remains only as a bounded safety reconciliation: one snapshot
   when the stream reports an overflow or a gap, or when the adapter restarts. It is never a loop.
 
-**Executor limits.** Each limit is a gate in `pane_feed.t27`. All three are false today, so
-`autonomy_allowed` answers no.
+**Executor limits.** Each limit is a gate in `pane_feed.t27`. All five are false today, so
+`autonomy_allowed` answers no, and landing the stage-1 patch does not make it answer yes.
 
 1. Lease (`PTY_HAS_LEASE`): no autonomous work on a shared cell. Until the server has a lease, the
    only cell a feed decision may act on is one the adapter spawned itself. `spawn_confirmed`
@@ -462,9 +485,13 @@ one item at a time.
    is not EXITED. The cell is then identified by its child's real pid, not by the slot number,
    because a respawn in the same slot is invisible in LIST.
 2. Spawn reply (`PTY_SPAWN_REPLY_CHECKED`): stage-1 patch item 3 below.
-3. Group kill (`PTY_KILL_ENDS_GROUP`): stage-1 patch item 1 below. A descendant that calls `setsid`
-   or `setpgid` leaves the group. A budget is therefore promised only as a deadline enforced by the
-   group kill, and only for descendants that stay in the group.
+3. Group kill (`PTY_KILL_ENDS_GROUP`): stage-1 patch item 1 below. It widens the stop; it does not
+   guarantee that detached descendants die.
+4. Detached descendants (`PTY_STOP_REACHES_DETACHED`): a descendant that calls `setsid` or
+   `setpgid` leaves the group, and no current stop reaches it. Until one does, no budget is
+   promised.
+5. Named ends (`PTY_ENDS_ARE_NAMED`): an attempt ends only with a record that names `task_id`,
+   `attempt_id` and the exit code. A LIST edge is never that record.
 
 **The stage-1 patch** is `target/next_step/stage1-pty.diff`: 21 lines added and 2 removed, against
 `specs/t27os/pty_server.t27`. It was checked on a copy only (evidence section 9).
@@ -484,28 +511,36 @@ Checks, `t27b` only, because the server spec has `@extern`:
 
 Not shown: the group kill on a live pane, and a refused spawn on a real full table.
 
-**Permissions.** Each is a separate owner's word, in this order:
+**Permissions.** Each stage is a separate owner's word, in this order (owner, 2026-11-02):
 
-1. land the stage-1 patch in `specs/t27os/pty_server.t27`. It is a protected change, because that
-   file is the live server's source;
-2. build a new `t27os-pty` binary and install it. That is an installation;
-3. restart the server (pid 30009) so that it takes the server half, the group kill. The client half,
-   the reply checks, takes effect with the new binary and needs no restart, because the CTL client
-   is the same binary run with `T27OS_CTL`;
-4. switch the working route: wire a feed decision to the executor path (`on_event`). This comes only
-   after 1 to 3, and only for a dedicated owned cell.
+1. review and land the exact patch in `specs/t27os/pty_server.t27`. It is a protected change,
+   because that file is the live server's source;
+2. a permitted build and isolated checks on a separate test server and socket: a full table gives
+   an explicit refusal and a nonzero client code; an unavailable server gives an explicit refusal;
+   stopping a test group leaves no process of that group; a foreign group is untouched. If the
+   isolation needs a protected edit, that edit is prepared separately first;
+3. install the binary, with the old one kept beside it;
+4. an agreed restart window for the shared server (pid 30009), so that it takes the server half,
+   the group kill. The client half, the reply checks, takes effect with the new binary and needs
+   no restart, because the CTL client is the same binary run with `T27OS_CTL`. Before this stage
+   the active panes and the consequences for each are listed; session preservation is not
+   promised, because no mechanism for it has been checked.
+
+Switching the working route (wiring anything to the executor path, `on_event`) is not one of
+these stages. It needs the named end record and the lease first, and only for a dedicated owned
+cell. A feed snapshot never reaches it.
 
 **Budgets:**
 
 - at most `FEED_MAX_SNAPS` (8) snapshots per run;
-- one decision per applied edge;
+- at most one extra check asked per applied idle edge, and no decision;
 - at most `RUN_CAP` (1) launch per record;
 - the approval deadline is fixed in the record at init, and a passed deadline is EXPIRED, never
   approval.
 
 **Stop.** There is no daemon, cron or conductor. Each run is one-shot and ends after at most 8
 snapshots, so stopping means not starting the next run. After stage 1, an attempt is stopped by the
-group kill of its pane.
+group kill of its pane, which reaches only the descendants that stay in the group.
 
 **Rollback:**
 
