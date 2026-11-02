@@ -439,3 +439,60 @@ reads any of them.
 
 The `pr-body.md` count was wrong and is corrected in the same commit: it claimed
 16 functions and 14 tests where the file had 13 and 15.
+
+## 10. Will a draft PR actually execute these files? Read, not assumed
+
+The instruction was to read the workflows before asking for publication, because
+opening a PR does not by itself guarantee that the tests run. Reading them
+changed four things in the request.
+
+**Both workflows do fire, and a draft does not stop them.** `spec-guards.yml`
+and `t27b-native.yml` are both `on: pull_request` with a `paths:` list that
+includes `specs/**`, and `grep -c draft` returns 0 in each, so neither job is
+gated on `github.event.pull_request.draft`. That is the part of the request that
+holds as written.
+
+**The ratchet is three jobs, not one.** `t27b-native.yml` -- the file is named
+`t27b-native.yml`, not `t27b-native-ratchet.yml` -- runs `t27b-native-linux`
+(`ubuntu-24.04-arm`, the crate's own release test suite), `t27b-native-macos`
+(`macos-15`, the MAP_JIT and Mach-O path) and `t27b-native-ratchet`. Only the
+third reads these specs; the first two exercise the Rust crate, which this
+branch does not touch. A publication request that names "the workflow" without
+saying which job is not checkable.
+
+**The ledger has no row for any of the five specs this branch touches, and that
+is not news.** `grep -c '"path"'` on `docs/reports/t27b_expectations.json`
+counts 2602 rows -- it names every spec, passing ones included -- and `grep -c`
+for each of `acceptance_matrix.t27`, `l1_clamp.t27`, `ifconv_plan.t27`,
+`codegen_audit.t27` and `analog/reference_receipt.t27` returns 0. The last two
+are already on master without rows.
+
+**Master's ratchet is already red.** Run `41401435133`, head `783f18b4f8`,
+2026-11-02T06:40:46Z: the two crate jobs succeeded, `t27b-native-ratchet`
+failed, with the summary line
+
+```
+tri t27b ratchet: red -- run 783f18b4f vs ledger 4125e2902:
+UNEXPECTED FAILURE 0, UNEXPECTED PASS 0, UNLISTED 42, STALE 0,
+OVER CAP 0, BAD REASON 0, MOVED 0, UNJUDGED 0, VACUITY MEASURED 0
+```
+
+so every finding is of one kind, and `codegen_audit.t27` and
+`reference_receipt.t27` are two of the 42. This branch therefore does not turn
+that job red, and `t27b-native.yml`'s own header states the consequence: the
+ratchet is not required, and `ready` judges it by Q16, where a red blocks only
+while master's run of it is green.
+
+**Why `acceptance_matrix.t27` appears in none of it.** UNLISTED is raised only
+when the reference *passes* a spec the ledger does not name
+(`scripts/tri_loop/t27b.py:915`, guarded by `unlisted(reference, listed)` in
+`t27b_rules.py:182`). A spec that does not exist on master cannot be run there
+at all, and `git cat-file -e origin/master:specs/tri/shootout/acceptance_matrix.t27`
+fails -- the file is new on this branch, which `pr-body.md` had listed as an
+edit to an existing file.
+
+What none of this establishes: that any test in these specs passes. The reading
+settles only *where* each file would be executed and *which* red is
+pre-existing. Nothing has been run.
+
+Refs #12877.
