@@ -1,6 +1,6 @@
 # REPORT.md -- TASK-R verification run, 2026-11-02 12:47 (+07)
 
-Compiler: /Users/playra/t27-build/target-m2/release/t27c -- `t27c 0.5.2, build 0 commit unknown`
+Compiler: the master worktree build of t27c (repo-relative target-m2/release/t27c) -- `t27c 0.5.2, build 0 commit unknown`
 Spec: specs/analog/reference_receipt.t27 at lane head ea09267d06b979a34dc74f81dcec05d824909e28
 (base 06bf52f62df9e65c5ad0bc5da07141d7a1b7953d); worktree clean before and after the run.
 
@@ -45,7 +45,7 @@ The spec at head ea09267d06b979a34dc74f81dcec05d824909e28 was verified with the 
 (the binary prints "build 0 commit unknown").
 
 Binary provenance, recorded without rebuilding it:
-- path: /Users/playra/t27-build/target-m2/release/t27c
+- path: the master worktree build of t27c (repo-relative target-m2/release/t27c)
 - sha256: 4dcd5cf240b4a4167a15f28850dd026ab7e64e977df593b89cb1f93069cfe467
 - size/mtime: 10625440 bytes, 2026-10-25 10:19
 - the worktree it lives in is at master commit 05b64483d5 (2026-10-31 merge); whether the
