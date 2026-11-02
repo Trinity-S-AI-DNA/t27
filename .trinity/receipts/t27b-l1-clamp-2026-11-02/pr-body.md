@@ -10,7 +10,7 @@ opened so that a runner that is allowed to execute tests does execute them.
 |---|---|
 | `specs/tri/shootout/l1_clamp.t27` (new) | the saturating wrap on its own, 3 functions, 5 tests pinning the edges of the wrap: 1, the limit, the limit + 1, the largest u64. The regression gate: the same values must hold after the transform |
 | `specs/tri/t27b/ifconv_plan.t27` (new) | when an `if` may become a select, and in what order the emitter may write it: 17 functions, 19 tests. Nothing in `cli/t27b` calls it yet |
-| `specs/tri/shootout/acceptance_matrix.t27` | the one-line spread rule replaced by three functions and three tests (below) |
+| `specs/tri/shootout/acceptance_matrix.t27` (new) | the acceptance axes, with the one-line spread rule written out as three functions and three tests (below). The file is new on this branch; master has no `acceptance_matrix.t27` |
 | `.trinity/receipts/t27b-l1-clamp-2026-11-02/README.md` | the snapshot, the emitted assembly today, the hand-derived after-shape, the numeric edges, the prepared-not-applied Rust glue, and a correction owed to `codegen_audit.t27` |
 
 ## The correctness rule for if-conversion
@@ -75,23 +75,49 @@ commands the local hook allows, and they are parse and lowering, not execution.
 **No test in these specs has been executed anywhere.** That is what this PR is
 for. Two jobs here do execute them:
 
-- `spec-guards`, step "Affected specs -- select with specs/ci/affected.t27, test
-  only those": runs `t27c test-report <spec> --specs-dir specs` on each changed
-  spec against zig 0.16.0 on `ubuntu-24.04`, and prints `<file>: head H, base B
+- `spec-guards` (`.github/workflows/spec-guards.yml`), step "Affected specs --
+  select with specs/ci/affected.t27, test only those": runs
+  `t27c test-report <spec> --specs-dir specs` on each changed spec against zig
+  0.16.0 on `ubuntu-24.04`, and prints `<file>: head H, base B
   (failing tests)`. For a new file the base is 0, so any failing test turns the
   step red and names the file.
-- `t27b-native-ratchet` on `ubuntu-24.04-arm`: `t27b corpus specs --json` with
+- `t27b-native-ratchet`, the third job of `.github/workflows/t27b-native.yml`
+  (the other two are `t27b-native-linux` and `t27b-native-macos`, which run
+  `cargo test -p t27b`, not these specs), on `ubuntu-24.04-arm`:
+  `t27b corpus specs --json` with
   `--reference ./target/release/t27c`, so every spec runs on both the t27b JIT
   and the t27c + zig reference. Per-file counts land in the `t27b-native-run`
   artifact (`run.json`: `tests`, `invariants`, `asserts`, `blockers` for each
   engine). It gives counts, not per-test names, and no per-file exit code.
 
-Expected, and not a defect of this PR: the four specs have no rows in
-`docs/reports/t27b_expectations.json`, so the ratchet will report them UNLISTED
-and go red. The rows are deliberately absent -- a row written before the run
-would be a guess at the verdict. They are added from the observed values once
-this run reports, and that must happen before any merge, because a missing row
-turns master's ratchet red for everyone.
+Which engine runs which file matters for reading the result. The ratchet job
+runs every spec twice, but `t27b corpus` reports `codegen_audit.t27` as
+`blocked` on the native engine, so **its 13 tests are executed by the reference
+path and not by the t27b JIT**: the verdict to read for that file is
+`spec-guards`' `t27c test-report`, and the ratchet's native column for it is a
+blocker count, not a pass count. `l1_clamp.t27`, `ifconv_plan.t27` and
+`acceptance_matrix.t27` have no such report yet, because they have never been
+run anywhere.
+
+Ledger rows, stated as measured rather than predicted. Five of the specs this
+branch touches have no row in `docs/reports/t27b_expectations.json`: the three
+new ones, plus `codegen_audit.t27` and `specs/analog/reference_receipt.t27`,
+which already had no row before this branch existed. And master's
+`t27b-native-ratchet` is **already red** without this branch: run
+`41401435133` on head `783f18b4f8` (2026-11-02T06:40:46Z) reports
+`UNLISTED 42` with every other finding kind at 0 -- no unexpected failure, no
+unexpected pass, no stale row, nothing over cap -- and `codegen_audit.t27` and
+`reference_receipt.t27` are two of those 42. So this PR does not turn that job
+red; it adds 3 names to a list of 42. The workflow's own header states the rule
+that follows from it: the ratchet is not required, and `ready` judges it by Q16,
+where a red here blocks only while master's run of it is green. It is not.
+
+The rows are still deliberately absent, for the reason that has not changed: a
+row written before the run is a guess at the verdict, and the ratchet exists to
+catch exactly that. They are written from the observed values once a run
+reports. What that does **not** buy, and the earlier draft of this paragraph
+claimed it did, is a green ratchet -- adding three rows leaves master's other 39
+unlisted specs exactly where they are.
 
 ## Also recorded, so it is not re-derived
 
