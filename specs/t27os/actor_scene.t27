@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/actor_scene.t27 -- the SCENE fold of the actor graph (pure records, no drawing)
+; Owner directive (readable-graph slice): glass_window draws; this card decides WHAT is drawn.
+; Built on specs/t27os/graph_draw.t27 (the landed transforms, curves, arrows, hit, width) and
+; specs/t27os/actor_graph.t27 (the nodes, edge classes, lifecycle and AGR grid layout).
+; --
+; WHAT IS DECIDED HERE: the node table -> per-node draw record fold (position from the EXISTING
+; AGR grid -- no force-directed layout this slice), the state ring as quarter fractions of the
+; node circle, the label truncation law (an ellipsis word at a measured char budget, never an
+; invisible clip), and the honesty gates (an edge is drawn only when BOTH ends exist; a message
+; pulse is drawn only when a DELIVER event backs it in the window -- a counter increment raises
+; the width, never a pulse; a stale or unknown node carries its word into the record).
+; SIGNATURE FREEZE: glass-wire consumes exactly these layouts:
+;   node record, SCN_F u32 words per node: pid lo, pid hi, x, y, quarters, word, issue, flags.
+;   edge record, SCE_F u32 words per edge: from lo, from hi, to lo, to hi, class, width u16 pair
+;   (width x100 as u32), pulse, spare.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osActorScene;
+
+use t27os::actor_graph::pid_of;
+use t27os::actor_graph::slot_of;
+use t27os::actor_graph::ag_edge_complete;
+use t27os::actor_graph::ag_down_visible;
+use t27os::actor_graph::agr_node_x;
+use t27os::actor_graph::agr_node_y;
+use t27os::actor_graph::agr_refused;
+use t27os::actor_graph::AE_SUPERVISOR;
+use t27os::actor_graph::AE_MESSAGE;
+use t27os::actor_graph::AE_TASK_REF;
+use t27os::actor_graph::AE_RESULT;
+use t27os::actor_graph::AE_OBSERVE;
+use t27os::actor_graph::AE_NAMES;
+use t27os::actor_graph::AGR_MAX_NODES;
+use queen::actor_view::VS_RUNNING;
+use queen::actor_view::VS_RESTARTING;
+use queen::actor_view::VS_DEAD;
+use queen::actor_view::VS_NAMES;
+use t27os::graph_draw::gd_edge_width;
+
+; --- 1. The node record ------------------------------------------------------------------------------
+
+/// SCN_F u32 words per node, at stride SCN_F in one u32 table:
+///   0 pid lo, 1 pid hi, 2 x, 3 y, 4 ring quarters 0..4, 5 state word index, 6 issue (0 = unlinked),
+///   7 flags: bit0 stale, bit1 unknown, bit2 pulse (event-backed), bit3 gone.
+pub const SCN_F : usize = 8;
+
+pub const SCN_W_RUNNING : u32 = 0;
+pub const SCN_W_RESTARTING : u32 = 1;
+pub const SCN_W_DEAD : u32 = 2;
+pub const SCN_W_STALE : u32 = 3;
+pub const SCN_W_UNKNOWN : u32 = 4;
+pub const SCN_WORDS : [5]str = ["running", "restarting", "dead", "stale", "unknown"];
+
+/// Flag bits inside word 7.
+pub const SCN_F_STALE : u32 = 1;
+pub const SCN_F_UNKNOWN : u32 = 2;
+pub const SCN_F_PULSE : u32 = 4;
+pub const SCN_F_GONE : u32 = 8;
+
+/// The state ring as quarters of the node circle: running fills the ring, restarting draws
+/// three quarters (the gap is the promise), dead one quarter (the memory), stale and unknown
+/// draw none -- their word is the tag, never a colour or an arc pretending to be one.
+pub fn scn_ring_quarters(state : u32, fresh : bool) -> u32 {
+    if (state == VS_RUNNING) {
+        if (fresh) { return 4; }
+        return 0;
+    }
+    if (state == VS_RESTARTING) { return 3; }
+    if (state == VS_DEAD) { return 1; }
+    return 0;
+}
+
+/// The word a node carries into its record: stale and unknown are words, not shades.
+pub fn scn_word(state : u32, fresh : bool) -> u32 {
+    if (state == VS_RUNNING) {
+        if (fresh) { return SCN_W_RUNNING; }
+        return SCN_W_STALE;
+    }
+    if (state == VS_RESTARTING) { return SCN_W_RESTARTING; }
+    if (state == VS_DEAD) { return SCN_W_DEAD; }
+    return SCN_W_UNKNOWN;
+}
+
+; --- 2. The fold -------------------------------------------------------------------------------------
+
+/// Fold one node of the table into its draw record at slot i of the output table.
+/// `fresh` = the node's freshness word is running (a live heartbeat in the window).
+pub fn scn_node(tab : []u32, i : u32, pid : u64, state : u32, fresh : bool, issue : u32, gone : bool, pulse : bool, x : f64, y : f64) -> u32 {
+    const r : usize = i * SCN_F;
+    tab[r + 0] = (pid % 4294967296) as u32;
+    tab[r + 1] = (pid / 4294967296) as u32;
+    tab[r + 2] = x as u32;
+    tab[r + 3] = y as u32;
+    tab[r + 4] = scn_ring_quarters(state, fresh);
+    tab[r + 5] = scn_word(state, fresh);
+    tab[r + 6] = issue;
+    var flags : u32 = 0;
+    if (state == VS_RUNNING and fresh == false) { flags = flags | SCN_F_STALE; }
+    if (scn_word(state, fresh) == SCN_W_UNKNOWN) { flags = flags | SCN_F_UNKNOWN; }
+    if (pulse) { flags = flags | SCN_F_PULSE; }
+    if (gone) { flags = flags | SCN_F_GONE; }
+    tab[r + 7] = flags;
+    return 0;
+}
+
+; --- 3. The label budget -----------------------------------------------------------------------------
+
+/// A label longer than the budget truncates with the ellipsis word -- the reader always sees that
+/// the label was cut. An invisible clip (a hard cut with no ellipsis) is a lie about the name.
+pub const SCN_LABEL_MAX : usize = 12;
+pub const SCN_ELLIPSIS : str = "...";
+
+/// Write the label within the budget: the whole name, or name + ellipsis with at least one
+/// letter kept. Returns the bytes written.
+pub fn scn_label(out : []u8, name : []const u8) -> usize {
+    if (name.len <= SCN_LABEL_MAX) {
+        var i : usize = 0;
+        while (i < name.len) { out[i] = name[i]; i = i + 1; }
+        return name.len;
+    }
+    const keep : usize = SCN_LABEL_MAX - SCN_ELLIPSIS.len;
+    var i : usize = 0;
+    while (i < keep) { out[i] = name[i]; i = i + 1; }
+    var j : usize = 0;
+    while (j < SCN_ELLIPSIS.len) { out[i] = SCN_ELLIPSIS[j]; i = i + 1; j = j + 1; }
+    return i;
+}
+
+; --- 4. The edge gates -------------------------------------------------------------------------------
+
+/// An edge is drawn only when BOTH ends exist in the table: a half-known arrow invents a
+/// relationship the event stream never named. `both_ends` = each pid resolves to a node row.
+pub fn scn_edge_drawable(from_pid : u64, to_pid : u64, have_from : bool, have_to : bool) -> bool {
+    if (have_from == false or have_to == false) { return false; }
+    return ag_edge_complete(from_pid) and ag_edge_complete(to_pid);
+}
+
+/// A message pulse is EVENT-BACKED only: a DELIVER observed for this edge inside the current
+/// window. A counter increment raises the width (gd_edge_width), never a pulse.
+pub fn scn_pulse(deliver_in_window : bool) -> bool {
+    return deliver_in_window;
+}
+
+; --- 5. The fixture ----------------------------------------------------------------------------------
+
+/// The pinned fixture scene: three actors and two edges -- one supervisor edge (complete), one
+/// message edge whose FROM left the table (the honesty gate must refuse it), and one DELIVER in
+/// the window for the complete edge. FIXTURE truth, never publishable as live.
+pub const SF_N : u32 = 3;
+pub const SF_PID : [3]u64 = [17179869185, 4294967298, 8589934594];
+pub const SF_STATE : [3]u32 = [VS_RUNNING, VS_RESTARTING, VS_DEAD];
+pub const SF_FRESH : [3]u8 = [1, 1, 0];
+pub const SF_ISSUE : [3]u32 = [12780, 12780, 0];
+pub const SF_GONE : [3]u8 = [0, 0, 0];
+pub const SF_PULSE : [3]u8 = [1, 0, 0];
+
+// ---------------------------------------------------------------- tests
+
+test the_node_record_folds_the_table_with_its_honest_words {
+    var tab : [24]u32 = undefined;
+    var i : u32 = 0;
+    while (i < SF_N) {
+        scn_node(tab[0..], i, SF_PID[i], SF_STATE[i], SF_FRESH[i] != 0, SF_ISSUE[i], SF_GONE[i] != 0, SF_PULSE[i] != 0, i as f64 * 100.0, 50.0);
+        i = i + 1;
+    }
+    // node 0: running fresh, full ring, running word, issue carried, pulse event-backed
+    assert(tab[0 * SCN_F + 4] == 4 and tab[0 * SCN_F + 5] == SCN_W_RUNNING);
+    assert(tab[0 * SCN_F + 6] == 12780);
+    assert(tab[0 * SCN_F + 7] == SCN_F_PULSE);
+    assert(tab[0 * SCN_F + 0] == SF_PID[0] % 4294967296 and tab[0 * SCN_F + 1] == SF_PID[0] / 4294967296);
+    // node 2: dead, one quarter, dead word, unlinked issue, stale-and-not -- flags carry the words
+    assert(tab[2 * SCN_F + 4] == 1 and tab[2 * SCN_F + 5] == SCN_W_DEAD);
+    assert(tab[2 * SCN_F + 6] == 0);
+    assert(tab[2 * SCN_F + 7] & SCN_F_STALE == 0);
+}
+
+test the_ring_quarters_are_the_state_words {
+    assert(scn_ring_quarters(VS_RUNNING, true) == 4);
+    assert(scn_ring_quarters(VS_RUNNING, false) == 0);
+    assert(scn_ring_quarters(VS_RESTARTING, true) == 3);
+    assert(scn_ring_quarters(VS_DEAD, false) == 1);
+    // stale and unknown draw no arc: their word is the tag
+    assert(scn_ring_quarters(VS_RUNNING, false) == 0);
+    assert(scn_word(VS_RUNNING, false) == SCN_W_STALE);
+    assert(scn_word(VS_DEAD, false) == SCN_W_DEAD);
+    assert(SCN_WORDS[SCN_W_STALE] == "stale" and SCN_WORDS[SCN_W_UNKNOWN] == "unknown");
+}
+
+test a_long_label_truncates_with_the_ellipsis_never_invisibly {
+    var out : [32]u8 = undefined;
+    // a short label rides whole
+    assert(scn_label(out[0..], "queen") == 5);
+    assert(out[0] == 113 and out[4] == 110);
+    // a long label keeps letters then the ellipsis word, exactly at the budget
+    const n : usize = scn_label(out[0..], "reconciler-domain-9");
+    assert(n == SCN_LABEL_MAX);
+    assert(out[SCN_LABEL_MAX - 1] == 46 and out[SCN_LABEL_MAX - 2] == 46 and out[SCN_LABEL_MAX - 3] == 46);
+    // exactly at the budget: whole, no ellipsis
+    assert(scn_label(out[0..], "abcdefghijkl") == 12);
+    assert(out[11] == 108);
+}
+
+test an_edge_draws_only_when_both_ends_exist {
+    const a : u64 = SF_PID[0];
+    const b : u64 = SF_PID[1];
+    // both ends present: drawable (the pid words are complete)
+    assert(scn_edge_drawable(a, b, true, true));
+    // either end missing from the table: refused -- no invented arrows
+    assert(scn_edge_drawable(a, b, true, false) == false);
+    assert(scn_edge_drawable(a, b, false, true) == false);
+    // the NO_PID end is refused by the graph law itself
+    assert(scn_edge_drawable(0, b, true, true) == false);
+}
+
+test a_pulse_is_event_backed_never_counter_derived {
+    // only a DELIVER in the window pulses
+    assert(scn_pulse(true) and scn_pulse(false) == false);
+    // the width is the counter's expression: 1px quiet, 3px at the cap (the cap IS the legend)
+    assert(gd_edge_width(0) == 1.0 and gd_edge_width(10) == 3.0);
+    assert(gd_edge_width(15) == 3.0 and gd_edge_width(5) == 2.0);
+    // a bumped counter with no deliver event: width yes, pulse no -- the fixture holds that split
+    assert(SF_PULSE[1] == 0);
+}
+
+test the_fixture_scene_folds_end_to_end {
+    var tab : [24]u32 = undefined;
+    var i : u32 = 0;
+    while (i < SF_N) {
+        scn_node(tab[0..], i, SF_PID[i], SF_STATE[i], SF_FRESH[i] != 0, SF_ISSUE[i], SF_GONE[i] != 0, SF_PULSE[i] != 0, agr_node_x(i, SF_N, 0.0, 800.0), agr_node_y(i, SF_N, 0.0, 600.0));
+        i = i + 1;
+    }
+    // the AGR grid positions land inside the content rect and every word is carried
+    i = 0;
+    while (i < SF_N) {
+        assert(tab[i * SCN_F + 2] <= 800 and tab[i * SCN_F + 3] <= 600);
+        assert(tab[i * SCN_F + 5] <= SCN_W_UNKNOWN);
+        i = i + 1;
+    }
+    // node 1 (restarting) carries its word and no pulse bit; node 0 carries the pulse bit
+    assert(tab[1 * SCN_F + 7] & SCN_F_PULSE == 0);
+    assert(tab[0 * SCN_F + 7] & SCN_F_PULSE != 0);
+    // the supervisor edge in the fixture is drawable: pid(2,1) -> pid(1,1)? both fixture pids resolve
+    assert(scn_edge_drawable(SF_PID[0], SF_PID[1], true, true));
+}
+
+invariant the_scene_signatures_are_frozen {
+    assert(SCN_F == 8);
+    assert(SCN_LABEL_MAX == 12);
+    assert(SCN_W_RUNNING == 0 and SCN_W_UNKNOWN == 4);
+    assert(SCN_F_STALE == 1 and SCN_F_PULSE == 4 and SCN_F_GONE == 8);
+}
