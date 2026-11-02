@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/viz_hit.t27 -- the ONE pointer-pick law of the T27F viz surfaces: a host, a per-rep
+; rect plan and a point answer (rep kind, index), or nothing.
+; Epic: interactive visualizations across the 27 T27 OS petals. Five hit-test families grew up
+; beside each other, one per surface, each re-deriving the same half-open box test:
+; --
+; THE CATALOGUE (the five families, what each answers today)
+;   specs/t27f/viz_contract.t27      vh_hit picks the deepest VizHost slot under a point (later
+;                                    slot wins a depth tie, the one drawn on top) but stops there:
+;                                    it names a slot, never the entity inside it.
+;   specs/t27f/petal_specs_viz.t27   psv_graph_hit / psv_matrix_hit / psv_list_hit pick per view and
+;                                    psv_ref_at chains them graph, then matrix, then list -- the
+;                                    host never decides; the caller walks views in a fixed order.
+;   specs/t27f/gnn_work_graph_viz.t27 gnn_node_hit through gnn_ref_at, feeding gnn_hover_at and the
+;                                    pinned-node flow: one graph, hand-rolled again.
+;   specs/t27f/spec_graph_fold.t27   wrap_hit / fold_hit / expand_hit pick over the wrapped, folded
+;                                    and expanded layouts; inclusive boxes (they double as the
+;                                    edge-attachment test), graph-model answers.
+;   specs/t27f/spec_graph_view.t27   view_point_in is inclusive too: it proves edge ends land on
+;                                    boxes, it is not a pointer pick.
+; petal_jobs_viz.t27's pjv_pick already half-derives the shape this file generalizes: the host slot
+; decides which view answers, that view answers with an entity ref. This file is that shape as one
+; pure function, with the per-rep dispatch and a stable ref encoding added.
+; --
+; THE RULES (each with a test below):
+;   - vh_hit walks the slots; the deepest slot under the point is the only slot that answers. A
+;     miss inside it is a miss: nothing falls through to the parent's content (the clip rule
+;     ui_in_clip holds for ui_snapshot, held here for hosts).
+;   - inside the slot the dispatch is on the slot's VIZ_REP_* kind: GRAPH walks the plan's node
+;     rects (lowest index wins an overlap), MATRIX and TIMELINE divide the slot's grid into cells
+;     (index = row * cols + col), LIST walks rows (index = the row). Every other rep (badge,
+;     controls, text) holds no entity and answers nothing.
+;   - every box is half-open on the right and bottom (the convention of vh_hit, psv_graph_hit and
+;     gnn_node_hit), so neighbouring rects and cells never share a pixel.
+;   - the answer is two stable u32s: the rep kind of the slot that answered, and the per-rep index.
+;     Same input, same answer, always; HIT_NO_INDEX = 65535 is "no index" and grid caps keep every
+;     real index under it.
+; Not claimed: no call site is migrated yet; the plan holds ONE rect table per rep kind, so a host
+; that shows two graphs at once asks each through its own host-and-plan pair. The host is expected
+; vh_validate-clean; an ill-formed host still answers, deterministically, under vh_hit's rules.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27fVizHit;
+
+use t27f::viz_contract::VizHost;
+use t27f::viz_contract::vh_hit;
+use t27f::viz_contract::vh_blank;
+use t27f::viz_contract::vh_add;
+use t27f::viz_contract::VH_NONE;
+use t27f::viz_contract::VH_ROOT;
+use t27f::viz_contract::VIZ_REP_GRAPH;
+use t27f::viz_contract::VIZ_REP_MATRIX;
+use t27f::viz_contract::VIZ_REP_LIST;
+use t27f::viz_contract::VIZ_REP_TIMELINE;
+use t27f::viz_contract::VIZ_REP_BADGE;
+use t27f::viz_contract::VIZ_REP_COUNT;
+
+; ---------------------------------------------------------------- capacities and codes
+
+/// The most node rects a plan holds; past it the rect is dropped and the count stops (a plan is a
+/// pick table, not a validator, so nothing needs to observe the drop).
+pub const HIT_MAX_NODES : u32 = 64;
+
+/// The most columns or rows of one grid; 255 x 255 cells keep the linear index under 65535, so a
+/// cell index can never read as HIT_NO_INDEX.
+pub const HIT_GRID_CAP : u32 = 255;
+
+/// The index of nothing, the contract's VIZ_NO_INDEX value.
+pub const HIT_NO_INDEX : u32 = 65535;
+
+/// The rep kind of no answer. Past VIZ_REP_COUNT, so it can never collide with a real slot's rep.
+pub const HIT_REP_NONE : u32 = 4294967295;
+
+; ---------------------------------------------------------------- the plan
+
+/// The per-rep geometry of one host, in HOST coordinates (the same space the host's slot rects
+/// live in). One rect table per rep kind: the node rects of the graph, the origin and cell size of
+/// the matrix grid, the line geometry of the list, the bucket grid of the timeline. A table left
+/// blank (zero counts or zero cell sizes) answers nothing for that rep.
+pub struct HitPlan {
+    node_count : u32,
+    node_x : [64]u32,
+    node_y : [64]u32,
+    node_w : [64]u32,
+    node_h : [64]u32,
+    mat_x : u32,
+    mat_y : u32,
+    mat_cols : u32,
+    mat_rows : u32,
+    mat_cw : u32,
+    mat_ch : u32,
+    lst_x : u32,
+    lst_y : u32,
+    lst_rows : u32,
+    lst_rh : u32,
+    lst_w : u32,
+    tl_x : u32,
+    tl_y : u32,
+    tl_cols : u32,
+    tl_rows : u32,
+    tl_cw : u32,
+    tl_rh : u32,
+}
+
+pub fn hit_plan_blank() -> HitPlan {
+    return HitPlan { node_count: 0, node_x: [0; 64], node_y: [0; 64], node_w: [0; 64], node_h: [0; 64], mat_x: 0, mat_y: 0, mat_cols: 0, mat_rows: 0, mat_cw: 0, mat_ch: 0, lst_x: 0, lst_y: 0, lst_rows: 0, lst_rh: 0, lst_w: 0, tl_x: 0, tl_y: 0, tl_cols: 0, tl_rows: 0, tl_cw: 0, tl_rh: 0 };
+}
+
+/// One more graph node rect. Past HIT_MAX_NODES the rect is dropped and the count stops.
+pub fn hit_plan_node(p: HitPlan, x: u32, y: u32, w: u32, h: u32) -> HitPlan {
+    var n : HitPlan = p;
+    if (n.node_count < HIT_MAX_NODES) {
+        let k : usize = n.node_count as usize;
+        n.node_x[k] = x;
+        n.node_y[k] = y;
+        n.node_w[k] = w;
+        n.node_h[k] = h;
+        n.node_count = n.node_count + 1;
+    }
+    return n;
+}
+
+/// The matrix grid: origin (x, y), cols x rows cells of cw x ch. Cols and rows clamp at
+/// HIT_GRID_CAP; a zero cell size hides the grid.
+pub fn hit_plan_matrix(p: HitPlan, x: u32, y: u32, cols: u32, rows: u32, cw: u32, ch: u32) -> HitPlan {
+    var n : HitPlan = p;
+    n.mat_x = x;
+    n.mat_y = y;
+    n.mat_cols = hit_clamp_grid(cols);
+    n.mat_rows = hit_clamp_grid(rows);
+    n.mat_cw = cw;
+    n.mat_ch = ch;
+    return n;
+}
+
+/// The list: lines of rh px starting at (x, y), the pick strip `w` px wide. A zero row height
+/// hides the list.
+pub fn hit_plan_list(p: HitPlan, x: u32, y: u32, rows: u32, rh: u32, w: u32) -> HitPlan {
+    var n : HitPlan = p;
+    n.lst_x = x;
+    n.lst_y = y;
+    n.lst_rows = rows;
+    n.lst_rh = rh;
+    n.lst_w = w;
+    return n;
+}
+
+/// The timeline bucket grid: origin (x, y), cols x rows buckets of cw x rh.
+pub fn hit_plan_timeline(p: HitPlan, x: u32, y: u32, cols: u32, rows: u32, cw: u32, rh: u32) -> HitPlan {
+    var n : HitPlan = p;
+    n.tl_x = x;
+    n.tl_y = y;
+    n.tl_cols = hit_clamp_grid(cols);
+    n.tl_rows = hit_clamp_grid(rows);
+    n.tl_cw = cw;
+    n.tl_rh = rh;
+    return n;
+}
+
+fn hit_clamp_grid(v: u32) -> u32 {
+    if (v > HIT_GRID_CAP) {
+        return HIT_GRID_CAP;
+    }
+    return v;
+}
+
+; ---------------------------------------------------------------- the answer
+
+/// The pick: which rep kind answered (a VIZ_REP_* code), and the index of the entity inside it.
+/// GRAPH indexes nodes; MATRIX and TIMELINE index cells as row * cols + col; LIST indexes rows.
+pub struct HitRef {
+    rep : u32,
+    index : u32,
+}
+
+pub fn hit_ref_none() -> HitRef {
+    return HitRef { rep: HIT_REP_NONE, index: HIT_NO_INDEX };
+}
+
+pub fn hit_is_none(r: HitRef) -> bool {
+    return r.rep == HIT_REP_NONE;
+}
+
+/// The row of a grid answer (MATRIX or TIMELINE); anything else, and a zero cols, is no row.
+pub fn hit_row(r: HitRef, cols: u32) -> u32 {
+    if (hit_is_none(r) or cols == 0) {
+        return HIT_NO_INDEX;
+    }
+    if (r.rep != (VIZ_REP_MATRIX as u32) and r.rep != (VIZ_REP_TIMELINE as u32)) {
+        return HIT_NO_INDEX;
+    }
+    return r.index / cols;
+}
+
+/// The column of a grid answer (MATRIX or TIMELINE); anything else, and a zero cols, is no column.
+pub fn hit_col(r: HitRef, cols: u32) -> u32 {
+    if (hit_is_none(r) or cols == 0) {
+        return HIT_NO_INDEX;
+    }
+    if (r.rep != (VIZ_REP_MATRIX as u32) and r.rep != (VIZ_REP_TIMELINE as u32)) {
+        return HIT_NO_INDEX;
+    }
+    return r.index % cols;
+}
+
+; ---------------------------------------------------------------- the pick
+
+/// The entity under the point (px, py) in host coordinates, or hit_ref_none. vh_hit picks the
+/// deepest slot; the slot's rep kind picks the rect logic; the slot's content is the ONLY content
+/// consulted, so a miss inside a child never falls through to the parent.
+pub fn hit_ref(h: VizHost, p: HitPlan, px: u32, py: u32) -> HitRef {
+    let slot : u32 = vh_hit(h, px, py);
+    if (slot == VH_NONE) {
+        return hit_ref_none();
+    }
+    let rep : u8 = h.rep[slot as usize];
+    if (rep == VIZ_REP_GRAPH) {
+        var i : u32 = 0;
+        while (i < p.node_count) {
+            let k : usize = i as usize;
+            if (px >= p.node_x[k] and py >= p.node_y[k] and px < p.node_x[k] + p.node_w[k] and py < p.node_y[k] + p.node_h[k]) {
+                return HitRef { rep: rep as u32, index: i };
+            }
+            i = i + 1;
+        }
+        return hit_ref_none();
+    }
+    if (rep == VIZ_REP_MATRIX) {
+        return hit_grid_ref(px, py, p.mat_x, p.mat_y, p.mat_cols, p.mat_rows, p.mat_cw, p.mat_ch, rep);
+    }
+    if (rep == VIZ_REP_TIMELINE) {
+        return hit_grid_ref(px, py, p.tl_x, p.tl_y, p.tl_cols, p.tl_rows, p.tl_cw, p.tl_rh, rep);
+    }
+    if (rep == VIZ_REP_LIST) {
+        if (p.lst_rh == 0) {
+            return hit_ref_none();
+        }
+        if (px < p.lst_x or py < p.lst_y or px >= p.lst_x + p.lst_w) {
+            return hit_ref_none();
+        }
+        let row : u32 = (py - p.lst_y) / p.lst_rh;
+        if (row >= p.lst_rows) {
+            return hit_ref_none();
+        }
+        return HitRef { rep: rep as u32, index: row };
+    }
+    return hit_ref_none();
+}
+
+/// The cell of a grid at the point: half-open cells, index = row * cols + col, HIT_NO_INDEX-ish
+/// none outside the grid or on a degenerate cell size.
+fn hit_grid_ref(px: u32, py: u32, x: u32, y: u32, cols: u32, rows: u32, cw: u32, ch: u32, rep: u8) -> HitRef {
+    if (cw == 0 or ch == 0) {
+        return hit_ref_none();
+    }
+    if (px < x or py < y) {
+        return hit_ref_none();
+    }
+    let col : u32 = (px - x) / cw;
+    let row : u32 = (py - y) / ch;
+    if (col >= cols or row >= rows) {
+        return hit_ref_none();
+    }
+    return HitRef { rep: rep as u32, index: row * cols + col };
+}
+
+; ---------------------------------------------------------------- test fixtures
+
+fn hit_host_graph_over_matrix() -> VizHost {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_GRAPH, VH_ROOT, 0, 0, 400, 300);
+    h = vh_add(h, VIZ_REP_MATRIX, 0, 10, 10, 200, 200);
+    return h;
+}
+
+fn hit_plan_graph_and_matrix() -> HitPlan {
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_node(p, 5, 5, 100, 50);
+    p = hit_plan_node(p, 120, 5, 100, 50);
+    p = hit_plan_matrix(p, 10, 10, 4, 4, 50, 50);
+    return p;
+}
+
+fn hit_host_list_with_graph_child() -> VizHost {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_LIST, VH_ROOT, 0, 0, 400, 300);
+    h = vh_add(h, VIZ_REP_GRAPH, 0, 10, 10, 200, 200);
+    return h;
+}
+
+fn hit_plan_list_and_one_node() -> HitPlan {
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_list(p, 0, 0, 10, 30, 400);
+    p = hit_plan_node(p, 20, 20, 50, 50);
+    return p;
+}
+
+; ---------------------------------------------------------------- tests
+
+test a_blank_plan_answers_nothing_inside_a_slot {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_blank();
+    assert hit_is_none(hit_ref(h, p, 50, 50));
+    assert hit_is_none(hit_ref(h, p, 0, 0));
+}
+
+test a_graph_slot_answers_with_the_node_rect_under_the_point {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    // the first rect, at its four corners: half-open on the right and bottom
+    let a : HitRef = hit_ref(h, p, 6, 6);
+    assert hit_is_none(a) == false;
+    assert a.rep == (VIZ_REP_GRAPH as u32);
+    assert a.index == 0;
+    assert hit_ref(h, p, 5, 5).index == 0;
+    // the top-right corner of the same rect, above the child slot that starts at y = 10
+    assert hit_ref(h, p, 104, 9).index == 0;
+    // outside the first rect, inside the second, still above the child slot
+    assert hit_ref(h, p, 125, 9).index == 1;
+}
+
+test the_lowest_node_index_wins_an_overlap {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_GRAPH, VH_ROOT, 0, 0, 300, 300);
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_node(p, 10, 10, 100, 100);
+    p = hit_plan_node(p, 60, 60, 100, 100);
+    // (80, 80) is inside both rects: the lower index answers
+    assert hit_ref(h, p, 80, 80).index == 0;
+    // the part only the second rect covers answers with the second index
+    assert hit_ref(h, p, 130, 130).index == 1;
+    assert hit_ref(h, p, 60, 60).index == 0;
+}
+
+test a_graph_miss_inside_its_slot_is_no_ref {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    // inside the parent slot but below the child slot (which ends at y = 210): between, beside
+    // and under both rects
+    assert hit_is_none(hit_ref(h, p, 115, 250));
+    assert hit_is_none(hit_ref(h, p, 50, 250));
+    assert hit_is_none(hit_ref(h, p, 390, 290));
+}
+
+test a_matrix_slot_answers_with_the_cell_linear_index {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    // cell (0, 0) at its top-left pixel
+    let a : HitRef = hit_ref(h, p, 10, 10);
+    assert hit_is_none(a) == false;
+    assert a.rep == (VIZ_REP_MATRIX as u32);
+    assert a.index == 0;
+    // half-open cells: the last pixel of cell (0, 0), then the first of (0, 1)
+    assert hit_ref(h, p, 59, 10).index == 0;
+    assert hit_ref(h, p, 60, 10).index == 1;
+    // row moves the index by cols; the last cell of the grid still answers
+    assert hit_ref(h, p, 10, 60).index == 4;
+    assert hit_ref(h, p, 209, 209).index == 15;
+    assert hit_row(hit_ref(h, p, 209, 209), 4) == 3;
+    assert hit_col(hit_ref(h, p, 209, 209), 4) == 3;
+}
+
+test a_point_outside_the_child_reaches_the_parent_content {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    // past the child slot's right edge the parent graph answers again: the clip ends at the slot
+    let r : HitRef = hit_ref(h, p, 210, 10);
+    assert hit_is_none(r) == false;
+    assert r.rep == (VIZ_REP_GRAPH as u32);
+    assert r.index == 1;
+    // and a point below the child grid's rows is a parent miss here, not a wrap into row 0
+    assert hit_is_none(hit_ref(h, p, 10, 210));
+}
+
+test a_list_slot_answers_with_the_row_and_bounds_it {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_LIST, VH_ROOT, 0, 0, 400, 300);
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_list(p, 0, 0, 10, 30, 400);
+    let a : HitRef = hit_ref(h, p, 100, 0);
+    assert hit_is_none(a) == false;
+    assert a.rep == (VIZ_REP_LIST as u32);
+    assert a.index == 0;
+    assert hit_ref(h, p, 100, 29).index == 0;
+    assert hit_ref(h, p, 100, 30).index == 1;
+    assert hit_ref(h, p, 100, 270).index == 9;
+    // past the rows, past the strip's width, before its x: no row
+    assert hit_is_none(hit_ref(h, p, 100, 300));
+    assert hit_is_none(hit_ref(h, p, 400, 5));
+    // the strip is half-open on the right too: the last pixel still answers
+    assert hit_ref(h, p, 399, 5).index == 0;
+    // the row decoders answer no row for a list ref
+    assert hit_row(a, 4) == HIT_NO_INDEX;
+    assert hit_col(a, 4) == HIT_NO_INDEX;
+}
+
+test a_timeline_slot_answers_with_the_bucket_linear_index {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_TIMELINE, VH_ROOT, 0, 0, 200, 200);
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_timeline(p, 0, 0, 4, 5, 50, 40);
+    let a : HitRef = hit_ref(h, p, 0, 0);
+    assert hit_is_none(a) == false;
+    assert a.rep == (VIZ_REP_TIMELINE as u32);
+    assert a.index == 0;
+    // row 2, col 2 -> 2 * 4 + 2
+    assert hit_ref(h, p, 130, 90).index == 10;
+    // the last bucket: row 4, col 3 -> 4 * 4 + 3
+    assert hit_ref(h, p, 199, 199).index == 19;
+    assert hit_row(hit_ref(h, p, 199, 199), 4) == 4;
+    assert hit_col(hit_ref(h, p, 199, 199), 4) == 3;
+}
+
+test the_deepest_slot_wins_over_the_parent_content {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    // (50, 50) is inside the parent graph's first node rect AND inside the child matrix: the
+    // child is deeper, so the cell answers and the parent's node never does
+    let r : HitRef = hit_ref(h, p, 50, 50);
+    assert hit_is_none(r) == false;
+    assert r.rep == (VIZ_REP_MATRIX as u32);
+    assert r.index == 0;
+}
+
+test a_later_sibling_slot_wins_a_depth_tie {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_GRAPH, VH_ROOT, 0, 0, 100, 100);
+    h = vh_add(h, VIZ_REP_LIST, VH_ROOT, 50, 0, 100, 100);
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_node(p, 0, 0, 100, 100);
+    p = hit_plan_list(p, 50, 0, 10, 10, 100);
+    // (60, 15) is inside both slots at depth 1: the later slot is the one drawn on top
+    let r : HitRef = hit_ref(h, p, 60, 15);
+    assert hit_is_none(r) == false;
+    assert r.rep == (VIZ_REP_LIST as u32);
+    assert r.index == 1;
+    // outside the overlap only the first slot answers
+    let g : HitRef = hit_ref(h, p, 10, 15);
+    assert g.rep == (VIZ_REP_GRAPH as u32);
+    assert g.index == 0;
+}
+
+test a_child_miss_does_not_fall_through_to_the_parent_content {
+    const h : VizHost = hit_host_list_with_graph_child();
+    const p : HitPlan = hit_plan_list_and_one_node();
+    // (150, 50) is inside the child graph slot but hits no node rect; the parent list's row 1
+    // covers the very same pixel, and still must not answer: the child clips the parent
+    assert hit_is_none(hit_ref(h, p, 150, 50));
+    // the same height answers in the parent where the child does not reach
+    let r : HitRef = hit_ref(h, p, 350, 50);
+    assert hit_is_none(r) == false;
+    assert r.rep == (VIZ_REP_LIST as u32);
+    assert r.index == 1;
+    // and inside the child, the child's own content answers
+    let g : HitRef = hit_ref(h, p, 30, 30);
+    assert g.rep == (VIZ_REP_GRAPH as u32);
+    assert g.index == 0;
+}
+
+test a_point_in_no_slot_is_no_ref {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    assert hit_is_none(hit_ref(h, p, 400, 300));
+    assert hit_is_none(hit_ref(h, p, 5000, 5000));
+    // an empty host answers nothing anywhere
+    assert hit_is_none(hit_ref(vh_blank(), p, 5, 5));
+}
+
+test a_non_entity_slot_holds_no_ref {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_BADGE, VH_ROOT, 0, 0, 600, 40);
+    h = vh_add(h, VIZ_REP_LIST, VH_ROOT, 0, 50, 600, 90);
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_list(p, 0, 50, 3, 30, 600);
+    // the badge slot is under the point, and a badge is not an entity
+    assert hit_is_none(hit_ref(h, p, 100, 20));
+    // the list slot right below answers
+    let r : HitRef = hit_ref(h, p, 100, 60);
+    assert hit_is_none(r) == false;
+    assert r.rep == (VIZ_REP_LIST as u32);
+    assert r.index == 0;
+    // the last row of the list, then nothing past it
+    assert hit_ref(h, p, 100, 139).index == 2;
+    assert hit_is_none(hit_ref(h, p, 100, 141));
+}
+
+test the_ref_encoding_is_stable_for_the_same_input {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    let a : HitRef = hit_ref(h, p, 130, 90);
+    let b : HitRef = hit_ref(h, p, 130, 90);
+    assert hit_is_none(a) == false;
+    assert a.rep == b.rep;
+    assert a.index == b.index;
+    // a structurally equal host and plan give the same answer
+    let h2 : VizHost = hit_host_graph_over_matrix();
+    let p2 : HitPlan = hit_plan_graph_and_matrix();
+    let c : HitRef = hit_ref(h2, p2, 130, 90);
+    assert c.rep == a.rep;
+    assert c.index == a.index;
+    // different inputs stay different answers
+    let d : HitRef = hit_ref(h, p, 10, 10);
+    assert d.rep == (VIZ_REP_MATRIX as u32);
+    assert a.rep == (VIZ_REP_MATRIX as u32);
+    assert d.index == 0;
+    // (130, 90) is cell row 1, col 2 -> 1 * 4 + 2
+    assert a.index == 6;
+}
+
+test hit_row_and_hit_col_decode_grid_refs_only {
+    const h : VizHost = hit_host_graph_over_matrix();
+    const p : HitPlan = hit_plan_graph_and_matrix();
+    let cell : HitRef = hit_ref(h, p, 130, 90);
+    assert hit_row(cell, 4) == 1;
+    assert hit_col(cell, 4) == 2;
+    // cols of 0 decodes to nothing instead of dividing by zero
+    assert hit_row(cell, 0) == HIT_NO_INDEX;
+    assert hit_col(cell, 0) == HIT_NO_INDEX;
+    let none : HitRef = hit_ref_none();
+    assert hit_row(none, 4) == HIT_NO_INDEX;
+    assert hit_col(none, 4) == HIT_NO_INDEX;
+}
+
+test node_rects_past_the_capacity_are_dropped_not_shifted {
+    var p : HitPlan = hit_plan_blank();
+    var i : u32 = 0;
+    while (i < 70) {
+        p = hit_plan_node(p, i * 20, 0, 10, 10);
+        i = i + 1;
+    }
+    assert p.node_count == HIT_MAX_NODES;
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_GRAPH, VH_ROOT, 0, 0, 2000, 40);
+    // the first rect and the last kept rect still answer at their own places
+    assert hit_ref(h, p, 5, 5).index == 0;
+    assert hit_ref(h, p, 63 * 20 + 5, 5).index == 63;
+    // the 65th rect is gone, and nothing moved into its place
+    assert hit_is_none(hit_ref(h, p, 64 * 20 + 5, 5));
+    assert hit_is_none(hit_ref(h, p, 69 * 20 + 5, 5));
+}
+
+test zero_geometry_yields_no_ref {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_MATRIX, VH_ROOT, 0, 0, 200, 200);
+    h = vh_add(h, VIZ_REP_LIST, VH_ROOT, 200, 0, 200, 200);
+    h = vh_add(h, VIZ_REP_TIMELINE, VH_ROOT, 0, 200, 200, 200);
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_matrix(p, 0, 0, 4, 4, 0, 50);
+    p = hit_plan_list(p, 200, 0, 4, 0, 200);
+    p = hit_plan_timeline(p, 0, 200, 0, 5, 50, 40);
+    assert hit_is_none(hit_ref(h, p, 100, 100));
+    assert hit_is_none(hit_ref(h, p, 300, 100));
+    assert hit_is_none(hit_ref(h, p, 100, 300));
+    // a grid past the column cap clamps, so the extra columns simply do not exist; the host slot
+    // is wide enough to show the clamp, not the slot edge
+    var g : VizHost = vh_blank();
+    g = vh_add(g, VIZ_REP_MATRIX, VH_ROOT, 0, 0, 300, 300);
+    var q : HitPlan = hit_plan_blank();
+    q = hit_plan_matrix(q, 0, 0, 300, 300, 1, 1);
+    assert hit_is_none(hit_ref(g, q, 260, 100));
+    // (254, 100) is row 100, col 254 of the clamped 255-wide grid
+    assert hit_ref(g, q, 254, 100).index == 100 * 255 + 254;
+    // the last clamped cell still answers, and stays under HIT_NO_INDEX; one pixel past it the
+    // clamped grid has already ended
+    assert hit_ref(g, q, 254, 254).index == 255 * 255 - 1;
+    assert hit_is_none(hit_ref(g, q, 255, 255));
+}
+
+; ---------------------------------------------------------------- invariants
+
+invariant no_answer_ever_reads_as_a_real_rep {
+    assert hit_is_none(hit_ref_none());
+    assert hit_ref_none().index == HIT_NO_INDEX;
+    assert HIT_REP_NONE != (VIZ_REP_GRAPH as u32);
+    assert HIT_REP_NONE != (VIZ_REP_MATRIX as u32);
+    assert HIT_REP_NONE != (VIZ_REP_LIST as u32);
+    assert HIT_REP_NONE != (VIZ_REP_TIMELINE as u32);
+    assert HIT_REP_NONE != (VIZ_REP_BADGE as u32);
+    assert (VIZ_REP_COUNT as u32) != HIT_REP_NONE;
+    assert hit_is_none(hit_ref(vh_blank(), hit_plan_blank(), 0, 0));
+}
+
+invariant a_full_grid_stays_under_the_no_index_value {
+    var h : VizHost = vh_blank();
+    h = vh_add(h, VIZ_REP_MATRIX, VH_ROOT, 0, 0, 255, 255);
+    var p : HitPlan = hit_plan_blank();
+    p = hit_plan_matrix(p, 0, 0, HIT_GRID_CAP, HIT_GRID_CAP, 1, 1);
+    let r : HitRef = hit_ref(h, p, 254, 254);
+    assert hit_is_none(r) == false;
+    assert r.index == 254 * 255 + 254;
+    assert r.index < HIT_NO_INDEX;
+    assert hit_row(r, HIT_GRID_CAP) == 254;
+    assert hit_col(r, HIT_GRID_CAP) == 254;
+}

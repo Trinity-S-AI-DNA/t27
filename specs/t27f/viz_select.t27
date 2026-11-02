@@ -1,0 +1,648 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/viz_select.t27 -- the deterministic representation selector for the T27F view factory.
+; frontend.t27 route() maps an intent to a SURFACE; this spec complements it one level deeper:
+; given the same intent plus a small shape descriptor of the data, it returns WHICH VizHost slot
+; composition to build (which VIZ_REP_* views and controls, flat, all root) and one honest reason
+; line. It does not re-implement route and never names a surface.
+; --
+; The rules, in the order they fire:
+;   Refusals (hard, checked first, in this order):
+;     1. intent outside frontend.t27 I_COUNT          -> VS_REF_INTENT
+;     2. zero nodes                                   -> VS_REF_EMPTY (nothing to draw yet)
+;     3. the graph wins the scoring but the data is a hairball (edges > 3 x nodes)
+;                                                     -> VS_REF_HAIRBALL (never drawn, not silently
+;                                                        downgraded to a view that hides the shape)
+;     4. the source view wins the scoring but some node provenance is UNKNOWN
+;                                                     -> VS_REF_PROVENANCE. VIZ_REP_SOURCE claims
+;                                                        exact facts, and an unknown-provenance node
+;                                                        is never rendered inside a rep that
+;                                                        claims exact. any_suggested never blocks:
+;                                                        SUGGESTED is a shown label, not a guess.
+;   Hard demotions (a blocked candidate is dropped from selection, no refusal):
+;     matrix only when node_count <= VS_MATRIX_MAX (400), else the list takes over;
+;     timeline only when has_time.
+;   Soft preferences (small integer weights added to the score, all or nothing):
+;     graph   +3 when max_fanout >= 3
+;     matrix  +3 for pairwise relations when node_count <= 60
+;     trace   +3 when a single path was requested
+;     list    +3 when node_count > 400
+;     chart   +2 on numeric load; timeline +2 on a time axis
+;   Intent affinity (frontend.t27 intents whose natural rep is in the candidate set): spec shape
+;   leans graph, spec words leans source, health leans chart, +2 each. All scores are small
+;   integers; no floats anywhere. Ties fall through in the fixed candidate order.
+; --
+; The composition is always flat: every slot's parent is VH_ROOT, so it validates against
+; viz_contract's VizHost (VH_MAX_SLOTS = 16) with room to embed. The badge is always present, so
+; viz_plan_ok holds by construction. A trace or a time axis adds the stepper control.
+; --
+; Determinism: the same (intent, shape) gives the same bytes of VizPick every call -- a fixed
+; candidate order, fixed weights, no clock, no randomness.
+; --
+; Not claimed: no petal calls this yet; the weights and thresholds are policy decided here, not
+; measurements; the reason lines are fixed strings selected by code (no string building), and no
+; test compares strings (the gen-c str trap: `.len` and `==` on str). VIZ_REP_MAP and VIZ_REP_TEXT
+; exist in viz_contract but are not candidates here -- no intent in this selector calls for them;
+; there is no tree rep in the contract at all.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27fVizSelect;
+
+use t27f::viz_contract::VizHost;
+use t27f::viz_contract::VIZ_REP_GRAPH;
+use t27f::viz_contract::VIZ_REP_MATRIX;
+use t27f::viz_contract::VIZ_REP_LIST;
+use t27f::viz_contract::VIZ_REP_SOURCE;
+use t27f::viz_contract::VIZ_REP_TRACE;
+use t27f::viz_contract::VIZ_REP_INSPECTOR;
+use t27f::viz_contract::VIZ_REP_CHART;
+use t27f::viz_contract::VIZ_REP_TIMELINE;
+use t27f::viz_contract::VIZ_REP_STEPPER;
+use t27f::viz_contract::VIZ_REP_BADGE;
+use t27f::viz_contract::VIZ_REP_COUNT;
+use t27f::viz_contract::viz_rep_bit;
+use t27f::viz_contract::viz_plan_ok;
+use t27f::viz_contract::viz_view_count;
+use t27f::viz_contract::viz_is_linked;
+use t27f::viz_contract::vh_blank;
+use t27f::viz_contract::vh_add;
+use t27f::viz_contract::vh_validate;
+use t27f::viz_contract::VH_ROOT;
+use t27f::viz_contract::VH_MAX_SLOTS;
+use t27f::frontend::I_COUNT;
+use t27f::frontend::I_SPEC_SHAPE;
+use t27f::frontend::I_SPEC_WORDS;
+use t27f::frontend::I_TOPIC_MAP;
+use t27f::frontend::I_HEALTH;
+
+; ---------------------------------------------------------------- shape descriptor
+
+/// What the caller knows about the data, all of it cheap to compute while building the graph.
+/// The flags are 0/1. wants_path and pairwise are request knobs (a single path was asked for;
+/// pairwise relations are the question), not properties of the data.
+pub struct VizShape {
+    node_count: u32,
+    edge_count: u32,
+    max_fanout: u32,
+    has_time: u8,
+    has_numeric: u8,
+    wants_path: u8,
+    pairwise: u8,
+    any_unknown: u8,
+    any_suggested: u8,
+}
+
+/// A shape with the flags off; tests and callers set the flags on the returned value.
+pub fn vs_shape(node_count: u32, edge_count: u32, max_fanout: u32) -> VizShape {
+    return VizShape { node_count: node_count, edge_count: edge_count, max_fanout: max_fanout, has_time: 0, has_numeric: 0, wants_path: 0, pairwise: 0, any_unknown: 0, any_suggested: 0 };
+}
+
+; ---------------------------------------------------------------- constants
+
+/// Candidate views, in fixed tie-break order. Controls and the badge are garnish, not candidates.
+pub const VS_CAND_COUNT : u32 = 8;
+
+pub fn vs_candidate(k: u32) -> u8 {
+    if (k == 0) { return VIZ_REP_GRAPH; }
+    if (k == 1) { return VIZ_REP_MATRIX; }
+    if (k == 2) { return VIZ_REP_LIST; }
+    if (k == 3) { return VIZ_REP_TRACE; }
+    if (k == 4) { return VIZ_REP_CHART; }
+    if (k == 5) { return VIZ_REP_TIMELINE; }
+    if (k == 6) { return VIZ_REP_SOURCE; }
+    if (k == 7) { return VIZ_REP_INSPECTOR; }
+    return VIZ_REP_COUNT;
+}
+
+/// Weights and thresholds: small integers, pinned by test. VS_HAIRBALL_K is the "graph only when
+/// edge_count <= 3 * node_count" law; VS_MATRIX_MAX the matrix cap; VS_PAIRWISE_MAX the small-set
+/// bound under which pairwise relations fit a matrix; VS_FANOUT_MIN the fan-out that wants a graph.
+pub const VS_W_FANOUT : u32 = 3;
+pub const VS_W_PAIRWISE : u32 = 3;
+pub const VS_W_PATH : u32 = 3;
+pub const VS_W_BIG : u32 = 3;
+pub const VS_W_NUMERIC : u32 = 2;
+pub const VS_W_TIME : u32 = 2;
+pub const VS_W_AFFINITY : u32 = 2;
+pub const VS_FANOUT_MIN : u32 = 3;
+pub const VS_PAIRWISE_MAX : u32 = 60;
+pub const VS_MATRIX_MAX : u32 = 400;
+pub const VS_HAIRBALL_K : u32 = 3;
+
+/// The composition never exceeds 8 slots (primary + 5 garnish views + stepper + badge), inside
+/// the host's 16.
+pub const VS_MAX_SLOTS : u32 = 8;
+
+; ---------------------------------------------------------------- refusal and reason codes
+
+pub const VS_OK : u8 = 0;
+pub const VS_REF_INTENT : u8 = 1;      // intent >= I_COUNT: not a frontend intent
+pub const VS_REF_EMPTY : u8 = 2;       // 0 nodes: nothing to draw yet
+pub const VS_REF_HAIRBALL : u8 = 3;    // graph won, but edges > 3 x nodes
+pub const VS_REF_PROVENANCE : u8 = 4;  // source won, but some provenance is unknown
+pub const VS_REF_COUNT : u8 = 5;
+pub const VS_REF_NAMES : [5]str = ["ok", "refused: intent outside frontend I_COUNT", "refused: 0 nodes, nothing to draw yet", "refused: hairball, edges exceed 3x nodes; filter or ask for a list", "refused: source claims exact facts but some node provenance is unknown"];
+
+/// Why the primary won, one honest line each. Priority when several bonuses fired:
+/// pairwise, path, fanout, big, numeric, time, affinity, tie.
+pub const VS_WHY_TIE : u8 = 0;
+pub const VS_WHY_AFFINITY : u8 = 1;
+pub const VS_WHY_FANOUT : u8 = 2;
+pub const VS_WHY_PAIRWISE : u8 = 3;
+pub const VS_WHY_PATH : u8 = 4;
+pub const VS_WHY_BIG : u8 = 5;
+pub const VS_WHY_NUMERIC : u8 = 6;
+pub const VS_WHY_TIME : u8 = 7;
+pub const VS_WHY_COUNT : u8 = 8;
+pub const VS_WHY_NAMES : [8]str = ["fixed candidate order: no rule fired", "intent affinity", "fan-out 3 or more wants a node-link view", "pairwise relations fit a matrix", "a single path was requested: trace", "over 400 nodes: the list scales", "numeric load: chart", "a time axis: timeline"];
+
+; ---------------------------------------------------------------- the pick
+
+/// What the selector returns: a refusal code or VS_OK with the composition. On refusal the
+/// composition is empty and primary is VIZ_REP_COUNT (not a valid rep: no rep was chosen).
+pub struct VizPick {
+    code: u8,
+    primary: u8,
+    why: u8,
+    count: u32,
+    score: u32,
+    reps: [8]u8,
+}
+
+; ---------------------------------------------------------------- scoring (pure, integer)
+
+/// Intent affinity: +VS_W_AFFINITY for the intents whose natural rep is a candidate here.
+/// frontend route() owns the surface; this only leans the rep inside it.
+pub fn vs_affinity(intent: u32, rep: u8) -> u32 {
+    if (intent == I_SPEC_SHAPE and rep == VIZ_REP_GRAPH) { return VS_W_AFFINITY; }
+    if (intent == I_SPEC_WORDS and rep == VIZ_REP_SOURCE) { return VS_W_AFFINITY; }
+    if (intent == I_HEALTH and rep == VIZ_REP_CHART) { return VS_W_AFFINITY; }
+    return 0;
+}
+
+/// The score of candidate k: affinity plus the soft preferences that fire on this shape.
+pub fn vs_score(k: u32, intent: u32, s: VizShape) -> u32 {
+    let rep : u8 = vs_candidate(k);
+    var sc : u32 = vs_affinity(intent, rep);
+    if (rep == VIZ_REP_GRAPH and s.max_fanout >= VS_FANOUT_MIN) { sc = sc + VS_W_FANOUT; }
+    if (rep == VIZ_REP_MATRIX and s.pairwise == 1 and s.node_count <= VS_PAIRWISE_MAX) { sc = sc + VS_W_PAIRWISE; }
+    if (rep == VIZ_REP_TRACE and s.wants_path == 1) { sc = sc + VS_W_PATH; }
+    if (rep == VIZ_REP_LIST and s.node_count > VS_MATRIX_MAX) { sc = sc + VS_W_BIG; }
+    if (rep == VIZ_REP_CHART and s.has_numeric == 1) { sc = sc + VS_W_NUMERIC; }
+    if (rep == VIZ_REP_TIMELINE and s.has_time == 1) { sc = sc + VS_W_TIME; }
+    return sc;
+}
+
+/// Hard constraints as candidate blockers. A blocked candidate is never selected; when it is the
+/// one the scoring would have picked, vs_refuse says so instead of drawing it.
+pub fn vs_blocked(k: u32, s: VizShape) -> bool {
+    let rep : u8 = vs_candidate(k);
+    if (rep == VIZ_REP_GRAPH and s.edge_count > VS_HAIRBALL_K * s.node_count) { return true; }
+    if (rep == VIZ_REP_MATRIX and s.node_count > VS_MATRIX_MAX) { return true; }
+    if (rep == VIZ_REP_TIMELINE and s.has_time == 0) { return true; }
+    if (rep == VIZ_REP_SOURCE and s.any_unknown == 1) { return true; }
+    return false;
+}
+
+/// Highest-scoring candidate, ties to the lowest index (fixed order). With filtered == true the
+/// blocked candidates do not participate; the list is never blocked, so a winner always exists.
+pub fn vs_argmax(intent: u32, s: VizShape, filtered: bool) -> u32 {
+    var best : u32 = VS_CAND_COUNT;
+    var best_sc : u32 = 0;
+    var k : u32 = 0;
+    while (k < VS_CAND_COUNT) {
+        if (filtered == false or vs_blocked(k, s) == false) {
+            let sc : u32 = vs_score(k, intent, s);
+            if (best == VS_CAND_COUNT or sc > best_sc) {
+                best = k;
+                best_sc = sc;
+            }
+        }
+        k = k + 1;
+    }
+    return best;
+}
+
+/// Why the winner won: the strongest rule that fired on it, in the stated priority.
+pub fn vs_why(w: u8, intent: u32, s: VizShape) -> u8 {
+    if (w == VIZ_REP_MATRIX and s.pairwise == 1 and s.node_count <= VS_PAIRWISE_MAX) { return VS_WHY_PAIRWISE; }
+    if (w == VIZ_REP_TRACE and s.wants_path == 1) { return VS_WHY_PATH; }
+    if (w == VIZ_REP_GRAPH and s.max_fanout >= VS_FANOUT_MIN) { return VS_WHY_FANOUT; }
+    if (w == VIZ_REP_LIST and s.node_count > VS_MATRIX_MAX) { return VS_WHY_BIG; }
+    if (w == VIZ_REP_CHART and s.has_numeric == 1) { return VS_WHY_NUMERIC; }
+    if (w == VIZ_REP_TIMELINE and s.has_time == 1) { return VS_WHY_TIME; }
+    if (vs_affinity(intent, w) > 0) { return VS_WHY_AFFINITY; }
+    return VS_WHY_TIE;
+}
+
+; ---------------------------------------------------------------- the selector
+
+/// The refusal path: VS_OK when nothing blocks, else the first failing hard constraint in order.
+pub fn vs_refuse(intent: u32, s: VizShape) -> u8 {
+    if (intent >= I_COUNT) { return VS_REF_INTENT; }
+    if (s.node_count == 0) { return VS_REF_EMPTY; }
+    let pre : u32 = vs_argmax(intent, s, false);
+    let want : u8 = vs_candidate(pre);
+    if (want == VIZ_REP_GRAPH and s.edge_count > VS_HAIRBALL_K * s.node_count) { return VS_REF_HAIRBALL; }
+    if (want == VIZ_REP_SOURCE and s.any_unknown == 1) { return VS_REF_PROVENANCE; }
+    return VS_OK;
+}
+
+/// Append rep to the composition if there is room and it is not already there.
+fn vs_push(p: VizPick, rep: u8) -> VizPick {
+    if (p.count >= VS_MAX_SLOTS) { return p; }
+    var i : u32 = 0;
+    while (i < p.count) {
+        if (p.reps[i as usize] == rep) { return p; }
+        i = i + 1;
+    }
+    let k : usize = p.count as usize;
+    p.reps[k] = rep;
+    p.count = p.count + 1;
+    return p;
+}
+
+/// The one selection: same (intent, shape) in, same VizPick out, every call.
+pub fn vs_select(intent: u32, s: VizShape) -> VizPick {
+    let rc : u8 = vs_refuse(intent, s);
+    var p : VizPick = VizPick { code: rc, primary: VIZ_REP_COUNT, why: VS_WHY_TIE, count: 0, score: 0, reps: [0; 8] };
+    if (rc != VS_OK) {
+        return p;
+    }
+    let wk : u32 = vs_argmax(intent, s, true);
+    let w : u8 = vs_candidate(wk);
+    p.code = VS_OK;
+    p.primary = w;
+    p.score = vs_score(wk, intent, s);
+    p.why = vs_why(w, intent, s);
+    p = vs_push(p, w);
+    if (s.has_numeric == 1) { p = vs_push(p, VIZ_REP_CHART); }
+    if (s.has_time == 1) { p = vs_push(p, VIZ_REP_TIMELINE); }
+    if (s.wants_path == 1) { p = vs_push(p, VIZ_REP_TRACE); }
+    if (s.pairwise == 1 and s.node_count <= VS_PAIRWISE_MAX) { p = vs_push(p, VIZ_REP_MATRIX); }
+    if (p.primary == VIZ_REP_TRACE or s.has_time == 1) { p = vs_push(p, VIZ_REP_STEPPER); }
+    p = vs_push(p, VIZ_REP_BADGE);
+    return p;
+}
+
+/// The one honest line for a pick: why the primary won, or why the pick was refused.
+pub fn vs_reason(p: VizPick) -> str {
+    if (p.code == VS_OK) {
+        if (p.why < VS_WHY_COUNT) { return VS_WHY_NAMES[p.why as usize]; }
+        return VS_WHY_NAMES[0];
+    }
+    if (p.code < VS_REF_COUNT) { return VS_REF_NAMES[p.code as usize]; }
+    return VS_REF_NAMES[0];
+}
+
+; ---------------------------------------------------------------- tests
+
+fn rich_shape() -> VizShape {
+    var s : VizShape = vs_shape(40, 60, 4);
+    s.has_time = 1;
+    s.has_numeric = 1;
+    s.wants_path = 1;
+    s.pairwise = 1;
+    return s;
+}
+
+test a_small_clean_shape_picks_the_graph_for_the_structure_intent {
+    const p : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(10, 8, 2));
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_GRAPH;
+    assert p.why == VS_WHY_AFFINITY;
+    assert p.score == VS_W_AFFINITY;
+    assert p.count == 2;
+    assert p.reps[0] == VIZ_REP_GRAPH;
+    assert p.reps[1] == VIZ_REP_BADGE;
+}
+
+test the_same_shape_gives_the_same_pick_twice {
+    const s : VizShape = rich_shape();
+    const a : VizPick = vs_select(I_SPEC_SHAPE, s);
+    const b : VizPick = vs_select(I_SPEC_SHAPE, s);
+    assert a.code == b.code;
+    assert a.primary == b.primary;
+    assert a.why == b.why;
+    assert a.count == b.count;
+    assert a.score == b.score;
+    var i : u32 = 0;
+    while (i < VS_MAX_SLOTS) {
+        assert a.reps[i as usize] == b.reps[i as usize];
+        i = i + 1;
+    }
+}
+
+test fan_out_of_three_or_more_lifts_the_graph_over_the_matrix {
+    var slow : VizShape = vs_shape(40, 20, 2);
+    slow.pairwise = 1;
+    const low : VizPick = vs_select(I_SPEC_SHAPE, slow);
+    assert low.code == VS_OK;
+    assert low.primary == VIZ_REP_MATRIX;
+    assert low.why == VS_WHY_PAIRWISE;
+    var shigh : VizShape = vs_shape(40, 20, 4);
+    shigh.pairwise = 1;
+    const high : VizPick = vs_select(I_SPEC_SHAPE, shigh);
+    assert high.code == VS_OK;
+    assert high.primary == VIZ_REP_GRAPH;
+    assert high.why == VS_WHY_FANOUT;
+    assert high.score == VS_W_AFFINITY + VS_W_FANOUT;
+}
+
+test pairwise_relations_lift_the_matrix {
+    const off : VizPick = vs_select(I_TOPIC_MAP, vs_shape(40, 20, 2));
+    assert off.code == VS_OK;
+    assert off.primary == VIZ_REP_GRAPH;
+    assert off.why == VS_WHY_TIE;
+    var on : VizShape = vs_shape(40, 20, 2);
+    on.pairwise = 1;
+    const p : VizPick = vs_select(I_TOPIC_MAP, on);
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_MATRIX;
+    assert p.why == VS_WHY_PAIRWISE;
+    assert p.score == VS_W_PAIRWISE;
+}
+
+test a_requested_single_path_lifts_the_trace {
+    const off : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(30, 20, 2));
+    assert off.code == VS_OK;
+    assert off.primary == VIZ_REP_GRAPH;
+    assert off.why == VS_WHY_AFFINITY;
+    var on : VizShape = vs_shape(30, 20, 2);
+    on.wants_path = 1;
+    const p : VizPick = vs_select(I_SPEC_SHAPE, on);
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_TRACE;
+    assert p.why == VS_WHY_PATH;
+    assert p.score == VS_W_PATH;
+    // a trace primary carries its stepper control and the badge
+    assert p.count == 3;
+    assert p.reps[0] == VIZ_REP_TRACE;
+    assert p.reps[1] == VIZ_REP_STEPPER;
+    assert p.reps[2] == VIZ_REP_BADGE;
+}
+
+test past_four_hundred_nodes_the_list_takes_over_and_the_matrix_is_gone {
+    var s : VizShape = vs_shape(401, 300, 2);
+    s.pairwise = 1;
+    const p : VizPick = vs_select(I_HEALTH, s);
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_LIST;
+    assert p.why == VS_WHY_BIG;
+    assert p.score == VS_W_BIG;
+    assert vs_blocked(1, s);
+    var i : u32 = 0;
+    while (i < p.count) {
+        assert p.reps[i as usize] != VIZ_REP_MATRIX;
+        i = i + 1;
+    }
+    assert p.count == 2;
+    assert p.reps[1] == VIZ_REP_BADGE;
+}
+
+test numeric_load_puts_the_chart_in_front {
+    var s : VizShape = vs_shape(100, 50, 2);
+    s.has_numeric = 1;
+    const p : VizPick = vs_select(I_HEALTH, s);
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_CHART;
+    assert p.why == VS_WHY_NUMERIC;
+    assert p.score == VS_W_AFFINITY + VS_W_NUMERIC;
+    assert p.reps[0] == VIZ_REP_CHART;
+    assert p.count == 2;
+    assert p.reps[1] == VIZ_REP_BADGE;
+}
+
+test the_timeline_and_its_stepper_come_only_with_a_time_axis {
+    const dry : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(10, 8, 2));
+    assert dry.code == VS_OK;
+    assert dry.count == 2;
+    var i : u32 = 0;
+    while (i < dry.count) {
+        assert dry.reps[i as usize] != VIZ_REP_TIMELINE;
+        assert dry.reps[i as usize] != VIZ_REP_STEPPER;
+        i = i + 1;
+    }
+    var wet : VizShape = vs_shape(10, 8, 2);
+    wet.has_time = 1;
+    const p : VizPick = vs_select(I_SPEC_SHAPE, wet);
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_GRAPH;
+    assert p.count == 4;
+    assert p.reps[0] == VIZ_REP_GRAPH;
+    assert p.reps[1] == VIZ_REP_TIMELINE;
+    assert p.reps[2] == VIZ_REP_STEPPER;
+    assert p.reps[3] == VIZ_REP_BADGE;
+    assert vs_blocked(5, vs_shape(10, 8, 2));
+    assert vs_blocked(5, wet) == false;
+}
+
+test a_hairball_is_refused_not_drawn {
+    const p : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(10, 31, 2));
+    assert p.code == VS_REF_HAIRBALL;
+    assert vs_refuse(I_SPEC_SHAPE, vs_shape(10, 31, 2)) == VS_REF_HAIRBALL;
+    assert p.count == 0;
+    assert p.primary == VIZ_REP_COUNT;
+    // the boundary is the law itself: 3 x nodes exactly is still drawable
+    const edge : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(10, 30, 2));
+    assert edge.code == VS_OK;
+    assert edge.primary == VIZ_REP_GRAPH;
+    // and a hairball under an intent that leans elsewhere is not refused: the chart wins
+    var h : VizShape = vs_shape(10, 31, 2);
+    h.has_numeric = 1;
+    const q : VizPick = vs_select(I_HEALTH, h);
+    assert q.code == VS_OK;
+    assert q.primary == VIZ_REP_CHART;
+    var i : u32 = 0;
+    while (i < q.count) {
+        assert q.reps[i as usize] != VIZ_REP_GRAPH;
+        i = i + 1;
+    }
+}
+
+test unknown_provenance_refuses_the_exact_claiming_source {
+    const clean : VizPick = vs_select(I_SPEC_WORDS, vs_shape(20, 10, 2));
+    assert clean.code == VS_OK;
+    assert clean.primary == VIZ_REP_SOURCE;
+    assert clean.why == VS_WHY_AFFINITY;
+    var dirty : VizShape = vs_shape(20, 10, 2);
+    dirty.any_unknown = 1;
+    const p : VizPick = vs_select(I_SPEC_WORDS, dirty);
+    assert p.code == VS_REF_PROVENANCE;
+    assert p.count == 0;
+    assert p.primary == VIZ_REP_COUNT;
+    assert vs_refuse(I_SPEC_WORDS, dirty) == VS_REF_PROVENANCE;
+    // suggested provenance never blocks: SUGGESTED is a shown label, not a guess
+    var mixed : VizShape = vs_shape(20, 10, 2);
+    mixed.any_suggested = 1;
+    const q : VizPick = vs_select(I_SPEC_WORDS, mixed);
+    assert q.code == VS_OK;
+    assert q.primary == VIZ_REP_SOURCE;
+    // without the words intent the unknown nodes do not refuse: nothing exact is claimed
+    const r : VizPick = vs_select(I_TOPIC_MAP, dirty);
+    assert r.code == VS_OK;
+    var i : u32 = 0;
+    while (i < r.count) {
+        assert r.reps[i as usize] != VIZ_REP_SOURCE;
+        i = i + 1;
+    }
+}
+
+test an_intent_outside_the_catalog_is_refused {
+    const p : VizPick = vs_select(I_COUNT, vs_shape(10, 8, 2));
+    assert p.code == VS_REF_INTENT;
+    assert p.count == 0;
+    assert p.primary == VIZ_REP_COUNT;
+    assert vs_refuse(999, vs_shape(10, 8, 2)) == VS_REF_INTENT;
+    assert vs_refuse(I_COUNT - 1, vs_shape(10, 8, 2)) == VS_OK;
+}
+
+test an_empty_shape_is_refused {
+    const p : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(0, 0, 0));
+    assert p.code == VS_REF_EMPTY;
+    assert p.count == 0;
+    assert p.primary == VIZ_REP_COUNT;
+    assert vs_refuse(I_SPEC_SHAPE, vs_shape(0, 0, 0)) == VS_REF_EMPTY;
+}
+
+test the_richest_composition_fits_a_flat_host_and_validates {
+    const p : VizPick = vs_select(I_SPEC_SHAPE, rich_shape());
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_GRAPH;
+    assert p.why == VS_WHY_FANOUT;
+    assert p.count == 7;
+    assert p.count <= VS_MAX_SLOTS;
+    assert p.count <= VH_MAX_SLOTS;
+    // graph, then chart, timeline, trace, matrix garnish, then stepper, then the badge
+    assert p.reps[0] == VIZ_REP_GRAPH;
+    assert p.reps[1] == VIZ_REP_CHART;
+    assert p.reps[2] == VIZ_REP_TIMELINE;
+    assert p.reps[3] == VIZ_REP_TRACE;
+    assert p.reps[4] == VIZ_REP_MATRIX;
+    assert p.reps[5] == VIZ_REP_STEPPER;
+    assert p.reps[6] == VIZ_REP_BADGE;
+    // flat: every slot a root slot with a non-empty rect, so the host validates
+    var h : VizHost = vh_blank();
+    var i : u32 = 0;
+    var bits : u32 = 0;
+    while (i < p.count) {
+        h = vh_add(h, p.reps[i as usize], VH_ROOT, i * 120, 0, 120, 80);
+        bits = bits | viz_rep_bit(p.reps[i as usize]);
+        i = i + 1;
+    }
+    assert vh_validate(h) == 0;
+    assert viz_plan_ok(bits);
+    assert viz_is_linked(bits);
+    assert viz_view_count(bits) == 5;
+}
+
+test every_ok_composition_carries_the_badge_and_at_least_one_view {
+    const a : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(10, 8, 2));
+    assert viz_plan_ok(pick_bits(a));
+    const b : VizPick = vs_select(I_SPEC_SHAPE, rich_shape());
+    assert viz_plan_ok(pick_bits(b));
+    var cshape : VizShape = vs_shape(30, 20, 2);
+    cshape.wants_path = 1;
+    const c : VizPick = vs_select(I_SPEC_SHAPE, cshape);
+    assert viz_plan_ok(pick_bits(c));
+    var dshape : VizShape = vs_shape(401, 300, 2);
+    const d : VizPick = vs_select(I_TOPIC_MAP, dshape);
+    assert viz_plan_ok(pick_bits(d));
+    var eshape : VizShape = vs_shape(100, 50, 2);
+    eshape.has_numeric = 1;
+    const e : VizPick = vs_select(I_HEALTH, eshape);
+    assert viz_plan_ok(pick_bits(e));
+}
+
+fn pick_bits(p: VizPick) -> u32 {
+    var bits : u32 = 0;
+    var i : u32 = 0;
+    while (i < p.count) {
+        bits = bits | viz_rep_bit(p.reps[i as usize]);
+        i = i + 1;
+    }
+    return bits;
+}
+
+test the_weights_and_thresholds_are_the_pinned_small_integers {
+    assert VS_W_FANOUT == 3;
+    assert VS_W_PAIRWISE == 3;
+    assert VS_W_PATH == 3;
+    assert VS_W_BIG == 3;
+    assert VS_W_NUMERIC == 2;
+    assert VS_W_TIME == 2;
+    assert VS_W_AFFINITY == 2;
+    assert VS_FANOUT_MIN == 3;
+    assert VS_PAIRWISE_MAX == 60;
+    assert VS_MATRIX_MAX == 400;
+    assert VS_HAIRBALL_K == 3;
+    assert VS_MAX_SLOTS == 8;
+    assert VS_CAND_COUNT == 8;
+    assert VS_OK == 0;
+    assert VS_REF_COUNT == 5;
+    assert VS_WHY_COUNT == 8;
+}
+
+test an_all_tied_shape_falls_through_in_fixed_order {
+    const p : VizPick = vs_select(I_TOPIC_MAP, vs_shape(10, 8, 2));
+    assert p.code == VS_OK;
+    assert p.primary == VIZ_REP_GRAPH;
+    assert p.why == VS_WHY_TIE;
+    assert p.score == 0;
+    // the candidate order is the tie order: graph, matrix, list, trace, chart, timeline, source, inspector
+    assert vs_candidate(0) == VIZ_REP_GRAPH;
+    assert vs_candidate(1) == VIZ_REP_MATRIX;
+    assert vs_candidate(2) == VIZ_REP_LIST;
+    assert vs_candidate(3) == VIZ_REP_TRACE;
+    assert vs_candidate(4) == VIZ_REP_CHART;
+    assert vs_candidate(5) == VIZ_REP_TIMELINE;
+    assert vs_candidate(6) == VIZ_REP_SOURCE;
+    assert vs_candidate(7) == VIZ_REP_INSPECTOR;
+}
+
+test a_reason_line_sits_on_the_code_for_refusals_and_the_why_for_ok_picks {
+    // vs_reason keys a refusal pick by code and an ok pick by why; the text itself is a fixed
+    // table entry, never built, and never compared here (the gen-c str trap).
+    const refused : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(0, 0, 0));
+    assert refused.code == VS_REF_EMPTY;
+    assert refused.why == VS_WHY_TIE;
+    assert refused.code < VS_REF_COUNT;
+    const ok : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(10, 8, 2));
+    assert ok.code == VS_OK;
+    assert ok.why == VS_WHY_AFFINITY;
+    assert ok.why < VS_WHY_COUNT;
+}
+
+invariant every_refusal_names_its_code_and_ships_no_slots {
+    const a : VizPick = vs_select(I_COUNT, vs_shape(10, 8, 2));
+    assert a.code == VS_REF_INTENT;
+    const b : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(0, 0, 0));
+    assert b.code == VS_REF_EMPTY;
+    const c : VizPick = vs_select(I_SPEC_SHAPE, vs_shape(10, 31, 2));
+    assert c.code == VS_REF_HAIRBALL;
+    var dshape : VizShape = vs_shape(20, 10, 2);
+    dshape.any_unknown = 1;
+    const d : VizPick = vs_select(I_SPEC_WORDS, dshape);
+    assert d.code == VS_REF_PROVENANCE;
+    // every refusal: an honest code inside the table, no slots, no rep chosen
+    assert a.code < VS_REF_COUNT and b.code < VS_REF_COUNT;
+    assert c.code < VS_REF_COUNT and d.code < VS_REF_COUNT;
+    assert a.count == 0 and b.count == 0 and c.count == 0 and d.count == 0;
+    assert a.primary == VIZ_REP_COUNT and b.primary == VIZ_REP_COUNT;
+    assert c.primary == VIZ_REP_COUNT and d.primary == VIZ_REP_COUNT;
+}
+
+invariant the_candidates_stay_inside_the_rep_vocabulary_and_the_host {
+    assert VS_CAND_COUNT == 8;
+    assert VS_MAX_SLOTS <= VH_MAX_SLOTS;
+    var i : u32 = 0;
+    while (i < VS_CAND_COUNT) {
+        assert vs_candidate(i) < VIZ_REP_COUNT;
+        var j : u32 = i + 1;
+        while (j < VS_CAND_COUNT) {
+            assert vs_candidate(i) != vs_candidate(j);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    assert vs_candidate(VS_CAND_COUNT) == VIZ_REP_COUNT;
+}
