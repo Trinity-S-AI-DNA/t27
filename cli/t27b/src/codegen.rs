@@ -1,24 +1,11 @@
-//! AArch64 code generation from the t27b IR.
-//!
-//! One pass per function, directly to machine words (no assembler text):
-//!
-//! * Canonical register form. A value of a type of 32 bits or less lives in
-//!   the low 32 bits of its register: u8/u16/bool zero-extended to 32 bits,
-//!   i8/i16 sign-extended to 32 bits, the upper 32 bits undefined. A 64-bit
-//!   value uses the whole X register. All arithmetic on narrow types is done in
-//!   W registers and re-normalised (or overflow-checked) afterwards.
-//! * Registers. x0-x7 arguments and result (and variable homes in leaf
-//!   functions); x8 operation scratch; x9-x15 the expression temp stack (temp
-//!   7 and deeper spill to the frame); x16/x17 scratch for spilled temps and
-//!   materialised constants; x18 never touched (Apple platform register);
-//!   x19-x28 variable homes, assigned by loop-weighted use count; x29/x30
-//!   frame pointer and link register.
-//! * Frame. `stp x29, x30, [sp, #-16]!; mov x29, sp; sub sp, sp, #N`, then
-//!   from sp upward: variable slots, saved callee-saved registers, temp slots
-//!   (spilled temps and temps saved across calls); and, directly below x29,
-//!   the aggregate area holding `Func::slots`, addressed from x29 so its
-//!   offsets do not depend on how many temps the body needs. Leaf functions
-//!   that need none of this get no frame at all.
+//! AArch64 code generation from the t27b IR: one pass per function, directly
+//! to machine words; the laws live in specs (tested there, L4), this is their emitter:
+//! * Canonical register form, register classes, frame layout and stack
+//!   probing: specs/tri/t27b/frame_layout.t27 (x0-x7 args, x8 scratch,
+//!   x9-x15 temps, x16/x17 spill scratch, x18 untouched, x19-x28 homes,
+//!   x29/x30 fp/lr; slots, saved callee-saved, temp slots, aggregate area
+//!   below x29; big frames probed one page at a time, #7367), narrow-type
+//!   normalisation by specs/tri/t27b/narrow_law.t27.
 //! * Memory. Loads and stores take the narrowest instruction for the type
 //!   (`ldrsb w` for i8, `ldrh` for u16, ...), so a loaded value is already in
 //!   canonical form. A slot access close to x29 is one `ldur`/`stur`; read-only
@@ -34,11 +21,17 @@ use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
 use std::collections::HashMap;
 
-// t27b-generated inline decision source of truth:
-//   specs/tri/t27b/inline.t27 -> gen/rust/tri/t27b/inline.rs
+// t27b-generated inline decision source of truth: specs/tri/t27b/inline.t27.
 #[path = "../../../gen/rust/tri/t27b/inline.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod inline_decision;
+#[path = "../../../gen/rust/tri/t27b/narrow_law.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod narrow_law;
+// t27b-generated home-plan source of truth: specs/tri/t27b/home_plan.t27.
+#[path = "../../../gen/rust/tri/t27b/home_plan.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod home_plan;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -117,11 +110,11 @@ fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_in(ty == Ty::F32, rd, rn) 
 fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_out(ty == Ty::F32, rd, rn) }
 fn fp_op(ty: Ty, w: u32) -> u32 { a64::fp_prec(ty == Ty::F32, w) }
 fn narrow_ext(ty: Ty) -> Option<Ext> {
-    match ty {
-        Ty::U8 | Ty::Bool => Some(Ext::Uxtb),
-        Ty::U16 => Some(Ext::Uxth),
-        Ty::I8 => Some(Ext::Sxtb),
-        Ty::I16 => Some(Ext::Sxth),
+    match narrow_law::narrow_ext(ty.bits(), ty.signed(), ty == Ty::Bool) {
+        0 => Some(Ext::Uxtb),
+        1 => Some(Ext::Uxth),
+        4 => Some(Ext::Sxtb),
+        5 => Some(Ext::Sxth),
         _ => None,
     }
 }
@@ -358,54 +351,37 @@ impl<'a> Gen<'a> {
             }
         }
         self.has_call = has_call;
-        self.stack_params = Program::stack_args(&Program::arg_regs(f)).1 > 0;
+        let regs = Program::arg_regs(f);
+        self.stack_params = Program::stack_args(&regs).1 > 0;
         let mut order: Vec<usize> = (0..f.vars.len()).collect();
         order.sort_by(|&a, &b| w[b].cmp(&w[a]).then(a.cmp(&b)));
-        let mut callee = CALLEE_SAVED.iter().copied();
         let mut slots = 0u32;
         for &v in order.iter().filter(|&&v| f.vars[v].ty == Ty::I128) { // i128_plan.t27: 16 frame bytes, laid out first (16-aligned)
             if w[v] > 0 { (self.homes[v], w[v], slots) = (Home::Slot(8 * slots), 0, slots + ip::HOME_WORDS); }
         }
-        if !has_call {
-            // Leaf: parameters stay in their argument registers; the free
-            // argument registers are homes too.
-            // An F64 parameter arrives in a d register; it gets a home like
-            // any other variable and the prologue moves it there.
-            let regs = Program::arg_regs(f);
-            let nint = regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0);
-            let mut caller: Vec<Reg> = ((nint as Reg)..8).collect();
-            caller.reverse();
-            for (p, &(fp, k)) in regs.iter().enumerate() {
-                if !fp && k < 8 && f.vars[p].ty != Ty::I128 { // a pair parameter is homed in the frame
-                    self.homes[p] = Home::Reg(k as Reg);
-                }
+        // The home pools are home_plan.t27's: a leaf's free argument registers
+        // (nint..8) first, then the callee-saved registers, then the slots.
+        let nint = if has_call { 8 } else { regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0) };
+        let mut taken_caller = 0u32;
+        let mut taken_callee = 0usize;
+        for (p, &(fp, k)) in regs.iter().enumerate() {
+            if home_plan::param_keeps_arg_reg(fp, k as u64, f.vars[p].ty == Ty::I128) {
+                self.homes[p] = Home::Reg(k as Reg); // a pair parameter is homed in the frame
             }
-            for &v in &order {
-                if (v < f.nparams && !regs[v].0 && regs[v].1 < 8) || w[v] == 0 {
-                    continue;
-                }
-                self.homes[v] = if let Some(r) = caller.pop() {
-                    Home::Reg(r)
-                } else if let Some(r) = callee.next() {
-                    self.used_callee.push(r);
-                    Home::Reg(r)
-                } else {
-                    slots += 1;
-                    Home::Slot(8 * (slots - 1))
-                };
+        }
+        for &v in &order {
+            if w[v] == 0 || (!has_call && v < f.nparams && !regs[v].0 && regs[v].1 < 8) {
+                continue; // never read, or already homed in its argument register
             }
-        } else {
-            for &v in &order {
-                if w[v] == 0 {
-                    continue;
-                }
-                self.homes[v] = if let Some(r) = callee.next() {
-                    self.used_callee.push(r);
-                    Home::Reg(r)
-                } else {
-                    slots += 1;
-                    Home::Slot(8 * (slots - 1))
-                };
+            let home = home_plan::next_home(
+                !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64),
+                home_plan::callee_pool_has(CALLEE_SAVED.len() as u64, taken_callee as u64),
+                slots as u64,
+            );
+            match home >> 32 {
+                home_plan::HOME_CALLER => { self.homes[v] = Home::Reg((nint + taken_caller) as Reg); taken_caller += 1; }
+                home_plan::HOME_CALLEE => { let r = CALLEE_SAVED[taken_callee]; taken_callee += 1; self.used_callee.push(r); self.homes[v] = Home::Reg(r); }
+                _ => { self.homes[v] = Home::Slot(8 * (home & 0xFFFFFFFF) as u32); slots += 1; }
             }
         }
         self.nvar_slots = slots;
