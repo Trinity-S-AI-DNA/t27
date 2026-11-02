@@ -526,6 +526,32 @@ Not shown: the group kill on a live pane, and a refused spawn on a real full tab
    the active panes and the consequences for each are listed; session preservation is not
    promised, because no mechanism for it has been checked.
 
+**Isolation, measured 2026-11-02.** A second server for stage 2 cannot be started from the spec as
+it stands:
+
+- the socket, `sessions/`, `hooks.json` and `live/app.beat` all derive from `$HOME`, so a test HOME
+  gives a separate socket;
+- but `run_server` loads every key at start, and a spawn reloads them when due, through
+  `/usr/bin/security`; a test server would read Keychain items, which is a credentials action, so
+  it is not started;
+- the router binds the fixed 127.0.0.1:47127, so a second server serves panes only.
+
+The isolation edit is prepared as its own diff and not applied: with `T27OS_NO_KEYS` set,
+`keys_wanted` is false and neither the start nor a spawn reads a key. On a copy of the spec,
+`t27b test` gave 26 passed, 0 failed, rc 0; a negative control whose `keys_wanted` always says yes
+failed exactly `a_test_server_reads_no_keychain`, 25/1, rc 1. It is a protected edit of
+`specs/t27os/pty_server.t27` and waits for its own review.
+
+The installed client against an empty test HOME (no server there): `list`, `spawn` and `kill` each
+print "no server" and exit 10, and the HOME stays empty. The refusal is explicit; whether 10 is a
+designed code is not established. Not run: the full-table, group-stop and foreign-group checks,
+which need the test server.
+
+Overlap: another session's local commit for #13088 already carries the spawn and kill reply checks
+(`pty_proto.t27`, `pty_server.t27`, `term_pane.t27`; not pushed, tests not run). The reply-check half
+of this lane's stage-1 draft defers to it; only the process-group kill stays this lane's draft, as
+a one-hunk diff, so the two never edit the same hunk.
+
 Switching the working route (wiring anything to the executor path, `on_event`) is not one of
 these stages. It needs the named end record and the lease first, and only for a dedicated owned
 cell. A feed snapshot never reaches it.
@@ -561,8 +587,8 @@ the same files at once (owner, 2026-11-01 about 23:35):
 
 | Lane | Result that closes it | Owner | Files and services it alone may touch |
 |---|---|---|---|
-| DSH in T27 OS (main priority) | the credentials load failure is gone and one headless exchange answers `DSH_T27OS_OK` | the Claude session "DSH" (`local_9f024a6d`, worktree `claude-code-key-rotation-9c2748`); confirmed by its reply at about 23:48; hand-off to the key master is #13079 | `~/.dsh/.credentials.yaml` and its writer, launchd `ai.t27.dsh-zai-rotate` (the key-master part), the installed dsh, any DSH probe |
-| Queen `next_step.t27` (bounded, parallel) | a checked pure module with tests; no background automation started | this session (`local_34d63a71`); executors pane 15 (attempts 1-2) and pane 14 (attempt 3), final two fixes by this session | `specs/queen/next_step.t27`, `target/next_step/`, this document |
+| DSH in T27 OS (main priority) | the credentials load failure is gone and one headless exchange answers `DSH_T27OS_OK` | the Claude session "DSH"; confirmed by its reply at about 23:48; hand-off to the key master is #13079 | `~/.dsh/.credentials.yaml` and its writer, launchd `ai.t27.dsh-zai-rotate` (the key-master part), the installed dsh, any DSH probe |
+| Queen `next_step.t27` (bounded, parallel) | a checked pure module with tests; no background automation started | this session; executors pane 15 (attempts 1-2) and pane 14 (attempt 3), final two fixes by this session | `specs/queen/next_step.t27`, `target/next_step/`, this document |
 
 This session reads no key, runs no DSH probe and does not start DSH Web. The disk blocker is
 closed (the owner removed the trees at about 23:25); no further cleanup is run.
