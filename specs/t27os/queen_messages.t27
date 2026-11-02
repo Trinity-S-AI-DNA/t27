@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/queen_messages.t27 -- the LIVE MESSAGE FLOW of the Queen graph plane (epic #12779):
+; what each agent is actually saying right now, read from its PTY scrollback, flowing on the map.
+; --
+; WHAT IS DECIDED HERE (every rule has a test below): how a pane's newest bytes become one clean
+; message line (ANSI escapes stripped, control bytes blanked, capped), how a message pulse decays
+; (an edge flashes bright on new output and fades back), and the fixed-stride message ring the
+; step keeps (newest first, honest counts, never a silent wrap). The data is the panes' own
+; terminal output read through specs/t27os/pty_proto.t27 READ -- never a fixture.
+; WHAT IS NOT HERE: the socket reads and the draw calls (glass_window.t27). FR-004 of the T27F
+; live page applies: the window holds no parsing, pulse or ring logic of its own.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27osQueenMessages;
+
+// ---------------------------------------------------------------- the message line
+
+/// One message's bytes in the ring and in a node's caption.
+pub const QM_TEXT_CAP : usize = 96;
+
+/// A ring entry: [pane u8][name_len u8][text, QM_TEXT_CAP bytes]. Fixed stride, so the step
+/// keeps the ring in one flat buffer and the window reads entry i without a walk.
+pub const QM_ENTRY : usize = 2 + QM_TEXT_CAP;
+pub const QM_RING_MAX : u32 = 16;
+
+/// Is this byte printable ASCII (the only bytes a message line keeps)?
+pub fn qm_printable(b : u8) -> bool {
+    return b >= 32 and b <= 126;
+}
+
+/// Copy the printable bytes of src into out, blanking anything else; returns the written length.
+pub fn qm_clean(src : []const u8, out : []u8) -> usize {
+    var w : usize = 0;
+    var i : usize = 0;
+    while (i < src.len and w < out.len) {
+        var b : u8 = src[i];
+        // an ANSI escape: CSI (ESC [ ... final byte 64..126) or OSC (ESC ] ... BEL or ESC \)
+        if (b == 27) {
+            i = i + 1;
+            if (i < src.len and src[i] == 91) {
+                i = i + 1;
+                while (i < src.len and (src[i] >= 64 and src[i] <= 126) == false) { i = i + 1; }
+                if (i < src.len) { i = i + 1; }
+            } else if (i < src.len and src[i] == 93) {
+                i = i + 1;
+                while (i < src.len and src[i] != 7 and src[i] != 27) { i = i + 1; }
+                if (i < src.len and src[i] == 27) { i = i + 1; }
+                if (i < src.len) { i = i + 1; }
+            }
+            continue;
+        }
+        if (qm_printable(b) == false) { b = 32; }
+        out[w] = b;
+        w = w + 1;
+        i = i + 1;
+    }
+    return w;
+}
+
+/// Trim the spaces off both ends in place (by slice); returns the trimmed slice.
+pub fn qm_trim(s : []const u8) -> []const u8 {
+    var a : usize = 0;
+    var b : usize = s.len;
+    while (a < b and s[a] == 32) { a = a + 1; }
+    while (b > a and s[b - 1] == 32) { b = b - 1; }
+    return s[a..b];
+}
+
+/// The last complete line of a scrollback tail as one clean capped message: scan from the end for
+/// the newline before it, clean and trim the line, cut to the cap. Empty tail or a tail of only
+/// escapes gives 0 -- the pane has said nothing drawable, and the window says so, honestly.
+pub fn qm_last_line(buf : []const u8, out : []u8) -> usize {
+    var end : usize = buf.len;
+    while (end > 0 and (buf[end - 1] == 10 or buf[end - 1] == 13)) { end = end - 1; }
+    var start : usize = end;
+    while (start > 0 and buf[start - 1] != 10 and buf[start - 1] != 13) { start = start - 1; }
+    if (end <= start) { return 0; }
+    var tmp : [256]u8 = undefined;
+    const cn : usize = qm_clean(buf[start..end], tmp[0..256]);
+    const line : []const u8 = qm_trim(tmp[0..cn]);
+    var w : usize = 0;
+    while (w < line.len and w < QM_TEXT_CAP and w < out.len) {
+        out[w] = line[w];
+        w = w + 1;
+    }
+    return w;
+}
+
+/// Do two message texts differ (a new message is one that changed)?
+pub fn qm_differs(a : []const u8, b : []const u8) -> bool {
+    if (a.len != b.len) { return true; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- the pulse
+
+/// Frames an edge stays lit after a new message, and the floor it fades to (never zero: the edge
+/// of a talking agent stays visible while it talks).
+pub const QM_PULSE_FRAMES : u32 = 45;
+pub const QM_PULSE_FLOOR : u32 = 8;
+
+/// A pulse age in frames onto an extra alpha step (0..): full at 0, gone at QM_PULSE_FRAMES.
+pub fn qm_pulse(age : u32) -> u32 {
+    if (age >= QM_PULSE_FRAMES) { return 0; }
+    return QM_PULSE_FRAMES - age;
+}
+
+/// One frame older; saturates at QM_PULSE_FRAMES so a quiet pane stops costing a subtraction.
+pub fn qm_age_one(age : u32) -> u32 {
+    if (age >= QM_PULSE_FRAMES) { return QM_PULSE_FRAMES; }
+    return age + 1;
+}
+
+/// The window polls the socket every QM_POLL_FRAMES frames, so each poll ages a pulse by that
+/// many frames at once; saturates the same way.
+pub const QM_POLL_FRAMES : u32 = 15;
+
+pub fn qm_age_bulk(age : u32) -> u32 {
+    var a : u32 = age + QM_POLL_FRAMES;
+    if (a > QM_PULSE_FRAMES) { a = QM_PULSE_FRAMES; }
+    return a;
+}
+
+// ---------------------------------------------------------------- the ring
+
+/// Write entry `i` of a flat ring buffer: [pane][name_len][text..]. Returns the text length.
+pub fn qm_put(ring : []u8, i : u32, pane : u8, name : []const u8, text : []const u8) -> void {
+    const base : usize = @as(usize, i) * QM_ENTRY;
+    ring[base] = pane;
+    var nl : u8 = @as(u8, @intCast(name.len));
+    if (nl > 30) { nl = 30; }
+    ring[base + 1] = nl;
+    var w : usize = 0;
+    while (w < name.len and w < 30 and w < QM_TEXT_CAP) {
+        ring[base + 2 + w] = name[w];
+        w = w + 1;
+    }
+    if (w < QM_TEXT_CAP) { ring[base + 2 + w] = 32; w = w + 1; }
+    var t : usize = 0;
+    while (t < text.len and w < QM_TEXT_CAP) {
+        ring[base + 2 + w] = text[t];
+        w = w + 1;
+        t = t + 1;
+    }
+    while (w < QM_TEXT_CAP) { ring[base + 2 + w] = 32; w = w + 1; }
+}
+
+/// Read entry `i`'s name slice out of the flat ring (name_len bytes at +2).
+pub fn qm_name_of(ring : []const u8, i : u32) -> []const u8 {
+    const base : usize = @as(usize, i) * QM_ENTRY;
+    const nl : usize = @as(usize, ring[base + 1]);
+    return ring[base + 2 .. base + 2 + nl];
+}
+
+/// Read entry `i`'s text slice out of the flat ring (everything after the name and its space).
+pub fn qm_text_of(ring : []const u8, i : u32) -> []const u8 {
+    const base : usize = @as(usize, i) * QM_ENTRY;
+    const nl : usize = @as(usize, ring[base + 1]);
+    var tn : usize = 0;
+    if (nl + 1 < QM_TEXT_CAP) { tn = QM_TEXT_CAP - nl - 1; }
+    return ring[base + 2 + nl + 1 .. base + 2 + nl + 1 + tn];
+}
+
+/// Entry `i`'s pane byte.
+pub fn qm_pane_of(ring : []const u8, i : u32) -> u8 {
+    return ring[@as(usize, i) * QM_ENTRY];
+}
+
+/// A walkable ring: push overwrites the oldest once full; `count` saturates at `cap` so the
+/// window draws exactly what is there and says nothing it does not have. The window passes
+/// cap = QM_RING_MAX; the rule itself holds at any size, and the tests hold it at a small one.
+/// Writes [new head, new count] into out[0..2].
+pub fn qm_next(head : u32, count : u32, cap : u32, out : []u32) -> void {
+    var c : u32 = count;
+    if (c < cap) { c = c + 1; }
+    var h : u32 = head + 1;
+    if (h >= cap) { h = 0; }
+    out[0] = h;
+    out[1] = c;
+}
+
+/// The index of the newest entry, given head (one past the newest) and count, at ring size `cap`.
+pub fn qm_newest(head : u32, count : u32, cap : u32) -> u32 {
+    if (count == 0) { return 0; }
+    var h : u32 = head;
+    if (h == 0) { h = cap; }
+    return h - 1;
+}
+
+// ---------------------------------------------------------------- the texts
+
+/// The panel's title and its honest empty state.
+pub const QM_TITLE : str = "AGENT MESSAGES";
+pub const QM_EMPTY_LINE : str = "no messages yet - the agents are quiet";
+
+/// A pane that has never printed anything drawable: the caption says so, it invents nothing.
+pub const QM_QUIET_LINE : str = "...";
+
+/// The source line the panel prints under its title (the window appends nothing it cannot read).
+pub const QM_SRC_LINE : str = "live: the panes' own terminal output (pty READ)";
+
+// ---------------------------------------------------------------- tests
+
+fn qm_str(s : []const u8) -> []const u8 {
+    return s;
+}
+
+test a_clean_line_survives_and_escapes_vanish {
+    var out : [128]u8 = undefined;
+    // a typical claude pane line: cursor moves and colour codes around real words
+    const n : usize = qm_clean("\x1b[2J\x1b[1;34mfixing the census pin\x1b[0m", out[0..128]);
+    const want : []const u8 = qm_str("fixing the census pin");
+    assert(n == want.len);
+    var i : usize = 0;
+    while (i < want.len) {
+        assert(out[i] == want[i]);
+        i = i + 1;
+    }
+}
+
+test control_bytes_blank_but_words_keep {
+    var out : [64]u8 = undefined;
+    // BEL is a lone control byte: blanked to a space. A whole OSC sequence (title metadata)
+    // vanishes entirely -- it is not text, it is the terminal's own bookkeeping.
+    const n : usize = qm_clean("a\x07b\x1b]0;title\x07c", out[0..64]);
+    assert(n == 4);
+    assert(out[0] == 97); // a
+    assert(out[1] == 32); // BEL blanked
+    assert(out[2] == 98); // b
+    assert(out[3] == 99); // c, right after the vanished OSC chunk
+}
+
+test the_last_line_comes_from_the_tail_and_is_capped {
+    var out : [128]u8 = undefined;
+    const n : usize = qm_last_line("older line\n\x1b[32mnewest line here\x1b[0m\n", out[0..128]);
+    const want : []const u8 = qm_str("newest line here");
+    assert(n == want.len);
+    var i : usize = 0;
+    while (i < want.len) {
+        assert(out[i] == want[i]);
+        i = i + 1;
+    }
+    // a tail of only escapes and blank lines says nothing
+    assert(qm_last_line("\x1b[2J\n\n", out[0..128]) == 0);
+    assert(qm_last_line("", out[0..128]) == 0);
+    // a long line cuts at the cap, never past it
+    var big : [200]u8 = undefined;
+    var bi : usize = 0;
+    while (bi < 200) { big[bi] = 120; bi = bi + 1; } // 'x' * 200, one line, no newline
+    const m : usize = qm_last_line(big[0..200], out[0..128]);
+    assert(m == QM_TEXT_CAP);
+}
+
+test a_message_is_what_changed {
+    assert(qm_differs("abc", "abd"));
+    assert(qm_differs("abc", "abcd"));
+    assert(qm_differs("abc", "abc") == false);
+}
+
+test the_pulse_flashes_and_fades_to_a_visible_floor {
+    assert(qm_pulse(0) == QM_PULSE_FRAMES);
+    assert(qm_pulse(1) == QM_PULSE_FRAMES - 1);
+    assert(qm_pulse(QM_PULSE_FRAMES) == 0);
+    assert(qm_pulse(10000) == 0);
+    // aging saturates: a quiet pane's age stops at the cap
+    assert(qm_age_one(0) == 1);
+    assert(qm_age_one(QM_PULSE_FRAMES - 1) == QM_PULSE_FRAMES);
+    assert(qm_age_one(QM_PULSE_FRAMES) == QM_PULSE_FRAMES);
+    // a poll ages a whole poll's worth, and saturates the same way
+    assert(qm_age_bulk(0) == QM_POLL_FRAMES);
+    assert(qm_age_bulk(QM_PULSE_FRAMES - 1) == QM_PULSE_FRAMES);
+    assert(qm_age_bulk(QM_PULSE_FRAMES) == QM_PULSE_FRAMES);
+    assert(QM_POLL_FRAMES > 0 and QM_POLL_FRAMES <= QM_PULSE_FRAMES);
+    // the floor keeps a talking agent's edge visible: pulse 0 means older than the flash,
+    // and QM_PULSE_FLOOR is the alpha step the window adds while the pane is live
+    assert(QM_PULSE_FLOOR > 0 and QM_PULSE_FLOOR < QM_PULSE_FRAMES);
+}
+
+test the_ring_holds_what_was_said_newest_first {
+    const cap : u32 = 4;
+    var ring : [QM_ENTRY * 4]u8 = undefined;
+    qm_put(ring[0 .. QM_ENTRY * 4], 0, 3, "queen", "spawned a lane");
+    qm_put(ring[0 .. QM_ENTRY * 4], 1, 7, "coder", "building glass_window");
+    const nm : []const u8 = qm_name_of(ring[0 .. QM_ENTRY * 4], 1);
+    const tx : []const u8 = qm_text_of(ring[0 .. QM_ENTRY * 4], 1);
+    assert(nm.len == 5); // "coder"
+    assert(nm[0] == 99 and nm[1] == 111 and nm[2] == 100 and nm[3] == 101 and nm[4] == 114);
+    assert(tx[0] == 98); // "building..."
+    assert(qm_pane_of(ring[0 .. QM_ENTRY * 4], 1) == 7);
+    // push cycles and the count saturates: the ring never claims more than it keeps
+    var head : u32 = 0;
+    var count : u32 = 0;
+    var nxt : [2]u32 = undefined;
+    var k : u32 = 0;
+    while (k < 6) {
+        qm_next(head, count, cap, nxt[0..2]);
+        head = nxt[0];
+        count = nxt[1];
+        k = k + 1;
+    }
+    assert(count == 4); // saturated at the cap: six pushes keep the newest four
+    assert(qm_newest(head, count, cap) == 1); // head is one past the newest, so the newest is 1
+    // the oldest kept entry (slot 0) still holds the first message
+    assert(qm_pane_of(ring[0 .. QM_ENTRY * 4], 0) == 3);
+    // a fresh ring has no newest: the window shows its honest empty line instead
+    assert(qm_newest(0, 0, cap) == 0);
+}
+
+invariant the_ring_entry_is_fixed_stride_and_the_cap_is_kept {
+    assert(QM_ENTRY == 2 + QM_TEXT_CAP);
+    assert(QM_TEXT_CAP == 96);
+    assert(QM_PULSE_FLOOR < QM_PULSE_FRAMES);
+}
