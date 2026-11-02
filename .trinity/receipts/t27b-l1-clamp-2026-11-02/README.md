@@ -366,7 +366,11 @@ numbers wrong. The input column is what makes that visible instead of silent.
 
 Both with the snapshot's `t27b` (sha256 `ee89c7d27724dc11`). If a committed
 disassembly is wanted, it needs a path the gate accepts -- a generator with a
-`.t27` source, not a rename.
+`.t27` source, not a rename. The reason is named rather than assumed: `asm` is
+in `FOREIGN_EXTS` (`specs/policy/own_language.t27:98`), so a 217-line and a
+1329-line listing are 1546 added foreign lines against a per-file cap of 40 and
+a net-zero rule, and no label lifts either. Hence the hashes above, which a
+reviewer can reproduce with the command in the last column.
 
 ## 7. What is not covered
 
