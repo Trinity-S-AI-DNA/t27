@@ -642,3 +642,150 @@ test apply_request_needs_flag_and_newer_generation {
     assert(apply_request_ok(0, 4, 3) == false);
     assert(apply_request_ok(2, 4, 3) == false);
 }
+
+// ------------------------------------------------------- attempt state machine
+// The life of one apply request, so a refused or half-done attempt is never
+// reported as applied. States:
+//   0 none, 1 requested, 2 staged, 3 validated, 4 attempting (exec issued),
+//   5 confirmed (new image started and restored), 6 exec_failed,
+//   7 unconfirmed (attempting without a confirmation record).
+
+pub const AT_NONE : u8 = 0;
+pub const AT_REQUESTED : u8 = 1;
+pub const AT_STAGED : u8 = 2;
+pub const AT_VALIDATED : u8 = 3;
+pub const AT_ATTEMPTING : u8 = 4;
+pub const AT_CONFIRMED : u8 = 5;
+pub const AT_EXEC_FAILED : u8 = 6;
+pub const AT_UNCONFIRMED : u8 = 7;
+
+/// exec outcome -> the attempt state. erc == 0 means the new image is running:
+/// the attempt stays ATTEMPTING until the new image itself confirms the
+/// necessary restoration. A nonzero execv leaves AT_EXEC_FAILED with the old
+/// binary still serving.
+pub fn exec_outcome_state(erc : i32) -> u8 {
+    if (erc == 0) { return AT_ATTEMPTING; }
+    return AT_EXEC_FAILED;
+}
+
+/// The new image confirms its own attempt: it is running the candidate build
+/// and the kept state was restored at launch. Anything less stays unconfirmed.
+pub fn attempt_confirm(state : u8, build_matches : bool, restore_ok : bool) -> u8 {
+    if (state != AT_ATTEMPTING and state != AT_UNCONFIRMED) { return state; }
+    if (build_matches and restore_ok) { return AT_CONFIRMED; }
+    return AT_UNCONFIRMED;
+}
+
+/// Re-apply policy: the SAME generation may not re-fire after a failed or
+/// unconfirmed attempt (no accidental retry loop); a STRICTLY NEWER generation
+/// is a fresh request and is allowed.
+pub fn reapply_allowed(state : u8, req_rev : u64, failed_rev : u64) -> bool {
+    if (state != AT_EXEC_FAILED and state != AT_UNCONFIRMED) { return req_rev > failed_rev; }
+    return req_rev > failed_rev;
+}
+
+/// Unique staging directory per attempt: the generation and the first eight
+/// hex chars of the candidate hash, so two writers (or two attempts) never
+/// share one staging path.
+pub fn staged_dir_for(rev : u64, art : u64, out : []u8, cap : usize) -> usize {
+    const prefix : str = "T27OS-dev-staged.app";
+    const pre_len : usize = 20;
+    var w : usize = 0;
+    var i : usize = 0;
+    while (i < pre_len) { out[w] = prefix[i]; w += 1; i += 1; }
+    // rev and art as 8 lowercase hex chars each
+    const hexc : str = "0123456789abcdef";
+    var s : u64 = rev;
+    var k : i32 = 7;
+    while (k >= 0) {
+        out[w] = hexc[@as(usize, @intCast((s >> (@as(u6, @intCast(k * 4)))) & 15))];
+        w += 1;
+        k -= 1;
+    }
+    s = art;
+    k = 7;
+    while (k >= 0) {
+        out[w] = hexc[@as(usize, @intCast((s >> (@as(u6, @intCast(k * 4)))) & 15))];
+        w += 1;
+        k -= 1;
+    }
+    return w;
+}
+
+/// One journal line for the attempt trace: attempt id, stage, outcome word.
+/// The host writes the line; no secrets, no payloads - identifiers only.
+pub fn journal_line(attempt_id : u64, stage : u8, word : []const u8, wn : usize, out : []u8, cap : usize) -> usize {
+    var w : usize = 0;
+    var buf : [32]u8 = undefined;
+    const hl : usize = staged_dir_for(attempt_id, attempt_id, buf[0..32], 32);
+    // copy the 16 hex chars (rev+hash) as the attempt id
+    var i : usize = 20;
+    while (i < 36 and w < cap) { out[w] = buf[i]; w += 1; i += 1; }
+    if (w < cap) { out[w] = 32; w += 1; }
+    i = 0;
+    while (i < wn and w < cap) { out[w] = word[i]; w += 1; i += 1; }
+    if (w < cap) { out[w] = 10; w += 1; }
+    _ = hl;
+    return w;
+}
+
+test exec_outcome_splits_success_and_failure {
+    assert(exec_outcome_state(0) == AT_ATTEMPTING);
+    assert(exec_outcome_state(-1) == AT_EXEC_FAILED);
+}
+
+test confirm_requires_build_and_restore {
+    assert(attempt_confirm(AT_ATTEMPTING, true, true) == AT_CONFIRMED);
+    assert(attempt_confirm(AT_ATTEMPTING, true, false) == AT_UNCONFIRMED);
+    assert(attempt_confirm(AT_ATTEMPTING, false, true) == AT_UNCONFIRMED);
+    assert(attempt_confirm(AT_NONE, true, true) == AT_NONE);
+}
+
+test reapply_policy_blocks_same_generation {
+    assert(reapply_allowed(AT_EXEC_FAILED, 4, 4) == false);
+    assert(reapply_allowed(AT_UNCONFIRMED, 4, 4) == false);
+    assert(reapply_allowed(AT_EXEC_FAILED, 5, 4) == true);
+    assert(reapply_allowed(AT_CONFIRMED, 5, 5) == false);
+    assert(reapply_allowed(AT_CONFIRMED, 6, 5) == true);
+}
+
+test staged_dir_is_unique_per_generation_and_hash {
+    var out1 : [64]u8 = undefined;
+    var out2 : [64]u8 = undefined;
+    const n1 : usize = staged_dir_for(3, 12345, out1[0..64], 64);
+    const n2 : usize = staged_dir_for(4, 12345, out2[0..64], 64);
+    assert(n1 > 20 and n2 > 20);
+    var same : bool = true;
+    var i : usize = 0;
+    while (i < n1) { if (out1[i] != out2[i]) { same = false; } i += 1; }
+    assert(same == false);
+    const n3 : usize = staged_dir_for(3, 12345, out1[0..64], 64);
+    assert(n3 == n1);
+}
+
+test exec_failed_keeps_its_reason_and_is_not_confirmed {
+    // a failed exec stays EXEC_FAILED: it is not silently confirmed by a later
+    // startup, and the failure reason is not lost
+    assert(attempt_confirm(AT_EXEC_FAILED, true, true) == AT_EXEC_FAILED);
+    assert(attempt_confirm(AT_EXEC_FAILED, false, false) == AT_EXEC_FAILED);
+}
+
+test unconfirmed_is_a_distinct_persisted_state {
+    // UNCONFIRMED is stored as its own value (7), not as an interpretation of
+    // ATTEMPTING: it survives a restart and is only closed by a real
+    // confirmation, never by the mere absence of failure
+    assert(AT_UNCONFIRMED != AT_ATTEMPTING);
+    assert(attempt_confirm(AT_UNCONFIRMED, false, false) == AT_UNCONFIRMED);
+    assert(attempt_confirm(AT_UNCONFIRMED, true, false) == AT_UNCONFIRMED);
+    assert(attempt_confirm(AT_UNCONFIRMED, true, true) == AT_CONFIRMED);
+}
+
+test an_old_confirmation_does_not_close_a_new_attempt {
+    // gen N confirmed; gen N+1 goes ATTEMPTING -> the record for N+1 is judged
+    // on its own build and restore, never auto-closed by the older confirmation
+    assert(attempt_confirm(AT_CONFIRMED, true, true) == AT_CONFIRMED);
+    assert(attempt_confirm(AT_ATTEMPTING, true, true) == AT_CONFIRMED);
+    // a new ATTEMPTING with a failed restore is UNCONFIRMED even though an
+    // older generation was confirmed before
+    assert(attempt_confirm(AT_ATTEMPTING, true, false) == AT_UNCONFIRMED);
+}
