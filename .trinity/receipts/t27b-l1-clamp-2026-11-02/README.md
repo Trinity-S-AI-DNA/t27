@@ -354,7 +354,8 @@ disassembly is wanted, it needs a path the gate accepts -- a generator with a
 |---|---|
 | `cf503a566abd18ec24c1f88a6dfdc646616c7c9b` | the two new specs, the matrix's noisy-row rule, this receipt |
 | `df4daec11661d0eeffefbf9a7cf049b0ca02a379` | `pr-body.md`, the text of the publication request |
-| the head commit | this section (a commit cannot carry its own hash; read it with `git log -1`) |
+| `d7a6f7b76e64807bd134cb444116dff76a24da50` | this section |
+| `2109e3739a` and later | section 9 and anything after it. A commit cannot carry its own hash, so this table stops here rather than chasing the head; `git log --oneline origin/master..HEAD` is the current list |
 
 `git merge-tree --write-tree HEAD origin/master` returns rc 0 against
 `origin/master` = `0215bd7223c646ceb57d1a468b16a263018aba3c`, so GitHub can
