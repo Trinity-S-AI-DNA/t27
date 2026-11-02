@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/policy/json_int53.t27 -- a 64-bit integer does not travel as a bare JSON number.
+; A JSON number has no width, but the reader that matters here does: JavaScript (trinity's website,
+; the t27f wasm host, the t27-mcp server) reads every JSON number into an f64. An integer above
+; 2^53 - 1 comes back as the nearest multiple of 2, 4, 8, ... : 9007199254740993 is read as
+; 9007199254740992 (test the_negative_control_9007199254740993_reads_as_9007199254740992), and the f64
+; bit pattern 0x7FF8000000000001 (a NaN payload) as 0x7FF8000000000000. Nothing throws; the number is
+; simply another number. Idea taken from morluto/rea 6.6.0, which fixed the same defect three times
+; (signed 64-bit TOML integers, Android version_code, plist integers).
+; --
+; The rule, for every JSON document a t27 tool writes and every JS value `t27c gen-js` prints:
+; - a 64-bit (or wider) integer goes out as a STRING, decimal or 0x-hex, never as a bare number; or
+; - it carries a proof that it is <= 2^53 - 1 (a loop bound, a count, a width), and then it may stay a
+;   number. form_of() decides which. An unproven u64 is a string.
+; - a float is a float: a decimal point or exponent makes a token a float literal, which a JS reader
+;   rounds the way the spec already says it is rounded. This rule is about integers only.
+; --
+; The scanner finds bare integers the rule forbids. Inside a JSON string nothing is scanned, so
+; "0x7FF8000000000001" and "9007199254740993" are the compliant spellings and pass. A digit run is
+; unsafe when its value exceeds 2^53 - 1 = 9007199254740991; the sign does not matter (the magnitude
+; is what a double cannot hold). The comparison is on the digits as text, so the scanner itself needs
+; no 64-bit arithmetic, which is the point: it must not use a number type that would round.
+; --
+; Measured 2026-10-18 (gHashTag/t27 @ 03c6be104, docs/reports/2026-10-18-json-int53-measured.md):
+; 35 (file, field) pairs in 32 committed JSON files carry 2225 bare integers above 2^53 - 1, all in
+; conformance/vectors/*.json (written by hand-written Python generators, not by t27c) except the
+; one deliberate 2^53 boundary id in conformance/tmem_bridge.json; and 121
+; `export const` lines that `t27c gen-js` prints as bare number literals above 2^53 - 1, from 53
+; specs, among them the Providers token supply SUPPLY_NGONKA = 446378386939836973.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module PolicyJsonInt53;
+
+/// 2^53 - 1, the largest integer every double holds exactly, and 2^53, the first one that shares its
+/// double with a neighbour. Number.isSafeInteger(2^53) is false for that reason.
+pub const SAFE_MAX : u64 = 9007199254740991;
+pub const TWO_53 : u64 = 9007199254740992;
+
+/// SAFE_MAX as ASCII digits (57 is the digit 9): its length is the longest digit run that can still be safe.
+pub const SAFE_MAX_DIGITS : [16]u8 = [57, 48, 48, 55, 49, 57, 57, 50, 53, 52, 55, 52, 48, 57, 57, 49];
+pub const SAFE_MAX_LEN : usize = 16;
+
+/// Bits a bare JSON number may use: 53 value bits. Wider integers go out as strings.
+pub const SAFE_BITS : u32 = 53;
+
+/// Verdicts of form_of().
+pub const FORM_NUMBER : u8 = 0;
+pub const FORM_STRING : u8 = 1;
+
+/// The bytes the scanner reads, by number (t27c does not read escapes in char literals).
+pub const C_QUOTE : u8 = 34;
+pub const C_BACKSLASH : u8 = 92;
+pub const C_MINUS : u8 = 45;
+pub const C_PLUS : u8 = 43;
+pub const C_DOT : u8 = 46;
+pub const C_E_UP : u8 = 69;
+pub const C_E_LOW : u8 = 101;
+pub const C_ZERO : u8 = 48;
+pub const C_NINE : u8 = 57;
+
+/// How a field of `width` bits, with a proven magnitude bound of `proven_bits` bits (0 = no proof),
+/// goes out. A 64-bit field with no proof is a string; a 64-bit field proven to hold 40-bit values
+/// may stay a number; a u32 is a number without a proof because its width is the proof.
+pub fn form_of(width: u32, proven_bits: u32) -> u8 {
+    if (width <= SAFE_BITS) { return FORM_NUMBER; }
+    if (proven_bits != 0 and proven_bits <= SAFE_BITS) { return FORM_NUMBER; }
+    return FORM_STRING;
+}
+
+/// Is v a value a JS reader gives back unchanged?
+pub fn is_safe(v: u64) -> bool {
+    return v <= SAFE_MAX;
+}
+
+/// The value a JS reader gives back for v: v rounded to the nearest double (ties to even) and back.
+/// Defined for v below 2^63, where the double converts back to a u64 without overflow.
+pub fn js_reads(v: u64) -> u64 {
+    const d : f64 = v as f64;
+    return d as u64;
+}
+
+/// Is c an ASCII digit?
+pub fn is_digit(c: u8) -> bool {
+    return c >= C_ZERO and c <= C_NINE;
+}
+
+/// Is the digit run buf[s..e) (no sign) above 2^53 - 1? Leading zeros do not count.
+pub fn run_unsafe(buf: []const u8, s: usize, e: usize) -> bool {
+    var a : usize = s;
+    while (a + 1 < e and buf[a] == C_ZERO) { a = a + 1; }
+    const len : usize = e - a;
+    if (len < SAFE_MAX_LEN) { return false; }
+    if (len > SAFE_MAX_LEN) { return true; }
+    var i : usize = 0;
+    while (i < SAFE_MAX_LEN) {
+        const c : u8 = buf[a + i];
+        const m : u8 = SAFE_MAX_DIGITS[i];
+        if (c != m) { return c > m; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Index just past the JSON string whose opening quote is at buf[i], or n when it is not closed.
+pub fn string_end(buf: []const u8, n: usize, i: usize) -> usize {
+    var k : usize = i + 1;
+    while (k < n and buf[k] != C_QUOTE) {
+        if (buf[k] == C_BACKSLASH) { k = k + 2; } else { k = k + 1; }
+    }
+    if (k >= n) { return n; }
+    return k + 1;
+}
+
+/// Index just past the number token that starts at buf[i] (a '-' or a digit).
+pub fn number_end(buf: []const u8, n: usize, i: usize) -> usize {
+    var k : usize = i + 1;
+    while (k < n) {
+        const c : u8 = buf[k];
+        if (is_digit(c) or c == C_DOT or c == C_E_UP or c == C_E_LOW or c == C_PLUS or c == C_MINUS) {
+            k = k + 1;
+        } else {
+            return k;
+        }
+    }
+    return n;
+}
+
+/// Is the number token buf[s..e) an integer, with no decimal point and no exponent?
+pub fn is_integer_token(buf: []const u8, s: usize, e: usize) -> bool {
+    var i : usize = s;
+    while (i < e) {
+        if (buf[i] == C_DOT or buf[i] == C_E_UP or buf[i] == C_E_LOW) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Offset of the first digit-or-minus of the next bare integer above 2^53 - 1 at or after `from`,
+/// or n when there is none. Strings are skipped whole.
+pub fn next_unsafe(buf: []const u8, n: usize, from: usize) -> usize {
+    var i : usize = from;
+    while (i < n) {
+        const c : u8 = buf[i];
+        if (c == C_QUOTE) {
+            i = string_end(buf, n, i);
+        } else if (c == C_MINUS or is_digit(c)) {
+            const e : usize = number_end(buf, n, i);
+            if (is_integer_token(buf, i, e)) {
+                var s : usize = i;
+                if (buf[s] == C_MINUS) { s = s + 1; }
+                if (run_unsafe(buf, s, e)) { return i; }
+            }
+            i = e;
+        } else {
+            i = i + 1;
+        }
+    }
+    return n;
+}
+
+/// How many bare integers above 2^53 - 1 buf[0..n] holds.
+pub fn unsafe_count(buf: []const u8, n: usize) -> u32 {
+    var count : u32 = 0;
+    var at : usize = next_unsafe(buf, n, 0);
+    while (at < n) {
+        count = count + 1;
+        at = next_unsafe(buf, n, number_end(buf, n, at));
+    }
+    return count;
+}
+
+/// 1-based line of the first bare integer above 2^53 - 1, or 0 when there is none, so CI can print
+/// path:line.
+pub fn first_unsafe_line(buf: []const u8, n: usize) -> u32 {
+    const at : usize = next_unsafe(buf, n, 0);
+    if (at >= n) { return 0; }
+    var line : u32 = 1;
+    var i : usize = 0;
+    while (i < at) {
+        if (buf[i] == 10) { line = line + 1; }
+        i = i + 1;
+    }
+    return line;
+}
+
+; --- The negative control: the rounding itself ---------------------------------------------------------
+
+test the_negative_control_9007199254740993_reads_as_9007199254740992 {
+    assert js_reads(9007199254740993) == 9007199254740992;
+    assert js_reads(9007199254740993) != 9007199254740993;
+    assert js_reads(9007199254740995) == 9007199254740996;
+}
+
+test the_last_safe_integer_is_read_back_unchanged {
+    assert js_reads(9007199254740991) == 9007199254740991;
+    assert js_reads(9007199254740992) == 9007199254740992;
+    assert js_reads(1234567890123) == 1234567890123;
+    assert is_safe(9007199254740991);
+    assert is_safe(9007199254740992) == false;
+    assert TWO_53 == SAFE_MAX + 1;
+}
+
+test an_f64_nan_payload_does_not_survive_a_json_number {
+    assert js_reads(0x7FF8000000000001) == 0x7FF8000000000000;
+    assert js_reads(0x7FF8000000000001) != 0x7FF8000000000001;
+    assert js_reads(0x7FF0000000000000) == 0x7FF0000000000000;
+}
+
+test a_u64_hash_does_not_survive_a_json_number {
+    assert js_reads(0x0CBF29CE484222FF) != 0x0CBF29CE484222FF;
+    assert js_reads(0x0CBF29CE484222FF) - 0x0CBF29CE48422000 < 1024;
+}
+
+test the_measured_token_supply_is_not_a_safe_integer {
+    assert is_safe(446378386939836973) == false;
+    assert js_reads(446378386939836973) != 446378386939836973;
+    assert is_safe(1174606773777);
+    assert is_safe(1284341372978310);
+}
+
+; --- The form a field goes out in ----------------------------------------------------------------------
+
+test a_wide_field_is_a_string_unless_it_is_proven_small {
+    assert form_of(8, 0) == FORM_NUMBER;
+    assert form_of(32, 0) == FORM_NUMBER;
+    assert form_of(53, 0) == FORM_NUMBER;
+    assert form_of(64, 0) == FORM_STRING;
+    assert form_of(128, 0) == FORM_STRING;
+    assert form_of(64, 40) == FORM_NUMBER;
+    assert form_of(64, 53) == FORM_NUMBER;
+    assert form_of(64, 54) == FORM_STRING;
+    assert form_of(128, 64) == FORM_STRING;
+}
+
+; --- The digit run ----------------------------------------------------------------------------------------
+
+test a_digit_run_is_unsafe_exactly_above_two_to_the_53_minus_1 {
+    assert run_unsafe("9007199254740991", 0, 16) == false;
+    assert run_unsafe("9007199254740992", 0, 16);
+    assert run_unsafe("9007199254740993", 0, 16);
+    assert run_unsafe("9999999999999999", 0, 16);
+    assert run_unsafe("9007199254740990", 0, 16) == false;
+    assert run_unsafe("1000000000000000", 0, 16) == false;
+    assert run_unsafe("999999999999999", 0, 15) == false;
+    assert run_unsafe("10000000000000000", 0, 17);
+    assert run_unsafe("18446744073709551615", 0, 20);
+}
+
+test leading_zeros_and_short_runs_are_not_counted {
+    assert run_unsafe("0", 0, 1) == false;
+    assert run_unsafe("0009007199254740991", 0, 19) == false;
+    assert run_unsafe("0009007199254740992", 0, 19);
+    assert run_unsafe("00000000000000000000", 0, 20) == false;
+    assert run_unsafe("", 0, 0) == false;
+}
+
+; --- The scanner ------------------------------------------------------------------------------------------
+; Each input is a const so its length comes from `.len`, not from a hand count that could cut the scan short.
+
+test a_bare_integer_above_the_bound_is_found_with_its_line {
+    const one : str = "{\"a\": 9007199254740993}";
+    assert unsafe_count(one, one.len) == 1;
+    assert first_unsafe_line(one, one.len) == 1;
+    const lines : str = "{\n\"a\": 1,\n\"b\": 9007199254740993\n}";
+    assert first_unsafe_line(lines, lines.len) == 3;
+    const two : str = "[1, 2, 18446744073709551615, -9223372036854775808, 3]";
+    assert unsafe_count(two, two.len) == 2;
+}
+
+test a_bare_integer_at_or_below_the_bound_passes {
+    const ok : str = "{\"a\": 9007199254740991, \"b\": -9007199254740991, \"c\": 0}";
+    assert unsafe_count(ok, ok.len) == 0;
+    const empty_list : str = "[]";
+    assert unsafe_count(empty_list, empty_list.len) == 0;
+    assert unsafe_count("", 0) == 0;
+    const small : str = "{\"a\": 1}";
+    assert first_unsafe_line(small, small.len) == 0;
+}
+
+test a_negative_integer_is_judged_by_its_magnitude {
+    const over : str = "[-9007199254740992]";
+    assert unsafe_count(over, over.len) == 1;
+    const edge : str = "[-9007199254740991]";
+    assert unsafe_count(edge, edge.len) == 0;
+}
+
+test a_string_spelling_passes_and_a_bare_one_after_it_is_still_found {
+    const dec : str = "{\"bits\": \"9007199254740993\"}";
+    assert unsafe_count(dec, dec.len) == 0;
+    const hex : str = "{\"bits\": \"0x7FF8000000000001\"}";
+    assert unsafe_count(hex, hex.len) == 0;
+    const esc : str = "{\"k\": \"a \\\" 99999999999999999999 b\"}";
+    assert unsafe_count(esc, esc.len) == 0;
+    const esc_then_bare : str = "{\"k\": \"a \\\" 99999999999999999999 b\", \"z\": 99999999999999999999}";
+    assert unsafe_count(esc_then_bare, esc_then_bare.len) == 1;
+    const unclosed : str = "{\"k\": \"99999999999999999999";
+    assert unsafe_count(unclosed, unclosed.len) == 0;
+}
+
+test a_float_literal_is_not_this_rules_business_and_the_bare_integer_is {
+    const f1 : str = "[99999999999999999999.0]";
+    assert unsafe_count(f1, f1.len) == 0;
+    const f2 : str = "[1e300]";
+    assert unsafe_count(f2, f2.len) == 0;
+    const f3 : str = "[1.618033988749894848]";
+    assert unsafe_count(f3, f3.len) == 0;
+    const bare : str = "[99999999999999999999]";
+    assert unsafe_count(bare, bare.len) == 1;
+}
+
+test the_measured_conformance_vector_line_is_found {
+    const bits : str = "{\"binary64_bits_int\": 4607182418800017408}";
+    assert unsafe_count(bits, bits.len) == 1;
+    const as_string : str = "{\"binary64_bits_int\": \"4607182418800017408\"}";
+    assert unsafe_count(as_string, as_string.len) == 0;
+    const bias : str = "{\"bias\": 79228162514264337593543950335}";
+    assert unsafe_count(bias, bias.len) == 1;
+}
+
+test the_rpc_id_vectors_of_tmem_bridge_sit_exactly_on_the_bound {
+    const max : str = "{\"id\": 9007199254740991}";
+    assert unsafe_count(max, max.len) == 0;
+    const min : str = "{\"id\": -9007199254740991}";
+    assert unsafe_count(min, min.len) == 0;
+    const over : str = "{\"id\": 9007199254740992}";
+    assert unsafe_count(over, over.len) == 1;
+}
+
+test every_bare_integer_is_counted_not_only_the_first {
+    const many : str = "{\"a\": 18446744073709551615, \"b\": [9007199254740993, 5, -9223372036854775808], \"c\": \"x\", \"d\": 1}";
+    assert unsafe_count(many, many.len) == 3;
+}

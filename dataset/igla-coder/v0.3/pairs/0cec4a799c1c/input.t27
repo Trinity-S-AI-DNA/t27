@@ -1,0 +1,1194 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/ts_emit.t27 -- the writer of `t27b ts` (issue #9994, phase 1). It walks the t27c AST of one
+; spec, as `flat` in cli/t27b/src/lower.rs writes it (see specs/tri/t27b/ast_walk.t27), and writes a
+; TypeScript module: the spec's consts, its pure scalar fns with their real bodies, and each test and
+; invariant as an exported self-check. Every decision it takes is in specs/tri/t27b/ts_plan.t27; this file
+; only spells them. It reaches cli/t27b only through `t27c gen-rust` (gen/rust/tri/t27b/ts_emit.rs).
+; --
+; The entry point is emit(nodes, text, meta, ptext, work, out), with the arguments of verilog_emit.t27's
+; emit, so the CLI calls either the same way: the AST records and their text; per node a meta record of four
+; u32 (flags, line, params span; verilog_plan.t27); the params text; a work area (unused here); the output
+; buffer. It returns the length of the TypeScript it wrote at out[0 ..], or minus the length of the refusal
+; it wrote there instead: "t27b: ts: unsupported construct <what> `<name>` at line <n>". A refusal writes no
+; TypeScript at all: a module that lowers in part would be a module that lies about the spec.
+; --
+; The output. A header naming the module, ts_plan.t27's prelude, then the items in the order of the spec:
+; `[export ]const N: number = e;`, `[export ]function f(p: number): number { ... }`, and
+; `export function t27_test_<name>(): number`, which zeroes t27_n, runs the body and returns how many
+; asserts ran. Then the tables t27_tests and t27_invariants and ts_plan.t27's coda (t27_report,
+; t27_failures). Node 24 runs it as `.mts`, stripping the types.
+; --
+; A module-level const is written by name inside a fn or a test, which run after the module is evaluated;
+; inside another module-level const's value it is folded to its value when it folds, so the order of the
+; consts in the spec does not matter. A const whose value does not fold and names a const declared below it
+; is the one case left to TypeScript's temporal dead zone (it throws ReferenceError at load).
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bTsEmit;
+
+use tri::t27b::ts_plan;
+use tri::t27b::text_escape;
+use tri::t27b::emit_kit; // byte writers, to_front, line_near, resolve and symbols, test trees
+
+// ----------------------------------------------------------------------------------------------------------
+// Writing bytes.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Writes v in decimal; a negative value in parentheses, `(-5)`, so no operator before it reads it
+/// otherwise.
+pub fn put_i64(out: []u8, at: usize, v: i64) -> usize {
+    if (v < 0) {
+        var q : usize = put_text(out, at, "(-");
+        const m : u64 = (0 - v) as u64;
+        q = put_dec(out, q, m);
+        return put_text(out, q, ")");
+    }
+    const u : u64 = v as u64;
+    return put_dec(out, at, u);
+}
+
+/// Writes v as a value of the scalar type t: `true`/`false` for a bool, the number for an integer.
+pub fn put_lit(out: []u8, at: usize, v: i64, t: i64) -> usize {
+    if (t == TS_BOOL) {
+        if (v == 0) { return put_text(out, at, "false"); }
+        return put_text(out, at, "true");
+    }
+    return put_i64(out, at, v);
+}
+
+/// Writes the signedness argument of t27_wrap, t27_shl and t27_shr and the closing parenthesis.
+pub fn put_sign(out: []u8, at: usize, t: i64) -> usize {
+    if (ts_signed(t)) { return put_text(out, at, ", true)"); }
+    return put_text(out, at, ", false)");
+}
+
+/// Writes a refusal at the end of out: "t27b: ts: unsupported construct <what> `<name>` at line <n>", the
+/// name being text[a .. b] (none when a == b). Returns minus its length.
+pub fn fail(out: []u8, nodes: []const u8, meta: []const u8, text: []const u8, i: usize, what: str, a: usize, b: usize) -> i64 {
+    const base : usize = out.len - MSG_ROOM;
+    var q : usize = put_text(out, base, "t27b: ts: unsupported construct ");
+    q = put_text(out, q, what);
+    if (b > a) {
+        var nb : usize = b;
+        if (nb - a > NAME_CAP) { nb = a + NAME_CAP; }
+        q = put_text(out, q, " `");
+        q = put_bytes(out, q, text, a, nb);
+        q = put_text(out, q, "`");
+    }
+    q = put_text(out, q, " at line ");
+    q = put_dec(out, q, line_near(nodes, meta, i) as u64);
+    const len : i64 = @intCast(q - base);
+    return 0 - len;
+}
+
+/// A refusal with no node, written at the front.
+pub fn fail_front(out: []u8, what: str) -> i64 {
+    var q : usize = put_text(out, 0, "t27b: ts: unsupported construct ");
+    q = put_text(out, q, what);
+    const l : i64 = @intCast(q);
+    return 0 - l;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Names, scopes and types.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Is c a byte of an identifier (a letter, `_`, or a digit when it is not the first)?
+pub fn name_char(c: u8, first: bool) -> bool {
+    if (c == 95) { return true; }
+    if ((c >= 97 and c <= 122) or (c >= 65 and c <= 90)) { return true; }
+    return !first and c >= 48 and c <= 57;
+}
+
+/// Is s[a .. b] an identifier?
+pub fn is_ident(s: []const u8, a: usize, b: usize) -> bool {
+    if (b <= a) { return false; }
+    if (!name_char(s[a], true)) { return false; }
+    var j : usize = a + 1;
+    while (j < b) {
+        if (!name_char(s[j], false)) { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// Is s[a .. b] a name the TypeScript cannot declare as it is: no identifier, or one ts_plan.t27 reserves?
+pub fn bad_name(s: []const u8, a: usize, b: usize) -> bool {
+    if (!is_ident(s, a, b)) { return true; }
+    return ts_reserved(s[a .. b]);
+}
+
+/// The type code of parameter k of `item`.
+pub fn param_type(meta: []const u8, ptext: []const u8, item: usize, k: usize) -> i64 {
+    const s : usize = param_name_lo(meta, ptext, item, k);
+    const e : usize = line_stop(ptext, s, params_hi(meta, item));
+    const c : usize = colon_at(ptext, s, e);
+    if (c >= e) { return TS_BAD; }
+    return ts_type(ptext, c + 1, e);
+}
+
+/// The tag of a symbol.
+pub fn sym_tag(s: i64) -> i64 {
+    const t : i64 = @divTrunc(s, SYM_UNIT);
+    return t;
+}
+
+/// The type of a symbol (a local, a parameter, a top-level const).
+pub fn sym_type(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, s: i64, depth: usize) -> i64 {
+    const tg : i64 = sym_tag(s);
+    const at : usize = sym_at(s);
+    if (tg == SYM_PARAM) { return param_type(meta, ptext, item, at); }
+    if (tg == SYM_LOCAL or tg == SYM_TOP) {
+        if (kind(nodes, at) != K_CONST_DECL and kind(nodes, at) != K_STMT_LOCAL) { return TS_BAD; }
+        if (hi(nodes, at, F_TYPE) > lo(nodes, at, F_TYPE)) {
+            return ts_type(text, lo(nodes, at, F_TYPE), hi(nodes, at, F_TYPE));
+        }
+        if (at + 1 >= end(nodes, at) or depth > 48) { return TS_BAD; }
+        var owner : usize = item;
+        if (tg == SYM_TOP) { owner = 0; }
+        const it : i64 = ty_of(nodes, text, meta, ptext, owner, at + 1, depth + 1);
+        if (it == TS_COMPTIME and is_mut(meta, at)) { return TS_BAD; }
+        return it;
+    }
+    return TS_BAD;
+}
+
+/// The result type of the fn declared at node f.
+pub fn fn_type(nodes: []const u8, text: []const u8, f: usize) -> i64 {
+    return ts_type(text, lo(nodes, f, F_RET), hi(nodes, f, F_RET));
+}
+
+/// The type of expression node i, used inside `item`. TS_BAD for anything this path does not hold.
+pub fn ty_of(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize, depth: usize) -> i64 {
+    if (depth > 64) { return TS_BAD; }
+    const k : u8 = kind(nodes, i);
+    if (k == K_EXPR_LITERAL) {
+        if (field_eq(nodes, text, i, F_VALUE, "true") or field_eq(nodes, text, i, F_VALUE, "false")) { return TS_BOOL; }
+        if (field_eq(nodes, text, i, F_KIND, "string")) { return TS_BAD; }
+        if (lit_ok(text, lo(nodes, i, F_VALUE), hi(nodes, i, F_VALUE))) { return TS_COMPTIME; }
+        return TS_BAD;
+    }
+    if (k == K_EXPR_IDENTIFIER) {
+        const s : i64 = resolve(nodes, text, meta, ptext, item, i, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+        if (s == NO_SYM or sym_tag(s) == SYM_FN) { return TS_BAD; }
+        return sym_type(nodes, text, meta, ptext, item, s, depth + 1);
+    }
+    if (k == K_EXPR_BINARY) {
+        if (children(nodes, i) != 2) { return TS_BAD; }
+        const l : usize = i + 1;
+        const r : usize = end(nodes, l);
+        const oc : u8 = op_class(text[lo(nodes, i, F_OP) .. hi(nodes, i, F_OP)]);
+        if (oc == OP_CMP or oc == OP_LOGIC) { return TS_BOOL; }
+        const lt : i64 = ty_of(nodes, text, meta, ptext, item, l, depth + 1);
+        if (oc == OP_SHIFT) { return lt; }
+        if (oc == OP_ARITH) {
+            const rt : i64 = ty_of(nodes, text, meta, ptext, item, r, depth + 1);
+            const pt : i64 = ts_peer(lt, rt);
+            if (pt == TS_BOOL and !op_bitwise(text[lo(nodes, i, F_OP) .. hi(nodes, i, F_OP)])) { return TS_BAD; }
+            return pt;
+        }
+        return TS_BAD;
+    }
+    if (k == K_EXPR_UNARY) {
+        if (children(nodes, i) != 1) { return TS_BAD; }
+        if (field_eq(nodes, text, i, F_OP, "!")) { return TS_BOOL; }
+        const ot : i64 = ty_of(nodes, text, meta, ptext, item, i + 1, depth + 1);
+        if (field_eq(nodes, text, i, F_OP, "~") and ts_int(ot)) { return ot; }
+        if (field_eq(nodes, text, i, F_OP, "-") and (ts_signed(ot) or ot == TS_COMPTIME)) { return ot; }
+        return TS_BAD;
+    }
+    if (k == K_EXPR_CAST) {
+        return ts_type(text, lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
+    }
+    if (k == K_EXPR_CALL) {
+        const f : i64 = find_fn(nodes, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+        if (f == NO_NODE) { return TS_BAD; }
+        const fi : usize = @intCast(f);
+        return fn_type(nodes, text, fi);
+    }
+    if (k == K_EXPR_IF) {
+        if (children(nodes, i) != 3) { return TS_BAD; }
+        const a1 : usize = end(nodes, i + 1);
+        const a2 : usize = end(nodes, a1);
+        return ts_peer(ty_of(nodes, text, meta, ptext, item, a1, depth + 1), ty_of(nodes, text, meta, ptext, item, a2, depth + 1));
+    }
+    return TS_BAD;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Folding, over i64 and within ts_plan.t27's range.
+// ----------------------------------------------------------------------------------------------------------
+
+/// The declaration a name used at node i stands for when it is a constant one: a top-level `const` or a
+/// `const` local, with a value; NO_NODE otherwise.
+pub fn const_decl(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize) -> i64 {
+    const s : i64 = resolve(nodes, text, meta, ptext, item, i, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+    const tg : i64 = sym_tag(s);
+    if (s == NO_SYM or (tg != SYM_TOP and tg != SYM_LOCAL)) { return NO_NODE; }
+    const d : usize = sym_at(s);
+    if (kind(nodes, d) != K_CONST_DECL and kind(nodes, d) != K_STMT_LOCAL) { return NO_NODE; }
+    if (is_mut(meta, d) or d + 1 >= end(nodes, d)) { return NO_NODE; }
+    if (ident_is(nodes, text, d + 1, "undefined")) { return NO_NODE; }
+    const di : i64 = @intCast(d);
+    return di;
+}
+
+/// Does expression node i fold to a value: a literal within the folding range, `true`/`false`, a constant
+/// that fits its declared type, a cast of one that fits, `-` and `!` of one, and a binary operator over two
+/// of them that ts_plan.t27's ts_fold_ok folds?
+pub fn fold_ok(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize, depth: usize) -> bool {
+    if (depth > 48) { return false; }
+    const k : u8 = kind(nodes, i);
+    if (k == K_EXPR_LITERAL) {
+        if (field_eq(nodes, text, i, F_VALUE, "true") or field_eq(nodes, text, i, F_VALUE, "false")) { return true; }
+        if (field_eq(nodes, text, i, F_KIND, "string")) { return false; }
+        if (!lit_ok(text, lo(nodes, i, F_VALUE), hi(nodes, i, F_VALUE))) { return false; }
+        return lit_val(text, lo(nodes, i, F_VALUE), hi(nodes, i, F_VALUE)) <= 4503599627370496;
+    }
+    if (k == K_EXPR_IDENTIFIER) {
+        const d : i64 = const_decl(nodes, text, meta, ptext, item, i);
+        if (d == NO_NODE) { return false; }
+        const di : usize = @intCast(d);
+        var owner : usize = item;
+        if (sym_tag(resolve(nodes, text, meta, ptext, item, i, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME))) == SYM_TOP) { owner = 0; }
+        if (!fold_ok(nodes, text, meta, ptext, owner, di + 1, depth + 1)) { return false; }
+        if (hi(nodes, di, F_TYPE) > lo(nodes, di, F_TYPE)) {
+            const dt : i64 = ts_type(text, lo(nodes, di, F_TYPE), hi(nodes, di, F_TYPE));
+            return ts_fits(fold_val(nodes, text, meta, ptext, owner, di + 1, depth + 1), dt);
+        }
+        return true;
+    }
+    if (k == K_EXPR_CAST) {
+        if (!fold_ok(nodes, text, meta, ptext, item, i + 1, depth + 1)) { return false; }
+        const ct : i64 = ts_type(text, lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
+        return ts_fits(fold_val(nodes, text, meta, ptext, item, i + 1, depth + 1), ct);
+    }
+    if (k == K_EXPR_UNARY and children(nodes, i) == 1) {
+        if (field_eq(nodes, text, i, F_OP, "-") or field_eq(nodes, text, i, F_OP, "!")) {
+            return fold_ok(nodes, text, meta, ptext, item, i + 1, depth + 1);
+        }
+        return false;
+    }
+    if (k == K_EXPR_BINARY and children(nodes, i) == 2) {
+        const r : usize = end(nodes, i + 1);
+        if (!fold_ok(nodes, text, meta, ptext, item, i + 1, depth + 1) or !fold_ok(nodes, text, meta, ptext, item, r, depth + 1)) { return false; }
+        const a : i64 = fold_val(nodes, text, meta, ptext, item, i + 1, depth + 1);
+        const b : i64 = fold_val(nodes, text, meta, ptext, item, r, depth + 1);
+        return ts_fold_ok(text[lo(nodes, i, F_OP) .. hi(nodes, i, F_OP)], a, b);
+    }
+    return false;
+}
+
+/// The value of expression node i, when fold_ok says it folds.
+pub fn fold_val(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize, depth: usize) -> i64 {
+    if (depth > 48) { return 0; }
+    const k : u8 = kind(nodes, i);
+    if (k == K_EXPR_LITERAL) {
+        if (field_eq(nodes, text, i, F_VALUE, "true")) { return 1; }
+        if (field_eq(nodes, text, i, F_VALUE, "false")) { return 0; }
+        const lv : u64 = lit_val(text, lo(nodes, i, F_VALUE), hi(nodes, i, F_VALUE));
+        if (lv > 4503599627370496) { return 0; }
+        const li : i64 = @intCast(lv);
+        return li;
+    }
+    if (k == K_EXPR_IDENTIFIER) {
+        const d : i64 = const_decl(nodes, text, meta, ptext, item, i);
+        if (d == NO_NODE) { return 0; }
+        const di : usize = @intCast(d);
+        var owner : usize = item;
+        if (sym_tag(resolve(nodes, text, meta, ptext, item, i, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME))) == SYM_TOP) { owner = 0; }
+        return fold_val(nodes, text, meta, ptext, owner, di + 1, depth + 1);
+    }
+    if (k == K_EXPR_CAST) { return fold_val(nodes, text, meta, ptext, item, i + 1, depth + 1); }
+    if (k == K_EXPR_UNARY) {
+        const ov : i64 = fold_val(nodes, text, meta, ptext, item, i + 1, depth + 1);
+        if (field_eq(nodes, text, i, F_OP, "!")) { return 1 - ov; }
+        return 0 - ov;
+    }
+    if (k == K_EXPR_BINARY and children(nodes, i) == 2) {
+        const a : i64 = fold_val(nodes, text, meta, ptext, item, i + 1, depth + 1);
+        const b : i64 = fold_val(nodes, text, meta, ptext, item, end(nodes, i + 1), depth + 1);
+        return ts_fold_val(text[lo(nodes, i, F_OP) .. hi(nodes, i, F_OP)], a, b);
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Expressions. ex writes node i where a value of type `want` is taken: an untyped value is folded and
+// written at that type, a typed one is checked to coerce to it. ex_typed writes node i at its own type.
+// Each returns the end, or a refusal.
+// ----------------------------------------------------------------------------------------------------------
+
+pub fn ex(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize, want: i64) -> i64 {
+    const k : u8 = kind(nodes, i);
+    const own : i64 = ty_of(nodes, text, meta, ptext, item, i, 0);
+    if (own == TS_COMPTIME) {
+        if (fold_ok(nodes, text, meta, ptext, item, i, 0)) {
+            if (!ts_int(want)) { return fail(out, nodes, meta, text, i, "untyped value with no integer type to take", 0, 0); }
+            const v : i64 = fold_val(nodes, text, meta, ptext, item, i, 0);
+            if (!ts_fits(v, want)) { return fail(out, nodes, meta, text, i, "literal that does not fit its type", 0, 0); }
+            const q0 : usize = put_lit(out, at, v, want);
+            const r0 : i64 = @intCast(q0);
+            return r0;
+        }
+        // An untyped operator over a typed operand, like `1 << i`, takes the type of its place.
+        if (ts_int(want) and (k == K_EXPR_BINARY or k == K_EXPR_UNARY or k == K_EXPR_IF)) {
+            return ex_typed(out, at, nodes, text, meta, ptext, item, i, want);
+        }
+        return fail(out, nodes, meta, text, i, "untyped value that does not fold", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+    }
+    if (own == TS_BAD) {
+        if (k == K_EXPR_CALL) {
+            const f : i64 = find_fn(nodes, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+            if (f == NO_NODE) { return fail(out, nodes, meta, text, i, "call of an undeclared fn", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+            return fail(out, nodes, meta, text, i, "call of a fn whose result is no integer or bool", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+        }
+        if (k == K_EXPR_IDENTIFIER) {
+            return fail(out, nodes, meta, text, i, "name with no integer or bool type", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+        }
+        if (k == K_EXPR_BINARY and children(nodes, i) == 2) {
+            // the operand that does not lower is the one to name
+            const bl : usize = i + 1;
+            const br : usize = end(nodes, bl);
+            if (ty_of(nodes, text, meta, ptext, item, bl, 0) == TS_BAD) { return ex(out, at, nodes, text, meta, ptext, item, bl, TS_BAD); }
+            if (ty_of(nodes, text, meta, ptext, item, br, 0) == TS_BAD) { return ex(out, at, nodes, text, meta, ptext, item, br, TS_BAD); }
+            return fail(out, nodes, meta, text, i, "operator", lo(nodes, i, F_OP), hi(nodes, i, F_OP));
+        }
+        if (k == K_EXPR_UNARY) {
+            if (children(nodes, i) == 1 and ty_of(nodes, text, meta, ptext, item, i + 1, 0) == TS_BAD) { return ex(out, at, nodes, text, meta, ptext, item, i + 1, TS_BAD); }
+            return fail(out, nodes, meta, text, i, "operator", lo(nodes, i, F_OP), hi(nodes, i, F_OP));
+        }
+        if (k == K_EXPR_CAST) {
+            return fail(out, nodes, meta, text, i, "cast to type", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE));
+        }
+        if (k == K_EXPR_LITERAL) {
+            return fail(out, nodes, meta, text, i, "literal that is no integer or bool", lo(nodes, i, F_VALUE), hi(nodes, i, F_VALUE));
+        }
+        return fail(out, nodes, meta, text, i, kind_label(k), lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+    }
+    if (!ts_scalar(own)) { return fail(out, nodes, meta, text, i, "value that is no integer or bool", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+    if (ts_scalar(want) and !ts_coerces(own, want)) { return fail(out, nodes, meta, text, i, "value whose type does not coerce to the type of its place", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+    return ex_typed(out, at, nodes, text, meta, ptext, item, i, own);
+}
+
+pub fn ex_typed(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize, own: i64) -> i64 {
+    const k : u8 = kind(nodes, i);
+    var q : usize = at;
+    if (k == K_EXPR_LITERAL) {
+        q = put_lit(out, q, fold_val(nodes, text, meta, ptext, item, i, 0), own);
+        const rl : i64 = @intCast(q);
+        return rl;
+    }
+    if (k == K_EXPR_IDENTIFIER) {
+        // in a module-level const's value a const is folded: TypeScript has not declared it yet when it is
+        // declared below
+        if (item == 0 and fold_ok(nodes, text, meta, ptext, 0, i, 0)) {
+            q = put_lit(out, q, fold_val(nodes, text, meta, ptext, 0, i, 0), own);
+        } else {
+            q = put_bytes(out, q, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+        }
+        const ri : i64 = @intCast(q);
+        return ri;
+    }
+    if (k == K_EXPR_BINARY) {
+        if (children(nodes, i) != 2) { return fail(out, nodes, meta, text, i, "operator", lo(nodes, i, F_OP), hi(nodes, i, F_OP)); }
+        const l : usize = i + 1;
+        const r : usize = end(nodes, l);
+        const oa : usize = lo(nodes, i, F_OP);
+        const ob : usize = hi(nodes, i, F_OP);
+        const oc : u8 = op_class(text[oa .. ob]);
+        const lt : i64 = ty_of(nodes, text, meta, ptext, item, l, 0);
+        const rt : i64 = ty_of(nodes, text, meta, ptext, item, r, 0);
+        if (lt == TS_BAD) { return ex(out, q, nodes, text, meta, ptext, item, l, TS_BAD); }
+        if (rt == TS_BAD) { return ex(out, q, nodes, text, meta, ptext, item, r, TS_BAD); }
+        if (oc == OP_CMP or oc == OP_LOGIC) {
+            var pt : i64 = ts_peer(lt, rt);
+            if (oc == OP_LOGIC) { pt = TS_BOOL; }
+            if (pt == TS_COMPTIME) {
+                // two untyped operands: the comparison folds
+                if (!fold_ok(nodes, text, meta, ptext, item, i, 0)) { return fail(out, nodes, meta, text, i, "comparison of untyped values that does not fold", oa, ob); }
+                q = put_lit(out, q, fold_val(nodes, text, meta, ptext, item, i, 0), TS_BOOL);
+                const rf : i64 = @intCast(q);
+                return rf;
+            }
+            if (!ts_scalar(pt)) { return fail(out, nodes, meta, text, i, "comparison of values whose types do not meet", oa, ob); }
+            if (pt == TS_BOOL and oc == OP_CMP and !same(text[oa .. ob], "==") and !same(text[oa .. ob], "!=")) { return fail(out, nodes, meta, text, i, "ordering of bools", oa, ob); }
+            q = put_text(out, q, "(");
+            const r1 : i64 = ex(out, q, nodes, text, meta, ptext, item, l, pt);
+            if (r1 < 0) { return r1; }
+            q = @intCast(r1);
+            q = put_text(out, q, " ");
+            q = put_text(out, q, ts_cmp(text[oa .. ob]));
+            q = put_text(out, q, " ");
+            const r2 : i64 = ex(out, q, nodes, text, meta, ptext, item, r, pt);
+            if (r2 < 0) { return r2; }
+            q = @intCast(r2);
+            q = put_text(out, q, ")");
+            const rc : i64 = @intCast(q);
+            return rc;
+        }
+        if (oc == OP_ARITH or oc == OP_SHIFT) {
+            return ex_op(out, q, nodes, text, meta, ptext, item, l, r, oa, ob, own);
+        }
+        return fail(out, nodes, meta, text, i, "operator", oa, ob);
+    }
+    if (k == K_EXPR_UNARY) {
+        if (children(nodes, i) != 1) { return fail(out, nodes, meta, text, i, "operator", lo(nodes, i, F_OP), hi(nodes, i, F_OP)); }
+        if (field_eq(nodes, text, i, F_OP, "!")) {
+            q = put_text(out, q, "(!");
+            const r3 : i64 = ex(out, q, nodes, text, meta, ptext, item, i + 1, TS_BOOL);
+            if (r3 < 0) { return r3; }
+            q = @intCast(r3);
+            q = put_text(out, q, ")");
+            const rn : i64 = @intCast(q);
+            return rn;
+        }
+        if (field_eq(nodes, text, i, F_OP, "~") and ts_int(own)) {
+            q = put_text(out, q, "(~");
+            const r4 : i64 = ex(out, q, nodes, text, meta, ptext, item, i + 1, own);
+            if (r4 < 0) { return r4; }
+            q = @intCast(r4);
+            if (own == 32) {
+                q = put_text(out, q, " >>> 0)");
+            } else if (ts_unsigned(own)) {
+                q = put_text(out, q, " & ");
+                q = put_i64(out, q, ts_max(own));
+                q = put_text(out, q, ")");
+            } else {
+                q = put_text(out, q, ")");
+            }
+            const rt2 : i64 = @intCast(q);
+            return rt2;
+        }
+        if (field_eq(nodes, text, i, F_OP, "-") and ts_signed(own)) {
+            q = put_text(out, q, "t27_chk(-(");
+            const r5 : i64 = ex(out, q, nodes, text, meta, ptext, item, i + 1, own);
+            if (r5 < 0) { return r5; }
+            q = @intCast(r5);
+            q = put_text(out, q, "), ");
+            q = put_i64(out, q, ts_min(own));
+            q = put_text(out, q, ", ");
+            q = put_i64(out, q, ts_max(own));
+            q = put_text(out, q, ")");
+            const rm : i64 = @intCast(q);
+            return rm;
+        }
+        return fail(out, nodes, meta, text, i, "operator", lo(nodes, i, F_OP), hi(nodes, i, F_OP));
+    }
+    if (k == K_EXPR_CAST) {
+        return ex_cast(out, q, nodes, text, meta, ptext, item, i, own);
+    }
+    if (k == K_EXPR_CALL) {
+        return ex_call(out, q, nodes, text, meta, ptext, item, i);
+    }
+    if (k == K_EXPR_IF) {
+        if (children(nodes, i) != 3) { return fail(out, nodes, meta, text, i, "if expression", 0, 0); }
+        const c0 : usize = i + 1;
+        const a1 : usize = end(nodes, c0);
+        const a2 : usize = end(nodes, a1);
+        q = put_text(out, q, "(");
+        const r6 : i64 = ex(out, q, nodes, text, meta, ptext, item, c0, TS_BOOL);
+        if (r6 < 0) { return r6; }
+        q = @intCast(r6);
+        q = put_text(out, q, " ? ");
+        const r7 : i64 = ex(out, q, nodes, text, meta, ptext, item, a1, own);
+        if (r7 < 0) { return r7; }
+        q = @intCast(r7);
+        q = put_text(out, q, " : ");
+        const r8 : i64 = ex(out, q, nodes, text, meta, ptext, item, a2, own);
+        if (r8 < 0) { return r8; }
+        q = @intCast(r8);
+        q = put_text(out, q, ")");
+        const rif : i64 = @intCast(q);
+        return rif;
+    }
+    return fail(out, nodes, meta, text, i, kind_label(k), lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+}
+
+/// Writes the arithmetic or shift operator text[oa .. ob] over nodes l and r at type own, in its
+/// ts_plan.t27 form: checked, wrapping, dividing, bitwise or shifting.
+pub fn ex_op(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, l: usize, r: usize, oa: usize, ob: usize, own: i64) -> i64 {
+    const form : u8 = ts_arith(text[oa .. ob]);
+    if (form == AR_BAD) { return fail(out, nodes, meta, text, l, "operator", oa, ob); }
+    var q : usize = at;
+    if (form == AR_SHIFTS) {
+        if (!ts_int(own)) { return fail(out, nodes, meta, text, l, "shift of a value that is no integer", oa, ob); }
+        var rw : i64 = ty_of(nodes, text, meta, ptext, item, r, 0);
+        if (rw == TS_COMPTIME) { rw = 32; }
+        if (rw == TS_BAD) { return ex(out, at, nodes, text, meta, ptext, item, r, TS_BAD); }
+        if (!ts_unsigned(rw)) { return fail(out, nodes, meta, text, l, "shift by an amount that is no unsigned integer", oa, ob); }
+        q = put_text(out, q, ts_arith_op(text[oa .. ob]));
+        q = put_text(out, q, "(");
+        const s1 : i64 = ex(out, q, nodes, text, meta, ptext, item, l, own);
+        if (s1 < 0) { return s1; }
+        q = @intCast(s1);
+        q = put_text(out, q, ", ");
+        const s2 : i64 = ex(out, q, nodes, text, meta, ptext, item, r, rw);
+        if (s2 < 0) { return s2; }
+        q = @intCast(s2);
+        q = put_text(out, q, ", ");
+        q = put_i64(out, q, ts_width(own));
+        q = put_sign(out, q, own);
+        const rs : i64 = @intCast(q);
+        return rs;
+    }
+    if (!ts_scalar(own) or (own == TS_BOOL and form != AR_BITS)) { return fail(out, nodes, meta, text, l, "operator", oa, ob); }
+    if (form == AR_DIVIDES and !ts_unsigned(own)) { return fail(out, nodes, meta, text, l, "division of a value that is no unsigned integer (t27c asks for @divTrunc or @rem)", oa, ob); }
+    const imul : bool = same(text[oa .. ob], "*%");
+    if (form == AR_CHECKED) { q = put_text(out, q, "t27_chk(("); }
+    if (form == AR_WRAPS) {
+        q = put_text(out, q, "t27_wrap(");
+        if (imul) {
+            q = put_text(out, q, "Math.imul(");
+        } else {
+            q = put_text(out, q, "(");
+        }
+    }
+    if (form == AR_DIVIDES) {
+        q = put_text(out, q, ts_arith_op(text[oa .. ob]));
+        q = put_text(out, q, "(");
+    }
+    if (form == AR_BITS) {
+        if (own == 32 or own == TS_BOOL) {
+            q = put_text(out, q, "((");
+        } else {
+            q = put_text(out, q, "(");
+        }
+    }
+    const e1 : i64 = ex(out, q, nodes, text, meta, ptext, item, l, own);
+    if (e1 < 0) { return e1; }
+    q = @intCast(e1);
+    if (form == AR_DIVIDES or imul) {
+        q = put_text(out, q, ", ");
+    } else {
+        q = put_text(out, q, " ");
+        q = put_text(out, q, ts_arith_op(text[oa .. ob]));
+        q = put_text(out, q, " ");
+    }
+    const e2 : i64 = ex(out, q, nodes, text, meta, ptext, item, r, own);
+    if (e2 < 0) { return e2; }
+    q = @intCast(e2);
+    if (form == AR_CHECKED) {
+        q = put_text(out, q, "), ");
+        q = put_i64(out, q, ts_min(own));
+        q = put_text(out, q, ", ");
+        q = put_i64(out, q, ts_max(own));
+        q = put_text(out, q, ")");
+    }
+    if (form == AR_WRAPS) {
+        q = put_text(out, q, "), ");
+        q = put_i64(out, q, ts_width(own));
+        q = put_sign(out, q, own);
+    }
+    if (form == AR_DIVIDES) { q = put_text(out, q, ")"); }
+    if (form == AR_BITS) {
+        if (own == 32) {
+            q = put_text(out, q, ") >>> 0)");
+        } else if (own == TS_BOOL) {
+            q = put_text(out, q, ") !== 0)");
+        } else {
+            q = put_text(out, q, ")");
+        }
+    }
+    const ro : i64 = @intCast(q);
+    return ro;
+}
+
+/// Writes `x as T` (own is T): a narrower width wraps, a range that holds the source's is the value as it
+/// is, any other cast is checked; a bool casts only to bool.
+pub fn ex_cast(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize, own: i64) -> i64 {
+    const src : i64 = ty_of(nodes, text, meta, ptext, item, i + 1, 0);
+    if (src == TS_COMPTIME) { return ex(out, at, nodes, text, meta, ptext, item, i + 1, own); }
+    if (src == TS_BAD) { return ex(out, at, nodes, text, meta, ptext, item, i + 1, TS_BAD); }
+    if (!ts_scalar(src)) { return fail(out, nodes, meta, text, i, "cast of a value that is no integer or bool", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE)); }
+    if (src == TS_BOOL or own == TS_BOOL) {
+        if (src != own) { return fail(out, nodes, meta, text, i, "cast between bool and an integer", lo(nodes, i, F_TYPE), hi(nodes, i, F_TYPE)); }
+        return ex(out, at, nodes, text, meta, ptext, item, i + 1, src);
+    }
+    if (ts_coerces(src, own)) { return ex(out, at, nodes, text, meta, ptext, item, i + 1, src); }
+    const narrows : bool = ts_width(own) < ts_width(src);
+    var q : usize = at;
+    if (narrows) {
+        q = put_text(out, q, "t27_wrap(");
+    } else {
+        q = put_text(out, q, "t27_chk(");
+    }
+    const r1 : i64 = ex(out, q, nodes, text, meta, ptext, item, i + 1, src);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, ", ");
+    if (narrows) {
+        q = put_i64(out, q, ts_width(own));
+        q = put_sign(out, q, own);
+    } else {
+        q = put_i64(out, q, ts_min(own));
+        q = put_text(out, q, ", ");
+        q = put_i64(out, q, ts_max(own));
+        q = put_text(out, q, ")");
+    }
+    const rc : i64 = @intCast(q);
+    return rc;
+}
+
+/// Writes a call of a fn with a body: `f(a, b)`, each argument at its parameter's type.
+pub fn ex_call(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize) -> i64 {
+    const f : i64 = find_fn(nodes, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+    if (f == NO_NODE) { return fail(out, nodes, meta, text, i, "call of an undeclared fn", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+    const fi : usize = @intCast(f);
+    if (is_extern(nodes, fi)) { return fail(out, nodes, meta, text, i, "call of an extern fn", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+    const np : usize = param_count(ptext, params_lo(meta, fi), params_hi(meta, fi));
+    if (children(nodes, i) != np) { return fail(out, nodes, meta, text, i, "call with the wrong number of arguments", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+    var q : usize = put_bytes(out, at, text, lo(nodes, i, F_NAME), hi(nodes, i, F_NAME));
+    q = put_text(out, q, "(");
+    var a : usize = i + 1;
+    var kx : usize = 0;
+    while (a < end(nodes, i)) {
+        if (kx > 0) { q = put_text(out, q, ", "); }
+        const pt : i64 = param_type(meta, ptext, fi, kx);
+        if (!ts_scalar(pt)) { return fail(out, nodes, meta, text, i, "call of a fn with a parameter that is no integer or bool", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+        const r : i64 = ex(out, q, nodes, text, meta, ptext, item, a, pt);
+        if (r < 0) { return r; }
+        q = @intCast(r);
+        a = end(nodes, a);
+        kx = kx + 1;
+    }
+    q = put_text(out, q, ")");
+    const rr : i64 = @intCast(q);
+    return rr;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Statements. TypeScript has t27's control flow, so each statement is written as it reads; `lp` is the
+// innermost loop's node (0 outside a loop).
+// ----------------------------------------------------------------------------------------------------------
+
+/// Writes the statements of block node b, its children from c on, at indent n.
+pub fn stmts(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, b: usize, c: usize, n: usize, lp: usize) -> i64 {
+    var q : usize = at;
+    var s : usize = c;
+    while (s < end(nodes, b)) {
+        const r : i64 = stmt(out, q, nodes, text, meta, ptext, item, s, n, lp);
+        if (r < 0) { return r; }
+        q = @intCast(r);
+        s = end(nodes, s);
+    }
+    const re : i64 = @intCast(q);
+    return re;
+}
+
+/// Writes one statement at indent n.
+pub fn stmt(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, s: usize, n: usize, lp: usize) -> i64 {
+    const k : u8 = kind(nodes, s);
+    var q : usize = at;
+    if (k == K_STMT_LOCAL) {
+        if (s + 1 >= end(nodes, s)) { return fail(out, nodes, meta, text, s, "local with no value", lo(nodes, s, F_NAME), hi(nodes, s, F_NAME)); }
+        if (ident_is(nodes, text, s + 1, "undefined")) { return fail(out, nodes, meta, text, s, "local left undefined", lo(nodes, s, F_NAME), hi(nodes, s, F_NAME)); }
+        const t : i64 = sym_type(nodes, text, meta, ptext, item, sym_of(SYM_LOCAL, s), 0);
+        if (t == TS_COMPTIME) {
+            // a constant local: every use is folded
+            const rc : i64 = @intCast(q);
+            return rc;
+        }
+        if (!ts_scalar(t)) { return fail(out, nodes, meta, text, s, "local that is no integer or bool", lo(nodes, s, F_NAME), hi(nodes, s, F_NAME)); }
+        if (bad_name(text, lo(nodes, s, F_NAME), hi(nodes, s, F_NAME))) { return fail(out, nodes, meta, text, s, "name TypeScript reserves or the prelude uses", lo(nodes, s, F_NAME), hi(nodes, s, F_NAME)); }
+        q = put_ind(out, q, n);
+        if (is_mut(meta, s)) {
+            q = put_text(out, q, "let ");
+        } else {
+            q = put_text(out, q, "const ");
+        }
+        q = put_bytes(out, q, text, lo(nodes, s, F_NAME), hi(nodes, s, F_NAME));
+        q = put_text(out, q, ": ");
+        q = put_text(out, q, ts_annot(t));
+        q = put_text(out, q, " = ");
+        const r1 : i64 = ex(out, q, nodes, text, meta, ptext, item, s + 1, t);
+        if (r1 < 0) { return r1; }
+        q = @intCast(r1);
+        q = put_text(out, q, ";\n");
+        const rl : i64 = @intCast(q);
+        return rl;
+    }
+    if (k == K_STMT_ASSIGN) {
+        return assign(out, q, nodes, text, meta, ptext, item, s, n);
+    }
+    if (k == K_STMT_IF) {
+        return stmt_if(out, q, nodes, text, meta, ptext, item, s, n, lp);
+    }
+    if (k == K_STMT_WHILE) {
+        return stmt_while(out, q, nodes, text, meta, ptext, item, s, n);
+    }
+    if (k == K_EXPR_RETURN) {
+        if (kind(nodes, item) != K_FN_DECL) { return fail(out, nodes, meta, text, s, "return in a test", 0, 0); }
+        if (s + 1 >= end(nodes, s)) { return fail(out, nodes, meta, text, s, "return with no value from a fn", 0, 0); }
+        q = put_ind(out, q, n);
+        q = put_text(out, q, "return ");
+        const r2 : i64 = ex(out, q, nodes, text, meta, ptext, item, s + 1, fn_type(nodes, text, item));
+        if (r2 < 0) { return r2; }
+        q = @intCast(r2);
+        q = put_text(out, q, ";\n");
+        const rr : i64 = @intCast(q);
+        return rr;
+    }
+    if (k == K_STMT_BREAK or k == K_STMT_CONTINUE) {
+        if (lp == 0) { return fail(out, nodes, meta, text, s, kind_label(k), 0, 0); }
+        q = put_ind(out, q, n);
+        if (k == K_STMT_BREAK) {
+            q = put_text(out, q, "break;\n");
+        } else {
+            q = put_text(out, q, "continue;\n");
+        }
+        const rb : i64 = @intCast(q);
+        return rb;
+    }
+    if (k == K_STMT_EXPR) {
+        if (s + 1 < end(nodes, s) and kind(nodes, s + 1) == K_EXPR_CALL) {
+            return call_stmt(out, q, nodes, text, meta, ptext, item, s + 1, n);
+        }
+        return fail(out, nodes, meta, text, s, "expression statement", 0, 0);
+    }
+    return fail(out, nodes, meta, text, s, kind_label(k), lo(nodes, s, F_NAME), hi(nodes, s, F_NAME));
+}
+
+/// Writes an assignment to a `var` local: `x = e`; a compound operator `x op= e` as `x = <x op e>` in the
+/// operator's form; `_ = e` evaluates e for what it throws, `void (e);`.
+pub fn assign(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, s: usize, n: usize) -> i64 {
+    if (children(nodes, s) != 2) { return fail(out, nodes, meta, text, s, "assignment", 0, 0); }
+    const t : usize = s + 1;
+    const e : usize = end(nodes, t);
+    var q : usize = at;
+    if (ident_is(nodes, text, t, "_")) {
+        const et : i64 = ty_of(nodes, text, meta, ptext, item, e, 0);
+        if (et == TS_COMPTIME) {
+            const rd : i64 = @intCast(q);
+            return rd;
+        }
+        q = put_ind(out, q, n);
+        q = put_text(out, q, "void (");
+        const r0 : i64 = ex(out, q, nodes, text, meta, ptext, item, e, et);
+        if (r0 < 0) { return r0; }
+        q = @intCast(r0);
+        q = put_text(out, q, ");\n");
+        const rv : i64 = @intCast(q);
+        return rv;
+    }
+    if (kind(nodes, t) != K_EXPR_IDENTIFIER) { return fail(out, nodes, meta, text, s, "assignment to", lo(nodes, t, F_NAME), hi(nodes, t, F_NAME)); }
+    const sy : i64 = resolve(nodes, text, meta, ptext, item, t, lo(nodes, t, F_NAME), hi(nodes, t, F_NAME));
+    if (sy == NO_SYM) { return fail(out, nodes, meta, text, s, "assignment that declares a name", lo(nodes, t, F_NAME), hi(nodes, t, F_NAME)); }
+    if (sym_tag(sy) != SYM_LOCAL or !is_mut(meta, sym_at(sy))) { return fail(out, nodes, meta, text, s, "assignment to a name that is no var local", lo(nodes, t, F_NAME), hi(nodes, t, F_NAME)); }
+    const tt : i64 = sym_type(nodes, text, meta, ptext, item, sy, 0);
+    if (!ts_scalar(tt)) { return fail(out, nodes, meta, text, s, "assignment to a name that is no integer or bool", lo(nodes, t, F_NAME), hi(nodes, t, F_NAME)); }
+    q = put_ind(out, q, n);
+    q = put_bytes(out, q, text, lo(nodes, t, F_NAME), hi(nodes, t, F_NAME));
+    q = put_text(out, q, " = ");
+    const oa : usize = lo(nodes, s, F_OP);
+    const ob : usize = hi(nodes, s, F_OP);
+    if (ob > oa and !field_eq(nodes, text, s, F_OP, "=")) {
+        // `x op= e`: the operator is the text before `=`
+        const oc : u8 = op_class(text[oa .. ob - 1]);
+        if (oc != OP_ARITH and oc != OP_SHIFT) { return fail(out, nodes, meta, text, s, "compound assignment", oa, ob); }
+        const r1 : i64 = ex_op(out, q, nodes, text, meta, ptext, item, t, e, oa, ob - 1, tt);
+        if (r1 < 0) { return r1; }
+        q = @intCast(r1);
+    } else {
+        const r2 : i64 = ex(out, q, nodes, text, meta, ptext, item, e, tt);
+        if (r2 < 0) { return r2; }
+        q = @intCast(r2);
+    }
+    q = put_text(out, q, ";\n");
+    const ra : i64 = @intCast(q);
+    return ra;
+}
+
+/// Writes `if (c) { ... } else { ... }`; an `else if` chain nests.
+pub fn stmt_if(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, s: usize, n: usize, lp: usize) -> i64 {
+    const c0 : usize = s + 1;
+    const th : usize = end(nodes, c0);
+    if (th >= end(nodes, s) or kind(nodes, th) != K_MODULE) { return fail(out, nodes, meta, text, s, "if", 0, 0); }
+    if (ty_of(nodes, text, meta, ptext, item, c0, 0) != TS_BOOL) { return ex(out, at, nodes, text, meta, ptext, item, c0, TS_BOOL); }
+    var q : usize = put_ind(out, at, n);
+    q = put_text(out, q, "if (");
+    const r1 : i64 = ex(out, q, nodes, text, meta, ptext, item, c0, TS_BOOL);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, ") {\n");
+    const r2 : i64 = stmts(out, q, nodes, text, meta, ptext, item, th, th + 1, n + 2, lp);
+    if (r2 < 0) { return r2; }
+    q = @intCast(r2);
+    q = put_ind(out, q, n);
+    q = put_text(out, q, "}");
+    const el : usize = end(nodes, th);
+    if (el < end(nodes, s)) {
+        q = put_text(out, q, " else {\n");
+        const r3 : i64 = stmts(out, q, nodes, text, meta, ptext, item, el, el + 1, n + 2, lp);
+        if (r3 < 0) { return r3; }
+        q = @intCast(r3);
+        q = put_ind(out, q, n);
+        q = put_text(out, q, "}");
+    }
+    q = put_text(out, q, "\n");
+    const ri : i64 = @intCast(q);
+    return ri;
+}
+
+/// Writes `while (c) { body; continue expression }`. A `continue` of a loop with a continue expression
+/// would skip it in TypeScript, so that pair is refused.
+pub fn stmt_while(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, w: usize, n: usize) -> i64 {
+    const body : i64 = loop_block(nodes, text, w, "body");
+    if (body == NO_NODE) { return fail(out, nodes, meta, text, w, "while with no body", 0, 0); }
+    const bi : usize = @intCast(body);
+    const ce : i64 = loop_block(nodes, text, w, "continue_expr");
+    if (ce != NO_NODE and own_continue(nodes, bi + 1, end(nodes, bi))) { return fail(out, nodes, meta, text, w, "continue in a while with a continue expression", 0, 0); }
+    const cnd : usize = w + 1;
+    if (ty_of(nodes, text, meta, ptext, item, cnd, 0) != TS_BOOL) { return ex(out, at, nodes, text, meta, ptext, item, cnd, TS_BOOL); }
+    var q : usize = put_ind(out, at, n);
+    q = put_text(out, q, "while (");
+    const r1 : i64 = ex(out, q, nodes, text, meta, ptext, item, cnd, TS_BOOL);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, ") {\n");
+    const r2 : i64 = stmts(out, q, nodes, text, meta, ptext, item, bi, bi + 1, n + 2, w);
+    if (r2 < 0) { return r2; }
+    q = @intCast(r2);
+    if (ce != NO_NODE) {
+        const cei : usize = @intCast(ce);
+        const r3 : i64 = stmts(out, q, nodes, text, meta, ptext, item, cei, cei + 1, n + 2, w);
+        if (r3 < 0) { return r3; }
+        q = @intCast(r3);
+    }
+    q = put_ind(out, q, n);
+    q = put_text(out, q, "}\n");
+    const rw : i64 = @intCast(q);
+    return rw;
+}
+
+/// Writes `assert c` as `t27_assert(c, 'name', line);` and `assert_eq(a, b)` as the same over `(a === b)`
+/// at the peer type, with t27_check when every operand folds; any other call statement is refused (a pure fn
+/// has no effect but its value).
+pub fn call_stmt(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, item: usize, i: usize, n: usize) -> i64 {
+    var q : usize = at;
+    if (!field_eq(nodes, text, i, F_NAME, "assert") and !field_eq(nodes, text, i, F_NAME, "assert_eq")) { return fail(out, nodes, meta, text, i, "call statement", lo(nodes, i, F_NAME), hi(nodes, i, F_NAME)); }
+    const eq : bool = field_eq(nodes, text, i, F_NAME, "assert_eq");
+    if ((eq and children(nodes, i) != 2) or (!eq and children(nodes, i) != 1)) { return fail(out, nodes, meta, text, i, "assert with a message", 0, 0); }
+    const a : usize = i + 1;
+    var pt : i64 = TS_BOOL;
+    if (eq) {
+        const at1 : i64 = ty_of(nodes, text, meta, ptext, item, a, 0);
+        const at2 : i64 = ty_of(nodes, text, meta, ptext, item, end(nodes, a), 0);
+        if (at1 == TS_BAD) { return ex(out, q, nodes, text, meta, ptext, item, a, TS_BAD); }
+        if (at2 == TS_BAD) { return ex(out, q, nodes, text, meta, ptext, item, end(nodes, a), TS_BAD); }
+        pt = ts_peer(at1, at2);
+        if (!ts_scalar(pt)) { return fail(out, nodes, meta, text, i, "assert_eq of values whose types do not meet", 0, 0); }
+    }
+    // test-report does not count an assert whose operands are all compile-time constants (#6509)
+    var folds : bool = fold_ok(nodes, text, meta, ptext, item, a, 0);
+    if (eq) { folds = folds and fold_ok(nodes, text, meta, ptext, item, end(nodes, a), 0); }
+    q = put_ind(out, q, n);
+    if (folds) { q = put_text(out, q, "t27_check("); } else { q = put_text(out, q, "t27_assert("); }
+    if (eq) { q = put_text(out, q, "("); }
+    const r1 : i64 = ex(out, q, nodes, text, meta, ptext, item, a, pt);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    if (eq) {
+        q = put_text(out, q, " === ");
+        const r2 : i64 = ex(out, q, nodes, text, meta, ptext, item, end(nodes, a), pt);
+        if (r2 < 0) { return r2; }
+        q = @intCast(r2);
+        q = put_text(out, q, ")");
+    }
+    q = put_text(out, q, ", '");
+    q = put_bytes(out, q, text, lo(nodes, item, F_NAME), hi(nodes, item, F_NAME));
+    q = put_text(out, q, "', ");
+    q = put_dec(out, q, line_near(nodes, meta, i) as u64);
+    q = put_text(out, q, ");\n");
+    const ra : i64 = @intCast(q);
+    return ra;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Items, tables and the module.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Writes the module-level const at node d: `[export ]const N: number = e;`; an untyped one with its folded
+/// value.
+pub fn const_text(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, d: usize) -> i64 {
+    const na : usize = lo(nodes, d, F_NAME);
+    const nb : usize = hi(nodes, d, F_NAME);
+    if (is_mut(meta, d)) { return fail(out, nodes, meta, text, d, "module-level var", na, nb); }
+    if (hi(nodes, d, F_TYPE) > lo(nodes, d, F_TYPE) and !ts_scalar(ts_type(text, lo(nodes, d, F_TYPE), hi(nodes, d, F_TYPE)))) {
+        return fail(out, nodes, meta, text, d, "const that is no integer or bool", na, nb);
+    }
+    if (d + 1 >= end(nodes, d)) { return fail(out, nodes, meta, text, d, "const with no value", na, nb); }
+    if (ident_is(nodes, text, d + 1, "undefined")) { return fail(out, nodes, meta, text, d, "const left undefined", na, nb); }
+    if (bad_name(text, na, nb)) { return fail(out, nodes, meta, text, d, "name TypeScript reserves or the prelude uses", na, nb); }
+    var t : i64 = sym_type(nodes, text, meta, ptext, 0, sym_of(SYM_TOP, d), 0);
+    if (t == TS_COMPTIME) {
+        if (!fold_ok(nodes, text, meta, ptext, 0, d + 1, 0)) { return fail(out, nodes, meta, text, d, "untyped const that does not fold", na, nb); }
+        t = TS_SIGNED + TS_MAX_WIDTH;
+        if (!ts_fits(fold_val(nodes, text, meta, ptext, 0, d + 1, 0), t)) { t = TS_MAX_WIDTH; }
+    }
+    if (!ts_scalar(t)) { return fail(out, nodes, meta, text, d, "const that is no integer or bool", na, nb); }
+    var q : usize = at;
+    if (is_pub(meta, d)) { q = put_text(out, q, "export "); }
+    q = put_text(out, q, "const ");
+    q = put_bytes(out, q, text, na, nb);
+    q = put_text(out, q, ": ");
+    q = put_text(out, q, ts_annot(t));
+    q = put_text(out, q, " = ");
+    const r1 : i64 = ex(out, q, nodes, text, meta, ptext, 0, d + 1, t);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, ";\n");
+    const rc : i64 = @intCast(q);
+    return rc;
+}
+
+/// Writes the fn at node f: `[export ]function f(p: number): number { ... }`.
+pub fn fn_text(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, f: usize) -> i64 {
+    const na : usize = lo(nodes, f, F_NAME);
+    const nb : usize = hi(nodes, f, F_NAME);
+    if (is_extern(nodes, f)) { return fail(out, nodes, meta, text, f, "extern fn", na, nb); }
+    const rt : i64 = fn_type(nodes, text, f);
+    if (rt == TS_VOID) { return fail(out, nodes, meta, text, f, "fn with no result", na, nb); }
+    if (!ts_scalar(rt)) { return fail(out, nodes, meta, text, f, "fn whose result is no integer or bool", na, nb); }
+    if (bad_name(text, na, nb)) { return fail(out, nodes, meta, text, f, "name TypeScript reserves or the prelude uses", na, nb); }
+    var q : usize = put_text(out, at, "\n");
+    if (is_pub(meta, f)) { q = put_text(out, q, "export "); }
+    q = put_text(out, q, "function ");
+    q = put_bytes(out, q, text, na, nb);
+    q = put_text(out, q, "(");
+    const np : usize = param_count(ptext, params_lo(meta, f), params_hi(meta, f));
+    var kx : usize = 0;
+    while (kx < np) {
+        const pa : usize = param_name_lo(meta, ptext, f, kx);
+        const pb : usize = param_name_hi(meta, ptext, f, kx);
+        if (bad_name(ptext, pa, pb)) { return fail(out, nodes, meta, text, f, "parameter whose name TypeScript reserves or the prelude uses, of fn", na, nb); }
+        const pt : i64 = param_type(meta, ptext, f, kx);
+        if (!ts_scalar(pt)) { return fail(out, nodes, meta, text, f, "parameter that is no integer or bool, of fn", na, nb); }
+        if (kx > 0) { q = put_text(out, q, ", "); }
+        q = put_bytes(out, q, ptext, pa, pb);
+        q = put_text(out, q, ": ");
+        q = put_text(out, q, ts_annot(pt));
+        kx = kx + 1;
+    }
+    q = put_text(out, q, "): ");
+    q = put_text(out, q, ts_annot(rt));
+    q = put_text(out, q, " {\n");
+    const r1 : i64 = stmts(out, q, nodes, text, meta, ptext, f, f, f + 1, 2, 0);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, "}\n");
+    const rf : i64 = @intCast(q);
+    return rf;
+}
+
+/// Writes the test or invariant at node c as `export function <prefix><name>(): number`, which returns how
+/// many asserts it ran.
+pub fn check_text(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, c: usize, prefix: str) -> i64 {
+    const na : usize = lo(nodes, c, F_NAME);
+    const nb : usize = hi(nodes, c, F_NAME);
+    if (!is_ident(text, na, nb)) { return fail(out, nodes, meta, text, c, "test whose name is no identifier", na, nb); }
+    var q : usize = put_text(out, at, "\nexport function ");
+    q = put_text(out, q, prefix);
+    q = put_bytes(out, q, text, na, nb);
+    q = put_text(out, q, "(): number {\n  t27_n = 0;\n");
+    const r1 : i64 = stmts(out, q, nodes, text, meta, ptext, c, c, c + 1, 2, 0);
+    if (r1 < 0) { return r1; }
+    q = @intCast(r1);
+    q = put_text(out, q, "  return t27_n;\n}\n");
+    const rt : i64 = @intCast(q);
+    return rt;
+}
+
+/// Writes the module's items in the order of the spec; anything that is no const, fn, test or invariant is
+/// refused by its kind.
+pub fn items(out: []u8, at: usize, nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8) -> i64 {
+    var q : usize = at;
+    var c : usize = 1;
+    while (c < end(nodes, 0)) {
+        const k : u8 = kind(nodes, c);
+        var r : i64 = 0;
+        if (k == K_CONST_DECL) {
+            r = const_text(out, q, nodes, text, meta, ptext, c);
+        } else if (k == K_FN_DECL) {
+            r = fn_text(out, q, nodes, text, meta, ptext, c);
+        } else if (k == K_TEST_BLOCK) {
+            r = check_text(out, q, nodes, text, meta, ptext, c, "t27_test_");
+        } else if (k == K_INVARIANT_BLOCK) {
+            r = check_text(out, q, nodes, text, meta, ptext, c, "t27_invariant_");
+        } else {
+            return fail(out, nodes, meta, text, c, kind_label(k), lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+        }
+        if (r < 0) { return r; }
+        q = @intCast(r);
+        c = end(nodes, c);
+    }
+    const ri : i64 = @intCast(q);
+    return ri;
+}
+
+/// Writes `export const <name>: t27_case[] = [['a', <prefix>a], ...];` over the items of kind kw.
+pub fn table(out: []u8, at: usize, nodes: []const u8, text: []const u8, kw: u8, name: str, prefix: str) -> usize {
+    var q : usize = put_text(out, at, "\nexport const ");
+    q = put_text(out, q, name);
+    q = put_text(out, q, ": t27_case[] = [\n");
+    var c : usize = 1;
+    while (c < end(nodes, 0)) {
+        if (kind(nodes, c) == kw) {
+            q = put_text(out, q, "  ['");
+            q = put_bytes(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+            q = put_text(out, q, "', ");
+            q = put_text(out, q, prefix);
+            q = put_bytes(out, q, text, lo(nodes, c, F_NAME), hi(nodes, c, F_NAME));
+            q = put_text(out, q, "],\n");
+        }
+        c = end(nodes, c);
+    }
+    return put_text(out, q, "];\n");
+}
+
+/// The entry point (see the header).
+pub fn emit(nodes: []const u8, text: []const u8, meta: []const u8, ptext: []const u8, work: []u8, out: []u8) -> i64 {
+    if (count(nodes) == 0 or kind(nodes, 0) != K_MODULE) { return fail_front(out, "file with no module node"); }
+    var q : usize = put_text(out, 0, "// Generated by t27b ts from module ");
+    q = put_bytes(out, q, text, lo(nodes, 0, F_NAME), hi(nodes, 0, F_NAME));
+    q = put_text(out, q, " -- DO NOT EDIT; the decisions are specs/tri/t27b/ts_plan.t27\n");
+    q = put_text(out, q, "// phi^2 + 1/phi^2 = 3 | TRINITY\n\n");
+    var j : usize = 0;
+    while (j < TS_PRELUDE_LINES) {
+        q = put_text(out, q, TS_PRELUDE[j]);
+        q = put_text(out, q, "\n");
+        j = j + 1;
+    }
+    const r1 : i64 = items(out, q, nodes, text, meta, ptext);
+    if (r1 < 0) {
+        const ml : usize = @intCast(0 - r1);
+        return to_front(out, ml);
+    }
+    q = @intCast(r1);
+    q = table(out, q, nodes, text, K_TEST_BLOCK, "t27_tests", "t27_test_");
+    q = table(out, q, nodes, text, K_INVARIANT_BLOCK, "t27_invariants", "t27_invariant_");
+    j = 0;
+    while (j < TS_CODA_LINES) {
+        q = put_text(out, q, TS_CODA[j]);
+        q = put_text(out, q, "\n");
+        j = j + 1;
+    }
+    if (q + MSG_ROOM > out.len) { return fail_front(out, "output larger than the buffer"); }
+    const rq : i64 = @intCast(q);
+    return rq;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Tests. A tree is written as ast_walk.t27 lays it out, with its meta records; its texts are slices of a
+// constant. The expected TypeScript is what ts_plan.t27 decides for it.
+// ----------------------------------------------------------------------------------------------------------
+
+/// The tree of `module M; pub fn f(x: u8) -> u8 { return x + 1; } test t { assert f(1) == 2; }`, with the
+/// called fn's name at text[ca .. cb] (`f`, or an undeclared one).
+/// text: M 0..1, f 1..2, x 2..3, u8 3..5, + 5..6, 1 6..7, 2 7..8, t 8..9, assert 9..15, == 15..17, g 17..18
+fn ttree(nb: []u8, mb: []u8, ca: usize, cb: usize) -> void {
+    tnode(nb, 0, K_MODULE, 13, 0, 1);
+    tnode(nb, 1, K_FN_DECL, 6, 1, 2);
+    vset(nb, 1, F_RET, 3, 5);
+    tnode(nb, 2, K_EXPR_RETURN, 6, 0, 0);
+    tnode(nb, 3, K_EXPR_BINARY, 6, 0, 0);
+    vset(nb, 3, F_OP, 5, 6);
+    tnode(nb, 4, K_EXPR_IDENTIFIER, 5, 2, 3);
+    tnode(nb, 5, K_EXPR_LITERAL, 6, 0, 0);
+    vset(nb, 5, F_VALUE, 6, 7);
+    tnode(nb, 6, K_TEST_BLOCK, 13, 8, 9);
+    tnode(nb, 7, K_STMT_EXPR, 13, 0, 0);
+    tnode(nb, 8, K_EXPR_CALL, 13, 9, 15);
+    tnode(nb, 9, K_EXPR_BINARY, 13, 0, 0);
+    vset(nb, 9, F_OP, 15, 17);
+    tnode(nb, 10, K_EXPR_CALL, 12, ca, cb);
+    tnode(nb, 11, K_EXPR_LITERAL, 12, 0, 0);
+    vset(nb, 11, F_VALUE, 6, 7);
+    tnode(nb, 12, K_EXPR_LITERAL, 13, 0, 0);
+    vset(nb, 12, F_VALUE, 7, 8);
+    var i : usize = 0;
+    while (i < 13) {
+        tmeta(mb, i, 0, 0);
+        i = i + 1;
+    }
+    // fn f is pub, at line 1, with the one parameter line `x:u8` of the params text
+    tmeta(mb, 1, FLAG_PUB, 1);
+    vput32(mb, 1 * META + 12, 5);
+    tmeta(mb, 6, 0, 2);
+    tmeta(mb, 8, 0, 3);
+}
+
+test numbers_and_names_are_spelled {
+    var out : [64]u8 = undefined;
+    assert put_dec(out[0 .. 64], 0, 0) == 1 and out[0] == 48;
+    const neg : i64 = 0 - 128;
+    const n1 : usize = put_i64(out[0 .. 64], 0, neg);
+    assert n1 == 6 and holds(out[0 .. 64], 6, "(-128)");
+    const n2 : usize = put_lit(out[0 .. 64], 0, 1, TS_BOOL);
+    assert n2 == 4 and holds(out[0 .. 64], 4, "true");
+    const n3 : usize = put_lit(out[0 .. 64], 0, 4294967295, 32);
+    assert n3 == 10 and holds(out[0 .. 64], 10, "4294967295");
+    const n4 : usize = put_sign(out[0 .. 64], 0, TS_SIGNED + 8);
+    assert n4 == 7 and holds(out[0 .. 64], 7, ", true)");
+    assert is_ident("a_1", 0, 3) and !is_ident("1a", 0, 2) and !is_ident("a-b", 0, 3) and !is_ident("x", 0, 0);
+    assert bad_name("delete", 0, 6) and bad_name("t27_x", 0, 5) and !bad_name("wait", 0, 4);
+}
+
+test a_fn_and_its_test_lower_to_checked_typescript {
+    const tx : str = "Mfxu8+12tassert==g";
+    var nb : [936]u8 = undefined;
+    var mb : [208]u8 = undefined;
+    ttree(nb[0 .. 936], mb[0 .. 208], 1, 2);
+    var wk : [8]u8 = undefined;
+    var out : [8192]u8 = undefined;
+    const r : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "x:u8\n", wk[0 .. 8], out[0 .. 8192]);
+    assert r > 0;
+    const n : usize = @intCast(r);
+    assert holds(out[0 .. 8192], n, "// Generated by t27b ts from module M -- DO NOT EDIT");
+    assert holds(out[0 .. 8192], n, "function t27_chk(v: number, lo: number, hi: number): number");
+    assert holds(out[0 .. 8192], n, "export function f(x: number): number {");
+    assert holds(out[0 .. 8192], n, "  return t27_chk((x + 1), 0, 255);");
+    assert holds(out[0 .. 8192], n, "export function t27_test_t(): number {");
+    assert holds(out[0 .. 8192], n, "  t27_assert((f(1) === 2), 't', 3);");
+    assert holds(out[0 .. 8192], n, "  ['t', t27_test_t],");
+    assert holds(out[0 .. 8192], n, "export function t27_report(): string {");
+    // a fn that is not pub is not exported
+    tmeta(mb[0 .. 208], 1, 0, 1);
+    vput32(mb[0 .. 208], 1 * META + 12, 5);
+    const r2 : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "x:u8\n", wk[0 .. 8], out[0 .. 8192]);
+    assert r2 > 0;
+    const n2 : usize = @intCast(r2);
+    assert holds(out[0 .. 8192], n2, "\nfunction f(x: number): number {");
+    assert !holds(out[0 .. 8192], n2, "export function f(");
+}
+
+test a_call_of_an_undeclared_fn_is_refused_by_name_and_line {
+    const tx : str = "Mfxu8+12tassert==g";
+    var nb : [936]u8 = undefined;
+    var mb : [208]u8 = undefined;
+    ttree(nb[0 .. 936], mb[0 .. 208], 17, 18);
+    var wk : [8]u8 = undefined;
+    var out : [8192]u8 = undefined;
+    const r : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "x:u8\n", wk[0 .. 8], out[0 .. 8192]);
+    assert r < 0;
+    const n : usize = @intCast(0 - r);
+    assert holds(out[0 .. 8192], n, "t27b: ts: unsupported construct call of an undeclared fn `g` at line 3");
+    // a refusal writes no TypeScript
+    assert !holds(out[0 .. 8192], n, "export function");
+}
+
+test a_value_that_does_not_fit_its_place_is_refused {
+    // the return of f is `x + 1` at u8; a literal 256 in its place does not fit
+    const tx : str = "Mfxu8+12tassert==g256";
+    var nb : [936]u8 = undefined;
+    var mb : [208]u8 = undefined;
+    ttree(nb[0 .. 936], mb[0 .. 208], 1, 2);
+    vset(nb[0 .. 936], 5, F_VALUE, 18, 21);
+    var wk : [8]u8 = undefined;
+    var out : [8192]u8 = undefined;
+    const r : i64 = emit(nb[0 .. 936], tx, mb[0 .. 208], "x:u8\n", wk[0 .. 8], out[0 .. 8192]);
+    assert r < 0;
+    const n : usize = @intCast(0 - r);
+    assert holds(out[0 .. 8192], n, "unsupported construct literal that does not fit its type at line 1");
+}

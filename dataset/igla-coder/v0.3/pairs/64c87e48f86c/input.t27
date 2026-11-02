@@ -1,0 +1,1012 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/suggest_feed.t27 -- the driver between a pull request and specs/claw/suggest.t27, and the
+; one function the claw-suggest job calls: PR files and diff headers in, one review document out.
+; Issue #10365. Owner order 2026-10-18: wire the merged TRI CLAW law specs to a real pull request.
+; --
+; Where things live:
+; - Placement (which hunk may be posted, where, how many): suggest.t27 plan. This file never decides it.
+; - The fix text: tri/fmt_source.t27 fmt_source, the lossless whitespace formatter that is also
+;   `t27c fmt`. A suggestion therefore never drops a comment or rewrites `+=`.
+; - The input, one stream on stdin, written by the job with git and gh and no logic of its own:
+;     S TAB <40 hex>                      the PR head commit the comments anchor on
+;     F TAB <path> TAB <n> LF <n bytes>   a changed .t27 file as it is at that commit
+;     H TAB <@@ -a,b +c,d @@ ...>        one diff header of that file (the `patch` of pr-files), 0 or more
+;   The bytes of a file follow its F line and are counted, so a file that holds a line starting with
+;   `H` cannot be mistaken for a header.
+; - The mapping: format the file, compare old line k with new line k (the formatter never merges or
+;   splits lines), group each run of differing lines into one K_REPLACE hunk whose replacement is the
+;   new lines, turn the blank lines the formatter drops at the end of the file into one K_DELETE hunk,
+;   hand all hunks and all diff ranges to plan, and render a review from the V_POST ones.
+; - The output: a pull-request review document, event COMMENT, side RIGHT, one comment per posted
+;   hunk with a ```suggestion block. 0 bytes when there is nothing to post.
+; --
+; Fail closed (suggest.t27 law 5, applied to this file's own reads): a path that is not a plain .t27
+; path, a file too big to hold, a line with a byte outside printable ASCII or with a code fence in it,
+; a diff header that does not parse, a sha that is not 40 hex digits, a stream cut short or a record
+; that is not S, F or H -- each withholds the file or the whole review. An unread fact never becomes a
+; comment. A formatter result that fails fmt_accept (it would lose a non-whitespace byte) withholds
+; its file.
+; The honest limit: whitespace only. A file whose only defect is a missing final newline gets no
+; suggestion, because a line-based comment cannot express it; `t27c fmt` on the author's side still
+; fixes it. phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawSuggestFeed;
+
+use claw::suggest;
+use claw::text;
+use tri::fmt_source;
+
+/// Files, hunks and diff ranges one review can carry; a stream with more is read up to the cap.
+pub const MAX_FILES : usize = 64;
+pub const MAX_HUNKS : usize = 512;
+pub const MAX_RANGES : usize = 2048;
+/// Largest file held, the formatter's output bound (4 * FILE_CAP + 1) and the replacement arena.
+pub const FILE_CAP : usize = 131072;
+pub const FMT_CAP : usize = 524289;
+pub const ARENA_CAP : usize = 262144;
+/// A hunk kind suggest.t27 does not know: it poisons its file (law 5).
+pub const K_BAD : u8 = 99;
+pub const NO_NUM : u32 = 4294967295;
+
+/// Indices into the stats array the caller passes (9 entries).
+pub const ST_POSTED : usize = 0;
+pub const ST_OUTSIDE : usize = 1;
+pub const ST_CAPPED : usize = 2;
+pub const ST_TOO_BIG : usize = 3;
+pub const ST_UNKNOWN : usize = 4;
+pub const ST_FILES : usize = 5;
+pub const ST_REFUSED : usize = 6;
+pub const ST_BAD_INPUT : usize = 7;
+pub const ST_TRUNCATED : usize = 8;
+pub const STATS_LEN : usize = 9;
+
+/// The pieces of the review document, each with its byte length (tests pin the lengths).
+pub const J_HEAD : str = "{\"commit_id\":\"";
+pub const J_HEAD_LEN : usize = 14;
+pub const J_EVENT : str = "\",\"event\":\"COMMENT\",\"body\":\"";
+pub const J_EVENT_LEN : usize = 28;
+pub const J_COMMENTS : str = "\",\"comments\":[";
+pub const J_COMMENTS_LEN : usize = 14;
+pub const J_PATH : str = "{\"path\":\"";
+pub const J_PATH_LEN : usize = 9;
+pub const J_SIDE : str = "\",\"side\":\"RIGHT\",\"line\":";
+pub const J_SIDE_LEN : usize = 24;
+pub const J_START : str = ",\"start_line\":";
+pub const J_START_LEN : usize = 14;
+pub const J_START_SIDE : str = ",\"start_side\":\"RIGHT\"";
+pub const J_START_SIDE_LEN : usize = 21;
+pub const J_BODY : str = ",\"body\":\"```suggestion\\n";
+pub const J_BODY_LEN : usize = 24;
+pub const J_END : str = "```\"}";
+pub const J_END_LEN : usize = 5;
+pub const J_NOTE_A : str = "TRI CLAW formatting suggestions: ";
+pub const J_NOTE_A_LEN : usize = 33;
+pub const J_NOTE_B : str = " left out (outside this diff, over the caps, or unreadable). Whitespace only: every comment and token is kept.";
+pub const J_NOTE_B_LEN : usize = 110;
+pub const J_TAIL : str = "]}";
+pub const J_TAIL_LEN : usize = 2;
+
+/// End of the field that starts at s: the next TAB below e, or e.
+fn sf_tab(t : []const u8, e : usize, s : usize) -> usize {
+    var i : usize = s;
+    while (i < e) {
+        if (t[i] == '\t') { return i; }
+        i += 1;
+    }
+    return e;
+}
+
+/// Decimal value of t[s..e); NO_NUM when empty, longer than 9 digits or not all digits.
+fn sf_num(t : []const u8, s : usize, e : usize) -> u32 {
+    if (e <= s) { return NO_NUM; }
+    if (e - s > 9) { return NO_NUM; }
+    var v : u32 = 0;
+    var i : usize = s;
+    while (i < e) {
+        if (t[i] < '0' or t[i] > '9') { return NO_NUM; }
+        v = v * 10 + ((t[i] - '0')) as u32;
+        i += 1;
+    }
+    return v;
+}
+
+/// Whether t[s..e) is 40 lowercase hex digits (a commit id).
+fn sf_sha_ok(t : []const u8, s : usize, e : usize) -> bool {
+    if (e - s != 40) { return false; }
+    var i : usize = s;
+    while (i < e) {
+        const b : u8 = t[i];
+        if ((b < '0' or b > '9') and (b < 'a' or b > 'f')) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Whether t[s..e) is a plain repository path to a .t27 file: letters, digits, `_ . / -`, no leading
+/// slash, no `..`, at most 200 bytes, ending in `.t27`. Nothing else is ever written into the JSON.
+fn sf_path_ok(t : []const u8, s : usize, e : usize) -> bool {
+    if (e <= s) { return false; }
+    if (e - s > 200 or e - s < 5) { return false; }
+    if (t[s] == '/') { return false; }
+    if (t[e - 4] != '.' or t[e - 3] != 't' or t[e - 2] != '2' or t[e - 1] != '7') { return false; }
+    var i : usize = s;
+    while (i < e) {
+        const b : u8 = t[i];
+        const word : bool = (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9');
+        if (word == false and b != '_' and b != '.' and b != '/' and b != '-') { return false; }
+        if (b == '.' and i + 1 < e and t[i + 1] == '.') { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// Whether t[s..e) can go into a suggestion: printable ASCII or tab, and no run of three backticks.
+fn sf_line_ok(t : []const u8, s : usize, e : usize) -> bool {
+    var ticks : usize = 0;
+    var i : usize = s;
+    while (i < e) {
+        const b : u8 = t[i];
+        if ((b < 32 and b != '\t') or b > 126) { return false; }
+        if (b == '`') {
+            ticks += 1;
+            if (ticks >= 3) { return false; }
+        } else {
+            ticks = 0;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn sf_hexd(d : u8) -> u8 {
+    if (d < 10) { return digit_byte(d as u32); }
+    if (d == 10) { return 'a'; }
+    if (d == 11) { return 'b'; }
+    if (d == 12) { return 'c'; }
+    if (d == 13) { return 'd'; }
+    if (d == 14) { return 'e'; }
+    return 'f';
+}
+
+/// One byte of replacement text as JSON string content.
+fn sf_esc(dst : []u8, cap : usize, w : usize, b : u8) -> usize {
+    if (b == 34) { return put_str(dst, cap, w, "\\\"", 2); }
+    if (b == 92) { return put_str(dst, cap, w, "\\\\", 2); }
+    if (b == '\n') { return put_str(dst, cap, w, "\\n", 2); }
+    if (b == '\t') { return put_str(dst, cap, w, "\\t", 2); }
+    if (b < 32) {
+        var x : usize = put_str(dst, cap, w, "\\u00", 4);
+        x = put_byte(dst, cap, x, sf_hexd(b / 16));
+        return put_byte(dst, cap, x, sf_hexd(b % 16));
+    }
+    return put_byte(dst, cap, w, b);
+}
+
+/// Whether old line [os, oe) of a equals new line [ns, ne) of b.
+fn sf_same_line(a : []const u8, os : usize, oe : usize, b : []const u8, ns : usize, ne : usize) -> bool {
+    if (oe - os != ne - ns) { return false; }
+    var k : usize = 0;
+    while (os + k < oe) {
+        if (a[os + k] != b[ns + k]) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// Number of lines in t[0..n): newline-terminated ones, plus a last one without a newline.
+fn sf_lines(t : []const u8, n : usize) -> u32 {
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t[i] == '\n') { c += 1; }
+        i += 1;
+    }
+    if (n > 0 and t[n - 1] != '\n') { c += 1; }
+    return c;
+}
+
+/// The review document for the stream inp[0..n), into out. Returns the bytes it needs: 0 when there
+/// is nothing to post (or the stream is unreadable, which stats[ST_BAD_INPUT] says). When the result
+/// exceeds out_cap the buffer holds a clipped document that must not be posted.
+pub fn suggest_review(inp : []const u8, n : usize, out : []u8, out_cap : usize, stats : []u32) -> usize {
+    var k : usize = 0;
+    while (k < STATS_LEN) {
+        stats[k] = 0;
+        k += 1;
+    }
+    var fps : [64]usize = undefined;
+    var fpe : [64]usize = undefined;
+    var hfile : [512]u32 = undefined;
+    var hstart : [512]u32 = undefined;
+    var hcount : [512]u32 = undefined;
+    var hkind : [512]u8 = undefined;
+    var hoff : [512]usize = undefined;
+    var hlen : [512]usize = undefined;
+    var verdict : [512]u8 = undefined;
+    var dfile : [2048]u32 = undefined;
+    var dstart : [2048]u32 = undefined;
+    var dlen : [2048]u32 = undefined;
+    var arena : [262144]u8 = undefined;
+    var fc : [131072]u8 = undefined;
+    var fo : [524289]u8 = undefined;
+    var hb : [128]u8 = undefined;
+    var rng : [2]u32 = undefined;
+    var sha_s : usize = 0;
+    var sha_e : usize = 0;
+    var nf : usize = 0;
+    var nh : usize = 0;
+    var nd : usize = 0;
+    var aw : usize = 0;
+    var cur : usize = MAX_FILES;
+    var bad : bool = false;
+    var p : usize = 0;
+    while (p < n and bad == false) {
+        const e : usize = line_stop(inp, n, p);
+        const tag : u8 = inp[p];
+        if (tag == 'S' and e > p + 1 and inp[p + 1] == '\t') {
+            sha_s = p + 2;
+            sha_e = e;
+            p = e + 1;
+        } else if (tag == 'H' and e > p + 1 and inp[p + 1] == '\t') {
+            const hl : usize = e - (p + 2);
+            var ok : bool = false;
+            if (cur < MAX_FILES) {
+                if (hl < 128) {
+                    var i : usize = 0;
+                    while (i < hl) {
+                        hb[i] = inp[p + 2 + i];
+                        i += 1;
+                    }
+                    ok = header_new_range(&hb, hl, &rng);
+                }
+                const cf : u32 = cur as u32;
+                if (ok and nd < MAX_RANGES) {
+                    dfile[nd] = cf;
+                    dstart[nd] = rng[0];
+                    dlen[nd] = rng[1];
+                    nd += 1;
+                } else if (ok) {
+                    stats[ST_TRUNCATED] = 1;
+                } else {
+                    // A header we cannot read: this file's diff ranges are unknown, so withhold it.
+                    var j : usize = 0;
+                    while (j < nh) {
+                        if (hfile[j] == cf) { hkind[j] = K_BAD; }
+                        j += 1;
+                    }
+                }
+            }
+            p = e + 1;
+        } else if (tag == 'F' and e > p + 1 and inp[p + 1] == '\t') {
+            const t2 : usize = sf_tab(inp, e, p + 2);
+            const len : u32 = sf_num(inp, t2 + 1, e);
+            const clen : usize = len as usize;
+            if (t2 >= e or len == NO_NUM or e + 1 + clen > n) {
+                bad = true;
+            } else {
+                const ps : usize = p + 2;
+                const cs : usize = e + 1;
+                p = cs + clen;
+                stats[ST_FILES] += 1;
+                cur = MAX_FILES;
+                var refuse : bool = false;
+                if (nf >= MAX_FILES or sf_path_ok(inp, ps, t2) == false or clen > FILE_CAP) { refuse = true; }
+                var m : usize = 0;
+                if (refuse == false) {
+                    var i : usize = 0;
+                    while (i < clen) {
+                        fc[i] = inp[cs + i];
+                        i += 1;
+                    }
+                    m = fmt_source(&fc, clen, &fo, FMT_CAP);
+                    if (fmt_accept(&fc, clen, &fo, m, FMT_CAP) == false) { refuse = true; }
+                }
+                if (refuse) {
+                    stats[ST_REFUSED] += 1;
+                } else {
+                    fps[nf] = ps;
+                    fpe[nf] = t2;
+                    cur = nf;
+                    nf += 1;
+                    // Line k of the old text against line k of the new text.
+                    var os : usize = 0;
+                    var ns : usize = 0;
+                    var line : u32 = 1;
+                    var run : u32 = 0;
+                    var roff : usize = 0;
+                    var rbad : bool = false;
+                    while (ns < m) {
+                        const oe : usize = line_stop(&fc, clen, os);
+                        const ne : usize = line_stop(&fo, m, ns);
+                        if (sf_same_line(&fc, os, oe, &fo, ns, ne) == false) {
+                            if (run == 0) {
+                                run = line;
+                                roff = aw;
+                                rbad = false;
+                            }
+                            if (sf_line_ok(&fo, ns, ne) == false) { rbad = true; }
+                            var q : usize = ns;
+                            while (q < ne) {
+                                aw = put_byte(&arena, ARENA_CAP, aw, fo[q]);
+                                q += 1;
+                            }
+                            aw = put_byte(&arena, ARENA_CAP, aw, '\n');
+                        } else if (run != 0) {
+                            if (nh < MAX_HUNKS) {
+                                hfile[nh] = cur as u32;
+                                hstart[nh] = run;
+                                hcount[nh] = line - run;
+                                hkind[nh] = K_REPLACE;
+                                if (rbad) { hkind[nh] = K_BAD; }
+                                hoff[nh] = roff;
+                                hlen[nh] = aw - roff;
+                                nh += 1;
+                            } else {
+                                stats[ST_TRUNCATED] = 1;
+                            }
+                            run = 0;
+                        }
+                        os = oe + 1;
+                        ns = ne + 1;
+                        line += 1;
+                    }
+                    if (run != 0) {
+                        if (nh < MAX_HUNKS) {
+                            hfile[nh] = cur as u32;
+                            hstart[nh] = run;
+                            hcount[nh] = line - run;
+                            hkind[nh] = K_REPLACE;
+                            if (rbad) { hkind[nh] = K_BAD; }
+                            hoff[nh] = roff;
+                            hlen[nh] = aw - roff;
+                            nh += 1;
+                        } else {
+                            stats[ST_TRUNCATED] = 1;
+                        }
+                    }
+                    // Blank lines the formatter dropped at the end of the file.
+                    const total : u32 = sf_lines(&fc, clen);
+                    if (total >= line) {
+                        if (nh < MAX_HUNKS) {
+                            hfile[nh] = cur as u32;
+                            hstart[nh] = line;
+                            hcount[nh] = total - line + 1;
+                            hkind[nh] = K_DELETE;
+                            hoff[nh] = aw;
+                            hlen[nh] = 0;
+                            nh += 1;
+                        } else {
+                            stats[ST_TRUNCATED] = 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            bad = true;
+        }
+    }
+    if (bad or aw > ARENA_CAP or sf_sha_ok(inp, sha_s, sha_e) == false) {
+        stats[ST_BAD_INPUT] = 1;
+        return 0;
+    }
+    const posted : u32 = plan(nh, &hfile, &hstart, &hcount, &hkind, nd, &dfile, &dstart, &dlen, &verdict);
+    stats[ST_POSTED] = posted;
+    stats[ST_OUTSIDE] = count_verdict(V_OUTSIDE, nh, &verdict);
+    stats[ST_CAPPED] = count_verdict(V_CAP, nh, &verdict);
+    stats[ST_TOO_BIG] = count_verdict(V_TOO_BIG, nh, &verdict);
+    stats[ST_UNKNOWN] = count_verdict(V_UNKNOWN, nh, &verdict);
+    if (should_post(posted) == false) { return 0; }
+    var w : usize = put_str(out, out_cap, 0, J_HEAD, J_HEAD_LEN);
+    var c : usize = sha_s;
+    while (c < sha_e) {
+        w = put_byte(out, out_cap, w, inp[c]);
+        c += 1;
+    }
+    w = put_str(out, out_cap, w, J_EVENT, J_EVENT_LEN);
+    w = put_str(out, out_cap, w, J_NOTE_A, J_NOTE_A_LEN);
+    w = put_count(out, out_cap, w, posted);
+    w = put_str(out, out_cap, w, " posted, ", 9);
+    w = put_count(out, out_cap, w, nh as u32 - posted);
+    w = put_str(out, out_cap, w, J_NOTE_B, J_NOTE_B_LEN);
+    w = put_str(out, out_cap, w, J_COMMENTS, J_COMMENTS_LEN);
+    var first : bool = true;
+    var i : usize = 0;
+    while (i < nh) {
+        if (verdict[i] == V_POST) {
+            if (first == false) { w = put_byte(out, out_cap, w, ','); }
+            first = false;
+            w = put_str(out, out_cap, w, J_PATH, J_PATH_LEN);
+            var x : usize = fps[hfile[i] as usize];
+            while (x < fpe[hfile[i] as usize]) {
+                w = put_byte(out, out_cap, w, inp[x]);
+                x += 1;
+            }
+            w = put_str(out, out_cap, w, J_SIDE, J_SIDE_LEN);
+            w = put_count(out, out_cap, w, comment_line(hstart[i], hcount[i]));
+            const sl : u32 = comment_start_line(hstart[i], hcount[i]);
+            if (sl != 0) {
+                w = put_str(out, out_cap, w, J_START, J_START_LEN);
+                w = put_count(out, out_cap, w, sl);
+                w = put_str(out, out_cap, w, J_START_SIDE, J_START_SIDE_LEN);
+            }
+            w = put_str(out, out_cap, w, J_BODY, J_BODY_LEN);
+            var y : usize = hoff[i];
+            while (y < hoff[i] + hlen[i]) {
+                w = sf_esc(out, out_cap, w, arena[y]);
+                y += 1;
+            }
+            w = put_str(out, out_cap, w, J_END, J_END_LEN);
+        }
+        i += 1;
+    }
+    w = put_str(out, out_cap, w, J_TAIL, J_TAIL_LEN);
+    return w;
+}
+
+; The tests build every input byte by byte with explicit lengths (gen-c has no .len on strings).
+
+test the_json_pieces_end_where_their_lengths_say {
+    var b : [160]u8 = undefined;
+    var k : usize = put_str(&b, 160, 0, J_HEAD, J_HEAD_LEN);
+    assert b[k - 1] == 34;
+    assert b[k - 2] == ':';
+    k = put_str(&b, 160, 0, J_EVENT, J_EVENT_LEN);
+    assert b[k - 1] == 34;
+    assert b[k - 2] == ':';
+    k = put_str(&b, 160, 0, J_COMMENTS, J_COMMENTS_LEN);
+    assert b[k - 1] == '[';
+    assert b[k - 2] == ':';
+    k = put_str(&b, 160, 0, J_PATH, J_PATH_LEN);
+    assert b[k - 1] == 34;
+    assert b[k - 2] == ':';
+    k = put_str(&b, 160, 0, J_SIDE, J_SIDE_LEN);
+    assert b[k - 1] == ':';
+    assert b[k - 2] == 34;
+    k = put_str(&b, 160, 0, J_START, J_START_LEN);
+    assert b[k - 1] == ':';
+    assert b[k - 2] == 34;
+    k = put_str(&b, 160, 0, J_START_SIDE, J_START_SIDE_LEN);
+    assert b[k - 1] == 34;
+    assert b[k - 2] == 'T';
+    k = put_str(&b, 160, 0, J_BODY, J_BODY_LEN);
+    assert b[k - 1] == 'n';
+    assert b[k - 2] == 92;
+    k = put_str(&b, 160, 0, J_END, J_END_LEN);
+    assert b[k - 1] == '}';
+    assert b[k - 2] == 34;
+    k = put_str(&b, 160, 0, J_TAIL, J_TAIL_LEN);
+    assert b[k - 1] == '}';
+    assert b[k - 2] == ']';
+    k = put_str(&b, 160, 0, J_NOTE_A, J_NOTE_A_LEN);
+    assert b[k - 1] == ' ';
+    assert b[k - 2] == ':';
+    k = put_str(&b, 160, 0, J_NOTE_B, J_NOTE_B_LEN);
+    assert b[k - 1] == '.';
+    assert b[k - 2] == 't';
+}
+
+test the_formatter_bound_is_four_times_the_file_cap_plus_one {
+    var cap : usize = FILE_CAP;
+    assert FMT_CAP == cap * 4 + 1;
+}
+
+test the_review_is_a_comment_on_the_right_side {
+    assert str_eq(event_for(EVENT, 7), 7, "COMMENT", 7);
+    assert str_eq(side_for(SIDE, 5), 5, "RIGHT", 5);
+    assert buf_has(J_EVENT, J_EVENT_LEN, "COMMENT", 7);
+    assert buf_has(J_SIDE, J_SIDE_LEN, "RIGHT", 5);
+}
+
+test a_commit_id_is_forty_lowercase_hex_digits {
+    assert sf_sha_ok("0123456789abcdef0123456789abcdef01234567", 0, 40) == true;
+    assert sf_sha_ok("0123456789abcdef0123456789abcdef01234567", 0, 39) == false;
+    assert sf_sha_ok("0123456789ABCDEF0123456789abcdef01234567", 0, 40) == false;
+    assert sf_sha_ok("0123456789abcdef0123456789abcdef0123456g", 0, 40) == false;
+}
+
+test only_plain_t27_paths_are_taken {
+    assert sf_path_ok("specs/x.t27", 0, 11) == true;
+    assert sf_path_ok("a-b_c.d/e.t27", 0, 13) == true;
+    assert sf_path_ok("x.rs", 0, 4) == false;
+    assert sf_path_ok("/specs/x.t27", 0, 12) == false;
+    assert sf_path_ok("specs/../x.t27", 0, 14) == false;
+    assert sf_path_ok("sp ecs/x.t27", 0, 12) == false;
+    assert sf_path_ok("sp\"ecs/x.t27", 0, 12) == false;
+    assert sf_path_ok(".t27", 0, 4) == false;
+}
+
+test a_line_with_a_code_fence_or_a_control_byte_is_not_suggested {
+    assert sf_line_ok("x = 1; ; ok", 0, 11) == true;
+    assert sf_line_ok("x ``` y", 0, 7) == false;
+    assert sf_line_ok("x `` ` y", 0, 8) == true;
+    assert sf_line_ok("x\ty", 0, 3) == true;
+}
+
+test an_unformatted_line_inside_the_diff_becomes_a_suggestion {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t16\n", 17);
+    w = put_str(&inp, 512, w, "a = 1;  \nb = 2;\n", 16);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    const m : usize = suggest_review(&inp, w, &out, 4096, &st);
+    assert m > 0;
+    assert m <= 4096;
+    assert st[0] == 1;
+    assert st[7] == 0;
+    assert buf_has(&out, m, "{\"commit_id\":\"0123456789abcdef0123456789abcdef01234567\",\"event\":\"COMMENT\"", 73) == true;
+    assert buf_has(&out, m, "{\"path\":\"specs/x.t27\",\"side\":\"RIGHT\",\"line\":1,\"body\":\"```suggestion\\na = 1;\\n```\"}", 82) == true;
+    assert out[m - 1] == '}';
+    assert out[m - 2] == ']';
+}
+
+test a_formatted_file_gets_no_review {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t7\n", 16);
+    w = put_str(&inp, 512, w, "a = 1;\n", 7);
+    w = put_str(&inp, 512, w, "H\t@@ -1,1 +1,1 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[0] == 0;
+    assert st[5] == 1;
+    assert st[7] == 0;
+}
+
+test a_fix_outside_the_diff_is_counted_and_not_posted {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t16\n", 17);
+    w = put_str(&inp, 512, w, "a = 1;  \nb = 2;\n", 16);
+    w = put_str(&inp, 512, w, "H\t@@ -5,1 +5,1 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[0] == 0;
+    assert st[1] == 1;
+}
+
+test a_comment_and_a_compound_assignment_survive_in_the_suggestion {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t18\n", 17);
+    w = put_str(&inp, 512, w, "\ti += 1; ; keep  \n", 18);
+    w = put_str(&inp, 512, w, "H\t@@ -1,1 +1,1 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    const m : usize = suggest_review(&inp, w, &out, 4096, &st);
+    assert st[0] == 1;
+    assert buf_has(&out, m, "```suggestion\\n    i += 1; ; keep\\n```", 38) == true;
+}
+
+test a_run_of_lines_is_one_multi_line_suggestion {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t13\n", 17);
+    w = put_str(&inp, 512, w, "a;  \nb;  \nc;\n", 13);
+    w = put_str(&inp, 512, w, "H\t@@ -1,3 +1,3 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    const m : usize = suggest_review(&inp, w, &out, 4096, &st);
+    assert st[0] == 1;
+    assert buf_has(&out, m, "\"line\":2,\"start_line\":1,\"start_side\":\"RIGHT\",\"body\":\"```suggestion\\na;\\nb;\\n```\"}", 81) == true;
+}
+
+test trailing_blank_lines_become_an_empty_suggestion {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t5\n", 16);
+    w = put_str(&inp, 512, w, "a;\n\n\n", 5);
+    w = put_str(&inp, 512, w, "H\t@@ -1,3 +1,3 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    const m : usize = suggest_review(&inp, w, &out, 4096, &st);
+    assert st[0] == 1;
+    assert buf_has(&out, m, "\"start_line\":2", 14) == true;
+    assert buf_has(&out, m, "\"body\":\"```suggestion\\n```\"}", 28) == true;
+}
+
+test a_line_that_would_close_the_fence_withholds_its_file {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t8\n", 16);
+    w = put_str(&inp, 512, w, "x ```  \n", 8);
+    w = put_str(&inp, 512, w, "H\t@@ -1,1 +1,1 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[0] == 0;
+    assert st[4] == 1;
+}
+
+test an_unreadable_diff_header_withholds_its_file {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t16\n", 17);
+    w = put_str(&inp, 512, w, "a = 1;  \nb = 2;\n", 16);
+    w = put_str(&inp, 512, w, "H\t@@ nonsense @@\n", 17);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[0] == 0;
+    assert st[4] == 1;
+}
+
+test a_bad_commit_id_posts_nothing {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\tnot-a-sha\n", 12);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t16\n", 17);
+    w = put_str(&inp, 512, w, "a = 1;  \nb = 2;\n", 16);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[7] == 1;
+}
+
+test a_stream_cut_short_or_with_an_unknown_record_posts_nothing {
+    var inp : [512]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t99\n", 17);
+    w = put_str(&inp, 512, w, "a = 1;  \n", 9);
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[7] == 1;
+    w = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "X\tfoo\n", 6);
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[7] == 1;
+}
+
+test a_path_that_is_not_a_t27_file_is_refused {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tsrc/x.rs\t16\n", 14);
+    w = put_str(&inp, 512, w, "a = 1;  \nb = 2;\n", 16);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[5] == 1;
+    assert st[6] == 1;
+    assert st[7] == 0;
+}
+
+test twenty_five_fixes_post_twenty_and_count_five_over_the_cap {
+    var inp : [4096]u8 = undefined;
+    var out : [16384]u8 = undefined;
+    var st : [9]u32 = undefined;
+    var w : usize = put_str(&inp, 4096, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 4096, w, "F\tspecs/x.t27\t200\n", 18);
+    for k in 0..25 {
+        assert k < 25;
+        w = put_str(&inp, 4096, w, "a;  \nb;\n", 8);
+    }
+    w = put_str(&inp, 4096, w, "H\t@@ -1,50 +1,50 @@\n", 20);
+    const m : usize = suggest_review(&inp, w, &out, 16384, &st);
+    assert m > 0;
+    assert m <= 16384;
+    assert st[0] == 20;
+    assert st[2] == 5;
+}
+
+test an_output_buffer_that_is_too_small_is_reported_by_its_size {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t16\n", 17);
+    w = put_str(&inp, 512, w, "a = 1;  \nb = 2;\n", 16);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    var out : [32]u8 = undefined;
+    var st : [9]u32 = undefined;
+    const need : usize = suggest_review(&inp, w, &out, 32, &st);
+    assert need > 32;
+}
+
+// ... mutation sweep of this file (#10737): each test below kills a mutant the tests above let live.
+
+fn t_fix_stream(inp : []u8, cap : usize) -> usize {
+    var w : usize = put_str(inp, cap, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(inp, cap, w, "F\tspecs/x.t27\t16\n", 17);
+    return put_str(inp, cap, w, "a = 1;  \nb = 2;\n", 16);
+}
+
+fn t_file_head(dst : []u8, cap : usize, w : usize, len : u32) -> usize {
+    var x : usize = put_str(dst, cap, w, "F\tspecs/x.t27\t", 14);
+    x = put_count(dst, cap, x, len);
+    return put_byte(dst, cap, x, '\n');
+}
+
+fn t_rep(dst : []u8, cap : usize, w : usize, s : str, n : usize, times : usize) -> usize {
+    var x : usize = w;
+    var k : usize = 0;
+    while (k < times) {
+        x = put_str(dst, cap, x, s, n);
+        k += 1;
+    }
+    return x;
+}
+
+test a_length_field_is_one_to_nine_decimal_digits {
+    assert sf_num("7", 0, 0) == NO_NUM;
+    assert sf_num("0", 0, 1) == 0;
+    assert sf_num("9", 0, 1) == 9;
+    assert sf_num("123456789", 0, 9) == 123456789;
+    assert sf_num("1234567890", 0, 10) == NO_NUM;
+    assert sf_num("1a", 0, 2) == NO_NUM;
+    assert sf_num("/", 0, 1) == NO_NUM;
+    assert sf_num(":", 0, 1) == NO_NUM;
+}
+
+test a_path_is_five_to_two_hundred_bytes_and_ends_in_t27 {
+    assert sf_path_ok("specs/x.t27", 0, 0) == false;
+    assert sf_path_ok("a.t27", 0, 5) == true;
+    assert sf_path_ok("z.t27", 0, 5) == true;
+    assert sf_path_ok("Z9.t27", 0, 6) == true;
+    assert sf_path_ok("specs/x.t28", 0, 11) == false;
+    assert sf_path_ok("specs/xxt27", 0, 11) == false;
+    var p : [208]u8 = undefined;
+    var w : usize = 0;
+    while (w < 197) {
+        p[w] = 'a';
+        w += 1;
+    }
+    w = put_str(&p, 208, w, ".t27", 4);
+    assert w == 201;
+    assert sf_path_ok(&p, 1, 201) == true;
+    assert sf_path_ok(&p, 0, 201) == false;
+}
+
+test a_suggested_line_is_printable_ascii_or_tab {
+    var b : [3]u8 = undefined;
+    b[0] = 'a';
+    b[2] = 'b';
+    b[1] = 126;
+    assert sf_line_ok(&b, 0, 3) == true;
+    b[1] = 32;
+    assert sf_line_ok(&b, 0, 3) == true;
+    b[1] = 127;
+    assert sf_line_ok(&b, 0, 3) == false;
+    b[1] = 31;
+    assert sf_line_ok(&b, 0, 3) == false;
+    b[1] = 1;
+    assert sf_line_ok(&b, 0, 3) == false;
+}
+
+test a_control_byte_is_escaped_with_lowercase_hex {
+    assert sf_hexd(0) == '0';
+    assert sf_hexd(9) == '9';
+    assert sf_hexd(10) == 'a';
+    assert sf_hexd(11) == 'b';
+    assert sf_hexd(12) == 'c';
+    assert sf_hexd(13) == 'd';
+    assert sf_hexd(14) == 'e';
+    assert sf_hexd(15) == 'f';
+    var o : [8]u8 = undefined;
+    const k : usize = sf_esc(&o, 8, 0, 27);
+    assert k == 6;
+    assert buf_has(&o, 6, "\\u001b", 6) == true;
+}
+
+test two_lines_are_the_same_only_when_every_byte_is {
+    assert sf_same_line("ab", 0, 2, "ab", 0, 2) == true;
+    assert sf_same_line("ab", 0, 2, "ax", 0, 2) == false;
+    assert sf_same_line("ab", 0, 2, "abc", 0, 3) == false;
+    assert sf_same_line("ax", 0, 1, "ay", 0, 1) == true;
+}
+
+test the_line_count_counts_a_last_line_without_a_newline {
+    assert sf_lines("a\nb", 3) == 2;
+    assert sf_lines("a\nb\n", 4) == 2;
+    assert sf_lines("a\nb\n", 3) == 2;
+    assert sf_lines("x", 0) == 0;
+}
+
+test a_missing_final_newline_alone_gets_no_suggestion {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t2\n", 16);
+    w = put_str(&inp, 512, w, "a;", 2);
+    w = put_str(&inp, 512, w, "H\t@@ -1,1 +1,1 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[5] == 1;
+    assert st[6] == 0;
+    assert st[7] == 0;
+    assert st[0] + st[1] + st[2] + st[3] + st[4] == 0;
+}
+
+test one_trailing_blank_line_is_a_one_line_empty_suggestion {
+    var inp : [512]u8 = undefined;
+    var w : usize = put_str(&inp, 512, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = put_str(&inp, 512, w, "F\tspecs/x.t27\t4\n", 16);
+    w = put_str(&inp, 512, w, "a;\n\n", 4);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    const m : usize = suggest_review(&inp, w, &out, 4096, &st);
+    assert st[0] == 1;
+    assert buf_has(&out, m, "\"line\":2,\"body\":\"```suggestion\\n```\"}", 37) == true;
+    assert buf_has(&out, m, "start_line", 10) == false;
+}
+
+test two_files_post_two_comments_split_by_one_comma {
+    var inp : [512]u8 = undefined;
+    var w : usize = t_fix_stream(&inp, 512);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    w = put_str(&inp, 512, w, "F\tspecs/y.t27\t16\n", 17);
+    w = put_str(&inp, 512, w, "a = 1;  \nb = 2;\n", 16);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    const m : usize = suggest_review(&inp, w, &out, 4096, &st);
+    assert st[0] == 2;
+    assert st[5] == 2;
+    assert st[7] == 0;
+    assert buf_has(&out, m, "\"comments\":[{\"path\":\"specs/x.t27\"", 33) == true;
+    assert buf_has(&out, m, "```\"},{\"path\":\"specs/y.t27\"", 27) == true;
+    assert out[m - 3] == '}';
+}
+
+test an_empty_diff_header_withholds_its_file_and_not_the_review {
+    var inp : [512]u8 = undefined;
+    var w : usize = t_fix_stream(&inp, 512);
+    w = put_str(&inp, 512, w, "H\t\n", 3);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[0] == 0;
+    assert st[4] == 1;
+    assert st[7] == 0;
+}
+
+test an_unknown_record_shaped_like_a_file_posts_nothing {
+    var inp : [512]u8 = undefined;
+    var w : usize = t_fix_stream(&inp, 512);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@\n", 18);
+    w = put_str(&inp, 512, w, "X\tspecs/y.t27\t3\n", 16);
+    w = put_str(&inp, 512, w, "a;\n", 3);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[7] == 1;
+}
+
+test a_stream_may_end_with_the_last_byte_of_a_file {
+    var inp : [512]u8 = undefined;
+    const w : usize = t_fix_stream(&inp, 512);
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[5] == 1;
+    assert st[7] == 0;
+    assert st[1] == 1;
+}
+
+test a_diff_header_of_127_bytes_is_read_and_128_is_not {
+    var inp : [512]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    var w : usize = t_fix_stream(&inp, 512);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@ ", 18);
+    w = t_rep(&inp, 512, w, "x", 1, 111);
+    w = put_byte(&inp, 512, w, '\n');
+    assert suggest_review(&inp, w, &out, 4096, &st) > 0;
+    assert st[0] == 1;
+    w = t_fix_stream(&inp, 512);
+    w = put_str(&inp, 512, w, "H\t@@ -1,2 +1,2 @@ ", 18);
+    w = t_rep(&inp, 512, w, "x", 1, 112);
+    w = put_byte(&inp, 512, w, '\n');
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[0] == 0;
+    assert st[4] == 1;
+    assert st[7] == 0;
+}
+
+test the_range_cap_keeps_2048_and_flags_the_next {
+    var inp : [37120]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    var w : usize = t_fix_stream(&inp, 37120);
+    w = t_rep(&inp, 37120, w, "H\t@@ -1,2 +1,2 @@\n", 18, 2048);
+    assert suggest_review(&inp, w, &out, 4096, &st) > 0;
+    assert st[0] == 1;
+    assert st[8] == 0;
+    w = t_fix_stream(&inp, 37120);
+    w = t_rep(&inp, 37120, w, "H\t@@ -1,2 +1,2 @@\n", 18, 2049);
+    assert w <= 37120;
+    assert suggest_review(&inp, w, &out, 4096, &st) > 0;
+    assert st[0] == 1;
+    assert st[8] == 1;
+}
+
+test the_hunk_cap_keeps_512_and_flags_the_next_wherever_it_closes {
+    var inp : [8192]u8 = undefined;
+    var out : [16384]u8 = undefined;
+    var st : [9]u32 = undefined;
+    // A run closed by the next line.
+    var w : usize = put_str(&inp, 8192, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 8192, w, 4096);
+    w = t_rep(&inp, 8192, w, "a;  \nb;\n", 8, 512);
+    assert suggest_review(&inp, w, &out, 16384, &st) == 0;
+    assert st[1] == 512;
+    assert st[8] == 0;
+    w = put_str(&inp, 8192, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 8192, w, 4104);
+    w = t_rep(&inp, 8192, w, "a;  \nb;\n", 8, 513);
+    assert suggest_review(&inp, w, &out, 16384, &st) == 0;
+    assert st[1] == 512;
+    assert st[8] == 1;
+    // A run still open at the end of the file.
+    w = put_str(&inp, 8192, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 8192, w, 4093);
+    w = t_rep(&inp, 8192, w, "a;  \nb;\n", 8, 511);
+    w = put_str(&inp, 8192, w, "a;  \n", 5);
+    assert suggest_review(&inp, w, &out, 16384, &st) == 0;
+    assert st[1] == 512;
+    assert st[8] == 0;
+    w = put_str(&inp, 8192, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 8192, w, 4101);
+    w = t_rep(&inp, 8192, w, "a;  \nb;\n", 8, 512);
+    w = put_str(&inp, 8192, w, "a;  \n", 5);
+    assert suggest_review(&inp, w, &out, 16384, &st) == 0;
+    assert st[1] == 512;
+    assert st[8] == 1;
+    // The trailing blank lines, the last hunk of a file.
+    w = put_str(&inp, 8192, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 8192, w, 4089);
+    w = t_rep(&inp, 8192, w, "a;  \nb;\n", 8, 511);
+    w = put_str(&inp, 8192, w, "\n", 1);
+    assert suggest_review(&inp, w, &out, 16384, &st) == 0;
+    assert st[1] == 512;
+    assert st[8] == 0;
+    w = put_str(&inp, 8192, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 8192, w, 4097);
+    w = t_rep(&inp, 8192, w, "a;  \nb;\n", 8, 512);
+    w = put_str(&inp, 8192, w, "\n", 1);
+    assert suggest_review(&inp, w, &out, 16384, &st) == 0;
+    assert st[1] == 512;
+    assert st[8] == 1;
+}
+
+test the_file_cap_reads_64_files_and_refuses_the_next {
+    var inp : [2048]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    var w : usize = put_str(&inp, 2048, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_rep(&inp, 2048, w, "F\tspecs/x.t27\t3\na;\n", 19, 64);
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[5] == 64;
+    assert st[6] == 0;
+    assert st[7] == 0;
+    w = put_str(&inp, 2048, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_rep(&inp, 2048, w, "F\tspecs/x.t27\t3\na;\n", 19, 65);
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[5] == 65;
+    assert st[6] == 1;
+    assert st[7] == 0;
+}
+
+test the_largest_file_held_is_file_cap_bytes {
+    var inp : [131200]u8 = undefined;
+    var out : [4096]u8 = undefined;
+    var st : [9]u32 = undefined;
+    var w : usize = put_str(&inp, 131200, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 131200, w, 131072);
+    w = t_rep(&inp, 131200, w, "a;\n", 3, 43690);
+    w = put_str(&inp, 131200, w, "a;", 2);
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[5] == 1;
+    assert st[6] == 0;
+    assert st[7] == 0;
+    w = put_str(&inp, 131200, 0, "S\t0123456789abcdef0123456789abcdef01234567\n", 43);
+    w = t_file_head(&inp, 131200, w, 131073);
+    w = t_rep(&inp, 131200, w, "a;\n", 3, 43691);
+    assert suggest_review(&inp, w, &out, 4096, &st) == 0;
+    assert st[5] == 1;
+    assert st[6] == 1;
+    assert st[7] == 0;
+}

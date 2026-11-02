@@ -1,0 +1,545 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/elf.t27 -- t27b's ELF64 relocatable object for aarch64 Linux (issue #8947, epic #8951)
+; `t27b build --elf` (the default on Linux) writes an ET_REL object for EM_AARCH64 that the GNU toolchain
+; links. Every decision is here and reaches cli/t27b through `t27c gen-rust` (gen/rust/tri/t27b/elf.rs,
+; mounted in cli/t27b/src/macho.rs): the layout, the sections, the symbols, the relocations and the bytes.
+; The glue only flattens the linked image into the tables macho.t27 describes ("the image both object
+; writers read") and sizes the buffer; the writers of fixed-width integers are macho.t27's.
+; --
+; The file, in order (every offset 8-byte aligned unless said):
+;   Elf64_Ehdr           64 bytes
+;   .text                at 64: the linked functions (each starts on 16 bytes; sh_addralign 16)
+;   .rodata              Program::data, each blob 8-byte aligned (codegen::data_layout)
+;   .data                the address table, 8 bytes per module-level var, then Program::globals, each
+;                        8-byte aligned
+;   .rela.text           two Elf64_Rela per data reference
+;   .rela.data           one Elf64_Rela per module-level var: its table entry
+;   .symtab              null, the section symbols of .rodata and .data, then one global per function
+;   .strtab              a NUL, then each exported name and a NUL
+;   .shstrtab            the section names (85 bytes; unaligned)
+;   section headers      10 of 64 bytes: null, .text, .rodata, .data, .rela.text, .rela.data, .symtab,
+;                        .strtab, .shstrtab, .note.GNU-stack (empty: the stack is not executable)
+; Every section is always present, empty when the image has nothing for it, so the indices are fixed.
+; There is no .bss: a module-level var starts with its initial bytes, zero or not, in .data.
+; --
+; The relocations are exactly the kinds t27b's link step leaves open (codegen::link):
+;   a data reference, `adrp xd, 0` + `add xd, xd, #0`  -> R_AARCH64_ADR_PREL_PG_HI21 on the adrp and
+;       R_AARCH64_ADD_ABS_LO12_NC on the add, both against the .rodata section symbol with the blob's
+;       offset as the addend (macho.t27's ARM64_RELOC_PAGE21 + ARM64_RELOC_PAGEOFF12 pair; RELA carries
+;       the addend, so no per-blob symbol is needed);
+;   a module-level var, the same pair against the .data section symbol, addend 0: the address table, from
+;       which the code loads the var's address (`ldr xd, [xd, #8k]`, as in the JIT);
+;   each table entry -> R_AARCH64_ABS64 against .data, addend the var's offset in .data.
+; Not emitted, because t27b emits no such site: R_AARCH64_CALL26 (every `bl` is to a function of the same
+; module and `link` resolves it), R_AARCH64_LDST*_ABS_LO12_NC (data is reached through `add`, never a load
+; with the low 12 bits folded in).
+; Symbols are named as in t27 (no `_` in front, unlike Mach-O); a function with an empty name or that was
+; not emitted gets no symbol. Which functions get their name, and so a symbol any AAPCS64 caller can call:
+; "the C ABI" below (#8948).
+; Known gap, for #8949: a module-level var that holds a str is filled by each test's preamble
+; (lower.rs `str_globals`), not by its initial bytes, so in an object file it starts zeroed.
+; --
+; The oracle: the tests below assert bytes worked out from the ELF-64 and AAELF64 specifications; on the
+; t27c lab `aarch64-linux-gnu-readelf -a` reads the same images back, and objects `t27b build --elf` wrote
+; for specs/tri/t27b/conformance/elf_object.t27 link with aarch64-linux-gnu-gcc and run under qemu-aarch64.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bElf;
+
+use tri::t27b::macho;
+
+// e_ident and Elf64_Ehdr (<elf.h>).
+pub const ELFCLASS64 : u8 = 2;
+pub const ELFDATA2LSB : u8 = 1;
+pub const EV_CURRENT : u8 = 1;
+pub const ET_REL : u16 = 1;
+pub const EM_AARCH64 : u16 = 183;
+// Section header types and flags.
+pub const SHT_PROGBITS : u32 = 1;
+pub const SHT_SYMTAB : u32 = 2;
+pub const SHT_STRTAB : u32 = 3;
+pub const SHT_RELA : u32 = 4;
+pub const SHF_WRITE : u64 = 1;
+pub const SHF_ALLOC : u64 = 2;
+pub const SHF_EXECINSTR : u64 = 4;
+pub const SHF_INFO_LINK : u64 = 64;
+// st_info = binding << 4 | type.
+pub const STB_GLOBAL : u8 = 1;
+pub const STT_FUNC : u8 = 2;
+pub const STT_SECTION : u8 = 3;
+// Relocation types (AAELF64).
+pub const R_AARCH64_ABS64 : u32 = 257;
+pub const R_AARCH64_ADR_PREL_PG_HI21 : u32 = 275;
+pub const R_AARCH64_ADD_ABS_LO12_NC : u32 = 277;
+// Record sizes.
+pub const EHDR_SIZE : usize = 64;
+pub const SHDR_SIZE : usize = 64;
+pub const SYM_SIZE : usize = 24;
+pub const RELA_SIZE : usize = 24;
+// Section indices.
+pub const SEC_TEXT : u16 = 1;
+pub const SEC_RODATA : u16 = 2;
+pub const SEC_DATA : u16 = 3;
+pub const SEC_RELA_TEXT : u16 = 4;
+pub const SEC_RELA_DATA : u16 = 5;
+pub const SEC_SYMTAB : u16 = 6;
+pub const SEC_STRTAB : u16 = 7;
+pub const SEC_SHSTRTAB : u16 = 8;
+pub const NSECT : usize = 10;
+// Symbol indices: null, .rodata, .data; the functions follow, all global (.symtab sh_info = NLOCAL).
+pub const SYM_RODATA : u64 = 1;
+pub const SYM_DATA : u64 = 2;
+pub const NLOCAL : usize = 3;
+// Offsets of the names in .shstrtab: "\0.text\0.rodata\0.data\0.rela.text\0.rela.data\0.symtab\0.strtab\0
+// .shstrtab\0.note.GNU-stack\0".
+pub const NAME_TEXT : u32 = 1;
+pub const NAME_RODATA : u32 = 7;
+pub const NAME_DATA : u32 = 15;
+pub const NAME_RELA_TEXT : u32 = 21;
+pub const NAME_RELA_DATA : u32 = 32;
+pub const NAME_SYMTAB : u32 = 43;
+pub const NAME_STRTAB : u32 = 51;
+pub const NAME_SHSTRTAB : u32 = 59;
+pub const NAME_NOTE_STACK : u32 = 69;
+pub const SHSTRTAB_SIZE : usize = 85;
+
+/// File offset of .rodata: after the code.
+pub fn rodata_off(text_len: usize) -> usize {
+    return align_up(EHDR_SIZE + text_len, 8);
+}
+
+/// File offset of .data.
+pub fn data_off(text_len: usize, rodata_size: usize) -> usize {
+    return align_up(rodata_off(text_len) + rodata_size, 8);
+}
+
+/// Bytes of .data for ng module-level vars whose initial bytes take globals_size: the table, then them.
+pub fn data_size(ng: usize, globals_size: usize) -> usize {
+    if (ng == 0) { return 0; }
+    return 8 * ng + globals_size;
+}
+
+/// File offset of .rela.text.
+pub fn rela_text_off(text_len: usize, rodata_size: usize, dsize: usize) -> usize {
+    return align_up(data_off(text_len, rodata_size) + dsize, 8);
+}
+
+/// File offset of the section headers: after .shstrtab, at the next 8 bytes.
+pub fn sh_off(shstrtab_at: usize) -> usize {
+    return align_up(shstrtab_at + SHSTRTAB_SIZE, 8);
+}
+
+/// r_info: the symbol in the high 32 bits, the type in the low 32.
+pub fn rela_info(sym: u64, ty: u32) -> u64 {
+    return (sym << 32) | (ty as u64);
+}
+
+/// One Elf64_Rela: r_offset, r_info, r_addend.
+pub fn put_rela(out: []u8, at: usize, off: usize, sym: u64, ty: u32, addend: usize) -> usize {
+    var p : usize = put_u64(out, at, off as u64);
+    p = put_u64(out, p, rela_info(sym, ty));
+    return put_u64(out, p, addend as u64);
+}
+
+/// The two relocations of the `adrp` + `add` pair at code word w: PG_HI21, then ADD_ABS_LO12_NC.
+pub fn put_rela_pair(out: []u8, at: usize, w: usize, sym: u64, addend: usize) -> usize {
+    const p : usize = put_rela(out, at, 4 * w, sym, R_AARCH64_ADR_PREL_PG_HI21, addend);
+    return put_rela(out, p, 4 * (w + 1), sym, R_AARCH64_ADD_ABS_LO12_NC, addend);
+}
+
+/// One Elf64_Sym: st_name, st_info, st_other 0 (STV_DEFAULT), st_shndx, st_value, st_size.
+pub fn put_sym(out: []u8, at: usize, name: u32, info: u8, shndx: u16, value: usize, size: usize) -> usize {
+    var p : usize = put_u32(out, at, name);
+    p = put_u8(out, p, info);
+    p = put_u8(out, p, 0);
+    p = put_u16(out, p, shndx);
+    p = put_u64(out, p, value as u64);
+    return put_u64(out, p, size as u64);
+}
+
+/// One Elf64_Shdr; sh_addr is 0 in a relocatable object.
+pub fn put_shdr(out: []u8, at: usize, name: u32, ty: u32, flags: u64, off: usize, size: usize, link: u16, info: u32, align: u64, entsize: usize) -> usize {
+    var p : usize = put_u32(out, at, name);
+    p = put_u32(out, p, ty);
+    p = put_u64(out, p, flags);
+    p = put_u64(out, p, 0);
+    p = put_u64(out, p, off as u64);
+    p = put_u64(out, p, size as u64);
+    p = put_u32(out, p, link as u32);
+    p = put_u32(out, p, info);
+    p = put_u64(out, p, align);
+    return put_u64(out, p, entsize as u64);
+}
+
+/// Elf64_Ehdr, from offset 0, for section headers at shoff.
+pub fn put_ehdr(out: []u8, shoff: usize) -> usize {
+    var p : usize = put_u32(out, 0, 0x464c457f);
+    p = put_u8(out, p, ELFCLASS64);
+    p = put_u8(out, p, ELFDATA2LSB);
+    p = put_u8(out, p, EV_CURRENT);
+    p = put_u8(out, p, 0);
+    p = put_u64(out, p, 0);
+    p = put_u16(out, p, ET_REL);
+    p = put_u16(out, p, EM_AARCH64);
+    p = put_u32(out, p, 1);
+    p = put_u64(out, p, 0);
+    p = put_u64(out, p, 0);
+    p = put_u64(out, p, shoff as u64);
+    p = put_u32(out, p, 0);
+    p = put_u16(out, p, EHDR_SIZE as u16);
+    p = put_u16(out, p, 0);
+    p = put_u16(out, p, 0);
+    p = put_u16(out, p, SHDR_SIZE as u16);
+    p = put_u16(out, p, NSECT as u16);
+    return put_u16(out, p, SEC_SHSTRTAB);
+}
+
+/// The section names, from `at`; the position after them.
+pub fn put_shstrtab(out: []u8, at: usize) -> usize {
+    out[at] = 0;
+    var p : usize = put_cstr(out, at + 1, ".text");
+    p = put_cstr(out, p, ".rodata");
+    p = put_cstr(out, p, ".data");
+    p = put_cstr(out, p, ".rela.text");
+    p = put_cstr(out, p, ".rela.data");
+    p = put_cstr(out, p, ".symtab");
+    p = put_cstr(out, p, ".strtab");
+    p = put_cstr(out, p, ".shstrtab");
+    return put_cstr(out, p, ".note.GNU-stack");
+}
+
+/// The bytes of w and a NUL.
+pub fn put_cstr(out: []u8, at: usize, w: string) -> usize {
+    const p : usize = put_text(out, at, w);
+    out[p] = 0;
+    return p + 1;
+}
+
+/// Length of the ELF object of an image whose code is text_len bytes; the first nblobs blobs are
+/// read-only data, the rest module-level vars.
+pub fn elf_size(names: []const u8, fns: []const u8, refs: []const u8, lens: []const u8, text_len: usize, nblobs: usize) -> usize {
+    const nall : usize = blob_count(lens);
+    const ng : usize = nall - nblobs;
+    const dsize : usize = data_size(ng, group_size(lens, nblobs, nall));
+    const rt : usize = rela_text_off(text_len, group_size(lens, 0, nblobs), dsize);
+    const nsyms : usize = NLOCAL + export_count(names, fns);
+    const sh : usize = rt + RELA_SIZE * (2 * ref_count(refs) + ng) + SYM_SIZE * nsyms + 1 + export_bytes(names, fns);
+    return sh_off(sh) + SHDR_SIZE * NSECT;
+}
+
+/// Writes the ELF object of an image into out, elf_size bytes; returns that length.
+pub fn write_elf(out: []u8, text: []const u8, names: []const u8, fns: []const u8, refs: []const u8, blobs: []const u8, lens: []const u8, nblobs: usize) -> usize {
+    const size : usize = elf_size(names, fns, refs, lens, text.len, nblobs);
+    var z : usize = 0;
+    while (z < size) {
+        out[z] = 0;
+        z = z + 1;
+    }
+    const nall : usize = blob_count(lens);
+    const ng : usize = nall - nblobs;
+    const nrefs : usize = ref_count(refs);
+    const nsyms : usize = NLOCAL + export_count(names, fns);
+    const strsize : usize = 1 + export_bytes(names, fns);
+    const rsize : usize = group_size(lens, 0, nblobs);
+    const dsize : usize = data_size(ng, group_size(lens, nblobs, nall));
+    const ro : usize = rodata_off(text.len);
+    const dat : usize = data_off(text.len, rsize);
+    const rt : usize = rela_text_off(text.len, rsize, dsize);
+    const rd : usize = rt + 2 * RELA_SIZE * nrefs;
+    const st : usize = rd + RELA_SIZE * ng;
+    const sto : usize = st + SYM_SIZE * nsyms;
+    const sh : usize = sto + strsize;
+    const shoff : usize = sh_off(sh);
+    put_ehdr(out, shoff);
+    put_bytes(out, EHDR_SIZE, text);
+    put_group(out, ro, blobs, lens, 0, nblobs);
+    put_group(out, dat + 8 * ng, blobs, lens, nblobs, nall);
+    // .rela.text: a pair per data reference; a blob past the read-only ones is the address table.
+    var i : usize = 0;
+    while (i < nrefs) {
+        const b : usize = ref_blob(refs, i);
+        if (b < nblobs) {
+            put_rela_pair(out, rt + 2 * RELA_SIZE * i, ref_word(refs, i), SYM_RODATA, blob_off(lens, 0, b));
+        } else {
+            put_rela_pair(out, rt + 2 * RELA_SIZE * i, ref_word(refs, i), SYM_DATA, 0);
+        }
+        i = i + 1;
+    }
+    // .rela.data: table entry g holds the address of var g.
+    var g : usize = 0;
+    while (g < ng) {
+        put_rela(out, rd + RELA_SIZE * g, 8 * g, SYM_DATA, R_AARCH64_ABS64, 8 * ng + blob_off(lens, nblobs, nblobs + g));
+        g = g + 1;
+    }
+    // .symtab (index 0 stays zero) and .strtab.
+    var p : usize = put_sym(out, st + SYM_SIZE, 0, STT_SECTION, SEC_RODATA, 0, 0);
+    p = put_sym(out, p, 0, STT_SECTION, SEC_DATA, 0, 0);
+    var strx : usize = 1;
+    var at : usize = 0;
+    var f : usize = 0;
+    while (f < fn_count(fns)) {
+        if (exported(names, fns, f, at)) {
+            p = put_sym(out, p, strx as u32, (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, 4 * (fn_at(fns, f) - 1), 4 * fn_words(fns, f));
+            strx = put_name(out, sto + strx, names, at) - sto;
+        }
+        at = at + name_len(names, at) + 1;
+        f = f + 1;
+    }
+    put_shstrtab(out, sh);
+    // Section headers; index 0 stays zero.
+    p = put_shdr(out, shoff + SHDR_SIZE, NAME_TEXT, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, EHDR_SIZE, text.len, 0, 0, 16, 0);
+    p = put_shdr(out, p, NAME_RODATA, SHT_PROGBITS, SHF_ALLOC, ro, rsize, 0, 0, 8, 0);
+    p = put_shdr(out, p, NAME_DATA, SHT_PROGBITS, SHF_WRITE | SHF_ALLOC, dat, dsize, 0, 0, 8, 0);
+    p = put_shdr(out, p, NAME_RELA_TEXT, SHT_RELA, SHF_INFO_LINK, rt, 2 * RELA_SIZE * nrefs, SEC_SYMTAB, SEC_TEXT as u32, 8, RELA_SIZE);
+    p = put_shdr(out, p, NAME_RELA_DATA, SHT_RELA, SHF_INFO_LINK, rd, RELA_SIZE * ng, SEC_SYMTAB, SEC_DATA as u32, 8, RELA_SIZE);
+    p = put_shdr(out, p, NAME_SYMTAB, SHT_SYMTAB, 0, st, SYM_SIZE * nsyms, SEC_STRTAB, NLOCAL as u32, 8, SYM_SIZE);
+    p = put_shdr(out, p, NAME_STRTAB, SHT_STRTAB, 0, sto, strsize, 0, 0, 1, 0);
+    p = put_shdr(out, p, NAME_SHSTRTAB, SHT_STRTAB, 0, sh, SHSTRTAB_SIZE, 0, 0, 1, 0);
+    p = put_shdr(out, p, NAME_NOTE_STACK, SHT_PROGBITS, 0, sh + SHSTRTAB_SIZE, 0, 0, 0, 1, 0);
+    return size;
+}
+
+// ---------------------------------------------------------------- the C ABI (#8948)
+// Which functions an object exports, and under which name. The name is the t27 fn's own, as gen-c names the
+// C function (bootstrap/src/compiler.rs `gen_c_fn`: the bare name, `pub` or not), with Mach-O's `_` in front
+// on macOS (macho.t27). Hand-written Rust calls it through `extern "C"`, C calls it by its prototype, because
+// for scalars t27b's own calling convention is AAPCS64 (section 6.8.2):
+//   - an integer of up to 64 bits, a bool, an enum's tag or a pointer: the next of x0-x7. AAPCS64 leaves the
+//     bits above a narrow argument unspecified, so the callee extends it (a64.t27's `narrow_word`, in the
+//     prologue); a narrow result goes back extended to 32 bits, which a caller that reads only its own bits,
+//     or one that assumes Apple's stronger rule, accepts alike;
+//   - f32 and f64: the next of s0-s7 / d0-d7, counted apart from the x registers; a result in s0 / d0;
+//   - i128: the next even pair, x0:x1 up to x6:x7, the low word first (i128_plan.t27's `arg_reg`, C.10 to C.13);
+//     a result in x0:x1;
+//   - the callee keeps x19-x28 (a64.t27's `save_word`), x29 and x30 (the frame's stp), d8-d15 and x18 (never
+//     written), and sp stays 16-byte aligned (a frame is a multiple of 16).
+// conformance/elf_object.t27's "C ABI" part has a fn for each class; cli/t27b/tests/source.rs loads that object
+// and calls each one through `extern "C"`, x19-x28, d8-d15 and x29 watched across one call.
+// Not exported:
+//   - a test or an invariant, which an object does not contain (a function not emitted);
+//   - HELPER: a routine of t27b's own, RESERVED in front of its name (libm_plan.t27's and i128_plan.t27's
+//     HELPER, lower's `__t27b_str_eql`). Every object that calls one carries its own copy, so two objects linked
+//     together would both define it;
+//   - REFUSED: a function in t27b's own convention (lower's `internal_abi`), named in a note. It passes or
+//     returns a struct, a str, a slice, an array or an optional through a hidden pointer, or takes a parameter
+//     past the registers, one full word each. AAPCS64 for aggregates (a small one in registers, a larger one
+//     through x8, HFAs) and for stack parameters: see #8972.
+
+/// t27b's reserved prefix for its own routines.
+pub const RESERVED : str = "__t27b_";
+/// What `t27b build` does with a function (cli/t27b/src/macho.rs `symbols`).
+pub const EXPORT : u8 = 0;
+pub const HELPER : u8 = 1;
+pub const REFUSED : u8 = 2;
+/// The note after a REFUSED function's name.
+pub const REFUSED_NOTE : str = "takes or returns a struct, a str, a slice, an array or an optional, or takes more than 8 parameters of a class, and is not exported (see #8972)";
+
+/// EXPORT, HELPER or REFUSED for the function called `name`; own_convention: it is in lower's `internal_abi`.
+pub fn export_kind(name: []const u8, own_convention: bool) -> u8 {
+    if (name.len > 0 and name[0] == 64) { return EXPORT; } // an import `@sym` (#8946) keeps its name: macho.t27 makes it undefined
+    if (name.len >= RESERVED.len) {
+        var i : usize = 0;
+        while (i < RESERVED.len and name[i] == RESERVED[i]) { i = i + 1; }
+        if (i == RESERVED.len) { return HELPER; }
+    }
+    if (own_convention) { return REFUSED; }
+    return EXPORT;
+}
+
+/// Test helper: the image of E2, the object of every kind of section the writer fills. One function
+/// `get` of six words: `adrp` + `add` to blob 1 at word 0, `adrp` + `add` + `ldr` of the address
+/// table at word 2; blobs "abc" and "defgh" (read-only), then two module-level vars of 4 and 1 bytes.
+pub fn e2_tables(text: []u8, names: []u8, fns: []u8, refs: []u8, lens: []u8, blobs: []u8) -> void {
+    put_u32(text, 0, 0x90000000);
+    put_u32(text, 4, 0x91000000);
+    put_u32(text, 8, 0x90000001);
+    put_u32(text, 12, 0x91000021);
+    put_u32(text, 16, 0xf9400021);
+    put_u32(text, 20, 0xd65f03c0);
+    names[put_text(names, 0, "get")] = 0;
+    put_row(fns, 0, 1, 6);
+    put_row(refs, 0, 0, 1);
+    put_row(refs, 1, 2, 2);
+    put_u64(lens, 0, 3);
+    put_u64(lens, 8, 5);
+    put_u64(lens, 16, 4);
+    put_u64(lens, 24, 1);
+    put_text(blobs, 0, "abcdefgh");
+    blobs[8] = 7;
+    blobs[9] = 0;
+    blobs[10] = 0;
+    blobs[11] = 0;
+    blobs[12] = 1;
+}
+
+test the_header_is_elf64_lsb_rel_aarch64 {
+    // e_ident 7f 'E' 'L' 'F', ELFCLASS64, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE; ET_REL, EM_AARCH64 (183),
+    // e_version 1; no entry, no program headers; e_shoff 264; e_ehsize 64, e_shentsize 64, 10 sections,
+    // .shstrtab at index 8.
+    var out : [64]u8 = undefined;
+    assert put_ehdr(&out, 264) == 64;
+    assert bytes_are(&out, 0, "7f454c460201010000000000000000000100b700010000000000000000000000000000000000000008010000000000000000000040000000000040000a000800");
+    assert EM_AARCH64 == 183;
+}
+
+test the_relocations_are_the_aaelf64_encodings {
+    // r_info = symbol << 32 | type: 275 ADR_PREL_PG_HI21, 277 ADD_ABS_LO12_NC, 257 ABS64.
+    assert rela_info(SYM_RODATA, R_AARCH64_ADR_PREL_PG_HI21) == 0x100000113;
+    assert rela_info(SYM_RODATA, R_AARCH64_ADD_ABS_LO12_NC) == 0x100000115;
+    assert rela_info(SYM_DATA, R_AARCH64_ABS64) == 0x200000101;
+    var out : [72]u8 = undefined;
+    // The pair of a reference at word 36 to the blob at .rodata + 16, then a table entry at .data + 8.
+    var p : usize = put_rela_pair(&out, 0, 36, SYM_RODATA, 16);
+    assert p == 48;
+    p = put_rela(&out, p, 8, SYM_DATA, R_AARCH64_ABS64, 24);
+    assert p == 72;
+    assert bytes_are(&out, 0, "90000000000000001301000001000000100000000000000094000000000000001501000001000000100000000000000008000000000000000101000002000000");
+    assert bytes_are(&out, 64, "1800000000000000");
+}
+
+test symbols_are_section_symbols_then_global_functions {
+    var out : [48]u8 = undefined;
+    var p : usize = put_sym(&out, 0, 0, STT_SECTION, SEC_RODATA, 0, 0);
+    p = put_sym(&out, p, 1, (STB_GLOBAL << 4) | STT_FUNC, SEC_TEXT, 16, 88);
+    assert p == 48;
+    assert bytes_are(&out, 0, "000000000300020000000000000000000000000000000000010000001200010010000000000000005800000000000000");
+}
+
+test the_section_names_sit_at_their_offsets {
+    var out : [85]u8 = undefined;
+    assert put_shstrtab(&out, 0) == SHSTRTAB_SIZE;
+    assert bytes_are(&out, NAME_TEXT as usize, "2e7465787400");
+    assert bytes_are(&out, NAME_RODATA as usize, "2e726f6461746100");
+    assert bytes_are(&out, NAME_DATA as usize, "2e6461746100");
+    assert bytes_are(&out, NAME_RELA_TEXT as usize, "2e72656c612e7465787400");
+    assert bytes_are(&out, NAME_RELA_DATA as usize, "2e72656c612e6461746100");
+    assert bytes_are(&out, NAME_SYMTAB as usize, "2e73796d74616200");
+    assert bytes_are(&out, NAME_STRTAB as usize, "2e73747274616200");
+    assert bytes_are(&out, NAME_SHSTRTAB as usize, "2e7368737472746162");
+    assert bytes_are(&out, NAME_NOTE_STACK as usize, "2e6e6f74652e474e552d737461636b00");
+    assert out[0] == 0;
+}
+
+test layout_of_one_function_without_data_e1 {
+    // 8 bytes of code: .rodata, .data and both relocation tables are empty at 72; .symtab 4 entries at 72,
+    // .strtab "\0answer\0" at 168, .shstrtab at 176, section headers at 264; 904 bytes.
+    assert rodata_off(8) == 72;
+    assert data_off(8, 0) == 72;
+    assert data_size(0, 0) == 0;
+    assert rela_text_off(8, 0, 0) == 72;
+    assert sh_off(176) == 264;
+    var names : [7]u8 = undefined;
+    names[put_text(&names, 0, "answer")] = 0;
+    var fns : [16]u8 = undefined;
+    put_row(&fns, 0, 1, 2);
+    var none : [8]u8 = undefined;
+    assert elf_size(&names, &fns, none[0..0], none[0..0], 8, 0) == 904;
+}
+
+test layout_with_data_and_vars_e2 {
+    // 24 bytes of code; .rodata 13 bytes at 88 ("abc", pad, "defgh"); .data at 104: the table (16) and the
+    // vars at 16 and 24 (25 bytes); .rela.text at 136 (4 entries), .rela.data at 232 (2), .symtab at 280,
+    // .strtab at 376, .shstrtab at 381, section headers at 472; 1112 bytes.
+    assert rodata_off(24) == 88;
+    assert data_off(24, 13) == 104;
+    assert data_size(2, 9) == 25;
+    assert rela_text_off(24, 13, 25) == 136;
+    assert sh_off(381) == 472;
+    var text : [24]u8 = undefined;
+    var names : [4]u8 = undefined;
+    var fns : [16]u8 = undefined;
+    var refs : [32]u8 = undefined;
+    var lens : [32]u8 = undefined;
+    var blobs : [13]u8 = undefined;
+    e2_tables(&text, &names, &fns, &refs, &lens, &blobs);
+    assert elf_size(&names, &fns, &refs, &lens, 24, 2) == 1112;
+    assert blob_off(&lens, 0, 1) == 8;
+    assert blob_off(&lens, 2, 3) == 8;
+}
+
+test the_object_of_one_function_e1 {
+    // E1 whole: `answer` (mov w0, #42; ret). aarch64-linux-gnu-readelf reads it back, and the same bytes from
+    // `t27b build --elf` link with aarch64-linux-gnu-gcc and exit 42 under qemu-aarch64.
+    var text : [8]u8 = undefined;
+    put_u32(&text, 0, 0x52800540);
+    put_u32(&text, 4, 0xd65f03c0);
+    var names : [7]u8 = undefined;
+    names[put_text(&names, 0, "answer")] = 0;
+    var fns : [16]u8 = undefined;
+    put_row(&fns, 0, 1, 2);
+    var none : [8]u8 = undefined;
+    var out : [904]u8 = undefined;
+    assert write_elf(&out, &text, &names, &fns, none[0..0], none[0..0], none[0..0], 0) == 904;
+    assert bytes_are(&out, 0, "7f454c460201010000000000000000000100b700010000000000000000000000000000000000000008010000000000000000000040000000000040000a000800");
+    assert bytes_are(&out, 64, "40058052c0035fd60000000000000000000000000000000000000000000000000000000003000200000000000000000000000000000000000000000003000300");
+    assert bytes_are(&out, 128, "0000000000000000000000000000000001000000120001000000000000000000080000000000000000616e7377657200002e74657874002e726f64617461002e");
+    assert bytes_are(&out, 192, "64617461002e72656c612e74657874002e72656c612e64617461002e73796d746162002e737472746162002e7368737472746162002e6e6f74652e474e552d73");
+    assert bytes_are(&out, 256, "7461636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 320, "00000000000000000100000001000000060000000000000000000000000000004000000000000000080000000000000000000000000000001000000000000000");
+    assert bytes_are(&out, 384, "00000000000000000700000001000000020000000000000000000000000000004800000000000000000000000000000000000000000000000800000000000000");
+    assert bytes_are(&out, 448, "00000000000000000f00000001000000030000000000000000000000000000004800000000000000000000000000000000000000000000000800000000000000");
+    assert bytes_are(&out, 512, "00000000000000001500000004000000400000000000000000000000000000004800000000000000000000000000000006000000010000000800000000000000");
+    assert bytes_are(&out, 576, "18000000000000002000000004000000400000000000000000000000000000004800000000000000000000000000000006000000030000000800000000000000");
+    assert bytes_are(&out, 640, "18000000000000002b00000002000000000000000000000000000000000000004800000000000000600000000000000007000000030000000800000000000000");
+    assert bytes_are(&out, 704, "1800000000000000330000000300000000000000000000000000000000000000a800000000000000080000000000000000000000000000000100000000000000");
+    assert bytes_are(&out, 768, "00000000000000003b0000000300000000000000000000000000000000000000b000000000000000550000000000000000000000000000000100000000000000");
+    assert bytes_are(&out, 832, "00000000000000004500000001000000000000000000000000000000000000000501000000000000000000000000000000000000000000000100000000000000");
+    assert bytes_are(&out, 896, "0000000000000000");
+}
+
+test the_object_with_data_and_vars_e2 {
+    // E2 whole. readelf reads .rela.text as .rodata + 8 (PG_HI21, ADD_ABS_LO12_NC) and .data + 0 (the
+    // table), .rela.data as ABS64 .data + 16 and .data + 24; `gcc -shared` resolves the table entries to
+    // the two vars.
+    var text : [24]u8 = undefined;
+    var names : [4]u8 = undefined;
+    var fns : [16]u8 = undefined;
+    var refs : [32]u8 = undefined;
+    var lens : [32]u8 = undefined;
+    var blobs : [13]u8 = undefined;
+    e2_tables(&text, &names, &fns, &refs, &lens, &blobs);
+    var out : [1112]u8 = undefined;
+    assert write_elf(&out, &text, &names, &fns, &refs, &blobs, &lens, 2) == 1112;
+    assert bytes_are(&out, 0, "7f454c460201010000000000000000000100b7000100000000000000000000000000000000000000d8010000000000000000000040000000000040000a000800");
+    assert bytes_are(&out, 64, "00000090000000910100009021000091210040f9c0035fd661626300000000006465666768000000000000000000000000000000000000000700000000000000");
+    assert bytes_are(&out, 128, "01000000000000000000000000000000130100000100000008000000000000000400000000000000150100000100000008000000000000000800000000000000");
+    assert bytes_are(&out, 192, "130100000200000000000000000000000c0000000000000015010000020000000000000000000000000000000000000001010000020000001000000000000000");
+    assert bytes_are(&out, 256, "08000000000000000101000002000000180000000000000000000000000000000000000000000000000000000000000000000000030002000000000000000000");
+    assert bytes_are(&out, 320, "00000000000000000000000003000300000000000000000000000000000000000100000012000100000000000000000018000000000000000067657400002e74");
+    assert bytes_are(&out, 384, "657874002e726f64617461002e64617461002e72656c612e74657874002e72656c612e64617461002e73796d746162002e737472746162002e73687374727461");
+    assert bytes_are(&out, 448, "62002e6e6f74652e474e552d737461636b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+    assert bytes_are(&out, 512, "00000000000000000000000000000000000000000000000001000000010000000600000000000000000000000000000040000000000000001800000000000000");
+    assert bytes_are(&out, 576, "00000000000000001000000000000000000000000000000007000000010000000200000000000000000000000000000058000000000000000d00000000000000");
+    assert bytes_are(&out, 640, "0000000000000000080000000000000000000000000000000f000000010000000300000000000000000000000000000068000000000000001900000000000000");
+    assert bytes_are(&out, 704, "00000000000000000800000000000000000000000000000015000000040000004000000000000000000000000000000088000000000000006000000000000000");
+    assert bytes_are(&out, 768, "060000000100000008000000000000001800000000000000200000000400000040000000000000000000000000000000e8000000000000003000000000000000");
+    assert bytes_are(&out, 832, "0600000003000000080000000000000018000000000000002b000000020000000000000000000000000000000000000018010000000000006000000000000000");
+    assert bytes_are(&out, 896, "07000000030000000800000000000000180000000000000033000000030000000000000000000000000000000000000078010000000000000500000000000000");
+    assert bytes_are(&out, 960, "0000000000000000010000000000000000000000000000003b00000003000000000000000000000000000000000000007d010000000000005500000000000000");
+    assert bytes_are(&out, 1024, "000000000000000001000000000000000000000000000000450000000100000000000000000000000000000000000000d2010000000000000000000000000000");
+    assert bytes_are(&out, 1088, "000000000000000001000000000000000000000000000000");
+}
+
+test the_export_rule {
+    // A scalar fn keeps its name; t27b's routines never get one; a fn in t27b's own convention is refused.
+    assert export_kind("abi_u8", false) == EXPORT;
+    assert export_kind("twice", false) == EXPORT;
+    assert export_kind("abi_pair", true) == REFUSED;
+    assert export_kind("__t27b_i128_div", false) == HELPER;
+    assert export_kind("__t27b_str_eql", true) == HELPER;
+    assert export_kind("__t27b_", false) == HELPER;
+    assert export_kind("@puts", true) == EXPORT;
+    // Only the whole prefix reserves: i128_plan.t27's port name, a shorter name and one that differs late.
+    assert export_kind("t27b_i128_div", false) == EXPORT;
+    assert export_kind("__t27", false) == EXPORT;
+    assert export_kind("__t27c_x", true) == REFUSED;
+}
+
+invariant every_section_offset_is_8_byte_aligned {
+    assert rodata_off(4) % 8 == 0;
+    assert data_off(4, 3) % 8 == 0;
+    assert rela_text_off(12, 5, 9) % 8 == 0;
+    assert sh_off(381) % 8 == 0;
+    assert NAME_NOTE_STACK as usize + 16 == SHSTRTAB_SIZE;
+}
