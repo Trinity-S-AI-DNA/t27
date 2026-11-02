@@ -1,24 +1,11 @@
-//! AArch64 code generation from the t27b IR.
-//!
-//! One pass per function, directly to machine words (no assembler text):
-//!
-//! * Canonical register form. A value of a type of 32 bits or less lives in
-//!   the low 32 bits of its register: u8/u16/bool zero-extended to 32 bits,
-//!   i8/i16 sign-extended to 32 bits, the upper 32 bits undefined. A 64-bit
-//!   value uses the whole X register. All arithmetic on narrow types is done in
-//!   W registers and re-normalised (or overflow-checked) afterwards.
-//! * Registers. x0-x7 arguments and result (and variable homes in leaf
-//!   functions); x8 operation scratch; x9-x15 the expression temp stack (temp
-//!   7 and deeper spill to the frame); x16/x17 scratch for spilled temps and
-//!   materialised constants; x18 never touched (Apple platform register);
-//!   x19-x28 variable homes, assigned by loop-weighted use count; x29/x30
-//!   frame pointer and link register.
-//! * Frame. `stp x29, x30, [sp, #-16]!; mov x29, sp; sub sp, sp, #N`, then
-//!   from sp upward: variable slots, saved callee-saved registers, temp slots
-//!   (spilled temps and temps saved across calls); and, directly below x29,
-//!   the aggregate area holding `Func::slots`, addressed from x29 so its
-//!   offsets do not depend on how many temps the body needs. Leaf functions
-//!   that need none of this get no frame at all.
+//! AArch64 code generation from the t27b IR: one pass per function, directly
+//! to machine words; the laws live in specs (tested there, L4), this is their emitter:
+//! * Canonical register form, register classes, frame layout and stack
+//!   probing: specs/tri/t27b/frame_layout.t27 (x0-x7 args, x8 scratch,
+//!   x9-x15 temps, x16/x17 spill scratch, x18 untouched, x19-x28 homes,
+//!   x29/x30 fp/lr; slots, saved callee-saved, temp slots, aggregate area
+//!   below x29; big frames probed one page at a time, #7367), narrow-type
+//!   normalisation by specs/tri/t27b/narrow_law.t27.
 //! * Memory. Loads and stores take the narrowest instruction for the type
 //!   (`ldrsb w` for i8, `ldrh` for u16, ...), so a loaded value is already in
 //!   canonical form. A slot access close to x29 is one `ldur`/`stur`; read-only
@@ -34,11 +21,13 @@ use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
 use std::collections::HashMap;
 
-// t27b-generated inline decision source of truth:
-//   specs/tri/t27b/inline.t27 -> gen/rust/tri/t27b/inline.rs
+// t27b-generated inline decision source of truth: specs/tri/t27b/inline.t27.
 #[path = "../../../gen/rust/tri/t27b/inline.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod inline_decision;
+#[path = "../../../gen/rust/tri/t27b/narrow_law.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod narrow_law;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -117,11 +106,11 @@ fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_in(ty == Ty::F32, rd, rn) 
 fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_out(ty == Ty::F32, rd, rn) }
 fn fp_op(ty: Ty, w: u32) -> u32 { a64::fp_prec(ty == Ty::F32, w) }
 fn narrow_ext(ty: Ty) -> Option<Ext> {
-    match ty {
-        Ty::U8 | Ty::Bool => Some(Ext::Uxtb),
-        Ty::U16 => Some(Ext::Uxth),
-        Ty::I8 => Some(Ext::Sxtb),
-        Ty::I16 => Some(Ext::Sxth),
+    match narrow_law::narrow_ext(ty.bits(), ty.signed(), ty == Ty::Bool) {
+        0 => Some(Ext::Uxtb),
+        1 => Some(Ext::Uxth),
+        4 => Some(Ext::Sxtb),
+        5 => Some(Ext::Sxth),
         _ => None,
     }
 }
