@@ -788,4 +788,37 @@ Their per-PR counts (`30 failing / 34 total`, then `28 failing / 33 total`,
 four minutes apart, for a PR whose finished set is 4 red of 41) are two more
 mid-run snapshots of the kind 12c already corrected.
 
+### 12e. A third engine, on the owner's own machine, prints the same counts
+
+Section 12's run used two engines, and neither was the binary named in this
+receipt's snapshot: the reference was `t27c test-report` plus a zig built inside
+the job, and t27b was the crate built in the same job. The owner closed that gap
+by running the spec himself:
+
+```
+t27b test specs/tri/shootout/codegen_audit.t27 --check --quiet
+  TriShootoutCodegenAudit: runtime asserts 53
+  TriShootoutCodegenAudit: ct-verified 0
+  TriShootoutCodegenAudit: 16 passed, 0 failed, 16 total
+```
+
+Three numbers, and all three are the ones `ubuntu-24.04-arm` produced: 16 tests,
+53 runtime asserts, and `ct-verified 0` where the artifact recorded invariants 0.
+Different machine, different build of the compiler, same counts.
+
+Which file it read is not taken on trust. `specs/tri/shootout/codegen_audit.t27`
+holds **11** `test` blocks on `origin/master` and **16** on this branch, so a run
+printing `16 total` read this branch's file and not master's.
+
+The binary is recorded by what is actually known about it, with no guess at its
+provenance: `/Users/playra/t27/target/release/t27b`, 3 226 800 B, mtime
+2026-11-01 20:19, sha256
+`ee89c7d27724dc115e74870f06a4e390b74ad898ebb84db8a10ba05f283a3cf5`. Which commit
+built it is not recorded anywhere this receipt can read, so it is left unstated
+rather than inferred from the absence of changes under `cli/t27b`.
+
+One boundary stays where it was: the owner ran this, not the session. Builds,
+tests and sweeps on this Mac remain off-limits to the agent, and the owner
+running a command himself is his own call rather than a route around that rule.
+
 Refs #12877.
