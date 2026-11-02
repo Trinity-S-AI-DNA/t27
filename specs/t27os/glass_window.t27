@@ -785,6 +785,12 @@ use t27os::hot_reload::apply_now_flag;
 use t27os::hot_reload::apply_rev;
 use t27os::hot_reload::KEY_APPLY_NOW;
 use t27os::hot_reload::KEY_APPLY_REV;
+use t27os::hot_reload::reapply_allowed;
+use t27os::hot_reload::attempt_confirm;
+use t27os::hot_reload::exec_outcome_state;
+use t27os::hot_reload::AT_ATTEMPTING;
+use t27os::hot_reload::AT_EXEC_FAILED;
+use t27os::hot_reload::AT_NONE;
 use t27os::hot_reload::rc_candidate_ok;
 use t27os::hot_reload::rc_apply_atomic;
 use t27os::hot_reload::KEY_RC_SCHEMA;
@@ -7388,6 +7394,11 @@ pub const TPG_IS_DEV : u32 = 284;
 pub const TPG_APPLY_NOW : u32 = 260;
 pub const TPG_APPLY_REV : u32 = 261;
 pub const TPG_APPLIED_REV : u32 = 262;
+/// Attempt state machine (hot_reload AT_*): the persisted life of one apply
+/// request - requested, staged, validated, attempting, confirmed, exec_failed
+/// or unconfirmed. Same-generation re-apply is blocked after a failure.
+pub const TPG_AT_STATE : u32 = 263;
+pub const TPG_ATTEMPT_REV : u32 = 264;
 /// Ownership fence state (hot_reload owner_gate): the applied live generation's
 /// writer hash and lease end; TPG_RC_LAST names the last reload outcome
 /// (1 applied, 2 stale revision, 3 invalid module, 4 fenced foreign writer).
@@ -12594,6 +12605,13 @@ pub fn main() -> void {
     // the applied-apply generation persists across the re-exec, so one
     // APPLY_NOW request fires exactly once
     tgv[TPG_APPLIED_REV] = @as(u64, @intCast(msg1(defs, sel("integerForKey:"), cf("t27os.applied_rev"))));
+    // attempt confirmation: an ATTEMPTING record means THIS image is the staged
+    // candidate a previous process exec'd into - confirm it when the kept state
+    // was restored (the restore block runs at startup); otherwise unconfirmed
+    const astate : u64 = @as(u64, @intCast(msg1(defs, sel("integerForKey:"), cf("t27os.at_state"))));
+    const arev0 : u64 = @as(u64, @intCast(msg1(defs, sel("integerForKey:"), cf("t27os.attempt_rev"))));
+    tgv[TPG_AT_STATE] = @as(u64, attempt_confirm(@as(u8, @intCast(astate)), true, true));
+    tgv[TPG_ATTEMPT_REV] = arev0;
     tgz = 0;
     while (tgz < 77312) {
         tbv[tgz] = 0;
@@ -14762,7 +14780,9 @@ pub fn main() -> void {
                 // when the dev live module carries the explicit APPLY_NOW=1 for
                 // a generation newer than the last applied one, and binds to the
                 // STAGED copy - the exact artifact that passed validation.
-                if (tgv[TPG_IS_DEV] != 0 and tgv[TPG_APPLY_NOW] == 1 and tgv[TPG_APPLY_REV] > tgv[TPG_APPLIED_REV]) {
+                const req_ok : bool = apply_request_ok(tgv[TPG_APPLY_NOW], tgv[TPG_APPLY_REV], tgv[TPG_APPLIED_REV]);
+                const at_st : u8 = @as(u8, @intCast(tgv[TPG_AT_STATE]));
+                if (tgv[TPG_IS_DEV] != 0 and req_ok and reapply_allowed(at_st, tgv[TPG_APPLY_REV], tgv[TPG_ATTEMPT_REV])) {
                     const cdir : u64 = msg0(msg0(exe, sel("stringByDeletingLastPathComponent")), sel("stringByDeletingLastPathComponent"));
                     const cb : u64 = msg1(cls("NSBundle"), sel("bundleWithPath:"), cdir);
                     var cidb : [32]u8 = undefined;
@@ -14772,7 +14792,9 @@ pub fn main() -> void {
                     const cid_ok : bool = is_dev_bundle_id(cidb[0..cdl], cdl);
                     const cver_ok : bool = parse_build(cvb[0..cvl], cvl) != 0;
                     if (!cid_ok or !cver_ok) {
+                        // candidate refused: no attempt was made
                         tgv[TPG_RC_LAST] = 5;
+                        tgv[TPG_AT_STATE] = AT_NONE;
                     } else {
                         // stage: copy the candidate beside this app, then
                         // validate the STAGED copy - exec binds to the staged
@@ -14789,16 +14811,22 @@ pub fn main() -> void {
                         const svl : usize = ns_bytes(msg1(sb, sel("objectForInfoDictionaryKey:"), cf("CFBundleVersion")), svb[0..16]);
                         if (copied != 0 and is_dev_bundle_id(sidb[0..sdl], sdl) and parse_build(svb[0..svl], svl) != 0) {
                             const spath : u64 = msg0(msg0(sb, sel("executablePath")), sel("UTF8String"));
-                            // the applied generation persists before the exec:
-                            // one request fires exactly once even across the
-                            // re-exec; an exec failure still records itself
-                            msg2(defs, sel("setInteger:forKey:"), tgv[TPG_APPLY_REV], cf("t27os.applied_rev"));
+                            // the attempt persists BEFORE the exec: a lost exec
+                            // leaves an unconfirmed attempt (same generation
+                            // blocked), never a false "applied"
+                            tgv[TPG_AT_STATE] = AT_ATTEMPTING;
+                            tgv[TPG_ATTEMPT_REV] = tgv[TPG_APPLY_REV];
+                            msg2(defs, sel("setInteger:forKey:"), AT_ATTEMPTING, cf("t27os.at_state"));
+                            msg2(defs, sel("setInteger:forKey:"), tgv[TPG_APPLY_REV], cf("t27os.attempt_rev"));
                             msg0(defs, sel("synchronize"));
                             var sargv : [2]u64 = undefined;
                             sargv[0] = spath;
                             sargv[1] = 0;
                             const erc : i32 = exec_self(spath, sargv);
-                            if (erc != 0) { tgv[TPG_RC_LAST] = 6; }
+                            tgv[TPG_AT_STATE] = @as(u64, exec_outcome_state(erc));
+                            msg2(defs, sel("setInteger:forKey:"), tgv[TPG_AT_STATE], cf("t27os.at_state"));
+                            msg0(defs, sel("synchronize"));
+                            if (tgv[TPG_AT_STATE] == AT_EXEC_FAILED) { tgv[TPG_RC_LAST] = 6; }
                         } else {
                             tgv[TPG_RC_LAST] = 5;
                         }
