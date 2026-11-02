@@ -495,6 +495,40 @@ What none of this establishes: that any test in these specs passes. The reading
 settles only *where* each file would be executed and *which* red is
 pre-existing. Nothing has been run.
 
+**That last sentence is superseded by section 12, and the reading above needs
+two corrections that only the run could expose.** Both are kept here rather than
+edited away, because the wrong version is what the request was built on.
+
+*First: `spec-guards` fires but executes none of these specs.* Section 10 reads
+`paths: specs/**` as "the file is in the trigger list, so the job tests it".
+Measured, the job's own selector decides that separately. `sg-full.log:6701-6702`:
+
+```
+frontier: reused 36 of 2935 (12 permille); rebuild: spec 63 closure 912 ...
+RUN_ALL: a change outside specs/; corpus-ratchet runs the corpus
+```
+
+and `grep -c 'shootout\|ifconv_plan' target/ci/sg-full.log` returns **0**. A
+change outside `specs/` -- here the `.trinity/receipts/**` files of this very
+receipt -- makes the selector hand the corpus to another job and run nothing
+itself. So "only the third reads these specs" was right about
+`t27b-native.yml`'s three jobs, and `spec-guards` is not a second route to the
+same answer, which is how I described it in chat. One job executed these specs,
+not two.
+
+*Second: the file list in this receipt and in `pr-body.md` names files that are
+master's, not this branch's.* It was built with a two-dot diff,
+`git diff --name-status origin/master..HEAD`, and `origin/master` has moved from
+this branch's base `8ca1b0817e` to `0215bd7223`. A two-dot diff then reports
+master's newer files as this branch's deletions, which is where
+`D specs/analog/reference_receipt.t27` and `D docs/analog/reference-receipt-test-2026-11-02.md`
+came from -- `git log -- <path>` shows no commit of mine for either. The
+three-dot diff, `git diff --name-status origin/master...HEAD`, gives the real
+set: **12 files, 8 added receipts, 3 added specs, 1 modified spec**, nothing
+under `docs/analog/` or `specs/analog/`. Section 10's own argument about
+`acceptance_matrix.t27` being new survives this (`git cat-file -e` was a direct
+test of master, not a diff), but the count does not.
+
 Refs #12877.
 
 ## 11. Which runner could execute the 16 + 13 tests: every route, checked
@@ -519,5 +553,158 @@ One correction to a note of my own, since it cost a process: the recorded
 mitigation for this binary was "never run `t27os-pty` bare; use `T27OS_CTL=list`".
 On the build running today, `T27OS_CTL=list` behaves like the bare command. The
 mitigation is not a mitigation.
+
+Refs #12877.
+
+## 12. The run: what the arm64 runner actually executed
+
+CI was the one reachable route (section 11), the publication was confirmed, and
+the run finished. This section replaces the phrase "nothing has been run" with
+numbers and the commands that read them.
+
+**Identity of the run.** Workflow `t27b-native.yml`, run `41412031594`, triggered
+by the pull request at head `389d6e26f61ddb63ab0dfd86cf1cae5527b18755`, branch
+`lane/t27b-floor-model`. Three jobs: `t27b-native-linux` `125167018287`,
+`t27b-native-macos` `125167017834`, `t27b-native-ratchet` `125167018191` --
+`ubuntu-24.04-arm`, conclusion **success**. The reference verdicts come from
+`t27c test-report` built inside that job against zig 0.16.0; the t27b verdicts
+from the crate built in the same job. Ledger read: `4125e2902`. Both engines are
+built from the branch's own tree, so neither is the Mac binary recorded in the
+snapshot at the top of this file.
+
+Read from the job's artifact, `t27b-native-run` id `13125729047`, 433 945 bytes
+zipped, unpacked to `target/ci/nat/`:
+
+```
+jq -c '.results[]|select((.file//"")|test("shootout|ifconv_plan"))
+  |{file,reference,t27b,tests,asserts,invariants,blockers}' target/ci/nat/run.json
+```
+
+| spec | reference | t27b | tests | asserts | invariants | blockers |
+|---|---|---|---|---|---|---|
+| `specs/tri/shootout/codegen_audit.t27` | pass | **pass** | **16** | 53 | 0 | none |
+| `specs/tri/shootout/acceptance_matrix.t27` | pass | **pass** | **16** | 94 | 0 | none |
+| `specs/tri/shootout/l1_clamp.t27` | pass | pass | 5 | 19 | 0 | none |
+| `specs/tri/t27b/ifconv_plan.t27` | pass | pass | 19 | 81 | 0 | none |
+
+56 tests, 247 runtime asserts, on both engines. Not one named verdict is
+anything but `true`:
+
+```
+jq -r '.results[]|select((.file//"")|test("codegen_audit|acceptance_matrix"))
+  |.file, ([.test_verdicts|to_entries[]|select(.value!=true)|.key]|tostring)'
+     target/ci/nat/run.json
+  ->  specs/tri/shootout/acceptance_matrix.t27   []
+      specs/tri/shootout/codegen_audit.t27       []
+```
+
+**The request said 16 + 13; the measurement is 16 + 16.** `acceptance_matrix.t27`
+carried 13 tests when the run was requested and carries 16 now -- section 9 and
+the `AcceptanceCell` repair below both added cases. The number in the request is
+not wrong, it is older than the file. Where this receipt says "the 16 + 13 tests"
+in section 11, read 16 + 16, and the source of each number is this table, not a
+recollection.
+
+**No local run of these specs is recorded in this receipt, and none is claimed.**
+There is no `t27b corpus` output for them on the Mac in `.trinity/`, because the
+load rule forbids producing one. The arm64 run above is the only measurement
+these four specs have. Any earlier sentence of mine that compared a local verdict
+with this one had no receipt and is withdrawn rather than repaired.
+
+**The ratchet's own verdict**, `native-ratchet.log:9559` and the job's notice:
+
+```
+tri t27b ratchet: green -- run 389d6e26f vs ledger 4125e2902:
+UNEXPECTED FAILURE 0, UNEXPECTED PASS 0, UNLISTED 45, STALE 0,
+OVER CAP 0, BAD REASON 0, MOVED 0, UNJUDGED 0, VACUITY MEASURED 0
+
+t27b 2502 / reference 2647 native arm64 (+4 pass_vacuous, 5 outside the
+reference; 2938 files; jit/interp mismatch 1; reference disagree 0);
+ratchet green; corpus 512 s
+```
+
+All four of this branch's specs appear in that run as UNLISTED, each with the
+same explanation: *the reference passes it and the ledger does not name it (t27b
+pass)* (log lines 9547, 9553, 9554, 9556).
+
+### 12a. Why this run is green at UNLISTED 45 and master's is red at 42
+
+Not a rules change. `git diff --stat 8ca1b0817e origin/master -- scripts/tri_loop/
+.github/workflows/t27b-native.yml docs/reports/t27b_expectations.json` prints
+nothing. The difference is one flag the workflow passes only on a pull request:
+
+```yaml
+# .github/workflows/t27b-native.yml:261-268
+PR_FLAG: ${{ github.event_name == 'pull_request' && '--pr' || '' }}
+./scripts/tri t27b ratchet --run run.json $PR_FLAG --json > ratchet.json
+```
+
+and what it means, from the parser itself:
+
+```python
+# scripts/tri_loop/t27b.py:1020
+ap.add_argument("--pr", action="store_true",
+                help="a pull request: lag is pending, a runtime defect stays red")
+```
+
+Ledger lag is **pending** on a PR and **red** on a push to master. So the green
+above is not evidence that the ledger is satisfied -- it is the rule that a lane
+is not held responsible for rows master owes. Stated plainly, and not softened:
+**landing this branch takes master's UNLISTED from 42 to 45 and fixes none of
+it.** The three added rows (`acceptance_matrix.t27`, `l1_clamp.t27`,
+`ifconv_plan.t27`) now have observed values and belong in
+`docs/reports/t27b_expectations.json`; the ledger steward writes them from
+master's next run, from the observed values only, and `max_not_pass` does not
+rise for a passing row.
+
+### 12b. The four red checks, separated by evidence rather than by assertion
+
+Each failing step was read from its own log, and then the same workflow was read
+on master's head. Three of the four fail there at a byte-identical step name.
+
+| check | step that failed | master's own run | mine to fix |
+|---|---|---|---|
+| Corpus ratchet (type names) | "A type name may not gain a second definition" | `41403284655`, job `125139605389`, head `0215bd7223` | **in part -- see below** |
+| spec-guards | "Does every seal still describe what the compiler emits" | `41401435163`, head `783f18b4f8` | no: `policy_PolicyOwnLanguage.json` is stale for `specs/policy/own_language.t27`, a file this branch does not touch |
+| coverage | "Every seal still describes its spec" | `41403284547`, head `0215bd7223` | no: the same stale seal, 1 newly-not-holding seal |
+| loop-tools-tracked | "No t27b spec moves without being named" | `41172959400`, head `4cfd2f2b6a` | no: one case, `ledger: every non-pass entry has a blocker and a known reason`, about `docs/reports/t27b_expectations.json` |
+
+The type-name check is the one that separates cleanly, because it prints its own
+arithmetic. Master's log:
+
+```
+ledger 141 name(s), observed 142
+  + ParsedCommand  NEW conflict
+```
+
+this run's log:
+
+```
+ledger 141 name(s), observed 143
+  + Cell  NEW conflict
+  + ParsedCommand  NEW conflict
+```
+
+`ParsedCommand` is master's: its two definitions are
+`specs/tri/collections/namespace.t27` and
+`specs/port/trios/apps/trios-macos/rings/RUST-04/clade-improve/src/main.t27`, the
+second added by `b91295e672` and present at this branch's base. `Cell` is the one
+name this branch adds -- `pub const Cell = struct` at
+`specs/tri/shootout/acceptance_matrix.t27:243`, colliding with
+`bootstrap/tests/fixtures/generic_const/pos_04_no_pub.t27:3` and
+`cli/t27b/tests/source.rs:1082`.
+
+So the repair is exactly one rename and nothing else: the 17 bare `Cell` tokens
+in `acceptance_matrix.t27` become `AcceptanceCell`, after which this check
+returns to master's state -- still red, on `ParsedCommand`, which is not mine.
+`CELLS` is deliberately **not** renamed: it is a const, not a type, and two
+`const CELLS` already coexist on master (`specs/fpga/systolic.t27`,
+`specs/queen/views.t27`) without a finding. Every reference to either name lives
+inside this one file, which is why the rename needs no second edit.
+
+The other three are not repaired here, and not because they are hard. Each is
+another actor's open work -- the own-language seal is PR #13096, the
+`ParsedCommand` pair is #13059/#13087 -- and a session merges or edits only a PR
+it opened itself, even when that PR is the one holding its own gate.
 
 Refs #12877.

@@ -66,58 +66,62 @@ The AOT receipt's own five runs are the test case:
 quieter second series leaves the union spread at 24.112, which is the arithmetic
 that forbids reporting the quiet one alone.
 
-## What has and has not been run
+## What has been run, measured
 
-Run locally, on the binaries named in the receipt's snapshot table:
-`t27c parse` and `t27b asm` on each spec, every one rc 0. Those are the only two
-commands the local hook allows, and they are parse and lowering, not execution.
+`t27b-native-ratchet` (run `41412031594`, job `125167018191`, head
+`389d6e26f6`, `ubuntu-24.04-arm`) finished **success**. Reference verdicts from
+`t27c test-report` built in that job against zig 0.16.0, t27b verdicts from the
+crate built in the same job, read out of the `t27b-native-run` artifact:
 
-**No test in these specs has been executed anywhere.** That is what this PR is
-for. Two jobs here do execute them:
+| spec | reference | t27b | tests | asserts | invariants | blockers |
+|---|---|---|---|---|---|---|
+| `specs/tri/shootout/codegen_audit.t27` | pass | pass | 16 | 53 | 0 | none |
+| `specs/tri/shootout/acceptance_matrix.t27` | pass | pass | 16 | 94 | 0 | none |
+| `specs/tri/shootout/l1_clamp.t27` | pass | pass | 5 | 19 | 0 | none |
+| `specs/tri/t27b/ifconv_plan.t27` | pass | pass | 19 | 81 | 0 | none |
 
-- `spec-guards` (`.github/workflows/spec-guards.yml`), step "Affected specs --
-  select with specs/ci/affected.t27, test only those": runs
-  `t27c test-report <spec> --specs-dir specs` on each changed spec against zig
-  0.16.0 on `ubuntu-24.04`, and prints `<file>: head H, base B
-  (failing tests)`. For a new file the base is 0, so any failing test turns the
-  step red and names the file.
-- `t27b-native-ratchet`, the third job of `.github/workflows/t27b-native.yml`
-  (the other two are `t27b-native-linux` and `t27b-native-macos`, which run
-  `cargo test -p t27b`, not these specs), on `ubuntu-24.04-arm`:
-  `t27b corpus specs --json` with
-  `--reference ./target/release/t27c`, so every spec runs on both the t27b JIT
-  and the t27c + zig reference. Per-file counts land in the `t27b-native-run`
-  artifact (`run.json`: `tests`, `invariants`, `asserts`, `blockers` for each
-  engine). It gives counts, not per-test names, and no per-file exit code.
+56 tests and 247 runtime asserts, on both engines, with no named verdict other
+than `true` in any of the four files. The ratchet's own line:
 
-Which engine runs which file matters for reading the result. The ratchet job
-runs every spec twice, but `t27b corpus` reports `codegen_audit.t27` as
-`blocked` on the native engine, so **its 13 tests are executed by the reference
-path and not by the t27b JIT**: the verdict to read for that file is
-`spec-guards`' `t27c test-report`, and the ratchet's native column for it is a
-blocker count, not a pass count. `l1_clamp.t27`, `ifconv_plan.t27` and
-`acceptance_matrix.t27` have no such report yet, because they have never been
-run anywhere.
+```
+tri t27b ratchet: green -- run 389d6e26f vs ledger 4125e2902: UNEXPECTED
+FAILURE 0, UNEXPECTED PASS 0, UNLISTED 45, STALE 0, OVER CAP 0, BAD REASON 0,
+MOVED 0, UNJUDGED 0, VACUITY MEASURED 0
 
-Ledger rows, stated as measured rather than predicted. Five of the specs this
-branch touches have no row in `docs/reports/t27b_expectations.json`: the three
-new ones, plus `codegen_audit.t27` and `specs/analog/reference_receipt.t27`,
-which already had no row before this branch existed. And master's
-`t27b-native-ratchet` is **already red** without this branch: run
-`41401435133` on head `783f18b4f8` (2026-11-02T06:40:46Z) reports
-`UNLISTED 42` with every other finding kind at 0 -- no unexpected failure, no
-unexpected pass, no stale row, nothing over cap -- and `codegen_audit.t27` and
-`reference_receipt.t27` are two of those 42. So this PR does not turn that job
-red; it adds 3 names to a list of 42. The workflow's own header states the rule
-that follows from it: the ratchet is not required, and `ready` judges it by Q16,
-where a red here blocks only while master's run of it is green. It is not.
+t27b 2502 / reference 2647 native arm64 (+4 pass_vacuous, 5 outside the
+reference; 2938 files; jit/interp mismatch 1; reference disagree 0)
+```
 
-The rows are still deliberately absent, for the reason that has not changed: a
-row written before the run is a guess at the verdict, and the ratchet exists to
-catch exactly that. They are written from the observed values once a run
-reports. What that does **not** buy, and the earlier draft of this paragraph
-claimed it did, is a green ratchet -- adding three rows leaves master's other 39
-unlisted specs exactly where they are.
+Two claims of an earlier draft of this section are corrected by that run, not
+edited away. **`codegen_audit.t27` is not blocked on the native engine** -- the
+draft said its tests ran only on the reference path; measured, t27b passes it
+with 16 tests, and the draft's claim carried no command. And **`spec-guards`
+executes none of these specs**: its selector printed `RUN_ALL: a change outside
+specs/; corpus-ratchet runs the corpus` (the `.trinity/receipts/**` files of this
+PR are that change), and `grep -c 'shootout\|ifconv_plan'` over its full log
+returns 0. One job executed these files, not two.
+
+Also measured and worth stating against this PR rather than for it. The ratchet
+is green here only because the workflow passes `--pr` on a pull request, which
+the parser documents as *"a pull request: lag is pending, a runtime defect stays
+red"* (`scripts/tri_loop/t27b.py:1020`). On a push to master the same lag is red,
+and master's run of this job is red today at `UNLISTED 42` for exactly that
+reason. **Landing this PR takes that count from 42 to 45 and fixes none of it.**
+The three new specs now have observed values and the rows belong in
+`docs/reports/t27b_expectations.json`, written from the observed values by the
+ledger steward from master's next run; no row is guessed here, and
+`max_not_pass` does not rise for a passing row.
+
+The other three red checks fail on master at byte-identical step names -- the
+stale `policy_PolicyOwnLanguage.json` seal (spec-guards `41401435163`, coverage
+`41403284547`), and `ledger: every non-pass entry has a blocker and a known
+reason` (loop-tools `41172959400`). Each is another actor's open work and none is
+touched here. The one finding that *is* this branch's is the type-name ratchet:
+master observes 142 conflicted names with `+ ParsedCommand`, this PR observed 143
+with `+ Cell` as well, and `Cell` is the name `acceptance_matrix.t27` added. It is
+renamed to `AcceptanceCell` in this PR -- 17 tokens, one file -- after which the
+check returns to master's state. `CELLS` stays: it is a const, not a type, and two
+`const CELLS` already coexist on master without a finding.
 
 ## Also recorded, so it is not re-derived
 
