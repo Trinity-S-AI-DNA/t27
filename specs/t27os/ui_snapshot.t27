@@ -1,0 +1,622 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/ui_snapshot.t27 -- UI Observatory, stage 1: what one frame of the T27 OS window is made of.
+; Owner order 2026-11-02 ("UI Observatory"): an agent inside T27 OS gets the picture of one surface, its
+; component structure, the input state and the result of an action at once, from inside the app, instead of
+; photographing the whole desktop. This spec is the snapshot contract and its pure checks. It captures no pixel
+; and reads no field: the window does that, under these rules (glass_window.t27, the ui_* hooks, a later step).
+; --
+; What the window is (surveyed 2026-11-02 in glass_window.t27): there is no component tree. draw() paints flat
+; state arrays (sst, tgv, dcv, ...) into one CGBitmapContext, the view `glass`; three native views are subviews
+; of glass and lie above its bitmap whatever the paint order (the DSH web view, dsh_place; the Queen dock's text
+; field, gf_place; the live page, live_show). The hit test is an if/else chain and the keyboard owner is the
+; window's first responder (term_input.t27 tf_key_owner). So a snapshot is not read from a tree: the window lists
+; the elements it placed this frame, at the rects it placed them at.
+; --
+; Relation to specs/t27f/viz_contract.t27: VizHost is the slot model of one petal (rects relative to a parent,
+; depth-first, the deepest slot wins). A window snapshot needs what VizHost does not carry: absolute rects, a
+; native layer above the bitmap, z, visible/enabled/focused, the offered actions and a text class that keeps
+; secrets out. It does not replace VizHost; a petal drawn through VizHost is one element here.
+; --
+; Rules the checks enforce:
+;   R1 one frame      tree and pixels come from one frame of one build; anything else is refused (ui_pair_ok).
+;   R2 no secrets     a SECRET element exports nothing, not even whether it is empty; a USER element (a document,
+;                     a chat, a composer) exports only "empty or not" unless the request opts in; only CHROME, the
+;                     app's own labels, is exported by default (ui_text_out).
+;   R3 honest pixels  the window captures what it drew itself; a native view has its rect and state, and its pixels
+;                     are unavailable unless its own adapter answered. The window's renderer never claims to have
+;                     seen embedded web content (ui_capture).
+;   R4 one owner      at most one element owns the keyboard, and it is visible and enabled (ui_validate).
+;   R5 show-through   an element painted above another one it overlaps, both visible, shows it through unless it is
+;                     opaque; with opacity unknown that is a suspicion, not a defect (ui_show_through). An element
+;                     never shows its own ancestors "through": a native field that means to let its drawn box show
+;                     is placed as that box's child.
+;   R6 evidence       a finding is PROVEN only with a reproduction, a trace and a named test (ui_finding).
+;   R7 baselines      approved -> new -> diff -> decision; whoever made a candidate never approves it (ui_may_approve).
+;   R8 two modes      SEMANTIC acts on an element that offers the action; USER needs the real route too: a click must
+;                     land on the element (nothing native covers it) and typing needs it to own the keyboard.
+; --
+; Integer-only, like viz_contract.t27. Not claimed: no window fills a UiSnap yet; no snapshot was taken.
+
+module T27osUiSnapshot;
+
+pub const UI_MAX : u32 = 32;
+pub const UI_NONE : u32 = 65535;
+
+; ---------------------------------------------------------------- stable component ids
+
+; The first stage instruments one input, one button and the DSH container (owner order, "First stage" 2).
+pub const UI_ID_WINDOW : u32 = 1;
+pub const UI_ID_SCENE : u32 = 2;         // glass: the view that paints the bitmap
+pub const UI_ID_DASHBOARD : u32 = 3;     // the Queen's CONTROL DASHBOARD (sst[SST_QDASH])
+pub const UI_ID_PANE : u32 = 4;          // a chat's pane area, where a Claude Code pane paints (on_term)
+pub const UI_ID_DSH : u32 = 5;           // the DSH web view (dsh_place)
+pub const UI_ID_QUEEN_INPUT : u32 = 6;   // the QUEEN CHAT dock's text field (gf_place)
+pub const UI_ID_SRV_RETRY : u32 = 7;     // Retry on the pane-server banner
+pub const UI_ID_COUNT : u32 = 8;
+pub const UI_ID_NAMES : [8]str = ["", "window", "scene", "control-dashboard", "pane-area", "dsh", "queen-input", "server-retry"];
+
+pub fn ui_id_name(id: u32) -> str {
+    if (id >= UI_ID_COUNT) { return ""; }
+    return UI_ID_NAMES[id as usize];
+}
+
+; ---------------------------------------------------------------- element kinds
+
+pub const UI_ROLE_WINDOW : u8 = 0;
+pub const UI_ROLE_REGION : u8 = 1;
+pub const UI_ROLE_INPUT : u8 = 2;
+pub const UI_ROLE_BUTTON : u8 = 3;
+pub const UI_ROLE_EMBED : u8 = 4;
+pub const UI_ROLE_TERMINAL : u8 = 5;
+pub const UI_ROLE_COUNT : u8 = 6;
+pub const UI_ROLE_NAMES : [6]str = ["window", "region", "input", "button", "embed", "terminal"];
+
+/// A role whose element takes typed text when it owns the keyboard.
+pub fn ui_role_edits(role: u8) -> bool {
+    return role == UI_ROLE_INPUT or role == UI_ROLE_EMBED or role == UI_ROLE_TERMINAL;
+}
+
+pub const UI_LAYER_BITMAP : u8 = 0;      // painted by draw() into glass
+pub const UI_LAYER_NATIVE : u8 = 1;      // an NSView subview of glass, above the bitmap
+
+pub const UI_F_VISIBLE : u32 = 1;
+pub const UI_F_ENABLED : u32 = 2;
+pub const UI_F_FOCUSED : u32 = 4;
+pub const UI_F_OPAQUE : u32 = 8;
+pub const UI_F_OPAQUE_UNKNOWN : u32 = 16;
+
+pub const UI_A_CLICK : u32 = 1;
+pub const UI_A_FOCUS : u32 = 2;
+pub const UI_A_TYPE : u32 = 4;
+pub const UI_A_PASTE : u32 = 8;
+pub const UI_A_SCROLL : u32 = 16;
+pub const UI_A_SUBMIT : u32 = 32;
+
+pub const UI_TEXT_NONE : u8 = 0;
+pub const UI_TEXT_CHROME : u8 = 1;
+pub const UI_TEXT_USER : u8 = 2;
+pub const UI_TEXT_SECRET : u8 = 3;
+
+; ---------------------------------------------------------------- the snapshot
+
+/// One frame of one surface. Elements are listed parents first: element 0 is the window (parent UI_NONE) and
+/// every other parent is an earlier index. Rects are absolute, in scene points. Equal layer and z: the later
+/// element is painted on top.
+pub struct UiSnap {
+    snap: u32,
+    frame: u32,
+    build: u32,
+    surface: u32,
+    vw: u32,
+    vh: u32,
+    scale: u32,
+    count: u32,
+    id: [32]u32,
+    role: [32]u8,
+    parent: [32]u32,
+    layer: [32]u8,
+    x: [32]u32,
+    y: [32]u32,
+    w: [32]u32,
+    h: [32]u32,
+    z: [32]u32,
+    flags: [32]u32,
+    acts: [32]u32,
+    text: [32]u8,
+}
+
+/// An empty snapshot of `surface` (a component id) at a viewport of vw x vh points, scale in percent.
+pub fn ui_blank(snap: u32, frame: u32, build: u32, surface: u32, vw: u32, vh: u32, scale: u32) -> UiSnap {
+    return UiSnap { snap: snap, frame: frame, build: build, surface: surface, vw: vw, vh: vh, scale: scale, count: 0, id: [0; 32], role: [0; 32], parent: [0; 32], layer: [0; 32], x: [0; 32], y: [0; 32], w: [0; 32], h: [0; 32], z: [0; 32], flags: [0; 32], acts: [0; 32], text: [0; 32] };
+}
+
+/// s with one more element, hidden and offering nothing until ui_set. Past UI_MAX the element is dropped but
+/// count still grows, so ui_validate reports the overflow instead of the snapshot silently losing a part.
+pub fn ui_add(s: UiSnap, id: u32, role: u8, parent: u32, layer: u8, x: u32, y: u32, w: u32, h: u32) -> UiSnap {
+    var n : UiSnap = s;
+    if (n.count < UI_MAX) {
+        let k : usize = n.count as usize;
+        n.id[k] = id;
+        n.role[k] = role;
+        n.parent[k] = parent;
+        n.layer[k] = layer;
+        n.x[k] = x;
+        n.y[k] = y;
+        n.w[k] = w;
+        n.h[k] = h;
+    }
+    n.count = n.count + 1;
+    return n;
+}
+
+/// The state of element i: z, flags (UI_F_*), offered actions (UI_A_*) and the class of its text.
+pub fn ui_set(s: UiSnap, i: u32, z: u32, flags: u32, acts: u32, text: u8) -> UiSnap {
+    var n : UiSnap = s;
+    if (i < n.count and i < UI_MAX) {
+        let k : usize = i as usize;
+        n.z[k] = z;
+        n.flags[k] = flags;
+        n.acts[k] = acts;
+        n.text[k] = text;
+    }
+    return n;
+}
+
+/// The index of component `id`, or UI_NONE: how an agent finds an element.
+pub fn ui_find(s: UiSnap, id: u32) -> u32 {
+    var i : u32 = 0;
+    while (i < s.count and i < UI_MAX) {
+        if (s.id[i as usize] == id) { return i; }
+        i = i + 1;
+    }
+    return UI_NONE;
+}
+
+pub fn ui_has(s: UiSnap, i: u32, f: u32) -> bool {
+    if (i >= s.count or i >= UI_MAX) { return false; }
+    return (s.flags[i as usize] & f) != 0;
+}
+
+pub fn ui_offers(s: UiSnap, i: u32, a: u32) -> bool {
+    if (i >= s.count or i >= UI_MAX) { return false; }
+    return (s.acts[i as usize] & a) != 0;
+}
+
+; ---------------------------------------------------------------- geometry
+
+pub fn ui_contains(s: UiSnap, i: u32, px: u32, py: u32) -> bool {
+    if (i >= s.count or i >= UI_MAX) { return false; }
+    let k : usize = i as usize;
+    return px >= s.x[k] and py >= s.y[k] and px < s.x[k] + s.w[k] and py < s.y[k] + s.h[k];
+}
+
+/// The point is inside i and inside every ancestor of i: what a parent clips away cannot be hit.
+pub fn ui_in_clip(s: UiSnap, i: u32, px: u32, py: u32) -> bool {
+    var c : u32 = i;
+    var d : u32 = 0;
+    while (c < s.count and c < UI_MAX and d <= UI_MAX) {
+        if (ui_contains(s, c, px, py) == false) { return false; }
+        c = s.parent[c as usize];
+        d = d + 1;
+    }
+    return true;
+}
+
+/// Element i reaches outside its parent's rect, so part of it is clipped away.
+pub fn ui_clipped(s: UiSnap, i: u32) -> bool {
+    if (i >= s.count or i >= UI_MAX) { return false; }
+    let k : usize = i as usize;
+    let p : u32 = s.parent[k];
+    if (p >= s.count or p >= UI_MAX) { return false; }
+    let q : usize = p as usize;
+    return s.x[k] < s.x[q] or s.y[k] < s.y[q] or s.x[k] + s.w[k] > s.x[q] + s.w[q] or s.y[k] + s.h[k] > s.y[q] + s.h[q];
+}
+
+pub fn ui_overlap(s: UiSnap, a: u32, b: u32) -> bool {
+    if (a >= s.count or b >= s.count or a >= UI_MAX or b >= UI_MAX) { return false; }
+    let i : usize = a as usize;
+    let j : usize = b as usize;
+    if (s.w[i] == 0 or s.h[i] == 0 or s.w[j] == 0 or s.h[j] == 0) { return false; }
+    return s.x[i] < s.x[j] + s.w[j] and s.x[j] < s.x[i] + s.w[i] and s.y[i] < s.y[j] + s.h[j] and s.y[j] < s.y[i] + s.h[i];
+}
+
+/// a is painted above b: a higher layer, else a higher z, else the later element.
+pub fn ui_above(s: UiSnap, a: u32, b: u32) -> bool {
+    let i : usize = a as usize;
+    let j : usize = b as usize;
+    if (s.layer[i] != s.layer[j]) { return s.layer[i] > s.layer[j]; }
+    if (s.z[i] != s.z[j]) { return s.z[i] > s.z[j]; }
+    return a > b;
+}
+
+/// p is a parent, grandparent, ... of i.
+pub fn ui_is_ancestor(s: UiSnap, p: u32, i: u32) -> bool {
+    if (i >= s.count or i >= UI_MAX) { return false; }
+    var c : u32 = s.parent[i as usize];
+    var d : u32 = 0;
+    while (c < s.count and c < UI_MAX and d <= UI_MAX) {
+        if (c == p) { return true; }
+        c = s.parent[c as usize];
+        d = d + 1;
+    }
+    return false;
+}
+
+/// The topmost visible element under the point, inside its clip; UI_NONE when there is none.
+pub fn ui_hit(s: UiSnap, px: u32, py: u32) -> u32 {
+    var best : u32 = UI_NONE;
+    var i : u32 = 0;
+    while (i < s.count and i < UI_MAX) {
+        if (ui_has(s, i, UI_F_VISIBLE) and ui_in_clip(s, i, px, py)) {
+            if (best == UI_NONE or ui_above(s, i, best)) { best = i; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+; ---------------------------------------------------------------- R4 one keyboard owner
+
+/// The element that owns the keyboard (the first one flagged focused), or UI_NONE.
+pub fn ui_key_owner(s: UiSnap) -> u32 {
+    var i : u32 = 0;
+    while (i < s.count and i < UI_MAX) {
+        if (ui_has(s, i, UI_F_FOCUSED)) { return i; }
+        i = i + 1;
+    }
+    return UI_NONE;
+}
+
+pub const UI_OK : u8 = 0;
+pub const UI_ERR_OVERFLOW : u8 = 1;
+pub const UI_ERR_ROOT : u8 = 2;
+pub const UI_ERR_PARENT : u8 = 3;
+pub const UI_ERR_DUP_ID : u8 = 4;
+pub const UI_ERR_TWO_OWNERS : u8 = 5;
+pub const UI_ERR_OWNER_HIDDEN : u8 = 6;
+pub const UI_ERR_NAMES : [7]str = ["ok", "overflow", "root", "parent", "duplicate-id", "two-keyboard-owners", "owner-hidden"];
+
+/// The first broken rule of the snapshot's shape, or UI_OK.
+pub fn ui_validate(s: UiSnap) -> u8 {
+    if (s.count > UI_MAX) { return UI_ERR_OVERFLOW; }
+    if (s.count == 0) { return UI_ERR_ROOT; }
+    if (s.role[0] != UI_ROLE_WINDOW or s.parent[0] != UI_NONE) { return UI_ERR_ROOT; }
+    var owners : u32 = 0;
+    var i : u32 = 0;
+    while (i < s.count) {
+        let k : usize = i as usize;
+        if (i > 0 and s.parent[k] == UI_NONE) { return UI_ERR_ROOT; }
+        if (i > 0 and s.parent[k] >= i) { return UI_ERR_PARENT; }
+        var j : u32 = 0;
+        while (j < i) {
+            if (s.id[j as usize] == s.id[k]) { return UI_ERR_DUP_ID; }
+            j = j + 1;
+        }
+        if (ui_has(s, i, UI_F_FOCUSED)) {
+            owners = owners + 1;
+            if (ui_has(s, i, UI_F_VISIBLE) == false or ui_has(s, i, UI_F_ENABLED) == false) { return UI_ERR_OWNER_HIDDEN; }
+        }
+        i = i + 1;
+    }
+    if (owners > 1) { return UI_ERR_TWO_OWNERS; }
+    return UI_OK;
+}
+
+; ---------------------------------------------------------------- R8 acting: semantic and user mode
+
+pub const UI_MODE_SEMANTIC : u8 = 0;
+pub const UI_MODE_USER : u8 = 1;
+
+/// May action `a` be performed on element i in `mode`? SEMANTIC: it is visible, enabled and offers `a`. USER: the
+/// real route reaches it too -- a click or focus at its centre hits it, and typed input needs it to own the keyboard.
+pub fn ui_may_act(s: UiSnap, i: u32, a: u32, mode: u8) -> bool {
+    if (ui_has(s, i, UI_F_VISIBLE) == false or ui_has(s, i, UI_F_ENABLED) == false or ui_offers(s, i, a) == false) { return false; }
+    if (mode == UI_MODE_SEMANTIC) { return true; }
+    let k : usize = i as usize;
+    if (a == UI_A_CLICK or a == UI_A_FOCUS or a == UI_A_SCROLL) {
+        return ui_hit(s, s.x[k] + s.w[k] / 2, s.y[k] + s.h[k] / 2) == i;
+    }
+    return ui_key_owner(s) == i;
+}
+
+; ---------------------------------------------------------------- R5 show-through
+
+pub const UI_ST_NONE : u8 = 0;
+pub const UI_ST_DEFECT : u8 = 1;
+pub const UI_ST_SUSPECT : u8 = 2;
+pub const UI_ST_NAMES : [3]str = ["none", "defect", "suspect"];
+
+/// Does element `top` show element `under` through? Both visible, overlapping, `top` painted above, `under` not one
+/// of top's ancestors. A known transparent `top` is a defect; opacity unknown is a suspicion; opaque is none.
+pub fn ui_show_through(s: UiSnap, top: u32, under: u32) -> u8 {
+    if (top == under) { return UI_ST_NONE; }
+    if (ui_has(s, top, UI_F_VISIBLE) == false or ui_has(s, under, UI_F_VISIBLE) == false) { return UI_ST_NONE; }
+    if (ui_overlap(s, top, under) == false or ui_above(s, top, under) == false) { return UI_ST_NONE; }
+    if (ui_is_ancestor(s, under, top)) { return UI_ST_NONE; }
+    if (ui_has(s, top, UI_F_OPAQUE)) { return UI_ST_NONE; }
+    if (ui_has(s, top, UI_F_OPAQUE_UNKNOWN)) { return UI_ST_SUSPECT; }
+    return UI_ST_DEFECT;
+}
+
+; ---------------------------------------------------------------- R2 text, R3 pixels, R1 one frame
+
+pub const UI_OUT_NOTHING : u8 = 0;
+pub const UI_OUT_EMPTY_BIT : u8 = 1;     // only whether the field is empty
+pub const UI_OUT_TEXT : u8 = 2;
+
+/// What a snapshot may carry of an element's text. opt_in is the request's explicit word for USER text.
+pub fn ui_text_out(text: u8, opt_in: bool) -> u8 {
+    if (text == UI_TEXT_CHROME) { return UI_OUT_TEXT; }
+    if (text == UI_TEXT_USER) {
+        if (opt_in) { return UI_OUT_TEXT; }
+        return UI_OUT_EMPTY_BIT;
+    }
+    return UI_OUT_NOTHING;
+}
+
+pub const UI_CAP_OWN : u8 = 0;           // the window drew it: its own bitmap has the pixels
+pub const UI_CAP_UNAVAILABLE : u8 = 1;   // a native view: rect and state only
+pub const UI_CAP_ADAPTER : u8 = 2;       // a native view whose own adapter answered with its pixels
+pub const UI_CAP_NAMES : [3]str = ["own-bitmap", "pixels-unavailable", "adapter"];
+
+pub fn ui_capture(layer: u8, adapter_answered: bool) -> u8 {
+    if (layer == UI_LAYER_BITMAP) { return UI_CAP_OWN; }
+    if (adapter_answered) { return UI_CAP_ADAPTER; }
+    return UI_CAP_UNAVAILABLE;
+}
+
+/// A tree and a picture belong together only when they come from the same frame of the same build.
+pub fn ui_pair_ok(tree_frame: u32, tree_build: u32, pixel_frame: u32, pixel_build: u32) -> bool {
+    return tree_frame == pixel_frame and tree_build == pixel_build;
+}
+
+/// Two snapshots may be diffed only on the same surface at the same viewport and scale.
+pub fn ui_comparable(a: UiSnap, b: UiSnap) -> bool {
+    return a.surface == b.surface and a.vw == b.vw and a.vh == b.vh and a.scale == b.scale;
+}
+
+; ---------------------------------------------------------------- R6 evidence, R7 baselines
+
+pub const UI_SUSPECT : u8 = 0;
+pub const UI_PROVEN : u8 = 1;
+pub const UI_EVIDENCE_NAMES : [2]str = ["suspect", "proven"];
+
+pub fn ui_finding(reproduced: bool, traced: bool, tested: bool) -> u8 {
+    if (reproduced and traced and tested) { return UI_PROVEN; }
+    return UI_SUSPECT;
+}
+
+/// actor ids are nonzero; 0 is "nobody". Whoever made the candidate never approves it as the new baseline.
+pub fn ui_may_approve(author: u32, approver: u32) -> bool {
+    return author != 0 and approver != 0 and author != approver;
+}
+
+; ---------------------------------------------------------------- the route of one key (the explainable trace)
+
+pub const UI_R_EVENT : u8 = 1;           // the window received the key (sendEvent:)
+pub const UI_R_WINDOW_KEY : u8 = 2;      // term_input tf_window_key: a window command
+pub const UI_R_OWNER : u8 = 3;           // term_input tf_key_owner decided who owns it
+pub const UI_R_GLOBAL : u8 = 4;          // a window command ran
+pub const UI_R_FIELD : u8 = 5;           // the first responder took it
+pub const UI_R_MENU : u8 = 6;            // the Edit menu sent it to the first responder
+pub const UI_R_DROPPED : u8 = 7;         // nobody took it
+pub const UI_R_NAMES : [8]str = ["", "event", "window-key", "owner", "global", "field", "menu", "dropped"];
+
+pub struct UiRoute {
+    n: u32,
+    step: [8]u8,
+}
+
+pub fn ui_route_blank() -> UiRoute {
+    return UiRoute { n: 0, step: [0; 8] };
+}
+
+/// r with one more step; past 8 steps the step is dropped and n still grows (the route reads as unfinished).
+pub fn ui_route_add(r: UiRoute, st: u8) -> UiRoute {
+    var n : UiRoute = r;
+    if (n.n < 8) { n.step[n.n as usize] = st; }
+    n.n = n.n + 1;
+    return n;
+}
+
+pub const UI_RV_OK : u8 = 0;
+pub const UI_RV_STOLEN : u8 = 1;         // a field key was taken by a window command while a field owned the keys
+pub const UI_RV_SWALLOWED : u8 = 2;      // a window key was eaten by the field
+pub const UI_RV_DROPPED : u8 = 3;
+pub const UI_RV_UNFINISHED : u8 = 4;
+pub const UI_RV_NAMES : [5]str = ["ok", "stolen-from-field", "window-key-swallowed", "dropped", "unfinished"];
+
+/// The verdict on a key's route. owner_role is the role of the keyboard owner (UI_ROLE_WINDOW when no field owns
+/// it); field_key says the key belongs to a field that is editing (term_input tf_key_owner's answer).
+pub fn ui_route_verdict(r: UiRoute, owner_role: u8, field_key: bool) -> u8 {
+    if (r.n == 0 or r.n > 8) { return UI_RV_UNFINISHED; }
+    let end : u8 = r.step[(r.n - 1) as usize];
+    if (end == UI_R_DROPPED) { return UI_RV_DROPPED; }
+    let to_field : bool = end == UI_R_FIELD or end == UI_R_MENU;
+    if (to_field == false and end != UI_R_GLOBAL) { return UI_RV_UNFINISHED; }
+    let editing : bool = field_key and ui_role_edits(owner_role);
+    if (editing and end == UI_R_GLOBAL) { return UI_RV_STOLEN; }
+    if (editing == false and to_field and field_key == false) { return UI_RV_SWALLOWED; }
+    return UI_RV_OK;
+}
+
+; ---------------------------------------------------------------- tests
+
+/// A synthetic frame: the dashboard and the DSH view up at once (the owner's defect state), the Queen field below
+/// the dashboard owning the keys, a drawn Retry button under the DSH view. Values are made up, not measured.
+fn fixture() -> UiSnap {
+    var s : UiSnap = ui_blank(1, 100, 7749, UI_ID_WINDOW, 1200, 800, 200);
+    s = ui_add(s, UI_ID_WINDOW, UI_ROLE_WINDOW, UI_NONE, UI_LAYER_BITMAP, 0, 0, 1200, 800);
+    s = ui_set(s, 0, 0, UI_F_VISIBLE + UI_F_ENABLED + UI_F_OPAQUE, 0, UI_TEXT_NONE);
+    s = ui_add(s, UI_ID_SCENE, UI_ROLE_REGION, 0, UI_LAYER_BITMAP, 0, 0, 1200, 800);
+    s = ui_set(s, 1, 0, UI_F_VISIBLE + UI_F_ENABLED + UI_F_OPAQUE, 0, UI_TEXT_NONE);
+    s = ui_add(s, UI_ID_DASHBOARD, UI_ROLE_REGION, 1, UI_LAYER_BITMAP, 220, 60, 900, 700);
+    s = ui_set(s, 2, 2, UI_F_VISIBLE + UI_F_ENABLED + UI_F_OPAQUE, 0, UI_TEXT_CHROME);
+    s = ui_add(s, UI_ID_SRV_RETRY, UI_ROLE_BUTTON, 1, UI_LAYER_BITMAP, 240, 80, 80, 24);
+    s = ui_set(s, 3, 3, UI_F_VISIBLE + UI_F_ENABLED, UI_A_CLICK, UI_TEXT_CHROME);
+    s = ui_add(s, UI_ID_DSH, UI_ROLE_EMBED, 1, UI_LAYER_NATIVE, 220, 60, 900, 700);
+    s = ui_set(s, 4, 0, UI_F_VISIBLE + UI_F_ENABLED + UI_F_OPAQUE_UNKNOWN, UI_A_CLICK + UI_A_FOCUS + UI_A_TYPE + UI_A_PASTE + UI_A_SCROLL + UI_A_SUBMIT, UI_TEXT_USER);
+    s = ui_add(s, UI_ID_QUEEN_INPUT, UI_ROLE_INPUT, 1, UI_LAYER_NATIVE, 300, 766, 600, 28);
+    s = ui_set(s, 5, 1, UI_F_VISIBLE + UI_F_ENABLED + UI_F_FOCUSED, UI_A_FOCUS + UI_A_TYPE + UI_A_PASTE + UI_A_SUBMIT, UI_TEXT_USER);
+    return s;
+}
+
+test an_input_is_found_by_its_id_and_the_fixture_is_well_formed {
+    const s : UiSnap = fixture();
+    assert ui_validate(s) == UI_OK;
+    assert ui_find(s, UI_ID_QUEEN_INPUT) == 5;
+    assert ui_find(s, UI_ID_DSH) == 4;
+    assert ui_find(s, 99) == UI_NONE;
+    assert ui_key_owner(s) == 5;
+    assert ui_id_name(UI_ID_QUEEN_INPUT) == "queen-input";
+}
+
+test a_native_view_is_hit_above_the_bitmap_whatever_its_z {
+    const s : UiSnap = fixture();
+    assert ui_hit(s, 260, 90) == 4;
+    assert ui_hit(s, 400, 780) == 5;
+    assert ui_hit(s, 100, 100) == 1;
+    assert ui_hit(s, 1300, 100) == UI_NONE;
+}
+
+test a_parent_clips_its_child_out_of_the_hit_test {
+    var s : UiSnap = fixture();
+    s = ui_set(s, 4, 0, 0, 0, UI_TEXT_USER);
+    s = ui_add(s, 20, UI_ROLE_BUTTON, 2, UI_LAYER_BITMAP, 1000, 100, 300, 50);
+    s = ui_set(s, 6, 4, UI_F_VISIBLE + UI_F_ENABLED, UI_A_CLICK, UI_TEXT_CHROME);
+    assert ui_clipped(s, 6);
+    assert ui_clipped(s, 2) == false;
+    assert ui_hit(s, 1050, 120) == 6;
+    assert ui_hit(s, 1150, 120) == 1;
+}
+
+test the_dsh_view_over_the_dashboard_is_a_suspicion_until_its_opacity_is_known {
+    var s : UiSnap = fixture();
+    assert ui_show_through(s, 4, 2) == UI_ST_SUSPECT;
+    s = ui_set(s, 4, 0, UI_F_VISIBLE + UI_F_ENABLED, UI_A_CLICK, UI_TEXT_USER);
+    assert ui_show_through(s, 4, 2) == UI_ST_DEFECT;
+    s = ui_set(s, 4, 0, UI_F_VISIBLE + UI_F_ENABLED + UI_F_OPAQUE, UI_A_CLICK, UI_TEXT_USER);
+    assert ui_show_through(s, 4, 2) == UI_ST_NONE;
+    s = ui_set(s, 4, 0, UI_F_VISIBLE + UI_F_ENABLED, UI_A_CLICK, UI_TEXT_USER);
+    s = ui_set(s, 2, 2, 0, 0, UI_TEXT_CHROME);
+    assert ui_show_through(s, 4, 2) == UI_ST_NONE;
+}
+
+test an_element_never_shows_its_own_ancestor_through {
+    var s : UiSnap = fixture();
+    s = ui_set(s, 4, 0, UI_F_VISIBLE + UI_F_ENABLED, UI_A_CLICK, UI_TEXT_USER);
+    assert ui_is_ancestor(s, 1, 4);
+    assert ui_show_through(s, 4, 1) == UI_ST_NONE;
+    assert ui_show_through(s, 2, 4) == UI_ST_NONE;
+    assert ui_show_through(s, 4, 4) == UI_ST_NONE;
+}
+
+test semantic_and_user_mode_differ_when_a_native_view_covers_a_button {
+    var s : UiSnap = fixture();
+    assert ui_may_act(s, 3, UI_A_CLICK, UI_MODE_SEMANTIC);
+    assert ui_may_act(s, 3, UI_A_CLICK, UI_MODE_USER) == false;
+    assert ui_may_act(s, 3, UI_A_TYPE, UI_MODE_SEMANTIC) == false;
+    assert ui_may_act(s, 5, UI_A_TYPE, UI_MODE_USER);
+    assert ui_may_act(s, 4, UI_A_TYPE, UI_MODE_SEMANTIC);
+    assert ui_may_act(s, 4, UI_A_TYPE, UI_MODE_USER) == false;
+    s = ui_set(s, 4, 0, 0, 0, UI_TEXT_USER);
+    assert ui_may_act(s, 3, UI_A_CLICK, UI_MODE_USER);
+    s = ui_set(s, 3, 3, UI_F_VISIBLE, UI_A_CLICK, UI_TEXT_CHROME);
+    assert ui_may_act(s, 3, UI_A_CLICK, UI_MODE_SEMANTIC) == false;
+}
+
+test the_shape_checks_catch_each_broken_rule {
+    var a : UiSnap = fixture();
+    a = ui_set(a, 4, 0, UI_F_VISIBLE + UI_F_ENABLED + UI_F_FOCUSED, UI_A_TYPE, UI_TEXT_USER);
+    assert ui_validate(a) == UI_ERR_TWO_OWNERS;
+    var b : UiSnap = fixture();
+    b = ui_set(b, 5, 1, UI_F_FOCUSED, UI_A_TYPE, UI_TEXT_USER);
+    assert ui_validate(b) == UI_ERR_OWNER_HIDDEN;
+    var c : UiSnap = fixture();
+    c = ui_add(c, UI_ID_DSH, UI_ROLE_EMBED, 1, UI_LAYER_NATIVE, 0, 0, 10, 10);
+    assert ui_validate(c) == UI_ERR_DUP_ID;
+    var d : UiSnap = fixture();
+    d = ui_add(d, 30, UI_ROLE_REGION, 9, UI_LAYER_BITMAP, 0, 0, 10, 10);
+    assert ui_validate(d) == UI_ERR_PARENT;
+    var e : UiSnap = fixture();
+    e = ui_add(e, 31, UI_ROLE_REGION, UI_NONE, UI_LAYER_BITMAP, 0, 0, 10, 10);
+    assert ui_validate(e) == UI_ERR_ROOT;
+    var f : UiSnap = fixture();
+    var k : u32 = 0;
+    while (k < UI_MAX) {
+        f = ui_add(f, 100 + k, UI_ROLE_REGION, 1, UI_LAYER_BITMAP, 0, 0, 1, 1);
+        k = k + 1;
+    }
+    assert f.count == UI_MAX + 6;
+    assert ui_validate(f) == UI_ERR_OVERFLOW;
+    assert ui_validate(ui_blank(1, 1, 1, 1, 1, 1, 100)) == UI_ERR_ROOT;
+}
+
+test a_secret_exports_nothing_and_user_text_only_on_an_explicit_opt_in {
+    assert ui_text_out(UI_TEXT_SECRET, true) == UI_OUT_NOTHING;
+    assert ui_text_out(UI_TEXT_SECRET, false) == UI_OUT_NOTHING;
+    assert ui_text_out(UI_TEXT_USER, false) == UI_OUT_EMPTY_BIT;
+    assert ui_text_out(UI_TEXT_USER, true) == UI_OUT_TEXT;
+    assert ui_text_out(UI_TEXT_CHROME, false) == UI_OUT_TEXT;
+    assert ui_text_out(UI_TEXT_NONE, true) == UI_OUT_NOTHING;
+}
+
+test embedded_pixels_are_never_claimed_without_their_adapter {
+    assert ui_capture(UI_LAYER_BITMAP, false) == UI_CAP_OWN;
+    assert ui_capture(UI_LAYER_NATIVE, false) == UI_CAP_UNAVAILABLE;
+    assert ui_capture(UI_LAYER_NATIVE, true) == UI_CAP_ADAPTER;
+}
+
+test tree_and_pixels_pair_only_on_one_frame_of_one_build {
+    assert ui_pair_ok(100, 7749, 100, 7749);
+    assert ui_pair_ok(100, 7749, 101, 7749) == false;
+    assert ui_pair_ok(100, 7749, 100, 7748) == false;
+    const a : UiSnap = fixture();
+    var b : UiSnap = fixture();
+    assert ui_comparable(a, b);
+    b.scale = 100;
+    assert ui_comparable(a, b) == false;
+}
+
+test a_defect_is_proven_only_with_reproduction_trace_and_test {
+    assert ui_finding(true, true, true) == UI_PROVEN;
+    assert ui_finding(true, true, false) == UI_SUSPECT;
+    assert ui_finding(false, true, true) == UI_SUSPECT;
+    assert ui_finding(true, false, true) == UI_SUSPECT;
+}
+
+test whoever_made_a_candidate_never_approves_its_baseline {
+    assert ui_may_approve(3, 4);
+    assert ui_may_approve(3, 3) == false;
+    assert ui_may_approve(0, 4) == false;
+    assert ui_may_approve(3, 0) == false;
+}
+
+test a_key_route_tells_stolen_swallowed_dropped_and_unfinished_apart {
+    var ok : UiRoute = ui_route_blank();
+    ok = ui_route_add(ok, UI_R_EVENT);
+    ok = ui_route_add(ok, UI_R_OWNER);
+    ok = ui_route_add(ok, UI_R_FIELD);
+    assert ui_route_verdict(ok, UI_ROLE_INPUT, true) == UI_RV_OK;
+    var st : UiRoute = ui_route_blank();
+    st = ui_route_add(st, UI_R_EVENT);
+    st = ui_route_add(st, UI_R_WINDOW_KEY);
+    st = ui_route_add(st, UI_R_GLOBAL);
+    assert ui_route_verdict(st, UI_ROLE_INPUT, true) == UI_RV_STOLEN;
+    assert ui_route_verdict(st, UI_ROLE_EMBED, true) == UI_RV_STOLEN;
+    assert ui_route_verdict(st, UI_ROLE_INPUT, false) == UI_RV_OK;
+    assert ui_route_verdict(st, UI_ROLE_WINDOW, true) == UI_RV_OK;
+    assert ui_route_verdict(ok, UI_ROLE_INPUT, false) == UI_RV_SWALLOWED;
+    var me : UiRoute = ui_route_blank();
+    me = ui_route_add(me, UI_R_EVENT);
+    me = ui_route_add(me, UI_R_MENU);
+    assert ui_route_verdict(me, UI_ROLE_INPUT, true) == UI_RV_OK;
+    var dr : UiRoute = ui_route_blank();
+    dr = ui_route_add(dr, UI_R_EVENT);
+    dr = ui_route_add(dr, UI_R_DROPPED);
+    assert ui_route_verdict(dr, UI_ROLE_INPUT, true) == UI_RV_DROPPED;
+    var un : UiRoute = ui_route_blank();
+    un = ui_route_add(un, UI_R_EVENT);
+    assert ui_route_verdict(un, UI_ROLE_INPUT, true) == UI_RV_UNFINISHED;
+    assert ui_route_verdict(ui_route_blank(), UI_ROLE_INPUT, true) == UI_RV_UNFINISHED;
+}
