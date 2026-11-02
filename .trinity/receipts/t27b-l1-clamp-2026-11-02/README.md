@@ -723,4 +723,33 @@ another actor's open work -- the own-language seal is PR #13096, the
 `ParsedCommand` pair is #13059/#13087 -- and a session merges or edits only a PR
 it opened itself, even when that PR is the one holding its own gate.
 
+### 12c. The rename held, and `loop-tools-tracked` has its own repair elsewhere
+
+After the rename, head `59a386af50`, three of the four are gone and one remains:
+`loop-tools-tracked` (run `41415969492`, job `125179777508`, 27 s). Its log is
+the same shape as before -- 43 `ok` lines, one `FAIL ledger: every non-pass entry
+has a blocker and a known reason`, and the cap line still passing at
+`(140, cap 140)`. Three facts make it not this branch's, each checkable:
+
+- `git diff <merge-base> HEAD -- docs/reports/t27b_expectations.json
+  scripts/tri_loop/` prints nothing: the branch touches neither the ledger the
+  case reads nor the checker that reads it.
+- `gh run list -w loop-tools-gate -b master -L 4` is `failure` four times, back
+  to 2026-10-27 (`41172959400` head `4cfd2f2b6a`, `41034049404`, `40512964239`,
+  `40511652636`). The workflow runs on master only when its own paths move, which
+  is why the newest master run is 10-31 rather than today.
+- The repair exists and is green somewhere else: on PR #13097
+  (`fix(t27b): regenerate steward.c so is_pass knows pass_ct; the ledger test asks
+  is_pass`, head `0d9ae29cae`) `loop-tools-tracked` **passes** -- run
+  `41403967388`, job `125141715680`. So the case is diagnosed and fixed in its own
+  lane; duplicating it here would be a second home for the same fix.
+
+One number from the same event is wrong and is worth recording so it is not
+quoted later. The PR-dashboard bot's comment of 08:45:41Z reads
+`#13099 ... 30 failing / 37 total`. Counted directly at that head,
+`gh api repos/.../commits/65c0819e13/check-runs` gives **4 failure, 29 success, 4
+cancelled, 4 skipped** -- 41 runs, 4 red. The bot's snapshot was taken while the
+run was still starting; its counting method is not read here, and the direct
+count is what section 12b is built on.
+
 Refs #12877.
