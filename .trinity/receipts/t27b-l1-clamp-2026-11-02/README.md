@@ -995,10 +995,15 @@ measured. The lane did not act, and did not need to.
 The direct count at `a393c15e2d`, for the record: **30 pass, 1 fail, 4 pending,
 4 skipping, 39 rows**. The dashboard bot's two comments from the same event read
 `28 failing / 32 total` (09:39:50Z) and `26 failing / 29 total` (09:42:14Z) for
-that same PR. It counts pending as failing, which section 12c already corrected
-once; the ratio is not a red count and is not quoted as one. Neither comment has
-an inline thread and neither asks anything of this branch, so nothing was acted
-on and nothing was replied to.
+that same PR. **Amended 2026-11-02, after the owner's correction:** the sentence
+that stood here said the bot counts pending as failing and that section 12c had
+already corrected that once. Both halves were wrong. Section 12c declines to read
+the bot's method at all, and the bot's denominators -- 32 and 29 against a direct
+39 -- are not this set, so no mapping of its ratio onto the five states exists to
+be right or wrong about. Its method is **not established**; the denominators are
+recorded above, the ratio is not a red count, and only the direct count is
+quoted. Neither comment has an inline thread and neither asks anything of this
+branch, so nothing was acted on and nothing was replied to.
 
 Still open, and named rather than implied: `Corpus ratchet`, `emit-bitexact`,
 `t27b-native-macos` and `t27b-native-ratchet` are **pending** at this head, so
@@ -1008,5 +1013,126 @@ the two tests commit `a684a5a831` added to the matrix (lines 769 and 779) --
 yet. Attempts 0; blocked by nothing but the queue. Their counts go in 12h when
 the arm64 job reports them, and until then this receipt claims nothing about
 them.
+
+## 13. The `Corpus ratchet` red: one line, twice
+
+Section 12d separated four reds and found them master's; 12g found a fifth and
+found it mine. This one is also mine, and unlike `scan` it is not a stray
+character in a sentence. `Corpus ratchet` fails because two specs on this branch
+discard tokens at parse, and the ratchet's `parse-no-discard` phase refuses that.
+
+The measurement names the line rather than inferring it. `t27c parse-complete
+--specs-dir specs/tri/shootout --show specs/tri/shootout/codegen_audit.t27`
+(W634) prints:
+
+```
+4 token(s) DISCARDED across 1 line(s)
+     24| use tri::shootout::bench::MEASURED_T27B_BASELINE;
+        dropped: : : MEASURED_T27B_BASELINE ;
+```
+
+`acceptance_matrix.t27` returns byte-identical output for its own line 24. One
+line each, four tokens each, nothing else in either file.
+
+The cause is #11101 with `bench` where that issue found `test`. `"bench" =>
+TokenKind::KwBench` sits at `bootstrap/src/compiler.rs:453`, beside `"test"` on
+451 and `"invariant"` on 452, and the `use` path loop accepts only
+`TokenKind::Ident` after a separator. So the path truncates to
+`tri::shootout::`, the import name becomes empty, and the stray `bench` opens a
+bench block at module level whose clause machinery discards the remaining four
+tokens. `specs/t27os/glass_window.t27` carries about twenty `use t27os::bench::X;`
+lines and is among the 48 discarding specs, so the keyword set that triggers this
+is at least `test`, `invariant` and `bench`, and the loss is corpus-wide.
+
+**No spelling reaches a module at a keyword path.** Every branch of the parser
+was read rather than guessed at. The `::` loop requires `Ident` after pushing
+`"::"`. The dotted branch (#5978) requires `Dot` followed by `Ident`, so
+`.bench` stops it and the dot form drops five tokens instead of four. The braced
+list (W630) fires only when the path ends in `"::"` and then requires `Ident`
+inside the braces. The alias form `using x: @import("...")` parses cleanly --
+the parser consumes `@import` and a balanced `(...)` -- but
+`bootstrap/src/use_resolve.rs:66` begins with `strip_prefix("use ")`, so a
+`using` line is invisible to the splicer: it would parse clean and import
+nothing, and `cli/t27b/src/front.rs` falls back to the unspliced original, so the
+asserts would read an unresolved name. `use_target` drops a single trailing
+segment, so the only two spellings that name `specs/tri/shootout/bench.t27` are
+`tri::shootout::bench` and `tri::shootout::bench::Item`, and both carry the
+keyword. FR-001 of #10233 -- "The spec MUST NOT import through a path segment
+that is a keyword" -- is therefore not a rule a consumer can satisfy by
+rewording. For a module at such a path there is no reachable form.
+
+**A dropped `use` is not a dead one.** t27b splices `use` targets textually from
+the raw source before parsing (`cli/t27b/src/front.rs`, via
+`crate::use_resolve::resolve`) and ignores `UseDecl` when lowering
+(`cli/t27b/src/lower.rs:755`). So the four-segment path resolves correctly while
+the parse stays dirty: `t27c check` prints `Typecheck OK (0 errors, 0 warnings)`
+for the spec exactly as it stands, and the value is really read at
+`codegen_audit.t27:352`, `:492`, `:493` and `acceptance_matrix.t27:732`.
+Deleting line 24 to clear the discard would break those four asserts, and
+nothing in the toolchain would warn. A clean typecheck is not licence to remove
+the line.
+
+That closes the fix space to one route, which is why this is an issue and not a
+commit:
+
+| route | state |
+|---|---|
+| fix the parser | Rust, `compiler.rs` frozen, needs the owner's label -- already filed as **#11101**, FR-003 naming FROZEN_HASH or a `.t27` port |
+| amnesty row in `suite_expectations.json` | **closed**: the file holds 75 entries against `"max_entries": 75`, two more would be 77, raising the cap is not allowed, and W699 wants a volume number |
+| delete the import | **wrong**: the import is live through the splice, per the paragraph above |
+| retype the measured values into the consumers | **forbidden**: a second home for a measured number, and not re-derivable here -- the lane's own `AOT_RUNS_MS` (`acceptance_matrix.t27:490`) has median 341.655 against bench.t27's 344.08, a different run set, which is exactly what line 732 asserts |
+| re-home the scalars to a non-keyword module | the only remaining route, and the provider-side reading of #10233's FR-001 |
+
+Two checks made the last row cheap, and both corrected an assumption rather than
+confirming one. `ls .trinity/seals/ | grep TriShootout` is **empty**: no seal
+exists for `TriShootoutBench`, `TriShootoutCodegenAudit` or
+`TriShootoutAcceptanceMatrix`, so editing `bench.t27` needs no seal re-save --
+and a seal re-save is the one step this session has no permission for. And
+`docs/reports/t27b_expectations.json` carries no `tri/shootout` rows at all, so
+the ledger is not in the way either.
+
+Where it went, since the remedy is not this branch's to apply under the hold:
+
+- the parser half is **#11101**, which existed already, so the measurement went
+  there as a comment (`issuecomment-6576064362`) rather than as a fourth
+  duplicate issue -- the new instances, the wider keyword set, the proof that no
+  spelling reaches such a module, the live-import finding, and that FR-003's
+  ledger workaround is unavailable at 75 of 75;
+- the spec half is **#13113**, filed with the four required headings: a new
+  `specs/tri/shootout/measured_aot.t27` holds the scalars with the provenance
+  comment, `MEASURED_T27B_BASELINE` keeps its name, type and field values and is
+  built from them, and the two consumers import through a path that parses. It
+  states that nothing was built or run on this Mac, and that a const initializer
+  reading an imported const is design rather than a measured fact until an arm64
+  run exists.
+
+Both texts as filed are beside this file, `issue-13113.md` and
+`comment-11101.md`, so the wording can be checked against what GitHub holds.
+
+**Not applied here.** The hold keeps this branch at `bbfb3be887`, and a push
+restarts all 39 checks, which moves section 12h further away for a change that
+is not the one the queue is waiting on.
+
+## 14. What this round saved, and what it could not
+
+Section 6c's six values were re-measured at this head and all six stand
+unchanged: `l1_clamp.before.asm` 217 lines / `92713df74a025198...` from input
+`96dc940bd28a8fe9...`, `ifconv_plan.asm` 1329 lines / `0179d4b597ac0f53...` from
+input `0e690948987d82d5...`. The two listings themselves are still **not
+committed**, and 6c's reason is unchanged: `asm` is in `FOREIGN_EXTS`, 1546 added
+lines against a per-file cap of 40 and a net-zero rule, and no label lifts
+either. Committing them now would be getting past a refusal by force rather than
+by a route the gate accepts, so they stay out, exactly as 6c says.
+
+Section 12h is still empty, and this commit does not fill it.
+`a_total_that_shrank_is_not_a_pass` and
+`a_total_with_nothing_to_compare_is_no_reading` have **not executed anywhere**;
+attempts 0; no verdict. `Corpus ratchet` is red at this head for the reason
+section 13 measures, which is not those two tests failing -- it is the parse
+phase refusing the file before any test runs. When the arm64 job reports, 12h
+records whether the result binds to this head and to the right attempt, whether
+those two tests themselves executed, and the actual counters; a test that did not
+run stays "not executed" even under a green job, and with nothing to compare
+against the reading stays "no measurement".
 
 Refs #12877.
