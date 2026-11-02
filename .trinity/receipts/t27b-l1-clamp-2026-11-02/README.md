@@ -20,6 +20,22 @@ Rust file in this branch is touched.**
 | `specs/tri/t27b/ifconv_plan.t27` (new) as sections 1-8 read it | sha256 `8e4b07b8b1d0b860...`, 13 functions, 15 tests |
 | `specs/tri/t27b/ifconv_plan.t27` after section 9's additions | sha256 `0e690948987d82d5...`, 17 functions, 19 tests |
 
+Second snapshot, for the measured run in section 12 and the repair that follows
+it. The run's numbers are bound to the first row here, not to the row above.
+
+| what | value |
+|---|---|
+| HEAD the arm64 run executed | `389d6e26f61ddb63ab0dfd86cf1cae5527b18755` |
+| `acceptance_matrix.t27` at that HEAD | sha256 `cf89bee8c554189d...`, 16 tests, the `Cell` name still in it |
+| `acceptance_matrix.t27` after the `AcceptanceCell` rename | sha256 `a927eeaa843dc5a7...`, blob `36b6b2fd6cf7ca60`, 16 tests |
+| HEAD after this round | `65c0819e13fd23a927f4627baed5a26df232727e` |
+| base (merge-base with master) | `8ca1b0817e99818ef35354da1b270c001e865232` |
+| `origin/master` when the reds were classified | `0215bd7223c646ceb57d1a468b16a263018aba3c` |
+
+The rename is after the run, so section 12's table describes the `cf89bee8`
+file. Nothing re-measures it here: a run of the renamed file does not exist yet,
+and the only claim made about it is the one the type-name check itself makes.
+
 Binaries used for every command in this receipt:
 
 | binary | version | sha256 (first 16) | size | mtime |
