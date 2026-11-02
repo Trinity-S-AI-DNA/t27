@@ -1,0 +1,351 @@
+# Receipt: the L1 clamp, site and prepared step (2026-11-02)
+
+Loss L1 of `specs/tri/shootout/codegen_audit.t27` is the conditional in the 200M
+heartbeat loop. This receipt records where it comes from, the assembly as t27b
+emits it today, the transform and its correctness conditions, and the Rust glue
+the transform would need. **Nothing here is a measurement of a change, and no
+Rust file in this branch is touched.**
+
+## Snapshot every line below is bound to
+
+| what | value |
+|---|---|
+| worktree | `~/t27/.claude/worktrees/loving-kilby-0e85a7` |
+| branch | `lane/t27b-floor-model` |
+| HEAD when this receipt was written | `75fdb1f1fe859a06d7fc24414e8133d518d098f3` |
+| `specs/tri/shootout/codegen_audit.t27` | sha256 `d66e075836097d8d...`, blob `9546cc2c0f01ef23` |
+| `specs/tri/shootout/acceptance_matrix.t27` at that HEAD | sha256 `7a17bdec33728434...`, blob `64d5333dc58b530b` |
+| `specs/tri/shootout/acceptance_matrix.t27` after this round's edit | sha256 `cf89bee8c554189d...`, 16 tests, uncommitted when written |
+| `specs/tri/shootout/l1_clamp.t27` (new) | sha256 `96dc940bd28a8fe9...` |
+| `specs/tri/t27b/ifconv_plan.t27` (new) | sha256 `8e4b07b8b1d0b860...` |
+
+Binaries used for every command in this receipt:
+
+| binary | version | sha256 (first 16) | size | mtime |
+|---|---|---|---|---|
+| `~/t27/target/release/t27c` | t27c 0.5.2 (build 0, commit unknown) | `041fb69cd5fe45b2` | 10639984 B | 2026-11-01T17:40:05 |
+| `~/t27/target/release/t27b` | t27b 0.1.0 | `ee89c7d27724dc11` | 3226800 B | 2026-11-01T20:19:20 |
+
+Provenance of those binaries, as far as it is actually known: at the t27b
+mtime the main clone's HEAD was `01f868a34a` on `spec/mycelium-zoom` (checked
+out 20:11:48 +0700, next reflog entry 20:48:34). The build inputs were not
+recorded, so this is the surrounding evidence and not a claim that the binary
+was built from that commit. The main clone is now on `spec/integration`. The
+worktree also holds a *different* `target/release/t27b` (sha256
+`2a13b5e2128a716e`, built 2026-11-02 13:06 by `make t27os`); it was not used
+here. An unchanged `cli/t27b` does not make either binary identical to one
+built from master.
+
+## 1. The site, exactly
+
+`specs/tri/shootout/bench_audit.t27` lines 21-27, inside
+`verdict_benchmark_200m`'s `while (i < CALLS_TARGET)`:
+
+```
+cur_tick = cur_tick + 1;
+if (cur_tick > 1000) { cur_tick = 0; cur_prev = 1000; } else { cur_prev = cur_tick - 1; }
+```
+
+The branches come from two places, and both are in t27b, not in the spec:
+
+| file:line | what it does |
+|---|---|
+| `cli/t27b/src/lower.rs:1923` | `NodeKind::StmtIf` -> `Stmt::If { cond, then, els }` |
+| `cli/t27b/src/codegen.rs:694` | `Stmt::If` -> `branch(cond, l_else, false)`, the then arm, `jump(l_end)`, the else arm |
+| `cli/t27b/src/codegen.rs:1315` | `ExprKind::Select` (an `if` used as a value) -> the same branch + jump, per arm |
+| `cli/t27b/src/codegen.rs:1458` | `fn branch` -> `compare` then `bcond`: a conditional branch for every integer compare |
+
+So rewriting the benchmark's `if` as a value expression would not remove the
+branch: `Select` branches too. That is also why this is not a
+benchmark-specific substitution -- the change is in the one place both shapes
+pass through.
+
+`specs/tri/t27b/a64.t27:632` already encodes `csel`, and it is generated into
+`gen/rust/tri/t27b/a64.rs` (included by `#[path]` at `cli/t27b/src/a64.rs:14`).
+`grep 'a64::csel' cli/t27b/src/codegen.rs` returns nothing: **no path in t27b
+emits CSEL today.**
+
+## 2. The minimal example and its assembly
+
+`specs/tri/shootout/l1_clamp.t27` is that conditional with nothing around it:
+`wrap_tick` (one arm), `wrap_prev` (two arms, one assignment each) and
+`wrap_pair` (the benchmark's shape: two assignments in one arm). Its five tests
+pin the edges 0, 1, 999, 1000, 1001, 1002 and u64 max, and they are the
+regression gate: the same values must come out after the transform.
+
+Commands, from the worktree root:
+
+```
+~/t27/target/release/t27c parse specs/tri/shootout/l1_clamp.t27     # rc 0
+~/t27/target/release/t27b asm  specs/tri/shootout/l1_clamp.t27      # rc 0, 217 lines
+```
+
+The full output is `l1_clamp.before.asm` in this directory (sha256
+`92713df74a025198...`). `wrap_pair`, which is the benchmark's shape:
+
+```
+_wrap_pair:  ; line 45
+      50: aa0003e1  mov x1, x0
+      54: d2800002  movz x2, #0x0
+      58: f10fa03f  cmp x1, #1000        <-- the L1 chain starts
+      5c: 54000089  b.ls 0x6c
+      60: d2800001  movz x1, #0x0
+      64: d2807d02  movz x2, #0x3e8
+      68: 14000003  b 0x74
+      6c: f1000422  subs x2, x1, #1
+      70: 54000103  b.lo 0x90            <-- the L1 chain ends
+      74: d2820011  movz x17, #0x1000
+      78: 9bd17c28  umulh x8, x1, x17
+      7c: 9b117c29  mul x9, x1, x17
+      80: b5000088  cbnz x8, 0x90
+      84: ab020120  adds x0, x9, x2
+      88: 54000042  b.hs 0x90
+      8c: d65f03c0  ret
+      90: d4200020  brk #0x1
+```
+
+`0x58..0x70` is seven instructions and reproduces the loop's chain exactly:
+`cmp / b.ls / movz / movz / b / subs / b.lo`. That is `L1_INSTRUCTIONS = 7` of
+`codegen_audit.t27:138`, now visible as emitted bytes rather than as a count in
+a spec. `0x74..0x8c` is the test harness's packing, not part of L1.
+
+`t27b asm` resolves names (see `.trinity/receipts/typecheck-unknown-name-2026-11-02/`),
+so rc 0 means every name in the spec exists. It is lowering, not execution: no
+test in `l1_clamp.t27` has been run anywhere.
+
+## 3. The transform
+
+If-conversion of an `if`/`Select` whose arms are speculable: evaluate both arms
+unconditionally into registers and choose with `csel`.
+
+Hand-derived expectation for `wrap_pair`. **This is written by hand. No binary
+emitted it, and no `t27b` in this repository can emit it today:**
+
+```
+      mov  x1, x0
+      subs x9, x1, #1       ; the else arm, speculated; subs because the trap check reads its flags
+      b.lo <trap>           ; fires only at x1 == 0 -- not in the then guard [1001, max]
+      cmp  x1, #1000
+      movz x10, #0x3e8      ; loop-invariant in the benchmark, hoistable out of the loop
+      csel x2, x10, x9, hi  ; prev = (x1 > 1000) ? 1000 : x1 - 1
+      csel x1, xzr, x1, hi  ; tick = (x1 > 1000) ? 0 : x1
+```
+
+The order is forced: `subs` sets the flags the trap check needs, so it has to
+precede the `cmp` that the two `csel`s read.
+
+| | chain length | branches in the chain | taken on the common path | instructions executed on the common path |
+|---|---|---|---|---|
+| today (emitted) | 7 | 2 | 1 | 4 |
+| after (hand-derived) | 6 | 1 | 0 | 6 |
+| after, with the `movz` hoisted | 5 | 1 | 0 | 5 |
+
+"Common path" is `tick <= 1000`, which is 1000 of every 1001 iterations.
+
+**Consequence inside the floor model of `codegen_audit.t27`, and only inside
+it.** The model is `bound = max(taken / 1, branches / 2, instructions / 8) / unroll`
+over `SHAPE_TODAY = 22 instructions / 9 branches / 5 taken` per call. Removing
+this one taken branch gives 21 / 8 / 4, so
+`max(4, 4, 2.625) = 4` cycles per call instead of 5: the model bound moves from
+312.5 ms to 250 ms for 200M calls. The AOT median on the receipt is 344.08 ms.
+**Both numbers are the model and the old receipt; this change has not been
+built, run or timed. The first measured result comes later, on one allowed
+machine, with the same inputs.**
+
+### Correction owed to `codegen_audit.t27`
+
+`codegen_audit.t27:139` says `L1_RECOVERABLE = 4  // sub + two csel replaces it;
+one residual move stays`, i.e. 3 instructions left of 7. The shape above leaves
+**6** (5 with the hoist), because the audit's count omits the `cmp`, the trap
+check `b.lo`, and the `movz` of the constant 1000. So `L1_RECOVERABLE` is
+optimistic by 2-3 instructions and must not be used as if it were derived.
+Correcting it moves the model's other rows, so it belongs in its own change
+with its own tests, not in this receipt. Recorded here so the number is not
+quoted again as sound.
+
+## 4. Correctness conditions, and where they are written down
+
+`specs/tri/t27b/ifconv_plan.t27` (module `T27bIfconvPlan`) is the decision, in
+t27, with 14 tests. `t27c parse` rc 0; `t27b asm` rc 0, 1157 lines
+(`ifconv_plan.asm` here, sha256 `447fdb0b309ecc89...`). Not executed anywhere.
+Nothing in `cli/t27b` calls it.
+
+1. **Integers in registers only.** No float, no i128 (`all_int`).
+2. **The arms touch nothing but registers.** `arm_speculable` accepts an absent
+   arm, a constant, another local, `x - k` and `x + k`; it refuses a call, a
+   load, a store, and everything else (`break`, `continue`, `return`, a nested
+   `if`, a non-scalar).
+3. **One compare.** `cond_is_simple`; an `and`/`or`/`!` chain is refused, because
+   `fn branch` turns those into several branches with their own labels.
+4. **Trap disjointness.** t27 arithmetic is checked, so a speculated `x - k` or
+   `x + k` traps on part of the range. It may run unconditionally only when its
+   trap range is disjoint from the guard interval of the side on which it
+   *stopped* running:
+   - trap ranges: `x - k` traps on `[0, k-1]`; `x + k` traps on `[2^64-k, max]`;
+     `k == 0` traps nowhere.
+   - guard intervals: `> c` is `[c+1, max]` (empty at `c == max`), `>= c` is
+     `[c, max]`, `< c` is `[0, c-1]` (empty at `c == 0`), `<= c` is `[0, c]`,
+     `== c` is `[c, c]`.
+   - `!=` is refused: its true set is two intervals, and this step keeps one
+     interval per side.
+   - the clamp: trap `{0}` against the then guard `[1001, max]` -- disjoint, so
+     the subtraction may be speculated.
+5. **Budget**: at most 2 selects and at most 2 speculated ops. **These two
+   numbers are chosen, not measured**; they hold the conversion to the shape the
+   clamp needs until a measurement says more pays.
+
+Negative controls in the spec (each refused, each as its own test):
+
+| case | why it is refused |
+|---|---|
+| `if (t < 5) { p = 7; } else { p = t - 10; }` | `t - 10` traps on `[0,9]`, the else arm stopped running on `[0,4]`: `t = 3` returned 7 and would now trap |
+| `if (t > 0) { p = 0; } else { p = t - 2; }` | trap `[0,1]` meets the then guard `[1, max]` at 1 |
+| `if (t < 1000) { p = t + 1; } else { p = 0; }` | the then arm overflows at max, which is on the else side |
+| an arm that calls (`verdict_fn`), loads, stores, or is anything else | not speculable |
+| a non-integer value | `all_int` false |
+| a compound condition | `cond_is_simple` false |
+| `!=` as the condition | not a single interval |
+| 3 selects, or 3 speculated ops | over the chosen budget |
+
+Accepted cases that are not the benchmark, so the rule is not a special case:
+the one-armed clamp; `if (t > 5) { p = 0; } else { p = t - 1; }`; `p = t - 0`
+against any guard; a guard that is empty (`t > max`, `t < 0`), where the arm
+already ran for every input; `== c` with two constant arms; and the mirror
+`if (t > 1000) { p = t + 1; } else { p = 0; }`.
+
+## 5. Numeric edges, including the one an assert cannot state
+
+| input `t` | `wrap_tick` | `wrap_prev` | `wrap_pair` | after the transform |
+|---|---|---|---|---|
+| 0 | 0 | **traps** (`0 - 1`, checked) | **traps** | must still trap: the speculated `subs` keeps its `b.lo` |
+| 1 | 1 | 0 | 4096 | unchanged |
+| 2 | 2 | 1 | 2 * 4096 + 1 | unchanged |
+| 999 | 999 | 998 | 999 * 4096 + 998 | unchanged |
+| 1000 | 1000 | 999 | 1000 * 4096 + 999 | unchanged, the last value before the wrap |
+| 1001 | 0 | 1000 | 1000 | unchanged, the first value after it |
+| 1002 | 0 | 1000 | 1000 | unchanged |
+| 18446744073709551615 | 0 | 1000 | 1000 | unchanged |
+
+`wrap_tick` is asserted at every row but the first; `wrap_prev` at 1, 2, 1000,
+1001, 1002 and max; `wrap_pair` at 1, 1000, 1001, max and 500. The remaining
+cells of the table are read off the two one-line functions, not asserted. The
+`t = 0` row is
+here because an `assert` cannot state "this traps": the benchmark never reaches
+it (`cur_tick` is incremented before the test), and the transform must not turn
+it into a silent 2^64-1.
+
+## 6. The Rust glue this needs -- prepared, NOT applied
+
+The decision is in t27; the emitter is not. Three hand-written Rust edits would
+be needed, and all three are inside the foreign-code gate:
+
+1. `cli/t27b/src/codegen.rs`, in `Stmt::If` (line 694) and `ExprKind::Select`
+   (line 1315): read each arm's kind and immediate, read the condition's
+   comparison and constant, count the selects and speculated ops, ask the
+   generated `may_if_convert`, and on `true` emit the arms into scratch
+   registers followed by `a64::csel` per result instead of
+   `branch` + `jump`. On `false` keep today's path byte for byte.
+2. `cli/t27b/src/codegen.rs` or a new module: a `#[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"]`
+   include, in the same shape as `cli/t27b/src/a64.rs:14` uses for `a64.rs`.
+3. `cli/t27b/src/a64.rs`, the disassembler at line 209: it matches conditional
+   select only as `w & 0x1FE0_0C00 == 0x1A80_0400`, which is the csinc/cset
+   form. A real `csel` word (op2 = 00, `0x1A80_0000`) falls through to
+   `.word 0x...`. Without about three more lines there, **the before/after
+   assembly comparison that this transform has to be judged by cannot be read**.
+
+Budget and gate, stated plainly rather than worked around:
+
+- the own-language gate allows at most 40 added hand-written foreign lines per
+  file and 80 per PR, **and** requires added `<=` deleted overall. The three
+  edits add lines to two files, so each added line has to be paid for with a
+  deletion in the same PR; that payment has not been found yet.
+- editing Rust also needs the owner's `owner-approved-foreign` label on the PR.
+  An agent never adds that label, and it cannot be obtained by changing how the
+  diff is presented.
+
+So the diff is described here and **not written into any `.rs` file in this
+branch**. `git status` for this branch shows no file under `cli/`.
+
+## 6a. Why this is L1 and not inlining
+
+L1 does not wait for the inline work, and the inline work is not what is nearest.
+Read from the closed PR's branch rather than from its description:
+
+| what | state |
+|---|---|
+| PR #12961 | CLOSED without merge; label `owner-approved-foreign` still attached |
+| its branch | `origin/epic2-inline-decision-glue`, head `966ff7e1f7`, unmerged |
+| the glue it adds to `cli/t27b/src/codegen.rs` | +37 hand-written lines: a `#[path = "../../../gen/rust/tri/t27b/inline.rs"]` module and `fn try_inline`, which builds the facts, calls `should_inline_call`, and then **returns `false`** |
+| contract drift | the glue builds a call site with `inside_loop`; master's `specs/tri/t27b/inline.t27` names that field `hot_loop`, so the two do not line up |
+| unrelated deletions on the branch | `.claude/hooks/session-gate.sh` (-127) and `.trinity/check_startupclk.py` (-34) |
+
+So the decision is computed and discarded: the glue has no runtime effect, and
+restoring it would move no instruction. What is actually missing is an executor --
+substituting a callee's body at the call site -- and that is a larger change than
+the branchless clamp. Nothing of #12961 is restored here, and the inline row is
+not treated as a prerequisite of L1.
+
+## 6b. The noisy-row rule, now executable
+
+`acceptance_matrix.t27` used to carry one sentence saying a noisy row "is
+re-run, never averaged in". That sentence permits the thing that must not
+happen: re-run until the number looks good, then report the quiet series. It is
+replaced by a rule with three functions and three tests behind it:
+
+| name | what it decides |
+|---|---|
+| `SPREAD_LIMIT_PCT = 5.0` | the spread, as a percent of the row's own median, above which a row is UNSTABLE |
+| `EXTRA_SERIES_MAX = 1` | how many further series of the same size, fixed in advance, an UNSTABLE row may be given |
+| `spread_status(spread, median)` | `ST_UNSTABLE` over the limit, and also when there is no median |
+| `may_run_extra_series(status, extra_done)` | false for a stable row at any count, false once the allowance is used |
+| `union_spread_ms(lo_a, hi_a, lo_b, hi_b)` | the spread of two series read together, which is their union and so never smaller than either |
+
+The AOT receipt's own five runs are the test case:
+`[341.655, 338.016, 349.013, 344.084, 324.901]`, median 341.655, spread 24.112 =
+7.06 percent. The row is therefore UNSTABLE, reported with that spread; adding
+an imagined quieter second series (341.0 to 342.0) leaves `union_spread_ms`
+equal to 24.112, which is the arithmetic that forbids reporting the quiet series
+alone. No run is dropped and no row is re-run to make it look stable.
+
+Checked with the two commands the Mac hook allows, on the snapshot's binaries:
+
+```
+~/t27/target/release/t27c parse specs/tri/shootout/acceptance_matrix.t27    # rc 0
+~/t27/target/release/t27b asm   specs/tri/shootout/acceptance_matrix.t27    # rc 0, 12176 asm lines
+```
+
+That is parse and lowering. None of the 16 tests has been executed.
+
+## 6c. The two .asm artifacts are deliberately not committed
+
+The full disassembly of both specs was written next to this file, and the
+pre-commit gate refused it twice: `hand-written .asm is forbidden` (own-language)
+and `more than 40 hand-written foreign lines added in one file`
+(foreign-budget). The files are `t27b asm` output rather than hand-written, but
+the gate cannot tell, and renaming them to an extension the gate does not check
+would be getting past a refusal by changing the form of presentation. So they
+stay out of the commit, and the part that carries the argument -- the
+`wrap_pair` chain of section 2 -- is quoted in this file instead.
+
+| artifact | lines | sha256 | how to reproduce it byte for byte |
+|---|---|---|---|
+| `l1_clamp.before.asm` | 217 | `92713df74a025198...` | `~/t27/target/release/t27b asm specs/tri/shootout/l1_clamp.t27` |
+| `ifconv_plan.asm` | 1157 | `447fdb0b309ecc89...` | `~/t27/target/release/t27b asm specs/tri/t27b/ifconv_plan.t27` |
+
+Both with the snapshot's `t27b` (sha256 `ee89c7d27724dc11`). If a committed
+disassembly is wanted, it needs a path the gate accepts -- a generator with a
+`.t27` source, not a rename.
+
+## 7. What is not covered
+
+- No test in `l1_clamp.t27` or `ifconv_plan.t27` has been executed anywhere.
+  `t27c parse` and `t27b asm` are the only commands run, and the Mac hook allows
+  only those two.
+- No timing. The 250 ms figure is the model's bound, not a measurement, and the
+  344.08 ms median is the older AOT receipt.
+- The "after" assembly is hand-derived. Until the glue exists and a
+  disassembler can print `csel`, there is no emitted after-shape to compare.
+- Register allocation: the shape above assumes two scratch registers are free at
+  that point in the loop. t27b's allocator has not been asked.
+
+Refs #12877.
