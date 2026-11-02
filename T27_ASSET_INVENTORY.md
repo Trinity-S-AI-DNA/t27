@@ -165,3 +165,88 @@ shakedown. Everything else from this inventory stands (budget 4/4, rollback
   eval -> checkpoints -> summary. int8 commit verified inert-by-default in the
   live path. Still honest: this is a shakedown, NOT Trained (needs real GPU
   pilot at plan scale + eval verdict vs baseline).
+
+## Owner-directive delivery (2026-11-02, evening): 7-item package
+
+1. **Manifest + 13m explained:** params 4,492,544 = blocks 4,426,752 + wte/tied-head
+   65,536 (vocab 256) + norm 256. "13m" is the ladder's NON-vocab architecture
+   name; at the real 32000 vocab wte = 8,192,000 -> ~12.6M ~= the ladder label.
+   Honest name: "CPU shakedown, 4.49M params (13m ladder, vocab-256 fixture)".
+2. **Fresh-process reload:** infer_probe.py (committed 7a9ae61 in
+   igla-coder-gpu, branch feat/int8-mm-optin) loads final.pt with no trainer
+   state; weights-only.
+3. **Generations (fixed inputs):** 3 prompts -> deterministic greedy output
+   (48 spaces - degenerate after 20 steps, recorded as-is per owner rule).
+4. **bpb_mix decomposed:** formula + mask + byte table; the 0.0668 was an
+   identity-table artifact (0.0668 == 3.70/ln2/~80); honest recount on the
+   same checkpoint: 5.47-5.59 bpb (~uniform, ln(256)=5.545).
+5. **Benchmark draft:** specs/igla/coder/bench_t27_tasks.t27 (5/5 t27b) -
+   tasks only from v0.3 val/test provenance, headline single-sample, two
+   mandatory baselines.
+6. **Corpus plan + leak checks:** docs/igla-coder-corpus-and-gpu-gate.md;
+   v0.3-real rebuilt to 116 pairs after the secret gate caught a dummy
+   ghp_ pattern inside one spec text (gate green, no bypass) - the leak
+   discipline working as designed.
+7. **GPU criteria A-E pre-registered** in the same doc; A done; B-E pending.
+   The $10-21 figure stays a scenario until live price and GPU tok/s measured.
+
+Commits: t27 branch golden-training/prepared-artifacts @ 2e8065e8c1 (hooks
+green); igla-coder-gpu branch feat/int8-mm-optin @ 7a9ae61. RunPod key
+revocation stays an OPEN owner security task; mail not re-checked.
+
+## BENCHMARK EXECUTED — first measured verdict (2026-11-02, late)
+
+GPU-gate criterion B: HARNESS DONE + BASELINES RUN (numbers recorded even
+though negative). Runner: igla-coder-gpu bench_run.py (commit e6f5077) —
+tasks only from v0.3 val/test, tracked specs only, in-place grade +
+guaranteed restore, dirty-file refusal. Results (results_bench_t27.json):
+
+| candidate          |  n | syntax | tests |
+|--------------------|----|--------|-------|
+| baseline-empty     | 24 |   0/24 |  0/24 |
+| baseline-copy      |  6 |    1/6 |   1/6 |
+| ckpt (4.49M, 20st) | 24 |   0/24 |  0/24 |
+
+VERDICT (pre-registered rule applied): the checkpoint does not beat even the
+empty baseline (degenerate whitespace continuation) and loses to copy where
+it applies. Model is NOT connected as an agent. The lever is data + training
+scale, not compute. copy-coverage 6/24 noted as a harness limitation.
+Incidents handled: untracked other-lane specs caught by grading (bytes
+preserved in dataset copies; tracked-guard added), litter removed, tree
+restored clean (0 modified tracked specs).
+
+## ITERATION 2 ON THE RULER (2026-11-02, night): data 40x, honest metric
+
+Pilot v2 on v0.3-real TRAIN-SPLIT-ONLY trainpack (7.06M tokens available,
+3.0M trained, batch 4096, seq 256, seed 13, CPU 6-7K tok/s, ~11 min):
+- train loss 2.139 (run1: 3.5555) | honest val bpb 4.2976 (run1 recount:
+  5.47-5.59; uniform ln(256)=5.545) => ~1.2 bpb real learning
+- token_bytes fixed to ones-table in the trainpack (run1 identity-table bug
+  not repeated)
+- Benchmark, same 24 tasks: baseline-empty 0/24, baseline-copy 1/6,
+  ckpt-v2 0/24 syntax and tests - task metric unchanged, LM metric improved
+- Qualitative: greedy continuation now code-shaped (assignments, newlines,
+  indentation) instead of 48 spaces
+- RULER ISOLATED THE BOTTLENECK: generation quality at micro-scale (model
+  size / data ordering / decoding), NOT compute. Next experiment queued by
+  the ruler itself: pair-format training (input->target document order with
+  separators) + sampled decoding, then re-benchmark.
+- Incidents: zero this round (tracked-guard + restore worked as designed)
+
+## REWRITE PLAN ONTO THE t27 TOOLCHAIN (2026-11-02, night)
+
+- docs/igla-coder-t27-rewrite-plan.md + specs/igla/coder/rewrite_plan.t27
+  (6/6 t27b): phases R0 reference-inference -> R1 train-step -> R2
+  reload/grade-in-t27 -> R3 CPU accel ladder -> R4 GPU kernels (bar 110) ->
+  R5 T27OS. Why-Python section records the honest boundary (no heap/IO/CUDA
+  lowering for ML yet; --backend ml IS proven: whole-HSLM trained in-spec,
+  306.7 tok/s).
+- Two subagent surveys merged: acceleration shelf (int8 2.9-3.5x fwd PTX,
+  dW splitk 11x, trainer speed 1-4, threads <=27.46x, 27-pos GEMM 10.75x,
+  f32 1.15x REJECT, dp4a never-picked) and the op-by-op coverage map
+  (anchors: nn/hslm 61/61, ternary_ste 26/26, adamw 12/12, attention_mechanism,
+  ternary_gemm_gpu dual-compiler, ocp_mx, file_io_contract 12/12; placeholders
+  blacklisted: arch swiglu/lm_head/embedding_lookup/gqa, training clip_gradients).
+- Pilot v3 (task-format pack, 274 docs, 0x00 masked separator): honest val
+  bpb 3.9503 vs v2 4.2976 (format hypothesis CONFIRMED on LM metric).
+  Fair task-metric bench with separator-aware prompts: RUNNING in background.
