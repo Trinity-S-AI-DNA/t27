@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/ui_snapshot.t27 -- snapshot freshness for the T27 OS window
+; observation channel (owner order, 2026-11-02: distinguish a fresh capture
+; of the running application from a file left over by a finished process).
+; Problem this guards: an observer asked the window for a snapshot and got a
+; PNG written by an earlier build, an earlier process, or an earlier request,
+; and reported it as a fresh PASS. Visual acceptance (chrome 7752, the DSH
+; width check) ran on stale captures exactly this way.
+; The rule: a snapshot answer is fresh only when build id, process id and
+; request id all match the question, AND the pixel half of the frame is
+; honestly stated. A missing answer is a timeout, never a stale file
+; promoted to success. Reuses the ws frame ids (frame_gate/ws_frame side);
+; this file holds only the pure decision logic, so the host wiring in
+; glass_window can call it without a new protocol.
+
+module T27osUiSnapshot;
+
+/// What a pixel half of a snapshot frame can honestly be. Written PNG is
+/// still not evidence: only VERIFIED (decoded back, dimensions or a digest
+/// checked) counts as a checked picture.
+pub const PIX_UNAVAILABLE : u8 = 0;
+pub const PIX_FILE_WRITTEN : u8 = 1;
+pub const PIX_VERIFIED : u8 = 2;
+
+/// The frame is a coherent answer only when the pixel half states VERIFIED.
+/// A text-only frame (PIX_UNAVAILABLE / FILE_WRITTEN) is honest but partial:
+/// it must never be reported as a full frame.
+pub fn pixels_coherent(pix_state : u8) -> bool {
+    return pix_state == PIX_VERIFIED;
+}
+
+/// Does a captured file belong to the running application? Build id and
+/// process id must both match. A finished process (pid changed) or a
+/// different build (relaunch) leaves its files behind, and they answer NO.
+pub fn capture_is_same_app(
+    captured_build : u64,
+    captured_pid : u64,
+    live_build : u64,
+    live_pid : u64,
+) -> bool {
+    return captured_build == live_build and captured_pid == live_pid;
+}
+
+/// Is a stored observation a valid answer to THIS request? The request id
+/// must match the response's request id AND the capture must come from the
+/// live app. An answer to a previous request is never reused.
+pub fn answer_is_fresh(
+    req_id : u64,
+    resp_req_id : u64,
+    captured_build : u64,
+    captured_pid : u64,
+    live_build : u64,
+    live_pid : u64,
+) -> bool {
+    return req_id == resp_req_id
+        and capture_is_same_app(captured_build, captured_pid, live_build, live_pid);
+}
+
+/// Milliseconds a request may wait for its own answer. Generous enough for a
+/// capture round trip on a loaded machine, short enough that a hung host is
+/// reported instead of stalling the observer.
+pub const REQ_TIMEOUT_MS : u64 = 5000;
+
+/// Outcome of waiting for a request's answer. TIMEOUT is explicit: no file
+/// on disk may stand in for it.
+pub const WAIT_ANSWERED : u8 = 0;
+pub const WAIT_TIMEOUT : u8 = 1;
+
+/// Wait result: ANSWERED only when a fresh answer arrived inside the window;
+/// everything else (no answer, an answer to an older request, a stale
+/// capture) is TIMEOUT.
+pub fn wait_outcome(
+    answered : bool,
+    req_id : u64,
+    resp_req_id : u64,
+    captured_build : u64,
+    captured_pid : u64,
+    live_build : u64,
+    live_pid : u64,
+    elapsed_ms : u64,
+) -> u8 {
+    if (elapsed_ms > REQ_TIMEOUT_MS) { return WAIT_TIMEOUT; }
+    if (!answered) { return WAIT_TIMEOUT; }
+    if (!answer_is_fresh(req_id, resp_req_id, captured_build, captured_pid,
+                         live_build, live_pid)) { return WAIT_TIMEOUT; }
+    return WAIT_ANSWERED;
+}
+
+/// The verdict for one snapshot frame: FRESH (a coherent, verified, same-app
+/// answer to this request), PARTIAL (an honest frame whose pixel half did
+/// not verify -- text only, or PNG written but unchecked), STALE (a file
+/// from another build/process/request), or TIMEOUT (no answer in the
+/// window). STALE and TIMEOUT are failures, never a PASS.
+pub const VERDICT_FRESH : u8 = 0;
+pub const VERDICT_PARTIAL : u8 = 1;
+pub const VERDICT_STALE : u8 = 2;
+pub const VERDICT_TIMEOUT : u8 = 3;
+
+pub fn verdict(
+    wait : u8,
+    pix_state : u8,
+) -> u8 {
+    if (wait == WAIT_TIMEOUT) { return VERDICT_TIMEOUT; }
+    if (!pixels_coherent(pix_state)) { return VERDICT_PARTIAL; }
+    return VERDICT_FRESH;
+}
+
+/// Last saved observation vs answer to the current request: a stored frame
+/// may be SHOWN as the last known state, but a consumer that asked a
+/// question must only accept LAST_GOOD as an answer when it is fresh for
+/// THIS request. This keeps panes from reading last painted as "what is
+/// on screen now".
+pub fn accept_stored_as_answer(
+    stored_req_id : u64,
+    current_req_id : u64,
+    stored_build : u64,
+    stored_pid : u64,
+    live_build : u64,
+    live_pid : u64,
+) -> bool {
+    return answer_is_fresh(current_req_id, stored_req_id, stored_build,
+                           stored_pid, live_build, live_pid);
+}
+
+test stale_capture_of_another_build_is_rejected {
+    // the app relaunched: build moved, pid moved
+    assert capture_is_same_app(7, 100, 7, 100);
+    assert capture_is_same_app(7, 100, 8, 100) == false;  // new build
+    assert capture_is_same_app(7, 100, 7, 101) == false;  // new process
+    // a finished process leaves files that answer NO
+    assert answer_is_fresh(42, 42, 7, 100, 7, 200) == false;
+}
+
+test an_answer_to_a_previous_request_never_closes_a_new_one {
+    // the host answered request 41; the observer asked 42
+    assert answer_is_fresh(42, 41, 7, 100, 7, 100) == false;
+    // the matching pair goes through, app identity held
+    assert answer_is_fresh(42, 42, 7, 100, 7, 100);
+}
+
+test no_answer_is_a_timeout_not_a_stale_file {
+    // nothing arrived in the window: TIMEOUT whatever is on disk
+    assert wait_outcome(false, 42, 0, 7, 100, 7, 100, 100) == WAIT_TIMEOUT;
+    // an answer, but for an older request: TIMEOUT
+    assert wait_outcome(true, 42, 41, 7, 100, 7, 100, 100) == WAIT_TIMEOUT;
+    // an answer from the previous process: TIMEOUT
+    assert wait_outcome(true, 42, 42, 7, 100, 7, 999, 100) == WAIT_TIMEOUT;
+    // over the time window even when answered: TIMEOUT
+    assert wait_outcome(true, 42, 42, 7, 100, 7, 100, REQ_TIMEOUT_MS + 1)
+        == WAIT_TIMEOUT;
+    // the one good path
+    assert wait_outcome(true, 42, 42, 7, 100, 7, 100, 900) == WAIT_ANSWERED;
+}
+
+test an_incomplete_pixel_half_is_partial_never_a_full_frame {
+    // pixels unavailable: honest, but not a coherent frame
+    assert verdict(WAIT_ANSWERED, PIX_UNAVAILABLE) == VERDICT_PARTIAL;
+    // PNG written but never decoded back: still not evidence
+    assert verdict(WAIT_ANSWERED, PIX_FILE_WRITTEN) == VERDICT_PARTIAL;
+    // decoded back and checked: a fresh frame
+    assert verdict(WAIT_ANSWERED, PIX_VERIFIED) == VERDICT_FRESH;
+    // a timeout is reported as a timeout whatever the pixel half says
+    assert verdict(WAIT_TIMEOUT, PIX_VERIFIED) == VERDICT_TIMEOUT;
+    // a stale capture can never grade FRESH or PARTIAL: it is TIMEOUT
+    assert verdict(WAIT_TIMEOUT, PIX_UNAVAILABLE) == VERDICT_TIMEOUT;
+    assert pixels_coherent(PIX_FILE_WRITTEN) == false;
+    assert pixels_coherent(PIX_VERIFIED);
+}
+
+test a_stored_observation_is_shown_but_not_answered_with {
+    // the pane shows its last good frame while nobody asked: fine
+    assert accept_stored_as_answer(41, 41, 7, 100, 7, 100);
+    // a consumer asking now must not take the old frame as the answer
+    assert accept_stored_as_answer(41, 42, 7, 100, 7, 100) == false;
+    // even a matching request id cannot paper over a dead process
+    assert accept_stored_as_answer(42, 42, 7, 100, 7, 404) == false;
+}
