@@ -12,10 +12,7 @@
 //!   data is reached with `adrp` + `add`, resolved by the JIT loader or by
 //!   PAGE21/PAGEOFF12 relocations in the object file. Large copies loop with
 //!   x30 as the end pointer, which forces a frame.
-//! * Traps. Every check branches to an out-of-line stub at the end of the
-//!   function. JIT stubs load the site number (and the assert_eq operands) and
-//!   jump to the shared `trap_common` routine of the JIT image; object-file
-//!   stubs are `brk #kind`.
+//! * Traps: the stub law (site-recording vs `brk`, the assert_eq ABI, the reach) is specs/tri/t27b/trap_plan.t27.
 //! * Calls inside the module are `bl` with the offset filled in by `link`.
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
@@ -36,6 +33,10 @@ pub(crate) mod home_plan;
 #[path = "../../../gen/rust/tri/t27b/frame_layout.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod frame_layout;
+// t27b-generated trap stub law: specs/tri/t27b/trap_plan.t27.
+#[path = "../../../gen/rust/tri/t27b/trap_plan.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod trap_plan;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -310,21 +311,16 @@ impl<'a> Gen<'a> {
     }
     // ------------------------------------------------------- trap stubs
     fn stub_site(&mut self, site: SiteId) -> Label {
-        match self.style {
-            TrapStyle::Jit => {
-                if let Some(&l) = self.stub_by_site.get(&site) {
-                    return l;
-                }
-                let l = self.new_label();
-                self.stubs.push((l, Stub::Site(site)));
-                self.stub_by_site.insert(site, l);
-                l
-            }
-            TrapStyle::Brk | TrapStyle::Elf => {
-                let kind = self.prog.sites[site as usize].kind;
-                self.stub_brk(kind)
-            }
+        if !trap_plan::stub_records_site(self.style == TrapStyle::Jit) {
+            return self.stub_brk(self.prog.sites[site as usize].kind);
         }
+        if let Some(&l) = self.stub_by_site.get(&site) {
+            return l;
+        }
+        let l = self.new_label();
+        self.stubs.push((l, Stub::Site(site)));
+        self.stub_by_site.insert(site, l);
+        l
     }
     fn stub_brk(&mut self, kind: TrapKind) -> Label {
         let k = kind as u32;
@@ -458,22 +454,19 @@ impl<'a> Gen<'a> {
         let stubs = std::mem::take(&mut self.stubs);
         for (l, stub) in stubs {
             self.bind(l);
-            match stub {
-                Stub::Site(site) => {
-                    self.mov_imm(false, 1, site as u64);
-                    self.trap_jumps.push(self.code.len());
-                    self.emit(a64::b(0));
-                }
+            let site = match stub {
+                Stub::Site(site) => site,
                 Stub::AssertEq(site, ra, rb) => {
-                    self.emit(a64::mov(true, X8, rb));
-                    self.emit(a64::mov(true, 2, ra));
-                    self.emit(a64::mov(true, 3, X8));
-                    self.mov_imm(false, 1, site as u64);
-                    self.trap_jumps.push(self.code.len());
-                    self.emit(a64::b(0));
+                    for (i, src) in [rb, ra, X8].into_iter().enumerate() {
+                        self.emit(a64::mov(true, trap_plan::assert_eq_dst(i as u64) as Reg, src));
+                    }
+                    site
                 }
-                Stub::Brk(kind) => self.emit(a64::brk(kind as u32)),
-            }
+                Stub::Brk(kind) => { self.emit(a64::brk(kind as u32)); continue; }
+            };
+            self.mov_imm(false, 1, site as u64);
+            self.trap_jumps.push(self.code.len());
+            self.emit(a64::b(0));
         }
         // Resolve local branches.
         let fixes = std::mem::take(&mut self.fixes);
@@ -488,7 +481,7 @@ impl<'a> Gen<'a> {
             let off = target as i64 - pos as i64;
             let w = self.code[pos];
             if w & 0x7C00_0000 == 0x1400_0000 {
-                if !(-(1 << 25)..(1 << 25)).contains(&off) {
+                if !trap_plan::branch_reaches(off) {
                     self.fail("branch out of range".into());
                 }
                 self.code[pos] = a64::b(off as i32);
@@ -2037,7 +2030,7 @@ pub fn link(prefix: Vec<u32>, trap_common: Option<usize>, funcs: &[FuncCode], nf
             let at = start + p;
             let target = offsets[callee as usize].ok_or_else(|| format!("call to function #{} that was not emitted", callee))?;
             let off = target as i64 - at as i64;
-            if !(-(1 << 25)..(1 << 25)).contains(&off) {
+            if !trap_plan::branch_reaches(off) {
                 return Err("bl out of range (module larger than 128 MiB)".into());
             }
             code[at] = a64::bl(off as i32);
@@ -2047,7 +2040,7 @@ pub fn link(prefix: Vec<u32>, trap_common: Option<usize>, funcs: &[FuncCode], nf
             let at = start + p;
             let tc = trap_common.ok_or("trap stub without trap_common")?;
             let off = tc as i64 - at as i64;
-            if !(-(1 << 25)..(1 << 25)).contains(&off) {
+            if !trap_plan::branch_reaches(off) {
                 return Err("trap branch out of range".into());
             }
             code[at] = a64::b(off as i32);
