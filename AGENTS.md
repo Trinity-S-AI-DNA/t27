@@ -142,12 +142,14 @@ its date, and re-measure a `NOTE` before you repeat it.
 
 Gaps that are open until a PR closes them. Do not assume otherwise:
 
-- **The owner's Mac has no `HOST`.** The vocabulary is `github-actions`,
-  `inngest`, `railway-cron`, `timer`. launchd jobs, crontab lines and Claude
-  Code scheduled tasks therefore have no card, and neither the page nor the
-  Queen sees them. A new host is a schema change in `specs/crons/README.md`
-  first, then in the trinity generator (`apps/website/scripts/agents-from-specs.mjs`),
-  then in the Queen's `src/inngest/plan.ts`.
+- **Claude Code scheduled tasks have no `HOST`.** The vocabulary since
+  0930ccde91 (2026-10-04) is `github-actions`, `inngest`, `railway-cron`,
+  `timer`, `launchd`: launchd jobs and crontab lines card under `launchd`
+  (`specs/crons/README.md`, "HOST launchd"), the page renders them with
+  controls disabled, and the Queen serves them `tick-only`. A new host is
+  still a schema change in `specs/crons/README.md` first, then in the trinity
+  generator (`apps/website/scripts/agents-from-specs.mjs`), then in the
+  Queen's `src/inngest/plan.ts`.
 - **Dispatched workflows fire twice.** A `github-actions` card the Queen
   dispatches still has its `schedule:` block until a PR removes it, in the
   order fixed by
