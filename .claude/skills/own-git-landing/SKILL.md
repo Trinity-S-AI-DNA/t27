@@ -45,6 +45,7 @@ Why: a push starts every required check again at the back of an Actions queue of
 - Re-run checks after a derived-only rebase (CARRIED or REGEN re-run nothing).
 - Force-push, or move the head except by gc_land.
 - Count a red as inherited unless the PR's failure set is a subset of master's.
+  The five conditions and the fingerprint fields: skill `analog-emulation`, lesson of 2026-10-31 on inherited reds.
 
 ## Traps
 
