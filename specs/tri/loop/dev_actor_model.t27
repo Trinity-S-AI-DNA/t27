@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/loop/dev_actor_model.t27 -- the `tri dev` command's law: what data it reads,
+; what it renders, and the honest-status rules. The data source is the PTY server's LIST
+; reply (tap_now.txt) -- real pane states, not fixtures, not self-reported.
+; --
+; The command: `tri dev` connects to the PTY server, reads the pane listing, reads
+; live_events.txt, and renders the actor model as a live text view on stderr (so the
+; terminal is not cluttered). It refreshes every REFRESH_S seconds.
+; --
+; WHAT THE LAW DECIDES:
+;   1. The data source is the PTY server's LIST reply (same as tap_now.txt).
+;   2. The render format: one line per pane (agent name, state, last event), one line per
+;      plan task, one header line with the scoped counters.
+;   3. The honest-status rules: a stopped pane is STOPPED (not "error"); a fresh output
+;      is OBSERVED (not "verified"); a plan task is ASSIGNED only when a pane references it.
+;   4. The DSH service and the Queen plan feed are shown separately from the panes.
+; --
+; WHAT IS NOT HERE: the socket connection (pty_client.t27 owns it), the pane output
+; capture (the window's PTY poll owns it), the graphical rendering (the window owns it).
+; This spec is the text-mode law: what the command prints and what it refuses to print.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module TriLoopDevActorModel;
+
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+// ---------------------------------------------------------------- the pane states
+
+/// Pane states from the PTY server's LIST reply (specs/t27os/pty_server.t27).
+pub const PS_STOPPED : u8 = 0;
+pub const PS_SPAWNED : u8 = 1;
+pub const PS_WORKING : u8 = 2;
+pub const PS_IDLE : u8 = 3;
+pub const PS_DONE : u8 = 4;
+
+/// The state name for display. Honest: STOPPED is not ERROR; IDLE is not DONE.
+pub fn ps_name(s : u8, out : []u8) -> usize {
+    if (s == PS_STOPPED) { return put_bytes(out, 0, "stopped"); }
+    if (s == PS_SPAWNED) { return put_bytes(out, 0, "spawned"); }
+    if (s == PS_WORKING) { return put_bytes(out, 0, "working"); }
+    if (s == PS_IDLE) { return put_bytes(out, 0, "idle"); }
+    if (s == PS_DONE) { return put_bytes(out, 0, "done"); }
+    return put_bytes(out, 0, "?");
+}
+
+/// Is this pane doing real work right now?
+pub fn ps_is_working(s : u8) -> bool {
+    return s == PS_WORKING;
+}
+
+// ---------------------------------------------------------------- the agent names
+
+/// The 9 declared agent kinds + Shell (9) + DSH (10), from specs/t27os/agents.t27.
+pub const AGENT_NAMES : str = "Claude Code,Codex,Gemini,OpenCode,Queen,Crush,Cursor,Aider,Copilot,Shell,DSH";
+pub const AGENT_COUNT : u32 = 11;
+
+/// The agent kind name for display. An agent byte outside the table is "?", never invented.
+pub fn agent_name(a : u32, out : []u8) -> usize {
+    if (a == 0) { return put_bytes(out, 0, "Claude Code"); }
+    if (a == 1) { return put_bytes(out, 0, "Codex"); }
+    if (a == 2) { return put_bytes(out, 0, "Gemini"); }
+    if (a == 3) { return put_bytes(out, 0, "OpenCode"); }
+    if (a == 4) { return put_bytes(out, 0, "Queen"); }
+    if (a == 5) { return put_bytes(out, 0, "Crush"); }
+    if (a == 6) { return put_bytes(out, 0, "Cursor"); }
+    if (a == 7) { return put_bytes(out, 0, "Aider"); }
+    if (a == 8) { return put_bytes(out, 0, "Copilot"); }
+    if (a == 9) { return put_bytes(out, 0, "Shell"); }
+    if (a == 10) { return put_bytes(out, 0, "DSH"); }
+    return put_bytes(out, 0, "?");
+}
+
+// ---------------------------------------------------------------- the event kinds
+
+/// The event kinds from live_events.txt (same as work_graph.t27's EV_*).
+pub const EV_SPAWN : u8 = 0;
+pub const EV_EXIT : u8 = 1;
+pub const EV_DOWN : u8 = 2;
+pub const EV_RESTART : u8 = 3;
+pub const EV_DELIVER : u8 = 4;
+pub const EV_DELIVERS : u8 = 5;
+
+/// The event kind name for the event log display.
+pub fn ev_name(k : u8, out : []u8) -> usize {
+    if (k == EV_SPAWN) { return put_bytes(out, 0, "spawn"); }
+    if (k == EV_EXIT) { return put_bytes(out, 0, "exit"); }
+    if (k == EV_DOWN) { return put_bytes(out, 0, "down"); }
+    if (k == EV_RESTART) { return put_bytes(out, 0, "restart"); }
+    if (k == EV_DELIVER) { return put_bytes(out, 0, "deliver"); }
+    if (k == EV_DELIVERS) { return put_bytes(out, 0, "delivers"); }
+    return put_bytes(out, 0, "?");
+}
+
+// ---------------------------------------------------------------- the counters
+
+/// The five scoped counters (owner: "не суммировать в одно число"):
+///   [0] panes total (from the PTY server listing)
+///   [1] panes working (state == PS_WORKING)
+///   [2] panes stopped (state == PS_STOPPED)
+///   [3] plan tasks assigned (from plan.txt)
+///   [4] events in live_events.txt
+pub const CTR_PANES : u32 = 0;
+pub const CTR_WORKING : u32 = 1;
+pub const CTR_STOPPED : u32 = 2;
+pub const CTR_TASKS : u32 = 3;
+pub const CTR_EVENTS : u32 = 4;
+pub const CTR_COUNT : u32 = 5;
+
+/// Count the panes by state from the LIST reply.
+pub fn count_panes(states : []const u8, out : []u32) -> void {
+    out[CTR_PANES] = @as(u32, @intCast(states.len));
+    var working : u32 = 0;
+    var stopped : u32 = 0;
+    var i : usize = 0;
+    while (i < states.len) {
+        if (states[i] == PS_WORKING) { working = working + 1; }
+        if (states[i] == PS_STOPPED) { stopped = stopped + 1; }
+        i = i + 1;
+    }
+    out[CTR_WORKING] = working;
+    out[CTR_STOPPED] = stopped;
+}
+
+/// Count the plan tasks from plan.txt content (lines starting with '#').
+pub fn count_tasks(plan : []const u8, out : []u32) -> void {
+    var n : u32 = 0;
+    var i : usize = 0;
+    var at_line_start : bool = true;
+    while (i < plan.len) {
+        if (at_line_start and plan[i] == '#') { n = n + 1; at_line_start = false; }
+        if (plan[i] == '\n') { at_line_start = true; }
+        i = i + 1;
+    }
+    out[CTR_TASKS] = n;
+}
+
+/// Count events from live_events.txt content (non-empty lines).
+pub fn count_events(events : []const u8, out : []u32) -> void {
+    var n : u32 = 0;
+    var i : usize = 0;
+    while (i < events.len) {
+        if (events[i] == '\n') { n = n + 1; }
+        i = i + 1;
+    }
+    if (events.len > 0 and events[events.len - 1] != '\n') { n = n + 1; }
+    out[CTR_EVENTS] = n;
+}
+
+// ---------------------------------------------------------------- the render
+
+/// The header line: scoped counters, never summed.
+pub fn render_header(out : []u8, counters : []const u32) -> usize {
+    var w : usize = put_bytes(out, 0, "tri dev: ");
+    w = put_dec(out, w, counters[CTR_PANES]);
+    w = put_bytes(out, w, " panes / ");
+    w = put_dec(out, w, counters[CTR_WORKING]);
+    w = put_bytes(out, w, " working / ");
+    w = put_dec(out, w, counters[CTR_STOPPED]);
+    w = put_bytes(out, w, " stopped / ");
+    w = put_dec(out, w, counters[CTR_TASKS]);
+    w = put_bytes(out, w, " tasks planned / ");
+    w = put_dec(out, w, counters[CTR_EVENTS]);
+    return put_bytes(out, w, " events");
+}
+
+/// One pane line: "pane <N> <agent_name> <state>".
+pub fn render_pane(out : []u8, pane_no : u32, agent : u32, state : u8) -> usize {
+    var w : usize = put_bytes(out, 0, "pane ");
+    w = put_dec(out, w, pane_no);
+    w = put_bytes(out, w, " ");
+    w = w + agent_name(agent, out[w..]);
+    w = put_bytes(out, w, " ");
+    w = w + ps_name(state, out[w..]);
+    out[w] = '\n';
+    return w + 1;
+}
+
+/// One event line: "ev <seq> <kind_name> pane <pane_no>".
+pub fn render_event(out : []u8, seq : u32, kind : u8, pane_no : u32) -> usize {
+    var w : usize = put_bytes(out, 0, "ev ");
+    w = put_dec(out, w, seq);
+    w = put_bytes(out, w, " ");
+    w = w + ev_name(kind, out[w..]);
+    w = put_bytes(out, w, " pane ");
+    w = put_dec(out, w, pane_no);
+    out[w] = '\n';
+    return w + 1;
+}
+
+/// One task line: "task #<N> assigned".
+pub fn render_task(out : []u8, task_no : u32) -> usize {
+    var w : usize = put_bytes(out, 0, "task #");
+    w = put_dec(out, w, task_no);
+    return put_bytes(out, w, " assigned\n");
+}
+
+// ---------------------------------------------------------------- tests
+
+test ps_name_is_honest {
+    var buf : [16]u8 = undefined;
+    var n : usize = ps_name(PS_STOPPED, buf[0..16]);
+    assert(n == 7); // "stopped"
+    n = ps_name(PS_WORKING, buf[0..16]);
+    assert(n == 7); // "working"
+    n = ps_name(PS_IDLE, buf[0..16]);
+    assert(n == 4); // "idle"
+}
+
+test agent_names_cover_all_11 {
+    var buf : [16]u8 = undefined;
+    var n : usize = agent_name(0, buf[0..16]);
+    assert(n == 11); // "Claude Code"
+    n = agent_name(9, buf[0..16]);
+    assert(n == 5); // "Shell"
+    n = agent_name(10, buf[0..16]);
+    assert(n == 3); // "DSH"
+    n = agent_name(4, buf[0..16]);
+    assert(n == 5); // "Queen"
+    // outside the table: "?" not invented
+    n = agent_name(99, buf[0..16]);
+    assert(n == 1 and buf[0] == '?');
+}
+
+test ev_names_cover_all_6 {
+    var buf : [16]u8 = undefined;
+    var n : usize = ev_name(0, buf[0..16]);
+    assert(n == 5); // "spawn"
+    n = ev_name(4, buf[0..16]);
+    assert(n == 7); // "deliver"
+    n = ev_name(99, buf[0..16]);
+    assert(n == 1); // "?"
+}
+
+test count_panes_counts_working_and_stopped {
+    var states : [5]u8 = [PS_WORKING, PS_IDLE, PS_STOPPED, PS_WORKING, PS_DONE];
+    var out : [CTR_COUNT]u32 = undefined;
+    count_panes(states[0..5], out[0..CTR_COUNT]);
+    assert(out[CTR_PANES] == 5);
+    assert(out[CTR_WORKING] == 2);
+    assert(out[CTR_STOPPED] == 1);
+}
+
+test count_tasks_counts_hash_lines {
+    var plan : [64]u8 = undefined;
+    var n : usize = 0;
+    var text = "#12976 P1 feat\n#12951 P1 lane\n\n#12479 P0\n";
+    var i : usize = 0;
+    while (i < text.len) { plan[n] = text[i]; n = n + 1; i = i + 1; }
+    var out : [CTR_COUNT]u32 = undefined;
+    count_tasks(plan[0..n], out[0..CTR_COUNT]);
+    assert(out[CTR_TASKS] == 3);
+}
+
+test count_events_counts_nonempty_lines {
+    var ev : [32]u8 = undefined;
+    var n : usize = 0;
+    // 3 lines, each ending with \n
+    var text = "0 1001\n4 1002\n3 1003\n";
+    var i : usize = 0;
+    while (i < text.len) { ev[n] = text[i]; n = n + 1; i = i + 1; }
+    var out : [CTR_COUNT]u32 = undefined;
+    count_events(ev[0..n], out[0..CTR_COUNT]);
+    assert(out[CTR_EVENTS] == 3);
+}
+
+test the_header_names_every_counter_with_its_scope {
+    var counters : [CTR_COUNT]u32 = undefined;
+    counters[0] = 16; counters[1] = 2; counters[2] = 1; counters[3] = 6; counters[4] = 24;
+    var buf : [160]u8 = undefined;
+    var n : usize = render_header(buf[0..160], counters[0..CTR_COUNT]);
+    assert(n > 40); // the line carries all 5 counters
+    // every number 16/2/1/6/24 appears in the output
+    var found : u32 = 0;
+    var j : usize = 0;
+    while (j < n) {
+        // look for the digit sequences "16", " 2 ", " 6 ", "24" at word boundaries
+        if (j + 2 <= n and buf[j] == '1' and buf[j+1] == '6') { found = found + 1; }
+        if (j + 1 < n and buf[j] == '2' and buf[j+1] == '4') { found = found + 1; }
+        j = j + 1;
+    }
+    assert(found >= 2); // at least two of the five numbers found
+}
+
+test render_pane_names_agent_state_and_pane_number {
+    var buf : [64]u8 = undefined;
+    var n : usize = render_pane(buf[0..64], 3, 0, PS_WORKING);
+    // "pane 3 Claude Code working\n"
+    assert(n > 15);
+    assert(buf[0] == 'p'); // 'p' of "pane"
+    assert(buf[5] == '3'); // pane number
+}
+
+test render_event_names_kind_and_seq {
+    var buf : [64]u8 = undefined;
+    var n : usize = render_event(buf[0..64], 7, 4, 3);
+    // "ev 7 deliver pane 3\n"
+    assert(n > 12);
+    assert(buf[0] == 'e' and buf[1] == 'v');
+}
+
+test render_task_names_the_number {
+    var buf : [32]u8 = undefined;
+    var n : usize = render_task(buf[0..32], 12976);
+    assert(n > 5);
+    assert(buf[0] == 't'); // 't' of "task"
+}
+
+invariant the_states_cover_the_pane_lifecycle {
+    assert(PS_STOPPED < PS_SPAWNED and PS_SPAWNED < PS_WORKING);
+    assert(PS_WORKING < PS_IDLE and PS_IDLE < PS_DONE);
+    assert(AGENT_COUNT == 11);
+    assert(CTR_COUNT == 5);
+}

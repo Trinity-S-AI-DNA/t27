@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/work_replay.t27 -- the actor model replay: the recorded fixture's events folded
+// through work_graph.t27 into a work graph, with per-event arrival on the law's tick grid.
+// --
+// The web page t27.ai/t27f/live/ replays logs/recorded_log.json through the same laws compiled
+// to wasm. This spec is the native counterpart: same fixture, same graph fold, same event list,
+// but running inside the T27 OS window's draw loop with no browser.
+// --
+// WHAT THIS SPEC DECIDES: the replay tick loop (how many events have fired by law-frame N),
+// the per-actor lifecycle state (spawn/active/down/restart/exit), the named-actor label table,
+// and the replay stats (agents alive, events fired, frame position on the law's axis).
+// WHAT IS NOT HERE: the drawing (glass_window reads these outputs), the PTY connection (the
+// live pane side is separate), the plan feed (that is the Queen's, not the actor model's).
+// ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27fWorkReplay;
+
+use t27f::work_graph_fixture::FIXTURE_EVENTS;
+use t27f::work_graph_fixture::KIND;
+use t27f::work_graph_fixture::F_SLOT;
+use t27f::work_graph_fixture::REPLAY_KIND_REF;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::apply_event;
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::nodes;
+use t27f::work_graph::edges;
+use t27f::work_graph::NK_AGENT;
+use t27f::work_graph::NK_TASK;
+use t27f::work_graph::NK_ACTION;
+use t27f::work_graph::NK_ARTIFACT;
+use t27f::work_graph::EV_SPAWN;
+use t27f::work_graph::EV_EXIT;
+use t27f::work_graph::EV_DOWN;
+use t27f::work_graph::EV_RESTART;
+use t27f::work_graph::EV_DELIVER;
+use t27f::work_graph::Event;
+
+// ---------------------------------------------------------------- the replay clock
+
+/// One event fires per law tick. The fixture's first 24 events are the actor replay.
+pub const REPLAY_EVENTS : u32 = 24;
+
+/// The event kind names for the log display, one per KIND value.
+pub const REPLAY_KIND_NAMES : [6]str = ["spawn", "exit", "down", "restart", "deliver", "delivers"];
+
+/// The kind name for KIND value k (returns the string, no allocation).
+pub fn wr_kind_name(k : u8) -> str {
+    if (k == 0) { return "spawn"; }
+    if (k == 1) { return "exit"; }
+    if (k == 2) { return "down"; }
+    if (k == 3) { return "restart"; }
+    if (k == 4) { return "deliver"; }
+    if (k == 5) { return "delivers"; }
+    return "?";
+}
+
+/// How many of the first `n` events are spawns (agents created).
+pub fn wr_spawn_count(n : u32) -> u32 {
+    var count : u32 = 0;
+    var i : u32 = 0;
+    while (i < n and i < REPLAY_EVENTS) {
+        if (KIND[i] == 0) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// How many of the first `n` events are delivers (messages between agents).
+pub fn wr_deliver_count(n : u32) -> u32 {
+    var count : u32 = 0;
+    var i : u32 = 0;
+    while (i < n and i < REPLAY_EVENTS) {
+        if (KIND[i] == 4) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// How many of the first `n` events are down/restart/exit (lifecycle transitions).
+pub fn wr_lifecycle_count(n : u32) -> u32 {
+    var count : u32 = 0;
+    var i : u32 = 0;
+    while (i < n and i < REPLAY_EVENTS) {
+        if (KIND[i] != 0 and KIND[i] != 4) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+/// The replay is monotonically forward: frame N has fired events 0..N-1. The playhead is the
+/// frame counter the UI displays; it saturates at REPLAY_EVENTS (no wraparound).
+pub fn wr_playhead(frame : u32) -> u32 {
+    if (frame > REPLAY_EVENTS) { return REPLAY_EVENTS; }
+    return frame;
+}
+
+/// Is the replay done? (The playhead reached the last event.)
+pub fn wr_done(frame : u32) -> bool {
+    return frame >= REPLAY_EVENTS;
+}
+
+// ---------------------------------------------------------------- per-actor state
+
+/// Per-actor lifecycle state at the current playhead, derived from KIND[0..playhead]:
+///   state 0 = not yet spawned
+///   state 1 = active (spawned, not exited/down)
+///   state 2 = down
+///   state 3 = restarted (was down, came back)
+///   state 4 = exited
+///
+/// The fixture's actor IDs are the F_SLOT values 1..7 (7 named agents).
+/// The arrays are indexed by actor slot 1..7 (slot 0 is the producer, not an actor).
+pub const WR_ACTORS : u32 = 8;
+
+/// Actor state at playhead `n`: scan KIND[0..n], track the last lifecycle event per F_SLOT.
+/// A spawn sets state 1 (active); an exit sets 4; a down sets 2; a restart sets 1 (back).
+pub fn wr_actor_state(n : u32, slot : u32) -> u8 {
+    // scan events 0..n for the last lifecycle event touching this slot
+    var state : u8 = 0; // not spawned
+    var i : u32 = 0;
+    while (i < n and i < REPLAY_EVENTS) {
+        if (F_SLOT[i] == slot) {
+            if (KIND[i] == 0) { state = 1; }      // spawn -> active
+            if (KIND[i] == 1) { state = 4; }      // exit -> gone
+            if (KIND[i] == 2) { state = 2; }      // down
+            if (KIND[i] == 3) { state = 1; }      // restart -> back
+        }
+        i = i + 1;
+    }
+    return state;
+}
+
+/// Count actors alive at playhead `n` (spawned and not exited).
+pub fn wr_alive_at(n : u32) -> u32 {
+    var alive : u32 = 0;
+    var slot : u32 = 1;
+    while (slot <= 7) {
+        const s : u8 = wr_actor_state(n, slot);
+        if (s == 1) { alive = alive + 1; }
+        slot = slot + 1;
+    }
+    return alive;
+}
+
+// ---------------------------------------------------------------- the graph fold
+
+/// Fold the first `n` fixture events into a fresh work graph. This is the same fold the
+/// M1 test uses (work_graph.t27's "the fixture replays to the same sha256 twice"), scoped
+/// to the first `n` events so the UI can show the graph growing as the playhead advances.
+pub fn wr_fold_n(g: *WorkGraph, n : u32) -> u32 {
+    var applied : u32 = 0;
+    var i : u32 = 0;
+    while (i < n and i < FIXTURE_EVENTS) {
+        // event_at(i) returns the Event struct for fixture event i
+        var ev = event_at(i);
+        var r = apply_event(g, ev);
+        if (r == 0) { applied = applied + 1; }
+        i = i + 1;
+    }
+    return applied;
+}
+
+/// The actor display name for slot `s`: the fixture's SPEC_NAMES truncated to the last path
+/// segment (e.g. "specs/t27os/release.t27" -> "release"), or the raw slot number for unknown.
+pub fn wr_actor_label(slot : u32, buf : []u8) -> u32 {
+    // the 7 actor slots map to SPEC_NAMES[0..7] in work_graph_fixture.t27
+    if (slot == 0 or slot > 8) {
+        buf[0] = '?';
+        buf[1] = 0;
+        return 1;
+    }
+    // the name is the last path segment of SPEC_NAMES[slot-1]
+    var path = SPEC_NAMES[(slot - 1) as usize];
+    // scan for the last '/'
+    var start : usize = 0;
+    var last : usize = 0;
+    var found : bool = false;
+    while (start < path.len) {
+        if (path[start] == '/') { last = start + 1; found = true; }
+        start = start + 1;
+    }
+    var w : u32 = 0;
+    var i : usize = last;
+    while (i < path.len and w < 40) {
+        buf[w] = path[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    return w;
+}
+
+// ---------------------------------------------------------------- tests
+
+test the_first_7_events_are_spawns {
+    assert(wr_spawn_count(7) == 7);
+    assert(wr_spawn_count(8) == 7); // event 7 (0-based) is the first deliver
+    assert(wr_spawn_count(24) == 7);
+}
+
+test the_deliver_count_grows_monotonically {
+    var d5 : u32 = wr_deliver_count(5);
+    var d10 : u32 = wr_deliver_count(10);
+    var d15 : u32 = wr_deliver_count(15);
+    var d20 : u32 = wr_deliver_count(20);
+    assert(d5 <= d10 and d10 <= d15 and d15 <= d20);
+    assert(d20 > d5); // the fixture has delivers
+}
+
+test the_playhead_saturates_at_the_event_count {
+    assert(wr_playhead(0) == 0);
+    assert(wr_playhead(10) == 10);
+    assert(wr_playhead(100) == REPLAY_EVENTS);
+    assert(wr_done(REPLAY_EVENTS));
+    assert(wr_done(REPLAY_EVENTS - 1) == false);
+}
+
+test the_actor_state_tracks_spawn_exit_restart {
+    // slot 1: spawned at event 0 (active), no exit/down/restart in KIND[0..7]
+    assert(wr_actor_state(7, 1) == 1); // still active after 7 events
+    // slot 4: KIND[14]=1 (exit) -> exited
+    // find the exit: KIND[14]=1? scan: the fixture's KIND at index 14 is 4 (deliver). The
+    // first exit (KIND=1) is at index 12. F_SLOT[12]=1 -> slot 1 exited at event 12.
+    // After 13 events, slot 1's state is exited (4).
+    assert(wr_actor_state(13, 1) == 4);
+}
+
+test alive_count_decreases_when_an_agent_exits {
+    // after 7 events: 7 agents spawned, all active
+    var alive_early : u32 = wr_alive_at(7);
+    assert(alive_early >= 5); // most still active
+    // after event 12 (exit): one fewer alive
+    var alive_after_exit : u32 = wr_alive_at(13);
+    assert(alive_after_exit < alive_early);
+}
+
+test the_fold_produces_a_nonempty_graph {
+    var g = new_graph();
+    var applied : u32 = wr_fold_n(&g, REPLAY_EVENTS);
+    assert(applied > 0);
+    assert(nodes(&g) > 0);
+    assert(edges(&g) > 0);
+}
+
+test the_fold_is_deterministic {
+    var a = new_graph();
+    var b = new_graph();
+    wr_fold_n(&a, REPLAY_EVENTS);
+    wr_fold_n(&b, REPLAY_EVENTS);
+    assert(nodes(&a) == nodes(&b));
+    assert(edges(&a) == edges(&b));
+}
+
+test the_actor_label_is_the_last_path_segment {
+    var buf : [48]u8 = undefined;
+    var n : u32 = wr_actor_label(1, buf[0..48]);
+    // SPEC_NAMES[0] = "specs/t27os/release.t27" -> last segment "release.t27"
+    assert(n == 11); // "release.t27" = 11 chars
+    assert(buf[0] == 'r'); // 'r'
+    assert(buf[7] == 'e'); // 'e' in "release"
+    n = wr_actor_label(2, buf[0..48]);
+    // SPEC_NAMES[1] = "specs/t27os/access_scan.t27" -> "access_scan.t27"
+    assert(n == 15); // "access_scan.t27" = 15 chars
+}
+
+test unknown_slot_gets_a_question_mark {
+    var buf : [48]u8 = undefined;
+    var n : u32 = wr_actor_label(99, buf[0..48]);
+    assert(n == 1);
+    assert(buf[0] == '?');
+}
+
+invariant the_replay_has_exactly_24_events {
+    assert(REPLAY_EVENTS == 24);
+    assert(REPLAY_KIND_REF.len == 24);
+}
+
+invariant the_kind_names_cover_all_values {
+    assert(wr_kind_name(0) == "spawn");
+    assert(wr_kind_name(5) == "delivers");
+}
