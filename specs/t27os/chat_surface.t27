@@ -1,0 +1,544 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/chat_surface.t27 -- the shared chat surface of T27 OS: one set of tokens, one message card
+; model and one transcript layout for every native chat (the Queen's dock today; any other chat later).
+; Owner, 2026-11-04: both chats speak one visual language -- the same message cards, composer, buttons,
+; type size, spacing and status cards -- and the Queen's normal view is a conversation, not a terminal.
+; The terminal grid stays as the backend and as a diagnostics view behind the header's "..." button.
+; What lives here, all pure (integers, floats and byte copies; no host call, no drawing):
+;   the tokens     padding, radius, type size, line height, gaps (CS_*), so two surfaces cannot drift apart;
+;   the cards      a ring of CS_SLOTS messages in a byte region the window owns (tb at TBO_CS): kind (you,
+;                  Queen, status, error), a delivery state, the message number, and up to CS_TEXT_MAX bytes;
+;   the layout     how many columns a card holds, where a line breaks, how tall a card is, which cards fit
+;                  the transcript (newest at the foot), and the "..." button's rectangle.
+; The drawing (rounded cards, text, the button) belongs to glass_window.t27, which owns the drawing
+; primitives; it calls these functions, so the tests below pin the math the screen uses.
+; Honest limits: the width of a glyph is approximated by CS_CHAR_W (conservative, so a line wraps early
+; rather than overflows); "sent" means the pane server took the bytes (queen_chats.t27), not that the Queen
+; program read them; a Queen card exists only when something produced one (a labelled local echo today).
+
+module T27osChatSurface;
+
+use t27os::queen::QP_PAD;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+// ---------------------------------------------------------------- tokens
+
+pub const CS_PAD : f64 = 12.0;
+pub const CS_RADIUS : f64 = 8.0;
+pub const CS_FONT : f64 = 9.5;
+pub const CS_LABEL_FONT : f64 = 8.5;
+pub const CS_LINE_H : f64 = 14.0;
+pub const CS_CARD_PAD : f64 = 8.0;
+pub const CS_LABEL_H : f64 = 12.0;
+pub const CS_GAP : f64 = 8.0;
+pub const CS_INDENT : f64 = 28.0;
+pub const CS_CHAR_W : f64 = 6.0;
+pub const CS_MENU_W : f64 = 20.0;
+
+// ---------------------------------------------------------------- message kinds and states
+
+pub const CK_NONE : u8 = 0;
+pub const CK_USER : u8 = 1;
+pub const CK_QUEEN : u8 = 2;
+pub const CK_STATUS : u8 = 3;
+pub const CK_ERROR : u8 = 4;
+
+/// The delivery state a card carries (0 = nothing to say). SENT: the pane server took every byte. ECHO: the
+/// card was made by the local test echo, never by the Queen.
+pub const CS_ST_NONE : u8 = 0;
+pub const CS_ST_SENT : u8 = 1;
+pub const CS_ST_ECHO : u8 = 2;
+
+// ---------------------------------------------------------------- the card ring
+
+/// The ring in the window's byte region. Header: [0] count, [1] index of the oldest slot, [2..3] the number of
+/// cards ever pushed (low, high byte), the rest reserved. A slot: [0] kind, [1] text length, [2] state, [3] how
+/// many times this card happened (an error repeats instead of stacking), [4..5] the message number, [6..7]
+/// reserved, then the text.
+pub const CS_SLOTS : usize = 12;
+pub const CS_SLOT : usize = 208;
+pub const CS_TEXT_MAX : usize = 200;
+pub const CS_HDR : usize = 8;
+pub const CS_BYTES : usize = CS_HDR + CS_SLOTS * CS_SLOT;
+
+pub fn cs_init(r : []u8) -> void {
+    var i : usize = 0;
+    while (i < CS_HDR) {
+        r[i] = 0;
+        i = i + 1;
+    }
+}
+
+pub fn cs_count(r : []const u8) -> usize { return r[0] as usize; }
+
+pub fn cs_seq(r : []const u8) -> u32 { return (r[2] as u32) + 256 * (r[3] as u32); }
+
+/// The byte offset of the i-th card from the oldest.
+pub fn cs_base(r : []const u8, i : usize) -> usize {
+    return CS_HDR + (((r[1] as usize) + i) % CS_SLOTS) * CS_SLOT;
+}
+
+pub fn cs_kind(r : []const u8, i : usize) -> u8 { return r[cs_base(r, i)]; }
+pub fn cs_len(r : []const u8, i : usize) -> usize { return r[cs_base(r, i) + 1] as usize; }
+pub fn cs_state(r : []const u8, i : usize) -> u8 { return r[cs_base(r, i) + 2]; }
+pub fn cs_rep(r : []const u8, i : usize) -> u8 { return r[cs_base(r, i) + 3]; }
+pub fn cs_id(r : []const u8, i : usize) -> u32 { return (r[cs_base(r, i) + 4] as u32) + 256 * (r[cs_base(r, i) + 5] as u32); }
+pub fn cs_text_off(r : []const u8, i : usize) -> usize { return cs_base(r, i) + 8; }
+
+/// Append a card. When the ring is full the oldest card goes. Text longer than CS_TEXT_MAX is cut there.
+pub fn cs_push(r : []u8, kind : u8, state : u8, id : u32, text : []const u8, n : usize) -> void {
+    const cnt : usize = r[0] as usize;
+    var slot : usize = 0;
+    if (cnt < CS_SLOTS) {
+        slot = ((r[1] as usize) + cnt) % CS_SLOTS;
+        r[0] = (cnt + 1) as u8;
+    } else {
+        slot = r[1] as usize;
+        r[1] = (((r[1] as usize) + 1) % CS_SLOTS) as u8;
+    }
+    const b : usize = CS_HDR + slot * CS_SLOT;
+    var m : usize = n;
+    var dots : usize = 0;
+    if (m > CS_TEXT_MAX) {
+        // a long text ends in "..."; the cut never lands inside a UTF-8 sequence (a continuation byte is 128..191)
+        m = CS_TEXT_MAX - 3;
+        while (m > 0 and text[m] >= 128 and text[m] < 192) { m = m - 1; }
+        dots = 3;
+    }
+    r[b] = kind;
+    r[b + 1] = (m + dots) as u8;
+    r[b + 2] = state;
+    r[b + 3] = 1;
+    r[b + 4] = (id % 256) as u8;
+    r[b + 5] = ((id / 256) % 256) as u8;
+    r[b + 6] = 0;
+    r[b + 7] = 0;
+    var i : usize = 0;
+    while (i < m) {
+        r[b + 8 + i] = text[i];
+        i = i + 1;
+    }
+    var d : usize = 0;
+    while (d < dots) {
+        r[b + 8 + m + d] = 46;
+        d = d + 1;
+    }
+    const sq : u32 = (cs_seq(r) + 1) % 65536;
+    r[2] = (sq % 256) as u8;
+    r[3] = (sq / 256) as u8;
+}
+
+/// An error card that repeats (the same refusal pressed again) bumps the newest card's count instead of
+/// stacking a copy; a different code, or anything between, starts a new card. `code` rides in the state byte.
+pub fn cs_push_error(r : []u8, code : u8, id : u32, text : []const u8, n : usize) -> void {
+    const cnt : usize = r[0] as usize;
+    if (cnt > 0 and cs_kind(r, cnt - 1) == CK_ERROR and cs_state(r, cnt - 1) == code) {
+        const b : usize = cs_base(r, cnt - 1);
+        if (r[b + 3] < 255) { r[b + 3] = r[b + 3] + 1; }
+        r[b + 4] = (id % 256) as u8;
+        r[b + 5] = ((id / 256) % 256) as u8;
+        const sq : u32 = (cs_seq(r) + 1) % 65536;
+        r[2] = (sq % 256) as u8;
+        r[3] = (sq / 256) as u8;
+        return;
+    }
+    cs_push(r, CK_ERROR, code, id, text, n);
+}
+
+/// The card's label line: who spoke, and what became of it. Never colour alone.
+pub fn cs_label(out : []u8, kind : u8, state : u8, rep : u8, id : u32) -> usize {
+    var w : usize = 0;
+    if (kind == CK_USER) {
+        w = put_bytes(out, w, "You");
+        if (state == CS_ST_SENT) { w = put_bytes(out, w, " - sent to the Queen's panel"); }
+        if (state == CS_ST_ECHO) { w = put_bytes(out, w, " - local echo"); }
+        return w;
+    }
+    if (kind == CK_QUEEN) {
+        if (state == CS_ST_ECHO) { return put_bytes(out, 0, "Local echo - not the Queen"); }
+        return put_bytes(out, 0, "Queen");
+    }
+    if (kind == CK_ERROR) {
+        w = put_bytes(out, w, "Error");
+        if (rep > 1) {
+            w = put_bytes(out, w, " x");
+            w = put_dec(out, w, @as(u64, rep));
+        }
+        return w;
+    }
+    return put_bytes(out, 0, "Status");
+}
+
+// ---------------------------------------------------------------- text layout
+
+/// Characters per line in a card of outer width w (at least one).
+pub fn cs_cols(w : f64) -> usize {
+    const inner : f64 = w - 2.0 * CS_CARD_PAD;
+    if (inner < CS_CHAR_W) { return 1; }
+    return (inner / CS_CHAR_W) as usize;
+}
+
+/// The end (exclusive) of the line that starts at `from` inside buf[0 .. end]: a newline ends it; a rest that fits
+/// runs to the end; otherwise the line breaks at the last space inside the width, else hard at the width.
+pub fn cs_line_end(buf : []const u8, from : usize, end : usize, cols : usize) -> usize {
+    var lim : usize = from + cols;
+    if (lim > end) { lim = end; }
+    var i : usize = from;
+    while (i < lim) {
+        if (buf[i] == 10) { return i; }
+        i = i + 1;
+    }
+    if (end - from <= cols) { return end; }
+    var j : usize = lim;
+    while (j > from) {
+        if (buf[j] == 32) { return j; }
+        j = j - 1;
+    }
+    return lim;
+}
+
+/// Where the next line starts: past a space or newline the break stopped on.
+pub fn cs_line_next(buf : []const u8, e : usize, end : usize) -> usize {
+    if (e < end and (buf[e] == 32 or buf[e] == 10)) { return e + 1; }
+    return e;
+}
+
+/// How many lines the text takes (an empty text still takes one; a trailing newline adds none).
+pub fn cs_lines(buf : []const u8, n : usize, cols : usize) -> usize {
+    if (n == 0) { return 1; }
+    var from : usize = 0;
+    var cnt : usize = 0;
+    while (from < n) {
+        const e : usize = cs_line_end(buf, from, n, cols);
+        cnt = cnt + 1;
+        from = cs_line_next(buf, e, n);
+    }
+    return cnt;
+}
+
+// ---------------------------------------------------------------- card geometry
+
+/// Your cards sit to the right, the Queen's to the left, status and error cards use the whole width.
+pub fn cs_card_x(kind : u8, x : f64, w : f64) -> f64 {
+    if (kind == CK_USER) { return x + CS_INDENT; }
+    return x;
+}
+
+pub fn cs_card_w(kind : u8, w : f64) -> f64 {
+    if (kind == CK_USER or kind == CK_QUEEN) { return w - CS_INDENT; }
+    return w;
+}
+
+/// The outer height of a card holding n bytes of text in a card of outer width cw.
+pub fn cs_card_h(buf : []const u8, n : usize, cw : f64) -> f64 {
+    const ln : usize = cs_lines(buf, n, cs_cols(cw));
+    return 2.0 * CS_CARD_PAD + CS_LABEL_H + (ln as f64) * CS_LINE_H;
+}
+
+/// Alphas per kind: [0] fill, [1] border, [2] text, [3] label.
+pub fn cs_style(kind : u8, out : []f64) -> void {
+    out[0] = 0.04;
+    out[1] = 0.18;
+    out[2] = 0.95;
+    out[3] = 0.55;
+    if (kind == CK_USER) {
+        out[0] = 0.10;
+        out[1] = 0.30;
+    }
+    if (kind == CK_STATUS) {
+        out[0] = 0.0;
+        out[1] = 0.14;
+        out[2] = 0.70;
+    }
+    if (kind == CK_ERROR) {
+        out[0] = 0.06;
+        out[1] = 0.85;
+        out[2] = 1.0;
+        out[3] = 0.95;
+    }
+}
+
+pub fn cs_card_height_at(r : []const u8, i : usize, w : f64) -> f64 {
+    const off : usize = cs_text_off(r, i);
+    const n : usize = cs_len(r, i);
+    return cs_card_h(r[off .. off + n], n, cs_card_w(cs_kind(r, i), w));
+}
+
+/// The height of the cards from index `from` to the newest, a gap between each pair.
+pub fn cs_height_from(r : []const u8, from : usize, w : f64) -> f64 {
+    const n : usize = r[0] as usize;
+    var h : f64 = 0.0;
+    var i : usize = from;
+    while (i < n) {
+        h = h + cs_card_height_at(r, i, w);
+        if (i + 1 < n) { h = h + CS_GAP; }
+        i = i + 1;
+    }
+    return h;
+}
+
+/// The oldest card to draw so the newest are whole inside a transcript h high; the newest always shows.
+pub fn cs_first_visible(r : []const u8, w : f64, h : f64) -> usize {
+    const n : usize = r[0] as usize;
+    if (n == 0) { return 0; }
+    var from : usize = n - 1;
+    var used : f64 = cs_card_height_at(r, n - 1, w);
+    while (from > 0) {
+        const hh : f64 = cs_card_height_at(r, from - 1, w);
+        if (used + CS_GAP + hh > h) { return from; }
+        used = used + CS_GAP + hh;
+        from = from - 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- the header's "..." button
+
+/// The "..." button: left of the close x (centred at sw - QP_PAD - 8, top + 20), on the same baseline.
+pub fn cs_menu_rect(sw : f64, top : f64, out : []f64) -> bool {
+    out[0] = sw - QP_PAD - 8.0 - 26.0 - 0.5 * CS_MENU_W;
+    out[1] = top + 20.0 - 0.5 * CS_MENU_W;
+    out[2] = CS_MENU_W;
+    out[3] = CS_MENU_W;
+    return out[0] > 0.0;
+}
+
+pub fn on_cs_menu(x : f64, y : f64, sw : f64, top : f64) -> bool {
+    var r : [4]f64 = undefined;
+    if (cs_menu_rect(sw, top, r[0..4]) == false) { return false; }
+    return x >= r[0] and x < r[0] + r[2] and y >= r[1] and y < r[1] + r[3];
+}
+
+// ---------------------------------------------------------------- tests
+
+test the_ring_is_sized_by_its_own_slots {
+    assert CS_BYTES == CS_HDR + CS_SLOTS * CS_SLOT;
+    assert CS_SLOT >= 8 + CS_TEXT_MAX;
+    assert CS_TEXT_MAX <= 255 and CS_SLOTS <= 255;
+}
+
+test a_pushed_card_reads_back_whole {
+    var r : [CS_BYTES]u8 = undefined;
+    cs_init(r[0..CS_BYTES]);
+    assert cs_count(r[0..CS_BYTES]) == 0;
+    cs_push(r[0..CS_BYTES], CK_USER, CS_ST_SENT, 7, "hello queen", 11);
+    assert cs_count(r[0..CS_BYTES]) == 1;
+    assert cs_kind(r[0..CS_BYTES], 0) == CK_USER;
+    assert cs_len(r[0..CS_BYTES], 0) == 11;
+    assert cs_state(r[0..CS_BYTES], 0) == CS_ST_SENT;
+    assert cs_id(r[0..CS_BYTES], 0) == 7;
+    assert cs_rep(r[0..CS_BYTES], 0) == 1;
+    const o : usize = cs_text_off(r[0..CS_BYTES], 0);
+    assert r[o] == 104 and r[o + 10] == 110;
+    assert cs_seq(r[0..CS_BYTES]) == 1;
+}
+
+test the_ring_drops_the_oldest_and_keeps_order {
+    var r : [CS_BYTES]u8 = undefined;
+    cs_init(r[0..CS_BYTES]);
+    var k : u32 = 1;
+    while (k <= 15) {
+        cs_push(r[0..CS_BYTES], CK_USER, CS_ST_SENT, k, "x", 1);
+        k = k + 1;
+    }
+    assert cs_count(r[0..CS_BYTES]) == CS_SLOTS;
+    assert cs_id(r[0..CS_BYTES], 0) == 4;
+    assert cs_id(r[0..CS_BYTES], CS_SLOTS - 1) == 15;
+    assert cs_seq(r[0..CS_BYTES]) == 15;
+    var i : usize = 1;
+    while (i < CS_SLOTS) {
+        assert cs_id(r[0..CS_BYTES], i) == cs_id(r[0..CS_BYTES], i - 1) + 1;
+        i = i + 1;
+    }
+}
+
+test a_long_text_is_cut_at_the_slot {
+    var r : [CS_BYTES]u8 = undefined;
+    var big : [300]u8 = undefined;
+    var i : usize = 0;
+    while (i < 300) {
+        big[i] = 97;
+        i = i + 1;
+    }
+    cs_init(r[0..CS_BYTES]);
+    cs_push(r[0..CS_BYTES], CK_QUEEN, CS_ST_NONE, 1, big[0..300], 300);
+    assert cs_len(r[0..CS_BYTES], 0) == CS_TEXT_MAX;
+    // the cut text ends in three dots
+    const t : usize = CS_HDR + 8;
+    assert r[t + 196] == 97 and r[t + 197] == 46 and r[t + 198] == 46 and r[t + 199] == 46;
+    // the neighbouring slot is untouched by the copy
+    cs_push(r[0..CS_BYTES], CK_STATUS, CS_ST_NONE, 2, "ok", 2);
+    assert cs_kind(r[0..CS_BYTES], 0) == CK_QUEEN and cs_len(r[0..CS_BYTES], 1) == 2;
+}
+
+test a_cut_never_lands_inside_a_utf8_sequence {
+    var r : [CS_BYTES]u8 = undefined;
+    var big : [300]u8 = undefined;
+    var i : usize = 0;
+    while (i < 300) {
+        big[i] = 97;
+        i = i + 1;
+    }
+    // two-byte letters (0xD0 0xB0) from byte 196 on: the cut at 197 would split the pair at 196/197
+    big[196] = 208;
+    big[197] = 176;
+    cs_init(r[0..CS_BYTES]);
+    cs_push(r[0..CS_BYTES], CK_USER, CS_ST_NONE, 1, big[0..300], 300);
+    const t : usize = CS_HDR + 8;
+    // the pair is dropped whole: the text stops before the lead byte at 196 and the dots follow it
+    assert cs_len(r[0..CS_BYTES], 0) == 199;
+    assert r[t + 195] == 97 and r[t + 196] == 46;
+    assert r[t + 197] == 46 and r[t + 198] == 46;
+}
+
+test a_repeated_error_counts_up_instead_of_stacking {
+    var r : [CS_BYTES]u8 = undefined;
+    cs_init(r[0..CS_BYTES]);
+    cs_push_error(r[0..CS_BYTES], 2, 1, "Queen panel unavailable", 23);
+    cs_push_error(r[0..CS_BYTES], 2, 1, "Queen panel unavailable", 23);
+    cs_push_error(r[0..CS_BYTES], 2, 1, "Queen panel unavailable", 23);
+    assert cs_count(r[0..CS_BYTES]) == 1;
+    assert cs_rep(r[0..CS_BYTES], 0) == 3;
+    // another cause is another card
+    cs_push_error(r[0..CS_BYTES], 1, 1, "No connection", 13);
+    assert cs_count(r[0..CS_BYTES]) == 2;
+    // a message in between ends the run: the same error afterwards is a new card
+    cs_push(r[0..CS_BYTES], CK_USER, CS_ST_SENT, 2, "again", 5);
+    cs_push_error(r[0..CS_BYTES], 1, 3, "No connection", 13);
+    assert cs_count(r[0..CS_BYTES]) == 4;
+    assert cs_rep(r[0..CS_BYTES], 3) == 1;
+}
+
+test the_label_says_who_and_what_became_of_it {
+    var b : [64]u8 = undefined;
+    // "You" (3) + " - sent to the Queen's panel" (28)
+    assert cs_label(b[0..64], CK_USER, CS_ST_SENT, 1, 1) == 31;
+    assert b[0] == 89 and b[6] == 115 and b[30] == 108;
+    assert cs_label(b[0..64], CK_USER, CS_ST_ECHO, 1, 1) == 16;
+    assert cs_label(b[0..64], CK_USER, CS_ST_NONE, 1, 1) == 3;
+    assert cs_label(b[0..64], CK_QUEEN, CS_ST_NONE, 1, 1) == 5;
+    assert cs_label(b[0..64], CK_QUEEN, CS_ST_ECHO, 1, 1) == 26;
+    assert cs_label(b[0..64], CK_STATUS, CS_ST_NONE, 1, 1) == 6;
+    assert cs_label(b[0..64], CK_ERROR, CS_ST_NONE, 1, 1) == 5;
+    assert cs_label(b[0..64], CK_ERROR, CS_ST_NONE, 3, 1) == 8;
+    assert b[5] == 32 and b[6] == 120 and b[7] == 51;
+}
+
+test the_text_wraps_at_spaces_and_hard_cuts_a_long_word {
+    // an empty text takes one line; a short one fits
+    assert cs_lines("", 0, 10) == 1;
+    assert cs_lines("hello", 5, 10) == 1;
+    // two words that do not fit one line
+    assert cs_lines("aaaa bbbb cccc", 14, 9) == 2;
+    assert cs_line_end("aaaa bbbb cccc", 0, 14, 9) == 9;
+    assert cs_line_next("aaaa bbbb cccc", 9, 14) == 10;
+    // a word longer than the line is cut at the width
+    assert cs_lines("abcdefghijklmnopqrstuvwxyz", 26, 10) == 3;
+    assert cs_line_end("abcdefghijklmnopqrstuvwxyz", 0, 26, 10) == 10;
+    // newlines break, a blank line counts, a trailing newline adds nothing
+    assert cs_lines("a\nb", 3, 10) == 2;
+    assert cs_lines("a\n\nb", 4, 10) == 3;
+    assert cs_lines("a\n", 2, 10) == 1;
+}
+
+test every_line_advances_so_wrapping_always_ends {
+    var t : [64]u8 = undefined;
+    var i : usize = 0;
+    while (i < 64) {
+        t[i] = 97 + (i % 7) as u8;
+        if (i % 9 == 4) { t[i] = 32; }
+        if (i % 23 == 11) { t[i] = 10; }
+        i = i + 1;
+    }
+    var cols : usize = 1;
+    while (cols <= 12) {
+        var from : usize = 0;
+        var guard : usize = 0;
+        while (from < 64) {
+            const e : usize = cs_line_end(t[0..64], from, 64, cols);
+            assert e >= from and e <= 64;
+            assert e - from <= cols;
+            const nx : usize = cs_line_next(t[0..64], e, 64);
+            assert nx > from;
+            from = nx;
+            guard = guard + 1;
+            assert guard <= 64;
+        }
+        cols = cols + 1;
+    }
+}
+
+test the_cards_stay_inside_the_transcript {
+    const x : f64 = 1000.0;
+    const w : f64 = 360.0;
+    var k : u8 = CK_USER;
+    while (k <= CK_ERROR) {
+        assert cs_card_x(k, x, w) >= x;
+        assert cs_card_x(k, x, w) + cs_card_w(k, w) <= x + w;
+        assert cs_card_w(k, w) > 2.0 * CS_CARD_PAD;
+        k = k + 1;
+    }
+    // your card is to the right, hers to the left
+    assert cs_card_x(CK_USER, x, w) > cs_card_x(CK_QUEEN, x, w);
+    assert cs_cols(w) >= 40;
+    assert cs_cols(1.0) == 1;
+}
+
+test a_card_is_as_tall_as_its_lines {
+    // one line: the pads, the label and one line
+    assert cs_card_h("hi", 2, 300.0) == 2.0 * CS_CARD_PAD + CS_LABEL_H + CS_LINE_H;
+    // 100 letters at 40 columns take three lines
+    var t : [100]u8 = undefined;
+    var i : usize = 0;
+    while (i < 100) {
+        t[i] = 98;
+        i = i + 1;
+    }
+    const cw : f64 = 2.0 * CS_CARD_PAD + 40.0 * CS_CHAR_W;
+    assert cs_cols(cw) == 40;
+    assert cs_card_h(t[0..100], 100, cw) == 2.0 * CS_CARD_PAD + CS_LABEL_H + 3.0 * CS_LINE_H;
+}
+
+test the_newest_cards_are_the_ones_that_show {
+    var r : [CS_BYTES]u8 = undefined;
+    cs_init(r[0..CS_BYTES]);
+    assert cs_first_visible(r[0..CS_BYTES], 300.0, 100.0) == 0;
+    var k : u32 = 1;
+    while (k <= 5) {
+        cs_push(r[0..CS_BYTES], CK_STATUS, CS_ST_NONE, k, "one line", 8);
+        k = k + 1;
+    }
+    const one : f64 = 2.0 * CS_CARD_PAD + CS_LABEL_H + CS_LINE_H;
+    assert cs_card_height_at(r[0..CS_BYTES], 0, 300.0) == one;
+    assert cs_height_from(r[0..CS_BYTES], 0, 300.0) == 5.0 * one + 4.0 * CS_GAP;
+    assert cs_height_from(r[0..CS_BYTES], 4, 300.0) == one;
+    // room for two cards and a gap: the visible ones are the last two
+    assert cs_first_visible(r[0..CS_BYTES], 300.0, 2.0 * one + CS_GAP) == 3;
+    // not even one fits: the newest still shows
+    assert cs_first_visible(r[0..CS_BYTES], 300.0, 10.0) == 4;
+    // room for all
+    assert cs_first_visible(r[0..CS_BYTES], 300.0, 1000.0) == 0;
+}
+
+test the_menu_button_sits_left_of_the_close_x {
+    const sw : f64 = 1400.0;
+    var m : [4]f64 = undefined;
+    assert cs_menu_rect(sw, 34.0, m[0..4]);
+    const closex : f64 = sw - QP_PAD - 8.0;
+    assert m[0] + m[2] < closex - 8.0;
+    assert on_cs_menu(m[0] + 0.5 * m[2], m[1] + 0.5 * m[3], sw, 34.0);
+    assert on_cs_menu(closex, 54.0, sw, 34.0) == false;
+    assert on_cs_menu(m[0] - 2.0, m[1] + 5.0, sw, 34.0) == false;
+}
+
+test the_styles_make_an_error_louder_than_a_status {
+    var a : [4]f64 = undefined;
+    var b : [4]f64 = undefined;
+    cs_style(CK_ERROR, a[0..4]);
+    cs_style(CK_STATUS, b[0..4]);
+    assert a[1] > b[1] and a[3] > b[3];
+    cs_style(CK_USER, a[0..4]);
+    cs_style(CK_QUEEN, b[0..4]);
+    assert a[0] > b[0];
+}
