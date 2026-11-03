@@ -207,7 +207,7 @@ fn compile_front(input: &str, o: &Opts) -> Result<(Program, Phases), u8> {
     };
     let parsed = ph.time("parse", || front::parse(&path, &src));
     let parsed = match parsed {
-        Ok(p) => p,
+        Ok(p) => { p.notes.iter().for_each(|n| errln!("t27b: note: {}", n)); p }
         Err(e) => {
             errln!("t27b: parse error in {}: {}", input, e);
             return Err(EXIT_FRONTEND);
