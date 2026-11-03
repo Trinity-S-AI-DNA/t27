@@ -272,13 +272,6 @@ def baseline():
 # fixed, not the tree changing.
 # Every kind `scan` can attach, and what to do about it.
 #
-# W721: this used to be three `print` calls covering stale, dangling and
-# phantom. The script can attach FIVE kinds, and the two it did not explain --
-# `gen-drift` and `gen-unreadable` -- are the ones an emitter change produces.
-# Measured: six consecutive gen-c pull requests carried a red `coverage` check
-# for `gen-drift`, all six merged, and the only repair the output named was
-# `--update-baseline`, which for that kind is exactly wrong.
-#
 # `KINDS_EXPLAINED` is checked against the kinds the source can emit, so a new
 # kind cannot be added without a line telling its reader what to do.
 LEGEND = {
@@ -632,9 +625,7 @@ def _check_legend():
     import re
 
     src = pathlib.Path(__file__).read_text()
-    # #13150 moved the gen-drift attach from `bad.append` to `NOTED.append`
-    # (#13117: host-dependent codegen makes the kind a note, not a failure).
-    # The legend line is still owed to the reader, so both append sites count.
+    # both append sites: #13150 notes gen-drift instead of failing it (#13117).
     attached = set(re.findall(r'bad\.append\(\s*\(\s*name\s*,\s*"([a-z-]+)"', src))
     attached |= set(re.findall(r'NOTED\.append\(\s*\(\s*name\s*,\s*"([a-z-]+)"', src))
     attached |= set(re.findall(r'bad\.append\(\s*\(\s*name\s*,\s*"([a-z-]+)" if ', src))
