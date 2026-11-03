@@ -32,6 +32,10 @@ pub(crate) mod narrow_law;
 #[path = "../../../gen/rust/tri/t27b/home_plan.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod home_plan;
+// t27b-generated frame-layout source of truth: specs/tri/t27b/frame_layout.t27.
+#[path = "../../../gen/rust/tri/t27b/frame_layout.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod frame_layout;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -62,24 +66,20 @@ pub struct CodegenError {
     pub construct: &'static str,
     pub detail: String,
 }
-const X0: Reg = 0;
-const X8: Reg = 8;
-const X16: Reg = 16;
-const X17: Reg = 17;
-const TEMP_REGS: usize = 7; // x9..x15
-const CALLEE_SAVED: [Reg; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
-const MAX_SLOT_BYTES: u32 = 32760;
+// Register classes and frame constants: specs/tri/t27b/frame_layout.t27 (mounted below), tested there (L4).
+const X0: Reg = frame_layout::X0 as Reg;
+const X8: Reg = frame_layout::SCRATCH as Reg;
+const X16: Reg = frame_layout::SPILL_A as Reg;
+const X17: Reg = frame_layout::SPILL_B as Reg;
+const TEMP_REGS: usize = frame_layout::TEMP_COUNT as usize; // x9..x15
+const MAX_SLOT_BYTES: u32 = frame_layout::MAX_SLOT_BYTES;
 /// Largest aggregate area of one frame: each slot is then at most two SUB words below x29 (a64::sub_const).
 pub const MAX_AGG_BYTES: u32 = (a64::SUB_CONST_REACH - 16) as u32;
-/// Largest frame the prologue allocates in one step. It is kept below the
-/// stack guard size, so such a frame never reaches past the guard page
-/// without touching it. A larger frame is allocated in `PROBE_STEP` steps,
-/// each one stored to before the next (#7367).
-const MAX_UNPROBED_FRAME: usize = 16384;
+/// Largest frame allocated in one step; the probe law lives in frame_layout.t27 (#7367).
+const MAX_UNPROBED_FRAME: usize = frame_layout::MAX_UNPROBED_FRAME as usize;
 /// One step of a probed frame: the smallest page size t27b runs on.
-const PROBE_STEP: usize = 4096;
-const LR: Reg = 30;
-const FP: Reg = 29;
+const PROBE_STEP: usize = frame_layout::PROBE_STEP as usize;
+const LR: Reg = frame_layout::LR as Reg; const FP: Reg = frame_layout::FP as Reg; // x29/x30
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Home {
     None,
@@ -375,27 +375,27 @@ impl<'a> Gen<'a> {
             }
             let home = home_plan::next_home(
                 !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64),
-                home_plan::callee_pool_has(CALLEE_SAVED.len() as u64, taken_callee as u64),
+                home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64),
                 slots as u64,
             );
             match home >> 32 {
                 home_plan::HOME_CALLER => { self.homes[v] = Home::Reg((nint + taken_caller) as Reg); taken_caller += 1; }
-                home_plan::HOME_CALLEE => { let r = CALLEE_SAVED[taken_callee]; taken_callee += 1; self.used_callee.push(r); self.homes[v] = Home::Reg(r); }
+                home_plan::HOME_CALLEE => { let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.homes[v] = Home::Reg(r); }
                 _ => { self.homes[v] = Home::Slot(8 * (home & 0xFFFFFFFF) as u32); slots += 1; }
             }
         }
         self.nvar_slots = slots;
-        if 8 * slots > MAX_SLOT_BYTES {
+        if !frame_layout::slot_ok(8 * slots) {
             self.fail(format!("more than {} variables spill to the frame", MAX_SLOT_BYTES / 8));
         }
-        self.temp_base = 8 * (slots + self.used_callee.len() as u32);
+        self.temp_base = frame_layout::temp_base_of(slots, self.used_callee.len() as u32);
     }
     fn slot_of_temp(&mut self, i: usize) -> u32 {
         if i + 1 > self.max_slot {
             self.max_slot = i + 1;
         }
-        let off = self.temp_base + 8 * i as u32;
-        if off > MAX_SLOT_BYTES {
+        let off = frame_layout::slot_of_temp(self.temp_base, i as u32);
+        if !frame_layout::slot_ok(off) {
             self.fail(format!("frame larger than {} bytes", MAX_SLOT_BYTES));
             return 0;
         }
@@ -410,13 +410,16 @@ impl<'a> Gen<'a> {
     /// Assemble prologue + body + epilogue + stubs, and resolve local branches.
     fn finish(&mut self, id: FuncId) -> FuncCode {
         let f = self.f;
-        let frame = self.has_call
-            || !self.used_callee.is_empty()
-            || self.nvar_slots > 0
-            || self.max_slot > 0
-            || self.agg_bytes > 0
-            || self.uses_lr
-            || self.stack_params;
+        // frame_layout.t27: a frame iff one of its facts holds; else `b ret` becomes `ret`.
+        let frame = frame_layout::needs_frame(frame_layout::FrameFacts {
+            has_call: self.has_call,
+            saves_callee: !self.used_callee.is_empty(),
+            has_var_slots: self.nvar_slots > 0,
+            has_temp_slots: self.max_slot > 0,
+            has_agg: self.agg_bytes > 0,
+            uses_lr: self.uses_lr,
+            has_stack_params: self.stack_params,
+        });
         // Drop a trailing `b ret` that would jump to the very next word.
         if let Some(&last) = self.ret_jumps.last() {
             if last + 1 == self.code.len() {
@@ -434,8 +437,8 @@ impl<'a> Gen<'a> {
         // Epilogue.
         self.bind(self.ret_label);
         let ncallee = self.used_callee.len();
-        let nbytes = 8 * (self.nvar_slots as usize + ncallee + self.max_slot);
-        let frame_bytes = ((nbytes + 15) & !15) + self.agg_bytes as usize;
+        let sizes = frame_layout::frame_bytes_of(self.nvar_slots, ncallee as u32, self.max_slot as u32, self.agg_bytes);
+        let frame_bytes = sizes.frame_bytes as usize;
         if frame {
             let (base, mut k) = (8 * self.nvar_slots, 0); // the callee-saved registers back: a64.t27's `save_word`
             while k < ncallee { let u = &self.used_callee; let w = a64::save_word(true, ncallee, base, k, u[k], u[(k + 1) % ncallee]); self.emit(w); k = a64::save_next(ncallee, base, k); }
@@ -502,17 +505,9 @@ impl<'a> Gen<'a> {
             pro.push(a64::stp_x_pre(29, 30, SP, -16));
             pro.push(a64::mov_sp(29, SP));
             if frame_bytes > MAX_UNPROBED_FRAME {
-                // Stack probing: lower sp one page at a time and touch each
-                // new page, top down, so the guard page below the stack
-                // faults instead of being stepped over (#7367).
-                //   mov  x16, #pages*4096
-                // 1: sub  sp, sp, #1, lsl #12
-                //   str  xzr, [sp]
-                //   subs x16, x16, #1, lsl #12
-                //   b.ne 1b
-                //   sub  sp, sp, #rest ; str xzr, [sp]
-                let whole = frame_bytes / PROBE_STEP * PROBE_STEP;
-                let rest = frame_bytes - whole;
+                // Stack probing, frame_layout.t27 (#7367): touch each new page top down.
+                let whole = frame_layout::probe_pages(frame_bytes as u32) as usize * PROBE_STEP;
+                let rest = frame_layout::probe_rest(frame_bytes as u32) as usize;
                 a64::mov_imm(true, X16, whole as u64, &mut pro);
                 pro.push(a64::addsub_imm(true, true, false, SP, SP, (PROBE_STEP >> 12) as u32, true));
                 pro.push(a64::str_x(ZR, SP, 0));
