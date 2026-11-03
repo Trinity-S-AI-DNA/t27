@@ -296,6 +296,11 @@ LEGEND = {
         "           gen_hashes name a file nobody can fetch, so there is nothing in",
         "           the record to check. Find the spec or drop the seal.",
     ],
+    "gen-extern": [
+        "\n  gen-extern the spec carries @extern: its gen hashes are verified by",
+        "           t27b on the host, not compared here. Nothing to re-seal --",
+        "           build the host binary and run its tests instead.",
+    ],
     "gen-drift": [
         "\n  gen-drift the spec is UNCHANGED and its generated output is not. This is",
         "           what an emitter fix looks like from here, and it is normal --",
@@ -627,7 +632,11 @@ def _check_legend():
     import re
 
     src = pathlib.Path(__file__).read_text()
+    # #13150 moved the gen-drift attach from `bad.append` to `NOTED.append`
+    # (#13117: host-dependent codegen makes the kind a note, not a failure).
+    # The legend line is still owed to the reader, so both append sites count.
     attached = set(re.findall(r'bad\.append\(\s*\(\s*name\s*,\s*"([a-z-]+)"', src))
+    attached |= set(re.findall(r'NOTED\.append\(\s*\(\s*name\s*,\s*"([a-z-]+)"', src))
     attached |= set(re.findall(r'bad\.append\(\s*\(\s*name\s*,\s*"([a-z-]+)" if ', src))
     # `dangling`/`phantom` share one append written as a conditional.
     attached |= {"dangling", "phantom"}
