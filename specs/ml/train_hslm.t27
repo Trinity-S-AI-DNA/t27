@@ -41,7 +41,14 @@
 ;   /tmp/hslm/ckpt_<step>.state     the full resumable state, since MSLH holds no attention matrices,
 ;                                   embedding, gains or output bias: a 64-byte header ("T27S", version
 ;                                   1, step, nparam, rng u64, beta1^t f64, beta2^t f64, loss f64,
-;                                   nseg) then the parameters, LAMB m and LAMB v, f64 each.
+;                                   nseg, then the FNV-style digest of the payload at byte 52) then
+;                                   the parameters, LAMB m and LAMB v, f64 each. The digest covers
+;                                   every payload f64 in file order; tr_load_state recomputes it
+;                                   over what it decoded and refuses a mismatched checkpoint with
+;                                   RC_RESUME, so one flipped byte in the payload is refused
+;                                   instead of resuming into corrupted weights (2026-11-03,
+;                                   resume-equivalence slice; the 12 trailing header bytes were
+;                                   written zero and never validated before).
 ; Both files are read back after they are written and compared with what was meant to be on disk;
 ; any difference makes main() fail (assert, a nonzero exit). resume=<step> in train.cfg restarts
 ; from ckpt_<step>.state and continues bit-identically (same windows, same updates).
@@ -260,6 +267,10 @@ var io_hdr_back : [STATE_HEADER]u8 = undefined;
 var ck_buf : [MSLH_BYTES]u8 = undefined;
 var ck_back : [MSLH_BYTES]u8 = undefined;
 var path_buf : [96]u8 = undefined;
+// Tests only: checkpoints go straight into /tmp (which exists in every sandbox) because a bare
+// sandbox has no /tmp/hslm and host_open cannot create directories (open has no mkdir). A fresh
+// process never sets it; production keeps /tmp/hslm/ckpt_<step>.state.
+var ckpt_dir_tmp : bool = false;
 var up_buf : [64]u8 = undefined;
 var cfg_buf : [4096]u8 = undefined;
 var ln_buf : [512]u8 = undefined;
@@ -268,6 +279,9 @@ var clip_buf : [1000]f64 = undefined;
 var clip_ref : [1000]f64 = undefined;
 var st_save : [131072]f64 = undefined;
 var tiny_before : f64 = 0.0;
+// Test plumbing, the tiny_before idiom: tr_resume_restart_load leaves the tr_load_state return
+// code here so the resume test can assert it in a clause of its own
+var resume_load_rc : i32 = 0;
 
 var cfg_steps : u64 = DEFAULT_STEPS;
 var cfg_total : u64 = DEFAULT_STEPS;
@@ -2564,10 +2578,16 @@ fn tr_load_data() -> i32 {
 ; 6. Checkpoints: MSLH (nn/hslm_data) and the resumable state, each read back and compared
 ; ---------------------------------------------------------------------------------------------
 
-/// /tmp/hslm/ckpt_<step>.bin (kind 0) or .state (kind 1), NUL-terminated, in path_buf
+/// /tmp/hslm/ckpt_<step>.bin (kind 0) or .state (kind 1), NUL-terminated, in path_buf.
+/// ckpt_dir_tmp (tests only) drops the hslm part: /tmp/ckpt_<step>.state, a directory that
+/// exists in every sandbox, since host_open cannot create /tmp/hslm.
 fn tr_path(step: u64, kind: u8) -> void {
     ln_reset();
-    ln_str("/tmp/hslm/ckpt_");
+    if (ckpt_dir_tmp) {
+        ln_str("/tmp/ckpt_");
+    } else {
+        ln_str("/tmp/hslm/ckpt_");
+    }
     ln_u64(step);
     if (kind == 0) {
         ln_str(".bin");
@@ -2749,7 +2769,29 @@ fn tr_state_decode(first: usize, count: usize, buf: []const u8) -> void {
     }
 }
 
-fn tr_state_header(buf: []u8, step: u64) -> void {
+/// Fold n elements of the state stream starting at e into the running digest h (FNV-style, one
+/// small lane per f64; the multiply never overflows because the running hash stays under 2^32).
+/// The loader folds chunk by chunk with this fn as it decodes; tr_state_digest_all folds the
+/// whole payload with it; tests run it against buffers without a file
+fn tr_state_digest_chunk(h: u64, e: usize, n: usize) -> u64 {
+    var out : u64 = h;
+    var k : usize = 0;
+    while (k < n) {
+        out = (out * 31 + (@as(u64, @bitCast(tr_state_get(e + k))) % 4294967291)) % 4294967291;
+        k = k + 1;
+    }
+    return out;
+}
+
+/// The digest of the whole resumable payload in file order: every parameter, LAMB m and LAMB v
+/// bit. The writer stores it in the header at byte 52; the loader recomputes it over what it
+/// decoded and refuses a mismatch
+fn tr_state_digest_all() -> u64 {
+    const total : usize = 3 * NPARAM;
+    return tr_state_digest_chunk(1469598103, 0, total);
+}
+
+fn tr_state_header(buf: []u8, step: u64, dig: u64) -> void {
     var z : usize = 0;
     while (z < STATE_HEADER) {
         buf[z] = 0;
@@ -2764,6 +2806,7 @@ fn tr_state_header(buf: []u8, step: u64) -> void {
     tr_put_f64(buf, 32, beta2_pow);
     tr_put_f64(buf, 40, last_loss);
     write_u32_le(buf, 48, @intCast(NSEG));
+    tr_put_u64(buf, 52, dig);
 }
 
 /// Write ckpt_<step>.state, then read it back and compare it chunk by chunk with the encoding
@@ -2773,7 +2816,7 @@ fn tr_write_state(step: u64) -> i32 {
     if (fd < 0) {
         return RC_STATE_WRITE;
     }
-    tr_state_header(&io_hdr, step);
+    tr_state_header(&io_hdr, step, tr_state_digest_all());
     var rc : i32 = tr_write_all(fd, &io_hdr);
     const total : usize = 3 * NPARAM;
     const per : usize = IO_CHUNK / 8;
@@ -2822,7 +2865,10 @@ fn tr_write_state(step: u64) -> i32 {
     return RC_OK;
 }
 
-/// Restart from ckpt_<step>.state: parameters, moments, beta powers, PRNG, last loss
+/// Restart from ckpt_<step>.state: parameters, moments, beta powers, PRNG, last loss. The header
+/// fields are validated first, then the payload decodes chunk by chunk while its digest folds;
+/// a wrong field, a short read or a digest mismatch (one flipped payload byte) all refuse with
+/// RC_RESUME and nothing is restored
 fn tr_load_state(step: u64) -> i32 {
     tr_path(step, 1);
     const rd : i32 = tr_open_path(0);
@@ -2836,6 +2882,7 @@ fn tr_load_state(step: u64) -> i32 {
     }
     const total : usize = 3 * NPARAM;
     const per : usize = IO_CHUNK / 8;
+    var dig : u64 = 1469598103;
     var e : usize = 0;
     while (ok and e < total) {
         var n : usize = total - e;
@@ -2847,8 +2894,12 @@ fn tr_load_state(step: u64) -> i32 {
             ok = false;
         } else {
             tr_state_decode(e, n, &io_back);
+            dig = tr_state_digest_chunk(dig, e, n);
         }
         e = e + n;
+    }
+    if (ok and dig != tr_get_u64(&io_hdr_back, 52)) {
+        ok = false;
     }
     tr_note(host_close(rd));
     if (!ok) {
@@ -2859,6 +2910,44 @@ fn tr_load_state(step: u64) -> i32 {
     beta2_pow = tr_get_f64(&io_hdr_back, 32);
     last_loss = tr_get_f64(&io_hdr_back, 40);
     tr_scatter_all();
+    return RC_OK;
+}
+
+/// Write ckpt_<step>.state the way the writer itself produces it, with two controlled defects a
+/// real corrupted file can have: `version` lands in the header's version field, and the first
+/// byte of payload element `flip_e` is xored with 0xFF when flip_e is inside the payload. The
+/// header otherwise stays valid and carries the digest of the TRUE payload, exactly what a
+/// checkpoint looks like after one flipped byte on disk. The IO layer has no seek, so a byte is
+/// mutated in the buffer on its way out rather than patched in the file afterwards
+fn tr_state_write_broken(step: u64, version: u32, flip_e: usize) -> i32 {
+    tr_path(step, 1);
+    const fd : i32 = tr_open_path(1);
+    if (fd < 0) {
+        return RC_STATE_WRITE;
+    }
+    tr_state_header(&io_hdr, step, tr_state_digest_all());
+    write_u32_le(&io_hdr, 4, version);
+    var rc : i32 = tr_write_all(fd, &io_hdr);
+    const total : usize = 3 * NPARAM;
+    const per : usize = IO_CHUNK / 8;
+    var e : usize = 0;
+    while (rc == 0 and e < total) {
+        var n : usize = total - e;
+        if (n > per) {
+            n = per;
+        }
+        tr_state_encode(e, n, &io_chunk);
+        if (flip_e >= e and flip_e < e + n) {
+            const b : usize = 8 * (flip_e - e);
+            io_chunk[b] = io_chunk[b] ^ 255;
+        }
+        rc = tr_write_all(fd, io_chunk[0..8 * n]);
+        e = e + n;
+    }
+    const c : i32 = host_close(fd);
+    if (rc != 0 or c != 0) {
+        return RC_STATE_WRITE;
+    }
     return RC_OK;
 }
 
@@ -3186,6 +3275,110 @@ fn tr_threads_started() -> u64 {
 /// After tr_prof_digest_on: the marks charged to `part` (2 windows x 27 positions)
 fn tr_prof_marks(part: usize) -> u64 {
     return prof_calls[part];
+}
+
+// ---------------------------------------------------------------------------------------------
+// RESUME EQUIVALENCE (2026-11-03, resume-equivalence slice). A checkpoint written after one step
+// of the tiny fixed slice and loaded by a state reset to what a fresh process sees must continue
+// the control run TO THE BIT. Bounded to bit-identity, stated before any result: the same backend
+// (speed_level 2), CPU execution (cfg_threads = 1, one thread, no GPU anywhere in this spec),
+// deterministic execution (fixed window starts, fixed learning rate 0.01, every scratch written
+// before it is read, the gate counters write-only), and the same seed (tr_tiny_setup(7) both
+// sides). A genuine nondeterminism would stop the equality assertion, not move it to a tolerance.
+// ---------------------------------------------------------------------------------------------
+
+/// The tiny slice the way a fresh process builds it before tr_load_state (tr_main: data, then
+/// tr_init(cfg_seed)), two fixed windows, one thread, checkpoints redirected into /tmp
+fn tr_resume_init() -> void {
+    speed_level = 2;
+    cfg_threads = 1;
+    ckpt_dir_tmp = true;
+    tr_tiny_setup(7);
+    fixed_starts[0] = 300;
+    fixed_starts[1] = 1700;
+}
+
+/// The digest of the whole resumable state: every parameter, LAMB m and LAMB v bit, then the
+/// header scalars the checkpoint carries (window PRNG, both beta powers, last loss). The payload
+/// folds interleaved p m v per element on purpose: a different order than the file's digest, so
+/// the two cannot be confused
+fn tr_resume_digest() -> u64 {
+    var h : u64 = 1469598103;
+    var i : usize = 0;
+    while (i < NPARAM) {
+        h = (h * 31 + (@as(u64, @bitCast(p_val[i])) % 4294967291)) % 4294967291;
+        h = (h * 31 + (@as(u64, @bitCast(m_val[i])) % 4294967291)) % 4294967291;
+        h = (h * 31 + (@as(u64, @bitCast(v_val[i])) % 4294967291)) % 4294967291;
+        i = i + 1;
+    }
+    h = (h * 31 + (rng_state % 4294967291)) % 4294967291;
+    h = (h * 31 + (@as(u64, @bitCast(beta1_pow)) % 4294967291)) % 4294967291;
+    h = (h * 31 + (@as(u64, @bitCast(beta2_pow)) % 4294967291)) % 4294967291;
+    h = (h * 31 + (@as(u64, @bitCast(last_loss)) % 4294967291)) % 4294967291;
+    return h;
+}
+
+/// `count` LAMB steps of the two fixed windows at lr 0.01 on a fresh tiny slice, then the full
+/// state digest (0 when a step went NaN, the tr_prof_step_digest guard)
+fn tr_resume_steps_digest(count: u64) -> u64 {
+    tr_resume_init();
+    var t : u64 = 0;
+    while (t < count) {
+        const seen : f64 = tr_train_step(t, 2, 0.01, true);
+        if (seen != seen) {
+            return 0;
+        }
+        t = t + 1;
+    }
+    return tr_resume_digest();
+}
+
+/// One step, then the REAL checkpoint write of step 1 (ckpt_1.state through tr_write_state, which
+/// also reads the file back and compares every byte): the restart run's first half
+fn tr_resume_restart_write() -> i32 {
+    tr_resume_init();
+    const seen : f64 = tr_train_step(0, 2, 0.01, true);
+    if (seen != seen) {
+        return RC_NAN;
+    }
+    return tr_write_state(1);
+}
+
+/// The process ends and a fresh one starts: every module mutable is re-initialized by
+/// tr_resume_init (parameters, moments, gradients, beta powers, PRNG, gates -- the same values a
+/// fresh process sees before tr_load_state), then the REAL resume loads ckpt_1.state; the digest
+/// after the load tells whether the checkpoint restored the state bit-exactly
+fn tr_resume_restart_load() -> u64 {
+    tr_resume_init();
+    resume_load_rc = tr_load_state(1);
+    return tr_resume_digest();
+}
+
+/// The restarted state runs the same second step the control ran; the digest closes the
+/// comparison with the control's final digest
+fn tr_resume_restart_final() -> u64 {
+    const seen : f64 = tr_train_step(1, 2, 0.01, true);
+    if (seen != seen) {
+        return 0;
+    }
+    return tr_resume_digest();
+}
+
+/// Write a checkpoint of one step through tr_state_write_broken and load it back. flip_e inside
+/// the payload flips one byte (element flip_e, xored 0xFF); the natural out-of-domain value
+/// 3 * NPARAM writes the file unbroken, which is the A/B control: the same writer, the same step,
+/// only the defect differs. The expected codes are RC_OK clean and RC_RESUME refused
+fn tr_resume_reload_rc(step: u64, version: u32, flip_e: usize) -> i32 {
+    tr_resume_init();
+    const seen : f64 = tr_train_step(0, 2, 0.01, true);
+    if (seen != seen) {
+        return RC_NAN;
+    }
+    const w : i32 = tr_state_write_broken(step, version, flip_e);
+    if (w != RC_OK) {
+        return w;
+    }
+    return tr_load_state(step);
 }
 
 /// The program `t27c compile --backend ml` builds: train, evaluate, checkpoint; any checkpoint
@@ -3761,6 +3954,36 @@ fn tr_state_roundtrip_diff() -> usize {
         k = k + 1;
     }
     return diff;
+}
+
+/// The payload digest the header carries, checked the way the loader checks it, without a file:
+/// byte 52 of a written header must equal the whole-stream fold; one changed payload byte must
+/// change the digest (the header keeps the stale value, exactly a corrupted checkpoint); the
+/// loader's chunked fold must land where the one-pass fold lands. 0 holds; 1, 2 and 3 name the
+/// check that failed
+fn tr_header_digest_status() -> u64 {
+    tr_init(9);
+    var k : usize = 0;
+    while (k < NPARAM) {
+        m_val[k] = 0.001 * p_val[k];
+        v_val[k] = p_val[k] * p_val[k];
+        k = k + 1;
+    }
+    const dig : u64 = tr_state_digest_all();
+    tr_state_header(&io_hdr, 5, dig);
+    if (tr_get_u64(&io_hdr, 52) != dig) {
+        return 1;
+    }
+    p_val[4317] = p_val[4317] + 1.0;
+    if (tr_state_digest_all() == dig) {
+        return 2;
+    }
+    var h : u64 = tr_state_digest_chunk(1469598103, 0, 1000);
+    h = tr_state_digest_chunk(h, 1000, NPARAM - 1000);
+    if (h != tr_state_digest_chunk(1469598103, 0, NPARAM)) {
+        return 3;
+    }
+    return 0;
 }
 
 fn tr_mslh_size() -> usize {
@@ -4445,3 +4668,7 @@ test one_and_three_threads_give_one_step_the_same_bits_at_speed_4
     then  one4 == three4
     and   one4 != 0
     and   one4 != two
+
+test the_state_payload_digest_catches_a_flipped_byte
+    given status = tr_header_digest_status()
+    then  status == 0
