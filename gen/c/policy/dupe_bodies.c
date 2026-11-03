@@ -147,9 +147,9 @@ uint32_t t_run(uint8_t* st, size_t n, uint8_t mode, uint8_t* out);
 size_t t_pos(uint8_t* out, uint8_t* msg);
 bool t_has(uint8_t* out, uint8_t* msg);
 size_t t_len(uint8_t* out);
-size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c);
 bool same(uint8_t* a, size_t af, size_t at, uint8_t* b, size_t bf, size_t bt);
 uint8_t existing(uint8_t kind, uint8_t r);
+size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c);
 size_t put_msg(uint8_t* out, size_t w, size_t cap, uint8_t* msg);
 size_t put_range(uint8_t* out, size_t w, size_t cap, uint8_t* s, size_t from, size_t to);
 bool is_alnum(uint8_t b);
@@ -1286,13 +1286,6 @@ size_t t_len(uint8_t* out) {
     return i;
 }
 
-size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c) {
-    if ((w < cap)) {
-        out[w] = c;
-    }
-    return (w + 1);
-}
-
 bool same(uint8_t* a, size_t af, size_t at, uint8_t* b, size_t bf, size_t bt) {
     if (((at - af) != (bt - bf))) {
         return false;
@@ -1312,6 +1305,13 @@ uint8_t existing(uint8_t kind, uint8_t r) {
         return R_MODIFIED;
     }
     return r;
+}
+
+size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c) {
+    if ((w < cap)) {
+        out[w] = c;
+    }
+    return (w + 1);
 }
 
 size_t put_msg(uint8_t* out, size_t w, size_t cap, uint8_t* msg) {
