@@ -5,13 +5,17 @@
 // walks the rungs in the order below and serves the first rung that answers a
 // TURN-SIZED request with 200. Laws:
 //   1. Rungs are tried strictly in ladder order; a rung is skipped only on its
-//      own refusal (429 quota, 402 unfunded, 5xx, timeout).
+//      own refusal (429 quota, 402 unfunded, 5xx, timeout) or because it is
+//      UNWIRED (law 8).
 //   2. Every probe and every serve attempt is TURN-SIZED (PROBE_TOKENS
 //      minimum): a 1-token answer is not evidence (measured 2026-10-26/27 --
 //      one-token probes passed on keys that refused real turns).
 //   3. FAIL CLOSED: when every rung refuses, the client receives a 503 JSON
-//      naming the last refusal -- never a silent fallback to an unverified
-//      answer, never a retry loop without end.
+//      naming the refusal of EVERY rung that was tried, in ladder order, so
+//      that a tail rung cannot mask an earlier failure (owner 2026-11-01: the
+//      old "last refusal" rule showed a tail rung's message for a z.ai or
+//      ollama failure) -- never a silent fallback to an unverified answer,
+//      never a retry loop without end.
 //   4. The ladder endpoint binds LOOPBACK only: it is node plumbing, not a
 //      network service.
 //   5. A rung's key never leaves the node; the ladder reads keys from the
@@ -26,20 +30,39 @@
 //      about the key or the model's presence on the plan. It rests the rung
 //      NOISE_REST_S and keeps its place; only a quota-class refusal (429
 //      quota, 402 unfunded) may demote a rung or mark its key bad.
+//   8. UNWIRED: a rung with no key, or with no probed 200 on a turn-sized
+//      request, is skipped with NO network call and recorded as unwired
+//      (STATUS_UNWIRED). The ladder never makes up an upstream status for it.
 // ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
 
 module T27OsLadder;
 
 // -- The rungs, in ladder order (index = attempt order) --
-// RUNG 0: z.ai free pool, glm-4.5-flash (the coding-tier head, 5 rotating keys)
-// RUNG 1: the own node's ollama cloud, gemma4:31b (free plan, 7/7 that night)
-// RUNG 2: deepseek official (after a top-up; prepaid, 402 while unfunded)
+// RUNG 0: nvidia direct (nvapi keys listed the catalogue with 200 and refused
+//         chat-completions with 403 on 2026-10-26, so this rung is live only
+//         while its own probe state says PROBE_OK -- never assumed)
+// RUNG 1: z.ai free pool, glm-4.5-flash (the coding-tier head, 5 rotating keys)
+// RUNG 2: the own node's ollama cloud, gemma4:31b (free plan, 7/7 that night)
 // RUNG 3: openrouter (after credits; the key limit is not a balance)
+// History 2026-11-01: the owner removed the deepseek rung (unfunded account);
+// RUNG_COUNT stays 4 so the 4-bit tried mask (15) of ladder_speed.t27 holds.
 pub const RUNG_COUNT : usize = 4;
-pub const RUNG_ZAI : usize = 0;
-pub const RUNG_OLLAMA : usize = 1;
-pub const RUNG_DEEPSEEK : usize = 2;
+pub const RUNG_NVIDIA : usize = 0;
+pub const RUNG_ZAI : usize = 1;
+pub const RUNG_OLLAMA : usize = 2;
 pub const RUNG_OPENROUTER : usize = 3;
+
+const RUNGS : u32 = RUNG_COUNT;
+
+// -- Law 8: probe state and the unwired record --
+// A probe state per rung, written by a TURN-SIZED probe only (law 2).
+pub const PROBE_NONE : u32 = 0;
+pub const PROBE_OK : u32 = 1;
+pub const PROBE_REFUSED : u32 = 2;
+
+// Recorded for a rung that made no network call. Not an HTTP status (those are
+// 100 and up), so it can never be mistaken for an upstream answer.
+pub const STATUS_UNWIRED : u32 = 0;
 
 // -- Turn-sized evidence law --
 pub const PROBE_TOKENS : u32 = 100;
@@ -105,6 +128,62 @@ pub fn demotes_rung(status : u32) -> bool {
     return status == 429 or status == 402;
 }
 
+// -- Law 8: a rung with no key or no probed 200 makes no network call --
+
+/// The probe state after one turn-sized probe: a 200 with at least PROBE_TOKENS
+/// of answer is PROBE_OK; a 200 with fewer proves nothing (law 2) and stays
+/// PROBE_NONE; any other status is PROBE_REFUSED (nvidia 403, 2026-10-26).
+pub fn probe_after(status : u32, tokens : u32) -> u32 {
+    if (status != 200) { return PROBE_REFUSED; }
+    if (tokens < PROBE_TOKENS) { return PROBE_NONE; }
+    return PROBE_OK;
+}
+
+/// Wired = holds a key AND its probe state is PROBE_OK. A rung that is not wired
+/// is skipped with no network call.
+pub fn rung_wired(has_key : bool, probe : u32) -> bool {
+    return has_key and probe == PROBE_OK;
+}
+
+/// What the ladder records for one rung: the upstream status when the rung was
+/// called, STATUS_UNWIRED when it was not. Never an invented upstream status.
+pub fn recorded_status(wired : bool, upstream : u32) -> u32 {
+    if (wired) { return upstream; }
+    return STATUS_UNWIRED;
+}
+
+// -- Law 3: the 503 names every rung that was tried, in ladder order --
+// `tried` is the 4-bit mask of ladder_speed.t27 (bit r set = rung r was called
+// and refused; 15 = all four). Bits above RUNG_COUNT are ignored.
+
+/// True when the 503 body carries an entry for this rung.
+pub fn names_refusal(tried : u32, rung : u32) -> bool {
+    if (rung >= RUNGS) { return false; }
+    return (tried >> rung) % 2 == 1;
+}
+
+/// The next rung named in the 503 body at or after `from`, in ladder order;
+/// RUNG_COUNT when none is left.
+pub fn next_named(tried : u32, from : u32) -> u32 {
+    var r : u32 = from;
+    while (r < RUNGS) {
+        if ((tried >> r) % 2 == 1) { return r; }
+        r = r + 1;
+    }
+    return RUNGS;
+}
+
+/// How many entries the 503 body carries.
+pub fn named_count(tried : u32) -> u32 {
+    var n : u32 = 0;
+    var r : u32 = 0;
+    while (r < RUNGS) {
+        if ((tried >> r) % 2 == 1) { n = n + 1; }
+        r = r + 1;
+    }
+    return n;
+}
+
 test ladder_consts_hold {
     var rc : usize = RUNG_COUNT;
     var pt : u32 = PROBE_TOKENS;
@@ -153,3 +232,87 @@ test service_noise_rests_and_never_demotes {
     assert demotes_rung(529) == false;
     assert demotes_rung(503) == false;
 }
+
+test the_rung_table_is_nvidia_zai_ollama_openrouter {
+    var rc : usize = RUNG_COUNT;
+    var n : usize = RUNG_NVIDIA;
+    var z : usize = RUNG_ZAI;
+    var o : usize = RUNG_OLLAMA;
+    var r : usize = RUNG_OPENROUTER;
+    assert rc == 4;
+    assert n == 0;
+    assert z == 1;
+    assert o == 2;
+    assert r == 3;
+    assert r + 1 == rc;
+}
+
+test a_rung_without_a_key_or_a_probed_200_is_unwired {
+    assert rung_wired(true, PROBE_OK) == true;
+    assert rung_wired(false, PROBE_OK) == false;
+    assert rung_wired(true, PROBE_NONE) == false;
+    assert rung_wired(true, PROBE_REFUSED) == false;
+    assert rung_wired(false, PROBE_NONE) == false;
+}
+
+test the_nvidia_403_leaves_its_rung_unwired {
+    assert probe_after(403, 100) == PROBE_REFUSED;
+    assert probe_after(403, 0) == PROBE_REFUSED;
+    assert rung_wired(true, probe_after(403, 100)) == false;
+    assert rung_wired(true, probe_after(200, 100)) == true;
+}
+
+test a_one_token_answer_is_not_a_probe {
+    assert probe_after(200, 1) == PROBE_NONE;
+    assert probe_after(200, 99) == PROBE_NONE;
+    assert probe_after(200, 100) == PROBE_OK;
+    assert rung_wired(true, probe_after(200, 1)) == false;
+}
+
+test an_unwired_rung_records_unwired_never_an_upstream_status {
+    assert recorded_status(false, 402) == STATUS_UNWIRED;
+    assert recorded_status(false, 503) == STATUS_UNWIRED;
+    assert recorded_status(false, 200) == STATUS_UNWIRED;
+    assert recorded_status(true, 402) == 402;
+    assert recorded_status(true, 429) == 429;
+    assert STATUS_UNWIRED < 100;
+}
+
+test the_503_names_every_tried_rung_in_ladder_order {
+    // z.ai, ollama and openrouter were called and refused; nvidia was unwired.
+    assert names_refusal(14, 0) == false;
+    assert names_refusal(14, 1) == true;
+    assert names_refusal(14, 2) == true;
+    assert names_refusal(14, 3) == true;
+    assert next_named(14, 0) == 1;
+    assert next_named(14, 2) == 2;
+    assert next_named(14, 3) == 3;
+    assert next_named(14, 4) == 4;
+    assert named_count(14) == 3;
+}
+
+test a_tail_rung_cannot_mask_an_earlier_refusal {
+    // ollama (2) and openrouter (3) refused: the body names ollama first and
+    // both entries, not the tail rung alone.
+    assert next_named(12, 0) == 2;
+    assert next_named(12, 3) == 3;
+    assert named_count(12) == 2;
+    assert names_refusal(12, 3) == true;
+    assert names_refusal(12, 2) == true;
+}
+
+test the_503_covers_all_four_rungs_and_ignores_stray_bits {
+    assert named_count(15) == 4;
+    assert named_count(31) == 4;
+    assert names_refusal(31, 4) == false;
+    assert next_named(15, 0) == 0;
+    assert named_count(0) == 0;
+    assert next_named(0, 0) == 4;
+    assert LAST_RESORT_STATUS == 503;
+    assert refusal(LAST_RESORT_STATUS) == true;
+}
+
+invariant an_unwired_rung_never_shows_an_upstream_status
+    assert recorded_status(false, 402) == STATUS_UNWIRED
+    assert recorded_status(false, 429) == STATUS_UNWIRED
+    assert rung_wired(false, PROBE_OK) == false
