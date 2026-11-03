@@ -1,0 +1,396 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/ifconv_plan.t27 -- when t27b may emit an `if` without a branch: the decision for the branchless
+; clamp, loss L1 of specs/tri/shootout/codegen_audit.t27 (Refs #12877). The shape it is written for is cut out as
+; specs/tri/shootout/l1_clamp.t27, whose values must not change when the decision starts saying yes.
+; --
+; What t27b does today. cli/t27b/src/lower.rs lowers `if` as a statement to Stmt::If (NodeKind::StmtIf) and `if`
+; as a value to ExprKind::Select (`if_expr` -> `select_vals`). cli/t27b/src/codegen.rs emits BOTH with a
+; conditional branch: Stmt::If calls `branch(cond, l_else, false)` and jumps over the then arm, ExprKind::Select
+; branches per arm in `select_arm`. No path in t27b emits CSEL, although specs/tri/t27b/a64.t27 encodes `csel`
+; (and the disassembler in cli/t27b/src/a64.rs only decodes the csinc/cset form, so a csel word prints as .word).
+; --
+; What this decision is for. The glue would ask before emitting Stmt::If / ExprKind::Select: may this one be
+; if-converted -- both arms evaluated unconditionally, the result chosen with CSEL? That is only sound when
+; speculating an arm cannot do anything the original would not. Two conditions carry the weight:
+;   1. an arm may only compute into a register-resident scalar local: no call, no load, no store, no control flow;
+;   2. t27 arithmetic is CHECKED, so an arm with `x - k` or `x + k` traps on part of the input range. Speculating
+;      it is sound only when that trap range is disjoint from the range on which the arm did NOT run, i.e. from
+;      the other side's guard interval. For the clamp (`t > 1000`, else arm `t - 1`) the trap range is {0} and the
+;      then-side guard is [1001, max]: disjoint, so the else arm may run unconditionally.
+; The budget (at most 2 selects, at most 2 speculated ops) is a CHOSEN bound, not a measured one: it keeps the
+; conversion to the shape the clamp needs until a measurement says more pays.
+; `!=` is refused here: its true set is two intervals, and this first step keeps one interval per side.
+; This spec decides nothing on its own -- it is the decision t27b's codegen would read through
+; `t27c gen-rust` (gen/rust/tri/t27b/ifconv_plan.rs). Nothing in cli/t27b calls it yet.
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bIfconvPlan;
+
+// ----------------------------------------------------------------------------------------------------------
+// What an arm does. The kind is read from the lowered arm, one statement at a time.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const AK_NONE : u8 = 0;     // the arm is absent (an `if` with no else)
+pub const AK_CONST : u8 = 1;    // v = <constant>
+pub const AK_VAR : u8 = 2;      // v = <other register-resident local>
+pub const AK_SUB_IMM : u8 = 3;  // v = x - k, checked
+pub const AK_ADD_IMM : u8 = 4;  // v = x + k, checked
+pub const AK_CALL : u8 = 5;     // the arm calls
+pub const AK_LOAD : u8 = 6;     // the arm reads memory
+pub const AK_STORE : u8 = 7;    // the arm writes memory
+pub const AK_OTHER : u8 = 8;    // anything else: break, continue, return, a nested if, a non-scalar
+
+// The comparison the condition is. G_NE is listed so it can be refused by name.
+pub const G_GT : u8 = 1;
+pub const G_GE : u8 = 2;
+pub const G_LT : u8 = 3;
+pub const G_LE : u8 = 4;
+pub const G_EQ : u8 = 5;
+pub const G_NE : u8 = 6;
+
+pub const U64_MAX : u64 = 18446744073709551615;
+
+// The chosen budget. Both are counts over the whole converted `if`.
+pub const MAX_SELECTS : u32 = 2;
+pub const MAX_SPEC_OPS : u32 = 2;
+
+// ----------------------------------------------------------------------------------------------------------
+// Arms.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Whether an arm may be evaluated unconditionally at all. Memory and control flow never may.
+pub fn arm_speculable(kind: u8) -> bool {
+    if (kind == AK_NONE or kind == AK_CONST or kind == AK_VAR) { return true; }
+    return kind == AK_SUB_IMM or kind == AK_ADD_IMM;
+}
+
+/// Whether an arm's arithmetic is checked, so it traps on part of the input range.
+pub fn arm_is_checked(kind: u8) -> bool {
+    return kind == AK_SUB_IMM or kind == AK_ADD_IMM;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// The guard interval of a comparison against a constant, as [lo, hi] over u64. `empty` first: lo and hi of an
+// empty interval are not meaningful.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Whether `x OP c` is true for no u64 at all.
+pub fn guard_empty(op: u8, c: u64) -> bool {
+    if (op == G_GT) { return c == U64_MAX; }
+    if (op == G_LT) { return c == 0; }
+    return false;
+}
+
+/// The smallest x for which `x OP c` holds. Only meaningful when guard_empty is false.
+pub fn guard_lo(op: u8, c: u64) -> u64 {
+    if (op == G_GT) {
+        if (c == U64_MAX) { return 0; }
+        return c + 1;
+    }
+    if (op == G_GE or op == G_EQ) { return c; }
+    return 0;
+}
+
+/// The largest x for which `x OP c` holds. Only meaningful when guard_empty is false.
+pub fn guard_hi(op: u8, c: u64) -> u64 {
+    if (op == G_LT) {
+        if (c == 0) { return 0; }
+        return c - 1;
+    }
+    if (op == G_LE or op == G_EQ) { return c; }
+    return U64_MAX;
+}
+
+/// The comparison that holds exactly where `op` does not.
+pub fn invert_guard(op: u8) -> u8 {
+    if (op == G_GT) { return G_LE; }
+    if (op == G_LE) { return G_GT; }
+    if (op == G_GE) { return G_LT; }
+    if (op == G_LT) { return G_GE; }
+    if (op == G_EQ) { return G_NE; }
+    return G_EQ;
+}
+
+/// Whether this comparison has a single-interval true set, so the rule below can reason about it.
+pub fn guard_is_interval(op: u8) -> bool {
+    return op == G_GT or op == G_GE or op == G_LT or op == G_LE or op == G_EQ;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// The trap range of a checked op, as [lo, hi] over its input x. `x - k` traps below k; `x + k` traps in the top
+// k values. k == 0 traps nowhere.
+// ----------------------------------------------------------------------------------------------------------
+
+pub fn trap_empty(kind: u8, k: u64) -> bool {
+    if (!arm_is_checked(kind)) { return true; }
+    return k == 0;
+}
+
+pub fn trap_lo(kind: u8, k: u64) -> u64 {
+    if (kind == AK_ADD_IMM) {
+        if (k == 0) { return 0; }
+        return U64_MAX - k + 1;
+    }
+    return 0;
+}
+
+pub fn trap_hi(kind: u8, k: u64) -> u64 {
+    if (kind == AK_ADD_IMM) { return U64_MAX; }
+    if (k == 0) { return 0; }
+    return k - 1;
+}
+
+/// Two non-empty closed ranges with no value in common.
+pub fn ranges_disjoint(lo_a: u64, hi_a: u64, lo_b: u64, hi_b: u64) -> bool {
+    if (hi_a < lo_b) { return true; }
+    return hi_b < lo_a;
+}
+
+/// Whether an arm may run unconditionally, given the guard interval of the side on which it did NOT run.
+/// It is safe when the arm cannot trap at all, when that other side is empty (the arm already ran for every
+/// input), or when the arm's trap range and that other side are disjoint.
+pub fn arm_safe_to_speculate(kind: u8, k: u64, other_op: u8, other_c: u64) -> bool {
+    if (!arm_speculable(kind)) { return false; }
+    if (trap_empty(kind, k)) { return true; }
+    if (!guard_is_interval(other_op)) { return false; }
+    if (guard_empty(other_op, other_c)) { return true; }
+    return ranges_disjoint(trap_lo(kind, k), trap_hi(kind, k),
+                           guard_lo(other_op, other_c), guard_hi(other_op, other_c));
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// The decision.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Whether codegen may emit this `if` (or Select) branchlessly.
+/// op, c: the condition, a single comparison of an integer against a constant.
+/// then_kind / then_k: the then arm and its immediate (0 when it has none); else_kind / else_k likewise.
+/// selects: how many results the conversion would have to choose with CSEL.
+/// spec_ops: how many arm operations would run that did not run before.
+/// all_int: every value involved is an integer no wider than a register (no float, no i128).
+/// cond_is_simple: the condition is that one comparison (an `and` / `or` / `!` chain is not).
+pub fn may_if_convert(op: u8, c: u64,
+                      then_kind: u8, then_k: u64,
+                      else_kind: u8, else_k: u64,
+                      selects: u32, spec_ops: u32,
+                      all_int: bool, cond_is_simple: bool) -> bool {
+    if (!all_int or !cond_is_simple) { return false; }
+    if (!guard_is_interval(op)) { return false; }
+    if (selects > MAX_SELECTS or spec_ops > MAX_SPEC_OPS) { return false; }
+    // The then arm did not run where the inverted condition holds; the else arm did not run where it holds.
+    if (!arm_safe_to_speculate(then_kind, then_k, invert_guard(op), c)) { return false; }
+    return arm_safe_to_speculate(else_kind, else_k, op, c);
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Emission order and registers. The decision above says a conversion is sound; these say the only order the
+// emitter may write it in, and what it costs in registers. Both are read off the clamp's own emitted bytes
+// (.trinity/receipts/t27b-l1-clamp-2026-11-02/README.md section 2), not assumed: t27b lowers the checked
+// subtraction to `subs x2, x1, #1` + `b.lo`, and the guard to `cmp x1, #1000`. Both write NZCV, and CSEL
+// reads NZCV.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Whether speculating this arm destroys the guard's own comparison. The checked forms lower to a
+/// flag-setting `subs` / `adds` plus its `b.lo` / `b.hs`; a constant or a plain local move writes no flag.
+pub fn arm_clobbers_flags(kind: u8) -> bool {
+    if (kind == AK_SUB_IMM) { return true; }
+    return kind == AK_ADD_IMM;
+}
+
+/// How many of the two arms destroy the flags when speculated.
+pub fn clobbering_arms(then_kind: u8, else_kind: u8) -> u32 {
+    var n : u32 = 0;
+    if (arm_clobbers_flags(then_kind)) { n = n + 1; }
+    if (arm_clobbers_flags(else_kind)) { n = n + 1; }
+    return n;
+}
+
+/// The order is correct only when every flag-clobbering speculated arm is emitted BEFORE the guard compare,
+/// leaving that compare the last writer of NZCV before the selects. Emitting one after it is not a slower
+/// shape but a wrong one: the select then chooses on the subtraction's flags, takes the other arm, and traps
+/// nowhere. Nothing in the trap-disjointness rule above catches this, which is why it is its own condition.
+pub fn emit_order_ok(clobbering_total: u32, clobbering_before_cmp: u32) -> bool {
+    return clobbering_before_cmp == clobbering_total;
+}
+
+/// Scratch registers one constant arm needs. A zero costs none: CSEL takes a register number for its first
+/// source and 31 is ZR (specs/tri/t27b/a64.t27 `csel`, whose own comment says so), so `tick = 0` needs no
+/// `movz` and no register. A non-zero constant needs one register, materialised once. The register map in
+/// cli/t27b/src/codegen.rs lines 10-15 keeps x8 as the operation scratch and x16/x17 for materialised
+/// constants, so the clamp's single non-zero constant has a home that no arm's value is living in.
+pub fn scratch_for_const(k: u64) -> u32 {
+    if (k == 0) { return 0; }
+    return 1;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Tests: the clamp this is written for, then every condition, each refused on its own.
+// ----------------------------------------------------------------------------------------------------------
+
+test the_clamp_of_the_benchmark_is_accepted {
+    // specs/tri/shootout/l1_clamp.t27 wrap_pair, the shape of bench_audit.t27 lines 21-27:
+    // if (tick > 1000) { tick = 0; prev = 1000; } else { prev = tick - 1; }
+    // two selects (tick and prev), one speculated op (the subtraction).
+    assert(may_if_convert(G_GT, 1000, AK_CONST, 0, AK_SUB_IMM, 1, 2, 1, true, true));
+}
+
+test the_one_armed_clamp_is_accepted {
+    // wrap_tick: if (tick > 1000) { tick = 0; }  -- the absent else speculates nothing.
+    assert(may_if_convert(G_GT, 1000, AK_CONST, 0, AK_NONE, 0, 1, 0, true, true));
+}
+
+test a_subtraction_that_would_trap_where_it_did_not_run_is_refused {
+    // if (t < 5) { p = 7; } else { p = t - 10; }
+    // t - 10 traps on [0, 9]; the else arm did not run on [0, 4]. t = 3 returned 7 and would now trap.
+    assert(!may_if_convert(G_LT, 5, AK_CONST, 0, AK_SUB_IMM, 10, 1, 1, true, true));
+    // What the clamp has instead: the side that stopped running is ABOVE the trap.
+    // if (t > 5) { p = 0; } else { p = t - 1; } -- trap {0}, the then side is [6, max].
+    assert(may_if_convert(G_GT, 5, AK_CONST, 0, AK_SUB_IMM, 1, 1, 1, true, true));
+    // if (t > 0) { p = 0; } else { p = t - 1; } -- the then side is [1, max]; the trap {0} is where the
+    // subtraction ran before and trapped before. Accepted: the conversion adds no trap.
+    assert(may_if_convert(G_GT, 0, AK_CONST, 0, AK_SUB_IMM, 1, 1, 1, true, true));
+    // but a two-wide trap against that same guard is refused: t - 2 traps on [0, 1], and 1 is on the then side.
+    assert(!may_if_convert(G_GT, 0, AK_CONST, 0, AK_SUB_IMM, 2, 1, 1, true, true));
+}
+
+test an_addition_that_would_overflow_where_it_did_not_run_is_refused {
+    // if (t > 1000) { p = 0; } else { p = t + 1; } -- t + 1 traps at max, and max is on the then side.
+    assert(!may_if_convert(G_GT, 1000, AK_CONST, 0, AK_ADD_IMM, 1, 1, 1, true, true));
+    // if (t < 1000) { p = t + 1; } else { p = 0; } -- the then arm traps at max, which is on the else side.
+    assert(!may_if_convert(G_LT, 1000, AK_ADD_IMM, 1, AK_CONST, 0, 1, 1, true, true));
+    // the mirror of the clamp is accepted: the trapping arm is the high one.
+    // if (t > 1000) { p = t + 1; } else { p = 0; } -- the then arm stopped running on [0, 1000] only.
+    assert(may_if_convert(G_GT, 1000, AK_ADD_IMM, 1, AK_CONST, 0, 1, 1, true, true));
+}
+
+test memory_and_control_flow_arms_are_refused {
+    assert(!may_if_convert(G_GT, 1000, AK_CALL, 0, AK_CONST, 0, 1, 1, true, true));
+    assert(!may_if_convert(G_GT, 1000, AK_CONST, 0, AK_CALL, 0, 1, 1, true, true));
+    assert(!may_if_convert(G_GT, 1000, AK_LOAD, 0, AK_CONST, 0, 1, 1, true, true));
+    assert(!may_if_convert(G_GT, 1000, AK_STORE, 0, AK_CONST, 0, 1, 1, true, true));
+    assert(!may_if_convert(G_GT, 1000, AK_OTHER, 0, AK_CONST, 0, 1, 1, true, true));
+}
+
+test a_value_that_is_not_an_integer_register_is_refused {
+    assert(!may_if_convert(G_GT, 1000, AK_CONST, 0, AK_SUB_IMM, 1, 2, 1, false, true));
+}
+
+test a_compound_condition_is_refused {
+    assert(!may_if_convert(G_GT, 1000, AK_CONST, 0, AK_SUB_IMM, 1, 2, 1, true, false));
+}
+
+test not_equal_is_refused_because_its_true_set_is_two_intervals {
+    assert(!guard_is_interval(G_NE));
+    assert(!may_if_convert(G_NE, 1000, AK_CONST, 0, AK_CONST, 0, 1, 0, true, true));
+    // equality itself is one interval, a single point, and is accepted
+    assert(may_if_convert(G_EQ, 1000, AK_CONST, 0, AK_CONST, 0, 1, 0, true, true));
+    // the inverse of `==` is `!=`, so a trapping arm opposite an equality is refused
+    assert(!may_if_convert(G_EQ, 1000, AK_SUB_IMM, 1, AK_CONST, 0, 1, 1, true, true));
+}
+
+test the_budget_is_a_ceiling {
+    assert(may_if_convert(G_GT, 1000, AK_CONST, 0, AK_SUB_IMM, 1, MAX_SELECTS, MAX_SPEC_OPS, true, true));
+    assert(!may_if_convert(G_GT, 1000, AK_CONST, 0, AK_SUB_IMM, 1, MAX_SELECTS + 1, 1, true, true));
+    assert(!may_if_convert(G_GT, 1000, AK_CONST, 0, AK_SUB_IMM, 1, 2, MAX_SPEC_OPS + 1, true, true));
+}
+
+test an_immediate_of_zero_traps_nowhere {
+    assert(trap_empty(AK_SUB_IMM, 0));
+    assert(trap_empty(AK_ADD_IMM, 0));
+    assert(trap_empty(AK_CONST, 7));
+    assert(!trap_empty(AK_SUB_IMM, 1));
+    // so `p = t - 0` may be speculated against any side
+    assert(may_if_convert(G_LT, 5, AK_CONST, 0, AK_SUB_IMM, 0, 1, 1, true, true));
+}
+
+test an_empty_guard_means_the_arm_already_ran_everywhere {
+    // `t > max` holds for no u64: the else arm ran for every input, so its subtraction is no new trap.
+    assert(guard_empty(G_GT, U64_MAX));
+    assert(may_if_convert(G_GT, U64_MAX, AK_CONST, 0, AK_SUB_IMM, 1, 1, 1, true, true));
+    // but the then arm never ran, so a trapping then arm is refused
+    assert(!may_if_convert(G_GT, U64_MAX, AK_SUB_IMM, 1, AK_CONST, 0, 1, 1, true, true));
+    // `t < 0` likewise
+    assert(guard_empty(G_LT, 0));
+    assert(may_if_convert(G_LT, 0, AK_CONST, 0, AK_SUB_IMM, 1, 1, 1, true, true));
+    assert(!may_if_convert(G_LT, 0, AK_SUB_IMM, 1, AK_CONST, 0, 1, 1, true, true));
+}
+
+test the_guard_interval_of_each_comparison {
+    assert(guard_lo(G_GT, 1000) == 1001);
+    assert(guard_hi(G_GT, 1000) == U64_MAX);
+    assert(guard_lo(G_GE, 1000) == 1000);
+    assert(guard_hi(G_GE, 1000) == U64_MAX);
+    assert(guard_lo(G_LT, 1000) == 0);
+    assert(guard_hi(G_LT, 1000) == 999);
+    assert(guard_lo(G_LE, 1000) == 0);
+    assert(guard_hi(G_LE, 1000) == 1000);
+    assert(guard_lo(G_EQ, 1000) == 1000);
+    assert(guard_hi(G_EQ, 1000) == 1000);
+}
+
+test the_trap_range_of_each_checked_op {
+    assert(trap_lo(AK_SUB_IMM, 1) == 0);
+    assert(trap_hi(AK_SUB_IMM, 1) == 0);
+    assert(trap_lo(AK_SUB_IMM, 10) == 0);
+    assert(trap_hi(AK_SUB_IMM, 10) == 9);
+    assert(trap_lo(AK_ADD_IMM, 1) == U64_MAX);
+    assert(trap_hi(AK_ADD_IMM, 1) == U64_MAX);
+    assert(trap_lo(AK_ADD_IMM, 2) == U64_MAX - 1);
+    assert(trap_hi(AK_ADD_IMM, 2) == U64_MAX);
+}
+
+test inverting_a_guard_twice_gives_it_back {
+    assert(invert_guard(invert_guard(G_GT)) == G_GT);
+    assert(invert_guard(invert_guard(G_GE)) == G_GE);
+    assert(invert_guard(invert_guard(G_LT)) == G_LT);
+    assert(invert_guard(invert_guard(G_LE)) == G_LE);
+    assert(invert_guard(invert_guard(G_EQ)) == G_EQ);
+    assert(invert_guard(invert_guard(G_NE)) == G_NE);
+    // and the two sides of the clamp: `t > 1000` false is `t <= 1000`
+    assert(invert_guard(G_GT) == G_LE);
+    assert(guard_hi(G_LE, 1000) == 1000);
+}
+
+test disjointness_is_symmetric_and_touching_ranges_are_not_disjoint {
+    assert(ranges_disjoint(0, 0, 1001, U64_MAX));
+    assert(ranges_disjoint(1001, U64_MAX, 0, 0));
+    assert(!ranges_disjoint(0, 9, 0, 4));
+    assert(!ranges_disjoint(0, 1000, 1000, 2000));
+    assert(ranges_disjoint(0, 999, 1000, 2000));
+}
+
+test the_clamp_needs_its_subtraction_emitted_before_the_guard_compare {
+    // wrap_pair: the else arm is the checked `t - 1`, so exactly one arm clobbers the flags.
+    assert(clobbering_arms(AK_CONST, AK_SUB_IMM) == 1);
+    // emitted before the cmp: correct. This is the order the receipt's after-shape is written in.
+    assert(emit_order_ok(1, 1));
+    // emitted after it: the select would read the subtraction's flags. Refused.
+    assert(!emit_order_ok(1, 0));
+}
+
+test an_arm_that_writes_no_flag_puts_no_order_on_the_emitter {
+    assert(!arm_clobbers_flags(AK_CONST));
+    assert(!arm_clobbers_flags(AK_VAR));
+    assert(!arm_clobbers_flags(AK_NONE));
+    assert(clobbering_arms(AK_CONST, AK_VAR) == 0);
+    // nothing to place, so any count of zero satisfies the rule
+    assert(emit_order_ok(0, 0));
+}
+
+test both_checked_arms_must_both_precede_the_compare {
+    assert(arm_clobbers_flags(AK_SUB_IMM));
+    assert(arm_clobbers_flags(AK_ADD_IMM));
+    assert(clobbering_arms(AK_SUB_IMM, AK_ADD_IMM) == 2);
+    assert(emit_order_ok(2, 2));
+    // one of the two left after the compare is still wrong
+    assert(!emit_order_ok(2, 1));
+}
+
+test the_clamp_costs_one_scratch_register_not_two {
+    // the then arm assigns two constants, tick = 0 and prev = 1000
+    assert(scratch_for_const(0) == 0);
+    assert(scratch_for_const(1000) == 1);
+    // so the whole conversion materialises one constant, which x8 or x16/x17 holds
+    assert(scratch_for_const(0) + scratch_for_const(1000) == 1);
+}

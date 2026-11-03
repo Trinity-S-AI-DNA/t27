@@ -1,0 +1,550 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/router_cache.t27 -- the cache law of the stage-2 router: session identity, session pinning
+; and usage normalization for the walk (router.t27). Prefix caching on the upstream reuses the KV of an
+; unchanged request head, so the router never reorders, edits or re-serializes a pane's request body: it
+; forwards the bytes it received, and keeps one session on one route while that route answers. The walk
+; decision itself stays provider_router.t27's (pr_chain, pr_after); this spec adds:
+;   (a) the session key of a request: the HOST's sid (session_store, per pane) is the pin key; the client's
+;       metadata.user_id is an explicitly documented FALLBACK only -- its scope (conversation, user or
+;       client install) is unverified on live DSH/Queen traffic, so it must never widen a pin and never
+;       carries authorization;
+;   (b) the pinned chain for that key, and the chain after a reply (provider_router's own laws, one
+;       address each, no second implementation);
+;   (c) usage normalization PER PROTOCOL. Anthropic: total input = input_tokens +
+;       cache_creation_input_tokens + cache_read_input_tokens (input_tokens does NOT include the cache
+;       fields). OpenAI Chat Completions (OpenRouter): total = prompt_tokens, cache read =
+;       prompt_tokens_details.cached_tokens, cache write has no field. Both reduce to one record:
+;       total_input_tokens, cache_read_tokens, cache_write_tokens, and a validity bit per field.
+;   (d) THREE DIFFERENT UNKNOWNS, never folded together: a request's cache hit is proven by valid usage;
+;       a route's cache SUPPORT is a property of the route (unverified for zai -- an Anthropic-compatible
+;       transport does not prove the provider's field semantics); a MONEY saving needs tariffs and is
+;       never claimed here. A valid positive cache_read_tokens stays a hit even when the price is
+;       unknown, and a documented support does not make one request a hit.
+;   (e) the ledger line: counters and ids only -- never a prompt text, a key value or personal data.
+; STREAMING: on a streaming route the usage arrives in the final delta, not the first fragment; nothing
+; below reads a stream fragment as final usage (the stream wiring is a later spec).
+; The parser refuses ambiguous input: a duplicate key, a non-integer, an overflow, a truncated object
+; classify as absent, never as zero. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osRouterCache;
+
+use t27os::editors::same_bytes;
+use t27os::provider_router::pr_chain;
+use t27os::provider_router::pr_after;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+pub const KEY_MAX : usize = 64;
+/// digits of one usage number; a usage count never exceeds 20 digits, and the VALUE must still fit u64:
+/// the parse below refuses a 20-digit number past RC_U64_MAX, not merely a longer one.
+pub const NUM_MAX : usize = 20;
+pub const RC_U64_MAX : u64 = 18446744073709551615;
+
+/// The ledger key alphabet: opaque, non-private ids only -- ASCII letters, digits, '-', '_', '.', at most
+/// KEY_MAX bytes. A comma, a quote or any control byte would forge the CSV, so the key is refused and the
+/// caller writes an empty key rather than an escaping scheme; raw metadata.user_id is never written here
+/// unchecked.
+pub fn rc_key_ok(key: []const u8) -> bool {
+    if (key.len == 0 or key.len > KEY_MAX) { return false; }
+    var i : usize = 0;
+    while (i < key.len) {
+        const c : u8 = key[i];
+        const ok : bool = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45 or c == 95 or c == 46;
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The usage classes of one answered request (the cache HIT unknown only).
+pub const RC_MISS : u32 = 0;
+pub const RC_HIT : u32 = 1;
+pub const RC_UNKNOWN : u32 = 2;
+
+/// Usage schemas.
+pub const SCHEMA_ANTHROPIC : u32 = 0;
+pub const SCHEMA_OPENAI : u32 = 1;
+pub const SCHEMA_NONE : u32 = 2;
+
+/// Validity bits of the normalized record u: u[0]=total, u[1]=read, u[2]=write, u[3]=mask.
+pub const RC_V_TOTAL : u32 = 1;
+pub const RC_V_READ : u32 = 2;
+pub const RC_V_WRITE : u32 = 4;
+pub const U_FIELDS : usize = 4;
+
+/// The index of the first occurrence of pat in src, src.len + 1 when absent.
+fn find_pat(src: []const u8, pat: []const u8) -> usize {
+    if (pat.len == 0 or src.len < pat.len) { return src.len + 1; }
+    var i : usize = 0;
+    while (i + pat.len <= src.len) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < pat.len) {
+            if (src[i + j] != pat[j]) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return src.len + 1;
+}
+
+fn make_key_pat(key: []const u8, pat: []u8) -> usize {
+    if (key.len > 38) { return 0; }
+    pat[0] = 34;
+    var n : usize = put_bytes(pat[0..44], 1, key);
+    pat[n] = 34;
+    pat[n + 1] = 58;
+    return n + 2;
+}
+
+/// The byte span of the object value of "key": { ... }, as (inner start, inner length) in f: the braces
+/// are matched by depth. A truncated object is refused. Key names inside strings are not parsed here --
+/// the spans this law reads (usage, prompt_tokens_details) carry counters only, and the counters' tests
+/// pin that.
+pub fn rc_span(src: []const u8, key: []const u8, f: []u64) -> bool {
+    var pat : [44]u8 = undefined;
+    const n : usize = make_key_pat(key, pat[0..44]);
+    if (n == 0) { return false; }
+    const at : usize = find_pat(src, pat[0..n]);
+    if (at > src.len) { return false; }
+    var i : usize = at + n;
+    while (i < src.len and src[i] == 32) { i = i + 1; }
+    if (i >= src.len or src[i] != 123) { return false; }
+    i = i + 1;
+    const start : usize = i;
+    var depth : u32 = 1;
+    while (i < src.len and depth > 0) {
+        if (src[i] == 123) { depth = depth + 1; }
+        else if (src[i] == 125) { depth = depth - 1; }
+        i = i + 1;
+    }
+    if (depth != 0) { return false; }
+    f[0] = start;
+    f[1] = i - start;
+    return true;
+}
+
+/// One well-formed counter "key":N inside span, as (value, 1) in f. Refused, with f left untouched
+/// (absent, classify UNKNOWN): the key appearing twice (ambiguous), no digits (null, a string, a minus),
+/// more than NUM_MAX digits (overflow), a '.', or a next byte that is not ',' or '}' (a float, a
+/// truncated object).
+pub fn rc_num_good(span: []const u8, key: []const u8, f: []u64) -> bool {
+    var pat : [44]u8 = undefined;
+    const n : usize = make_key_pat(key, pat[0..44]);
+    if (n == 0) { return false; }
+    const first : usize = find_pat(span, pat[0..n]);
+    if (first > span.len) { return false; }
+    const sub_len : usize = span.len - first - 1;
+    if (sub_len > 0) {
+        const second : usize = find_pat(span[first + 1 ..], pat[0..n]);
+        if (second <= sub_len) { return false; }
+    }
+    var i : usize = first + n;
+    while (i < span.len and span[i] == 32) { i = i + 1; }
+    if (i >= span.len or span[i] < 48 or span[i] > 57) { return false; }
+    var d : [NUM_MAX]u8 = undefined;
+    var m : usize = 0;
+    while (i + m < span.len and span[i + m] >= 48 and span[i + m] <= 57 and m < NUM_MAX) {
+        d[m] = span[i + m];
+        m = m + 1;
+    }
+    if (i + m < span.len and span[i + m] >= 48 and span[i + m] <= 57) { return false; }
+    if (m == 0) { return false; }
+    var j : usize = i + m;
+    while (j < span.len and span[j] == 32) { j = j + 1; }
+    if (j >= span.len) { return false; }
+    if (span[j] != 44 and span[j] != 125) { return false; }
+    // value bounds: 20 digits can still pass RC_U64_MAX, so the accumulation itself is checked.
+    var v : u64 = 0;
+    var t : usize = 0;
+    while (t < m) {
+        const dg : u64 = @as(u64, @intCast(d[t] - 48));
+        if (v > (RC_U64_MAX - dg) / 10) { return false; }
+        v = v * 10 + dg;
+        t = t + 1;
+    }
+    f[0] = v;
+    f[1] = 1;
+    return true;
+}
+
+/// The session key of a request: the host sid when the caller holds one, else the client's
+/// metadata.user_id as the documented fallback (scope unverified; never an authorization basis).
+/// Returns the length written, 0 when neither exists.
+pub fn rc_pin_key(out: []u8, host_sid: []const u8, body: []const u8) -> usize {
+    if (host_sid.len > 0) { return put_bytes(out, 0, host_sid); }
+    return rc_session_key(body, out);
+}
+
+/// The client fallback key: metadata.user_id when present. A value longer than KEY_MAX or holding an
+/// escape is refused, not truncated.
+pub fn rc_session_key(body: []const u8, out: []u8) -> usize {
+    var f : [2]u64 = undefined;
+    if (json_str_field(body, "user_id", f[0..2]) == false) { return 0; }
+    const at : usize = @as(usize, @intCast(f[0]));
+    const ln : usize = @as(usize, @intCast(f[1]));
+    if (ln > KEY_MAX) { return 0; }
+    var i : usize = 0;
+    while (i < ln) {
+        out[i] = body[at + i];
+        i = i + 1;
+    }
+    return ln;
+}
+
+/// The string field reader the fallback needs: the same law as session_store json_field, kept local so
+/// the cache law does not widen that spec's surface. A value with a backslash is refused.
+fn json_str_field(src: []const u8, key: []const u8, f: []u64) -> bool {
+    var pat : [44]u8 = undefined;
+    const n : usize = make_key_pat(key, pat[0..44]);
+    if (n == 0) { return false; }
+    const at : usize = find_pat(src, pat[0..n]);
+    if (at > src.len) { return false; }
+    var i : usize = at + n;
+    while (i < src.len and src[i] == 32) { i = i + 1; }
+    if (i >= src.len or src[i] != 34) { return false; }
+    i = i + 1;
+    var e : usize = i;
+    while (e < src.len and src[e] != 34) {
+        if (src[e] == 92) { return false; }
+        e = e + 1;
+    }
+    if (e >= src.len) { return false; }
+    f[0] = i;
+    f[1] = e - i;
+    return true;
+}
+
+/// The pinned chain for a session: the remembered route id first when the chain holds it, the chain
+/// unchanged otherwise (no route is invented). The provider_router's own law, named here so the cache
+/// policy has one address; no second implementation. An invalid pin falls back to the plain chain.
+pub fn rc_pin(out: []u8, order: []const u8, remembered: []const u8) -> usize {
+    return pr_chain(out, order, remembered);
+}
+
+/// The chain after a reply: demoted when the reply says "next", unchanged otherwise -- a loss of the warm
+/// cache is the accepted price of a dead endpoint, and a good reply keeps the session where it is.
+pub fn rc_after(out: []u8, chain: []const u8, status: u32, body: []const u8) -> usize {
+    return pr_after(out, chain, status, body);
+}
+
+/// The class of one answered request: UNKNOWN when the provider did not report a usable cache-read
+/// field, MISS when it reported 0, HIT when it reported more. Unknown is never folded into miss, and
+/// this says nothing about money: a hit's price needs the route's tariff, held elsewhere.
+pub fn rc_cache_class(known: bool, read: u64) -> u32 {
+    if (known == false) { return RC_UNKNOWN; }
+    if (read == 0) { return RC_MISS; }
+    return RC_HIT;
+}
+
+/// The Anthropic usage record of a reply body into u: total = input_tokens +
+/// cache_creation_input_tokens + cache_read_input_tokens (input_tokens excludes the cache fields).
+/// Returns the schema; SCHEMA_NONE leaves u zeroed when no usage object exists.
+pub fn rc_usage_anthropic(body: []const u8, u: []u64) -> u32 {
+    u[0] = 0; u[1] = 0; u[2] = 0; u[3] = 0;
+    var f : [2]u64 = undefined;
+    if (rc_span(body, "usage", f[0..2]) == false) { return SCHEMA_NONE; }
+    const s : usize = @as(usize, @intCast(f[0]));
+    const l : usize = @as(usize, @intCast(f[1]));
+    const span : []const u8 = body[s .. s + l];
+    var v : [2]u64 = undefined;
+    var total : u64 = 0;
+    var sum_ok : bool = true;
+    if (rc_num_good(span, "input_tokens", v[0..2])) {
+        u[3] = u[3] | RC_V_TOTAL;
+        total = v[0];
+    }
+    if (rc_num_good(span, "cache_creation_input_tokens", v[0..2])) {
+        u[3] = u[3] | RC_V_WRITE;
+        u[2] = v[0];
+        if (total > RC_U64_MAX - v[0]) { sum_ok = false; }
+        else { total = total + v[0]; }
+    }
+    if (rc_num_good(span, "cache_read_input_tokens", v[0..2])) {
+        u[3] = u[3] | RC_V_READ;
+        u[1] = v[0];
+        if (total > RC_U64_MAX - v[0]) { sum_ok = false; }
+        else { total = total + v[0]; }
+    }
+    if (sum_ok == false) {
+        // the three counters do not fit u64 together: the total is UNKNOWN, never a wrapped value;
+        // the per-field reads stay valid and keep their bits.
+        u[3] = u[3] & (255 - RC_V_TOTAL);
+        u[0] = 0;
+        return SCHEMA_ANTHROPIC;
+    }
+    u[0] = total;
+    return SCHEMA_ANTHROPIC;
+}
+
+/// The OpenAI Chat Completions (OpenRouter) usage record of a reply body into u: total =
+/// prompt_tokens, cache read = prompt_tokens_details.cached_tokens, cache write has no field (its bit
+/// stays clear). Returns the schema; SCHEMA_NONE leaves u zeroed when no usage object exists.
+pub fn rc_usage_openai(body: []const u8, u: []u64) -> u32 {
+    u[0] = 0; u[1] = 0; u[2] = 0; u[3] = 0;
+    var f : [2]u64 = undefined;
+    if (rc_span(body, "usage", f[0..2]) == false) { return SCHEMA_NONE; }
+    const s : usize = @as(usize, @intCast(f[0]));
+    const l : usize = @as(usize, @intCast(f[1]));
+    const span : []const u8 = body[s .. s + l];
+    var v : [2]u64 = undefined;
+    if (rc_num_good(span, "prompt_tokens", v[0..2])) {
+        u[3] = u[3] | RC_V_TOTAL;
+        u[0] = v[0];
+    }
+    var d : [2]u64 = undefined;
+    if (rc_span(span, "prompt_tokens_details", d[0..2])) {
+        const ds : usize = @as(usize, @intCast(d[0]));
+        const dl : usize = @as(usize, @intCast(d[1]));
+        const inner : []const u8 = span[ds .. ds + dl];
+        if (rc_num_good(inner, "cached_tokens", v[0..2])) {
+            u[3] = u[3] | RC_V_READ;
+            u[1] = v[0];
+        }
+    }
+    return SCHEMA_OPENAI;
+}
+
+/// The record of a reply body, whatever protocol the route answered with: a usage object carrying
+/// prompt_tokens is OpenAI's, otherwise Anthropic's.
+pub fn rc_usage(body: []const u8, u: []u64) -> u32 {
+    u[0] = 0; u[1] = 0; u[2] = 0; u[3] = 0;
+    var f : [2]u64 = undefined;
+    if (rc_span(body, "usage", f[0..2]) == false) { return SCHEMA_NONE; }
+    const s : usize = @as(usize, @intCast(f[0]));
+    const l : usize = @as(usize, @intCast(f[1]));
+    if (find_pat(body[s .. s + l], "\"prompt_tokens\":") <= l) { return rc_usage_openai(body, u); }
+    return rc_usage_anthropic(body, u);
+}
+
+/// The share of reused input, in permille: 1000 * cache_read / total_input, as (value, ok) in f. ok is 0
+/// -- the result is UNDEFINED, never an invented percent -- when either field is absent, when the input
+/// is zero, when read exceeds total (contradictory numbers), or on a multiply overflow. This is the
+/// share of reused input TOKENS, not a share of cost: money needs cache-read and cache-write tariffs.
+pub fn rc_permille(f: []u64, u: []const u64) -> void {
+    f[0] = 0;
+    f[1] = 0;
+    if ((u[3] & RC_V_TOTAL) == 0 or (u[3] & RC_V_READ) == 0) { return; }
+    if (u[1] > u[0]) { return; }
+    if ((u[3] & RC_V_WRITE) != 0 and u[2] > u[0] - u[1]) { return; }
+    if (u[0] == 0) { return; }
+    if (u[1] > 18446744073709551) { return; }
+    f[0] = u[1] * 1000 / u[0];
+    f[1] = 1;
+}
+
+/// One ledger line, counters and ids only -- never a prompt text, a key value or personal data:
+/// key,route,schema,validity,total,read,write,class. Returns the length written.
+pub fn rc_ledger_line(out: []u8, key: []const u8, route: []const u8, schema: u32, u: []const u64, class: u32) -> usize {
+    var p : usize = put_bytes(out, 0, key);
+    out[p] = 44; p = p + 1;
+    p = put_bytes(out, p, route);
+    out[p] = 44; p = p + 1;
+    p = put_dec(out, p, schema);
+    out[p] = 44; p = p + 1;
+    p = put_dec(out, p, u[3]);
+    out[p] = 44; p = p + 1;
+    p = put_dec(out, p, u[0]);
+    out[p] = 44; p = p + 1;
+    p = put_dec(out, p, u[1]);
+    out[p] = 44; p = p + 1;
+    p = put_dec(out, p, u[2]);
+    out[p] = 44; p = p + 1;
+    return put_dec(out, p, class);
+}
+
+test "the_session_key_is_the_host_sid_and_the_client_field_is_only_the_fallback" {
+    var out : [KEY_MAX]u8 = undefined;
+    const body : []const u8 = "{\"model\":\"m\",\"metadata\":{\"user_id\":\"pane-7_abc\"},\"messages\":[]}";
+    const h : usize = rc_pin_key(out[0..], "host-sid-9", body);
+    assert same_bytes(out[0..h], "host-sid-9");
+    const f : usize = rc_pin_key(out[0..], "", body);
+    assert same_bytes(out[0..f], "pane-7_abc");
+    const e : usize = rc_pin_key(out[0..], "", "{\"model\":\"m\"}");
+    assert e == 0;
+}
+
+test "two_host_sids_never_share_a_pin_key_and_a_long_escaped_client_value_is_refused" {
+    var a : [KEY_MAX]u8 = undefined;
+    var b : [KEY_MAX]u8 = undefined;
+    const na : usize = rc_pin_key(a[0..], "sid-1", "{}");
+    const nb : usize = rc_pin_key(b[0..], "sid-2", "{}");
+    assert na == nb;
+    assert same_bytes(a[0..na], b[0..nb]) == false;
+    var long : [80]u8 = undefined;
+    var i : usize = 0;
+    while (i < 80) { long[i] = 97; i = i + 1; }
+    var body : [100]u8 = undefined;
+    var n : usize = put_bytes(body[0..], 0, "{\"user_id\":\"");
+    n = put_bytes(body[0..], n, long[0..]);
+    n = put_bytes(body[0..], n, "\"}");
+    assert rc_session_key(body[0..n], a[0..]) == 0;
+    assert rc_session_key("{\"user_id\":\"a\\\"b\"}", a[0..]) == 0;
+}
+
+test "the_anthropic_record_sums_the_three_fields_and_marks_their_bits" {
+    var u : [U_FIELDS]u64 = undefined;
+    const body : []const u8 = "{\"usage\":{\"input_tokens\":80000,\"cache_creation_input_tokens\":1000,\"cache_read_input_tokens\":60000}}";
+    assert rc_usage(body, u[0..]) == SCHEMA_ANTHROPIC;
+    assert u[0] == 141000;
+    assert u[1] == 60000;
+    assert u[2] == 1000;
+    assert u[3] == RC_V_TOTAL + RC_V_READ + RC_V_WRITE;
+}
+
+test "the_openrouter_record_reads_the_nested_cached_tokens_and_has_no_write" {
+    var u : [U_FIELDS]u64 = undefined;
+    const body : []const u8 = "{\"usage\":{\"prompt_tokens\":80000,\"prompt_tokens_details\":{\"cached_tokens\":60000}}}";
+    assert rc_usage(body, u[0..]) == SCHEMA_OPENAI;
+    assert u[0] == 80000;
+    assert u[1] == 60000;
+    assert u[2] == 0;
+    assert u[3] == RC_V_TOTAL + RC_V_READ;
+    const nocache : []const u8 = "{\"usage\":{\"prompt_tokens\":80000}}";
+    assert rc_usage(nocache, u[0..]) == SCHEMA_OPENAI;
+    assert (u[3] & RC_V_READ) == 0;
+}
+
+test "a_counter_inside_content_or_a_wrong_object_is_not_read" {
+    var u : [U_FIELDS]u64 = undefined;
+    const tricky : []const u8 = "{\"content\":\"the field \\\"input_tokens\\\":9 appears in text\",\"usage\":{\"input_tokens\":3}}";
+    assert rc_usage(tricky, u[0..]) == SCHEMA_ANTHROPIC;
+    assert u[0] == 3;
+    assert u[1] == 0;
+    const wrongnest : []const u8 = "{\"other\":{\"input_tokens\":2,\"cache_read_input_tokens\":5},\"usage\":{\"input_tokens\":1}}";
+    assert rc_usage(wrongnest, u[0..]) == SCHEMA_ANTHROPIC;
+    assert u[0] == 1;
+    assert (u[3] & RC_V_READ) == 0;
+}
+
+test "a_minus_a_fraction_null_a_string_an_overflow_and_a_duplicate_are_absent_not_zero" {
+    var u : [U_FIELDS]u64 = undefined;
+    assert rc_usage("{\"usage\":{\"input_tokens\":-5}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert (u[3] & RC_V_TOTAL) == 0;
+    assert rc_usage("{\"usage\":{\"input_tokens\":1.5}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert (u[3] & RC_V_TOTAL) == 0;
+    assert rc_usage("{\"usage\":{\"input_tokens\":null}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert (u[3] & RC_V_TOTAL) == 0;
+    assert rc_usage("{\"usage\":{\"input_tokens\":\"3\"}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert (u[3] & RC_V_TOTAL) == 0;
+    assert rc_usage("{\"usage\":{\"input_tokens\":123456789012345678901234}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert (u[3] & RC_V_TOTAL) == 0;
+    assert rc_usage("{\"usage\":{\"input_tokens\":1,\"input_tokens\":2}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert (u[3] & RC_V_TOTAL) == 0;
+}
+
+test "a_truncated_usage_object_is_schema_none_not_a_partial_record" {
+    var u : [U_FIELDS]u64 = undefined;
+    assert rc_usage("{\"usage\":{\"input_tokens\":", u[0..]) == SCHEMA_NONE;
+    assert u[3] == 0;
+}
+
+test "the_cache_class_never_calls_a_missing_field_a_miss" {
+    assert rc_cache_class(false, 0) == RC_UNKNOWN;
+    assert rc_cache_class(true, 0) == RC_MISS;
+    assert rc_cache_class(true, 60000) == RC_HIT;
+}
+
+test "the_permille_is_defined_only_for_consistent_known_numbers" {
+    var f : [2]u64 = undefined;
+    var u : [U_FIELDS]u64 = undefined;
+    assert rc_usage("{\"usage\":{\"prompt_tokens\":80000,\"prompt_tokens_details\":{\"cached_tokens\":60000}}}", u[0..]) == SCHEMA_OPENAI;
+    rc_permille(f[0..], u[0..]);
+    assert f[0] == 750;
+    assert f[1] == 1;
+    assert rc_usage("{\"usage\":{\"input_tokens\":141000,\"cache_read_input_tokens\":60000}}", u[0..]) == SCHEMA_ANTHROPIC;
+    rc_permille(f[0..], u[0..]);
+    assert f[0] == 298;
+    assert f[1] == 1;
+    assert rc_usage("{\"usage\":{\"input_tokens\":100}}", u[0..]) == SCHEMA_ANTHROPIC;
+    rc_permille(f[0..], u[0..]);
+    assert f[1] == 0;
+    assert rc_usage("{\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":0}}", u[0..]) == SCHEMA_ANTHROPIC;
+    rc_permille(f[0..], u[0..]);
+    assert f[1] == 0;
+    assert rc_usage("{\"usage\":{\"prompt_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":7}}}", u[0..]) == SCHEMA_OPENAI;
+    rc_permille(f[0..], u[0..]);
+    assert f[1] == 0;
+}
+
+test "the_max_counter_is_read_and_one_past_it_is_refused" {
+    var u : [U_FIELDS]u64 = undefined;
+    assert rc_usage("{\"usage\":{\"input_tokens\":18446744073709551615}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert u[0] == RC_U64_MAX;
+    assert (u[3] & RC_V_TOTAL) != 0;
+    assert rc_usage("{\"usage\":{\"input_tokens\":18446744073709551616}}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert (u[3] & RC_V_TOTAL) == 0;
+}
+
+test "three_counters_that_overflow_u64_together_lose_only_the_total" {
+    var u : [U_FIELDS]u64 = undefined;
+    const body : []const u8 = "{\"usage\":{\"input_tokens\":9223372036854775807,\"cache_creation_input_tokens\":9223372036854775807,\"cache_read_input_tokens\":9223372036854775807}}";
+    assert rc_usage(body, u[0..]) == SCHEMA_ANTHROPIC;
+    assert u[0] == 0;
+    assert (u[3] & RC_V_TOTAL) == 0;
+    assert (u[3] & RC_V_READ) != 0;
+    assert (u[3] & RC_V_WRITE) != 0;
+    assert u[1] == 9223372036854775807;
+}
+
+test "a_refused_reply_leaves_a_zeroed_record_not_the_previous_reply" {
+    var u : [U_FIELDS]u64 = undefined;
+    assert rc_usage("{\"usage\":{\"prompt_tokens\":80000,\"prompt_tokens_details\":{\"cached_tokens\":60000}}}", u[0..]) == SCHEMA_OPENAI;
+    assert u[0] == 80000;
+    assert rc_usage("{\"usage\":{\"input_tokens\":\", }}", u[0..]) == SCHEMA_ANTHROPIC;
+    assert u[0] == 0;
+    assert u[1] == 0;
+    assert u[3] == 0;
+}
+
+test "the_ledger_key_alphabet_is_opaque_and_csv_safe" {
+    assert rc_key_ok("sid-1_aBc.7");
+    assert rc_key_ok("") == false;
+    assert rc_key_ok("a,b") == false;
+    assert rc_key_ok("a\"b") == false;
+    assert rc_key_ok("a\nb") == false;
+    var long : [KEY_MAX + 1]u8 = undefined;
+    var i : usize = 0;
+    while (i < KEY_MAX + 1) { long[i] = 97; i = i + 1; }
+    assert rc_key_ok(long[0..]) == false;
+}
+
+test "read_plus_write_past_the_total_is_undefined_even_when_each_field_is_valid" {
+    var f : [2]u64 = undefined;
+    var u : [U_FIELDS]u64 = undefined;
+    u[0] = 100; u[1] = 90; u[2] = 20;
+    u[3] = RC_V_TOTAL + RC_V_READ + RC_V_WRITE;
+    rc_permille(f[0..], u[0..]);
+    assert f[1] == 0;
+    u[0] = 100; u[1] = 90; u[2] = 10;
+    rc_permille(f[0..], u[0..]);
+    assert f[1] == 1;
+    assert f[0] == 900;
+}
+
+test "the_pinned_session_keeps_its_route_and_a_failure_demotes_it" {
+    var pin : [96]u8 = undefined;
+    var out : [96]u8 = undefined;
+    const p : usize = rc_pin(pin[0..], "zai,kie,nemotron", "kie");
+    assert same_bytes(pin[0..p], "kie,zai,nemotron");
+    const a : usize = rc_after(out[0..], pin[0..p], 429, "");
+    assert same_bytes(out[0..a], "zai,nemotron,kie");
+    const g : usize = rc_after(out[0..], pin[0..p], 200, "ok");
+    assert same_bytes(out[0..g], "kie,zai,nemotron");
+}
+
+test "a_route_outside_the_chain_is_never_invented_by_the_pin" {
+    var out : [96]u8 = undefined;
+    const n : usize = rc_pin(out[0..], "zai,kie", "ghost");
+    assert same_bytes(out[0..n], "zai,kie");
+}
+
+test "the_ledger_line_holds_counters_and_ids_only" {
+    var u : [U_FIELDS]u64 = undefined;
+    assert rc_usage("{\"usage\":{\"input_tokens\":80000,\"cache_read_input_tokens\":60000}}", u[0..]) == SCHEMA_ANTHROPIC;
+    var line : [128]u8 = undefined;
+    const n : usize = rc_ledger_line(line[0..], "sid-1", "zai", SCHEMA_ANTHROPIC, u[0..], RC_HIT);
+    assert same_bytes(line[0..n], "sid-1,zai,0,3,140000,60000,0,1");
+}
