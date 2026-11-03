@@ -22,7 +22,7 @@
 //! elsewhere.
 #![cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 
-use t27b::codegen::{self, canon, TrapStyle};
+use t27b::codegen::{self, TrapStyle};
 use t27b::eval::{Interp, Stop};
 use t27b::ir::*;
 use t27b::jit::Jit;
@@ -1267,7 +1267,7 @@ struct Stats {
 /// Raw register image of an argument: canonical form, plus random garbage in
 /// the upper half for types of 32 bits or less (the ABI leaves it undefined).
 fn raw_arg(rng: &mut Rng, v: i128, ty: Ty) -> u64 {
-    let c = canon(v, ty);
+    let c = t27b::a64::canon(v as u64, ty.is64());
     if ty.is64() {
         c
     } else {
@@ -1277,9 +1277,9 @@ fn raw_arg(rng: &mut Rng, v: i128, ty: Ty) -> u64 {
 
 fn check_value(ty: Ty, want: i128, raw: u64) -> bool {
     if ty.is64() {
-        raw == canon(want, ty)
+        raw == t27b::a64::canon(want as u64, ty.is64())
     } else {
-        (raw & 0xffff_ffff) == canon(want, ty)
+        (raw & 0xffff_ffff) == t27b::a64::canon(want as u64, ty.is64())
     }
 }
 
@@ -1377,6 +1377,31 @@ fn env_u64(name: &str, default: u64) -> u64 {
     }
 }
 
+/// The row key, or None when the cache is off (T27B_DIFF_NOCACHE, or
+/// T27B_DIFF_ONE: a single-case replay never reads or writes the cache).
+fn diff_cache_key(cases: u64, base: u64, trace: bool) -> Option<u64> {
+    if std::env::var_os("T27B_DIFF_NOCACHE").is_some() || std::env::var_os("T27B_DIFF_ONE").is_some() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok())?;
+    let harness = t27b::blockers::fnv64(include_str!("differential.rs").as_bytes());
+    let host = t27b::blockers::fnv64(format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS).as_bytes());
+    let knobs = cases ^ base.wrapping_shl(8) ^ ((trace as u64) << 40);
+    Some(t27b::diff_cache::suite_key(harness, t27b::blockers::fnv64(&exe), knobs, host))
+}
+
+/// The row path of one key, when HOME is set.
+fn diff_cache_row(key: u64) -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache/t27/diff-cache").join(format!("{key:016x}.txt")))
+}
+
+/// True when the row exists, its hex parses and may_reuse matches the key.
+fn diff_cache_hit(key: u64) -> bool {
+    diff_cache_row(key).and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| u64::from_str_radix(s.trim(), 16).ok())
+        .is_some_and(|stored| t27b::diff_cache::may_reuse(stored, key))
+}
+
 #[test]
 fn random_programs_jit_matches_interpreter() {
     let cases = env_u64("T27B_DIFF_CASES", 2500);
@@ -1384,6 +1409,11 @@ fn random_programs_jit_matches_interpreter() {
     let trace = std::env::var("T27B_DIFF_TRACE").is_ok();
     // T27B_DIFF_ONE=<seed> replays a single case (bit 40 selects wrap mode).
     let one = std::env::var("T27B_DIFF_ONE").ok().map(|_| env_u64("T27B_DIFF_ONE", 0));
+    let cache_key = diff_cache_key(cases, base, trace);
+    if cache_key.is_some_and(diff_cache_hit) {
+        println!("diff-cache HIT (T27B_DIFF_NOCACHE=1 forces a rerun)");
+        return;
+    }
     let mut failures = Vec::new();
     for mode in [OverflowMode::Trap, OverflowMode::Wrap] {
         let mut stats = Stats::default();
@@ -1436,6 +1466,14 @@ fn random_programs_jit_matches_interpreter() {
         );
     }
     assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    // Past the assert the verdict is all-pass, so keep_verdict holds: write it.
+    if let Some(key) = cache_key {
+        if let Some(row) = diff_cache_row(key) {
+            if row.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) {
+                let _ = std::fs::write(&row, format!("{key:016x}\n"));
+            }
+        }
+    }
 }
 
 // ------------------------------------------------- exhaustive edge values

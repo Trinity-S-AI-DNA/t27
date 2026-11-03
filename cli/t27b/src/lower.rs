@@ -492,7 +492,6 @@ pub fn lower_src<'a>(ast: &'a Node, mode: OverflowMode, src: Option<&'a str>) ->
 /// item: lowering continues past each rejection (statement by statement, and
 /// operand by operand inside an expression), and a value built from a rejected
 /// one is dropped without a second report. Empty when the module lowers.
-///
 /// A rejected top-level declaration (a `struct`, an `enum`) is still one
 /// entry: its members are not looked into, so a file's list is a lower bound.
 pub fn blockers(ast: &Node, mode: OverflowMode) -> Vec<Reject> {
@@ -4080,7 +4079,7 @@ impl<'a> Lower<'a> {
             "|" => ArithOp::Or,
             "^" => ArithOp::Xor,
             "<<" => if trap { ArithOp::Shl } else { ArithOp::ShlW },
-            ">>" => if trap { ArithOp::Shr } else { ArithOp::ShrW },
+            ">>" => if trap && !matches!(&a, Val::E(e) if matches!(e.ty, Ty::U32 | Ty::U16 | Ty::U8)) && !matches!(&a, Val::P(_, LTy::S(Ty::U32 | Ty::U16 | Ty::U8))) { ArithOp::Shr } else { ArithOp::ShrW }, // #12835: an unsigned dividend ALWAYS lowers to the unsigned shift (wasm masks & 31 -- divergence floor 13)
             _ => return self.reject(&format!("ExprBinary({})", op), String::new()),
         };
         if aop.is_shift() {
@@ -4097,7 +4096,7 @@ impl<'a> Lower<'a> {
         }
         // Two typed constants fold as Zig folds them where the plan says so (specs/tri/t27b/coerce_plan.t27).
         if let (ExprKind::Const(p), ExprKind::Const(q), true) = (&x.kind, &y.kind, ty.is_int()) {
-            let r = match aop { ArithOp::Add | ArithOp::AddW => p.checked_add(*q), ArithOp::Sub | ArithOp::SubW => p.checked_sub(*q), ArithOp::Mul | ArithOp::MulW => p.checked_mul(*q), ArithOp::And => Some(p & q), ArithOp::Or => Some(p | q), ArithOp::Xor => Some(p ^ q), ArithOp::Div | ArithOp::DivW => p.checked_div(*q), ArithOp::Rem => p.checked_rem(*q), _ => None };
+            let r = crate::eval::arith(aop, ty, *p, *q, ty).ok(); // the law's value (specs/tri/t27b/eval_arith.t27): the same fn the interpreter runs, so a fold cannot disagree with it
             let b = op.as_bytes();
             // `/` and `%` fold where specs/tri/t27b/const_div_plan.t27 says so, as Zig folds them at compile time.
             if let Some(r) = r.filter(|r| cp::folds(b[0], b.get(1).copied().unwrap_or(0), b.len(), ty.fits(*r)) || dv::div_folds(b[0], b.len(), ty.signed(), *q == 0, ty.fits(*r))) { return Ok(Val::E(Expr { ty, kind: ExprKind::Const(ty.wrap(r)) })); }
