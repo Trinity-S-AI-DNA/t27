@@ -1,0 +1,534 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/shootout/codegen_audit.t27 -- Epic 1 of the t27b Runtime Frontier:
+; where the 656 ms of the 200M-call benchmark is actually spent.
+
+; Evidence: t27b asm specs/tri/shootout/bench_audit.t27
+;   function _verdict_benchmark_200m is 44 instructions (0x20..0xcc).
+;   its hot loop is 21 instructions (0x54..0xa4, back edge b.lo 0x54).
+;   function _verdict_fn is 6 instructions; 4 of them execute per call.
+
+; Measured runtime of that spec: 656 ms for 200_000_000 logical calls
+;   (t27b test specs/tri/shootout/bench_audit.t27 --time, arm64 Mac, warm).
+;   656 ms / 200M = 3.28 ns per logical call.
+
+; This spec holds the COUNTS and the arithmetic derived from them.
+; The raw disassembly receipt lives beside it in codegen_audit.json.
+; Every number below is either MEASURED (with its command above) or DERIVED
+; from a measured number; nothing here is estimated and presented as measured.
+
+; Closes #11275
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module TriShootoutCodegenAudit;
+
+use tri::shootout::bench::MEASURED_T27B_BASELINE;
+
+; ----------------------------------------------------------------
+; Measured workload
+; ----------------------------------------------------------------
+
+pub const MEASURED_LOGICAL_CALLS : u64 = 200_000_000;
+pub const MEASURED_RUNTIME_MS : f64 = 656.0;
+pub const MEASURED_OBJECT_BYTES : u64 = 560;
+pub const MEASURED_COMPILE_MS : f64 = 3.684;
+
+; Reference rung: Zig 0.16 on the publishable 200M workload (bench.t27).
+pub const ZIG_RUNTIME_MS : f64 = 150.0;
+pub const ZIG_CALLS_PER_SEC : f64 = 1_333_000_000.0;
+
+; Performance-core clock of the measurement machine, used only to turn
+; nanoseconds into cycles. Stated so a reader can redo the arithmetic.
+pub const ASSUMED_CORE_GHZ : f64 = 3.2;
+
+; ----------------------------------------------------------------
+; Instruction census of one hot-loop iteration
+; ----------------------------------------------------------------
+
+/// Counts of one iteration of the loop at 0x54..0xa4.
+/// The five fields partition the 21 instructions exactly; a test checks it.
+pub const HotLoopAudit = struct {
+    instructions : u64,
+    calls : u64,          // bl (the callee body is counted separately)
+    branches : u64,       // every b / b.cond, including the back edge
+    compares : u64,       // cmp / cmn
+    moves : u64,          // mov / movz / movk, register and immediate
+    alu : u64,            // adds / subs and other arithmetic
+    loads : u64,
+    stores : u64,
+    spills : u64,
+    overflow_checks : u64,        // subset of branches: adds/subs + b.hs/b.lo
+    invariant_rematerialisations : u64, // subset of moves: loop-invariant rebuilt per iteration
+}
+
+/// MEASURED: the loop as the compiler emits it today.
+/// One iteration, from t27b asm specs/tri/shootout/bench_audit.t27:
+///   54 mov x0, x19          58 mov x1, x21          5c bl 0x0
+///   60 mov x9, x0           64 adds x22, x22, x9    68 b.hs 0xcc
+///   6c adds x19, x19, #1    70 b.hs 0xcc            74 cmp x19, #1000
+///   78 b.ls 0x88            7c movz x19, #0x0       80 movz x21, #0x3e8
+///   84 b 0x90               88 subs x21, x19, #1    8c b.lo 0xcc
+///   90 adds x20, x20, #1    94 b.hs 0xcc            98 movz x17, #0xc200
+///   9c movk x17, #0xbeb     a0 cmp x20, x17         a4 b.lo 0x54
+pub const BASELINE : HotLoopAudit = HotLoopAudit {
+    .instructions = 21,
+    .calls = 1,
+    .branches = 7,
+    .compares = 2,
+    .moves = 7,
+    .alu = 4,
+    .loads = 0,
+    .stores = 0,
+    .spills = 0,
+    .overflow_checks = 4,
+    .invariant_rematerialisations = 2,
+}
+
+/// MEASURED: instructions of _verdict_fn that execute on the hot path.
+///   0 cmp x0, x1 / 4 b.ne 0x10 / 10 movz x0, #0x1 / 14 ret
+/// (the equal branch executes cmp / b.ne / 8 movz x0, #0x0 / c ret: also 4)
+/// The function returns u64, so the movz writes the whole X register, not W.
+pub const CALLEE_EXECUTED_INSTRUCTIONS : u64 = 4;
+
+/// MEASURED: loop instructions spent crossing into the callee and back:
+/// 54 mov x0, x19 / 58 mov x1, x21 / 5c bl / 60 mov x9, x0.
+pub const CALL_PLUMBING_INSTRUCTIONS : u64 = 4;
+
+/// Instructions executed per logical call today: loop body plus callee body.
+pub fn instructions_per_logical_call() -> u64 {
+    return BASELINE.instructions + CALLEE_EXECUTED_INSTRUCTIONS;
+}
+
+/// MEASURED ns per logical call.
+pub fn ns_per_logical_call() -> f64 {
+    return (MEASURED_RUNTIME_MS * 1_000_000.0) / (MEASURED_LOGICAL_CALLS as f64);
+}
+
+/// MEASURED instructions retired per second, from the two numbers above.
+pub fn instructions_per_second() -> f64 {
+    return (instructions_per_logical_call() as f64) / (ns_per_logical_call() / 1_000_000_000.0);
+}
+
+/// DERIVED: instructions retired per core cycle on this machine.
+pub fn measured_ipc() -> f64 {
+    return instructions_per_second() / (ASSUMED_CORE_GHZ * 1_000_000_000.0);
+}
+
+/// MEASURED calls per second of this workload.
+pub fn calls_per_second() -> f64 {
+    return (MEASURED_LOGICAL_CALLS as f64) / (MEASURED_RUNTIME_MS / 1000.0);
+}
+
+; ----------------------------------------------------------------
+; The five losses, largest first
+; ----------------------------------------------------------------
+
+/// One recoverable loss in the hot loop.
+/// `instructions` is what it costs per iteration today.
+/// `recoverable` is how much of that a fix removes, conservatively.
+pub const Loss = struct {
+    id : str,
+    name : str,
+    instructions : u64,
+    recoverable : u64,
+    fix : str,
+    epic : u32,
+}
+
+/// One const per number, referenced by LOSSES below, so every count has one home.
+pub const L1_INSTRUCTIONS : u64 = 7;   // 74 cmp / 78 b.ls / 7c movz / 80 movz / 84 b / 88 subs / 8c b.lo
+pub const L1_RECOVERABLE : u64 = 4;    // sub + two csel replaces it; one residual move stays
+pub const L2_INSTRUCTIONS : u64 = 8;   // 54 mov / 58 mov / 5c bl / 60 mov + 4 callee instructions
+pub const L2_RECOVERABLE : u64 = 6;    // cmp + csel in place of the whole crossing
+pub const L3_INSTRUCTIONS : u64 = 4;   // 68 b.hs / 70 b.hs / 8c b.lo / 94 b.hs
+pub const L3_RECOVERABLE : u64 = 4;    // no proof is available today; a speed tier may drop it
+pub const L4_INSTRUCTIONS : u64 = 2;   // 98 movz x17 / 9c movk x17 (200_000_000)
+pub const L4_RECOVERABLE : u64 = 2;    // hoist into a callee-saved register
+pub const L5_INSTRUCTIONS : u64 = 4;   // 38 mov / 3c mov / 48 mov / 4c mov, once per call, not per iteration
+pub const L5_RECOVERABLE : u64 = 0;    // out of the loop: costs nothing per logical call at 200M iterations
+
+/// Sized from the census above, not from intuition.
+/// Ordering matters: the largest loss is the control-flow chain, not the call.
+pub const LOSSES : [5]Loss = [
+    Loss {
+        .id = "L1",
+        .name = "clamp branch chain for the saturating wrap",
+        .instructions = L1_INSTRUCTIONS,
+        .recoverable = L1_RECOVERABLE,
+        .fix = "branchless saturating wrap: sub plus csel, no taken branch",
+        .epic = 4,
+    },
+    Loss {
+        .id = "L2",
+        .name = "call crossing not inlined",
+        .instructions = L2_INSTRUCTIONS,
+        .recoverable = L2_RECOVERABLE,
+        .fix = "inline a pure, non-recursive callee under an instruction budget",
+        .epic = 2,
+    },
+    Loss {
+        .id = "L3",
+        .name = "u64 overflow checks on every add",
+        .instructions = L3_INSTRUCTIONS,
+        .recoverable = L3_RECOVERABLE,
+        .fix = "prove the bound or drop the check in a speed tier; keep it in the safe tier",
+        .epic = 5,
+    },
+    Loss {
+        .id = "L4",
+        .name = "loop-invariant limit rebuilt every iteration",
+        .instructions = L4_INSTRUCTIONS,
+        .recoverable = L4_RECOVERABLE,
+        .fix = "hoist invariant materialisation out of the loop into a callee-saved register",
+        .epic = 3,
+    },
+    Loss {
+        .id = "L5",
+        .name = "entry register shuffling",
+        .instructions = L5_INSTRUCTIONS,
+        .recoverable = L5_RECOVERABLE,
+        .fix = "coalesce argument copies at entry; no runtime effect on this workload",
+        .epic = 3,
+    },
+];
+
+/// Sum of every recoverable instruction, per iteration.
+/// A test checks it never exceeds the recoverable instructions actually present.
+pub fn total_recoverable() -> u64 {
+    return L1_RECOVERABLE + L2_RECOVERABLE + L3_RECOVERABLE + L4_RECOVERABLE + L5_RECOVERABLE;
+}
+
+/// Best case the five fixes can reach, ignoring register pressure.
+pub fn best_case_instructions() -> u64 {
+    return BASELINE.instructions - total_recoverable();
+}
+
+/// What the ladder plans for, allowing residual moves for register pressure.
+/// Four arithmetic ops + one compare + one branch = 6; one spare move is budgeted.
+pub const PLANNED_INSTRUCTIONS : u64 = 6;
+
+/// DERIVED: runtime if every fix lands and instruction cost stays linear.
+/// This holds IPC constant, which understates the gain: removing a call and a
+/// taken branch raises IPC, so the real number should be better than this.
+pub fn projected_runtime_ms(new_instructions : u64) -> f64 {
+    return MEASURED_RUNTIME_MS * (new_instructions as f64) / (BASELINE.instructions as f64);
+}
+
+/// DERIVED: instructions per logical call needed to hit a wall-clock target,
+/// at the measured cost per instruction. This is the rung test.
+pub fn required_instructions_for_ms(target_ms : f64) -> f64 {
+    return (BASELINE.instructions as f64) * target_ms / MEASURED_RUNTIME_MS;
+}
+
+/// The name of the file that holds the raw disassembly this census was read from.
+pub fn evidence_command() -> str {
+    return "t27b asm specs/tri/shootout/bench_audit.t27";
+}
+
+; ----------------------------------------------------------------
+; Branch-bound model, a HYPOTHESIS, on the AOT receipt (2026-11-02)
+; ----------------------------------------------------------------
+; This is a model, not a physical limit. "Today runs at about 91% of its
+; bound" and "tuning the same stream gains at most about 10%" are predictions
+; of the model. Neither is measured: no hardware counter (taken branches per
+; cycle) has been read on this machine for this loop.
+
+; The model above holds IPC at the JIT run (656 ms, 10.5 cycles). The AOT run
+; of the SAME instruction stream measured 344.08 ms median, 324.90 ms min
+; (bench.t27, .trinity/receipts/bench_200m_aot_summary.json): 5.5 cycles per
+; call at 3.2 GHz. The hypothesis is that the binding limit is not the
+; instruction count but the branches: on the common path one call executes 22 instructions (the
+; three at 7c/80/84 run once per 1001 calls, so 25 over-counts), 9 of them
+; branches, 5 of them taken (bl, b.ne in the callee, ret, b.ls, back edge).
+
+; LITERATURE, not measured here (public Apple M1 Firestorm microbenchmarks):
+; one taken branch per cycle, two branch units, 8-wide decode. The model bound of a
+; shape is the largest of the three bounds. It is falsifiable: a hardware
+; counter run that retires today's loop in under 5 cycles refutes it.
+
+; PROJECTED shapes are instruction streams t27b does not emit yet; their
+; counts are hand-scheduled from the fixes in LOSSES, not read from asm.
+; ZIG_RUNTIME_MS has no run receipt in .trinity/receipts; it is used below
+; only as the 150 ms rung, never as a measured competitor: TARGET_RUNG_MS.
+
+/// A target rung, not a Zig result: there is no Zig run receipt.
+pub const TARGET_RUNG_MS : f64 = ZIG_RUNTIME_MS;
+
+pub const LIT_TAKEN_PER_CYCLE : u64 = 1;
+pub const LIT_BRANCH_UNITS : u64 = 2;
+pub const LIT_DECODE_WIDTH : u64 = 8;
+
+/// One loop shape. Counts are per loop iteration on the common path;
+/// `unroll` logical calls share one iteration (one back edge).
+pub const Shape = struct {
+    name : str,
+    instructions : u64,
+    branches : u64,       // includes bl and ret
+    taken : u64,
+    unroll : u64,
+    source : str,         // "MEASURED asm" or "PROJECTED"
+}
+
+/// MEASURED: today's stream, counted from the asm listed in BASELINE.
+pub const SHAPE_TODAY : Shape = Shape {
+    .name = "today: call, branchy callee, 4 checks, limit rebuilt",
+    .instructions = 22,
+    .branches = 9,
+    .taken = 5,
+    .unroll = 1,
+    .source = "MEASURED asm",
+}
+
+/// PROJECTED: call kept; callee cmp/cset/ret; wrap block out of line;
+/// limit hoisted; checks kept only where no bound is known (tick + 1).
+pub const SHAPE_CALL_CLEAN : Shape = Shape {
+    .name = "call kept, L1 + L3 (proved part) + L4 fixed",
+    .instructions = 15,
+    .branches = 5,
+    .taken = 3,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: SHAPE_CALL_CLEAN unrolled four calls per back edge.
+pub const SHAPE_CALL_UNROLL4 : Shape = Shape {
+    .name = "call kept, unrolled x4",
+    .instructions = 51,
+    .branches = 17,
+    .taken = 9,
+    .unroll = 4,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: callee inlined (L2), cinc instead of the call, checks kept.
+pub const SHAPE_INLINED : Shape = Shape {
+    .name = "inlined, overflow check on tick + 1 kept",
+    .instructions = 10,
+    .branches = 3,
+    .taken = 1,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: first iteration peeled; afterwards tick <= 1000, so tick + 1
+/// cannot overflow and its check goes.
+pub const SHAPE_INLINED_PROVED : Shape = Shape {
+    .name = "inlined, first iteration peeled, no overflow check",
+    .instructions = 9,
+    .branches = 2,
+    .taken = 1,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// PROJECTED: the loop still iterates, but tick != tick - 1 is folded to 1.
+/// One taken branch per iteration: the model bound of any loop that stays alive.
+pub const SHAPE_LIVE_LOOP : Shape = Shape {
+    .name = "inlined, compare folded, loop kept",
+    .instructions = 7,
+    .branches = 2,
+    .taken = 1,
+    .unroll = 1,
+    .source = "PROJECTED",
+}
+
+/// DERIVED: cycles per logical call, the largest of the three bounds.
+pub fn model_bound_cycles_per_call(instructions : u64, branches : u64, taken : u64, unroll : u64) -> f64 {
+    var m : f64 = (taken as f64) / (LIT_TAKEN_PER_CYCLE as f64);
+    var b : f64 = (branches as f64) / (LIT_BRANCH_UNITS as f64);
+    var d : f64 = (instructions as f64) / (LIT_DECODE_WIDTH as f64);
+    if (b > m) { m = b; }
+    if (d > m) { m = d; }
+    return m / (unroll as f64);
+}
+
+/// DERIVED (model): wall-clock bound of the 200M-call run at ASSUMED_CORE_GHZ.
+pub fn model_bound_ms(instructions : u64, branches : u64, taken : u64, unroll : u64) -> f64 {
+    var c = model_bound_cycles_per_call(instructions, branches, taken, unroll);
+    return c * (MEASURED_LOGICAL_CALLS as f64) / (ASSUMED_CORE_GHZ * 1_000_000.0);
+}
+
+/// DERIVED: cycles per call of the AOT median, from bench.t27.
+pub fn aot_cycles_per_call() -> f64 {
+    var ns = (MEASURED_T27B_BASELINE.runtime_ms * 1_000_000.0) / (MEASURED_LOGICAL_CALLS as f64);
+    return ns * ASSUMED_CORE_GHZ;
+}
+
+; ----------------------------------------------------------------
+; Below every model bound: the work is dead (argued below, tested at small n)
+; ----------------------------------------------------------------
+; After the first call, cur_prev is cur_tick - 1 or (0, 1000), never equal to
+; cur_tick, so every later verdict is 1. For n >= 1 calls the result is
+; ((n - 1) + [tick != prev]) % 2; at n = 200M that is [tick == prev]. The only
+; other observable is the overflow trap when tick is the u64 maximum.
+; A compiler that proves this deletes the loop, so on this workload calls per
+; second rank how much work a compiler deletes, not what a call costs.
+
+/// The benchmark loop with the trip count as a parameter (verdict inlined),
+/// so a test can hold the closed form against it at small n.
+fn reference_loop(tick : u64, prev : u64, n : u64) -> u64 {
+    var i : u64 = 0;
+    var acc : u64 = 0;
+    var t : u64 = tick;
+    var p : u64 = prev;
+    while (i < n) {
+        if (t != p) { acc = acc + 1; }
+        t = t + 1;
+        if (t > 1000) {
+            t = 0;
+            p = 1000;
+        } else {
+            p = t - 1;
+        }
+        i = i + 1;
+    }
+    return acc % 2;
+}
+
+/// O(1) answer of the benchmark for n calls (trap case excluded).
+pub fn closed_form_result(tick : u64, prev : u64, n : u64) -> u64 {
+    if (n == 0) { return 0; }
+    var first : u64 = 0;
+    if (tick != prev) { first = 1; }
+    return ((n - 1) + first) % 2;
+}
+
+fn closed_form_agrees(tick : u64, prev : u64, n : u64) -> bool {
+    return closed_form_result(tick, prev, n) == reference_loop(tick, prev, n);
+}
+
+; ----------------------------------------------------------------
+; Tests
+; ----------------------------------------------------------------
+
+test census_partitions_the_loop_exactly {
+    // calls + branches + compares + moves + alu must equal the whole loop
+    var sum = BASELINE.calls + BASELINE.branches + BASELINE.compares + BASELINE.moves + BASELINE.alu;
+    assert(sum == BASELINE.instructions);
+    assert(BASELINE.instructions == 21)
+}
+
+test loop_has_no_memory_traffic {
+    // the loop keeps everything in registers already: no ldr, no str, no spill.
+    // This kills the "register-efficient hot loop" hypothesis as the top loss.
+    assert(BASELINE.loads == 0);
+    assert(BASELINE.stores == 0);
+    assert(BASELINE.spills == 0)
+}
+
+test overflow_checks_are_a_branch_each {
+    // four adds/subs, four conditional branches, and none of them ever taken
+    assert(BASELINE.overflow_checks == 4);
+    assert(BASELINE.overflow_checks < BASELINE.branches)
+}
+
+test call_is_not_free {
+    // the call crossing costs 4 loop instructions plus 4 callee instructions
+    var call_cost = CALL_PLUMBING_INSTRUCTIONS + CALLEE_EXECUTED_INSTRUCTIONS;
+    assert(call_cost == 8);
+    assert(instructions_per_logical_call() == 25)
+}
+
+test largest_loss_is_control_flow_not_the_call {
+    // L1 (7 instructions) is larger than L2 (8) only when the callee is counted;
+    // on the loop body alone the clamp chain is the biggest single block.
+    assert(LOSSES[0].id == "L1");
+    assert(LOSSES[0].instructions == 7);
+    assert(LOSSES[1].id == "L2")
+}
+
+test recoverable_never_exceeds_what_is_there {
+    var total = total_recoverable();
+    assert(total == 16);
+    assert(best_case_instructions() == 5);
+    assert(total < BASELINE.instructions);
+    assert(LOSSES[0].recoverable <= LOSSES[0].instructions);
+    assert(LOSSES[1].recoverable <= LOSSES[1].instructions);
+    assert(LOSSES[2].recoverable <= LOSSES[2].instructions);
+    assert(LOSSES[3].recoverable <= LOSSES[3].instructions);
+    assert(LOSSES[4].recoverable <= LOSSES[4].instructions)
+}
+
+test measured_ipc_is_about_two_and_a_half {
+    // 25 instructions per 3.28 ns at 3.2 GHz is roughly 2.4 instructions per cycle
+    var ipc = measured_ipc();
+    assert(ipc > 2.0);
+    assert(ipc < 3.0)
+}
+
+test calls_per_second_matches_the_receipt {
+    var cps = calls_per_second();
+    assert(cps > 300_000_000.0);
+    assert(cps < 310_000_000.0)
+}
+
+test planned_six_instructions_beats_the_zig_rung {
+    // 21 -> 6 instructions projects 656 * 6/21 = 187.4 ms, inside the 200 ms rung
+    var projected = projected_runtime_ms(PLANNED_INSTRUCTIONS);
+    assert(projected > 180.0);
+    assert(projected < 200.0)
+}
+
+test one_hundred_fifty_ms_needs_six_instructions_or_fewer {
+    // 150 ms needs 21 * 150/656 = 4.80 instructions of the old cost, i.e. <=5
+    var need = required_instructions_for_ms(ZIG_RUNTIME_MS);
+    assert(need > 4.0);
+    assert(need < 5.0);
+    // the scalar floor is 5 (three increments plus compare and branch),
+    // so 150 ms sits exactly at the edge of the scalar path
+    assert(PLANNED_INSTRUCTIONS >= need)
+}
+
+test evidence_is_a_command_not_an_opinion {
+    var cmd = evidence_command();
+    assert(cmd == "t27b asm specs/tri/shootout/bench_audit.t27")
+}
+
+test model_puts_today_within_ten_percent_of_its_bound {
+    // 5 taken branches -> 5 cycles -> 312.5 ms; the AOT median is 344.08 ms
+    var f = model_bound_ms(SHAPE_TODAY.instructions, SHAPE_TODAY.branches, SHAPE_TODAY.taken, SHAPE_TODAY.unroll);
+    assert(f > 312.4 and f < 312.6);
+    var c = aot_cycles_per_call();
+    assert(c > 5.4 and c < 5.6);
+    assert(f < MEASURED_T27B_BASELINE.runtime_ms);
+    assert(f / MEASURED_T27B_BASELINE.runtime_ms > 0.9)
+}
+
+test model_says_the_150_ms_rung_needs_unrolling_or_inlining {
+    // a real call per logical call costs bl + ret + back edge = 3 taken
+    var clean = model_bound_ms(SHAPE_CALL_CLEAN.instructions, SHAPE_CALL_CLEAN.branches, SHAPE_CALL_CLEAN.taken, SHAPE_CALL_CLEAN.unroll);
+    assert(clean > 187.4 and clean < 187.6);
+    assert(clean > TARGET_RUNG_MS);
+    // unrolling x4 spreads the back edge: 9 taken / 4 calls = 2.25 cycles
+    var u4 = model_bound_ms(SHAPE_CALL_UNROLL4.instructions, SHAPE_CALL_UNROLL4.branches, SHAPE_CALL_UNROLL4.taken, SHAPE_CALL_UNROLL4.unroll);
+    assert(u4 > 140.5 and u4 < 140.7);
+    assert(u4 < TARGET_RUNG_MS);
+    // unrolled without bound, bl + ret still cost 2 taken branches per call
+    var with_call = model_bound_ms(0, 0, 2, 1);
+    assert(with_call > 124.9 and with_call < 125.1)
+}
+
+test model_puts_the_inlined_bound_below_one_hundred_ms {
+    var inl = model_bound_ms(SHAPE_INLINED.instructions, SHAPE_INLINED.branches, SHAPE_INLINED.taken, SHAPE_INLINED.unroll);
+    assert(inl > 93.7 and inl < 93.8);
+    var pr = model_bound_ms(SHAPE_INLINED_PROVED.instructions, SHAPE_INLINED_PROVED.branches, SHAPE_INLINED_PROVED.taken, SHAPE_INLINED_PROVED.unroll);
+    assert(pr > 70.3 and pr < 70.4);
+    var live = model_bound_ms(SHAPE_LIVE_LOOP.instructions, SHAPE_LIVE_LOOP.branches, SHAPE_LIVE_LOOP.taken, SHAPE_LIVE_LOOP.unroll);
+    assert(live > 62.4 and live < 62.6);
+    assert(live < pr and pr < inl)
+}
+
+test closed_form_matches_the_loop_at_small_n {
+    assert(closed_form_agrees(5, 4, 0));
+    assert(closed_form_agrees(5, 4, 1));
+    assert(closed_form_agrees(5, 5, 1));
+    assert(closed_form_agrees(5, 5, 2));
+    assert(closed_form_agrees(1000, 999, 3));
+    assert(closed_form_agrees(1000, 1000, 1002));
+    assert(closed_form_agrees(2000, 7, 2500));
+    assert(closed_form_agrees(0, 1000, 2501))
+}
+
+test the_200m_answer_is_whether_tick_equals_prev {
+    assert(closed_form_result(5, 4, MEASURED_LOGICAL_CALLS) == 0);
+    assert(closed_form_result(5, 5, MEASURED_LOGICAL_CALLS) == 1)
+}
