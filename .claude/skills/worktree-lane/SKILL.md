@@ -27,6 +27,10 @@ behind a step lives in one place and is pointed at, not copied: landing is `own-
 1. **Room first.** `df -g .` shows more than 5.4 GiB free (the app refuses a worktree below that) and `uptime`
    shows a load average under 40. Heavy builds, sweeps and benchmarks never run on the Mac: they go to the lab
    or a T27 OS pane (owner, 2026-10-09).
+   Under 5.4 GiB free, make no second tree (two docs lanes made outside the one home on 2026-10-30 and 10-31
+   broke step 4): for a small docs or spec change, cut a branch in the session's own worktree,
+   `git switch -c <branch> origin/master`; untracked files stay. A heavy step still goes to a pane and still
+   needs its own room.
 2. **Issue.** `gh issue list --search "<words>"` first; reuse an open issue. A new one has the four headings
    Boundary / User Scenarios / Requirements / Success Criteria (skill `issue-shape`), English, ASCII, filed with
    `--body-file`. Two issues whose Boundary names the same file run one after the other: give each its own
