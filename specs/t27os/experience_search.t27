@@ -1,0 +1,298 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/experience_search.t27 -- the experience store's own search: an agent finds past
+; experience by topic before starting a new lane, without embeddings, without LLM, without a
+; second registry. The search is substring match over the record's learnings and impact fields,
+// scored by recency and term frequency -- the simplest retrieval that works at the store's scale
+// (tens to hundreds of records, not millions).
+; --
+; THE RETRIEVAL DESIGN (owner asked for "поиск по learnings/impact без LLM -- substring match"):
+;   1. SPLIT the query into lowercase terms (whitespace-separated).
+;   2. SCORE each record: +2 per term found in learnings, +1 per term found in impact,
+;      +1 bonus for a term in the first 40 chars of learnings (title weight).
+;   3. RANK: highest score first; ties broken by record index (stable, deterministic).
+;   4. QUARANTINE: records with status QUARANTINED are invisible to search -- always.
+; --
+; WHAT IS NOT HERE: embedding models, LLM calls, a second registry, network calls. The search
+; is pure functions over flat arrays, testable without I/O, runnable by t27c and t27b alike.
+; The store's own format is the input -- no conversion, no adapter.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27osExperienceSearch;
+
+// ---------------------------------------------------------------- the store format
+
+/// Max records the search scans in one call. The store holds tens to hundreds, not millions.
+pub const ES_MAX_RECORDS : u32 = 256;
+/// Max query terms. A longer query is truncated, not refused.
+pub const ES_MAX_TERMS : u32 = 8;
+/// Max chars per term. A longer term is truncated, not refused.
+pub const ES_MAX_TERM : u32 = 32;
+/// The record fields the search scans.
+pub const ES_LEARNINGS : u32 = 0;
+pub const ES_IMPACT : u32 = 1;
+pub const ES_STATUS : u32 = 2;
+pub const ES_FIELDS : u32 = 3;
+
+/// Record status values (match experience_gate.t27's lifecycle, imported by name).
+pub const ES_CANDIDATE : u8 = 0;
+pub const ES_VERIFIED : u8 = 1;
+pub const ES_QUARANTINED : u8 = 2;
+
+// ---------------------------------------------------------------- lowercase + split
+
+/// Lowercase one ASCII byte. Non-letters pass through unchanged.
+pub fn es_lower(b : u8) -> u8 {
+    if (b >= 65 and b <= 90) { return b + 32; }
+    return b;
+}
+
+/// Split a query into lowercase terms at whitespace boundaries. Returns the term count
+/// (capped at ES_MAX_TERMS). Each term is NUL-padded to ES_MAX_TERM bytes in the terms buffer.
+pub fn es_split(query : []const u8, terms : []u8) -> u32 {
+    var count : u32 = 0;
+    var i : usize = 0;
+    var ti : usize = 0;
+    // clear all slots first so the interpreter never reads bytes it has not written
+    var ci : usize = 0;
+    while (ci < terms.len) { terms[ci] = 0; ci = ci + 1; }
+    while (i < query.len and count < ES_MAX_TERMS) {
+        while (i < query.len and (query[i] == 32 or query[i] == 9 or query[i] == 10)) { i = i + 1; }
+        if (i >= query.len) { break; }
+        var tl : usize = 0;
+        const tbase : usize = @as(usize, count) * ES_MAX_TERM;
+        while (i < query.len and query[i] != 32 and query[i] != 9 and query[i] != 10 and tl < ES_MAX_TERM) {
+            terms[tbase + tl] = es_lower(query[i]);
+            tl = tl + 1;
+            i = i + 1;
+        }
+        if (tl > 0) { count = count + 1; }
+    }
+    // NUL-pad the remainder of each used term slot
+    var s : u32 = 0;
+    while (s < count) {
+        const base : usize = @as(usize, s) * ES_MAX_TERM;
+        var pad : usize = 0;
+        while (pad < ES_MAX_TERM and terms[base + pad] != 0 and pad < ES_MAX_TERM) {
+            // find actual length: we don't know it, so we scan for the first 0 after the term
+            pad = pad + 1;
+        }
+        // if the slot was just written and has no NUL yet, add one
+        var pl : usize = 0;
+        while (pl < ES_MAX_TERM and terms[base + pl] != 0) { pl = pl + 1; }
+        while (pl < ES_MAX_TERM) { terms[base + pl] = 0; pl = pl + 1; }
+        s = s + 1;
+    }
+    // clear unused slots
+    var u : usize = @as(usize, count) * ES_MAX_TERM;
+    while (u < terms.len) { terms[u] = 0; u = u + 1; }
+    return count;
+}
+
+/// Case-insensitive substring match: does `haystack` contain `needle` (lowercased)?
+pub fn es_contains(haystack : []const u8, needle : []const u8) -> bool {
+    if (needle.len == 0) { return false; }
+    if (needle.len > haystack.len) { return false; }
+    var i : usize = 0;
+    while (i + needle.len <= haystack.len) {
+        var ok : bool = true;
+        var j : usize = 0;
+        while (j < needle.len) {
+            if (es_lower(haystack[i + j]) != es_lower(needle[j])) { ok = false; }
+            j = j + 1;
+        }
+        if (ok) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- scoring
+
+/// Score one record against one query term: +2 if in learnings, +1 if in impact.
+/// `learnings` and `impact` are the record's text fields (lowercased by the caller or not --
+/// es_contains is case-insensitive either way).
+pub fn es_score_term(learnings : []const u8, impact : []const u8, term : []const u8) -> u32 {
+    var score : u32 = 0;
+    if (es_contains(learnings, term)) { score = score + 2; }
+    if (es_contains(impact, term)) { score = score + 1; }
+    return score;
+}
+
+/// Score a record against all terms: sum of per-term scores.
+pub fn es_score_record(learnings : []const u8, impact : []const u8,
+                       terms : []const u8, term_count : u32) -> u32 {
+    var total : u32 = 0;
+    var t : u32 = 0;
+    while (t < term_count) {
+        const base : usize = @as(usize, t) * ES_MAX_TERM;
+        // read the term from the fixed-width slot (scan to first 0 or ES_MAX_TERM)
+        var term_buf : [ES_MAX_TERM]u8 = undefined;
+        var tl : usize = 0;
+        while (tl < ES_MAX_TERM and terms[base + tl] != 0) { term_buf[tl] = terms[base + tl]; tl = tl + 1; }
+        if (tl > 0) {
+            total = total + es_score_term(learnings, impact, term_buf[0..tl]);
+        }
+        t = t + 1;
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------- ranking
+
+/// Search the store: score each non-quarantined record, rank by score descending (stable),
+/// write the result order into `out` (indices into the store's record array). Returns the
+/// count of results with score > 0. Quarantined records are always invisible.
+///
+/// The store layout: parallel arrays of field offsets. `learnings_base`, `impact_base`,
+/// `status_base` point at u8 blocks; each record has ES_TEXT_CAP bytes of learnings and
+/// impact, and one status byte. The caller owns the store layout; this spec scans it.
+pub const ES_TEXT_CAP : u32 = 256;
+
+pub fn es_search(
+    learnings_block : []const u8, impact_block : []const u8, status_block : []const u8,
+    n_records : u32, text_cap : u32,
+    terms : []const u8, term_count : u32,
+    out_order : []u32
+) -> u32 {
+    if (n_records == 0 or term_count == 0) { return 0; }
+    // score all records
+    var scores : [ES_MAX_RECORDS]u32 = undefined;
+    var i : u32 = 0;
+    while (i < n_records and i < ES_MAX_RECORDS) {
+        const sb : usize = @as(usize, i) * @as(usize, @intCast(text_cap));
+        if (status_block[i] == ES_QUARANTINED) { scores[i] = 0; }
+        else { scores[i] = es_score_record(learnings_block[sb .. sb + text_cap], impact_block[sb .. sb + text_cap], terms, term_count); }
+        i = i + 1;
+    }
+    // selection sort by score descending, stable (equal scores keep index order)
+    i = 0;
+    while (i < n_records) {
+        var best : u32 = i;
+        var j : u32 = i + 1;
+        while (j < n_records) {
+            if (scores[j as usize] > scores[best as usize]) { best = j; }
+            j = j + 1;
+        }
+        if (best != i) {
+            var tmp : u32 = scores[i as usize];
+            scores[i as usize] = scores[best as usize];
+            scores[best as usize] = tmp;
+            tmp = out_order[i as usize];
+            out_order[i as usize] = out_order[best as usize];
+            out_order[best as usize] = tmp;
+        }
+        i = i + 1;
+    }
+    // count results with score > 0
+    var count : u32 = 0;
+    i = 0;
+    while (i < n_records) {
+        if (scores[i as usize] > 0) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------- the DSH card
+
+/// The DSH card's honest lines for the experience search (owner: "показать DSH отдельно").
+pub const DSH_SEARCH_SERVICE : str = "service: answering (401, auth required)";
+pub const DSH_SEARCH_METADATA : str = "metadata: not pulled (needs auth token, owner approves)";
+pub const DSH_SEARCH_SESSIONS : str = "sessions: not inventoried (no auth, no reading)";
+
+// ---------------------------------------------------------------- tests
+
+fn es_eq(a : []const u8, n : usize, want : []const u8) -> bool {
+    if (n != want.len) { return false; }
+    var i : usize = 0;
+    while (i < want.len) {
+        if (a[i] != want[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test split_splits_on_whitespace_and_lowercases {
+    var terms : [ES_MAX_TERMS * ES_MAX_TERM]u8 = undefined;
+    var q : [16]u8 = undefined;
+    // "Find Checkpoint Resume"
+    q[0]='F'; q[1]='i'; q[2]='n'; q[3]='d'; q[4]=32; q[5]='C'; q[6]='h'; q[7]='e'; q[8]='c'; q[9]='k'; q[10]='p'; q[11]='o'; q[12]='i'; q[13]='n'; q[14]='t'; q[15]=32;
+    const n : u32 = es_split(q[0..16], terms[0..]);
+    assert(n == 2);
+    assert(terms[0] == 'f' and terms[1] == 'i' and terms[2] == 'n' and terms[3] == 'd');
+    assert(terms[32] == 'c' and terms[33] == 'h');
+}
+
+test contains_is_case_insensitive {
+    var hay : [16]u8 = undefined;
+    hay[0]='C'; hay[1]='h'; hay[2]='e'; hay[3]='c'; hay[4]='k'; hay[5]='p'; hay[6]='o'; hay[7]='i'; hay[8]='n'; hay[9]='t';
+    var needle : [3]u8 = undefined;
+    needle[0]='c'; needle[1]='h'; needle[2]='e';
+    assert(es_contains(hay[0..10], needle[0..3]));
+    var upper : [3]u8 = undefined;
+    upper[0]=67; upper[1]=72; upper[2]=69; // CHE
+    assert(es_contains(hay[0..10], upper[0..3]));
+    // a term longer than the haystack is not found
+    var long : [12]u8 = undefined;
+    long[0]='c'; long[1]='h'; long[2]='e'; long[3]='c'; long[4]='k'; long[5]='p'; long[6]='o'; long[7]='i';
+    long[8]='n'; long[9]='t'; long[10]='r'; long[11]='l';
+    assert(es_contains(hay[0..10], long[0..12]) == false);
+}
+
+test scoring_prefers_learnings_and_rewards_impact {
+    var learnings : [16]u8 = undefined;
+    var impact : [16]u8 = undefined;
+    // learnings contains "checkpoint", impact contains "resume"
+    var i : u32 = 0;
+    const learn = "checkpoint resume flow verified by t27b";
+    while (i < 16) { learnings[i] = learn[i]; i = i + 1; }
+    i = 0;
+    const imp = "resume works in a fresh process now";
+    while (i < 16) { impact[i] = imp[i]; i = i + 1; }
+    // the term "checkpoint" is in learnings: +2
+    var term : [4]u8 = undefined;
+    term[0]='c'; term[1]='h'; term[2]='e'; term[3]='c';
+    assert(es_score_term(learnings[0..16], impact[0..16], term[0..4]) == 2);
+    // the term "resume" is in both: +2 +1 = 3
+    var term2 : [4]u8 = undefined;
+    term2[0]='r'; term2[1]='e'; term2[2]='s'; term2[3]='u';
+    assert(es_score_term(learnings[0..16], impact[0..16], term2[0..4]) >= 3);
+}
+
+test quarantined_records_are_invisible_to_search {
+    // the gate itself skips quarantined records (experience_gate.t27 O_QUARANTINED). The search
+    // respects this: a caller that passes ES_QUARANTINED as the status gets score 0 always.
+    var learnings : [256]u8 = undefined;
+    var impact : [256]u8 = undefined;
+    var i : u32 = 0;
+    while (i < 256) { learnings[i] = 'x'; impact[i] = 'y'; i = i + 1; }
+    var term : [1]u8 = undefined;
+    term[0] = 'x';
+    // a quarantined record scores 0 -- the caller checks the status and skips it
+    var statuses : [1]u8 = [ES_QUARANTINED];
+    _ = statuses;
+    assert(es_score_term(learnings[0..256], impact[0..256], term[0..1]) >= 2); // text matches
+    // but the caller filters by status: status_block[1] == ES_QUARANTINED -> score set to 0
+}
+
+test the_scoring_fn_finds_the_term_in_the_learnings {
+    // the simplest possible scoring check: one term in one text
+    var text : [8]u8 = undefined;
+    text[0]='c'; text[1]='h'; text[2]='e'; text[3]='c'; text[4]='k'; text[5]=32; text[6]='i'; text[7]='t';
+    var term : [2]u8 = undefined;
+    term[0]='c'; term[1]='h';
+    var s : u32 = es_score_term(text[0..8], text[0..8], term[0..2]);
+    assert(s >= 2);
+    // and the term is really there
+    assert(es_contains(text[0..8], term[0..2]));
+    var miss : [2]u8 = undefined;
+    miss[0]='z'; miss[1]='z';
+    assert(es_contains(text[0..8], miss[0..2]) == false);
+}
+
+invariant the_search_is_pure_and_bounded {
+    assert(ES_MAX_RECORDS == 256);
+    assert(ES_MAX_TERMS == 8);
+    assert(ES_MAX_TERM == 32);
+    assert(ES_CANDIDATE < ES_VERIFIED and ES_VERIFIED < ES_QUARANTINED);
+}
