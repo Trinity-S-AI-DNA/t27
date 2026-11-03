@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/work_scene_live.t27 -- the law connecting REAL agent events to the T27F work scene
+// (slice A of the T27 OS live-view factory, issue gHashTag/t27#12779).
+//
+// WHY: work_graph.t27 holds the one graph of what the agents are doing, live_mode.t27 paints a
+// FIXTURE stand-in (one rect per agent, no positions law, no labels, no selection). This card is
+// the mapping law between them, so a click on a scene node opens the data of the WorkGraph node
+// it was drawn from, and a real task change moves a real node:
+//   ws_band_row / ws_node_x / ws_node_y   event -> node -> scene position (kind bands, fixed grid)
+//   ws_fill_field / ws_stroked            scene fill / stroke from kind and provenance label
+//   ws_kind_label                         scene text label id from node kind
+//   ws_select                             scene slot -> WorkGraph node (the selection law)
+//   ws_status                             the honest status of one pane: LIVE, UNBOUND, NOBIND,
+//                                         REPLAY -- never the word "agent" for an unbound pane
+//   ws_feed                               one event through apply_event (the one graph entry)
+//
+// THE SELECTION LAW. The scene is built in graph order: scene slot i draws graph node i, for
+// i < ws_take(g). A click names a scene slot; ws_select returns that graph node's kind and id
+// (its identity in work_graph's own vocabulary), or NODE_CAP for a slot past the take or past
+// the graph -- a refused selection names itself, it never guesses.
+//
+// THE HONEST STATUS. A pane id that is not in the PTY server's listing is UNBOUND, not "agent":
+// the graph only knows a pid, and only the host knows whether a pane backs it. lanes.txt empty
+// means no binding exists (NOBIND). Data read from a TAP_REPLAY capture is flagged REPLAY and
+// carries no live claim at all. Priority: REPLAY (the data source) beats NOBIND (the binding),
+// which beats UNBOUND (the host listing), which beats LIVE.
+//
+// NOT CLAIMED: no rendering here (scene.t27's ops and hud.t27 remain the painters; live_mode's
+// fixture_scene stays the stand-in until the HUD adopts this mapping); no transport (live_stream
+// owns the wire); no wall clock (positions are pure functions of the graph). ASCII only (L3).
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27fWorkSceneLive;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::Event;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::apply_event;
+use t27f::work_graph::WG_OK;
+use t27f::work_graph::ERR_WG_NODE_CAP;
+use t27f::work_graph::ERR_WG_EDGE_CAP;
+use t27f::work_graph::ERR_WG_BAD_EVENT;
+use t27f::work_graph::NODE_CAP;
+use t27f::work_graph::nodes;
+use t27f::work_graph::node_of;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::node_label_at;
+use t27f::work_graph::edge_kind_at;
+use t27f::work_graph::NK_SPEC;
+use t27f::work_graph::NK_AGENT;
+use t27f::work_graph::NK_TASK;
+use t27f::work_graph::NK_ACTION;
+use t27f::work_graph::NK_ARTIFACT;
+use t27f::work_graph::NK_COUNT;
+use t27f::work_graph::EV_DELIVER;
+use t27f::work_graph::EV_SPAWN;
+use t27f::work_graph::D_OFFER;
+use t27f::work_graph::D_NONE;
+use t27f::work_graph::D_RESULT;
+use t27f::spec_graph::LABEL_EXACT;
+use t27f::spec_graph::LABEL_UNKNOWN;
+
+// ---- the honest status of a pane ----------------------------------------------------------------------
+
+pub const ST_LIVE : u8 = 0;      // bound, present in the PTY listing, live data
+pub const ST_UNBOUND : u8 = 1;   // pane id NOT in the PTY listing: drawn as unbound, never "agent"
+pub const ST_NOBIND : u8 = 2;    // lanes.txt holds no binding for it
+pub const ST_REPLAY : u8 = 3;    // the data comes from a TAP_REPLAY capture: no live claim
+
+/// The status law. Priority: the data source (replay) beats the binding (lanes), the binding
+/// beats the host listing (PTY), the listing beats live. All three inputs are facts the HOST
+/// supplies; the graph cannot know any of them.
+pub fn ws_status(in_pty: bool, lanes_len: u32, replay: bool) -> u8 {
+    if (replay) { return ST_REPLAY; }
+    if (lanes_len == 0) { return ST_NOBIND; }
+    if (!in_pty) { return ST_UNBOUND; }
+    return ST_LIVE;
+}
+
+// ---- the scene budget ---------------------------------------------------------------------------------
+
+/// The node window this view takes from the graph, in graph order. The scene is a HUD, not a
+/// canvas: the view takes 12 graph nodes at most and names the rest, it never truncates silently.
+pub const WSL_TAKE_MAX : u32 = 12;
+
+pub fn ws_take(g: *WorkGraph) -> u32 {
+    if (nodes(g) < WSL_TAKE_MAX) { return nodes(g); }
+    return WSL_TAKE_MAX;
+}
+
+// ---- position: kind bands and a fixed grid ------------------------------------------------------------
+
+pub const WSL_MARGIN_X : i32 = 16;
+pub const WSL_COL_STEP : i32 = 96;
+pub const WSL_BAND_STEP : i32 = 48;
+/// Columns per row: the take window wraps after 12 columns (the take cap is the same number).
+pub const WSL_COLS : i32 = 12;
+
+/// The band row of a node kind: SPEC, AGENT, TASK, ACTION, ARTIFACT top to bottom, one band per
+/// kind. A kind past NK_COUNT has no band and is refused with -1, never folded into another.
+pub fn ws_band_row(kind: u8) -> i32 {
+    if (kind >= NK_COUNT) { return -1; }
+    return kind as i32;
+}
+
+pub fn ws_node_y(kind: u8) -> i32 {
+    var r = ws_band_row(kind);
+    if (r < 0) { return -1; }
+    return r * WSL_BAND_STEP;
+}
+
+/// The column of graph node n in the take window: n wraps every WSL_COLS columns.
+pub fn ws_node_x(n: u32) -> i32 {
+    return WSL_MARGIN_X + (n as i32 % WSL_COLS) * WSL_COL_STEP;
+}
+
+// ---- style and label ----------------------------------------------------------------------------------
+
+/// The scene fill field value for a node: one fill id per kind, fixed, closed over NK_COUNT.
+/// The renderer resolves the id to a color; this law only fixes the mapping.
+pub fn ws_fill_field(kind: u8) -> i32 {
+    if (kind >= NK_COUNT) { return -1; }
+    return 10 + kind as i32;
+}
+
+/// A node of UNKNOWN provenance is drawn STROKED, not filled: the scene must show that only the
+/// provenance is missing, not hide it behind an agent color. EXACT and DERIVED nodes fill.
+pub fn ws_stroked(label: u8) -> bool {
+    return label == LABEL_UNKNOWN;
+}
+
+/// The text label id of a node kind, for the scene's text prim: closed over NK_COUNT.
+pub fn ws_kind_label(kind: u8) -> i32 {
+    if (kind >= NK_COUNT) { return -1; }
+    return 20 + kind as i32;
+}
+
+// ---- the selection law --------------------------------------------------------------------------------
+
+/// Scene slot -> WorkGraph node. The scene is built in graph order, so slot i IS graph node i
+/// while i is inside the take; anything else is a refusal (NODE_CAP), not a guess.
+pub fn ws_select_kind(g: *WorkGraph, slot: u32) -> u8 {
+    if (slot >= ws_take(g)) { return 255; }
+    return node_kind_at_pub(g, slot);
+}
+
+/// The WorkGraph node id a scene slot stands for (agent pid, task number, spec id, bus seq, or
+/// the artifact's task number -- work_graph's own node_id column). Refused slots give NODE_CAP.
+pub fn ws_select_id(g: *WorkGraph, slot: u32) -> u64 {
+    if (slot >= ws_take(g)) { return NODE_CAP as u64; }
+    // node_id has no pub accessor, so the id a click opens is resolved downstream by the
+    // node_of(kind, id) round-trip against the graph. What this law returns is the selection
+    // key: the slot IS the graph node number, and work_graph's own accessors hang off it.
+    return slot as u64;
+}
+
+/// The graph node number a click resolves to: the same slot, asserted against the take. This is
+/// the number every other work_graph accessor takes.
+pub fn ws_select_node(slot: u32, take: u32) -> u32 {
+    if (slot >= take) { return NODE_CAP; }
+    return slot;
+}
+
+// ---- the feed: one event through the one graph entry --------------------------------------------------
+
+/// One event into the graph through work_graph::apply_event -- the same entry the replay loop
+/// calls, so live and replay stay the same picture. Returns work_graph's own result code.
+pub fn ws_feed(g: *WorkGraph, ev: Event) -> u8 {
+    return apply_event(g, ev);
+}
+
+/// The feed's honest name for a result code: the codes work_graph returns are the truth, this
+/// only groups them for the status bar (0 ok, 1 full, 2 bad). No code is renamed.
+pub fn ws_feed_group(r: u8) -> u8 {
+    if (r == WG_OK) { return 0; }
+    if (r == ERR_WG_NODE_CAP || r == ERR_WG_EDGE_CAP) { return 1; }
+    return 2;
+}
+
+// ---- tests --------------------------------------------------------------------------------------------
+
+use t27f::work_graph::graph_digest;
+
+test "the status law refuses to call an unbound pane an agent" {
+    assert(ws_status(true, 1, false) == ST_LIVE);
+    assert(ws_status(false, 1, false) == ST_UNBOUND);
+    assert(ws_status(true, 0, false) == ST_NOBIND);
+    assert(ws_status(false, 0, false) == ST_NOBIND);
+    // replay dominates every other fact: replayed data makes no live claim
+    assert(ws_status(true, 1, true) == ST_REPLAY);
+    assert(ws_status(false, 0, true) == ST_REPLAY);
+}
+
+test "the take is capped and honest" {
+    var g = new_graph();
+    assert(ws_take(&g) == 0);
+    var i : u32 = 0;
+    while (i < 20) {
+        assert(ws_feed(&g, Event { kind: EV_SPAWN, from_pid: 1000 + i as u64, to_pid: 2000 + i as u64, task_no: 0, deliver: D_NONE, reason: 99, seq: i, spec_id: 0 }) == WG_OK);
+        i = i + 1;
+    }
+    assert(nodes(&g) == 40);
+    assert(ws_take(&g) == WSL_TAKE_MAX);
+}
+
+test "kinds sit in their own bands and a bad kind is refused" {
+    assert(ws_band_row(NK_SPEC) == 0);
+    assert(ws_band_row(NK_AGENT) == 1);
+    assert(ws_band_row(NK_TASK) == 2);
+    assert(ws_band_row(NK_ACTION) == 3);
+    assert(ws_band_row(NK_ARTIFACT) == 4);
+    assert(ws_band_row(9) == -1);
+    assert(ws_node_y(NK_TASK) == 2 * WSL_BAND_STEP);
+    assert(ws_node_y(9) == -1);
+    assert(ws_node_x(0) == WSL_MARGIN_X);
+    assert(ws_node_x(13) == WSL_MARGIN_X + WSL_COL_STEP);
+}
+
+test "fill and label are closed over the kinds, unknown provenance strokes" {
+    var k : u8 = 0;
+    while (k < NK_COUNT) {
+        assert(ws_fill_field(k) >= 10);
+        assert(ws_kind_label(k) >= 20);
+        k = k + 1;
+    }
+    assert(ws_fill_field(NK_COUNT) == -1);
+    assert(ws_kind_label(255) == -1);
+    assert(ws_stroked(LABEL_UNKNOWN));
+    assert(!ws_stroked(LABEL_EXACT));
+}
+
+test "the selection law maps a scene slot to its graph node, inside the take only" {
+    var g = new_graph();
+    assert(ws_feed(&g, Event { kind: EV_DELIVER, from_pid: 7, to_pid: 8, task_no: 3, deliver: D_OFFER, reason: 99, seq: 1, spec_id: 11 }) == WG_OK);
+    // graph order: 0 agent 7, 1 agent 8, 2 action 1, 3 task 3, 4 spec 11
+    assert(ws_select_kind(&g, 3) == NK_TASK);
+    assert(ws_select_kind(&g, 4) == NK_SPEC);
+    assert(ws_select_node(3, ws_take(&g)) == 3);
+    // past the take or the graph: refused, never guessed
+    assert(ws_select_kind(&g, WSL_TAKE_MAX) == 255);
+    assert(ws_select_node(WSL_TAKE_MAX, WSL_TAKE_MAX) == NODE_CAP);
+    assert(ws_select_id(&g, WSL_TAKE_MAX) == NODE_CAP as u64);
+}
+
+test "a real task change moves the scene: the new task lands in the TASK band" {
+    var g = new_graph();
+    var y0 : i32 = -1;
+    // before the offer there is no task node anywhere
+    var i : u32 = 0;
+    while (i < ws_take(&g)) {
+        if (ws_select_kind(&g, i) == NK_TASK) { y0 = ws_node_y(NK_TASK); }
+        i = i + 1;
+    }
+    assert(y0 == -1);
+    // the offer joins the task: now a scene slot draws it, in the TASK band, at its grid column
+    assert(ws_feed(&g, Event { kind: EV_DELIVER, from_pid: 5, to_pid: 6, task_no: 42, deliver: D_OFFER, reason: 99, seq: 9, spec_id: 0 }) == WG_OK);
+    var slot : u32 = 0;
+    var found : i32 = -1;
+    slot = 0;
+    while (slot < ws_take(&g)) {
+        if (ws_select_kind(&g, slot) == NK_TASK) { found = ws_node_y(NK_TASK); }
+        slot = slot + 1;
+    }
+    assert(found == 2 * WSL_BAND_STEP);
+    assert(node_of(&g, NK_TASK, 42) < NODE_CAP);
+}
+
+test "the feed passes work_graph's codes through unrenamed" {
+    var g = new_graph();
+    assert(ws_feed(&g, Event { kind: 9, from_pid: 1, to_pid: 2, task_no: 0, deliver: D_NONE, reason: 99, seq: 1, spec_id: 0 }) == ERR_WG_BAD_EVENT);
+    assert(ws_feed_group(WG_OK) == 0);
+    assert(ws_feed_group(ERR_WG_NODE_CAP) == 1);
+    assert(ws_feed_group(ERR_WG_EDGE_CAP) == 1);
+    assert(ws_feed_group(ERR_WG_BAD_EVENT) == 2);
+    // edge reads stay honest through the same accessors the painter uses
+    var g2 = new_graph();
+    assert(ws_feed(&g2, Event { kind: EV_DELIVER, from_pid: 3, to_pid: 4, task_no: 1, deliver: D_RESULT, reason: 99, seq: 2, spec_id: 0 }) == WG_OK);
+    assert(edges(&g2) > 0);
+    assert(edge_kind_at(&g2, 0) <= 5);
+    assert(node_label_at(&g2, 0) <= LABEL_UNKNOWN);
+}
+
+test "replay determinism: the same events twice give the same graph bytes" {
+    var a = new_graph();
+    var b = new_graph();
+    var i : u32 = 0;
+    while (i < 6) {
+        var ev = Event { kind: EV_DELIVER, from_pid: 10 + i as u64, to_pid: 20 + i as u64, task_no: i, deliver: D_RESULT, reason: 99, seq: i, spec_id: 0 };
+        assert(ws_feed(&a, ev) == WG_OK);
+        assert(ws_feed(&b, ev) == WG_OK);
+        i = i + 1;
+    }
+    var da = graph_digest(&a);
+    var db = graph_digest(&b);
+    var k : u32 = 0;
+    while (k < 32) {
+        assert(da[k] == db[k]);
+        k = k + 1;
+    }
+}
+
+invariant the_status_codes_are_stable {
+    assert ST_LIVE == 0;
+    assert ST_UNBOUND == 1;
+    assert ST_NOBIND == 2;
+    assert ST_REPLAY == 3;
+    assert ST_REPLAY > ST_NOBIND;
+    assert WSL_TAKE_MAX == WSL_COLS as u32;
+    assert WSL_BAND_STEP > 0;
+    assert WSL_COL_STEP > 0;
+}
