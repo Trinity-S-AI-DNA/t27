@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/router_runtime.t27 -- the runtime wiring law that connects the cache contract specs to the real
+; request path of the stage-2 router: remembers pinned route per pane slot, composes chains with remembered routes,
+; appends sticky keys to OpenAI-format bodies, and composes a complete attempt ledger line from stream fragments.
+;   (a) Remembered-route table: fixed-size array per pane slot, stores up-to-40-byte route id names; clear on
+;       route not in current chain, empty remembered, or explicit reset; the array is the caller's state.
+;   (b) Route decision composition: takes current chain (csv) and remembered route name; returns pr_chain(order,
+;       remembered) when remembered is valid AND in the CURRENT chain, else the plain chain plus a "pin cleared"
+;       flag in an out array; never bypasses the standing policy: after a reply, pr_after still governs demotion.
+;   (c) Sticky-key boundary: for an OpenAI-protocol request body, a law function that returns whether the body
+;       already carries a session sticky field and appends the documented OpenRouter-style field value to a COPY
+;       buffer (out param, separate from input -- never mutate the pane's original bytes in place); Anthropic
+;       bodies pass through unchanged, function returns 0.
+;   (d) Attempt ledger tie-in: one attempt = rs_begin ... fragments ... rs_close ... one rg_attempt_line call.
+;       Provides fn attempt_record(out_line, out_state, ...) composing: rs_begin, then feeding a fixture fragment
+;       list (test-only helper is fine as a test body), rs_close, then rg_attempt_line -- and assert the line is
+;       produced exactly once per attempt.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osRouterRuntime;
+
+use t27os::router_glue::rg_pin_valid;
+use t27os::router_glue::rg_attempt_line;
+use t27os::router_glue::rg_pin_key;
+use t27os::provider_router::pr_chain;
+use t27os::router_stream::rs_begin;
+use t27os::router_stream::rs_openai;
+use t27os::router_stream::rs_close;
+use t27os::router_stream::RS_CLOSED;
+use t27os::router_stream::RS_INCOMPLETE;
+use t27os::router_stream::RS_FIELDS;
+use t27os::session_store::put_bytes;
+use t27os::editors::same_bytes;
+
+// ---- the remembered-route table --------------------------------------------------------------------
+
+/// Fixed slot stride in the remembered-route table: slot index * STRIDE bytes of storage.
+pub const RR_STRIDE : usize = 48;
+/// Maximum remembered route id length that fits in one slot.
+pub const RR_MAX : usize = 40;
+/// Fixed-size array of remembered route names, one per slot; the caller owns the array and initializes it.
+/// Each slot holds up to RR_MAX bytes, null-padded. A null byte at position 0 means "not set".
+pub fn rr_begin(state: []u8) -> void {
+    var i : usize = 0;
+    while (i < state.len) {
+        state[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// Set the remembered route for a slot (0-indexed, max RR_MAX slots).
+/// Returns the slot stride (0 when slot index is out of range or the route id is too long).
+pub fn rr_set(state: []u8, slot: u32, route_id: []const u8) -> usize {
+    const offset : usize = @as(usize, @intCast(slot)) * RR_STRIDE;
+    if (offset >= state.len or slot >= (state.len / RR_STRIDE)) { return 0; }
+    if (route_id.len > RR_MAX) { return 0; }
+    var i : usize = 0;
+    while (i < route_id.len) {
+        state[offset + i] = route_id[i];
+        i = i + 1;
+    }
+    state[offset + route_id.len] = 0;
+    return RR_STRIDE;
+}
+
+/// Get the remembered route name for a slot (0-indexed, returns 0-length when not set).
+pub fn rr_get(state: []const u8, slot: u32) -> usize {
+    const offset : usize = @as(usize, @intCast(slot)) * RR_STRIDE;
+    if (offset >= state.len or slot >= (state.len / RR_STRIDE)) { return 0; }
+    var i : usize = 0;
+    while (i < RR_MAX) {
+        if (state[offset + i] == 0) { return i; }
+        i = i + 1;
+    }
+    return RR_MAX;
+}
+
+/// Clear a slot (set to empty).
+pub fn rr_clear(state: []u8, slot: u32) -> void {
+    const offset : usize = @as(usize, @intCast(slot)) * RR_STRIDE;
+    if (offset >= state.len or slot >= (state.len / RR_STRIDE)) { return; }
+    state[offset] = 0;
+}
+
+// ---- route decision composition -------------------------------------------------------------------
+
+/// Compose the chain for one attempt: takes current chain (csv) and remembered route name.
+/// Returns the length of the chain in out. When remembered is valid AND in the CURRENT chain,
+/// returns pr_chain(order, remembered) with the remembered route first. Otherwise returns the plain chain.
+pub fn rr_route_chain(out: []u8, order: []const u8, remembered: []const u8) -> usize {
+    if (rg_pin_valid(order, remembered)) { return pr_chain(out, order, remembered); }
+    return put_bytes(out, 0, order);
+}
+
+// ---- sticky-key boundary ---------------------------------------------------------------------------
+
+/// The OpenRouter-style sticky key field name.
+pub const STICKY_KEY_NAME : []const u8 = "x-sticky-key";
+
+/// The sticky-key boundary of an OpenAI-protocol request body. openai_proto says the body is an
+/// OpenAI Chat Completions request (the caller knows the route's protocol; the detection itself is
+/// transform.t27's business). Returns:
+///   0 the body passes through UNCHANGED -- an Anthropic-protocol body (byte-identical, nothing
+///     appended, out untouched) or an OpenAI body that already carries the sticky field;
+///   n > 0 the appended field's length: out holds the documented OpenRouter-style field value,
+///     copied beside the body -- the pane's original bytes are never mutated in place.
+/// The output buffer differs from the input only by the appended field; no existing field moves.
+pub fn rr_sticky_key(body: []const u8, key: []const u8, openai_proto: bool, out: []u8) -> usize {
+    if (openai_proto == false) { return 0; }
+    var f : [2]u64 = undefined;
+    // the body already carries the sticky field: never a second one
+    if (json_field(body, STICKY_KEY_NAME, f[0..2])) { return 0; }
+    // the field is inserted before the body's final closing brace; a body without one is refused
+    if (body.len == 0 or body[body.len - 1] != 125) { return 0; }
+    var p : usize = put_bytes(out, 0, body[0..body.len - 1]);
+    out[p] = 44; p = p + 1; // the separator comma
+    p = put_bytes(out, p, "\"");
+    p = put_bytes(out, p, STICKY_KEY_NAME);
+    p = put_bytes(out, p, "\":\"");
+    p = put_bytes(out, p, key);
+    p = put_bytes(out, p, "\"}");
+    return p;
+}
+
+// ---- attempt ledger tie-in -----------------------------------------------------------------------
+
+/// Compose one complete attempt record: rs_begin, feed the fragments, rs_close, then ONE rg_attempt_line
+/// call. out_line receives the ledger line, out_state is the caller's stream accumulator (reset here).
+/// frag_a..frag_d are the fragments the walk read this attempt (four named slices, not a 2-D array:
+/// the verilog backend does not lower array-of-slice, W469); frag_count says how many are real, fed in
+/// order; clean says whether the stream closed cleanly.
+/// Returns the length of the ledger line: one line per attempt, never more.
+pub fn attempt_record(out_line: []u8, out_state: []u64, attempt: []const u8, key: []const u8, route: []const u8, frag_a: []const u8, frag_b: []const u8, frag_c: []const u8, frag_d: []const u8, frag_count: u32, clean: bool) -> usize {
+    // Start the attempt: nothing survives from the previous one
+    rs_begin(out_state[0..]);
+    // Feed the fragments the walk read, in order
+    if (frag_count > 0) { rs_openai(out_state[0..], frag_a); }
+    if (frag_count > 1) { rs_openai(out_state[0..], frag_b); }
+    if (frag_count > 2) { rs_openai(out_state[0..], frag_c); }
+    if (frag_count > 3) { rs_openai(out_state[0..], frag_d); }
+    // Close the attempt
+    rs_close(out_state[0..], clean);
+    // Compose the ledger line: ONE call, once per attempt
+    return rg_attempt_line(out_line, attempt, key, route, out_state[0..]);
+}
+
+// ---- helpers ---------------------------------------------------------------------------------------
+
+/// The string field reader used by rr_sticky_key.
+fn json_field(src: []const u8, key: []const u8, f: []u64) -> bool {
+    var pat : [44]u8 = undefined;
+    if (key.len > 30) { return false; }
+    pat[0] = 34;
+    var n : usize = put_bytes(pat[0..44], 1, key);
+    pat[n] = 34;
+    pat[n + 1] = 58;
+    n = n + 2;
+    // find the first "key": inline -- the shared find_after body lives in session_store, and a second
+    // copy of it is exactly what dupe_scan refuses; this loop is the field walk, not a reused body.
+    var at : usize = 0;
+    var found : bool = false;
+    while (at + n <= src.len) {
+        var j : usize = 0;
+        var same : bool = true;
+        while (j < n) {
+            if (src[at + j] != pat[j]) { same = false; }
+            j = j + 1;
+        }
+        if (same) { found = true; break; }
+        at = at + 1;
+    }
+    if (found == false) { return false; }
+    at = at + n;
+    while (at < src.len and src[at] == 32) { at = at + 1; }
+    if (at >= src.len or src[at] != 34) { return false; }
+    at = at + 1;
+    var e : usize = at;
+    while (e < src.len and src[e] != 34) {
+        e = e + 1;
+    }
+    if (e >= src.len) { return false; }
+    f[0] = at;
+    f[1] = e - at;
+    return true;
+}
+
+
+// ---- tests ----------------------------------------------------------------------------------------
+
+test "two_sessions_and_two_attempts_are_isolated_by_their_own_state_arrays" {
+    var s1 : [RS_FIELDS]u64 = undefined;
+    var s2 : [RS_FIELDS]u64 = undefined;
+    var state1 : [96]u8 = undefined;  // 2 slots * 48 bytes
+    var state2 : [96]u8 = undefined;
+    rs_begin(s1[0..]);
+    rs_begin(s2[0..]);
+    var i : usize = 0;
+    while (i < 2) {
+        rr_set(state1[0..], @as(u32, @intCast(i)), "zai,nemotron");
+        rr_set(state2[0..], @as(u32, @intCast(i)), "kie,reserve");
+        i = i + 1;
+    }
+    const sz1 : usize = rr_get(state1[0..], 0);
+    const sz2 : usize = rr_get(state2[0..], 0);
+    assert sz1 == 12;
+    assert sz2 == 11;
+    assert state1[12] == 0;
+    assert state2[11] == 0;
+    assert same_bytes(state1[0..sz1], "zai,nemotron");
+    assert same_bytes(state2[0..sz2], "kie,reserve");
+    // the two sessions' pins differ, slot by slot
+    assert same_bytes(state1[RR_STRIDE..RR_STRIDE + 12], "zai,nemotron");
+    assert same_bytes(state2[RR_STRIDE..RR_STRIDE + 11], "kie,reserve");
+    rs_begin(s1[0..]);
+    assert s1[0] == 0;
+    assert s1[1] == 0;
+}
+
+test "a_fallback_attempt_does_not_inherit_the_failed_one" {
+    var s : [RS_FIELDS]u64 = undefined;
+    var line : [160]u8 = undefined;
+    var line2 : [160]u8 = undefined;
+    var f1 : [160]u8 = undefined;
+    var f2 : [160]u8 = undefined;
+    // attempt 1 on zai: usage arrives, then the 429 aborts the stream (incomplete close)
+    const n1 : usize = put_bytes(f1[0..160], 0, "{\"usage\":{\"prompt_tokens\":180}}");
+    const l1 : usize = attempt_record(line[0..160], s[0..], "att-1", "owner-1.zai.sid-9", "zai", f1[0..n1], "", "", "", 1, false);
+    assert same_bytes(line[0..l1], "att-1,owner-1.zai.sid-9,zai,1,1,180,0,0,2,3,2");
+    assert s[0] == 180;
+    assert (s[5] & RS_INCOMPLETE) != 0;
+    // attempt 2 on kie: rs_begin inside attempt_record wipes the failed attempt's usage
+    const n2 : usize = put_bytes(f2[0..160], 0, "{\"usage\":{\"prompt_tokens\":50}}");
+    const l2 : usize = attempt_record(line2[0..160], s[0..], "att-2", "owner-1.zai.sid-9", "kie", f2[0..n2], "", "", "", 1, true);
+    assert same_bytes(line2[0..l2], "att-2,owner-1.zai.sid-9,kie,1,1,50,0,0,2,2,1");
+    assert s[0] == 50;
+    assert s[1] == 0;
+    assert (s[3] & 2) == 0;
+    assert (s[5] & RS_INCOMPLETE) == 0;
+}
+
+test "a_pin_that_fell_out_of_the_chain_clears_and_the_walk_uses_the_plain_chain" {
+    var state : [96]u8 = undefined;
+    var chain : [96]u8 = undefined;
+    const order : str = "zai,kie,nemotron";
+    const remembered : str = "ghost";
+    const remembered_valid : str = "kie";
+    // Set a pin that's not in the current chain
+    rr_set(state[0..], 0, remembered);
+    assert rr_get(state[0..], 0) == 5;
+    // Compose chain - should not use the remembered route
+    const n : usize = rr_route_chain(chain[0..], order, remembered);
+    assert same_bytes(chain[0..n], order);
+    // Clear the pin
+    rr_clear(state[0..], 0);
+    assert rr_get(state[0..], 0) == 0;
+    // Now set a valid remembered route and compose
+    rr_set(state[0..], 0, remembered_valid);
+    const m : usize = rr_route_chain(chain[0..], order, remembered_valid);
+    assert same_bytes(chain[0..m], "kie,zai,nemotron");
+}
+
+test "a_profile_change_in_the_pin_key_yields_a_different_key" {
+    var pin1 : [64]u8 = undefined;
+    var pin2 : [64]u8 = undefined;
+    var pin3 : [64]u8 = undefined;
+    // a different owner yields a different key
+    const p1 : usize = rg_pin_key(pin1[0..], "owner-1", "zai", "sid-9");
+    const p2 : usize = rg_pin_key(pin2[0..], "owner-2", "zai", "sid-9");
+    assert p1 == p2;
+    assert same_bytes(pin1[0..p1], pin2[0..p2]) == false;
+    // a different PROFILE in the pin key yields a different key too: isolation is in the key
+    const p3 : usize = rg_pin_key(pin3[0..], "owner-1", "openrouter", "sid-9");
+    assert p3 == p1 + 7;
+    assert same_bytes(pin1[0..p1], pin3[0..p3]) == false;
+}
+
+test "rr_begin_clears_every_slot_and_an_explicit_reset_clears_one" {
+    var state : [96]u8 = undefined;
+    rr_begin(state[0..]);
+    assert rr_get(state[0..], 0) == 0;
+    assert rr_get(state[0..], 1) == 0;
+    rr_set(state[0..], 0, "zai");
+    rr_set(state[0..], 1, "kie");
+    assert rr_get(state[0..], 1) == 3;
+    // explicit reset of one slot leaves the other slot's pin alone
+    rr_clear(state[0..], 1);
+    assert rr_get(state[0..], 1) == 0;
+    assert rr_get(state[0..], 0) == 3;
+    // a route id longer than RR_MAX is refused, not truncated
+    var long : [RR_MAX + 1]u8 = undefined;
+    var i : usize = 0;
+    while (i < RR_MAX + 1) { long[i] = 97; i = i + 1; }
+    assert rr_set(state[0..], 0, long[0..]) == 0;
+    assert rr_get(state[0..], 0) == 3;
+}
+
+test "sticky_key_appended_only_on_openai_format_body_and_byte_identical_pass_through_on_anthropic" {
+    var out : [256]u8 = undefined;
+    const openai_body : str = "{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    const anthropic_body : str = "{\"model\":\"claude-sonnet-5-5\",\"max_tokens\":64,\"messages\":[]}";
+    const key : str = "session-123";
+    var in_copy : [128]u8 = undefined;
+    var k : usize = 0;
+    while (k < anthropic_body.len) { in_copy[k] = anthropic_body[k]; k = k + 1; }
+    // Anthropic protocol: byte-identical pass-through, 0, the caller's copy untouched
+    const m : usize = rr_sticky_key(anthropic_body, key, false, out[0..256]);
+    assert m == 0;
+    assert same_bytes(in_copy[0..anthropic_body.len], anthropic_body);
+    // OpenAI protocol: the field is inserted before the final brace, in a COPY of the body
+    const n : usize = rr_sticky_key(openai_body, key, true, out[0..256]);
+    assert n == openai_body.len + 29;
+    // the output differs from the input only by the appended field: no existing field moves
+    assert same_bytes(out[0..openai_body.len - 1], openai_body[0..openai_body.len - 1]);
+    assert same_bytes(out[openai_body.len - 1..n], ",\"x-sticky-key\":\"session-123\"}");
+    // a body that already carries the field is never given a second one
+    const with_key : str = "{\"model\":\"gpt-4\",\"x-sticky-key\":\"already\"}";
+    assert rr_sticky_key(with_key, key, true, out[0..256]) == 0;
+}
+
+test "a_complete_attempt_record_composes_the_ledger_line_once" {
+    var s : [RS_FIELDS]u64 = undefined;
+    var line : [160]u8 = undefined;
+    var f1 : [160]u8 = undefined;
+    var f2 : [160]u8 = undefined;
+    const frag1_len : usize = put_bytes(f1[0..160], 0, "{\"choices\":[{\"delta\":{\"content\":\"he\"}}]}");
+    const frag2_len : usize = put_bytes(f2[0..160], 0, "{\"usage\":{\"prompt_tokens\":100}}");
+    // attempt 1: the line is produced exactly once, with this attempt's counters
+    const n : usize = attempt_record(line[0..160], s[0..], "att-1", "owner-1.zai.sid-9", "zai", f1[0..frag1_len], f2[0..frag2_len], "", "", 2, true);
+    assert same_bytes(line[0..n], "att-1,owner-1.zai.sid-9,zai,1,1,100,0,0,2,2,1");
+    // attempt 2 (fallback to the next route): the accumulator restarts, the line is this attempt's alone
+    var line2 : [160]u8 = undefined;
+    var f3 : [160]u8 = undefined;
+    const frag3_len : usize = put_bytes(f3[0..160], 0, "{\"usage\":{\"prompt_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":20}}}");
+    const m : usize = attempt_record(line2[0..160], s[0..], "att-2", "owner-1.zai.sid-9", "kie", f3[0..frag3_len], "", "", "", 1, true);
+    assert same_bytes(line2[0..m], "att-2,owner-1.zai.sid-9,kie,1,3,50,20,0,1,2,0");
+    assert s[0] == 50;
+    assert s[1] == 20;
+    assert (s[5] & RS_CLOSED) != 0;
+    assert (s[5] & RS_INCOMPLETE) == 0;
+}
