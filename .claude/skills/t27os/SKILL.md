@@ -109,6 +109,7 @@ an `AGENTS:` line. Purpose: make the system's hard-to-follow work transparent to
 | Boards, provenance of every number, project summary strip | `specs/t27os/bench.t27` (+ `specs/verified/bench_boards.t27`) |
 | The window: screens, sidebar helpers shared by chat and home tabs, scrolling, live widget pane | `specs/t27os/glass_window.t27` |
 | T27F surfaces T27 OS can host (spec graph, outline, check, particles, dashboard) | `specs/t27f/frontend.t27` |
+| Dev-mode entry into the EXISTING dsh web UI: discover, open once, verify, never a second instance, never the ready URL in a transcript | `specs/t27os/dev_monitor.t27`; the moves: skill `dev-monitor` |
 
 ## Build and run locally (verified 2026-10-20)
 
