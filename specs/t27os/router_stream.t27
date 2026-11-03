@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/router_stream.t27 -- the streaming usage accumulator of the stage-2 router: how a walk's
+; usage record is built from stream fragments, per protocol, without losing or double-counting input.
+;   Anthropic Messages: the INPUT counters live in message_start; a message_delta carries only
+;   cumulative counters (output, and possibly an updated input field) -- values REPLACE the state, they
+;   are never added to it. message_stop ends the record.
+;   OpenRouter Chat Completions: one usage-chunk before [DONE] is the accounting frame; a chunk without
+;   a total is not an accounting frame and is ignored.
+;   An abort: the known fields are kept, the record is marked INCOMPLETE, and what is unknown stays
+;   unknown -- an incomplete record is never folded into MISS.
+; The accumulator is a plain u64 array the caller owns: one per attempt, reset by rs_begin; a refused
+; fragment leaves the state as it was (the reason lives in the ledger, not in invented counters). This is
+; the tested adapter scheme; it does not confirm the live field semantics of any provider, zai included.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osRouterStream;
+
+use t27os::router_cache::rc_usage;
+use t27os::router_cache::rc_pin;
+use t27os::router_cache::rc_usage_anthropic;
+use t27os::router_cache::rc_usage_openai;
+use t27os::router_cache::rc_cache_class;
+use t27os::router_cache::RC_V_TOTAL;
+use t27os::router_cache::RC_V_READ;
+use t27os::router_cache::RC_V_WRITE;
+use t27os::router_cache::RC_MISS;
+use t27os::router_cache::RC_UNKNOWN;
+use t27os::router_cache::SCHEMA_NONE;
+
+/// The accumulator the caller owns, one per attempt: total, read, write, validity mask, schema, flags.
+pub const RS_FIELDS : usize = 6;
+pub const RS_INCOMPLETE : u64 = 1;
+pub const RS_CLOSED : u64 = 2;
+
+/// The start of an attempt: every counter is cleared, nothing survives from the previous attempt --
+/// a fallback to the next route must never inherit the failed attempt's usage.
+pub fn rs_begin(st: []u64) -> void {
+    var i : usize = 0;
+    while (i < RS_FIELDS) {
+        st[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// The attempt-reset the host glue must call instead of a bare rs_begin: it
+/// zeroes the stream accumulator AND the pinned route chain, so the previous
+/// attempt's sticky route never leaks into the next attempt (owner directive
+/// 2026-11-02, item 10). The pin byte array is left at length 0 -- an empty
+/// chain holds no route, so the next attempt pins anew from its own outcome.
+pub fn rs_begin_attempt(st: []u64, pin: []u8) -> void {
+    rs_begin(st);
+    var i : usize = 0;
+    while (i < pin.len) {
+        pin[i] = 0;
+        i = i + 1;
+    }
+}
+
+/// The valid input fields of fragment record u replace the state's fields (cumulative semantics):
+/// a field absent from the fragment leaves the state untouched; no field is ever added.
+fn rs_merge(st: []u64, u: []const u64) -> void {
+    if ((u[3] & RC_V_TOTAL) != 0) {
+        st[0] = u[0];
+        st[3] = st[3] | RC_V_TOTAL;
+    }
+    if ((u[3] & RC_V_READ) != 0) {
+        st[1] = u[1];
+        st[3] = st[3] | RC_V_READ;
+    }
+    if ((u[3] & RC_V_WRITE) != 0) {
+        st[2] = u[2];
+        st[3] = st[3] | RC_V_WRITE;
+    }
+}
+
+/// One Anthropic Messages fragment (message_start, message_delta, whatever the walk read): its usage
+/// replaces the present input counters. A fragment with no usable usage changes nothing.
+pub fn rs_anthropic(st: []u64, frag: []const u8) -> void {
+    var u : [4]u64 = undefined;
+    const sc : u32 = rc_usage_anthropic(frag, u[0..]);
+    if (sc == SCHEMA_NONE) { return; }
+    st[4] = sc;
+    rs_merge(st, u[0..]);
+}
+
+/// One OpenRouter Chat Completions fragment: only a chunk with a valid total (the usage-chunk before
+/// [DONE]) is an accounting frame; everything else is ignored.
+pub fn rs_openai(st: []u64, frag: []const u8) -> void {
+    var u : [4]u64 = undefined;
+    const sc : u32 = rc_usage_openai(frag, u[0..]);
+    if (sc == SCHEMA_NONE or (u[3] & RC_V_TOTAL) == 0) { return; }
+    st[4] = sc;
+    rs_merge(st, u[0..]);
+}
+
+/// The end of an attempt: clean closes the record; an abort keeps the known fields and marks the record
+/// INCOMPLETE -- its unknown fields stay unknown (class UNKNOWN, never MISS).
+pub fn rs_close(st: []u64, clean: bool) -> void {
+    st[5] = st[5] | RS_CLOSED;
+    if (clean == false) { st[5] = st[5] | RS_INCOMPLETE; }
+}
+
+/// The cache class of a closed attempt: UNKNOWN when a required field was never reported -- including
+/// every incomplete record whose input fields never arrived.
+pub fn rs_class(st: []const u64) -> u32 {
+    return rc_cache_class((st[3] & RC_V_READ) != 0, st[1]);
+}
+
+test "input_from_message_start_is_kept_when_the_delta_has_only_output" {
+    var st : [RS_FIELDS]u64 = undefined;
+    rs_begin(st[0..]);
+    rs_anthropic(st[0..], "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":80}}}");
+    rs_anthropic(st[0..], "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}");
+    rs_close(st[0..], true);
+    assert st[0] == 180;
+    assert st[1] == 80;
+    assert (st[3] & RC_V_TOTAL) != 0;
+    assert (st[3] & RC_V_READ) != 0;
+    assert (st[5] & RS_INCOMPLETE) == 0;
+    assert rs_class(st[0..]) != RC_UNKNOWN;
+}
+
+test "cumulative_deltas_replace_and_never_double_count" {
+    var st : [RS_FIELDS]u64 = undefined;
+    rs_begin(st[0..]);
+    rs_anthropic(st[0..], "{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":80}}");
+    rs_anthropic(st[0..], "{\"usage\":{\"cache_read_input_tokens\":90}}");
+    rs_anthropic(st[0..], "{\"usage\":{\"cache_read_input_tokens\":90}}");
+    rs_close(st[0..], true);
+    assert st[1] == 90;
+    assert st[0] == 180;
+}
+
+test "one_openrouter_usage_chunk_after_finish_is_the_one_record" {
+    var st : [RS_FIELDS]u64 = undefined;
+    rs_begin(st[0..]);
+    rs_openai(st[0..], "{\"choices\":[{\"delta\":{\"content\":\"he\"}}]}");
+    rs_openai(st[0..], "{\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}");
+    rs_openai(st[0..], "{\"usage\":{\"prompt_tokens\":80000,\"prompt_tokens_details\":{\"cached_tokens\":60000}}}");
+    rs_openai(st[0..], "{\"usage\":{\"prompt_tokens\":80000,\"prompt_tokens_details\":{\"cached_tokens\":60000}}}");
+    rs_close(st[0..], true);
+    assert st[4] != 0;
+    assert st[0] == 80000;
+    assert st[1] == 60000;
+}
+
+test "an_abort_before_usage_is_incomplete_and_unknown_never_miss" {
+    var st : [RS_FIELDS]u64 = undefined;
+    rs_begin(st[0..]);
+    rs_anthropic(st[0..], "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}");
+    rs_close(st[0..], false);
+    assert st[0] == 100;
+    assert (st[5] & RS_INCOMPLETE) != 0;
+    assert rs_class(st[0..]) == RC_UNKNOWN;
+    assert rs_class(st[0..]) != RC_MISS;
+}
+
+test "a_refused_fragment_leaves_the_state_untouched" {
+    var st : [RS_FIELDS]u64 = undefined;
+    rs_begin(st[0..]);
+    rs_anthropic(st[0..], "{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":80}}");
+    rs_anthropic(st[0..], "{\"usage\":{\"input_tokens\":}}");
+    rs_anthropic(st[0..], "not json at all");
+    rs_close(st[0..], true);
+    assert st[0] == 180;
+    assert st[1] == 80;
+    assert st[2] == 0;
+}
+
+test "two_sessions_and_two_attempts_are_isolated_by_their_own_accumulators" {
+    var a : [RS_FIELDS]u64 = undefined;
+    var b : [RS_FIELDS]u64 = undefined;
+    rs_begin(a[0..]);
+    rs_anthropic(a[0..], "{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":80}}");
+    rs_begin(b[0..]);
+    rs_openai(b[0..], "{\"usage\":{\"prompt_tokens\":50}}");
+    assert a[0] == 180;
+    assert b[0] == 50;
+    assert b[1] == 0;
+    rs_begin(a[0..]);
+    assert a[0] == 0;
+    assert a[1] == 0;
+    assert a[3] == 0;
+    assert a[5] == 0;
+}
+
+test "a_fallback_attempt_does_not_inherit_the_failed_one" {
+    var st : [RS_FIELDS]u64 = undefined;
+    rs_begin(st[0..]);
+    rs_anthropic(st[0..], "{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":80}}");
+    rs_close(st[0..], false);
+    rs_begin(st[0..]);
+    rs_openai(st[0..], "{\"usage\":{\"prompt_tokens\":50}}");
+    rs_close(st[0..], true);
+    assert st[0] == 50;
+    assert st[1] == 0;
+    assert (st[3] & RC_V_READ) == 0;
+    assert (st[5] & RS_INCOMPLETE) == 0;
+}
+
+test "write_kept_from_start_and_a_total_from_a_later_delta_stay_distinct" {
+    var st : [RS_FIELDS]u64 = undefined;
+    rs_begin(st[0..]);
+    rs_anthropic(st[0..], "{\"usage\":{\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":80}}");
+    rs_anthropic(st[0..], "{\"usage\":{\"input_tokens\":200,\"cache_read_input_tokens\":90}}");
+    rs_close(st[0..], true);
+    assert st[2] == 10;
+    assert st[1] == 90;
+    assert st[0] == 290;
+    assert st[3] == RC_V_TOTAL + RC_V_READ + RC_V_WRITE;
+}
+
+test "the_sticky_route_never_survives_rs_begin_attempt" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var pin : [96]u8 = undefined;
+    rs_begin(st[0..]);
+    const p : usize = rc_pin(pin[0..], "zai,kie,nemotron", "kie");
+    assert p != 0;
+    rs_begin_attempt(st[0..], pin[0..]);
+    assert pin[0] == 0;
+    var i : usize = 0;
+    while (i < RS_FIELDS) {
+        assert st[i] == 0;
+        i = i + 1;
+    }
+}
