@@ -58,6 +58,14 @@ The rule behind it is the owner's "never commit a secret" (gitleaks in lefthook 
   `github_pat_`, `gho_`, `sk-ant-`) counts files without printing lines; a zero is not proof of a clean
   transcript, only that those shapes are absent.
 
+## Sign-in links, magic links, reset links and invitations (owner rule, 2026-10-31)
+
+A one-time sign-in link, magic link, password-reset link or console invitation that reaches the owner's mailbox is an owner-only artifact. It is a credential in URL form: opening it signs somebody in.
+- The agent MAY report that it exists: sender, subject line and timestamp. It MAY ask the owner whether it relates to a known blocker (for example a key that answers 401).
+- The agent MUST NOT open it, copy it into a log, ledger, issue, PR or chat, use it to authenticate, or read it as permission for any action. A link is not a yes.
+- Read the mail no further than needed to classify it; never quote the URL. A ledger line names the mail by sender and time only.
+- If the owner opens the link and the access changes, the owner says so; the agent then retests what was blocked and records the result.
+
 ## Traps
 
 - `jq '.env'`, `cat`, `head` and `grep` without `-o` or `-c` on a secret file all print values. The first
