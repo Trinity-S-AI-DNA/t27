@@ -1,0 +1,487 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/queen_verdict.t27 -- what the Queen decides when an agent returns a result: the verdict
+; machine behind the conversation cards (owner, 2026-11-04: owner task -> assignment -> agent ACK ->
+; execution -> result -> Queen verification -> next action or completion, each state distinct).
+; --
+; The states, in the owner's words: RESULT_SUBMITTED -> VERIFYING -> ACCEPTED / CHANGES_REQUESTED /
+; BLOCKED. "The agent returned a result" is never "the task is solved": only ACCEPTED is solved, and
+; ACCEPTED is reached only from VERIFYING by a check that passed (qv_check_event: the artifact exists,
+; the evidence reference is set, and a non-vacuous run of its tests failed nothing).
+; A terminal state (ACCEPTED, CANCELLED) never reopens. A late or repeated event never starts the next
+; task twice (qv_accepts is delta_action of queen/events.t27: only seq == cursor + 1 applies).
+; A lost link is a visible BLOCKED state, not silence. After a restart a half-run check is not trusted
+; (qv_restore sends VERIFYING back to RESULT_SUBMITTED), so no verdict is ever assumed.
+; The loop is bounded: two counted send-backs, then it escalates to the owner (RETRY_RULE in
+; queen/dispatch.t27); a paused loop takes no new action; and the loop never grants itself a paid
+; call, a push, a merge or a close (qv_loop_may): those keep the owner's own permission.
+; --
+; Reuse, not a second rulebook: the event kinds are queen/control.t27 EV_* (EV_EVIDENCE with an evidence
+; reference is a result; EV_LEASE_EXPIRED is a lost link; EV_HEARTBEAT is the link back; EV_CANCEL is a
+; cancel), the reviewer's answers are queen/dispatch.t27 R_ACCEPT / R_SENDBACK / R_ESCALATE (accept needs
+; a committed file, as REVIEW_RULE says), the cursor is queen/events.t27.
+; WHAT IS NOT HERE: who publishes the events, that a file exists on disk, or that the tests ran -- the
+; booleans and counts are the HOST's measurements, never this module's claim about itself.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27osQueenVerdict;
+
+use queen::events::delta_action;
+use queen::events::DA_APPLY;
+use queen::control::EV_EVIDENCE;
+use queen::control::EV_LEASE_EXPIRED;
+use queen::control::EV_HEARTBEAT;
+use queen::control::EV_CANCEL;
+use queen::control::EVENT_KINDS;
+use queen::dispatch::R_ACCEPT;
+use queen::dispatch::R_SENDBACK;
+use queen::dispatch::R_ESCALATE;
+use t27os::session_store::put_bytes;
+
+// ---------------------------------------------------------------- the states
+
+pub const QV_NONE : u8 = 0;
+pub const QV_RESULT_SUBMITTED : u8 = 1;
+pub const QV_VERIFYING : u8 = 2;
+pub const QV_ACCEPTED : u8 = 3;
+pub const QV_CHANGES_REQUESTED : u8 = 4;
+pub const QV_BLOCKED : u8 = 5;
+pub const QV_NEEDS_OWNER : u8 = 6;
+pub const QV_CANCELLED : u8 = 7;
+pub const QV_STATES : u8 = 8;
+
+/// What happened to the task, as the machine sees it. QE_NONE is an event that means nothing here.
+pub const QE_RESULT : u8 = 0;
+pub const QE_VERIFY_START : u8 = 1;
+pub const QE_CHECK_PASSED : u8 = 2;
+pub const QE_CHECK_FAILED : u8 = 3;
+pub const QE_LINK_LOST : u8 = 4;
+pub const QE_LINK_BACK : u8 = 5;
+pub const QE_CANCEL : u8 = 6;
+pub const QE_ESCALATE : u8 = 7;
+pub const QE_EVENTS : u8 = 8;
+pub const QE_NONE : u8 = 255;
+
+/// Counted send-backs before the Queen escalates (RETRY_RULE in queen/dispatch.t27).
+pub const QV_MAX_SENDBACKS : u8 = 2;
+
+pub fn qv_is_terminal(state : u8) -> bool {
+    return state == QV_ACCEPTED or state == QV_CANCELLED;
+}
+
+/// Only ACCEPTED is solved. A submitted result, a running check and a request for changes are not.
+pub fn qv_is_solved(state : u8) -> bool {
+    return state == QV_ACCEPTED;
+}
+
+/// One event applied to one task's state. had_result: the task has had a result at some point (a link
+/// that comes back returns to RESULT_SUBMITTED if so, to NONE if not).
+pub fn qv_step(state : u8, ev : u8, had_result : bool) -> u8 {
+    if (qv_is_terminal(state)) { return state; }
+    if (ev == QE_NONE) { return state; }
+    if (ev == QE_CANCEL) { return QV_CANCELLED; }
+    if (state == QV_NEEDS_OWNER) {
+        // only the owner's decision moves it: a fresh result after the owner chose to retry
+        if (ev == QE_RESULT) { return QV_RESULT_SUBMITTED; }
+        return state;
+    }
+    if (state == QV_BLOCKED) {
+        // blocked leaves on the link coming back, not on a result the Queen could not have heard
+        if (ev == QE_LINK_BACK) {
+            if (had_result) { return QV_RESULT_SUBMITTED; }
+            return QV_NONE;
+        }
+        return state;
+    }
+    if (ev == QE_LINK_LOST) { return QV_BLOCKED; }
+    if (state == QV_NONE) {
+        if (ev == QE_RESULT) { return QV_RESULT_SUBMITTED; }
+        return state;
+    }
+    if (state == QV_RESULT_SUBMITTED) {
+        // a check that passed before verification began proves nothing: it is ignored
+        if (ev == QE_VERIFY_START) { return QV_VERIFYING; }
+        if (ev == QE_ESCALATE) { return QV_NEEDS_OWNER; }
+        return state;
+    }
+    if (state == QV_VERIFYING) {
+        if (ev == QE_CHECK_PASSED) { return QV_ACCEPTED; }
+        if (ev == QE_CHECK_FAILED) { return QV_CHANGES_REQUESTED; }
+        if (ev == QE_ESCALATE) { return QV_NEEDS_OWNER; }
+        return state;
+    }
+    if (state == QV_CHANGES_REQUESTED) {
+        if (ev == QE_RESULT) { return QV_RESULT_SUBMITTED; }
+        if (ev == QE_ESCALATE) { return QV_NEEDS_OWNER; }
+        return state;
+    }
+    return state;
+}
+
+/// The send-back count after a transition: it grows only when a running check failed.
+pub fn qv_count_sendback(prev : u8, next : u8, n : u8) -> u8 {
+    if (prev == QV_VERIFYING and next == QV_CHANGES_REQUESTED and n < 255) { return n + 1; }
+    return n;
+}
+
+// ---------------------------------------------------------------- the check
+
+/// What the host measured about the artifact becomes one event. PASS needs all four: the artifact exists,
+/// the evidence reference is set, the run had at least one test (a vacuous run proves nothing) and
+/// failed none.
+pub fn qv_check_event(exists : bool, evidence_set : bool, tests_total : u32, tests_failed : u32) -> u8 {
+    if (exists and evidence_set and tests_total > 0 and tests_failed == 0) { return QE_CHECK_PASSED; }
+    return QE_CHECK_FAILED;
+}
+
+// ---------------------------------------------------------------- events in, events out
+
+/// A published event as the chain sees it (the owner's envelope). event_type uses the EV_* numbering of
+/// queen/control.t27; the references are hashes of the payload and of the evidence (0 = none).
+pub struct ChainEvent {
+    event_id: u32,
+    task_id: u32,
+    command_id: u32,
+    actor_id: u32,
+    session_id: u64,
+    event_type: u8,
+    timestamp: u64,
+    payload_ref: u32,
+    evidence_ref: u32,
+}
+
+/// An envelope is usable when it names the event, the task, who acted and when, and its kind is known.
+pub fn ce_valid(e : ChainEvent) -> bool {
+    return e.event_id != 0 and e.task_id != 0 and e.actor_id != 0 and e.timestamp != 0 and e.event_type < EVENT_KINDS;
+}
+
+/// A result is an evidence event that carries evidence. An agent's claim with no reference is no result.
+pub fn ce_is_result(e : ChainEvent) -> bool {
+    return ce_valid(e) and e.event_type == EV_EVIDENCE and e.evidence_ref != 0;
+}
+
+/// The machine event a control event stands for. Everything else (created, ended, idle, assign, tick)
+/// means nothing to the verdict.
+pub fn qv_event_of(event_type : u8, evidence_ref : u32) -> u8 {
+    if (event_type == EV_EVIDENCE and evidence_ref != 0) { return QE_RESULT; }
+    if (event_type == EV_LEASE_EXPIRED) { return QE_LINK_LOST; }
+    if (event_type == EV_HEARTBEAT) { return QE_LINK_BACK; }
+    if (event_type == EV_CANCEL) { return QE_CANCEL; }
+    return QE_NONE;
+}
+
+/// The reviewer's answer as a machine event. An accept with no committed file is not an accept
+/// (REVIEW_RULE: escalate when none was committed); a wait changes nothing.
+pub fn qv_event_of_review(review : u32, evidence_ref : u32) -> u8 {
+    if (review == R_ACCEPT and evidence_ref != 0) { return QE_CHECK_PASSED; }
+    if (review == R_ACCEPT) { return QE_ESCALATE; }
+    if (review == R_SENDBACK) { return QE_CHECK_FAILED; }
+    if (review == R_ESCALATE) { return QE_ESCALATE; }
+    return QE_NONE;
+}
+
+/// A repeated or stale event does nothing; one that skips a number asks for a resync (and is not applied).
+pub fn qv_accepts(cursor : u64, seq : u64) -> bool {
+    return delta_action(cursor, seq) == DA_APPLY;
+}
+
+pub fn qv_cursor_after(cursor : u64, seq : u64) -> u64 {
+    if (qv_accepts(cursor, seq)) { return seq; }
+    return cursor;
+}
+
+// ---------------------------------------------------------------- what the Queen does next
+
+pub const QA_NONE : u8 = 0;
+pub const QA_VERIFY : u8 = 1;
+pub const QA_RESEND : u8 = 2;
+pub const QA_ESCALATE : u8 = 3;
+pub const QA_DONE : u8 = 4;
+pub const QA_WAIT_LINK : u8 = 5;
+pub const QA_HOLD : u8 = 6;
+
+/// One bounded decision. paused: the owner suspended coordination, so no new action starts.
+pub fn qv_next_action(state : u8, sendbacks : u8, paused : bool) -> u8 {
+    if (state == QV_ACCEPTED) { return QA_DONE; }
+    if (state == QV_CANCELLED) { return QA_NONE; }
+    if (paused) { return QA_HOLD; }
+    if (state == QV_RESULT_SUBMITTED) { return QA_VERIFY; }
+    if (state == QV_CHANGES_REQUESTED) {
+        if (sendbacks < QV_MAX_SENDBACKS) { return QA_RESEND; }
+        return QA_ESCALATE;
+    }
+    if (state == QV_BLOCKED) { return QA_WAIT_LINK; }
+    return QA_NONE;
+}
+
+/// The kinds of thing the loop might do. The first four are the loop's own; the rest keep the owner's word.
+pub const QK_ASSIGN_LOCAL : u8 = 0;
+pub const QK_VERIFY : u8 = 1;
+pub const QK_RESEND : u8 = 2;
+pub const QK_NOTIFY : u8 = 3;
+pub const QK_PAID_CALL : u8 = 4;
+pub const QK_MERGE : u8 = 5;
+pub const QK_PUSH : u8 = 6;
+pub const QK_CLOSE : u8 = 7;
+
+/// A loop that runs by itself gets no new permission by running: a paid call, a push, a merge and a close
+/// are the owner's, whatever the loop's state.
+pub fn qv_loop_may(kind : u8) -> bool {
+    return kind <= QK_NOTIFY;
+}
+
+/// After a restart: a half-run check did not survive, so it is run again; no verdict is assumed.
+pub fn qv_restore(state : u8) -> u8 {
+    if (state == QV_VERIFYING) { return QV_RESULT_SUBMITTED; }
+    return state;
+}
+
+/// A command that must be restored after a restart: not finished, not cancelled, not empty.
+pub fn qv_unfinished(state : u8) -> bool {
+    return state != QV_NONE and state != QV_ACCEPTED and state != QV_CANCELLED;
+}
+
+// ---------------------------------------------------------------- the dashboard's counters
+
+/// Working | Blocked | Awaiting decision | No link | Done. The dashboard and the chat card read the same
+/// function, so they cannot disagree about a task. A cancelled task is counted nowhere.
+pub const DB_WORKING : u8 = 0;
+pub const DB_BLOCKED : u8 = 1;
+pub const DB_AWAITING : u8 = 2;
+pub const DB_NO_LINK : u8 = 3;
+pub const DB_DONE : u8 = 4;
+pub const DB_NONE : u8 = 255;
+
+pub fn qv_bucket(state : u8, link_ok : bool) -> u8 {
+    if (state == QV_ACCEPTED) { return DB_DONE; }
+    if (state == QV_CANCELLED) { return DB_NONE; }
+    if (state == QV_NEEDS_OWNER) { return DB_AWAITING; }
+    if (link_ok == false) { return DB_NO_LINK; }
+    if (state == QV_BLOCKED) { return DB_BLOCKED; }
+    return DB_WORKING;
+}
+
+// ---------------------------------------------------------------- the words on the card
+
+/// The state as a card label. Never colour alone.
+pub fn qv_label(out : []u8, state : u8) -> usize {
+    if (state == QV_RESULT_SUBMITTED) { return put_bytes(out, 0, "Result submitted - not yet verified"); }
+    if (state == QV_VERIFYING) { return put_bytes(out, 0, "Verifying"); }
+    if (state == QV_ACCEPTED) { return put_bytes(out, 0, "Accepted"); }
+    if (state == QV_CHANGES_REQUESTED) { return put_bytes(out, 0, "Changes requested"); }
+    if (state == QV_BLOCKED) { return put_bytes(out, 0, "Blocked - link lost"); }
+    if (state == QV_NEEDS_OWNER) { return put_bytes(out, 0, "Awaiting your decision"); }
+    if (state == QV_CANCELLED) { return put_bytes(out, 0, "Cancelled"); }
+    return put_bytes(out, 0, "No result yet");
+}
+
+// ---------------------------------------------------------------- tests
+
+test a_result_is_not_a_solution {
+    var s : u8 = QV_NONE;
+    s = qv_step(s, QE_RESULT, false);
+    assert s == QV_RESULT_SUBMITTED;
+    assert qv_is_solved(s) == false;
+    // a passed check before verification began proves nothing
+    assert qv_step(s, QE_CHECK_PASSED, true) == QV_RESULT_SUBMITTED;
+    s = qv_step(s, QE_VERIFY_START, true);
+    assert s == QV_VERIFYING;
+    assert qv_is_solved(s) == false;
+    s = qv_step(s, QE_CHECK_PASSED, true);
+    assert s == QV_ACCEPTED;
+    assert qv_is_solved(s);
+}
+
+test no_result_means_nothing_to_verify {
+    assert qv_step(QV_NONE, QE_VERIFY_START, false) == QV_NONE;
+    assert qv_step(QV_NONE, QE_CHECK_PASSED, false) == QV_NONE;
+    assert qv_step(QV_NONE, QE_ESCALATE, false) == QV_NONE;
+}
+
+test a_failed_check_asks_for_changes_and_a_resubmit_goes_round_again {
+    var s : u8 = QV_VERIFYING;
+    s = qv_step(s, QE_CHECK_FAILED, true);
+    assert s == QV_CHANGES_REQUESTED;
+    assert qv_is_solved(s) == false;
+    assert qv_step(s, QE_RESULT, true) == QV_RESULT_SUBMITTED;
+    // the count grows only when a running check failed
+    assert qv_count_sendback(QV_VERIFYING, QV_CHANGES_REQUESTED, 0) == 1;
+    assert qv_count_sendback(QV_RESULT_SUBMITTED, QV_VERIFYING, 1) == 1;
+    assert qv_count_sendback(QV_VERIFYING, QV_ACCEPTED, 1) == 1;
+    assert qv_count_sendback(QV_VERIFYING, QV_CHANGES_REQUESTED, 255) == 255;
+}
+
+test two_send_backs_then_the_owner_decides {
+    assert qv_next_action(QV_CHANGES_REQUESTED, 0, false) == QA_RESEND;
+    assert qv_next_action(QV_CHANGES_REQUESTED, 1, false) == QA_RESEND;
+    assert qv_next_action(QV_CHANGES_REQUESTED, 2, false) == QA_ESCALATE;
+    assert qv_next_action(QV_CHANGES_REQUESTED, 9, false) == QA_ESCALATE;
+    // the escalation moves the task to the owner and only a fresh result takes it back
+    assert qv_step(QV_CHANGES_REQUESTED, QE_ESCALATE, true) == QV_NEEDS_OWNER;
+    assert qv_step(QV_NEEDS_OWNER, QE_LINK_LOST, true) == QV_NEEDS_OWNER;
+    assert qv_step(QV_NEEDS_OWNER, QE_CHECK_PASSED, true) == QV_NEEDS_OWNER;
+    assert qv_step(QV_NEEDS_OWNER, QE_RESULT, true) == QV_RESULT_SUBMITTED;
+    assert qv_next_action(QV_NEEDS_OWNER, 2, false) == QA_NONE;
+}
+
+test a_terminal_state_never_reopens {
+    var e : u8 = 0;
+    while (e < QE_EVENTS) {
+        assert qv_step(QV_ACCEPTED, e, true) == QV_ACCEPTED;
+        assert qv_step(QV_CANCELLED, e, true) == QV_CANCELLED;
+        e = e + 1;
+    }
+    assert qv_step(QV_ACCEPTED, QE_NONE, true) == QV_ACCEPTED;
+    assert qv_next_action(QV_ACCEPTED, 0, false) == QA_DONE;
+    assert qv_next_action(QV_ACCEPTED, 0, true) == QA_DONE;
+    assert qv_next_action(QV_CANCELLED, 0, false) == QA_NONE;
+}
+
+test a_lost_link_is_a_visible_block_and_the_link_back_resumes {
+    assert qv_step(QV_VERIFYING, QE_LINK_LOST, true) == QV_BLOCKED;
+    assert qv_step(QV_RESULT_SUBMITTED, QE_LINK_LOST, true) == QV_BLOCKED;
+    assert qv_step(QV_NONE, QE_LINK_LOST, false) == QV_BLOCKED;
+    assert qv_next_action(QV_BLOCKED, 0, false) == QA_WAIT_LINK;
+    // a result the Queen could not have heard does not unblock; only the link does
+    assert qv_step(QV_BLOCKED, QE_RESULT, true) == QV_BLOCKED;
+    assert qv_step(QV_BLOCKED, QE_CHECK_PASSED, true) == QV_BLOCKED;
+    assert qv_step(QV_BLOCKED, QE_LINK_BACK, true) == QV_RESULT_SUBMITTED;
+    assert qv_step(QV_BLOCKED, QE_LINK_BACK, false) == QV_NONE;
+}
+
+test a_cancel_stops_a_task_in_any_open_state {
+    var s : u8 = 0;
+    while (s < QV_STATES) {
+        if (qv_is_terminal(s) == false) {
+            assert qv_step(s, QE_CANCEL, true) == QV_CANCELLED;
+        }
+        s = s + 1;
+    }
+    assert qv_step(QV_ACCEPTED, QE_CANCEL, true) == QV_ACCEPTED;
+}
+
+test the_check_passes_only_when_every_measurement_holds {
+    assert qv_check_event(true, true, 12, 0) == QE_CHECK_PASSED;
+    // negative controls: each missing measurement fails the check
+    assert qv_check_event(false, true, 12, 0) == QE_CHECK_FAILED;
+    assert qv_check_event(true, false, 12, 0) == QE_CHECK_FAILED;
+    assert qv_check_event(true, true, 0, 0) == QE_CHECK_FAILED;
+    assert qv_check_event(true, true, 12, 1) == QE_CHECK_FAILED;
+}
+
+test a_repeated_or_skipped_event_does_not_apply {
+    assert qv_accepts(5, 6);
+    assert qv_accepts(5, 5) == false;
+    assert qv_accepts(5, 4) == false;
+    assert qv_accepts(5, 7) == false;
+    assert qv_cursor_after(5, 6) == 6;
+    assert qv_cursor_after(6, 6) == 6;
+    assert qv_cursor_after(6, 9) == 6;
+}
+
+test a_control_event_becomes_a_machine_event_only_with_its_evidence {
+    assert qv_event_of(EV_EVIDENCE, 77) == QE_RESULT;
+    assert qv_event_of(EV_EVIDENCE, 0) == QE_NONE;
+    assert qv_event_of(EV_LEASE_EXPIRED, 0) == QE_LINK_LOST;
+    assert qv_event_of(EV_HEARTBEAT, 0) == QE_LINK_BACK;
+    assert qv_event_of(EV_CANCEL, 0) == QE_CANCEL;
+    assert qv_event_of(9, 0) == QE_NONE;
+    assert qv_event_of(0, 77) == QE_NONE;
+}
+
+test the_reviewers_answer_follows_the_review_rule {
+    assert qv_event_of_review(R_ACCEPT, 77) == QE_CHECK_PASSED;
+    // an accept with no committed file escalates, it does not accept
+    assert qv_event_of_review(R_ACCEPT, 0) == QE_ESCALATE;
+    assert qv_event_of_review(R_SENDBACK, 77) == QE_CHECK_FAILED;
+    assert qv_event_of_review(R_ESCALATE, 77) == QE_ESCALATE;
+    assert qv_event_of_review(3, 77) == QE_NONE;
+}
+
+test the_envelope_needs_its_names_and_a_known_kind {
+    const ok : ChainEvent = ChainEvent {
+        event_id: 7, task_id: 42, command_id: 3, actor_id: 5, session_id: 9001,
+        event_type: EV_EVIDENCE, timestamp: 1000, payload_ref: 11, evidence_ref: 22
+    };
+    assert ce_valid(ok);
+    assert ce_is_result(ok);
+    const claim : ChainEvent = ChainEvent {
+        event_id: 7, task_id: 42, command_id: 3, actor_id: 5, session_id: 9001,
+        event_type: EV_EVIDENCE, timestamp: 1000, payload_ref: 11, evidence_ref: 0
+    };
+    assert ce_valid(claim);
+    assert ce_is_result(claim) == false;
+    const nameless : ChainEvent = ChainEvent {
+        event_id: 0, task_id: 42, command_id: 3, actor_id: 5, session_id: 9001,
+        event_type: EV_EVIDENCE, timestamp: 1000, payload_ref: 11, evidence_ref: 22
+    };
+    assert ce_valid(nameless) == false;
+    const unknown : ChainEvent = ChainEvent {
+        event_id: 7, task_id: 42, command_id: 3, actor_id: 5, session_id: 9001,
+        event_type: 10, timestamp: 1000, payload_ref: 11, evidence_ref: 22
+    };
+    assert ce_valid(unknown) == false;
+}
+
+test a_paused_loop_starts_nothing {
+    assert qv_next_action(QV_RESULT_SUBMITTED, 0, false) == QA_VERIFY;
+    assert qv_next_action(QV_RESULT_SUBMITTED, 0, true) == QA_HOLD;
+    assert qv_next_action(QV_CHANGES_REQUESTED, 0, true) == QA_HOLD;
+    assert qv_next_action(QV_BLOCKED, 0, true) == QA_HOLD;
+    assert qv_next_action(QV_VERIFYING, 0, false) == QA_NONE;
+    assert qv_next_action(QV_NONE, 0, false) == QA_NONE;
+}
+
+test the_loop_never_grants_itself_a_paid_call_a_push_a_merge_or_a_close {
+    assert qv_loop_may(QK_ASSIGN_LOCAL);
+    assert qv_loop_may(QK_VERIFY);
+    assert qv_loop_may(QK_RESEND);
+    assert qv_loop_may(QK_NOTIFY);
+    assert qv_loop_may(QK_PAID_CALL) == false;
+    assert qv_loop_may(QK_MERGE) == false;
+    assert qv_loop_may(QK_PUSH) == false;
+    assert qv_loop_may(QK_CLOSE) == false;
+    assert qv_loop_may(200) == false;
+}
+
+test a_restart_never_assumes_a_verdict {
+    assert qv_restore(QV_VERIFYING) == QV_RESULT_SUBMITTED;
+    assert qv_restore(QV_ACCEPTED) == QV_ACCEPTED;
+    assert qv_restore(QV_CHANGES_REQUESTED) == QV_CHANGES_REQUESTED;
+    assert qv_restore(QV_BLOCKED) == QV_BLOCKED;
+    assert qv_restore(QV_NEEDS_OWNER) == QV_NEEDS_OWNER;
+    assert qv_unfinished(QV_VERIFYING);
+    assert qv_unfinished(QV_BLOCKED);
+    assert qv_unfinished(QV_NEEDS_OWNER);
+    assert qv_unfinished(QV_ACCEPTED) == false;
+    assert qv_unfinished(QV_CANCELLED) == false;
+    assert qv_unfinished(QV_NONE) == false;
+}
+
+test the_dashboard_and_the_card_read_one_bucket {
+    assert qv_bucket(QV_ACCEPTED, true) == DB_DONE;
+    assert qv_bucket(QV_ACCEPTED, false) == DB_DONE;
+    assert qv_bucket(QV_VERIFYING, true) == DB_WORKING;
+    assert qv_bucket(QV_RESULT_SUBMITTED, true) == DB_WORKING;
+    assert qv_bucket(QV_CHANGES_REQUESTED, true) == DB_WORKING;
+    assert qv_bucket(QV_BLOCKED, true) == DB_BLOCKED;
+    assert qv_bucket(QV_NEEDS_OWNER, true) == DB_AWAITING;
+    assert qv_bucket(QV_NEEDS_OWNER, false) == DB_AWAITING;
+    // no link is its own counter, not "working"
+    assert qv_bucket(QV_VERIFYING, false) == DB_NO_LINK;
+    assert qv_bucket(QV_BLOCKED, false) == DB_NO_LINK;
+    assert qv_bucket(QV_CANCELLED, true) == DB_NONE;
+}
+
+test the_label_names_each_state {
+    var b : [48]u8 = undefined;
+    assert qv_label(b[0..48], QV_NONE) == 13;
+    assert qv_label(b[0..48], QV_RESULT_SUBMITTED) == 35;
+    assert b[0] == 82 and b[34] == 100;
+    assert qv_label(b[0..48], QV_VERIFYING) == 9;
+    assert qv_label(b[0..48], QV_ACCEPTED) == 8;
+    assert qv_label(b[0..48], QV_CHANGES_REQUESTED) == 17;
+    assert qv_label(b[0..48], QV_BLOCKED) == 19;
+    assert qv_label(b[0..48], QV_NEEDS_OWNER) == 22;
+    assert qv_label(b[0..48], QV_CANCELLED) == 9;
+    assert b[0] == 67;
+}
