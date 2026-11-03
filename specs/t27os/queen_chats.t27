@@ -30,6 +30,9 @@ use t27os::term_pane::TP_COLS_MIN;
 use t27os::term_pane::TP_COLS_MAX;
 use t27os::term_pane::TP_ROWS_MIN;
 use t27os::term_pane::TP_ROWS_MAX;
+use t27os::pty_proto::RE_OK;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
 
 // ---------------------------------------------------------------- geometry
 
@@ -51,8 +54,37 @@ pub fn rc_term_rect(sw : f64, sh : f64, top : f64, foot : f64, out : []f64) -> b
     out[0] = rc_left(sw) + RC_TERM_PAD;
     out[1] = top + RC_TERM_TOP;
     out[2] = QP_W - 2.0 * RC_TERM_PAD;
-    out[3] = sh - foot - out[1] - RC_IN_GAP - RC_IN_H;
+    out[3] = sh - foot - out[1] - RC_IN_GAP - RC_IN_H - QD_ROW_H;
     return out[2] > 0.0 and out[3] >= 4.0 * TP_LINE_H;
+}
+
+/// The delivery row (P0, owner 2026-11-03): between the transcript and the input line, the delivery status on
+/// the left and the Send button on the right, so a press that goes nowhere is never silent.
+pub const QD_ROW_H : f64 = 26.0;
+pub const QD_BTN_W : f64 = 64.0;
+
+pub fn qd_row_rect(sw : f64, sh : f64, top : f64, foot : f64, out : []f64) -> bool {
+    out[0] = rc_left(sw) + QP_PAD;
+    out[1] = sh - foot - RC_IN_GAP - RC_IN_H - QD_ROW_H;
+    out[2] = QP_W - 2.0 * QP_PAD;
+    out[3] = QD_ROW_H;
+    return out[2] > QD_BTN_W;
+}
+
+/// The Send button: the right end of the delivery row, inset 2 at the top and the foot.
+pub fn qd_send_rect(sw : f64, sh : f64, top : f64, foot : f64, out : []f64) -> bool {
+    if (qd_row_rect(sw, sh, top, foot, out) == false) { return false; }
+    out[0] = out[0] + out[2] - QD_BTN_W;
+    out[1] = out[1] + 2.0;
+    out[2] = QD_BTN_W;
+    out[3] = QD_ROW_H - 4.0;
+    return true;
+}
+
+pub fn on_qd_send(x : f64, y : f64, sw : f64, sh : f64, top : f64, foot : f64) -> bool {
+    var r : [4]f64 = undefined;
+    if (qd_send_rect(sw, sh, top, foot, r[0..4]) == false) { return false; }
+    return x >= r[0] and x < r[0] + r[2] and y >= r[1] and y < r[1] + r[3];
 }
 
 /// The input line rectangle: full panel width minus the pad, at the foot above the status bar.
@@ -204,6 +236,104 @@ pub fn rc_paste(t : []u8, clip : []const u8, m : usize) -> usize {
     return n;
 }
 
+// ---------------------------------------------------------------- the delivery of one message (P0, owner 2026-11-03)
+//
+// "wrote -> sent -> the Queen took it -> an answer appeared" as states the dock can draw. The dock is a view of the
+// Queen's terminal pane, so the acknowledgements are the ones that exist there and no more: ACCEPTED means the pane
+// server answered the write of every byte into her pty; OUTPUT means her pane produced more than the echo of what was
+// sent. Neither is a parsed reply; the Queen program's own words are the transcript above the row. Every refusal
+// names its cause and keeps the draft: nothing is ever swallowed.
+
+pub const QD_IDLE : u32 = 0;
+pub const QD_SENDING : u32 = 1;
+pub const QD_ACCEPTED : u32 = 2;
+pub const QD_OUTPUT : u32 = 3;
+pub const QD_NO_SERVER : u32 = 4;
+pub const QD_NO_PANE : u32 = 5;
+pub const QD_WRITE_FAIL : u32 = 6;
+pub const QD_EMPTY : u32 = 7;
+pub const QD_READY : u32 = 8;
+
+/// Bytes of output after a send that still count as the echo of the send (the typed line, its line end, a redraw).
+pub const QD_ECHO_SLACK : usize = 32;
+
+/// The link the dock has right now: no connection to the pane server, a server with no Queen pane (the table is full
+/// or her program cannot start), or a live pane.
+pub fn qd_link(server_up : bool, link_live : bool, pane_open : bool) -> u32 {
+    if (server_up == false) { return QD_NO_SERVER; }
+    if (link_live == false or pane_open == false) { return QD_NO_PANE; }
+    return QD_READY;
+}
+
+/// What a press of Send (or Return) does: nothing typed sends nothing and is no error; a dead link is named and
+/// sends nothing; a live link goes on to SENDING.
+pub fn qd_decide(len : usize, link : u32) -> u32 {
+    if (len == 0) { return QD_EMPTY; }
+    if (link != QD_READY) { return link; }
+    return QD_SENDING;
+}
+
+/// One chunk's answer from the pane server: a frame came back (`n` bytes) and its kind is RE_OK. A frame of
+/// RE_ERR (her pane is gone) or no frame at all (timeout, closed socket) is a failure. Until 2026-11-03 glass
+/// tested only `n == 0`, so an RE_ERR answer counted as delivered and the draft was erased.
+pub fn qd_reply_ok(n : usize, op : u8) -> bool { return n > 0 and op == RE_OK; }
+
+/// The write finished: the pane server answered every chunk, or it did not.
+pub fn qd_after_write(ok : bool) -> u32 {
+    if (ok) { return QD_ACCEPTED; }
+    return QD_WRITE_FAIL;
+}
+
+pub fn qd_failed(state : u32) -> bool {
+    return state == QD_NO_SERVER or state == QD_NO_PANE or state == QD_WRITE_FAIL;
+}
+
+/// The field is cleared only when the pane took the message; every other state keeps the draft.
+pub fn qd_clears_draft(state : u32) -> bool { return state == QD_ACCEPTED; }
+
+/// The message number advances once, when a message is accepted; a retry of a refused draft keeps its number.
+pub fn qd_next_id(id : u32, state : u32) -> u32 {
+    if (state == QD_ACCEPTED) { return id + 1; }
+    return id;
+}
+
+/// Output after the send beyond the echo of the sent bytes.
+pub fn qd_reply_seen(got : usize, sent : usize) -> bool { return got > sent + QD_ECHO_SLACK; }
+
+/// The delivery state after `more` bytes of the pane's output arrived while the state was `state`.
+pub fn qd_on_output(state : u32, got : usize, sent : usize) -> u32 {
+    if (state == QD_ACCEPTED and qd_reply_seen(got, sent)) { return QD_OUTPUT; }
+    return state;
+}
+
+/// The button reads Retry after a refusal, Send otherwise.
+pub fn qd_retry(state : u32) -> bool { return qd_failed(state); }
+
+/// The row's text. Idle shows the standing link; a delivery shows its stage and message number.
+pub fn qd_status_text(out : []u8, state : u32, id : u32, link : u32) -> usize {
+    var w : usize = 0;
+    if (state == QD_SENDING) {
+        w = put_bytes(out, w, "Sending #");
+        w = put_dec(out, w, @as(u64, id));
+        return put_bytes(out, w, "...");
+    }
+    if (state == QD_ACCEPTED) {
+        w = put_bytes(out, w, "Accepted #");
+        w = put_dec(out, w, @as(u64, id));
+        return put_bytes(out, w, " by her pane");
+    }
+    if (state == QD_OUTPUT) {
+        w = put_bytes(out, w, "Output after #");
+        return put_dec(out, w, @as(u64, id));
+    }
+    if (state == QD_NO_SERVER) { return put_bytes(out, 0, "NOT SENT: no pane server"); }
+    if (state == QD_NO_PANE) { return put_bytes(out, 0, "NOT SENT: no Queen pane"); }
+    if (state == QD_WRITE_FAIL) { return put_bytes(out, 0, "NOT SENT: no answer"); }
+    if (link == QD_NO_SERVER) { return put_bytes(out, 0, "No link to the pane server"); }
+    if (link == QD_NO_PANE) { return put_bytes(out, 0, "No Queen pane on the server"); }
+    return put_bytes(out, 0, "Queen pane connected");
+}
+
 invariant rc_dock_takes_the_panel_regime : QP_W >= 260.0 and QP_W <= 340.0 and RC_TEXT_MAX == 200;
 invariant rc_the_dock_never_swallows_a_control_byte : rc_takes(13) == false and rc_takes(27) == false and rc_takes(32) and rc_takes(126) and rc_takes(127) == false;
 invariant rc_input_sits_at_the_foot : RC_IN_H >= 32.0 and RC_IN_GAP >= 8.0;
@@ -222,13 +352,18 @@ test the_dock_binds_to_the_panel_geometry {
     assert rc_term_rect(sw, 700.0, 34.0, 20.0, r[0..4]);
     assert r[0] == sw - QP_W + RC_TERM_PAD and r[2] == QP_W - 2.0 * RC_TERM_PAD;
     assert r[1] == 34.0 + RC_TERM_TOP;
-    assert r[3] == 700.0 - 20.0 - 34.0 - RC_TERM_TOP - RC_IN_GAP - RC_IN_H;
+    assert r[3] == 700.0 - 20.0 - 34.0 - RC_TERM_TOP - RC_IN_GAP - RC_IN_H - QD_ROW_H;
     var i : [4]f64 = undefined;
     assert rc_input_rect(sw, 700.0, 34.0, 20.0, i[0..4]);
     assert i[0] == sw - QP_W + QP_PAD and i[2] == QP_W - 2.0 * QP_PAD;
     assert i[1] == 700.0 - 20.0 - RC_IN_GAP - RC_IN_H;
-    // transcript and input never overlap, and neither slides under the status bar
-    assert r[1] + r[3] <= i[1];
+    // the delivery row sits between the transcript and the input
+    var d : [4]f64 = undefined;
+    assert qd_row_rect(sw, 700.0, 34.0, 20.0, d[0..4]);
+    assert d[1] == i[1] - QD_ROW_H and d[3] == QD_ROW_H;
+    // transcript, delivery row and input never overlap, and none slides under the status bar
+    assert r[1] + r[3] <= d[1];
+    assert d[1] + d[3] <= i[1];
     assert i[1] + i[3] <= 700.0 - 20.0;
 }
 
@@ -326,4 +461,169 @@ test opening_the_chat_leaves_the_selected_session_alone_and_the_dock_follows_a_q
     assert rc_pick(4294967295, AGENT_QUEEN, 4294967295) == 4294967295;
     assert rc_live(true, 4294967295) == false;
     assert rc_hides_centre(true, 4294967295, 4294967295) == false;
+}
+
+// ---- the delivery of one message (P0, owner 2026-11-03)
+
+test the_link_names_why_nothing_can_be_sent_and_an_empty_field_sends_nothing {
+    assert qd_link(false, true, true) == QD_NO_SERVER;
+    assert qd_link(true, false, true) == QD_NO_PANE;
+    assert qd_link(true, true, false) == QD_NO_PANE;
+    assert qd_link(true, true, true) == QD_READY;
+    // an empty field is no error and no send, whatever the link
+    assert qd_decide(0, QD_READY) == QD_EMPTY;
+    assert qd_decide(0, QD_NO_PANE) == QD_EMPTY;
+    // a dead link is named, never swallowed
+    assert qd_decide(5, QD_NO_SERVER) == QD_NO_SERVER;
+    assert qd_decide(5, QD_NO_PANE) == QD_NO_PANE;
+    assert qd_decide(5, QD_READY) == QD_SENDING;
+    assert qd_failed(QD_NO_SERVER) and qd_failed(QD_NO_PANE) and qd_failed(QD_WRITE_FAIL);
+    assert qd_failed(QD_ACCEPTED) == false and qd_failed(QD_EMPTY) == false and qd_failed(QD_IDLE) == false;
+}
+
+test only_a_ok_frame_is_an_answer_and_an_error_frame_keeps_the_draft {
+    assert qd_reply_ok(4, RE_OK);
+    // the defect this replaces: an RE_ERR frame has a length too
+    assert qd_reply_ok(4, 129) == false;
+    assert qd_reply_ok(0, RE_OK) == false;
+    assert qd_reply_ok(0, 0) == false;
+    assert qd_after_write(true) == QD_ACCEPTED;
+    assert qd_after_write(false) == QD_WRITE_FAIL;
+    // the field is cleared only on ACCEPTED
+    assert qd_clears_draft(QD_ACCEPTED);
+    assert qd_clears_draft(QD_WRITE_FAIL) == false;
+    assert qd_clears_draft(QD_NO_PANE) == false;
+    assert qd_clears_draft(QD_NO_SERVER) == false;
+    assert qd_clears_draft(QD_EMPTY) == false;
+}
+
+test the_message_number_advances_once_on_accept_and_a_retry_keeps_it {
+    var id : u32 = 1;
+    // first press: no Queen pane, refused; the number stays
+    id = qd_next_id(id, QD_NO_PANE);
+    assert id == 1;
+    // retry: the write fails; still the same message
+    id = qd_next_id(id, QD_WRITE_FAIL);
+    assert id == 1;
+    // third press: taken
+    id = qd_next_id(id, QD_ACCEPTED);
+    assert id == 2;
+    // only a send that failed shows Retry on the button
+    assert qd_retry(QD_NO_PANE) and qd_retry(QD_WRITE_FAIL) and qd_retry(QD_NO_SERVER);
+    assert qd_retry(QD_ACCEPTED) == false and qd_retry(QD_IDLE) == false and qd_retry(QD_OUTPUT) == false;
+}
+
+test output_after_a_send_beyond_the_echo_is_the_only_sign_of_an_answer {
+    // 12 bytes were sent; the pane echoes them and a line end: that is not an answer
+    assert qd_reply_seen(14, 12) == false;
+    assert qd_reply_seen(12 + QD_ECHO_SLACK, 12) == false;
+    assert qd_reply_seen(12 + QD_ECHO_SLACK + 1, 12);
+    // the state moves from ACCEPTED only
+    assert qd_on_output(QD_ACCEPTED, 14, 12) == QD_ACCEPTED;
+    assert qd_on_output(QD_ACCEPTED, 400, 12) == QD_OUTPUT;
+    assert qd_on_output(QD_NO_PANE, 400, 12) == QD_NO_PANE;
+    assert qd_on_output(QD_IDLE, 400, 12) == QD_IDLE;
+    assert qd_on_output(QD_OUTPUT, 400, 12) == QD_OUTPUT;
+}
+
+test the_status_row_says_what_happened_in_plain_ascii {
+    var b : [64]u8 = undefined;
+    var n : usize = qd_status_text(b[0..64], QD_SENDING, 7, QD_READY);
+    assert n == 13;
+    assert b[0] == 83 and b[8] == 35 and b[9] == 55 and b[10] == 46;
+    n = qd_status_text(b[0..64], QD_ACCEPTED, 12, QD_READY);
+    assert n == 24;
+    assert b[0] == 65 and b[9] == 35 and b[10] == 49 and b[11] == 50;
+    n = qd_status_text(b[0..64], QD_OUTPUT, 3, QD_READY);
+    assert n == 15;
+    n = qd_status_text(b[0..64], QD_NO_PANE, 1, QD_NO_PANE);
+    assert n == 23;
+    assert b[0] == 78 and b[1] == 79 and b[2] == 84;
+    n = qd_status_text(b[0..64], QD_NO_SERVER, 1, QD_NO_SERVER);
+    assert n == 24;
+    n = qd_status_text(b[0..64], QD_WRITE_FAIL, 1, QD_READY);
+    assert n == 19;
+    // idle: the standing link, honest even before a first press
+    n = qd_status_text(b[0..64], QD_IDLE, 1, QD_READY);
+    assert n == 20;
+    n = qd_status_text(b[0..64], QD_IDLE, 1, QD_NO_PANE);
+    assert n == 27;
+    n = qd_status_text(b[0..64], QD_IDLE, 1, QD_NO_SERVER);
+    assert n == 26;
+    // every text is ASCII and fits the row
+    var i : usize = 0;
+    while (i < n) {
+        assert b[i] >= 32 and b[i] < 127;
+        i = i + 1;
+    }
+    assert n <= 34;
+}
+
+test a_mock_transport_walks_the_whole_chain_and_never_loses_the_draft {
+    // This is a model-level mock: no pane, no socket, no model call. It is not the live Queen.
+    var id : u32 = 1;
+    var draft : usize = 11;
+    var state : u32 = QD_IDLE;
+    // 1. the pane server is up but the table is full: no Queen pane
+    state = qd_decide(draft, qd_link(true, false, false));
+    assert state == QD_NO_PANE;
+    assert qd_clears_draft(state) == false;
+    id = qd_next_id(id, state);
+    assert id == 1 and draft == 11;
+    // 2. a pane appears; the write of 11 bytes + CR is one chunk and the server answers RE_ERR
+    state = qd_decide(draft, qd_link(true, true, true));
+    assert state == QD_SENDING;
+    var ok : bool = qd_reply_ok(4, 129);
+    state = qd_after_write(ok);
+    assert state == QD_WRITE_FAIL and qd_clears_draft(state) == false;
+    id = qd_next_id(id, state);
+    assert id == 1;
+    // 3. the retry: RE_OK for every chunk of a 9000-byte message (3 chunks of at most 4000)
+    state = qd_decide(draft, qd_link(true, true, true));
+    assert state == QD_SENDING;
+    ok = true;
+    var c : u32 = 0;
+    while (c < 3) {
+        ok = ok and qd_reply_ok(4, RE_OK);
+        c = c + 1;
+    }
+    state = qd_after_write(ok);
+    assert state == QD_ACCEPTED and qd_clears_draft(state);
+    id = qd_next_id(id, state);
+    assert id == 2;
+    // 4. the pane echoes the line, then answers
+    state = qd_on_output(state, 13, 12);
+    assert state == QD_ACCEPTED;
+    state = qd_on_output(state, 200, 12);
+    assert state == QD_OUTPUT;
+    // 5. a chunk failing in the middle fails the whole send, and the draft stays
+    ok = true;
+    c = 0;
+    while (c < 3) {
+        var rn : usize = 4;
+        if (c == 1) { rn = 0; }
+        ok = ok and qd_reply_ok(rn, RE_OK);
+        c = c + 1;
+    }
+    assert qd_after_write(ok) == QD_WRITE_FAIL;
+}
+
+test the_send_button_is_the_right_end_of_the_delivery_row_and_never_under_the_input {
+    const sw : f64 = 1400.0;
+    var r : [4]f64 = undefined;
+    assert qd_send_rect(sw, 700.0, 34.0, 20.0, r[0..4]);
+    var d : [4]f64 = undefined;
+    assert qd_row_rect(sw, 700.0, 34.0, 20.0, d[0..4]);
+    var i : [4]f64 = undefined;
+    assert rc_input_rect(sw, 700.0, 34.0, 20.0, i[0..4]);
+    // inside the row, on its right end, above the input
+    assert r[0] + r[2] == d[0] + d[2];
+    assert r[1] >= d[1] and r[1] + r[3] <= d[1] + d[3];
+    assert r[1] + r[3] <= i[1];
+    assert r[2] == QD_BTN_W;
+    // the hit test agrees with the rect: its centre hits, a point on the input row and one left of it miss
+    assert on_qd_send(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, sw, 700.0, 34.0, 20.0);
+    assert on_qd_send(r[0] + r[2] / 2.0, i[1] + 5.0, sw, 700.0, 34.0, 20.0) == false;
+    assert on_qd_send(r[0] - 1.0, r[1] + r[3] / 2.0, sw, 700.0, 34.0, 20.0) == false;
+    assert on_qd_send(r[0] + r[2], r[1] + r[3] / 2.0, sw, 700.0, 34.0, 20.0) == false;
 }
