@@ -1,0 +1,1035 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/queen_receiver.t27 -- the Queen's receiver: the one place an owner message becomes a task with a
+; number, is handed to a REAL executor, and comes back as a result checked against that same number
+; (owner, 2026-11-04: owner message -> receiver -> task_id -> executor -> result with the same task_id ->
+; verifying -> verdict with grounds -> the chat; the dock never shows an echo or a fixture as the Queen working).
+; --
+; TWO results, kept apart on purpose:
+;   1. TRANSPORT: the receiver accepted the message, gave it a task number and saved it (qr_accept, qr_seal).
+;      That is all "Task #N saved by the receiver" claims. It does not say a Queen read the bytes, that an
+;      executor exists, or that anything runs.
+;   2. COMPLETED TRACE: a designated, reachable executor pane was handed the task (qr_handoff), acknowledged
+;      it (qr_ack), returned a result carrying the same task_id and an evidence reference (qr_result), the
+;      Queen started a check (qr_verify_start) and the host-measured grounds passed (qr_verdict). Only then
+;      qr_trace_complete is true, and never for a task marked as a fixture (qr_mark_fixture).
+; With no executor the task stays SAVED_NO_EXECUTOR and qr_boundary names the next step: the owner's own
+; word to give an executor a pane slot. Nothing here closes a pane, spawns one, pays, pushes or merges
+; (queen_verdict.t27 qv_loop_may; pane_slots.t27 ps_may_close is the owner's word alone).
+; --
+; Reuse, not a second rulebook: the verdict states, the check and the bounded send-back loop are
+; queen_verdict.t27 (qv_step, qv_check_event, qv_next_action, qv_restore, qv_bucket); whether a pane may be an
+; executor reads pane_slots.t27 (a pane the owner works in, or an idle shell cell, is never one).
+; WHAT IS NOT HERE: writing the table to disk and reading it back (the window host does it; qr_seal and
+; qr_sealed_ok say whether the bytes read are the bytes written), the pane write that carries the brief
+; to the executor, and the measurements behind the grounds (exists, evidence, tests run, tests failed):
+; those are the HOST's, never this module's claim about itself.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27osQueenReceiver;
+
+use t27os::queen_verdict::QV_NONE;
+use t27os::queen_verdict::QV_RESULT_SUBMITTED;
+use t27os::queen_verdict::QV_VERIFYING;
+use t27os::queen_verdict::QV_ACCEPTED;
+use t27os::queen_verdict::QV_CHANGES_REQUESTED;
+use t27os::queen_verdict::QV_BLOCKED;
+use t27os::queen_verdict::QV_NEEDS_OWNER;
+use t27os::queen_verdict::QV_CANCELLED;
+use t27os::queen_verdict::QE_RESULT;
+use t27os::queen_verdict::QE_VERIFY_START;
+use t27os::queen_verdict::QE_LINK_LOST;
+use t27os::queen_verdict::QE_LINK_BACK;
+use t27os::queen_verdict::QE_CANCEL;
+use t27os::queen_verdict::QE_ESCALATE;
+use t27os::queen_verdict::QA_VERIFY;
+use t27os::queen_verdict::QA_ESCALATE;
+use t27os::queen_verdict::qv_step;
+use t27os::queen_verdict::qv_check_event;
+use t27os::queen_verdict::qv_count_sendback;
+use t27os::queen_verdict::qv_next_action;
+use t27os::queen_verdict::qv_restore;
+use t27os::queen_verdict::qv_unfinished;
+use t27os::queen_verdict::qv_is_terminal;
+use t27os::queen_verdict::qv_bucket;
+use t27os::pane_slots::WHY_LIVE_SESSION;
+use t27os::pane_slots::WHY_WORKING;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+
+// ---------------------------------------------------------------- the table
+
+/// The table in the host's byte region (and in its file). Header: [0..3] the last task number given, [4..7]
+/// the magic Q R 1 0, [8..9] the seal (a sum of the slots), the rest reserved. A slot: [0..3] task number
+/// (0 = free), [4..5] the chat message number, [6] hand-off state, [7] executor pane (255 = none), [8] verdict
+/// state (queen_verdict QV_*), [9] counted send-backs, [10] 1 once a result came, [11] flags (1 artifact
+/// exists, 2 evidence set, 4 fixture), [12..13] tests run, [14..15] tests failed, [16..19] evidence reference,
+/// [20] text length, then the owner's text from byte 32.
+pub const QR_HDR : usize = 16;
+pub const QR_SLOTS : usize = 16;
+pub const QR_SLOT : usize = 232;
+pub const QR_TEXT : usize = 32;
+pub const QR_TEXT_MAX : usize = 200;
+pub const QR_BYTES : usize = 3728;
+pub const QR_NO_SLOT : usize = 255;
+pub const QR_NO_PANE : u8 = 255;
+
+pub const HO_NO_PATH : u8 = 0;
+pub const HO_ASSIGNED : u8 = 1;
+pub const HO_ACKED : u8 = 2;
+
+pub const QR_OK : u8 = 0;
+pub const QR_EMPTY : u8 = 1;
+pub const QR_FULL : u8 = 2;
+
+pub fn qr_get32(t : []const u8, o : usize) -> u32 {
+    return (t[o] as u32) + 256 * (t[o + 1] as u32) + 65536 * (t[o + 2] as u32) + 16777216 * (t[o + 3] as u32);
+}
+
+pub fn qr_put32(t : []u8, o : usize, v : u32) -> void {
+    t[o] = @intCast(v % 256);
+    t[o + 1] = @intCast((v / 256) % 256);
+    t[o + 2] = @intCast((v / 65536) % 256);
+    t[o + 3] = @intCast(v / 16777216);
+}
+
+pub fn qr_get16(t : []const u8, o : usize) -> u32 {
+    return (t[o] as u32) + 256 * (t[o + 1] as u32);
+}
+
+pub fn qr_put16(t : []u8, o : usize, v : u32) -> void {
+    t[o] = @intCast(v % 256);
+    t[o + 1] = @intCast((v / 256) % 256);
+}
+
+/// An empty table: no task, the magic set.
+pub fn qr_init(t : []u8) -> void {
+    var i : usize = 0;
+    while (i < QR_BYTES) {
+        t[i] = 0;
+        i = i + 1;
+    }
+    t[4] = 81;
+    t[5] = 82;
+    t[6] = 49;
+}
+
+pub fn qr_base(i : usize) -> usize {
+    return QR_HDR + i * QR_SLOT;
+}
+
+/// The slot of a task number, QR_NO_SLOT when there is none (task 0 is never a task).
+pub fn qr_find(t : []const u8, task_id : u32) -> usize {
+    if (task_id == 0) { return QR_NO_SLOT; }
+    var i : usize = 0;
+    while (i < QR_SLOTS) {
+        if (qr_get32(t, qr_base(i)) == task_id) { return i; }
+        i = i + 1;
+    }
+    return QR_NO_SLOT;
+}
+
+pub fn qr_free_slot(t : []const u8) -> usize {
+    var i : usize = 0;
+    while (i < QR_SLOTS) {
+        if (qr_get32(t, qr_base(i)) == 0) { return i; }
+        i = i + 1;
+    }
+    return QR_NO_SLOT;
+}
+
+pub fn qr_last_id(t : []const u8) -> u32 {
+    return qr_get32(t, 0);
+}
+
+pub fn qr_count(t : []const u8) -> usize {
+    var c : usize = 0;
+    var i : usize = 0;
+    while (i < QR_SLOTS) {
+        if (qr_get32(t, qr_base(i)) != 0) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------- intake: the transport result
+
+/// How many bytes of a text a task keeps: at most QR_TEXT_MAX, and a character is never cut in two.
+pub fn qr_cut(text : []const u8, n : usize) -> usize {
+    var m : usize = n;
+    if (m > QR_TEXT_MAX) {
+        m = QR_TEXT_MAX;
+        while (m > 0 and text[m] >= 128 and text[m] < 192) { m = m - 1; }
+    }
+    return m;
+}
+
+/// The slot of the task that already holds this message number with this text. The same number with other text is
+/// another message (the owner changed the draft after a refusal): it becomes a new task and the first one stays.
+pub fn qr_slot_of(t : []const u8, msg_id : u32, text : []const u8, n : usize) -> usize {
+    const m : usize = qr_cut(text, n);
+    var i : usize = 0;
+    while (i < QR_SLOTS) {
+        const b : usize = qr_base(i);
+        if (qr_get32(t, b) != 0 and qr_get16(t, b + 4) == msg_id and (t[b + 20] as usize) == m) {
+            var same : bool = true;
+            var k : usize = 0;
+            while (k < m) {
+                if (t[b + QR_TEXT + k] != text[k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) { return i; }
+        }
+        i = i + 1;
+    }
+    return QR_NO_SLOT;
+}
+
+/// The task number of a message already taken, 0 when it was not.
+pub fn qr_lookup(t : []const u8, msg_id : u32, text : []const u8, n : usize) -> u32 {
+    const at : usize = qr_slot_of(t, msg_id, text, n);
+    if (at == QR_NO_SLOT) { return 0; }
+    return qr_get32(t, qr_base(at));
+}
+
+/// The first message number no saved task holds. After a restart the dock numbers from here, so a new message
+/// never meets an old task of the same number.
+pub fn qr_next_msg(t : []const u8) -> u32 {
+    var top : u32 = 0;
+    var i : usize = 0;
+    while (i < QR_SLOTS) {
+        const b : usize = qr_base(i);
+        if (qr_get32(t, b) != 0 and qr_get16(t, b + 4) > top) { top = qr_get16(t, b + 4); }
+        i = i + 1;
+    }
+    return top + 1;
+}
+
+/// Why a message is not taken: nothing typed, or no free slot. A repeat of a message already taken (same number,
+/// same text) is not a refusal; it finds its task.
+pub fn qr_refusal(t : []const u8, msg_id : u32, text : []const u8, n : usize) -> u8 {
+    if (n == 0) { return QR_EMPTY; }
+    if (qr_slot_of(t, msg_id, text, n) != QR_NO_SLOT) { return QR_OK; }
+    if (qr_free_slot(t) == QR_NO_SLOT) { return QR_FULL; }
+    return QR_OK;
+}
+
+/// Take an owner message: a new task number, saved. A repeat of the same message (number and text) returns the
+/// task it already has and changes nothing (no duplicate task). Returns 0 when the message is refused.
+pub fn qr_accept(t : []u8, msg_id : u32, text : []const u8, n : usize) -> u32 {
+    if (qr_refusal(t, msg_id, text, n) != QR_OK) { return 0; }
+    const old : usize = qr_slot_of(t, msg_id, text, n);
+    if (old != QR_NO_SLOT) { return qr_get32(t, qr_base(old)); }
+    const at : usize = qr_free_slot(t);
+    const b : usize = qr_base(at);
+    const id : u32 = qr_get32(t, 0) + 1;
+    const m : usize = qr_cut(text, n);
+    var i : usize = 4;
+    while (i < QR_SLOT) {
+        t[b + i] = 0;
+        i = i + 1;
+    }
+    qr_put32(t, b, id);
+    qr_put16(t, b + 4, msg_id);
+    t[b + 6] = HO_NO_PATH;
+    t[b + 7] = QR_NO_PANE;
+    t[b + 8] = QV_NONE;
+    t[b + 20] = @intCast(m);
+    i = 0;
+    while (i < m) {
+        t[b + QR_TEXT + i] = text[i];
+        i = i + 1;
+    }
+    qr_put32(t, 0, id);
+    return id;
+}
+
+pub fn qr_text_len(t : []const u8, task_id : u32) -> usize {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return 0; }
+    return t[qr_base(at) + 20] as usize;
+}
+
+/// The message number a task came from (0 = no such task).
+pub fn qr_msg_of(t : []const u8, task_id : u32) -> u32 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return 0; }
+    return qr_get16(t, qr_base(at) + 4);
+}
+
+pub fn qr_handoff_of(t : []const u8, task_id : u32) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return HO_NO_PATH; }
+    return t[qr_base(at) + 6];
+}
+
+pub fn qr_executor_of(t : []const u8, task_id : u32) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return QR_NO_PANE; }
+    return t[qr_base(at) + 7];
+}
+
+pub fn qr_verdict_of(t : []const u8, task_id : u32) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return QV_NONE; }
+    return t[qr_base(at) + 8];
+}
+
+pub fn qr_sendbacks_of(t : []const u8, task_id : u32) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return 0; }
+    return t[qr_base(at) + 9];
+}
+
+pub fn qr_flag(t : []const u8, b : usize, bit : u32) -> bool {
+    return ((t[b + 11] as u32) / bit) % 2 == 1;
+}
+
+pub fn qr_set_flag(t : []u8, b : usize, bit : u32, on : bool) -> void {
+    const cur : bool = qr_flag(t, b, bit);
+    if (on and cur == false) { t[b + 11] = @intCast((t[b + 11] as u32) + bit); }
+    if (on == false and cur) { t[b + 11] = @intCast((t[b + 11] as u32) - bit); }
+}
+
+/// A fixture task (test events, an explicit test mode) can never complete a real trace.
+pub fn qr_mark_fixture(t : []u8, task_id : u32) -> void {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return; }
+    qr_set_flag(t, qr_base(at), 4, true);
+}
+
+pub fn qr_is_fixture(t : []const u8, task_id : u32) -> bool {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return false; }
+    return qr_flag(t, qr_base(at), 4);
+}
+
+// ---------------------------------------------------------------- hand-off to an executor
+
+/// May this pane be an executor? Only a pane the receiver was told to use for this (designated, measured by
+/// the host) and that holds a live session or is working. A pane the owner works in is never designated, an
+/// idle shell cell is not an executor, and a slot whose process is gone cannot take a task.
+pub fn qr_target_ok(designated : bool, why : u32) -> bool {
+    return designated and (why == WHY_LIVE_SESSION or why == WHY_WORKING);
+}
+
+/// Hand a saved task to a pane. False (and nothing changes) when the task is unknown or already handed, the
+/// task is finished, or the pane is not an executor.
+pub fn qr_handoff(t : []u8, task_id : u32, pane : u32, designated : bool, why : u32) -> bool {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return false; }
+    if (pane >= 255) { return false; }
+    if (qr_target_ok(designated, why) == false) { return false; }
+    const b : usize = qr_base(at);
+    if (t[b + 6] != HO_NO_PATH) { return false; }
+    if (qv_is_terminal(t[b + 8])) { return false; }
+    t[b + 6] = HO_ASSIGNED;
+    t[b + 7] = @intCast(pane);
+    return true;
+}
+
+/// The executor says it has the task: the same task number from the same pane.
+pub fn qr_ack(t : []u8, task_id : u32, pane : u32) -> bool {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return false; }
+    const b : usize = qr_base(at);
+    if (t[b + 6] != HO_ASSIGNED) { return false; }
+    if ((t[b + 7] as u32) != pane) { return false; }
+    t[b + 6] = HO_ACKED;
+    return true;
+}
+
+// ---------------------------------------------------------------- a result comes back
+
+pub const QR_R_OK : u8 = 0;
+pub const QR_R_UNKNOWN : u8 = 1;
+pub const QR_R_NOT_HANDED : u8 = 2;
+pub const QR_R_WRONG_PANE : u8 = 3;
+pub const QR_R_NO_EVIDENCE : u8 = 4;
+pub const QR_R_REPEAT : u8 = 5;
+pub const QR_R_CLOSED : u8 = 6;
+pub const QR_R_BUSY : u8 = 7;
+
+/// A result for a task number. It counts only from the pane the task was handed to, with an evidence
+/// reference, for a task that exists and is not finished; a repeat of the same evidence does nothing.
+pub fn qr_result(t : []u8, task_id : u32, pane : u32, evidence_ref : u32) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return QR_R_UNKNOWN; }
+    const b : usize = qr_base(at);
+    if (t[b + 6] == HO_NO_PATH) { return QR_R_NOT_HANDED; }
+    if ((t[b + 7] as u32) != pane) { return QR_R_WRONG_PANE; }
+    if (evidence_ref == 0) { return QR_R_NO_EVIDENCE; }
+    const state : u8 = t[b + 8];
+    if (qv_is_terminal(state)) { return QR_R_CLOSED; }
+    if (t[b + 10] == 1 and qr_get32(t, b + 16) == evidence_ref) { return QR_R_REPEAT; }
+    const next : u8 = qv_step(state, QE_RESULT, true);
+    if (next == state) { return QR_R_BUSY; }
+    t[b + 8] = next;
+    t[b + 10] = 1;
+    t[b + 6] = HO_ACKED;
+    qr_put32(t, b + 16, evidence_ref);
+    qr_put16(t, b + 12, 0);
+    qr_put16(t, b + 14, 0);
+    qr_set_flag(t, b, 1, false);
+    qr_set_flag(t, b, 2, false);
+    return QR_R_OK;
+}
+
+/// The Queen starts the check. paused: the owner suspended coordination, so nothing new starts.
+pub fn qr_verify_start(t : []u8, task_id : u32, paused : bool) -> bool {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return false; }
+    const b : usize = qr_base(at);
+    if (qv_next_action(t[b + 8], t[b + 9], paused) != QA_VERIFY) { return false; }
+    t[b + 8] = qv_step(t[b + 8], QE_VERIFY_START, t[b + 10] == 1);
+    return true;
+}
+
+/// The verdict, from what the host measured. It is read only while a check runs; the grounds are kept on the
+/// task so the card can show them. Returns the task's state after it.
+pub fn qr_verdict(t : []u8, task_id : u32, exists : bool, evidence_set : bool, tests_total : u32, tests_failed : u32) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return QV_NONE; }
+    const b : usize = qr_base(at);
+    const prev : u8 = t[b + 8];
+    if (prev != QV_VERIFYING) { return prev; }
+    var tt : u32 = tests_total;
+    if (tt > 65535) { tt = 65535; }
+    var tf : u32 = tests_failed;
+    if (tf > 65535) { tf = 65535; }
+    qr_set_flag(t, b, 1, exists);
+    qr_set_flag(t, b, 2, evidence_set);
+    qr_put16(t, b + 12, tt);
+    qr_put16(t, b + 14, tf);
+    const next : u8 = qv_step(prev, qv_check_event(exists, evidence_set, tests_total, tests_failed), true);
+    t[b + 8] = next;
+    t[b + 9] = qv_count_sendback(prev, next, t[b + 9]);
+    return next;
+}
+
+/// After two send-backs the Queen asks the owner instead of a third round.
+pub fn qr_escalate(t : []u8, task_id : u32) -> bool {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return false; }
+    const b : usize = qr_base(at);
+    if (qv_next_action(t[b + 8], t[b + 9], false) != QA_ESCALATE) { return false; }
+    t[b + 8] = qv_step(t[b + 8], QE_ESCALATE, t[b + 10] == 1);
+    return true;
+}
+
+pub fn qr_link_lost(t : []u8, task_id : u32) -> void {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return; }
+    const b : usize = qr_base(at);
+    t[b + 8] = qv_step(t[b + 8], QE_LINK_LOST, t[b + 10] == 1);
+}
+
+pub fn qr_link_back(t : []u8, task_id : u32) -> void {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return; }
+    const b : usize = qr_base(at);
+    t[b + 8] = qv_step(t[b + 8], QE_LINK_BACK, t[b + 10] == 1);
+}
+
+pub fn qr_cancel(t : []u8, task_id : u32) -> void {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return; }
+    const b : usize = qr_base(at);
+    t[b + 8] = qv_step(t[b + 8], QE_CANCEL, t[b + 10] == 1);
+}
+
+// ---------------------------------------------------------------- where the task stands
+
+pub const QS_NONE : u8 = 0;
+pub const QS_SAVED_NO_EXECUTOR : u8 = 1;
+pub const QS_HANDED_OFF : u8 = 2;
+pub const QS_EXECUTOR_ACKED : u8 = 3;
+pub const QS_RESULT : u8 = 4;
+pub const QS_VERIFYING : u8 = 5;
+pub const QS_ACCEPTED : u8 = 6;
+pub const QS_CHANGES : u8 = 7;
+pub const QS_BLOCKED : u8 = 8;
+pub const QS_OWNER : u8 = 9;
+pub const QS_CANCELLED : u8 = 10;
+
+/// One stage per task, read by the chat card and the dashboard alike.
+pub fn qr_stage(t : []const u8, task_id : u32) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return QS_NONE; }
+    const b : usize = qr_base(at);
+    const v : u8 = t[b + 8];
+    if (v == QV_ACCEPTED) { return QS_ACCEPTED; }
+    if (v == QV_CANCELLED) { return QS_CANCELLED; }
+    if (v == QV_NEEDS_OWNER) { return QS_OWNER; }
+    if (v == QV_BLOCKED) { return QS_BLOCKED; }
+    if (v == QV_CHANGES_REQUESTED) { return QS_CHANGES; }
+    if (v == QV_VERIFYING) { return QS_VERIFYING; }
+    if (v == QV_RESULT_SUBMITTED) { return QS_RESULT; }
+    if (t[b + 6] == HO_ACKED) { return QS_EXECUTOR_ACKED; }
+    if (t[b + 6] == HO_ASSIGNED) { return QS_HANDED_OFF; }
+    return QS_SAVED_NO_EXECUTOR;
+}
+
+/// Result 1: the receiver has the task. True for any task that was taken; it says nothing about a Queen,
+/// an executor or a run.
+pub fn qr_transport_done(t : []const u8, task_id : u32) -> bool {
+    return qr_find(t, task_id) != QR_NO_SLOT;
+}
+
+/// Result 2: the completed trace. A real executor was handed the task, a result with the same number came
+/// back, the check ran on measured grounds and passed, and the task is not a fixture.
+pub fn qr_trace_complete(t : []const u8, task_id : u32) -> bool {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return false; }
+    const b : usize = qr_base(at);
+    if (t[b + 8] != QV_ACCEPTED) { return false; }
+    if (t[b + 6] != HO_ACKED) { return false; }
+    if (t[b + 10] != 1) { return false; }
+    if (qr_flag(t, b, 4)) { return false; }
+    if (qr_flag(t, b, 1) == false or qr_flag(t, b, 2) == false) { return false; }
+    return qr_get16(t, b + 12) > 0 and qr_get16(t, b + 14) == 0;
+}
+
+/// The dashboard bucket of a task. A task nobody was handed to has no link to an executor, whatever the
+/// chat link is: it counts as "no link", never as "working".
+pub fn qr_bucket(t : []const u8, task_id : u32, link_ok : bool) -> u8 {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return 255; }
+    const b : usize = qr_base(at);
+    return qv_bucket(t[b + 8], link_ok and t[b + 6] != HO_NO_PATH);
+}
+
+/// How many tasks fall in one dashboard bucket.
+pub fn qr_bucket_count(t : []const u8, bucket : u8, link_ok : bool) -> usize {
+    var c : usize = 0;
+    var i : usize = 0;
+    while (i < QR_SLOTS) {
+        const id : u32 = qr_get32(t, qr_base(i));
+        if (id != 0 and qr_bucket(t, id, link_ok) == bucket) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------- the words in the chat
+
+/// The grounds of a verdict, in words, from what was measured. Empty before a check has run.
+pub fn qr_grounds(out : []u8, t : []const u8, task_id : u32) -> usize {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return 0; }
+    const b : usize = qr_base(at);
+    const total : u32 = qr_get16(t, b + 12);
+    const failed : u32 = qr_get16(t, b + 14);
+    const v : u8 = t[b + 8];
+    if (v != QV_ACCEPTED and v != QV_CHANGES_REQUESTED and v != QV_NEEDS_OWNER) { return 0; }
+    var n : usize = 0;
+    if (qr_flag(t, b, 1) == false) { return put_bytes(out, 0, "Checks: the artifact is missing."); }
+    if (qr_flag(t, b, 2) == false) { return put_bytes(out, 0, "Checks: no evidence reference."); }
+    if (total == 0) { return put_bytes(out, 0, "Checks: no test ran, so nothing is proven."); }
+    n = put_bytes(out, 0, "Checks: ");
+    n = put_dec(out, n, total - failed);
+    n = put_bytes(out, n, " of ");
+    n = put_dec(out, n, total);
+    n = put_bytes(out, n, " tests pass.");
+    return n;
+}
+
+/// The Queen-side card for a task, by stage. It never says the Queen accepted anything before a check passed,
+/// and a saved task says in the same line that no executor has it. A fixture says so at the end.
+pub fn qr_card_text(out : []u8, t : []const u8, task_id : u32) -> usize {
+    const at : usize = qr_find(t, task_id);
+    if (at == QR_NO_SLOT) { return 0; }
+    const b : usize = qr_base(at);
+    const st : u8 = qr_stage(t, task_id);
+    const pane : u32 = t[b + 7] as u32;
+    var n : usize = put_bytes(out, 0, "Task #");
+    n = put_dec(out, n, task_id);
+    if (st == QS_SAVED_NO_EXECUTOR) {
+        n = put_bytes(out, n, " saved by the receiver. No executor has it yet.");
+    } else if (st == QS_HANDED_OFF) {
+        n = put_bytes(out, n, " handed to pane ");
+        n = put_dec(out, n, pane);
+        n = put_bytes(out, n, ". Waiting for its acknowledgement.");
+    } else if (st == QS_EXECUTOR_ACKED) {
+        n = put_bytes(out, n, " taken by pane ");
+        n = put_dec(out, n, pane);
+        n = put_bytes(out, n, ". No result yet.");
+    } else if (st == QS_RESULT) {
+        n = put_bytes(out, n, ": result received from pane ");
+        n = put_dec(out, n, pane);
+        n = put_bytes(out, n, ", not verified yet.");
+    } else if (st == QS_VERIFYING) {
+        n = put_bytes(out, n, ": verifying the result.");
+    } else if (st == QS_ACCEPTED) {
+        n = put_bytes(out, n, " accepted. ");
+        n = n + qr_grounds(out[n..n + 64], t, task_id);
+    } else if (st == QS_CHANGES) {
+        n = put_bytes(out, n, ": changes requested. ");
+        n = n + qr_grounds(out[n..n + 64], t, task_id);
+    } else if (st == QS_BLOCKED) {
+        n = put_bytes(out, n, " blocked: the link to pane ");
+        n = put_dec(out, n, pane);
+        n = put_bytes(out, n, " is lost.");
+    } else if (st == QS_OWNER) {
+        n = put_bytes(out, n, " awaits your decision.");
+    } else {
+        n = put_bytes(out, n, " cancelled.");
+    }
+    if (qr_flag(t, b, 4)) { n = put_bytes(out, n, " - test fixture"); }
+    return n;
+}
+
+/// The next boundary of a task that has not completed, in words. Empty when the trace is complete.
+pub fn qr_boundary(out : []u8, t : []const u8, task_id : u32) -> usize {
+    const st : u8 = qr_stage(t, task_id);
+    if (st == QS_SAVED_NO_EXECUTOR) {
+        return put_bytes(out, 0, "Next: no executor is reachable. An executor pane needs a free slot, which only the owner frees.");
+    }
+    if (st == QS_HANDED_OFF) { return put_bytes(out, 0, "Next: the executor has not acknowledged the task number."); }
+    if (st == QS_EXECUTOR_ACKED) { return put_bytes(out, 0, "Next: the executor has not returned a result."); }
+    if (st == QS_RESULT) { return put_bytes(out, 0, "Next: the Queen has not started the check."); }
+    if (st == QS_VERIFYING) { return put_bytes(out, 0, "Next: the check has not finished."); }
+    if (st == QS_CHANGES) { return put_bytes(out, 0, "Next: the executor resubmits, or the owner decides after two send-backs."); }
+    if (st == QS_BLOCKED) { return put_bytes(out, 0, "Next: the link to the executor comes back."); }
+    if (st == QS_OWNER) { return put_bytes(out, 0, "Next: the owner decides."); }
+    return 0;
+}
+
+// ---------------------------------------------------------------- the file and the restart
+
+fn qr_sum(t : []const u8) -> u32 {
+    var s : u32 = 0;
+    var i : usize = 0;
+    while (i < QR_BYTES) {
+        if (i < 8 or i >= QR_HDR) { s = (s + (t[i] as u32) * ((i as u32) % 251 + 1)) % 65521; }
+        i = i + 1;
+    }
+    return s;
+}
+
+/// Write the seal before the table goes to its file.
+pub fn qr_seal(t : []u8) -> void {
+    qr_put16(t, 8, qr_sum(t));
+}
+
+/// After reading the file: the magic is there and the bytes are the bytes that were sealed. A table that
+/// fails this is not trusted; it is started empty and the owner is told.
+pub fn qr_sealed_ok(t : []const u8) -> bool {
+    if (t[4] != 81 or t[5] != 82 or t[6] != 49) { return false; }
+    return qr_get16(t, 8) == qr_sum(t);
+}
+
+/// After a restart: a half-run check did not survive, so it is run again; no verdict is assumed. Returns how
+/// many tasks are still unfinished.
+pub fn qr_restore(t : []u8) -> usize {
+    var open : usize = 0;
+    var i : usize = 0;
+    while (i < QR_SLOTS) {
+        const b : usize = qr_base(i);
+        if (qr_get32(t, b) != 0) {
+            t[b + 8] = qv_restore(t[b + 8]);
+            if (qv_unfinished(t[b + 8])) { open = open + 1; }
+        }
+        i = i + 1;
+    }
+    return open;
+}
+
+// ---------------------------------------------------------------- tests (every event below is a SYNTHETIC test input)
+
+fn qr_same(a : []const u8, b : []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test the_table_has_its_size {
+    assert QR_BYTES == QR_HDR + QR_SLOTS * QR_SLOT;
+    assert QR_TEXT + QR_TEXT_MAX == QR_SLOT;
+}
+
+test an_owner_message_becomes_a_numbered_saved_task {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    assert qr_count(tab[0..3728]) == 0;
+    assert qr_refusal(tab[0..3728], 1, "hello", 5) == QR_OK;
+    const id : u32 = qr_accept(tab[0..3728], 1, "hello", 5);
+    assert id == 1;
+    assert qr_transport_done(tab[0..3728], id);
+    assert qr_msg_of(tab[0..3728], id) == 1;
+    assert qr_text_len(tab[0..3728], id) == 5;
+    assert tab[qr_base(0) + QR_TEXT] == 104 and tab[qr_base(0) + QR_TEXT + 4] == 111;
+    assert qr_last_id(tab[0..3728]) == 1;
+    // the saved task has no executor: the honest stage is not "working"
+    assert qr_stage(tab[0..3728], id) == QS_SAVED_NO_EXECUTOR;
+    assert qr_handoff_of(tab[0..3728], id) == HO_NO_PATH;
+    assert qr_executor_of(tab[0..3728], id) == QR_NO_PANE;
+    assert qr_trace_complete(tab[0..3728], id) == false;
+    assert qr_accept(tab[0..3728], 2, "second", 6) == 2;
+    assert qr_count(tab[0..3728]) == 2;
+}
+
+test nothing_typed_and_a_full_table_are_refused_and_a_repeat_makes_no_second_task {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    assert qr_refusal(tab[0..3728], 1, "", 0) == QR_EMPTY;
+    assert qr_accept(tab[0..3728], 1, "", 0) == 0;
+    assert qr_count(tab[0..3728]) == 0;
+    assert qr_last_id(tab[0..3728]) == 0;
+    // a repeat of message 7 is the same task
+    const first : u32 = qr_accept(tab[0..3728], 7, "do it", 5);
+    assert qr_accept(tab[0..3728], 7, "do it", 5) == first;
+    assert qr_count(tab[0..3728]) == 1;
+    assert qr_last_id(tab[0..3728]) == first;
+    // fill the table: message numbers 100 .. 114 take the other fifteen slots
+    var m : u32 = 100;
+    while (m < 115) {
+        assert qr_accept(tab[0..3728], m, "x", 1) != 0;
+        m = m + 1;
+    }
+    assert qr_count(tab[0..3728]) == 16;
+    assert qr_refusal(tab[0..3728], 200, "x", 1) == QR_FULL;
+    assert qr_accept(tab[0..3728], 200, "x", 1) == 0;
+    // a repeat is still found when the table is full
+    assert qr_refusal(tab[0..3728], 7, "do it", 5) == QR_OK;
+    assert qr_accept(tab[0..3728], 7, "do it", 5) == first;
+}
+
+test a_long_text_is_cut_at_a_character_boundary {
+    var tab : [3728]u8 = undefined;
+    var big : [260]u8 = undefined;
+    var i : usize = 0;
+    while (i < 260) {
+        big[i] = 97;
+        i = i + 1;
+    }
+    qr_init(tab[0..3728]);
+    assert qr_accept(tab[0..3728], 1, big[0..260], 260) == 1;
+    assert qr_text_len(tab[0..3728], 1) == 200;
+    // byte 200 is a continuation byte: the cut steps back, so no character is split
+    big[199] = 208;
+    big[200] = 144;
+    assert qr_accept(tab[0..3728], 2, big[0..260], 260) == 2;
+    assert qr_text_len(tab[0..3728], 2) == 199;
+}
+
+test a_changed_draft_under_the_same_number_is_a_new_task_and_the_first_stays {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    assert qr_accept(tab[0..3728], 1, "make it", 7) == 1;
+    // a retry of the same draft finds task 1
+    assert qr_lookup(tab[0..3728], 1, "make it", 7) == 1;
+    assert qr_accept(tab[0..3728], 1, "make it", 7) == 1;
+    // the owner edited the draft after a refusal: same number, other text, other task; task 1 keeps its text
+    assert qr_lookup(tab[0..3728], 1, "make it so", 10) == 0;
+    assert qr_accept(tab[0..3728], 1, "make it so", 10) == 2;
+    assert qr_count(tab[0..3728]) == 2;
+    assert qr_text_len(tab[0..3728], 1) == 7 and qr_text_len(tab[0..3728], 2) == 10;
+    assert qr_lookup(tab[0..3728], 1, "make it", 7) == 1;
+    assert qr_lookup(tab[0..3728], 1, "make it so", 10) == 2;
+    // a text that differs in one byte, or in length only, is another message
+    assert qr_lookup(tab[0..3728], 1, "make iT", 7) == 0;
+    assert qr_lookup(tab[0..3728], 1, "make i", 6) == 0;
+    assert qr_lookup(tab[0..3728], 2, "make it", 7) == 0;
+}
+
+test after_a_restart_a_new_message_never_meets_an_old_task_number {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    assert qr_next_msg(tab[0..3728]) == 1;
+    assert qr_accept(tab[0..3728], 1, "a", 1) == 1;
+    assert qr_next_msg(tab[0..3728]) == 2;
+    assert qr_accept(tab[0..3728], 4, "b", 1) == 2;
+    assert qr_next_msg(tab[0..3728]) == 5;
+    // the dock numbered from 5, so its message 5 is a new task even with the text of an old one
+    assert qr_accept(tab[0..3728], 5, "a", 1) == 3;
+    assert qr_count(tab[0..3728]) == 3;
+}
+
+test only_a_designated_live_pane_can_be_an_executor {
+    assert qr_target_ok(true, WHY_LIVE_SESSION);
+    assert qr_target_ok(true, WHY_WORKING);
+    // negative controls: the owner's own pane, an idle cell, a dead slot, a finished pane
+    assert qr_target_ok(false, WHY_LIVE_SESSION) == false;
+    assert qr_target_ok(true, 4) == false;
+    assert qr_target_ok(true, 1) == false;
+    assert qr_target_ok(true, 5) == false;
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    assert qr_handoff(tab[0..3728], id, 5, false, WHY_LIVE_SESSION) == false;
+    assert qr_handoff(tab[0..3728], id, 5, true, 1) == false;
+    assert qr_handoff(tab[0..3728], id, 255, true, WHY_LIVE_SESSION) == false;
+    assert qr_handoff(tab[0..3728], 99, 5, true, WHY_LIVE_SESSION) == false;
+    assert qr_stage(tab[0..3728], id) == QS_SAVED_NO_EXECUTOR;
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_stage(tab[0..3728], id) == QS_HANDED_OFF;
+    assert qr_executor_of(tab[0..3728], id) == 5;
+    // handed once: a second hand-off to another pane is refused
+    assert qr_handoff(tab[0..3728], id, 6, true, WHY_LIVE_SESSION) == false;
+    assert qr_executor_of(tab[0..3728], id) == 5;
+}
+
+test an_acknowledgement_needs_the_same_task_and_the_same_pane {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    assert qr_ack(tab[0..3728], id, 5) == false;
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_ack(tab[0..3728], id, 6) == false;
+    assert qr_ack(tab[0..3728], 99, 5) == false;
+    assert qr_stage(tab[0..3728], id) == QS_HANDED_OFF;
+    assert qr_ack(tab[0..3728], id, 5);
+    assert qr_stage(tab[0..3728], id) == QS_EXECUTOR_ACKED;
+    assert qr_ack(tab[0..3728], id, 5) == false;
+}
+
+test a_result_counts_only_for_its_task_from_its_pane_with_evidence {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    // nobody was handed the task: a result is not a result (this is what stops an echo from completing a trace)
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_NOT_HANDED;
+    assert qr_result(tab[0..3728], 99, 5, 77) == QR_R_UNKNOWN;
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_result(tab[0..3728], id, 6, 77) == QR_R_WRONG_PANE;
+    assert qr_result(tab[0..3728], id, 5, 0) == QR_R_NO_EVIDENCE;
+    assert qr_stage(tab[0..3728], id) == QS_HANDED_OFF;
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    assert qr_stage(tab[0..3728], id) == QS_RESULT;
+    assert qr_verdict_of(tab[0..3728], id) == QV_RESULT_SUBMITTED;
+    // the same evidence again changes nothing; a different one while it waits is busy
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_REPEAT;
+    assert qr_result(tab[0..3728], id, 5, 78) == QR_R_BUSY;
+    assert qr_trace_complete(tab[0..3728], id) == false;
+}
+
+test the_whole_chain_completes_only_through_a_check_on_measured_grounds {
+    // SYNTHETIC events: this proves the receiver's logic, not that a real executor ran
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "add the card", 12);
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_ack(tab[0..3728], id, 5);
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    // a verdict before the check started is ignored
+    assert qr_verdict(tab[0..3728], id, true, true, 12, 0) == QV_RESULT_SUBMITTED;
+    assert qr_verify_start(tab[0..3728], id, false);
+    assert qr_stage(tab[0..3728], id) == QS_VERIFYING;
+    assert qr_trace_complete(tab[0..3728], id) == false;
+    assert qr_verdict(tab[0..3728], id, true, true, 12, 0) == QV_ACCEPTED;
+    assert qr_stage(tab[0..3728], id) == QS_ACCEPTED;
+    assert qr_trace_complete(tab[0..3728], id);
+    // a terminal task takes no more results
+    assert qr_result(tab[0..3728], id, 5, 80) == QR_R_CLOSED;
+}
+
+test a_fixture_task_never_completes_a_real_trace {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "demo", 4);
+    qr_mark_fixture(tab[0..3728], id);
+    assert qr_is_fixture(tab[0..3728], id);
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], id, false);
+    assert qr_verdict(tab[0..3728], id, true, true, 12, 0) == QV_ACCEPTED;
+    assert qr_stage(tab[0..3728], id) == QS_ACCEPTED;
+    assert qr_trace_complete(tab[0..3728], id) == false;
+    var out : [160]u8 = undefined;
+    const n : usize = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[n - 15..n], " - test fixture");
+}
+
+test each_missing_ground_refuses_the_verdict {
+    var k : u32 = 0;
+    while (k < 4) {
+        var tab : [3728]u8 = undefined;
+        qr_init(tab[0..3728]);
+        const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+        assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+        assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+        assert qr_verify_start(tab[0..3728], id, false);
+        var exists : bool = true;
+        var evidence : bool = true;
+        var total : u32 = 12;
+        var failed : u32 = 0;
+        if (k == 0) { exists = false; }
+        if (k == 1) { evidence = false; }
+        if (k == 2) { total = 0; }
+        if (k == 3) { failed = 1; }
+        assert qr_verdict(tab[0..3728], id, exists, evidence, total, failed) == QV_CHANGES_REQUESTED;
+        assert qr_stage(tab[0..3728], id) == QS_CHANGES;
+        assert qr_trace_complete(tab[0..3728], id) == false;
+        assert qr_sendbacks_of(tab[0..3728], id) == 1;
+        k = k + 1;
+    }
+}
+
+test two_send_backs_then_the_owner_decides {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], id, false);
+    assert qr_verdict(tab[0..3728], id, true, true, 12, 2) == QV_CHANGES_REQUESTED;
+    assert qr_escalate(tab[0..3728], id) == false;
+    assert qr_result(tab[0..3728], id, 5, 78) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], id, false);
+    assert qr_verdict(tab[0..3728], id, true, true, 12, 1) == QV_CHANGES_REQUESTED;
+    assert qr_sendbacks_of(tab[0..3728], id) == 2;
+    assert qr_escalate(tab[0..3728], id);
+    assert qr_stage(tab[0..3728], id) == QS_OWNER;
+    assert qr_bucket(tab[0..3728], id, true) == 2;
+}
+
+test a_paused_loop_starts_no_check {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], id, true) == false;
+    assert qr_stage(tab[0..3728], id) == QS_RESULT;
+    assert qr_verify_start(tab[0..3728], id, false);
+}
+
+test a_lost_link_is_visible_and_cancel_stops_the_task {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_ack(tab[0..3728], id, 5);
+    qr_link_lost(tab[0..3728], id);
+    assert qr_stage(tab[0..3728], id) == QS_BLOCKED;
+    assert qr_bucket(tab[0..3728], id, true) == 1;
+    qr_link_back(tab[0..3728], id);
+    assert qr_stage(tab[0..3728], id) == QS_EXECUTOR_ACKED;
+    qr_cancel(tab[0..3728], id);
+    assert qr_stage(tab[0..3728], id) == QS_CANCELLED;
+    assert qr_handoff(tab[0..3728], id, 6, true, WHY_LIVE_SESSION) == false;
+    assert qr_bucket(tab[0..3728], id, true) == 255;
+}
+
+test the_dashboard_counts_a_saved_task_with_no_executor_as_no_link {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const a : u32 = qr_accept(tab[0..3728], 1, "one", 3);
+    const b : u32 = qr_accept(tab[0..3728], 2, "two", 3);
+    assert qr_handoff(tab[0..3728], b, 5, true, WHY_LIVE_SESSION);
+    // the chat link is fine, but only the second task has a path to an executor
+    assert qr_bucket(tab[0..3728], a, true) == 3;
+    assert qr_bucket(tab[0..3728], b, true) == 0;
+    assert qr_bucket_count(tab[0..3728], 3, true) == 1;
+    assert qr_bucket_count(tab[0..3728], 0, true) == 1;
+    assert qr_bucket_count(tab[0..3728], 4, true) == 0;
+    assert qr_bucket_count(tab[0..3728], 3, false) == 2;
+}
+
+test the_card_never_claims_more_than_the_stage {
+    var tab : [3728]u8 = undefined;
+    var out : [160]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    var n : usize = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Task #1 saved by the receiver. No executor has it yet.");
+    n = qr_boundary(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Next: no executor is reachable. An executor pane needs a free slot, which only the owner frees.");
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    n = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Task #1 handed to pane 5. Waiting for its acknowledgement.");
+    assert qr_ack(tab[0..3728], id, 5);
+    n = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Task #1 taken by pane 5. No result yet.");
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    n = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Task #1: result received from pane 5, not verified yet.");
+    assert qr_verify_start(tab[0..3728], id, false);
+    n = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Task #1: verifying the result.");
+    assert qr_verdict(tab[0..3728], id, true, true, 17, 0) == QV_ACCEPTED;
+    n = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Task #1 accepted. Checks: 17 of 17 tests pass.");
+    assert qr_boundary(out[0..160], tab[0..3728], id) == 0;
+    // no card before a check passed says "accepted"
+    assert qr_card_text(out[0..160], tab[0..3728], 99) == 0;
+}
+
+test the_grounds_name_what_failed {
+    var tab : [3728]u8 = undefined;
+    var out : [160]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    assert qr_grounds(out[0..160], tab[0..3728], id) == 0;
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], id, false);
+    assert qr_verdict(tab[0..3728], id, true, true, 17, 2) == QV_CHANGES_REQUESTED;
+    var n : usize = qr_grounds(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Checks: 15 of 17 tests pass.");
+    n = qr_card_text(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Task #1: changes requested. Checks: 15 of 17 tests pass.");
+    assert qr_result(tab[0..3728], id, 5, 78) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], id, false);
+    assert qr_verdict(tab[0..3728], id, false, true, 17, 0) == QV_CHANGES_REQUESTED;
+    n = qr_grounds(out[0..160], tab[0..3728], id);
+    assert qr_same(out[0..n], "Checks: the artifact is missing.");
+}
+
+test the_saved_table_survives_a_restart_and_a_flipped_byte_is_caught {
+    var tab : [3728]u8 = undefined;
+    var disk : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const id : u32 = qr_accept(tab[0..3728], 1, "task", 4);
+    assert qr_handoff(tab[0..3728], id, 5, true, WHY_LIVE_SESSION);
+    assert qr_result(tab[0..3728], id, 5, 77) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], id, false);
+    qr_seal(tab[0..3728]);
+    assert qr_sealed_ok(tab[0..3728]);
+    // the file is a copy of the bytes; a restart reads it back
+    var i : usize = 0;
+    while (i < 3728) {
+        disk[i] = tab[i];
+        i = i + 1;
+    }
+    assert qr_sealed_ok(disk[0..3728]);
+    // a half-run check does not survive: it goes back to "result submitted", and no verdict is assumed
+    assert qr_restore(disk[0..3728]) == 1;
+    assert qr_stage(disk[0..3728], id) == QS_RESULT;
+    assert qr_verdict_of(disk[0..3728], id) == QV_RESULT_SUBMITTED;
+    assert qr_executor_of(disk[0..3728], id) == 5;
+    // the next number goes on from the saved one
+    assert qr_accept(disk[0..3728], 2, "next", 4) == 2;
+    // negative controls: one flipped byte in a slot, a wrong magic
+    disk[qr_base(0) + 40] = 1;
+    qr_seal(disk[0..3728]);
+    assert qr_sealed_ok(disk[0..3728]);
+    tab[qr_base(0) + 40] = 255;
+    assert qr_sealed_ok(tab[0..3728]) == false;
+    tab[qr_base(0) + 40] = 0;
+    assert qr_sealed_ok(tab[0..3728]);
+    tab[4] = 0;
+    assert qr_sealed_ok(tab[0..3728]) == false;
+}
+
+test a_finished_task_is_not_restored_as_open {
+    var tab : [3728]u8 = undefined;
+    qr_init(tab[0..3728]);
+    const a : u32 = qr_accept(tab[0..3728], 1, "one", 3);
+    const b : u32 = qr_accept(tab[0..3728], 2, "two", 3);
+    qr_cancel(tab[0..3728], a);
+    assert qr_handoff(tab[0..3728], b, 5, true, WHY_LIVE_SESSION);
+    assert qr_result(tab[0..3728], b, 5, 77) == QR_R_OK;
+    assert qr_verify_start(tab[0..3728], b, false);
+    assert qr_verdict(tab[0..3728], b, true, true, 3, 0) == QV_ACCEPTED;
+    // a saved task with no verdict yet (state none) is not "unfinished" in the verdict machine's words,
+    // so a task that never got a result is still listed by its stage and not lost
+    const c : u32 = qr_accept(tab[0..3728], 3, "three", 5);
+    assert qr_restore(tab[0..3728]) == 0;
+    assert qr_stage(tab[0..3728], c) == QS_SAVED_NO_EXECUTOR;
+    assert qr_count(tab[0..3728]) == 3;
+}
