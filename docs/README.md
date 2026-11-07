@@ -25,6 +25,7 @@ First-party docs follow the **27-agent trinity alphabet** grouping: **three nona
 | [`coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md`](coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md) | Phased plan: seed → tests → Queen brain (`tri`/`t27c`, conformance, codegen gap). |
 | [`coordination/inter-agent-handoff/`](coordination/inter-agent-handoff/) | Portable handoff bundle. |
 | [`coordination/HANDOFF.md`](coordination/HANDOFF.md) | The ledger `tri trigit handoff` reads and appends (#12286). |
+| [`coordination/dsh-to-t27os-migration-2026-11-01.md`](coordination/dsh-to-t27os-migration-2026-11-01.md) | DSH to T27 OS migration package: audit scope, module map, behaviour table, backlog, blocker (#12884); data in [`dsh-to-t27os-audit/`](coordination/dsh-to-t27os-audit/). |
 
 ## [`system/`](system/) — system documentation bodies (rendered at `t27.ai/#/docs`)
 
