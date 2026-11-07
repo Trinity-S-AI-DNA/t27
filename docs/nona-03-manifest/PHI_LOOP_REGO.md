@@ -253,7 +253,7 @@ def cmd_skill_begin(issue_id: str, description: str, skill_id: str = None):
     print(f"  Allowed paths: {', '.join(allowed_paths)}")
 ```
 
-### 2.2. `tri skill end` / `tri skill close`
+### 2.2. `tri skill end`
 
 ```bash
 tri skill end [--force]
@@ -411,7 +411,7 @@ def cmd_status(only_mode: bool = False):
         print("    2. tri test <spec>")
         print("    3. tri verdict --toxic <spec>")
         print("    4. tri experience save")
-        print("    5. tri skill commit")
+        print("    5. tri git commit")
 ```
 
 ---
@@ -499,7 +499,7 @@ $ tri experience save
 ✓ Episode saved: phi-2026-04-04T14:45:00Z#1
 
 # 5. Commit (allowed now!)
-$ tri skill commit
+$ tri git commit
 ✓ Commit created: ae12bc34... feat: GF4 spec [ref: 42]
 ✓ Skill closed.
 ```
@@ -518,7 +518,7 @@ $ tri skill commit
 if ! git config --get tri.session.active > /dev/null 2>&1; then
     # Not using tri CLI, block commit
     echo "ERROR: Commits must go through tri CLI for PHI LOOP enforcement."
-    echo "Run: tri skill commit"
+    echo "Run: tri git commit"
     exit 1
 fi
 

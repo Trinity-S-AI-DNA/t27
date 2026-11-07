@@ -177,7 +177,7 @@ From repo root, after `cargo build --release` in `bootstrap/`:
 # Seal (verify / save)
 ./scripts/tri seal          specs/brain/unified_state.t27 --verify
 ./scripts/tri seal          specs/brain/unified_state.t27 --save
-./scripts/tri skill-seal    specs/brain/unified_state.t27
+./scripts/tri cell seal    specs/brain/unified_state.t27
 
 # Conformance JSON check (full repo scan)
 ./scripts/tri validate-conformance
@@ -204,7 +204,7 @@ From repo root, after `cargo build --release` in `bootstrap/`:
 | `t27c gen-c` | `tri gen-c` |
 | `t27c gen-verilog` | `tri gen-verilog` |
 | `t27c gen` | `tri gen` (single file; the Zig backend) |
-| `t27c seal --save` | `tri seal <file.t27> --save` or `tri skill-seal <file.t27>` |
+| `t27c seal --save` | `tri seal <file.t27> --save` or `tri cell seal <file.t27>` |
 | `t27c validate-conformance` | `tri validate-conformance` |
 | `./bootstrap/target/release/t27c` | `tri` (via `./scripts/tri`) |
 
@@ -230,12 +230,12 @@ tri brain evolve --scenario baseline --cycles 1000
 ```bash
 tri skill begin --issue 501
 tri spec edit specs/brain/cognitive/dlpfc.t27
-tri skill seal --hash
+tri cell seal --hash
 tri gen
 tri test
 tri verdict --toxic
 tri experience save
-tri skill commit
+tri git commit
 tri git commit -m "feat(brain): DLPFC spec — Closes #501"
 ```
 
