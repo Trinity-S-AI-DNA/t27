@@ -3,7 +3,13 @@
 Every claim in `main.tex` maps to one committed artifact:
 
 - Report: `docs/reports/t27b-bench-2026-10.md` (sections A-E).
-- Raw data: `docs/reports/t27b-bench-2026-10.json`.
+- Raw data: `docs/reports/t27b-bench-2026-10.json`. Its `icount/`,
+  `runtime_median/` and `size/` entries against `zig_*` and `t27b_wrap`
+  average over n = 24 specs (tier 1 plus the four tier-2 specs). The
+  report's and the paper's rows for those pipelines are the tier-1 subset,
+  n = 20, and differ from the JSON's (3.17 against 3.62 for Zig ReleaseSafe
+  instructions). The gcc and clang entries are n = 20; the paper's Clang -O2
+  row is the report's 9-spec subset, not the JSON's n = 20 entry.
 - Measured revision: commit `9a0f4c394a1474bb75103f141cc0b405d9de51b9` (2026-10-10).
 - Ledger in t27: `specs/tri/shootout/acceptance_matrix.t27` holds the
   headline ratios as cells tagged with the same commit. It restates this
