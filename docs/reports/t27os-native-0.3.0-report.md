@@ -127,8 +127,11 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
     read a field straight off a call result, bound to a local const in 277d39ab34) did not move the counts at
     ceeb4e941c (`native_log` 2, `native_policy` 1, `native_host` 3, `native_accept` not building), so it is
     withdrawn. Hand-tracing the 15 policy tests and reading the 13 log tests found no failing one.
-    Owner decision 2026-11-07: fix only the `native_host` and `native_accept` blockers and run nothing. Two changes
-    (untested, because the Mac load hook denies `t27c`; WAITING_RESOURCE):
+    Owner decision 2026-11-07: fix only the `native_host` and `native_accept` blockers and run nothing. Two changes,
+    not run here (the Mac load hook denies `t27c`; WAITING_RESOURCE). CI then scored head 4055d7e702
+    (`t27c test-report`, spec-guards run 42350406579): `native_host` 0 failing (was 3), `native_accept` builds with
+    12 failing (was 1000000, does not build), `native_log` 2 and `native_policy` 1 unchanged, the other five
+    native specs 0. That is a machine signal from CI, not an acceptance run:
     - `native_host`: under `t27c` every `@extern` is a stub of its return type, so `sys_open_ro` returns 0 (every
       path "exists") and `sys_write` returns 0 (a save never succeeds). The three tests that need real files
       (`a_log_is_saved_atomically_and_read_back_after_a_reload`, `a_missing_log_reads_as_nothing`,
@@ -137,9 +140,9 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
     - `native_accept`: the likely cause of "not building" is a name clash, not the `@extern`. `native_agent` and
       `native_provider` each declared `pub fn error_label` with a different body, and `native_accept` reaches both
       through `native_host` and `native_swarm`; the `use` splice marks such a name UNRESOLVED. The agent one is now
-      `agent_error_label` (65bfbda130). If the build still fails, the diagnostic is the next blocker; it is not known.
-    Even if `native_accept` builds under `t27c`, its LM Studio and file tests fail on the stubs, so spec-guards stays
-    red for it unless the owner rules how `@extern` specs are scored (request 3). Still unidentified: the `native_log`
+      `agent_error_label` (65bfbda130). CI confirms the build: 12 failing tests, not 1000000.
+    The 12 `native_accept` failures are presumably its LM Studio and file tests failing on the stubs (names not in
+    the CI score, so this is inferred), so spec-guards stays red for it unless the owner rules how `@extern` specs are scored (request 3). Still unidentified: the `native_log`
     2 and `native_policy` 1 failing pure tests; they are outside the three assigned blockers. Nothing here is EXECUTED.
 
 ## Safety defaults in force
