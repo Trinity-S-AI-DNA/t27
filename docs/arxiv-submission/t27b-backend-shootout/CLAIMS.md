@@ -7,7 +7,9 @@ Every claim in `main.tex` maps to one committed artifact:
 - Measured revision: commit `9a0f4c394a1474bb75103f141cc0b405d9de51b9` (2026-10-10).
 - Ledger in t27: `specs/tri/shootout/acceptance_matrix.t27` holds the
   headline ratios as cells tagged with the same commit. It restates this
-  report; it is not a second measurement. Clang is not one of its rivals.
+  report; it is not a second measurement. It lists Clang -O0 and -O2 as
+  rivals, but no cell is taken against Clang; the paper's Clang ratios come
+  from report sections B and C only.
 - Superseded public text: `docs/blog/2026-10-27-t27b-backend-shootout.md`
   carries a 2026-11-07 erratum pointing at this report (withdrawn C2, C3).
 
