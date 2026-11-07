@@ -101,6 +101,17 @@ use t27os::session_store::hooks_json;
 use t27os::rotation_status::OP_STATUS;
 use t27os::rotation_status::STATUS_LINE_MAX;
 use t27os::rotation_status::pane_status_line;
+use t27os::windows::SPACE_COUNT;
+use t27os::pty_proto::OP_IDENTITIES;
+use t27os::pty_proto::RE_IDENTITIES;
+use t27os::pty_proto::OP_TASK_PANE;
+use t27os::pty_proto::OP_TASK_IO;
+use t27os::pty_proto::TASK_START;
+use t27os::pty_proto::TASK_RESTART;
+use t27os::pty_proto::TASK_LOOKUP;
+use t27os::pty_proto::TASK_SLOT_FIRST;
+use t27os::pty_proto::task_pane_ok;
+use t27os::pty_proto::task_cwd_matches;
 use t27os::pty_proto::OP_LIST;
 use t27os::pty_proto::OP_SPAWN;
 use t27os::pty_proto::OP_ATTACH;
@@ -338,7 +349,7 @@ use t27os::pty_logic::launch_command;
 use t27os::pty_logic::editor_spawn_ok;
 use t27os::pty_logic::argv_text;
 use t27os::pty_logic::plist_text;
-use t27os::pty_logic::path_first;
+use t27os::pty_logic::pane_command_path;
 use t27os::pty_logic::c_path;
 
 // ---- the host loop: syscalls and bytes ----
@@ -622,7 +633,10 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32, spawned: bool) -> bool {
             sys_close(fd);
             fd = fd + 1;
         }
-        sys_chdir(mem[O_TMP1 + 3000 .. O_TMP1 + 3000 + cw + 1]);
+        if (sys_chdir(mem[O_TMP1 + 3000 .. O_TMP1 + 3000 + cw + 1]) < 0 and st[base + PF_SLOT] >= @as(u64, TASK_SLOT_FIRST)) {
+            sys_exit(127);
+            return false;
+        }
         sys_setenv("T27OS_PANE", mem[O_TMP1 + 3300 .. O_TMP1 + 3300 + idn + 1], 1);
         pane_path_first(st, mem);
         strip_claude_env(mem, agent);
@@ -648,7 +662,7 @@ fn launch(st: []u64, mem: []u8, i: usize, plan: u32, spawned: bool) -> bool {
 }
 
 /// In the child: PATH starts with <home>/.t27os/bin, where the updater installs the release's t27b, t27c and tri,
-/// so every pane on every machine runs the same ones (pty_logic path_first).
+/// so every pane runs the same tools. Add client directories after the inherited PATH.
 fn pane_path_first(st: []const u64, mem: []u8) -> void {
     const p : u64 = sys_getenv("PATH");
     var n : u64 = 0;
@@ -657,7 +671,7 @@ fn pane_path_first(st: []const u64, mem: []u8) -> void {
         if (n > 1500) { n = 1500; }
         sys_peek(mem[O_TMP2 + 4200 .. O_TMP2 + 5700], p, n);
     }
-    const l : usize = path_first(mem[O_TMP2 + 6000 .. O_TMP2 + 9000], home_slice(st, mem), mem[O_TMP2 + 4200 .. O_TMP2 + 4200 + @as(usize, @intCast(n))]);
+    const l : usize = pane_command_path(mem[O_TMP2 + 6000 .. O_TMP2 + 9000], home_slice(st, mem), mem[O_TMP2 + 4200 .. O_TMP2 + 4200 + @as(usize, @intCast(n))]);
     mem[O_TMP2 + 6000 + l] = 0;
     sys_setenv("PATH", mem[O_TMP2 + 6000 .. O_TMP2 + 6000 + l + 1], 1);
 }
@@ -838,13 +852,47 @@ fn reply(fd: i32, mem: []u8, op: u8, pane: u8, plen: usize) -> void {
     sys_write(fd, mem[O_OUT .. O_OUT + HEADER + plen], @as(u64, HEADER + plen));
 }
 
+/// Darwin O_DIRECTORY. Validate the directory before allocating or relaunching.
+fn task_directory(cwd: []const u8) -> bool {
+    var path : [256]u8 = undefined;
+    const n : usize = c_path(path[0..256], cwd);
+    const fd : i32 = sys_open_ro(path[0 .. n + 1], 1048576);
+    if (fd < 0) { return false; }
+    sys_close(fd);
+    return true;
+}
+
 fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
-    const op : u8 = mem[off];
+    var op : u8 = mem[off];
     const pane : u32 = @as(u32, mem[off + 1]);
-    const plen : usize = @as(usize, get_u16(mem[off .. off + HEADER], 2));
-    const p0 : usize = off + HEADER;
+    var plen : usize = @as(usize, get_u16(mem[off .. off + HEADER], 2));
+    var p0 : usize = off + HEADER;
     const base : usize = @as(usize, pane) * PF;
-    if (op == OP_LIST) {
+    if (op == OP_TASK_IO) {
+        if (pane >= MAX_PANES or plen < 3 or st[base + PF_USED] == 0
+            or st[base + PF_SPACE] != @as(u64, mem[p0])
+            or st[base + PF_SLOT] != @as(u64, mem[p0 + 1])
+            or st[base + PF_SLOT] < @as(u64, TASK_SLOT_FIRST)) {
+            reply(fd, mem, RE_ERR, 0, 0);
+            return;
+        }
+        op = mem[p0 + 2];
+        if (op != OP_ATTACH and op != OP_KEYS and op != OP_RESIZE and op != OP_READ and op != OP_KILL) {
+            reply(fd, mem, RE_ERR, 0, 0);
+            return;
+        }
+        p0 = p0 + 3;
+        plen = plen - 3;
+        if (((op == OP_ATTACH or op == OP_KILL) and plen != 0)
+            or (op == OP_READ and plen != 8)
+            or (op == OP_RESIZE and plen != 4)
+            or (op == OP_KEYS and plen == 0)) {
+            reply(fd, mem, RE_ERR, 0, 0);
+            return;
+        }
+    }
+    if (op == OP_LIST or op == OP_IDENTITIES) {
+        if (op == OP_IDENTITIES and (pane != 0 or plen != 0)) { reply(fd, mem, RE_ERR, 0, 0); return; }
         var at : usize = O_OUT + HEADER;
         var i : u32 = 0;
         while (i < MAX_PANES) {
@@ -854,13 +902,56 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
                 // the flags byte carries the pane's key number + 1 in its high nibble (0 = no key); bits 0 to 2 as before
                 const kshown : u32 = pane_key_shown(st, @as(usize, i), @as(u32, @intCast(st[b + PF_AGENT])));
                 at = put_list_entry(mem[O_OUT .. O_OUT + 128], at - O_OUT, i, @as(u32, @intCast(st[b + PF_AGENT])), list_shown(st, @as(usize, i), @as(u32, @intCast(st[b + PF_AGENT])), shown_state(w), now_ms(mem)), list_flags_key(st[b + PF_LIVE] != 0, w, kshown)) + O_OUT;
+                if (op == OP_IDENTITIES) {
+                    mem[at] = @as(u8, @intCast(st[b + PF_SPACE] & 255));
+                    mem[at + 1] = @as(u8, @intCast(st[b + PF_SLOT] & 255));
+                    at = at + 2;
+                }
             }
             i = i + 1;
         }
-        reply(fd, mem, RE_LISTING, 0, at - O_OUT - HEADER);
+        var listing : u8 = RE_LISTING;
+        if (op == OP_IDENTITIES) { listing = RE_IDENTITIES; }
+        reply(fd, mem, listing, 0, at - O_OUT - HEADER);
         return;
     }
-    if (op == OP_SPAWN) {
+    if (op == OP_SPAWN or op == OP_TASK_PANE) {
+        if (op == OP_TASK_PANE) {
+            if (pane > @as(u32, TASK_LOOKUP) or !task_pane_ok(mem[p0 .. p0 + plen], SPACE_COUNT, CWD_CAP - 1)) {
+                reply(fd, mem, RE_ERR, 0, 0);
+                return;
+            }
+            var matched : u32 = MAX_PANES;
+            var i : u32 = 0;
+            while (i < MAX_PANES) {
+                const b : usize = @as(usize, i) * PF;
+                if (st[b + PF_USED] != 0 and st[b + PF_SPACE] == @as(u64, mem[p0 + 1]) and st[b + PF_SLOT] == @as(u64, mem[p0 + 2])) {
+                    if (matched != MAX_PANES or st[b + PF_AGENT] != @as(u64, mem[p0]) or !task_cwd_matches(cwd_of(st, mem, @as(usize, i)), mem[p0 + 3 .. p0 + plen])) {
+                        reply(fd, mem, RE_ERR, 0, 0);
+                        return;
+                    }
+                    matched = i;
+                }
+                i = i + 1;
+            }
+            if (matched < MAX_PANES) {
+                const b : usize = @as(usize, matched) * PF;
+                if (pane == @as(u32, TASK_RESTART) and st[b + PF_LIVE] == 0) {
+                    if (!task_directory(mem[p0 + 3 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
+                    pane_keys_reset(st, @as(usize, matched));
+                    st[b + PF_SIDLEN] = 0;
+                    if (!launch(st, mem, @as(usize, matched), R_RELAUNCH, true)) {
+                        save_pane(st, mem, @as(usize, matched));
+                        reply(fd, mem, RE_ERR, 0, 0);
+                        return;
+                    }
+                    save_pane(st, mem, @as(usize, matched));
+                }
+                reply(fd, mem, RE_OK, @as(u8, @intCast(matched)), 0);
+                return;
+            }
+            if (pane != @as(u32, TASK_START) or !task_directory(mem[p0 + 3 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
+        }
         if (!spawn_ok(mem[p0 .. p0 + plen])) { reply(fd, mem, RE_ERR, 0, 0); return; }
         const slot : u32 = pane_alloc(st);
         const cl : usize = spawn_cwd_len(mem[p0 .. p0 + plen]);
@@ -895,8 +986,9 @@ fn handle_frame(st: []u64, mem: []u8, fd: i32, off: usize) -> void {
         // Keychain for the providers the agent reads, unless that was done in the last minute (keys_reload_due)
         const spawn_agent : u32 = @as(u32, mem[p0]);
         if (keys_reload_due(st, spawn_agent, now_ms(mem), st[G_KLOAD])) { load_keys(st, mem, load_mask_agent(spawn_agent)); }
-        launch(st, mem, @as(usize, slot), R_RELAUNCH, true);
+        const launched : bool = launch(st, mem, @as(usize, slot), R_RELAUNCH, true);
         save_pane(st, mem, @as(usize, slot));
+        if (op == OP_TASK_PANE and !launched) { reply(fd, mem, RE_ERR, 0, 0); return; }
         reply(fd, mem, RE_OK, @as(u8, @intCast(slot)), 0);
         return;
     }
@@ -1121,6 +1213,7 @@ fn restore_all(st: []u64, mem: []u8) -> u32 {
                     const sid : []const u8 = sid_of(st, mem, @as(usize, i));
                     const sidv : []const u8 = sid;
                     var plan : u32 = restore_plan(@as(u32, @intCast(f[F_AGENT])), @as(u32, @intCast(f[F_STATE])), sidv);
+                    if (f[F_SLOT] >= @as(u64, TASK_SLOT_FIRST)) { plan = R_SKIP; }
                     if (plan == R_SKIP) {
                         st[b + PF_STATUS] = @as(u64, @intCast(f[F_STATE]));
                     } else if (restore_waits(st, @as(u32, @intCast(f[F_AGENT])))) {
