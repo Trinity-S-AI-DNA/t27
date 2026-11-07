@@ -37,13 +37,13 @@ and the chat slice reaches LM Studio only through `native_host` (libSystem socke
 | `native_agent.t27` | ONESHOT agent contract (9 fields), status machine, one optional read-only tool, one final result, cancel |
 | `native_swarm.t27` | coordinator, at most 3 members, explicit task graph, deterministic collection, aggregate, cancel |
 | `native_host.t27` | thin libSystem glue: env, loopback exchange, atomic log save, cancel file, `host_turn`, `host_run_agent`, `host_run_swarm` |
-| `native_accept.t27` | the acceptance suite, 16 tests in groups A-G (G = the three host-file tests moved from `native_host`) |
+| `native_accept.t27` | the acceptance suite, 17 tests in groups A-G (G = the four host tests moved from `native_host`) |
 
 No Rust, JS, Python or shell was written. `git diff --stat origin/master` shows only these eight specs and this
 report. The seven staged `.t27` files that belong to another actor, `parser_fixtures.t27`, `glass_window.t27`,
 the LM Studio and NVIDIA settings, the DSH service and the stable chain were not touched.
 
-## Tests (16 in `native_accept.t27`)
+## Tests (17 in `native_accept.t27`)
 
 | Group | Test | Needs LM Studio | Status |
 |-------|------|-----------------|--------|
@@ -63,6 +63,7 @@ the LM Studio and NVIDIA settings, the DSH service and the stable chain were not
 | G | g_a_log_is_saved_atomically_and_read_back_after_a_reload | no (t27b) | WAITING_RESOURCE |
 | G | g_a_missing_log_reads_as_nothing | no (t27b) | WAITING_RESOURCE |
 | G | g_a_cancel_file_is_seen_and_can_be_cleared | no (t27b) | WAITING_RESOURCE |
+| G | g_a_closed_port_is_a_connect_error_and_not_a_hang | no (t27b) | WAITING_RESOURCE |
 
 What was actually done: `t27_check` (parse and typecheck, no import resolution) returned ok, 0 errors, 0
 warnings on `native_accept.t27`; imported names and signatures were checked by reading the source specs. The
@@ -91,7 +92,7 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
 
 ## REMAINING_GAPS
 
-1. **No test has run.** All sixteen acceptance tests and the existing spec tests are WAITING_RESOURCE.
+1. **No test has run.** All seventeen acceptance tests and the existing spec tests are WAITING_RESOURCE.
 2. **Version baseline corrected.** The first commits named 0.1.0-alpha.1, below the published T27 OS line
    (0.2.0, `release.t27`, tag `t27os-v0.2.0-b7645`, master build 7896). The native line is now 0.3.0, the next
    minor. Owner decision 2026-11-07: keep 0.3.0. Open: the branch name and issue #13212 still say
@@ -136,7 +137,17 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
       path "exists") and `sys_write` returns 0 (a save never succeeds). The three tests that need real files
       (`a_log_is_saved_atomically_and_read_back_after_a_reload`, `a_missing_log_reads_as_nothing`,
       `a_cancel_file_is_seen_and_can_be_cleared`) moved unchanged in substance to `native_accept` group G (4942a7f4a6),
-      which `t27b` runs. `native_host` keeps its four stub-safe tests.
+      which `t27b` runs. `native_host` kept four stub-safe tests.
+    - `t27b-native-ratchet` (CI, head f1049d160e) then found two of those four failing under `t27b` while passing
+      under the `t27c` + zig reference (REFDISAGREE; the ledger names neither): the corpus `t27b` stops with "import
+      sys_getenv run outside an object" on `only_the_four_lmstudio_names_are_ever_read` (its third assertion calls
+      `host_env` with a known name, which reaches `sys_getenv`); the log prints that text for the first test only, and
+      the second (`a_closed_port_is_a_connect_error_and_not_a_hang`) calls `sys_signal` and `sys_socket` the same
+      way, so the same stop is inferred, not read. The first loses that assertion and now checks
+      a prefix-only name, which `env_name_known` rejects before any extern runs; the second moved to group G as
+      `g_a_closed_port_is_a_connect_error_and_not_a_hang`, with two clock reads that fail under stubs (clock 0), so
+      both runners fail it and agree. `native_host` now holds three tests that reach no extern. Not run here
+      (the Mac load hook denies `t27b`/`t27c`); the next CI ratchet is the check.
     - `native_accept`: the likely cause of "not building" is a name clash, not the `@extern`. `native_agent` and
       `native_provider` each declared `pub fn error_label` with a different body, and `native_accept` reaches both
       through `native_host` and `native_swarm`; the `use` splice marks such a name UNRESOLVED. The agent one is now
@@ -153,7 +164,7 @@ tool outside the allowlist is rejected; command and network tools return "hold f
 hold or call the spawn tool, and a swarm refuses members without an explicit spawn policy.
 
 Requests out: owner -- (1) run `MAC_HEAVY_OK=1 ./target/release/t27c test-report specs/t27os/native_host.t27
---specs-dir specs` (intended: 4 of 4, a prediction) and then the same for `native_accept.t27` (expect it to build; paste the
+--specs-dir specs` (intended: 3 of 3, a prediction) and then the same for `native_accept.t27` (expect it to build; paste the
 diagnostic if not), from `~/t27`; native_accept itself runs only after native_host is green; (2) run the same
 `t27c test-report` for `native_log` and `native_policy` and paste the lines that are not `pass`; (3) rule how
 spec-guards treats `@extern` specs; (4) only then say whether the two `t27b test` commands above may run;
