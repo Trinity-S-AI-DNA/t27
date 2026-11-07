@@ -5,6 +5,11 @@ Every claim in `main.tex` maps to one committed artifact:
 - Report: `docs/reports/t27b-bench-2026-10.md` (sections A-E).
 - Raw data: `docs/reports/t27b-bench-2026-10.json`.
 - Measured revision: commit `9a0f4c394a1474bb75103f141cc0b405d9de51b9` (2026-10-10).
+- Ledger in t27: `specs/tri/shootout/acceptance_matrix.t27` holds the
+  headline ratios as cells tagged with the same commit. It restates this
+  report; it is not a second measurement. Clang is not one of its rivals.
+- Superseded public text: `docs/blog/2026-10-27-t27b-backend-shootout.md`
+  carries a 2026-11-07 erratum pointing at this report (withdrawn C2, C3).
 
 The measurement harness is lab scratch and is not committed. The report
 lists every command it ran, and the JSON holds every sample with the
@@ -20,6 +25,7 @@ host load at the time.
 | C11 | 0.91x GCC -O0 and 3.4x GCC -O2 executed instructions; 4.1x GCC -O2 and 3.7x Clang -O2 (9 of 20 not folded) emulated time; 1.8x GCC -O2 size | report section C | measured; time is qemu-aarch64 emulation |
 | C12 | 3.08 MB executable, one crate dependency, 5.26 MiB median peak RSS | report section D | measured |
 | C13 | t27b objects and listings bit-identical within and across directories | report section E | measured |
+| C14 | Related work: TinyCC, QBE, Liftoff, Winch, Titzer, copy-and-patch, TPDE, Umbra, Zig 0.15 notes | their own pages, read 2026-11-07 | cited, not measured; no ratio against them is claimed |
 
 ## Withdrawn from this paper
 

@@ -26,7 +26,9 @@ Status: draft. Not submitted. Tracking issue: #13202.
 | Determinism | bit-identical, path-independent | E |
 
 `CLAIMS.md` maps each claim to its evidence and lists the withdrawn and
-planned ones. `LIMITATIONS.md` lists the limits.
+planned ones. `LIMITATIONS.md` lists the limits. The same ratios live as
+cells of `specs/tri/shootout/acceptance_matrix.t27`, tagged with the report
+commit.
 
 Negative results kept in the paper:
 

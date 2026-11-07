@@ -15,3 +15,5 @@
 - t27b is not an optimising compiler and not a replacement for LLVM.
 - No front end for C, Rust, Zig, Go or Python exists. Cross-language lowering is not claimed.
 - t27b reads no serialised IR. The external `t27_ir_v1` contract has no t27b reader.
+- The Zig ratios are against Zig Debug through LLVM for aarch64. Zig 0.15+ uses a self-hosted backend for x86-64 Debug builds, so the 640x figure does not carry over there.
+- No other baseline compiler (TinyCC, QBE, Liftoff, Winch, TPDE) was measured; related work is cited, not compared.
