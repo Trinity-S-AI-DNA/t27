@@ -1,25 +1,10 @@
-//! `tri synth sweep` — synthesise across a parameter and check the area moves.
-//!
-//! Written after two synthesis folds in one afternoon, both of which reported a
-//! number rather than an error.
-//!
-//! A layer whose operand memory had no write port: yosys propagated the
-//! never-written memory as constant and pruned the design. It reported **12
-//! logic cells** for a 64-tap multiplier layer, and the area did not grow with
-//! fan-in at all.
-//!
-//! The same layer with one memory location per lane: reading N of them per
-//! cycle is N read ports, which becomes muxes rather than block RAM. **23052
-//! cells on a 7680-cell part**, zero RAM inferred.
-//!
-//! Neither is an error. Both are numbers, and both were caught only because a
-//! human found them implausible. This checks the shape instead: sweep the
-//! parameter, and say plainly when the area does not respond to it, or responds
-//! far too violently.
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::process::Command;
+
+#[allow(dead_code, unused_parens)]
+pub use crate::sweep_rules::*;
 
 #[derive(Subcommand)]
 pub enum SweepCmd {

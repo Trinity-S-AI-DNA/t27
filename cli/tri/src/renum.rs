@@ -1,31 +1,3 @@
-//! `tri skill renumber` -- give appended sections the numbers master left free.
-//!
-//! Six times in one week a branch and master appended sections to
-//! `.claude/skills/ci-gates/SKILL.md` at the same time and took the same
-//! numbers. Every one of those cost the same manual repair: rebuild the file
-//! from `origin/master`, move my sections to the end, assert the master prefix
-//! is byte-identical, re-run `tri skill check`. Six repetitions is the argument
-//! for a command; the repair itself never varied.
-//!
-//! The invariant this leans on is the one the workflow already has: a section is
-//! APPENDED. So the branch's file is the merge-base's file plus a tail, and the
-//! tail is exactly what has to move. If that is not true -- someone edited an
-//! existing section, or a previous conflict was resolved by hand -- this refuses
-//! and says so rather than guessing which lines are yours.
-//!
-//! `--base` TAKES A BRANCH, AND POINTING IT AT A SIBLING IS A TRAP. Two of my own
-//! open branches once claimed the same number, and `--base origin/<sibling>`
-//! numbered correctly around it -- and rebuilt my file on the SIBLING, so my
-//! branch then carried the sibling's sections too and would have merged them
-//! under my PR. `--first N` is the answer that documentation was standing in
-//! for: both branches number against the SHARED base, and the second one starts
-//! higher. A number, not a different base. `--base` is for a different base
-//! BRANCH, not for a peer.
-//!
-//! References are rewritten only for the numbers being moved and only INSIDE the
-//! tail. A section that cites `&sect;447` keeps citing 447; a section that cites
-//! its own sibling follows it. Both spellings are handled, and the word boundary
-//! matters: renumbering 46 must not touch 460.
 
 use anyhow::{bail, Result};
 use std::path::Path;
@@ -33,6 +5,9 @@ use std::process::Command;
 
 /// The tail of `mine` that is not in `base`, or `None` when `mine` is not
 /// `base` plus an append.
+#[allow(dead_code, unused_parens)]
+pub use crate::renum_rules::*;
+
 pub fn appended_tail<'a>(base: &str, mine: &'a str) -> Option<&'a str> {
     // Trailing-newline differences are not an edit. Compare on the trimmed
     // prefix and hand back everything after it.
@@ -550,6 +525,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     /// `without_sections` cuts from a `## N. ` heading to the next one, and a
     /// heading inside a fenced block is a QUOTATION -- this file quotes headings

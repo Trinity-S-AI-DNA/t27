@@ -1,30 +1,10 @@
-//! What `.trinity/seals` says about a spec, when it says it twice.
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! `t27c seal <spec> --save` writes `.trinity/seals/<module>.json`, and the name
-//! it derives is path-based. Many specs also carry an OLDER seal keyed by the
-//! bare module name. Both name the same `spec_path`, the seal gate reads both,
-//! and `--save` updates exactly one of them.
-//!
-//! Measured on this repository the day the command was written:
-//!
-//!   seals                1316
-//!   specs sealed TWICE    547
-//!   pairs DISAGREEING      31
-//!
-//! The failure it produces is quiet and confusing: a spec is repaired, re-sealed,
-//! and `coverage` still goes red -- on the twin. That happened on #2766, and the
-//! minute spent staring at a green re-seal beside a red gate is what this command
-//! removes. See #2767.
-//!
-//! It reports. It does not write: which of two disagreeing seals is the truth is
-//! not a question a lister may answer, and re-sealing both would freeze whichever
-//! generation happens to be current into two places instead of one.
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[allow(dead_code, unused_parens)]
+pub use crate::seals_rules::*;
+
 #[path = "../../../gen/rust/tri/seals/drift.rs"] #[allow(dead_code, unused_parens)] mod drift; // t27c gen-rust of specs/tri/seals/drift.t27 (#11045)
 #[path = "../../../gen/rust/tri/seals/merge_driver.rs"] #[allow(dead_code, unused_parens)] mod merge_driver; // t27c gen-rust of specs/tri/seals/merge_driver.t27 (#11402)
 #[path = "../../../bootstrap/gen/rust/verified/suite_jobs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] mod suite_jobs; // specs/verified/suite_jobs.t27

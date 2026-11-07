@@ -1,24 +1,10 @@
-//! `tri synth area` — synthesise and report area, with the instrument named.
-//!
-//! Written after getting the same task wrong twice in one session.
-//!
-//! First: the stat parser matched `Number of cells:`, which is what yosys 0.33
-//! prints. 0.65 prints `N cells`. The parser found nothing, reported zero, and
-//! zero looks exactly like a small design.
-//!
-//! Second: the output was captured into a shell variable and printed with
-//! `echo`. zsh's `echo` interprets backslash escapes, and yosys writes Verilog
-//! identifiers with a leading backslash -- `\tern_node` became a tab, and a
-//! `\c` further along truncated the stream. Every count came back zero again,
-//! from data that was correct on disk.
-//!
-//! Both failures produced a plausible number rather than an error, which is the
-//! dangerous shape. This runs the flow, parses the counts, and refuses to print
-//! anything if synthesis did not reach a stat block.
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::process::Command;
+
+#[allow(dead_code, unused_parens)]
+pub use crate::synth_rules::*;
 
 #[derive(Subcommand)]
 pub enum SynthCmd {

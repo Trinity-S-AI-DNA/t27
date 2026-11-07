@@ -77,14 +77,14 @@ mod pf; // t27c gen-rust of specs/tri/preflight/preflight.t27: the push prefligh
 #[path = "../../../gen/rust/tools/t27o/rust_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod t27o; // t27c gen-rust of specs/tools/t27o/rust_convert.t27: every rule of `tri t27o` (#8967)
 #[path = "../../../gen/rust/tools/t27o/spice_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod spice; // t27c gen-rust of specs/tools/t27o/spice_convert.t27: the SPICE front end of `tri t27o` (#10509)
 #[path = "../../../gen/rust/tools/t27o/zig_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod zig; // t27c gen-rust of specs/tools/t27o/zig_convert.t27: the Zig front end of `tri t27o` (#10765)
-mod renum;
+#[path = "../../../gen/rust/tri/renum/renum.rs"] #[allow(dead_code, unused_parens)] mod renum_rules; mod renum; // t27c gen-rust + thin I/O glue
 mod reseal;
 mod rtl;
 mod scratch;
-mod seals;
+#[path = "../../../gen/rust/tri/seals/seals.rs"] #[allow(dead_code, unused_parens)] mod seals_rules; mod seals; // t27c gen-rust + thin I/O glue
 mod skillnum;
-mod sweep;
-mod synth;
+#[path = "../../../gen/rust/tri/sweep/sweep.rs"] #[allow(dead_code, unused_parens)] mod sweep_rules; mod sweep; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/synth/synth.rs"] #[allow(dead_code, unused_parens)] mod synth_rules; mod synth; // t27c gen-rust + thin I/O glue
 mod topic;
 mod trees;
 mod types_dup;
