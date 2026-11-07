@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/telegram_link.t27 -- when the current T27 OS local profile may be bound to one verified
+// Telegram account. Contract only: no host call, no UI, no stored file. The broker deployment and the
+// app glue that carry these decisions out are follow-up work (FR-004).
+//
+// Who verifies. A dedicated broker runs the Telegram OIDC login with its own client and a registered
+// HTTPS callback (state, S256 PKCE, scope openid), keeps the client secret, and checks the ID token
+// signature, issuer, audience, time claims and nonce before it gives the app a result. `verified` below
+// is that broker verdict; nothing the browser returns can set it. Proofs, browser state and exchange
+// codes never enter the local profile.
+//
+// What names an account (FR-002): the issuer, the configured client and the verified subject, together.
+// The subject is opaque (OIDC: printable ASCII, 1 to 255 bytes). A username or display name is shown to
+// the owner and never compared.
+//
+// An attempt (FR-001) belongs to one local profile handle and one fresh attempt handle that is never
+// reused, and lives LINK_WINDOW_S seconds of monotonic time; a handle of 0 is no attempt. A result is
+// taken once, while the attempt is PENDING. The app then shows the identity and waits for an explicit
+// confirm, and the confirm checks the profile, the attempt and the deadline again.
+//
+// Ending an attempt (FR-003): cancel, expiry, rejection, unlink and a finished attach set the active
+// handle to 0 before they return, so a late result finds no current attempt and is refused. A profile
+// linked to one subject never takes another one; the owner unlinks it first, explicitly.
+//
+// Refs dmitrii-f-t27/t27#17, Trinity-S-AI-DNA/t27#13255.
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+module T27osTelegramLink;
+
+use t27os::editors::same_bytes;
+
+pub const LINK_WINDOW_S : u64 = 300;
+
+// Decisions.
+pub const LINK_REJECTED : u32 = 0;
+pub const LINK_CONFIRM : u32 = 1;
+pub const LINK_ATTACH : u32 = 2;
+pub const LINK_ALREADY_ATTACHED : u32 = 3;
+pub const LINK_CONFLICT : u32 = 4;
+pub const LINK_UNLINK : u32 = 5;
+
+// Attempt phases.
+pub const LINK_IDLE : u32 = 0;
+pub const LINK_PENDING : u32 = 1;
+pub const LINK_VERIFIED : u32 = 2;
+
+// How an attempt ends; LINK_END_NONE leaves it running.
+pub const LINK_END_NONE : u32 = 0;
+pub const LINK_END_CANCEL : u32 = 1;
+pub const LINK_END_EXPIRE : u32 = 2;
+pub const LINK_END_REJECT : u32 = 3;
+pub const LINK_END_UNLINK : u32 = 4;
+pub const LINK_END_ATTACH : u32 = 5;
+
+/// A zero handle represents no active attempt. Times are monotonic seconds.
+pub fn link_attempt_current(profile : u64, attempt : u64, owner : u64, active : u64, started : u64, now : u64) -> bool {
+    if (owner == 0 or active == 0 or profile != owner or attempt != active or now < started) {
+        return false;
+    }
+    return now - started < LINK_WINDOW_S;
+}
+
+/// OIDC subject identifiers are opaque printable ASCII strings of 1 to 255 bytes.
+pub fn link_subject_valid(subject : []const u8) -> bool {
+    if (subject.len == 0 or subject.len > 255) { return false; }
+    var i : usize = 0;
+    while (i < subject.len) {
+        if (subject[i] < 33 or subject[i] > 126) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// FR-002: the result names the configured issuer and the configured client, byte for byte. An empty
+/// configuration matches nothing, so an unconfigured app links no account.
+pub fn link_issuer_client_ok(issuer : []const u8, client : []const u8, cfg_issuer : []const u8, cfg_client : []const u8) -> bool {
+    if (cfg_issuer.len == 0 or cfg_client.len == 0) { return false; }
+    return same_bytes(issuer, cfg_issuer) and same_bytes(client, cfg_client);
+}
+
+/// `verified` is supplied by the trusted broker adapter, never by browser input, and only when
+/// link_issuer_client_ok also holds. An empty existing subject represents an unlinked profile.
+pub fn link_decision(current : bool, verified : bool, confirmed : bool, existing : []const u8, subject : []const u8) -> u32 {
+    if (!current or !verified or !link_subject_valid(subject)) { return LINK_REJECTED; }
+    if (existing.len != 0) {
+        if (same_bytes(existing, subject)) { return LINK_ALREADY_ATTACHED; }
+        return LINK_CONFLICT;
+    }
+    if (!confirmed) { return LINK_CONFIRM; }
+    return LINK_ATTACH;
+}
+
+/// A verified result is taken once, only while its attempt is PENDING and current. The caller moves the
+/// phase to VERIFIED in the same step, so the same result delivered again is refused.
+pub fn link_accept_candidate(phase : u32, current : bool, verified : bool, subject : []const u8) -> bool {
+    if (phase != LINK_PENDING or !current or !verified) { return false; }
+    return link_subject_valid(subject);
+}
+
+/// The explicit confirm. `current` is link_attempt_current evaluated again at the moment of the confirm,
+/// so a wrong profile, a replaced attempt or a passed deadline refuses it.
+pub fn link_confirm_candidate(phase : u32, current : bool, confirmed : bool, existing : []const u8, subject : []const u8) -> u32 {
+    if (phase != LINK_VERIFIED or !confirmed) { return LINK_REJECTED; }
+    return link_decision(current, true, true, existing, subject);
+}
+
+/// FR-003: the active handle after an event. LINK_END_NONE keeps it; every other event, known or not,
+/// clears it.
+pub fn link_active_after(event : u32, active : u64) -> u64 {
+    if (event == LINK_END_NONE) { return active; }
+    return 0;
+}
+
+/// FR-003: unlink removes the link of a linked profile, and only on an explicit confirm.
+pub fn link_unlink_decision(existing : []const u8, confirmed : bool) -> u32 {
+    if (existing.len == 0 or !confirmed) { return LINK_REJECTED; }
+    return LINK_UNLINK;
+}
+
+test an_attempt_belongs_to_the_profile_and_expires_at_the_boundary {
+    assert(link_attempt_current(1, 2, 1, 2, 100, 100));
+    assert(link_attempt_current(1, 2, 1, 2, 100, 399));
+    assert(!link_attempt_current(1, 2, 1, 2, 100, 400));
+    assert(!link_attempt_current(1, 2, 1, 2, 100, 99));
+    assert(!link_attempt_current(3, 2, 1, 2, 100, 101));
+    assert(!link_attempt_current(1, 2, 1, 3, 100, 101));
+    assert(!link_attempt_current(0, 2, 0, 2, 100, 101));
+}
+
+test a_cancelled_or_consumed_attempt_cannot_attach_on_late_delivery {
+    const current : bool = link_attempt_current(1, 2, 1, 0, 100, 101);
+    assert(link_decision(current, true, true, "", "1234") == LINK_REJECTED);
+}
+
+test an_unlinked_profile_requires_verified_proof_and_explicit_confirmation {
+    assert(link_decision(true, false, true, "", "1234") == LINK_REJECTED);
+    assert(link_decision(true, true, false, "", "1234") == LINK_CONFIRM);
+    assert(link_decision(true, true, true, "", "1234") == LINK_ATTACH);
+}
+
+test a_second_account_cannot_replace_an_existing_subject {
+    assert(link_decision(true, true, true, "1234", "1235") == LINK_CONFLICT);
+    assert(link_decision(true, true, false, "1234", "1234") == LINK_ALREADY_ATTACHED);
+    assert(link_decision(true, false, true, "1234", "1234") == LINK_REJECTED);
+}
+
+test empty_or_malformed_subjects_cannot_be_linked {
+    var long : [256]u8 = undefined;
+    var i : usize = 0;
+    while (i < long.len) {
+        long[i] = 65;
+        i = i + 1;
+    }
+    assert(link_subject_valid(long[0..255]));
+    assert(!link_subject_valid(long[0..256]));
+    assert(link_decision(true, true, true, "", "") == LINK_REJECTED);
+    assert(link_decision(true, true, true, "", "12 34") == LINK_REJECTED);
+    assert(link_decision(true, true, true, "", "12\n34") == LINK_REJECTED);
+}
+
+test only_the_configured_issuer_and_client_name_an_account {
+    assert(link_issuer_client_ok("https://issuer.example", "t27os-a", "https://issuer.example", "t27os-a"));
+    assert(!link_issuer_client_ok("https://issuer.example/", "t27os-a", "https://issuer.example", "t27os-a"));
+    assert(!link_issuer_client_ok("https://other.example", "t27os-a", "https://issuer.example", "t27os-a"));
+    assert(!link_issuer_client_ok("https://issuer.example", "t27os-b", "https://issuer.example", "t27os-a"));
+    assert(!link_issuer_client_ok("https://issuer.example", "t27os-a", "", "t27os-a"));
+    assert(!link_issuer_client_ok("https://issuer.example", "t27os-a", "https://issuer.example", ""));
+    assert(!link_issuer_client_ok("", "", "", ""));
+}
+
+test a_result_is_accepted_once_while_the_attempt_is_pending {
+    assert(link_accept_candidate(LINK_PENDING, true, true, "1234"));
+    assert(!link_accept_candidate(LINK_PENDING, false, true, "1234"));
+    assert(!link_accept_candidate(LINK_PENDING, true, false, "1234"));
+    assert(!link_accept_candidate(LINK_PENDING, true, true, ""));
+    assert(!link_accept_candidate(LINK_VERIFIED, true, true, "1234"));
+    assert(!link_accept_candidate(LINK_IDLE, true, true, "1234"));
+}
+
+test a_replayed_result_cannot_complete_an_attempt_twice {
+    var phase : u32 = LINK_PENDING;
+    var active : u64 = 2;
+    const c0 : bool = link_attempt_current(1, 2, 1, active, 100, 110);
+    assert(link_accept_candidate(phase, c0, true, "1234"));
+    phase = LINK_VERIFIED;
+    const c1 : bool = link_attempt_current(1, 2, 1, active, 100, 111);
+    assert(!link_accept_candidate(phase, c1, true, "1234"));
+    const c2 : bool = link_attempt_current(1, 2, 1, active, 100, 120);
+    assert(link_confirm_candidate(phase, c2, true, "", "1234") == LINK_ATTACH);
+    active = link_active_after(LINK_END_ATTACH, active);
+    phase = LINK_IDLE;
+    assert(active == 0);
+    const c3 : bool = link_attempt_current(1, 2, 1, active, 100, 121);
+    assert(!link_accept_candidate(phase, c3, true, "1234"));
+    assert(link_confirm_candidate(LINK_VERIFIED, c3, true, "", "1234") == LINK_REJECTED);
+    assert(link_decision(c3, true, true, "", "1234") == LINK_REJECTED);
+}
+
+test confirmation_rechecks_profile_attempt_and_deadline {
+    const in_time : bool = link_attempt_current(1, 2, 1, 2, 100, 399);
+    const too_late : bool = link_attempt_current(1, 2, 1, 2, 100, 400);
+    const other_profile : bool = link_attempt_current(3, 2, 1, 2, 100, 120);
+    const other_attempt : bool = link_attempt_current(1, 2, 1, 3, 100, 120);
+    assert(link_confirm_candidate(LINK_VERIFIED, in_time, true, "", "1234") == LINK_ATTACH);
+    assert(link_confirm_candidate(LINK_VERIFIED, in_time, false, "", "1234") == LINK_REJECTED);
+    assert(link_confirm_candidate(LINK_PENDING, in_time, true, "", "1234") == LINK_REJECTED);
+    assert(link_confirm_candidate(LINK_VERIFIED, too_late, true, "", "1234") == LINK_REJECTED);
+    assert(link_confirm_candidate(LINK_VERIFIED, other_profile, true, "", "1234") == LINK_REJECTED);
+    assert(link_confirm_candidate(LINK_VERIFIED, other_attempt, true, "", "1234") == LINK_REJECTED);
+    assert(link_confirm_candidate(LINK_VERIFIED, in_time, true, "4321", "1234") == LINK_CONFLICT);
+}
+
+test every_end_of_an_attempt_refuses_a_late_result {
+    assert(link_active_after(LINK_END_NONE, 2) == 2);
+    assert(link_active_after(LINK_END_CANCEL, 2) == 0);
+    assert(link_active_after(LINK_END_EXPIRE, 2) == 0);
+    assert(link_active_after(LINK_END_REJECT, 2) == 0);
+    assert(link_active_after(LINK_END_UNLINK, 2) == 0);
+    assert(link_active_after(LINK_END_ATTACH, 2) == 0);
+    assert(link_active_after(9, 2) == 0);
+    const a_none : u64 = link_active_after(LINK_END_NONE, 2);
+    const c_none : bool = link_attempt_current(1, 2, 1, a_none, 100, 101);
+    assert(c_none);
+    const a_cancel : u64 = link_active_after(LINK_END_CANCEL, 2);
+    const c_cancel : bool = link_attempt_current(1, 2, 1, a_cancel, 100, 101);
+    assert(link_decision(c_cancel, true, true, "", "1234") == LINK_REJECTED);
+    const a_unlink : u64 = link_active_after(LINK_END_UNLINK, 2);
+    const c_unlink : bool = link_attempt_current(1, 2, 1, a_unlink, 100, 101);
+    assert(link_decision(c_unlink, true, true, "", "1234") == LINK_REJECTED);
+}
+
+test unlink_needs_a_linked_profile_and_explicit_confirmation {
+    assert(link_unlink_decision("1234", true) == LINK_UNLINK);
+    assert(link_unlink_decision("1234", false) == LINK_REJECTED);
+    assert(link_unlink_decision("", true) == LINK_REJECTED);
+    assert(link_decision(true, true, true, "", "1235") == LINK_ATTACH);
+}
