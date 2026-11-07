@@ -91,9 +91,10 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
 1. **No test has run.** All thirteen acceptance tests and the existing spec tests are WAITING_RESOURCE.
 2. **Version baseline corrected.** The first commits named 0.1.0-alpha.1, below the published T27 OS line
    (0.2.0, `release.t27`, tag `t27os-v0.2.0-b7645`, master build 7896). The native line is now 0.3.0, the next
-   minor, as proposed in `target/lane/VERSION_DECISION.md`. Open: the branch name and issue #13212 still say
+   minor. Owner decision 2026-11-07: keep 0.3.0. Open: the branch name and issue #13212 still say
    0.1.0-alpha.1 (a rename needs the owner); when the published line reaches 0.3.0 two artifacts will share
-   the number (the `line=native` row keeps them apart). Nothing tagged, published, or edited in the release card.
+   the number (the owner accepted this; the `line=native` row keeps them apart). Nothing tagged, published,
+   or edited in the release card.
 3. **Process restart is simulated.** Acceptance C drops every in-memory copy and rebuilds from the file bytes;
    a true cross-process restart is covered only by running the suite twice (the fixed-id test reads what the
    first run left).
