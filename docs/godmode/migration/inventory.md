@@ -10,7 +10,7 @@ Exit: owner reviews; no migration action starts without approval.
 
 | Session | Branch | Status | Purpose |
 |---|---|---|---|
-| godmode-v1-executor-8d89e4 (this) | claude/godmode-ring-02-golden-chain | ACTIVE | Ring 2 GODMODE execution |
+| godmode-v1-executor-8d89e4 (this) | claude/godmode-ring-02-golden-chain (PR #13301), claude/godmode-phase0-phase1 (PR #13307) | ACTIVE | Ring 2 + Phase 0/1/4b docs |
 | queen-vertical-stack (other) | claude/queen-vertical-stack | OPEN | PR #13259 overlaps Ring 2+3 |
 
 ## Sessions (DSH)
@@ -102,7 +102,7 @@ Worktrees under `.agents/worktrees/`:
 | ~/t27 main clone on merge-pr-12695 | REVIEW | Not on master; may cause branch confusion |
 | Phase 3 DSH migration | DO_NOT_MIGRATE | Requires explicit owner approval |
 | Phase 4 external routing | DO_NOT_MIGRATE | Requires explicit owner approval |
-| Phase 4b free-first routing | DO_NOT_MIGRATE | Policy recorded in [phase4b-free-first.md](phase4b-free-first.md); wiring waits on Phase 4 approval |
+| Phase 4b free-first routing | APPROVED, BLOCKED | Owner approved 2026-11-08; spec work builds on `specs/t27os/lagger.t27` (#13204), another session's unpushed commit 9e9029cbdf; see [phase4b-free-first.md](phase4b-free-first.md) |
 | .claude/hooks.json migration | DO_NOT_MIGRATE | Requires explicit owner approval |
 
 ---
@@ -119,7 +119,9 @@ Worktrees under `.agents/worktrees/`:
 
 4. **Phase 4 routing**: No action until owner explicitly approves.
 
-5. **Phase 4b free-first**: the `--fallback-model` chain cannot carry it (no
-   trigger on 429/401/403, Anthropic endpoint only), NVIDIA NIM answers 403 on
-   inference, and DeepSeek is unfunded. See
-   [phase4b-free-first.md](phase4b-free-first.md) section 2.
+5. **Phase 4b free-first**: approved 2026-11-08. The `--fallback-model` chain
+   cannot carry it (no trigger on 429/401/403, Anthropic endpoint only), NVIDIA
+   NIM answers 403 on inference, and DeepSeek is unfunded. The free-first law
+   already exists as `specs/t27os/lagger.t27` (#13204), unpushed in the
+   `lagger-cost` worktree; a second spec is forbidden, so the Phase 4b lane
+   waits for #13204 to land. See [phase4b-free-first.md](phase4b-free-first.md).
