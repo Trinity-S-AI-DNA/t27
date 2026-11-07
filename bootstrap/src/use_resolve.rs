@@ -224,7 +224,14 @@ fn decl_name(line: &str) -> Option<String> {
     if let Some(r) = t.strip_prefix("pub ") {
         t = r.trim_start();
     }
-    for kw in ["fn ", "struct ", "enum ", "const ", "type "] {
+    // `threadlocal var` is a module-level declaration like any other: without
+    // stripping the storage prefix it was invisible to the splice and every
+    // pulled fn that wrote it emitted `use of undeclared identifier`
+    // (specs/ml/eval_hslm.t27 vs train_hslm.t27's b4_q/b4_s/b4_wt, #5980).
+    if let Some(r) = t.strip_prefix("threadlocal ") {
+        t = r.trim_start();
+    }
+    for kw in ["fn ", "struct ", "enum ", "const ", "type ", "var "] {
         if let Some(rest) = t.strip_prefix(kw) {
             let name: String = rest
                 .chars()

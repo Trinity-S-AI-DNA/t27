@@ -6457,9 +6457,9 @@ pub fn put_vec_elem(src: &[u8], st: &mut [usize], out: &mut [u8], typed: bool, e
     if typed {
         let t: usize = st[(LETTY) as usize];
         let lt: usize = skip_ws(src, tok_end(src, t));
-        let tp: usize = skip_ws(src, tok_end(src, lt));
-        if ((tok_is(src, t, b"Vec") && tok_is(src, lt, b"<")) && !(tok_is(src, tp, b"_"))) {
-            put_elem_ty(src, st, out, tp);
+        let tp_lv: usize = skip_ws(src, tok_end(src, lt));
+        if ((tok_is(src, t, b"Vec") && tok_is(src, lt, b"<")) && !(tok_is(src, tp_lv, b"_"))) {
+            put_elem_ty(src, st, out, tp_lv);
             return !(bad(st[(ERR) as usize]));
         }
     }
@@ -8638,7 +8638,7 @@ pub fn clean_text(src: &[u8], a: usize, b: usize) -> bool {
     return true;
 }
 
-pub const NUM_REFUSED: usize = 4611686018427387904;
+pub const NUM_REFUSED: u64 = 4611686018427387904;
 
 pub fn num_value(src: &[u8], q: usize, te: usize) -> usize {
     let mut r: usize = 10;
@@ -8676,7 +8676,7 @@ pub fn num_value(src: &[u8], q: usize, te: usize) -> usize {
         }
         if (g == 99) {
             if (((c == B_DOT) || (c == B_LOWER_E)) || (c == B_UPPER_E)) {
-                return NUM_REFUSED;
+                return (NUM_REFUSED) as usize;
             }
             return v;
         }
@@ -8685,12 +8685,12 @@ pub fn num_value(src: &[u8], q: usize, te: usize) -> usize {
         }
         v = ((v * r) + g);
         if (v >= bit(62)) {
-            return NUM_REFUSED;
+            return (NUM_REFUSED) as usize;
         }
         i = (i + 1);
     }
     if (v >= bit(62)) {
-        return NUM_REFUSED;
+        return (NUM_REFUSED) as usize;
     }
     return v;
 }
@@ -8814,7 +8814,7 @@ pub fn derived_at(src: &[u8], st: &mut [usize], kind: usize, tq: usize, d: usize
         }
         if ((ints && (src[(q) as usize] >= B_ZERO)) && (src[(q) as usize] <= B_NINE)) {
             let v: usize = num_value(src, q, te);
-            if (v < NUM_REFUSED) {
+            if (v < (NUM_REFUSED as usize)) {
                 let mut m: usize = 0;
                 let mut g: bool = false;
                 if (neg || (v >= 1)) {
@@ -11694,7 +11694,7 @@ pub fn enum_tag(src: &[u8], lb: usize) -> usize {
             if (((d < end) && is_digit(src[(d) as usize])) && (skip_ws(src, de) >= end)) {
                 m = num_value(src, d, de);
             }
-            if (m < NUM_REFUSED) {
+            if (m < (NUM_REFUSED as usize)) {
                 cneg = (ng && (m > 0));
                 cmag = m;
                 known = true;
