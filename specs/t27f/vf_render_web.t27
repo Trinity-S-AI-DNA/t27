@@ -1,90 +1,78 @@
 // SPDX-License-Identifier: Apache-2.0
 ; T27F renderer, browser target: one VfGraph frame onto an HTML canvas through four WASM host imports
-; Refs gHashTag/t27#13296
+; Refs gHashTag/t27#13296 gHashTag/t27#13214
+; Style: the UI Kit painter, not a palette of its own. The raster is vct_render (vf_card_tok: the vf_tokens metrics
+;   into vf_card's vc_render_s) in theme TH_T27 (vf_theme: BG 0x000000, text 0xFFFFFF, accent 0x00FF88, outline 0x333333)
+;   with Outfit type (vf_type: heading 26 px Bold, body 16 px Regular)
 ; Two paths, both fed by the one shared graph (vf_menu) and the one layout (vf_layout):
-;   pixel path (FR-001..FR-004): vf_render_rgb paints the frame, vf_web_rgba adds alpha 255, then
-;     canvas_set_size + canvas_put_pixels hand w * h * 4 bytes to the canvas, one ImageData put
-;   vector path: the shared draw list vf_draw_ops, one canvas_fill_rect per outline and per fill and
-;     one canvas_draw_text per label, so the canvas 2D context does the rasterising
-; No fill or glyph loop lives here (FR-003): the raster is vf_render_rgb's, the colours are vf_pixel_color's
-; vf_render_fpga reads the same draw list, so the two vector targets cannot drift apart
-; canvas_put_pixels takes the RGBA slice: on wasm32 a slice argument lowers to its address, the ptr of FR-002
+;   pixel path: vct_render paints the frame, vf_web_rgba adds alpha 255, then canvas_set_size + canvas_put_pixels
+;     hand w * h * 4 bytes to the canvas, one ImageData put
+;   vector path: the draw list vf_draw_ops, built from vf_card's own box and text rules (vc_box, vc_box_inner, vc_text)
+;     in the painter's order, one canvas_fill_rect per outline and per fill and one canvas_draw_text per label
+; No colour, size or position is decided here: each comes from vc_box or vc_text, so the vector frame cannot drift
+; vf_ops_replay paints the draw list back with vc_fill and vt_draw_text; it equals vct_render in every byte (tested)
 ; The JavaScript side of the four imports is NOT written here: it is foreign host code (owner rule only-t27)
-; Limits: vector-path labels are the browser's font, pixel-path labels the 5x7 font, so only fills are pinned equal
+; canvas_draw_text gets the pen in Q8 pixels, the baseline row, the size in px and the weight; the shim would set
+;   font = weight + " " + px + "px Outfit", textBaseline alphabetic, x = x_q8 / 256 (not written, see above)
 ; The externs make this spec t27b-only; the tests call only the pure functions, never an extern
 
 module t27f_vf_render_web;
 use t27f::visual_factory_contract::VfGraph;
-use t27f::visual_factory_contract::VF_TEXT;
-use t27f::visual_factory_contract::VF_BUTTON;
-use t27f::visual_factory_contract::VF_BADGE;
 use t27f::visual_factory_contract::VF_CARD;
-use t27f::visual_factory_contract::VF_STACK;
 use t27f::vf_layout::VfLayout;
 use t27f::vf_layout::vf_layout;
-use t27f::vf_pixel::vf_pixel_color;
-use t27f::vf_pixel::VF_PX_BG;
-use t27f::vf_pixel::VF_PALETTE;
-use t27f::vf_render::vf_render_rgb;
-use t27f::vf_render::VF_R_OK;
-use t27f::vf_render::VF_R_SMALL;
-use t27f::vf_render::VF_R_BORDER;
-use t27f::vf_render::VF_R_TEXT_LIGHT;
+use t27f::vf_card::VcBox;
+use t27f::vf_card::VcText;
+use t27f::vf_card::VcStyle;
+use t27f::vf_card::vc_box;
+use t27f::vf_card::vc_box_inner;
+use t27f::vf_card::vc_text;
+use t27f::vf_card::vc_off_m;
+use t27f::vf_card::vc_fill;
+use t27f::vf_card::VC_OK;
+use t27f::vf_card::VC_BAD_RASTER;
+use t27f::vf_card::VC_NO_FOCUS;
+use t27f::vf_card_tok::vct_render;
+use t27f::vf_card_tok::vct_render_style;
+use t27f::vf_theme::TH_T27;
+use t27f::vf_theme::TH_BG;
+use t27f::vf_theme::TH_TEXT;
+use t27f::vf_theme::TH_ACCENT;
+use t27f::vf_theme::TH_BORDER;
+use t27f::vf_theme::TH_CARD_BORDER;
+use t27f::vf_theme::th_color;
+use t27f::vf_theme::th_kind_color;
+use t27f::vf_type::vt_draw_text;
+use t27f::vf_type::VT_OK;
+use t27f::vf_type::VT_BOLD;
+use t27f::vf_type::VT_REGULAR;
 use t27f::vf_menu::vf_menu_graph;
 use t27f::vf_menu::VF_MENU_H;
 
-; ---- the WASM host imports (FR-001, FR-002, plus the vector pair) ----
+; ---- the WASM host imports ----
 fn canvas_set_size(w: u32, h: u32) -> void { @extern("canvas_set_size"); }
 fn canvas_put_pixels(rgba: []const u8, len: u32) -> void { @extern("canvas_put_pixels"); }
 fn canvas_fill_rect(x: u32, y: u32, w: u32, h: u32, rgb: u32) -> void { @extern("canvas_fill_rect"); }
-fn canvas_draw_text(x: u32, y: u32, s: []const u8, n: u32, rgb: u32) -> void { @extern("canvas_draw_text"); }
+fn canvas_draw_text(x_q8: u32, base: u32, s: []const u8, n: u32, rgb: u32, px: u32, weight: u32) -> void { @extern("canvas_draw_text"); }
 
 ; ---- the draw list: 6 words per op, [kind, a, b, c, d, e] ----
-; FILL [1, x, y, w, h, rgb]; TEXT [2, x, y, node, rgb, 0], the string is g.text[node]
+; FILL [1, x, y, w, h, rgb]; TEXT [2, pen_q8, base, node, ink, px * 1000 + weight], the string is vc_text's for that node
 pub const VF_OP_WORDS : u32 = 6;
 pub const VF_OP_FILL : u32 = 1;
 pub const VF_OP_TEXT : u32 = 2;
+; the renderers draw at 100 percent: one design pixel is one output pixel
+pub const VF_PCT : u32 = 100;
 
-; the menu frame: 375 x 84, 31500 pixels, 94500 RGB bytes, 126000 RGBA bytes
-pub var VF_W_RGB : [94500]u8 = [0] ** 94500;
-pub var VF_W_RGB2 : [94500]u8 = [0] ** 94500;
-pub var VF_W_RGBA : [126000]u8 = [0] ** 126000;
+; the menu frame: 375 x 108, 40500 pixels, 121500 RGB bytes, 162000 RGBA bytes
+pub var VF_W_RGB : [121500]u8 = [0] ** 121500;
+pub var VF_W_RGB2 : [121500]u8 = [0] ** 121500;
+pub var VF_W_RGBA : [162000]u8 = [0] ** 162000;
 pub var VF_W_OPS : [240]u32 = [0] ** 240;
 
 ; colour 0xRRGGBB of pixel (x, y) in an RGB raster w pixels wide
 pub fn vf_rgb_at(rgb: []const u8, w: u32, x: u32, y: u32) -> u32 {
     var at : usize = ((y * w + x) * 3) as usize;
     return (rgb[at] as u32) * 65536 + (rgb[at + 1] as u32) * 256 + (rgb[at + 2] as u32);
-}
-
-; the fill colour of node i: vf_pixel_color on the layout cut to nodes 0..i, at node i's own origin,
-; where node i is topmost; a node with w or h 0 covers nothing and is never asked
-pub fn vf_node_rgb(g: VfGraph, l: VfLayout, i: u32) -> u32 {
-    var lc : VfLayout = l;
-    lc.node_count = i + 1;
-    return vf_pixel_color(g, lc, l.x[i], l.y[i]);
-}
-
-; the nodes vf_render_rgb labels: text, badge and button with a non-empty string
-pub fn vf_node_labelled(g: VfGraph, i: u32) -> bool {
-    var k : u8 = g.kind[i];
-    if k != VF_TEXT and k != VF_BADGE and k != VF_BUTTON {
-        return false;
-    }
-    let s : str = g.text[i];
-    if s == "" {
-        return false;
-    }
-    return true;
-}
-
-; the label row: centred in the node's height when it is over the 7-pixel glyph height
-pub fn vf_label_y(l: VfLayout, i: u32) -> u32 {
-    var ty : u32 = l.y[i];
-    if l.h[i] > 7 {
-        ty = ty + (l.h[i] - 7) / 2;
-    }
-    return ty;
 }
 
 ; append one op when it fits; the count grows either way, so a short buffer shows as n * 6 > ops.len
@@ -102,35 +90,44 @@ fn vf_op_put(ops: []u32, n: u32, k: u32, a: u32, b: u32, c: u32, d: u32, e: u32)
     return n + 1;
 }
 
-; the shared draw list in painter's order: the background, then per node an outline rect in VF_R_BORDER
-; and an inner rect 1 pixel in, then the labels; painting it in order gives vf_render_rgb's fills exactly,
-; because the last rect over a pixel belongs to its topmost node and is that node's outline or its fill
+; the text record of node i exactly as vct_render's painter draws it (theme TH_T27, 100 percent, no focus)
+pub fn vf_node_text(g: VfGraph, l: VfLayout, i: u32) -> VcText {
+    var st : VcStyle = vct_render_style();
+    return vc_text(g, l, i, VF_PCT, TH_T27, vc_off_m(l, st.max_w), VC_NO_FOCUS, st);
+}
+
+; the draw list in the painter's order: the TH_BG background, then per node (the first 16, as vc_render_s) the outline
+; rect in the box's edge colour, the inner rect in its fill when vc_box_inner, then its text when it has one
 pub fn vf_draw_ops(g: VfGraph, l: VfLayout, w: u32, h: u32, ops: []u32) -> u32 {
-    var n : u32 = vf_op_put(ops, 0, VF_OP_FILL, 0, 0, w, h, VF_PX_BG);
+    var st : VcStyle = vct_render_style();
+    var off : u32 = vc_off_m(l, st.max_w);
+    var n : u32 = vf_op_put(ops, 0, VF_OP_FILL, 0, 0, w, h, th_color(TH_T27, TH_BG));
+    var cnt : u32 = l.node_count;
+    if cnt > 16 {
+        cnt = 16;
+    }
     var i : u32 = 0;
-    while i < l.node_count {
-        if l.w[i] > 0 and l.h[i] > 0 {
-            n = vf_op_put(ops, n, VF_OP_FILL, l.x[i], l.y[i], l.w[i], l.h[i], VF_R_BORDER);
-            if l.w[i] > 2 and l.h[i] > 2 {
-                n = vf_op_put(ops, n, VF_OP_FILL, l.x[i] + 1, l.y[i] + 1, l.w[i] - 2, l.h[i] - 2, vf_node_rgb(g, l, i));
+    while i < cnt {
+        var b : VcBox = vc_box(g, l, i, VF_PCT, TH_T27, off, VC_NO_FOCUS, st);
+        if b.boxed == 1 and b.x1 > b.x0 and b.y1 > b.y0 {
+            n = vf_op_put(ops, n, VF_OP_FILL, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, b.edge);
+            if vc_box_inner(b) {
+                n = vf_op_put(ops, n, VF_OP_FILL, b.x0 + b.t, b.y0 + b.t, b.x1 - b.x0 - 2 * b.t, b.y1 - b.y0 - 2 * b.t, b.fill);
             }
         }
-        i = i + 1;
-    }
-    var t : u32 = 0;
-    while t < l.node_count {
-        if vf_node_labelled(g, t) {
-            n = vf_op_put(ops, n, VF_OP_TEXT, l.x[t] + 4, vf_label_y(l, t), t, VF_R_TEXT_LIGHT, 0);
+        var tx : VcText = vc_text(g, l, i, VF_PCT, TH_T27, off, VC_NO_FOCUS, st);
+        if tx.s != "" {
+            n = vf_op_put(ops, n, VF_OP_TEXT, tx.pen_q8, tx.base, i, tx.ink, tx.px * 1000 + tx.weight);
         }
-        t = t + 1;
+        i = i + 1;
     }
     return n;
 }
 
-; the colour the canvas holds at (px, py) after the FILL ops: the last one covering it, else the page background
+; the colour the canvas holds at (px, py) after the FILL ops: the last one covering it, else black
 ; a test model of what canvas_fill_rect does, never a renderer
 pub fn vf_ops_color_at(ops: []const u32, n: u32, px: u32, py: u32) -> u32 {
-    var col : u32 = VF_PX_BG;
+    var col : u32 = 0;
     var k : u32 = 0;
     while k < n {
         var at : usize = (k * VF_OP_WORDS) as usize;
@@ -146,19 +143,46 @@ pub fn vf_ops_color_at(ops: []const u32, n: u32, px: u32, py: u32) -> u32 {
     return col;
 }
 
-; the bytes canvas_put_pixels hands over: w * h * 4 on success, none on a refusal (FR-004)
-pub fn vf_web_put_len(code: u8, w: u32, h: u32) -> u32 {
-    if code != VF_R_OK {
+; paint the first n ops of a draw list into an RGB raster: FILL through vc_fill, TEXT through vt_draw_text with the node's
+; vc_text string, the same two back ends the painter uses; VC_BAD_RASTER for a bad viewport, a short raster or a refused text
+pub fn vf_ops_replay(g: VfGraph, l: VfLayout, ops: []const u32, n: u32, rgb: []u8, w: u32, h: u32) -> u32 {
+    if w == 0 or h == 0 or w > 4096 or h > 4096 {
+        return VC_BAD_RASTER;
+    }
+    if w * h * 3 > (rgb.len as u32) or n * VF_OP_WORDS > (ops.len as u32) {
+        return VC_BAD_RASTER;
+    }
+    var k : u32 = 0;
+    while k < n {
+        var at : usize = (k * VF_OP_WORDS) as usize;
+        if ops[at] == VF_OP_FILL {
+            vc_fill(rgb, w, h, ops[at + 1], ops[at + 2], ops[at + 1] + ops[at + 3], ops[at + 2] + ops[at + 4], ops[at + 5]);
+        }
+        if ops[at] == VF_OP_TEXT {
+            var tx : VcText = vf_node_text(g, l, ops[at + 3]);
+            var tr : u32 = vt_draw_text(rgb, w, h, ops[at + 1], ops[at + 2], tx.s, ops[at + 5] / 1000, ops[at + 5] % 1000, ops[at + 4]);
+            if tr != VT_OK {
+                return VC_BAD_RASTER;
+            }
+        }
+        k = k + 1;
+    }
+    return VC_OK;
+}
+
+; the bytes canvas_put_pixels hands over: w * h * 4 on success, none on a refusal
+pub fn vf_web_put_len(code: u32, w: u32, h: u32) -> u32 {
+    if code != VC_OK {
         return 0;
     }
     return w * h * 4;
 }
 
-; RGB to the canvas's RGBA order, alpha 255; VF_R_SMALL when either buffer is short
-pub fn vf_web_rgba(rgb: []const u8, rgba: []u8, w: u32, h: u32) -> u8 {
+; RGB to the canvas's RGBA order, alpha 255; VC_BAD_RASTER when either buffer is short
+pub fn vf_web_rgba(rgb: []const u8, rgba: []u8, w: u32, h: u32) -> u32 {
     var px : u32 = w * h;
     if px * 3 > (rgb.len as u32) or px * 4 > (rgba.len as u32) {
-        return VF_R_SMALL;
+        return VC_BAD_RASTER;
     }
     var i : u32 = 0;
     while i < px {
@@ -170,37 +194,37 @@ pub fn vf_web_rgba(rgb: []const u8, rgba: []u8, w: u32, h: u32) -> u8 {
         rgba[d + 3] = 255;
         i = i + 1;
     }
-    return VF_R_OK;
+    return VC_OK;
 }
 
-; the pixel path, pure: render and convert; the code present returns
-pub fn vf_web_plan(g: VfGraph, l: VfLayout, rgb: []u8, rgba: []u8, w: u32, h: u32) -> u8 {
-    var code : u8 = vf_render_rgb(g, l, rgb, w, h);
-    if code != VF_R_OK {
+; the pixel path, pure: the UI Kit raster in TH_T27, then RGBA; the code present returns
+pub fn vf_web_plan(g: VfGraph, l: VfLayout, rgb: []u8, rgba: []u8, w: u32, h: u32) -> u32 {
+    var code : u32 = vct_render(g, l, rgb, w, h, TH_T27);
+    if code != VC_OK {
         return code;
     }
     return vf_web_rgba(rgb, rgba, w, h);
 }
 
-; the pixel path on the canvas: no import is called when the plan refuses (FR-004)
-pub fn vf_web_present(g: VfGraph, l: VfLayout, rgb: []u8, rgba: []u8, w: u32, h: u32) -> u8 {
-    var code : u8 = vf_web_plan(g, l, rgb, rgba, w, h);
-    if code != VF_R_OK {
+; the pixel path on the canvas: no import is called when the plan refuses
+pub fn vf_web_present(g: VfGraph, l: VfLayout, rgb: []u8, rgba: []u8, w: u32, h: u32) -> u32 {
+    var code : u32 = vf_web_plan(g, l, rgb, rgba, w, h);
+    if code != VC_OK {
         return code;
     }
     canvas_set_size(w, h);
     canvas_put_pixels(rgba, vf_web_put_len(code, w, h));
-    return VF_R_OK;
+    return VC_OK;
 }
 
 ; the vector path on the canvas: the draw list, op by op
-pub fn vf_web_present_vector(g: VfGraph, l: VfLayout, w: u32, h: u32, ops: []u32) -> u8 {
+pub fn vf_web_present_vector(g: VfGraph, l: VfLayout, w: u32, h: u32, ops: []u32) -> u32 {
     if w == 0 or h == 0 or w > 4096 or h > 4096 {
-        return VF_R_SMALL;
+        return VC_BAD_RASTER;
     }
     var n : u32 = vf_draw_ops(g, l, w, h, ops);
     if n * VF_OP_WORDS > (ops.len as u32) {
-        return VF_R_SMALL;
+        return VC_BAD_RASTER;
     }
     canvas_set_size(w, h);
     var k : u32 = 0;
@@ -210,22 +234,22 @@ pub fn vf_web_present_vector(g: VfGraph, l: VfLayout, w: u32, h: u32, ops: []u32
             canvas_fill_rect(ops[at + 1], ops[at + 2], ops[at + 3], ops[at + 4], ops[at + 5]);
         }
         if ops[at] == VF_OP_TEXT {
-            let s : str = g.text[ops[at + 3]];
-            canvas_draw_text(ops[at + 1], ops[at + 2], s, s.len as u32, ops[at + 4]);
+            var tx : VcText = vf_node_text(g, l, ops[at + 3]);
+            canvas_draw_text(ops[at + 1], ops[at + 2], tx.s, tx.s.len as u32, ops[at + 4], ops[at + 5] / 1000, ops[at + 5] % 1000);
         }
         k = k + 1;
     }
-    return VF_R_OK;
+    return VC_OK;
 }
 
-; how many pixels of colour col lie in x0 <= x < x1, y0 <= y < y1 of the menu raster
-fn vf_w_count(x0: u32, x1: u32, y0: u32, y1: u32, col: u32) -> u32 {
+; how many pixels in x0 <= x < x1, y0 <= y < y1 of the menu raster differ from colour col
+fn vf_w_other(x0: u32, x1: u32, y0: u32, y1: u32, col: u32) -> u32 {
     var cnt : u32 = 0;
     var cy : u32 = y0;
     while cy < y1 {
         var cx : u32 = x0;
         while cx < x1 {
-            if vf_rgb_at(&VF_W_RGB, 375, cx, cy) == col {
+            if vf_rgb_at(&VF_W_RGB, 375, cx, cy) != col {
                 cnt = cnt + 1;
             }
             cx = cx + 1;
@@ -238,111 +262,124 @@ fn vf_w_count(x0: u32, x1: u32, y0: u32, y1: u32, col: u32) -> u32 {
 test pixel_plan_ok {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
-    var code : u8 = vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 375, VF_MENU_H);
-    assert code == VF_R_OK;
-    assert vf_web_put_len(code, 375, VF_MENU_H) == 126000;
+    var code : u32 = vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 375, VF_MENU_H);
+    assert code == VC_OK;
+    assert vf_web_put_len(code, 375, VF_MENU_H) == 162000;
     assert VF_W_RGBA[3] == 255;
-    assert VF_W_RGBA[125999] == 255;
+    assert VF_W_RGBA[161999] == 255;
 }
 
 test refusal_puts_nothing {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
     var small : [10]u8 = [0; 10];
-    var c1 : u8 = vf_web_plan(g, l, &small, &VF_W_RGBA, 375, VF_MENU_H);
-    assert c1 == VF_R_SMALL;
+    var c1 : u32 = vf_web_plan(g, l, &small, &VF_W_RGBA, 375, VF_MENU_H);
+    assert c1 == VC_BAD_RASTER;
     assert vf_web_put_len(c1, 375, VF_MENU_H) == 0;
-    var c2 : u8 = vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 0, VF_MENU_H);
-    assert c2 == VF_R_SMALL;
+    var c2 : u32 = vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 0, VF_MENU_H);
+    assert c2 == VC_BAD_RASTER;
     assert vf_web_put_len(c2, 0, VF_MENU_H) == 0;
-    var c3 : u8 = vf_web_plan(g, l, &VF_W_RGB, &small, 375, VF_MENU_H);
-    assert c3 == VF_R_SMALL;
+    var c3 : u32 = vf_web_plan(g, l, &VF_W_RGB, &small, 375, VF_MENU_H);
+    assert c3 == VC_BAD_RASTER;
 }
 
-test menu_pixel_colors {
+test menu_theme_colours {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
-    assert vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 375, VF_MENU_H) == VF_R_OK;
-    // card outline at the corners, card fill past the row's right end (8 + 304 = 312)
-    assert vf_rgb_at(&VF_W_RGB, 375, 0, 0) == VF_R_BORDER;
-    assert vf_rgb_at(&VF_W_RGB, 375, 374, 83) == VF_R_BORDER;
-    assert vf_rgb_at(&VF_W_RGB, 375, 360, 50) == VF_PALETTE[VF_CARD as u32];
-    // the Browser button fill right of its label (12 .. 52), 0x1565C0 pinned as a literal
-    assert vf_rgb_at(&VF_W_RGB, 375, 90, 40) == 1402304;
-    // the row stack between buttons 0 (ends 104) and 1 (starts 112)
-    assert vf_rgb_at(&VF_W_RGB, 375, 108, 50) == VF_PALETTE[VF_STACK as u32];
-    // button outlines: Desktop's left edge at 112, FPGA's bottom edge at 36 + 40 - 1 = 75
-    assert vf_rgb_at(&VF_W_RGB, 375, 112, 50) == VF_R_BORDER;
-    assert vf_rgb_at(&VF_W_RGB, 375, 250, 75) == VF_R_BORDER;
-    // RGBA keeps the bytes: pixel (90, 40) is at 4 * (40 * 375 + 90) = 60360
-    assert VF_W_RGBA[60360] == 21;
-    assert VF_W_RGBA[60361] == 101;
-    assert VF_W_RGBA[60362] == 192;
-    assert VF_W_RGBA[60363] == 255;
+    assert vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 375, VF_MENU_H) == VC_OK;
+    // the card outline is TH_CARD_BORDER 0x333333 at both corners, the card inside is the theme's card fill
+    assert vf_rgb_at(&VF_W_RGB, 375, 0, 0) == 3355443;
+    assert vf_rgb_at(&VF_W_RGB, 375, 374, 107) == th_color(TH_T27, TH_CARD_BORDER);
+    assert vf_rgb_at(&VF_W_RGB, 375, 360, 60) == th_kind_color(TH_T27, VF_CARD as u32);
+    // Browser is PRIMARY: accent 0x00FF88 up to its edge (16, 52); Desktop is SECONDARY: 0x333333 edge, 0x141414 inside
+    assert vf_rgb_at(&VF_W_RGB, 375, 17, 53) == 65416;
+    assert vf_rgb_at(&VF_W_RGB, 375, 17, 53) == th_color(TH_T27, TH_ACCENT);
+    assert vf_rgb_at(&VF_W_RGB, 375, 122, 70) == 3355443;
+    assert vf_rgb_at(&VF_W_RGB, 375, 124, 54) == 1315860;
+    assert vf_rgb_at(&VF_W_RGB, 375, 124, 54) == th_color(TH_T27, TH_BORDER);
+    // the row stack draws nothing: the 10 px action gap between Browser (ends 112) and Desktop is card fill
+    assert vf_rgb_at(&VF_W_RGB, 375, 116, 70) == th_kind_color(TH_T27, VF_CARD as u32);
+    // RGBA keeps the bytes: pixel (17, 53) is at 4 * (53 * 375 + 17) = 79568
+    assert VF_W_RGBA[79568] == 0;
+    assert VF_W_RGBA[79569] == 255;
+    assert VF_W_RGBA[79570] == 136;
+    assert VF_W_RGBA[79571] == 255;
 }
 
 test menu_labels_drawn {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
-    assert vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 375, VF_MENU_H) == VF_R_OK;
-    // Browser: x 12 .. 53, rows 36 + (40 - 7) / 2 = 52 .. 58; title Targets: x 12 .. 53, rows 8 + 6 = 14 .. 20
-    assert vf_w_count(12, 53, 52, 59, VF_R_TEXT_LIGHT) >= 20;
-    assert vf_w_count(116, 157, 52, 59, VF_R_TEXT_LIGHT) >= 20;
-    assert vf_w_count(220, 243, 52, 59, VF_R_TEXT_LIGHT) >= 10;
-    assert vf_w_count(12, 53, 14, 21, VF_R_TEXT_LIGHT) >= 20;
-    // no white below the labels inside the buttons
-    assert vf_w_count(9, 311, 60, 75, VF_R_TEXT_LIGHT) == 0;
+    assert vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 375, VF_MENU_H) == VC_OK;
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    // ink inside the title box and inside each button's inner rect: anti-aliased Outfit, so count pixels off the fill
+    assert vf_w_other(16, 120, 16, 50, card) >= 40;
+    assert vf_w_other(17, 111, 53, 91, 65416) >= 30;
+    assert vf_w_other(123, 217, 53, 91, 1315860) >= 30;
+    assert vf_w_other(229, 323, 53, 91, 1315860) >= 20;
+    // nothing right of the row: the card is untouched from x 330 to its inner edge
+    assert vf_w_other(330, 374, 1, 107, card) == 0;
 }
 
 test draw_list_shape {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
     var n : u32 = vf_draw_ops(g, l, 375, VF_MENU_H, &VF_W_OPS);
-    // 1 background + 6 outlines + 6 fills + 4 labels (title and three buttons; card and row carry no text op)
-    assert n == 17;
+    // background, card edge + inside, title text, Browser fill + text (PRIMARY: one rect), Desktop and FPGA edge + inside + text
+    assert n == 12;
     assert VF_W_OPS[0] == VF_OP_FILL;
     assert VF_W_OPS[3] == 375;
-    assert VF_W_OPS[4] == 84;
-    assert VF_W_OPS[5] == VF_PX_BG;
-    assert VF_W_OPS[11] == VF_R_BORDER;
+    assert VF_W_OPS[4] == 108;
+    assert VF_W_OPS[5] == 0;
+    // op 1: the card outline over the whole frame; op 2: its inside 1 px in
+    assert VF_W_OPS[6] == VF_OP_FILL;
+    assert VF_W_OPS[9] == 375;
+    assert VF_W_OPS[11] == 3355443;
     assert VF_W_OPS[13] == 1;
     assert VF_W_OPS[15] == 373;
-    assert VF_W_OPS[17] == VF_PALETTE[VF_CARD as u32];
-    // op 13 is the first label: the title, node 1, at (12, 14)
-    assert VF_W_OPS[78] == VF_OP_TEXT;
-    assert VF_W_OPS[79] == 12;
-    assert VF_W_OPS[80] == 14;
-    assert VF_W_OPS[81] == 1;
-    // op 14: the Browser label, node 3, at (12, 52)
-    assert VF_W_OPS[85] == 12;
-    assert VF_W_OPS[86] == 52;
-    assert VF_W_OPS[87] == 3;
+    assert VF_W_OPS[16] == 106;
+    assert VF_W_OPS[17] == th_kind_color(TH_T27, VF_CARD as u32);
+    // op 3: the title, node 1, white, 26 px Bold
+    assert VF_W_OPS[18] == VF_OP_TEXT;
+    assert VF_W_OPS[21] == 1;
+    assert VF_W_OPS[22] == th_color(TH_T27, TH_TEXT);
+    assert VF_W_OPS[23] == 26000 + VT_BOLD;
+    // op 4: the Browser button, one accent rect 96 x 40 at (16, 52)
+    assert VF_W_OPS[24] == VF_OP_FILL;
+    assert VF_W_OPS[25] == 16;
+    assert VF_W_OPS[26] == 52;
+    assert VF_W_OPS[27] == 96;
+    assert VF_W_OPS[28] == 40;
+    assert VF_W_OPS[29] == 65416;
+    // op 5: the Browser label, node 3, 16 px Regular
+    assert VF_W_OPS[30] == VF_OP_TEXT;
+    assert VF_W_OPS[33] == 3;
+    assert VF_W_OPS[35] == 16000 + VT_REGULAR;
+    // ops 6 and 7: Desktop's outline at x 122 and its inside at 123, 94 x 38
+    assert VF_W_OPS[37] == 122;
+    assert VF_W_OPS[41] == 3355443;
+    assert VF_W_OPS[43] == 123;
+    assert VF_W_OPS[45] == 94;
+    assert VF_W_OPS[46] == 38;
+    assert VF_W_OPS[47] == 1315860;
+    // op 11: the FPGA label, node 5
+    assert VF_W_OPS[66] == VF_OP_TEXT;
+    assert VF_W_OPS[69] == 5;
     var tiny : [12]u32 = [0; 12];
     assert vf_draw_ops(g, l, 375, VF_MENU_H, &tiny) * VF_OP_WORDS > 12;
-}
-
-test node_colours_come_from_vf_pixel {
-    var g : VfGraph = vf_menu_graph(375);
-    var l : VfLayout = vf_layout(g);
-    assert vf_node_rgb(g, l, 0) == VF_PALETTE[VF_CARD as u32];
-    assert vf_node_rgb(g, l, 1) == VF_PALETTE[VF_TEXT as u32];
-    assert vf_node_rgb(g, l, 2) == VF_PALETTE[VF_STACK as u32];
-    assert vf_node_rgb(g, l, 3) == VF_PALETTE[VF_BUTTON as u32];
-    assert vf_node_rgb(g, l, 5) == VF_PALETTE[VF_BUTTON as u32];
 }
 
 test vector_fills_equal_raster {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
     var n : u32 = vf_draw_ops(g, l, 375, VF_MENU_H, &VF_W_OPS);
-    // the raster without labels, so only fills are compared: every one of the 31500 pixels
+    // the raster without labels, so only fills are compared: every one of the 40500 pixels
     var gb : VfGraph = g;
     var b : u32 = 0;
     while b < 6 {
         gb.text[b] = "";
         b = b + 1;
     }
-    assert vf_render_rgb(gb, l, &VF_W_RGB2, 375, VF_MENU_H) == VF_R_OK;
+    assert vct_render(gb, l, &VF_W_RGB2, 375, VF_MENU_H, TH_T27) == VC_OK;
     var bad : u32 = 0;
     var y : u32 = 0;
     while y < VF_MENU_H {
@@ -356,7 +393,38 @@ test vector_fills_equal_raster {
         y = y + 1;
     }
     assert bad == 0;
-    // negative control: repaint the Browser fill (op 8) and the comparison must see it
-    VF_W_OPS[53] = VF_R_BORDER;
-    assert vf_ops_color_at(&VF_W_OPS, n, 90, 40) != vf_rgb_at(&VF_W_RGB2, 375, 90, 40);
+    // negative control: repaint the Browser rect (op 4) in the outline colour and the comparison must see it
+    VF_W_OPS[29] = 3355443;
+    assert vf_ops_color_at(&VF_W_OPS, n, 17, 53) != vf_rgb_at(&VF_W_RGB2, 375, 17, 53);
+}
+
+test replay_equals_raster {
+    var g : VfGraph = vf_menu_graph(375);
+    var l : VfLayout = vf_layout(g);
+    assert vf_web_plan(g, l, &VF_W_RGB, &VF_W_RGBA, 375, VF_MENU_H) == VC_OK;
+    var n : u32 = vf_draw_ops(g, l, 375, VF_MENU_H, &VF_W_OPS);
+    // all 12 ops painted back with vc_fill and vt_draw_text: the same 121500 bytes, labels included
+    assert vf_ops_replay(g, l, &VF_W_OPS, n, &VF_W_RGB2, 375, VF_MENU_H) == VC_OK;
+    var diff : u32 = 0;
+    var i : u32 = 0;
+    while i < 121500 {
+        if VF_W_RGB[i] != VF_W_RGB2[i] {
+            diff = diff + 1;
+        }
+        i = i + 1;
+    }
+    assert diff == 0;
+    // negative control: without the last op (the FPGA label) the frames differ
+    assert vf_ops_replay(g, l, &VF_W_OPS, n - 1, &VF_W_RGB2, 375, VF_MENU_H) == VC_OK;
+    var miss : u32 = 0;
+    var j : u32 = 0;
+    while j < 121500 {
+        if VF_W_RGB[j] != VF_W_RGB2[j] {
+            miss = miss + 1;
+        }
+        j = j + 1;
+    }
+    assert miss > 0;
+    var tiny : [10]u8 = [0; 10];
+    assert vf_ops_replay(g, l, &VF_W_OPS, n, &tiny, 375, VF_MENU_H) == VC_BAD_RASTER;
 }
