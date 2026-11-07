@@ -148,12 +148,15 @@ start. The chosen finding must:
 
 ---
 
+> `tri igla` is not built yet; the loop runs as a manual agent procedure (see §6).
+
 ## 5. IGLA command surface
 
 IGLA is driven through `tri` (or `t27c`) subcommands. No new shell scripts.
 
 | Command | Purpose |
 |---------|---------|
+### Not built (planned surface only): tri igla
 | `tri igla audit` | Run OBSERVE + CATALOG; write audit report. |
 | `tri igla triage` | Read latest audit; update `igla-loop-state.json` with one needle. |
 | `tri igla state` | Print current needle, ETA, blocked-by. |
@@ -166,6 +169,7 @@ using existing `t27c` commands and this document.
 
 ## 6. Manual IGLA scan checklist
 
+### Not built (planned surface only): tri igla
 Until `tri igla audit` exists, run these read-only checks:
 
 ### 6.1 Seal and compiler
