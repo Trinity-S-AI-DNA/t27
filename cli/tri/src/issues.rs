@@ -1,23 +1,3 @@
-//! Open issues whose headline calls a workflow red, against what that workflow
-//! does on master today.
-//!
-//! An open issue is a claim with a date on it: *this is broken*. The repository
-//! holds 477 of them, and 268 carry a number in the title -- a stated
-//! measurement of the tree, taken once. Nothing re-reads them.
-//!
-//! One subset can be re-measured exactly, because its truth is defined outside
-//! the repository: an issue whose title says a named workflow is red. GitHub
-//! records what that workflow last concluded on master, so the claim can be
-//! checked without judgement.
-//!
-//! **What a green reading here does NOT mean.** It does not say the issue is
-//! resolved, and this command never suggests closing one. An issue titled
-//! "cli-tri has been red on master for three days" also argues that a `paths:`
-//! filter kept it from running, and that argument can outlive the redness
-//! entirely. What a green reading says is narrower and still worth having: the
-//! sentence at the top of that issue is no longer true, so a reader who stops
-//! at the title is misled about the state of the tree.
-
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;

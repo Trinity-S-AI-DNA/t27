@@ -1,39 +1,3 @@
-//! Specs the compiler cannot read, ranked by the CONSTRUCT that stops it --
-//! and every construct backed by a live probe.
-//!
-//! WHY A PROBE
-//! -----------
-//! The obvious census groups by the compiler's message, and that census was
-//! shipped once and was wrong: `import x`, `algorithm y {`, `type T = T` and an
-//! English sentence all print "unexpected token after expression statement".
-//! The message names the state the parser recovered INTO, not what stopped it.
-//!
-//! Grouping by what the line CONTAINS is better and still not enough, because a
-//! pattern can name a construct the compiler already supports. Measured the day
-//! this was written, SIX candidates -- read off real failing lines, and every
-//! one plausible -- compile in isolation:
-//!
-//!     @trim("x", "y")          builtin call             ACCEPTED
-//!     .anthropic               enum literal             ACCEPTED
-//!     if (c) { 1 } else { 2 }  if-expression            ACCEPTED
-//!     *Foo   &Foo              pointer / reference      ACCEPTED
-//!     []const u8               const-qualified slice    ACCEPTED
-//!     for (s) |v| { }          capture in a for-loop    ACCEPTED
-//!
-//! An earlier fan-out named `[]const u8` as a cause. A census that repeated it
-//! would have sent someone to implement a feature that is already there.
-//!
-//! So every construct here carries a MINIMAL SOURCE, and the census names it
-//! only while the compiler rejects that source today. It is self-invalidating
-//! on purpose: when a construct gains support its probe starts passing and the
-//! row disappears without anyone editing a list.
-//!
-//! WHAT IT ABSTAINS ON
-//! -------------------
-//! A failing line carrying no probed construct, whose head is a construct the
-//! parser accepts, is a SYMPTOM -- the cause is earlier in the file. Naming one
-//! would be inventing it. Files under `fixtures/` are broken ON PURPOSE as
-//! detector inputs and are counted on their own line, never as debt.
 use anyhow::Result;
 use clap::Subcommand;
 use std::collections::{BTreeMap, BTreeSet};

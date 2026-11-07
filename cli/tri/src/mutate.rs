@@ -1,25 +1,3 @@
-//! `tri mutate` — find the constants in a checker that nothing actually checks.
-//!
-//! This exists because of one hour. A workflow step was added to catch a
-//! toolchain pin that was being silently ignored; the step read an 8-digit date
-//! out of `yosys -V`, there is no date in that string, so the variable was
-//! empty, the guard skipped, and the step reported success without comparing
-//! anything. A vacuous assertion, written to catch a vacuous pin.
-//!
-//! An hour later the same class appeared in a verifier written to be careful
-//! about exactly this: flipping one entry of its lookup table left every claim
-//! green, because the table sat on both sides of the identity being tested and
-//! cancelled with itself.
-//!
-//! Neither was caught by reading. Both were caught by changing a constant and
-//! noticing nothing went red. That is what this command automates: perturb one
-//! literal at a time, re-run the checker, and report every literal the checker
-//! did not notice.
-//!
-//! A surviving mutant is not always a bug — some constants genuinely do not
-//! affect the outcome. It is always a question worth answering, because a check
-//! that cannot fail is indistinguishable from one that passed.
-
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};

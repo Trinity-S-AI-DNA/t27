@@ -1,19 +1,3 @@
-//! `tri gates` — find workflows that have never once succeeded.
-//!
-//! A gate that has never been green carries no information: it is red before
-//! your change and red after it, so nobody reads it — and after a while nobody
-//! reads the others either. Eighteen such workflows were found across three of
-//! these repositories, between them consuming 8182 runs and producing zero
-//! green results.
-//!
-//! That is not an aesthetic complaint. It is the measured cause of nine
-//! defects living undetected in a request path that had executed once in its
-//! lifetime: when red is the normal colour, a real red says nothing.
-//!
-//! This was a hand-run loop of `gh api` calls three times before it became a
-//! command. It reports, it does not disable anything — deciding between fix,
-//! dispatch-only and delete belongs to whoever owns the workflow.
-
 use anyhow::{Context, Result};
 #[path = "../../../gen/rust/claw/text.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)]
 mod ct; // t27c gen-rust of specs/claw/text.t27: token_occurrences/is_ident_byte (the orphaned-tests boundary count) moved out of this file into the spec (#11783)

@@ -1,9 +1,3 @@
-//! `tri fpga ...` — centralised FPGA programming via the in-tree `dlc10`
-//! crate. Replaces `tools/dlc10_jtag.py` and `tools/tri_fpga/cli.py`.
-//!
-//! All operations use pure-Rust paths through `rusb`; no external tools
-//! (Vivado / openFPGALoader) and no Python dependencies are required.
-
 use std::io::{BufRead, Read};
 use std::path::PathBuf;
 
