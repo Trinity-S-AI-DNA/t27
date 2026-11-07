@@ -109,10 +109,20 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
    `t27b` (typechecks; first run will show).
 9. **Wiring.** No seals saved (new specs stay unsealed), `native_host` is not wired into a UI window or the
    kernel, and the UI component is text-only by declaration (`component.ui.state=text-only`).
-10. **Duplicate-bodies.** No function body was copied; the dupe ratchet has not been run on this branch.
+10. **Duplicate-bodies.** CI found `host_parse_port` copied from `ladder_serve.ls_parse_port`; `native_host` now imports
+    the original (6c3d6a74ce). The other growth CI shows (`bytes_eq` 11 to 12) is not in a native file and persists
+    after that fix, so it is master-side. Three native type names collided with existing ones (`Agent`, `Policy`,
+    `Turn`); they are now `NativeAgent`, `NativePolicy`, `NativeTurn` (3f6227b975).
 11. **`host_run_swarm` takes 11 parameters** (three fixed agent slots), a consequence of no heap in .t27.
 12. **#5980 was not needed.** The atomic write, env read, loopback socket and poll-with-deadline all have
     working .t27 paths through `pty_sys`, so nothing is parked and no capability issue is filed.
+13. **First machine signal, not an acceptance run.** CI `t27c test-report` (spec-guards, head e35edfa24e) scored
+    `native_agent`, `native_provider`, `native_swarm`, `native_version` at 0 failing tests, `native_log` 2,
+    `native_policy` 1, `native_host` 3, and `native_accept` as not building (it imports the `@extern` host).
+    The log and policy failures matched five asserts that read a field straight off a call result; they are bound
+    to a local const in 277d39ab34 (not re-scored yet). The three `native_host` failures are not identified:
+    the file says `@extern` specs run under `t27b`, and the owner's hold keeps `native_host` and `native_accept`
+    unrun, so they stay WAITING_RESOURCE. This does not change any status above; nothing here is EXECUTED.
 
 ## Safety defaults in force
 
