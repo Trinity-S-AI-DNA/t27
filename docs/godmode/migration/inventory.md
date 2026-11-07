@@ -102,6 +102,7 @@ Worktrees under `.agents/worktrees/`:
 | ~/t27 main clone on merge-pr-12695 | REVIEW | Not on master; may cause branch confusion |
 | Phase 3 DSH migration | DO_NOT_MIGRATE | Requires explicit owner approval |
 | Phase 4 external routing | DO_NOT_MIGRATE | Requires explicit owner approval |
+| Phase 4b free-first routing | DO_NOT_MIGRATE | Policy recorded in [phase4b-free-first.md](phase4b-free-first.md); wiring waits on Phase 4 approval |
 | .claude/hooks.json migration | DO_NOT_MIGRATE | Requires explicit owner approval |
 
 ---
@@ -117,3 +118,8 @@ Worktrees under `.agents/worktrees/`:
 3. **Phase 3 migration**: No action until owner explicitly approves after reviewing this inventory.
 
 4. **Phase 4 routing**: No action until owner explicitly approves.
+
+5. **Phase 4b free-first**: the `--fallback-model` chain cannot carry it (no
+   trigger on 429/401/403, Anthropic endpoint only), NVIDIA NIM answers 403 on
+   inference, and DeepSeek is unfunded. See
+   [phase4b-free-first.md](phase4b-free-first.md) section 2.
