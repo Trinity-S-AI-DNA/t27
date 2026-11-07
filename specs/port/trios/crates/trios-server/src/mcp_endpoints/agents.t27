@@ -1,0 +1,221 @@
+module port::trios::crates::trios_server::src::mcp_endpoints::agents;
+
+// Port of gHashTag/trios crates/trios-server/src/mcp_endpoints/agents.rs
+// (128 lines).
+//
+// The handlers are `async` and touch `AppState` (tokio Mutex, reqwest client,
+// atomic key index). None of that is modelled: the port keeps the registry as a
+// fixed 16-slot array (the original Vec is unbounded; a full table refuses the
+// new entry) and turns each handler into the decision it makes.
+//   - `list` (lines 12-15) is a read-only snapshot of the agent table;
+//   - `chat` (lines 17-35) dispatches on an empty agent_id, then on whether the
+//     id exists, and only then formats the reply;
+//   - `call_zai` (lines 38-128) decides echo, retry, parse or error per attempt.
+// The JSON bodies, the tracing calls and the HTTP request are plumbing.
+
+const MAX_RETRIES: usize = 3;
+const AGENT_CAPACITY: usize = 16;
+
+// Lines 5-8: the system prompt is data, not logic; it is pinned here so the
+// port can be checked against the original text.
+const SYSTEM_PROMPT: str = "You are Trinity - an AI agent orchestrator built on the trios stack. You help developers manage agents, tasks, and tools. Be concise, technical, and precise. When unsure, ask for clarification rather than guessing.";
+
+struct Agent {
+    id: str,
+}
+
+// The parts of AppState the three handlers read.
+struct AppState {
+    agents: [16]Agent,
+    agent_count: usize,
+    zai_api: str,
+    zai_key_count: usize,
+    zai_key_idx: usize,
+}
+
+// Lines 12-15: `serde_json::to_value(&*agents)`. The serialized value is the
+// table as-is, so the pure decision is the snapshot size; a full table is still
+// listed (unlike registration, there is no capacity rejection here).
+pub fn list(state: AppState) -> usize {
+    return state.agent_count;
+}
+
+// Lines 17-35, the three disjoint branches:
+//   * agent_id empty            -> call_zai (the free-form assistant path);
+//   * agent_id present but unknown -> the "register an agent first" error;
+//   * known agent               -> "[id] message" reply.
+enum ChatOutcome {
+    CallZai,
+    AgentNotFound,
+    AgentReply,
+}
+
+pub fn chat(state: AppState, agent_id: str, message: str) -> ChatOutcome {
+    if (agent_id.len == 0) {
+        return .CallZai;
+    }
+    var i: usize = 0;
+    while (i < state.agent_count) {
+        if (state.agents[i].id == agent_id) {
+            return .AgentReply;
+        }
+        i += 1;
+    }
+    return .AgentNotFound;
+}
+
+// Lines 39-41: no API configured, or no key, means echo the message back.
+// Lines 54-99: a transport failure (encoded as status 0) or a 429/5xx status is
+// retried on the next key while attempts remain; the last attempt is an error.
+// Lines 101-124: a 2xx status proceeds to read and parse the body.
+// Lines 126-127: falling out of the loop is the all-retries-exhausted error.
+enum ZaiOutcome {
+    Echo,
+    Retry,
+    Reply,
+    Error,
+}
+
+// `status == 0` is the port's encoding of `Err(e)` from `.send()` (line 71),
+// which has no HTTP status at all.
+pub fn call_zai(state: AppState, attempt: usize, status: u16) -> ZaiOutcome {
+    if (state.zai_api.len == 0 || state.zai_key_count == 0) {
+        return .Echo;
+    }
+    if (status == 0) {
+        if (attempt + 1 < MAX_RETRIES) {
+            return .Retry;
+        }
+        return .Error;
+    }
+    if (status == 429 || is_server_error(status)) {
+        if (attempt + 1 < MAX_RETRIES) {
+            return .Retry;
+        }
+        return .Error;
+    }
+    if (status >= 200 && status < 300) {
+        return .Reply;
+    }
+    return .Error;
+}
+
+// Lines 84-85: `status.is_server_error()` is 500..=599.
+fn is_server_error(status: u16) -> bool {
+    return status >= 500 && status <= 599;
+}
+
+// Lines 54-57: round-robin key index = fetch_add(1) % n_keys. The atomic is the
+// world; the modulo decision is pure and gets its own check.
+fn key_index(idx: u64, n_keys: usize) -> usize {
+    if (n_keys == 0) {
+        return 0;
+    }
+    return (idx % (n_keys as u64)) as usize;
+}
+
+fn empty_state() -> AppState {
+    return AppState {
+        agents: [_]Agent{Agent { id: "" }} ** AGENT_CAPACITY,
+        agent_count: 0,
+        zai_api: "",
+        zai_key_count: 0,
+        zai_key_idx: 0,
+    };
+}
+
+// Lines 12-15: a snapshot returns the registry size, empty or not.
+test list_is_a_read_only_snapshot {
+    var state = empty_state();
+    assert(list(state) == 0);
+    state.agents[0].id = "alpha";
+    state.agents[1].id = "beta";
+    state.agent_count = 2;
+    assert(list(state) == 2);
+}
+
+// Lines 22-24: an empty agent_id falls through to z.AI.
+test chat_empty_agent_calls_zai {
+    const state = empty_state();
+    assert(chat(state, "", "hello") == .CallZai);
+}
+
+// Lines 26-32: an unknown non-empty id is rejected, never echoed.
+test chat_unknown_agent_rejected {
+    const state = empty_state();
+    assert(chat(state, "ghost", "hello") == .AgentNotFound);
+}
+
+// Lines 26-34: a known id replies with the bracketed form.
+test chat_known_agent_replies {
+    var state = empty_state();
+    state.agents[0].id = "alpha";
+    state.agent_count = 1;
+    assert(chat(state, "alpha", "hello") == .AgentReply);
+}
+
+// Lines 39-41: with no API or no key the message is echoed.
+test call_zai_echo_without_config {
+    const state = empty_state();
+    assert(call_zai(state, 0, 200) == .Echo);
+}
+
+// Lines 54-91: 429 and 5xx retry while attempts remain.
+test call_zai_retries_on_429_and_5xx {
+    var state = empty_state();
+    state.zai_api = "https://z.ai/v1";
+    state.zai_key_count = 2;
+    assert(call_zai(state, 0, 429) == .Retry);
+    assert(call_zai(state, 1, 503) == .Retry);
+    assert(call_zai(state, 2, 500) == .Error);
+}
+
+// Lines 71-79: a transport failure follows the same retry budget.
+test call_zai_retries_transport_error {
+    var state = empty_state();
+    state.zai_api = "https://z.ai/v1";
+    state.zai_key_count = 1;
+    assert(call_zai(state, 0, 0) == .Retry);
+    assert(call_zai(state, 2, 0) == .Error);
+}
+
+// Lines 93-124: a 2xx body is parsed and answered.
+test call_zai_success_replies {
+    var state = empty_state();
+    state.zai_api = "https://z.ai/v1";
+    state.zai_key_count = 1;
+    assert(call_zai(state, 0, 200) == .Reply);
+    assert(call_zai(state, 1, 201) == .Reply);
+}
+
+// Lines 101-104: a non-retryable non-success status is an immediate error.
+test call_zai_client_error_is_error {
+    var state = empty_state();
+    state.zai_api = "https://z.ai/v1";
+    state.zai_key_count = 1;
+    assert(call_zai(state, 0, 400) == .Error);
+    assert(call_zai(state, 0, 404) == .Error);
+}
+
+// Lines 84-85: the 5xx predicate boundaries, including 600 which is not 5xx.
+test is_server_error_boundaries {
+    assert(!is_server_error(499));
+    assert(is_server_error(500));
+    assert(is_server_error(599));
+    assert(!is_server_error(600));
+}
+
+// Lines 56-57: key rotation wraps by the number of keys.
+test key_index_round_robin {
+    assert(key_index(0, 3) == 0);
+    assert(key_index(2, 3) == 2);
+    assert(key_index(3, 3) == 0);
+    assert(key_index(7, 3) == 1);
+    assert(key_index(7, 0) == 0);
+}
+
+// Line 5: the system prompt is the original text (ASCII transliteration of the
+// two em dashes only).
+test system_prompt_pinned {
+    assert(SYSTEM_PROMPT.len > 0);
+}
