@@ -1,6 +1,7 @@
-# T27 OS native 0.1.0-alpha.1: completion report
+# T27 OS native 0.3.0: completion report
 
-Date: 2026-11-07. Branch: `lane/t27os-native-0.1.0-alpha.1`. Tracking issue: Trinity-S-AI-DNA/t27#13212.
+Date: 2026-11-07. Branch: `lane/t27os-native-0.1.0-alpha.1` (the branch name keeps the first, wrong version
+until the owner allows a rename; every file below says 0.3.0). Tracking issue: Trinity-S-AI-DNA/t27#13212.
 Status words: EXECUTED means the test ran and its output was read. WAITING_RESOURCE means it was written,
 parsed and typechecked, but no run was possible from this session. Nothing below is EXECUTED.
 
@@ -29,7 +30,7 @@ and the chat slice reaches LM Studio only through `native_host` (libSystem socke
 
 | Spec | Role |
 |------|------|
-| `native_version.t27` | T27OS_VERSION 0.1.0-alpha.1, four component versions, `version_report` rows |
+| `native_version.t27` | T27OS_VERSION 0.3.0, four component versions, `version_report` rows |
 | `native_provider.t27` | provider contract: list models, chat request, stream event, timeout, cancellation, token usage, redacted error classes; LM Studio adapter bytes |
 | `native_log.t27` | append-only event log, six event kinds, sequence numbers, torn-tail recovery, cursor `Cur`, `continuable` |
 | `native_policy.t27` | tool allowlist, approval gate, spawn refusal, audit lines, redaction, secret-only-from-environment |
@@ -88,8 +89,11 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
 ## REMAINING_GAPS
 
 1. **No test has run.** All thirteen acceptance tests and the existing spec tests are WAITING_RESOURCE.
-2. **Version numbering conflict.** The published T27 OS line is 0.2.0 (`release.t27`), so 0.1.0-alpha.1 is
-   numerically lower. Used exactly as ordered; nothing tagged, published, or edited in the release card.
+2. **Version baseline corrected.** The first commits named 0.1.0-alpha.1, below the published T27 OS line
+   (0.2.0, `release.t27`, tag `t27os-v0.2.0-b7645`, master build 7896). The native line is now 0.3.0, the next
+   minor, as proposed in `target/lane/VERSION_DECISION.md`. Open: the branch name and issue #13212 still say
+   0.1.0-alpha.1 (a rename needs the owner); when the published line reaches 0.3.0 two artifacts will share
+   the number (the `line=native` row keeps them apart). Nothing tagged, published, or edited in the release card.
 3. **Process restart is simulated.** Acceptance C drops every in-memory copy and rebuilds from the file bytes;
    a true cross-process restart is covered only by running the suite twice (the fixed-id test reads what the
    first run left).
