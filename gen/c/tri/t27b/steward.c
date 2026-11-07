@@ -129,6 +129,9 @@ bool is_pass(uint8_t v) {
     if ((v == 1)) {
         return true;
     }
+    if ((v == 12)) {
+        return true;
+    }
     return false;
 }
 
