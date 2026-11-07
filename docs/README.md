@@ -52,6 +52,7 @@ TDD, bootstrap/testing plans, math/physics test framework charter, PHI loop, tec
 | [`nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md`](nona-03-manifest/T27O-COMPETITORS-AND-DOGFOOD.md) | t27o on the roadmap repositories (coverage, refusal kinds, timing), its field and ten weaknesses (#10522) |
 | [`nona-03-manifest/VIZ-DISTILL-GRAPH.md`](nona-03-manifest/VIZ-DISTILL-GRAPH.md) | The spec corpus as one interactive Distill-style graph; materialise `build/viz/spec-graph.html` (#12218) |
 | [`nona-03-manifest/VIZ-PETAL-GUIDE.md`](nona-03-manifest/VIZ-PETAL-GUIDE.md) | Contributor guide: add the visualization for one more petal (start, write, test, check, land) through `viz_contract` and `petal_viz_plan` (#12173) |
+| [`nona-03-manifest/ELECTRONICS-101-TEARDOWN.md`](nona-03-manifest/ELECTRONICS-101-TEARDOWN.md) | Teardown of electronics-101-six.vercel.app: lesson-as-data architecture, `/closed-loop` vertical slice, 48-lesson content tree, learning model and a course-27 mapping |
 
 ## External Projects
 
