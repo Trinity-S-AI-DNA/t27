@@ -88,7 +88,7 @@ mod skillnum;
 mod topic;
 mod trees;
 mod types_dup;
-mod unparsed;
+#[path = "../../../gen/rust/tri/unparsed/unparsed.rs"] #[allow(dead_code, unused_parens)] mod unparsed_rules; mod unparsed; // t27c gen-rust of specs/tools/tri/unparsed.t27
 mod vectors;
 mod vsim;
 
