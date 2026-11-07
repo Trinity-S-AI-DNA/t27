@@ -4,7 +4,7 @@
 
 ## 1. Что исследовано
 
-Репозиторий `Trinity-S-AI-DNA/t27` (в скиллах ещё `gHashTag/t27`, переименован). Рабочая директория `/Users/playra/t27` сидела на древней ветке `lane/t27-lagger-spec` без половины репо (нет `crates/`, `backend/`, `trinity/`, `trios-coq/`, `COMPETITORS.md`, `TASK.md` и т.д.). Работа велась в worktree `t27-build` на `master` (5cd8e315d6, собран `target/release/t27c` + `target/release/tri`; системный `tri` — не t27 CLI).
+Репозиторий `Trinity-S-AI-DNA/t27` (в скиллах ещё `gHashTag/t27`, переименован). Рабочая директория `~/t27` сидела на древней ветке `lane/t27-lagger-spec` без половины репо (нет `crates/`, `backend/`, `trinity/`, `trios-coq/`, `COMPETITORS.md`, `TASK.md` и т.д.). Работа велась в worktree `t27-build` на `master` (5cd8e315d6, собран `target/release/t27c` + `target/release/tri`; системный `tri` — не t27 CLI).
 
 **Что найдено:**
 - 44 открытых PR, из них 6 конфликтных (#13050, #13009, #12997, #12996, #12695, #12035), большинство MERGEABLE.
