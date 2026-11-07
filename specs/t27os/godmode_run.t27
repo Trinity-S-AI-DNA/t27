@@ -1,0 +1,886 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/godmode_run.t27 -- the GODMODE v1 run law: one green path task -> isolated worktree -> supervised PTY -> allowlisted command -> validated report.
+; This spec is PURE (no @extern). It decides; the host would act. It holds: the PTY supervisor state machine, the failure classes,
+; bounded retry, the five completion gates, the machine-readable final report row, the `tri godmode` CLI decision and the
+; doctor's host-needs table.
+; The host that would drive it is NOT wired. Process spawn in a PTY exists only inside specs/t27os/pty_server.t27 and
+; specs/t27os/pty_sys.t27 as t27b externs (forkpty, posix_spawn, waitpid, kill, poll, gettimeofday). `git worktree add` has no t27 caller.
+; Appending a line to a file is a GAP (specs/t27os/godmode_tick.t27 line 13). `tri godmode` needs a clap variant in the hand-written
+; Rust cli/tri/src/main.rs (template: the T27os action and cmd_t27os), which is foreign code and needs the owner-approved-foreign label.
+; The doctor table at the end of this file records each of these needs honestly: gm_doctor_ready() is false today.
+; Supervisor rules, in one place: the child runs in its own process group; a budget timeout or a graceful stop sends TERM to the group
+; and waits out a grace; a hard cancel or an elapsed grace sends KILL to the group; terminal states ignore every event.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osGodmodeRun;
+
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use sync::schema::bytes_equal;
+
+; --- 1. supervisor: states, events, actions ---------------------------------------------------------------
+
+pub const SV_IDLE : u8 = 0;
+pub const SV_STARTING : u8 = 1;
+pub const SV_RUNNING : u8 = 2;
+pub const SV_STOPPING : u8 = 3;
+pub const SV_EXITED : u8 = 4;
+pub const SV_TIMED_OUT : u8 = 5;
+pub const SV_CANCELLED : u8 = 6;
+pub const SV_KILLED : u8 = 7;
+pub const SV_SPAWN_FAILED : u8 = 8;
+
+pub const SE_SPAWN : u8 = 1;
+pub const SE_SPAWN_OK : u8 = 2;
+pub const SE_SPAWN_FAIL : u8 = 3;
+pub const SE_EXIT : u8 = 4;
+pub const SE_TICK : u8 = 5;
+pub const SE_STOP : u8 = 6;
+pub const SE_CANCEL : u8 = 7;
+
+pub const ACT_NONE : u8 = 0;
+pub const ACT_SPAWN : u8 = 1;
+pub const ACT_TERM_GROUP : u8 = 2;
+pub const ACT_KILL_GROUP : u8 = 3;
+pub const ACT_RECORD : u8 = 4;
+
+/// Why the host started stopping the child; the host keeps it and passes it back in.
+pub const STOP_NONE : u8 = 0;
+pub const STOP_TIMEOUT : u8 = 1;
+pub const STOP_USER : u8 = 2;
+
+/// Default grace between TERM and KILL, in milliseconds.
+pub const GM_GRACE_MS : u64 = 5000;
+
+/// Milliseconds from start to end; 0 when the clock went backwards.
+pub fn gm_duration_ms(start_ms: u64, end_ms: u64) -> u64 {
+    if (end_ms < start_ms) { return 0; }
+    return end_ms - start_ms;
+}
+
+/// True for the five final states (4..8): they ignore every event.
+pub fn gm_sv_terminal(s: u8) -> bool {
+    return s >= SV_EXITED and s <= SV_SPAWN_FAILED;
+}
+
+/// The next state. now_ms is the host clock, started_ms when RUNNING began, stop_ms when TERM was sent.
+pub fn gm_sv_next(state: u8, ev: u8, now_ms: u64, started_ms: u64, budget_ms: u64, stop_ms: u64, grace_ms: u64, reason: u8) -> u8 {
+    if (gm_sv_terminal(state)) { return state; }
+    if (state == SV_IDLE) {
+        if (ev == SE_SPAWN) { return SV_STARTING; }
+        return state;
+    }
+    if (state == SV_STARTING) {
+        if (ev == SE_SPAWN_OK) { return SV_RUNNING; }
+        if (ev == SE_SPAWN_FAIL) { return SV_SPAWN_FAILED; }
+        return state;
+    }
+    if (state == SV_RUNNING) {
+        if (ev == SE_EXIT) { return SV_EXITED; }
+        if (ev == SE_TICK and gm_duration_ms(started_ms, now_ms) >= budget_ms) { return SV_STOPPING; }
+        if (ev == SE_STOP) { return SV_STOPPING; }
+        if (ev == SE_CANCEL) { return SV_CANCELLED; }
+        return state;
+    }
+    if (state == SV_STOPPING) {
+        if (ev == SE_CANCEL) { return SV_CANCELLED; }
+        if (ev == SE_EXIT) {
+            if (reason == STOP_TIMEOUT) { return SV_TIMED_OUT; }
+            if (reason == STOP_USER) { return SV_CANCELLED; }
+            // no reason recorded: the child simply exited on its own
+            return SV_EXITED;
+        }
+        if (ev == SE_TICK and gm_duration_ms(stop_ms, now_ms) >= grace_ms) { return SV_KILLED; }
+        return state;
+    }
+    return state;
+}
+
+/// What the host must do on that transition. Same arguments as gm_sv_next.
+pub fn gm_sv_action(state: u8, ev: u8, now_ms: u64, started_ms: u64, budget_ms: u64, stop_ms: u64, grace_ms: u64, reason: u8) -> u8 {
+    if (gm_sv_terminal(state)) { return ACT_NONE; }
+    if (state == SV_IDLE) {
+        if (ev == SE_SPAWN) { return ACT_SPAWN; }
+        return ACT_NONE;
+    }
+    if (state == SV_STARTING) {
+        if (ev == SE_SPAWN_FAIL) { return ACT_RECORD; }
+        return ACT_NONE;
+    }
+    if (state == SV_RUNNING) {
+        if (ev == SE_EXIT) { return ACT_RECORD; }
+        if (ev == SE_TICK and gm_duration_ms(started_ms, now_ms) >= budget_ms) { return ACT_TERM_GROUP; }
+        if (ev == SE_STOP) { return ACT_TERM_GROUP; }
+        if (ev == SE_CANCEL) { return ACT_KILL_GROUP; }
+        return ACT_NONE;
+    }
+    if (state == SV_STOPPING) {
+        if (ev == SE_CANCEL) { return ACT_KILL_GROUP; }
+        if (ev == SE_EXIT) { return ACT_RECORD; }
+        if (ev == SE_TICK and gm_duration_ms(stop_ms, now_ms) >= grace_ms) { return ACT_KILL_GROUP; }
+        return ACT_NONE;
+    }
+    return ACT_NONE;
+}
+
+; --- 2. no unmanaged background processes ------------------------------------------------------------------
+
+pub const OR_NONE : u8 = 0;
+pub const OR_KILLED : u8 = 1;
+
+/// After the child exits the host counts processes still in its group: any left means the host kills the group and the policy gate fails.
+pub fn gm_orphans_verdict(left_in_group: u32) -> u8 {
+    if (left_in_group == 0) { return OR_NONE; }
+    return OR_KILLED;
+}
+
+; --- 3. command result and output cap -----------------------------------------------------------------------
+
+pub struct GmCommandResult {
+    exit_code: i32,
+    final_state: u8,
+    duration_ms: u64,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    truncated: bool,
+    orphans: u32,
+}
+
+/// Output cap per stream, in bytes (1 MiB).
+pub const GM_OUT_CAP : u64 = 1048576;
+
+/// A stream is truncated only when it went past the cap; exactly the cap is kept whole.
+pub fn gm_out_truncated(bytes: u64) -> bool {
+    return bytes > GM_OUT_CAP;
+}
+
+; --- 4. failure classes ---------------------------------------------------------------------------------------
+
+pub const FC_NONE : u8 = 0;
+pub const FC_EXIT_NONZERO : u8 = 1;
+pub const FC_TEST_FAILED : u8 = 2;
+pub const FC_TIMEOUT : u8 = 3;
+pub const FC_TRANSIENT : u8 = 4;
+pub const FC_CANCELLED : u8 = 5;
+pub const FC_POLICY : u8 = 6;
+pub const FC_INTERNAL : u8 = 7;
+
+/// The bit of a class in a retryable mask: 1 << class (1, 2, 4 ... 128). A class past 31 has no bit.
+pub fn gm_class_bit(class: u8) -> u32 {
+    if (class > 31) { return 0; }
+    return (1 as u32) << @as(u32, class);
+}
+
+/// The failure class of one command run. Policy beats every other class.
+pub fn gm_classify(r: GmCommandResult, acceptance_passed: bool, policy_ok: bool) -> u8 {
+    if (policy_ok == false or r.orphans > 0) { return FC_POLICY; }
+    if (r.final_state == SV_SPAWN_FAILED) { return FC_TRANSIENT; }
+    if (r.final_state == SV_CANCELLED) { return FC_CANCELLED; }
+    if (r.final_state == SV_TIMED_OUT or r.final_state == SV_KILLED) { return FC_TIMEOUT; }
+    if (r.final_state == SV_EXITED) {
+        if (r.exit_code != 0) { return FC_EXIT_NONZERO; }
+        if (acceptance_passed == false) { return FC_TEST_FAILED; }
+        return FC_NONE;
+    }
+    return FC_INTERNAL;
+}
+
+pub fn gm_class_name(c: u8) -> []const u8 {
+    if (c == FC_NONE) { return "none"; }
+    if (c == FC_EXIT_NONZERO) { return "exit_nonzero"; }
+    if (c == FC_TEST_FAILED) { return "test_failed"; }
+    if (c == FC_TIMEOUT) { return "timeout"; }
+    if (c == FC_TRANSIENT) { return "transient"; }
+    if (c == FC_CANCELLED) { return "cancelled"; }
+    if (c == FC_POLICY) { return "policy"; }
+    return "internal";
+}
+
+; --- 5. bounded retry -------------------------------------------------------------------------------------------
+
+pub const GM_RETRY_CAP : u32 = 3;
+
+pub const RD_DONE : u8 = 0;
+pub const RD_RETRY : u8 = 1;
+pub const RD_STOP_NOT_RETRYABLE : u8 = 2;
+pub const RD_STOP_BUDGET : u8 = 3;
+pub const RD_STOP_REPEATED : u8 = 4;
+
+/// Only explicit classes (the mask) are retried, never cancelled, policy or internal ones; at most GM_RETRY_CAP retries
+/// (so at most 4 runs) whatever max_retries says; and a deterministic identical failure (same class, same exit code
+/// as the previous run, for an exit or a test failure) stops early because running it again cannot change it.
+pub fn gm_retry_decide(class: u8, retryable_mask: u32, retries_used: u32, max_retries: u32, prev_class: u8, prev_exit: i32, exit: i32) -> u8 {
+    if (class == FC_NONE) { return RD_DONE; }
+    if (class == FC_CANCELLED or class == FC_POLICY or class == FC_INTERNAL) { return RD_STOP_NOT_RETRYABLE; }
+    if ((retryable_mask & gm_class_bit(class)) == 0) { return RD_STOP_NOT_RETRYABLE; }
+    var cap : u32 = max_retries;
+    if (cap > GM_RETRY_CAP) { cap = GM_RETRY_CAP; }
+    if (retries_used >= cap) { return RD_STOP_BUDGET; }
+    if (class == FC_EXIT_NONZERO or class == FC_TEST_FAILED) {
+        if (prev_class == class and prev_exit == exit) { return RD_STOP_REPEATED; }
+    }
+    return RD_RETRY;
+}
+
+; --- 6. the five completion gates ------------------------------------------------------------------------------
+
+pub const G_TEST : u32 = 1;
+pub const G_ARTIFACT : u32 = 2;
+pub const G_POLICY : u32 = 4;
+pub const G_JOURNAL : u32 = 8;
+pub const G_ROLLBACK : u32 = 16;
+pub const G_ALL : u32 = 31;
+
+/// No vacuous pass: at least one test declared, every one ran, every one passed.
+pub fn gm_test_gate(declared: u32, ran: u32, passed: u32) -> bool {
+    return declared > 0 and ran == declared and passed == declared;
+}
+
+/// Every declared artifact is present and non-empty, and none sits outside the allowed paths.
+pub fn gm_artifact_gate(declared: u32, present: u32, nonempty: u32, path_violations: u32) -> bool {
+    return declared > 0 and present == declared and nonempty == declared and path_violations == 0;
+}
+
+pub fn gm_policy_gate(change_violations: u32, approvals_denied: u32, orphans: u32, secrets_in_journal: u32) -> bool {
+    return change_violations == 0 and approvals_denied == 0 and orphans == 0 and secrets_in_journal == 0;
+}
+
+pub fn gm_journal_gate(journal_complete: bool, torn: bool) -> bool {
+    return journal_complete and torn == false;
+}
+
+/// Rollback is a written procedure plus a dedicated worktree (removing it restores the base) plus a known base head.
+pub fn gm_rollback_gate(procedure_len: u32, worktree_dedicated: bool, base_head_known: bool) -> bool {
+    return procedure_len > 0 and worktree_dedicated and base_head_known;
+}
+
+/// The failed-gate bitmask; 0 means every gate passed.
+pub fn gm_gates_failed(test_ok: bool, artifact_ok: bool, policy_ok: bool, journal_ok: bool, rollback_ok: bool) -> u32 {
+    var f : u32 = 0;
+    if (test_ok == false) { f = f | G_TEST; }
+    if (artifact_ok == false) { f = f | G_ARTIFACT; }
+    if (policy_ok == false) { f = f | G_POLICY; }
+    if (journal_ok == false) { f = f | G_JOURNAL; }
+    if (rollback_ok == false) { f = f | G_ROLLBACK; }
+    return f;
+}
+
+pub fn gm_may_complete(failed: u32) -> bool {
+    return failed == 0;
+}
+
+pub fn gm_gate_name(bit: u32) -> []const u8 {
+    if (bit == G_TEST) { return "test"; }
+    if (bit == G_ARTIFACT) { return "artifact"; }
+    if (bit == G_POLICY) { return "policy"; }
+    if (bit == G_JOURNAL) { return "journal"; }
+    if (bit == G_ROLLBACK) { return "rollback"; }
+    return "unknown";
+}
+
+; --- 7. final status words ------------------------------------------------------------------------------------
+
+pub const TS_COMPLETED : u8 = 0;
+pub const TS_FAILED : u8 = 1;
+pub const TS_REJECTED : u8 = 2;
+pub const TS_CANCELLED : u8 = 3;
+pub const TS_TIMED_OUT : u8 = 4;
+pub const TS_DENIED : u8 = 5;
+
+pub fn gm_status_name(s: u8) -> []const u8 {
+    if (s == TS_COMPLETED) { return "completed"; }
+    if (s == TS_FAILED) { return "failed"; }
+    if (s == TS_REJECTED) { return "rejected"; }
+    if (s == TS_CANCELLED) { return "cancelled"; }
+    if (s == TS_TIMED_OUT) { return "timed_out"; }
+    if (s == TS_DENIED) { return "denied"; }
+    return "unknown";
+}
+
+/// Priority: a refused contract, then a denied approval, then the run class, then the gates.
+pub fn gm_final_status(diag: u16, approval_denied: bool, class: u8, failed_gates: u32) -> u8 {
+    if (diag != 0) { return TS_REJECTED; }
+    if (approval_denied) { return TS_DENIED; }
+    if (class == FC_CANCELLED) { return TS_CANCELLED; }
+    if (class == FC_TIMEOUT) { return TS_TIMED_OUT; }
+    if (class != FC_NONE) { return TS_FAILED; }
+    if (failed_gates != 0) { return TS_FAILED; }
+    return TS_COMPLETED;
+}
+
+; --- 8. the machine-readable final report ----------------------------------------------------------------------
+
+/// The longest row gm_report_row writes (task and head are capped at 64 bytes each); a smaller buffer gets nothing written.
+pub const GM_REPORT_MAX : usize = 400;
+
+fn put_bool(out: []u8, at: usize, v: bool) -> usize {
+    if (v) { return put_bytes(out, at, "true"); }
+    return put_bytes(out, at, "false");
+}
+
+fn put_gate(out: []u8, at: usize, name: []const u8, failed: u32, bit: u32) -> usize {
+    var n : usize = put_bytes(out, at, "\"");
+    n = put_bytes(out, n, name);
+    n = put_bytes(out, n, "\":");
+    return put_bool(out, n, (failed & bit) == 0);
+}
+
+fn put_diag(out: []u8, at: usize, diag: u16) -> usize {
+    if (diag == 0) { return put_bytes(out, at, "GM-OK"); }
+    var n : usize = put_bytes(out, at, "GM-E");
+    var d : u32 = @as(u32, diag);
+    out[n] = @intCast(48 + (d / 100) % 10);
+    out[n + 1] = @intCast(48 + (d / 10) % 10);
+    out[n + 2] = @intCast(48 + d % 10);
+    return n + 3;
+}
+
+/// One JSON line, newline included; returns the position after it, or `at` when nothing could be written.
+pub fn gm_report_row(out: []u8, at: usize, task: []const u8, status: u8, diag: u16, class: u8, attempts: u32, exit_code: i32, duration_ms: u64, failed_gates: u32, journal_seq: u32, head: []const u8) -> usize {
+    if (task.len > 64 or head.len > 64) { return at; }
+    if (out.len < at + GM_REPORT_MAX) { return at; }
+    var n : usize = put_bytes(out, at, "{\"task\":\"");
+    n = put_bytes(out, n, task);
+    n = put_bytes(out, n, "\",\"status\":\"");
+    n = put_bytes(out, n, gm_status_name(status));
+    n = put_bytes(out, n, "\",\"diag\":\"");
+    n = put_diag(out, n, diag);
+    n = put_bytes(out, n, "\",\"class\":\"");
+    n = put_bytes(out, n, gm_class_name(class));
+    n = put_bytes(out, n, "\",\"attempts\":");
+    n = put_dec(out, n, @as(u64, attempts));
+    n = put_bytes(out, n, ",\"exit_code\":");
+    if (exit_code < 0) {
+        out[n] = 45;
+        n = n + 1;
+        var m : i64 = 0 - @as(i64, exit_code);
+        n = put_dec(out, n, @intCast(m));
+    } else {
+        n = put_dec(out, n, @as(u64, exit_code));
+    }
+    n = put_bytes(out, n, ",\"duration_ms\":");
+    n = put_dec(out, n, duration_ms);
+    n = put_bytes(out, n, ",\"gates\":{");
+    n = put_gate(out, n, "test", failed_gates, G_TEST);
+    n = put_bytes(out, n, ",");
+    n = put_gate(out, n, "artifact", failed_gates, G_ARTIFACT);
+    n = put_bytes(out, n, ",");
+    n = put_gate(out, n, "policy", failed_gates, G_POLICY);
+    n = put_bytes(out, n, ",");
+    n = put_gate(out, n, "journal", failed_gates, G_JOURNAL);
+    n = put_bytes(out, n, ",");
+    n = put_gate(out, n, "rollback", failed_gates, G_ROLLBACK);
+    n = put_bytes(out, n, "},\"journal_seq\":");
+    n = put_dec(out, n, @as(u64, journal_seq));
+    n = put_bytes(out, n, ",\"head\":\"");
+    n = put_bytes(out, n, head);
+    n = put_bytes(out, n, "\"}");
+    out[n] = 10;
+    return n + 1;
+}
+
+; --- 9. the `tri godmode` CLI decision -------------------------------------------------------------------------
+
+pub const CLI_UNKNOWN : u8 = 0;
+pub const CLI_RUN : u8 = 1;
+pub const CLI_STATUS : u8 = 2;
+pub const CLI_STOP : u8 = 3;
+pub const CLI_REPORT : u8 = 4;
+pub const CLI_DOCTOR : u8 = 5;
+
+pub const CX_OK : u8 = 0;
+pub const CX_USAGE : u8 = 2;
+pub const CX_BAD_ARG : u8 = 3;
+
+pub fn gm_cli_verb(word: []const u8) -> u8 {
+    if (bytes_equal(word, "run")) { return CLI_RUN; }
+    if (bytes_equal(word, "status")) { return CLI_STATUS; }
+    if (bytes_equal(word, "stop")) { return CLI_STOP; }
+    if (bytes_equal(word, "report")) { return CLI_REPORT; }
+    if (bytes_equal(word, "doctor")) { return CLI_DOCTOR; }
+    return CLI_UNKNOWN;
+}
+
+/// A task id is 1..64 bytes of [A-Za-z0-9_-].
+fn task_id_ok(arg: []const u8) -> bool {
+    if (arg.len == 0 or arg.len > 64) { return false; }
+    var i : usize = 0;
+    while (i < arg.len) {
+        const c : u8 = arg[i];
+        const digit : bool = c >= 48 and c <= 57;
+        const upper : bool = c >= 65 and c <= 90;
+        const lower : bool = c >= 97 and c <= 122;
+        if ((digit or upper or lower or c == 95 or c == 45) == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A task file name: more than just the suffix, ending in .t27.
+fn task_file_ok(arg: []const u8) -> bool {
+    if (arg.len <= 4) { return false; }
+    const k : usize = arg.len - 4;
+    return arg[k] == 46 and arg[k + 1] == 116 and arg[k + 2] == 50 and arg[k + 3] == 55;
+}
+
+/// The exit code `tri godmode <verb> [arg]` gives before doing anything.
+pub fn gm_cli_check(verb: u8, nargs: u32, arg: []const u8) -> u8 {
+    if (verb == CLI_RUN) {
+        if (nargs != 1) { return CX_USAGE; }
+        if (task_file_ok(arg)) { return CX_OK; }
+        return CX_BAD_ARG;
+    }
+    if (verb == CLI_STATUS or verb == CLI_STOP or verb == CLI_REPORT) {
+        if (nargs != 1) { return CX_USAGE; }
+        if (task_id_ok(arg)) { return CX_OK; }
+        return CX_BAD_ARG;
+    }
+    if (verb == CLI_DOCTOR) {
+        if (nargs != 0) { return CX_USAGE; }
+        return CX_OK;
+    }
+    return CX_USAGE;
+}
+
+pub fn gm_cli_usage() -> []const u8 {
+    return "tri godmode run <task.t27> | status <task-id> | stop <task-id> | report <task-id> | doctor";
+}
+
+; --- 10. doctor: the host needs table ---------------------------------------------------------------------------
+
+pub const GM_NEEDS : u32 = 9;
+
+pub const NS_WIRED : u8 = 0;
+pub const NS_SPEC_ONLY : u8 = 1;
+pub const NS_GAP : u8 = 2;
+
+pub fn gm_need_name(i: u32) -> []const u8 {
+    if (i == 0) { return "pty spawn"; }
+    if (i == 1) { return "process group kill"; }
+    if (i == 2) { return "monotonic clock"; }
+    if (i == 3) { return "append journal line"; }
+    if (i == 4) { return "git worktree add/remove"; }
+    if (i == 5) { return "write sandbox"; }
+    if (i == 6) { return "git status of the worktree"; }
+    if (i == 7) { return "tri godmode clap glue"; }
+    if (i == 8) { return "secret redaction"; }
+    return "unknown";
+}
+
+/// SPEC_ONLY: a t27 spec or extern exists but no GODMODE host calls it yet. GAP: nothing exists.
+pub fn gm_need_state(i: u32) -> u8 {
+    if (i <= 2) { return NS_SPEC_ONLY; }
+    if (i >= 3 and i <= 7) { return NS_GAP; }
+    if (i == 8) { return NS_SPEC_ONLY; }
+    return NS_GAP;
+}
+
+pub fn gm_need_where(i: u32) -> []const u8 {
+    if (i == 0) { return "specs/t27os/pty_sys.t27 forkpty (t27b extern)"; }
+    if (i == 1) { return "specs/t27os/pty_sys.t27 kill (t27b extern)"; }
+    if (i == 2) { return "specs/t27os/pty_sys.t27 gettimeofday (t27b extern)"; }
+    if (i == 3) { return "specs/t27os/godmode_tick.t27 append_line (proposed)"; }
+    if (i == 4) { return "none (tri land does it in hand Rust)"; }
+    if (i == 5) { return "none (v1 detects changes after the run)"; }
+    if (i == 6) { return "none"; }
+    if (i == 7) { return "cli/tri/src/main.rs (foreign, needs owner-approved-foreign)"; }
+    if (i == 8) { return "specs/t27os/share.t27 redact"; }
+    return "none";
+}
+
+/// How many of the nine needs are GAP rows.
+pub fn gm_doctor_gaps() -> u32 {
+    var n : u32 = 0;
+    var i : u32 = 0;
+    while (i < GM_NEEDS) {
+        if (gm_need_state(i) == NS_GAP) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Ready only when no need is a GAP. False today.
+pub fn gm_doctor_ready() -> bool {
+    return gm_doctor_gaps() == 0;
+}
+
+; --- 11. tests --------------------------------------------------------------------------------------------------
+
+fn res(exit_code: i32, final_state: u8, orphans: u32) -> GmCommandResult {
+    return GmCommandResult { exit_code: exit_code, final_state: final_state, duration_ms: 10, stdout_bytes: 0, stderr_bytes: 0, truncated: false, orphans: orphans };
+}
+
+fn same_bytes(buf: []const u8, n: usize, want: []const u8) -> bool {
+    if (n != want.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (buf[i] != want[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+test sv_happy_path_states {
+    var s : u8 = SV_IDLE;
+    s = gm_sv_next(s, SE_SPAWN, 0, 0, 1000, 0, 5000, STOP_NONE);
+    assert(s == SV_STARTING);
+    s = gm_sv_next(s, SE_SPAWN_OK, 1, 0, 1000, 0, 5000, STOP_NONE);
+    assert(s == SV_RUNNING);
+    s = gm_sv_next(s, SE_EXIT, 50, 1, 1000, 0, 5000, STOP_NONE);
+    assert(s == SV_EXITED);
+}
+
+test sv_happy_path_actions {
+    assert(gm_sv_action(SV_IDLE, SE_SPAWN, 0, 0, 1000, 0, 5000, STOP_NONE) == ACT_SPAWN);
+    assert(gm_sv_action(SV_STARTING, SE_SPAWN_OK, 1, 0, 1000, 0, 5000, STOP_NONE) == ACT_NONE);
+    assert(gm_sv_action(SV_RUNNING, SE_EXIT, 50, 1, 1000, 0, 5000, STOP_NONE) == ACT_RECORD);
+}
+
+test sv_timeout_fires_at_exactly_budget {
+    assert(gm_sv_next(SV_RUNNING, SE_TICK, 1100, 100, 1000, 0, 5000, STOP_NONE) == SV_STOPPING);
+    assert(gm_sv_action(SV_RUNNING, SE_TICK, 1100, 100, 1000, 0, 5000, STOP_NONE) == ACT_TERM_GROUP);
+}
+
+test sv_timeout_not_one_ms_before {
+    assert(gm_sv_next(SV_RUNNING, SE_TICK, 1099, 100, 1000, 0, 5000, STOP_NONE) == SV_RUNNING);
+    assert(gm_sv_action(SV_RUNNING, SE_TICK, 1099, 100, 1000, 0, 5000, STOP_NONE) == ACT_NONE);
+}
+
+test sv_graceful_stop_sends_term {
+    assert(gm_sv_next(SV_RUNNING, SE_STOP, 10, 0, 1000, 0, 5000, STOP_NONE) == SV_STOPPING);
+    assert(gm_sv_action(SV_RUNNING, SE_STOP, 10, 0, 1000, 0, 5000, STOP_NONE) == ACT_TERM_GROUP);
+}
+
+test sv_stopping_exit_after_timeout_is_timed_out {
+    assert(gm_sv_next(SV_STOPPING, SE_EXIT, 1200, 100, 1000, 1100, 5000, STOP_TIMEOUT) == SV_TIMED_OUT);
+    assert(gm_sv_action(SV_STOPPING, SE_EXIT, 1200, 100, 1000, 1100, 5000, STOP_TIMEOUT) == ACT_RECORD);
+}
+
+test sv_stopping_exit_after_user_stop_is_cancelled {
+    assert(gm_sv_next(SV_STOPPING, SE_EXIT, 1200, 100, 1000, 1100, 5000, STOP_USER) == SV_CANCELLED);
+    assert(gm_sv_action(SV_STOPPING, SE_EXIT, 1200, 100, 1000, 1100, 5000, STOP_USER) == ACT_RECORD);
+}
+
+test sv_grace_elapsed_kills_group {
+    assert(gm_sv_next(SV_STOPPING, SE_TICK, 6100, 100, 1000, 1100, 5000, STOP_TIMEOUT) == SV_KILLED);
+    assert(gm_sv_action(SV_STOPPING, SE_TICK, 6100, 100, 1000, 1100, 5000, STOP_TIMEOUT) == ACT_KILL_GROUP);
+}
+
+test sv_grace_not_yet_elapsed_waits {
+    assert(gm_sv_next(SV_STOPPING, SE_TICK, 6099, 100, 1000, 1100, 5000, STOP_TIMEOUT) == SV_STOPPING);
+    assert(gm_sv_action(SV_STOPPING, SE_TICK, 6099, 100, 1000, 1100, 5000, STOP_TIMEOUT) == ACT_NONE);
+}
+
+test sv_cancel_from_running_kills {
+    assert(gm_sv_next(SV_RUNNING, SE_CANCEL, 10, 0, 1000, 0, 5000, STOP_NONE) == SV_CANCELLED);
+    assert(gm_sv_action(SV_RUNNING, SE_CANCEL, 10, 0, 1000, 0, 5000, STOP_NONE) == ACT_KILL_GROUP);
+}
+
+test sv_cancel_from_stopping_kills {
+    assert(gm_sv_next(SV_STOPPING, SE_CANCEL, 10, 0, 1000, 5, 5000, STOP_USER) == SV_CANCELLED);
+    assert(gm_sv_action(SV_STOPPING, SE_CANCEL, 10, 0, 1000, 5, 5000, STOP_USER) == ACT_KILL_GROUP);
+}
+
+test sv_terminal_states_ignore_events {
+    var s : u8 = SV_EXITED;
+    while (s <= SV_SPAWN_FAILED) {
+        assert(gm_sv_terminal(s));
+        assert(gm_sv_next(s, SE_SPAWN, 9, 0, 1, 0, 1, STOP_USER) == s);
+        assert(gm_sv_next(s, SE_CANCEL, 9, 0, 1, 0, 1, STOP_USER) == s);
+        assert(gm_sv_action(s, SE_CANCEL, 9, 0, 1, 0, 1, STOP_USER) == ACT_NONE);
+        assert(gm_sv_action(s, SE_TICK, 9, 0, 1, 0, 1, STOP_USER) == ACT_NONE);
+        s = s + 1;
+    }
+}
+
+test sv_live_states_are_not_terminal {
+    assert(gm_sv_terminal(SV_IDLE) == false);
+    assert(gm_sv_terminal(SV_STARTING) == false);
+    assert(gm_sv_terminal(SV_RUNNING) == false);
+    assert(gm_sv_terminal(SV_STOPPING) == false);
+}
+
+test sv_spawn_failure_is_recorded {
+    assert(gm_sv_next(SV_STARTING, SE_SPAWN_FAIL, 1, 0, 1000, 0, 5000, STOP_NONE) == SV_SPAWN_FAILED);
+    assert(gm_sv_action(SV_STARTING, SE_SPAWN_FAIL, 1, 0, 1000, 0, 5000, STOP_NONE) == ACT_RECORD);
+}
+
+test sv_unrelated_events_change_nothing {
+    assert(gm_sv_next(SV_IDLE, SE_EXIT, 1, 0, 1000, 0, 5000, STOP_NONE) == SV_IDLE);
+    assert(gm_sv_next(SV_STARTING, SE_TICK, 1, 0, 1000, 0, 5000, STOP_NONE) == SV_STARTING);
+    assert(gm_sv_action(SV_IDLE, SE_TICK, 1, 0, 1000, 0, 5000, STOP_NONE) == ACT_NONE);
+}
+
+test duration_and_clock_backwards {
+    assert(gm_duration_ms(100, 142) == 42);
+    assert(gm_duration_ms(100, 100) == 0);
+    assert(gm_duration_ms(200, 100) == 0);
+    assert(GM_GRACE_MS == 5000);
+}
+
+test orphans_verdict {
+    assert(gm_orphans_verdict(0) == OR_NONE);
+    assert(gm_orphans_verdict(1) == OR_KILLED);
+    assert(gm_orphans_verdict(7) == OR_KILLED);
+}
+
+test truncation_at_cap_plus_one_not_at_cap {
+    assert(gm_out_truncated(GM_OUT_CAP) == false);
+    assert(gm_out_truncated(GM_OUT_CAP + 1));
+    assert(gm_out_truncated(0) == false);
+    assert(GM_OUT_CAP == 1048576);
+}
+
+test class_values_are_stable {
+    assert(FC_NONE == 0);
+    assert(FC_EXIT_NONZERO == 1);
+    assert(FC_TEST_FAILED == 2);
+    assert(FC_TIMEOUT == 3);
+    assert(FC_TRANSIENT == 4);
+    assert(FC_CANCELLED == 5);
+    assert(FC_POLICY == 6);
+    assert(FC_INTERNAL == 7);
+}
+
+test class_bits {
+    assert(gm_class_bit(FC_NONE) == 1);
+    assert(gm_class_bit(FC_EXIT_NONZERO) == 2);
+    assert(gm_class_bit(FC_TRANSIENT) == 16);
+    assert(gm_class_bit(FC_INTERNAL) == 128);
+}
+
+test classify_each_class_once {
+    assert(gm_classify(res(0, SV_EXITED, 0), true, true) == FC_NONE);
+    assert(gm_classify(res(3, SV_EXITED, 0), true, true) == FC_EXIT_NONZERO);
+    assert(gm_classify(res(0, SV_EXITED, 0), false, true) == FC_TEST_FAILED);
+    assert(gm_classify(res(0, SV_TIMED_OUT, 0), true, true) == FC_TIMEOUT);
+    assert(gm_classify(res(0, SV_KILLED, 0), true, true) == FC_TIMEOUT);
+    assert(gm_classify(res(0, SV_SPAWN_FAILED, 0), true, true) == FC_TRANSIENT);
+    assert(gm_classify(res(0, SV_CANCELLED, 0), true, true) == FC_CANCELLED);
+    assert(gm_classify(res(0, SV_EXITED, 0), true, false) == FC_POLICY);
+    assert(gm_classify(res(0, SV_RUNNING, 0), true, true) == FC_INTERNAL);
+}
+
+test classify_orphans_are_policy {
+    assert(gm_classify(res(0, SV_EXITED, 1), true, true) == FC_POLICY);
+    assert(gm_classify(res(5, SV_CANCELLED, 2), true, true) == FC_POLICY);
+}
+
+test class_names {
+    assert(bytes_equal(gm_class_name(FC_NONE), "none"));
+    assert(bytes_equal(gm_class_name(FC_EXIT_NONZERO), "exit_nonzero"));
+    assert(bytes_equal(gm_class_name(FC_TEST_FAILED), "test_failed"));
+    assert(bytes_equal(gm_class_name(FC_TIMEOUT), "timeout"));
+    assert(bytes_equal(gm_class_name(FC_TRANSIENT), "transient"));
+    assert(bytes_equal(gm_class_name(FC_CANCELLED), "cancelled"));
+    assert(bytes_equal(gm_class_name(FC_POLICY), "policy"));
+    assert(bytes_equal(gm_class_name(FC_INTERNAL), "internal"));
+}
+
+test retry_done_on_success {
+    assert(gm_retry_decide(FC_NONE, 255, 0, 3, FC_NONE, 0, 0) == RD_DONE);
+}
+
+test retry_transient_is_retried {
+    assert(gm_retry_decide(FC_TRANSIENT, 16, 0, 3, FC_NONE, 0, 0) == RD_RETRY);
+    assert(gm_retry_decide(FC_TRANSIENT, 16, 2, 3, FC_TRANSIENT, 0, 0) == RD_RETRY);
+}
+
+test retry_class_outside_mask_stops {
+    assert(gm_retry_decide(FC_TRANSIENT, 0, 0, 3, FC_NONE, 0, 0) == RD_STOP_NOT_RETRYABLE);
+    assert(gm_retry_decide(FC_TIMEOUT, 16, 0, 3, FC_NONE, 0, 0) == RD_STOP_NOT_RETRYABLE);
+}
+
+test retry_policy_never_even_in_mask {
+    assert(gm_retry_decide(FC_POLICY, 255, 0, 3, FC_NONE, 0, 0) == RD_STOP_NOT_RETRYABLE);
+    assert(gm_retry_decide(FC_CANCELLED, 255, 0, 3, FC_NONE, 0, 0) == RD_STOP_NOT_RETRYABLE);
+    assert(gm_retry_decide(FC_INTERNAL, 255, 0, 3, FC_NONE, 0, 0) == RD_STOP_NOT_RETRYABLE);
+}
+
+test retry_cap_wins_over_max {
+    assert(gm_retry_decide(FC_TRANSIENT, 16, 3, 5, FC_TRANSIENT, 0, 0) == RD_STOP_BUDGET);
+    assert(gm_retry_decide(FC_TRANSIENT, 16, 2, 5, FC_TRANSIENT, 0, 0) == RD_RETRY);
+}
+
+test retry_max_one_stops_at_one {
+    assert(gm_retry_decide(FC_TRANSIENT, 16, 0, 1, FC_NONE, 0, 0) == RD_RETRY);
+    assert(gm_retry_decide(FC_TRANSIENT, 16, 1, 1, FC_TRANSIENT, 0, 0) == RD_STOP_BUDGET);
+    assert(gm_retry_decide(FC_TRANSIENT, 16, 0, 0, FC_NONE, 0, 0) == RD_STOP_BUDGET);
+}
+
+test retry_deterministic_repeat_stops {
+    assert(gm_retry_decide(FC_EXIT_NONZERO, 2, 1, 3, FC_EXIT_NONZERO, 7, 7) == RD_STOP_REPEATED);
+    assert(gm_retry_decide(FC_TEST_FAILED, 4, 1, 3, FC_TEST_FAILED, 0, 0) == RD_STOP_REPEATED);
+}
+
+test retry_changed_exit_code_is_retried {
+    assert(gm_retry_decide(FC_EXIT_NONZERO, 2, 1, 3, FC_EXIT_NONZERO, 7, 8) == RD_RETRY);
+    assert(gm_retry_decide(FC_EXIT_NONZERO, 2, 1, 3, FC_TIMEOUT, 7, 7) == RD_RETRY);
+}
+
+test retry_timeout_repeat_is_retried {
+    assert(gm_retry_decide(FC_TIMEOUT, 8, 1, 3, FC_TIMEOUT, 0, 0) == RD_RETRY);
+}
+
+test gate_test_fails_alone {
+    assert(gm_test_gate(3, 3, 3));
+    assert(gm_test_gate(3, 3, 2) == false);
+    assert(gm_test_gate(3, 2, 2) == false);
+}
+
+test gate_test_vacuous_pass_refused {
+    assert(gm_test_gate(0, 0, 0) == false);
+}
+
+test gate_artifact_fails_alone {
+    assert(gm_artifact_gate(2, 2, 2, 0));
+    assert(gm_artifact_gate(2, 1, 1, 0) == false);
+    assert(gm_artifact_gate(2, 2, 1, 0) == false);
+    assert(gm_artifact_gate(2, 2, 2, 1) == false);
+    assert(gm_artifact_gate(0, 0, 0, 0) == false);
+}
+
+test gate_policy_fails_alone {
+    assert(gm_policy_gate(0, 0, 0, 0));
+    assert(gm_policy_gate(1, 0, 0, 0) == false);
+    assert(gm_policy_gate(0, 1, 0, 0) == false);
+    assert(gm_policy_gate(0, 0, 1, 0) == false);
+    assert(gm_policy_gate(0, 0, 0, 1) == false);
+}
+
+test gate_journal_fails_alone {
+    assert(gm_journal_gate(true, false));
+    assert(gm_journal_gate(false, false) == false);
+    assert(gm_journal_gate(true, true) == false);
+}
+
+test gate_rollback_fails_alone {
+    assert(gm_rollback_gate(3, true, true));
+    assert(gm_rollback_gate(0, true, true) == false);
+    assert(gm_rollback_gate(3, false, true) == false);
+    assert(gm_rollback_gate(3, true, false) == false);
+}
+
+test gates_failed_mask_and_complete {
+    assert(gm_gates_failed(true, true, true, true, true) == 0);
+    assert(gm_may_complete(0));
+    assert(gm_gates_failed(false, true, true, true, true) == G_TEST);
+    assert(gm_gates_failed(true, false, true, true, true) == G_ARTIFACT);
+    assert(gm_gates_failed(true, true, false, true, true) == G_POLICY);
+    assert(gm_gates_failed(true, true, true, false, true) == G_JOURNAL);
+    assert(gm_gates_failed(true, true, true, true, false) == G_ROLLBACK);
+    assert(gm_gates_failed(false, false, false, false, false) == G_ALL);
+    assert(gm_may_complete(G_POLICY) == false);
+}
+
+test gate_names {
+    assert(bytes_equal(gm_gate_name(G_TEST), "test"));
+    assert(bytes_equal(gm_gate_name(G_ARTIFACT), "artifact"));
+    assert(bytes_equal(gm_gate_name(G_POLICY), "policy"));
+    assert(bytes_equal(gm_gate_name(G_JOURNAL), "journal"));
+    assert(bytes_equal(gm_gate_name(G_ROLLBACK), "rollback"));
+}
+
+test final_status_priority {
+    assert(gm_final_status(6, true, FC_CANCELLED, G_ALL) == TS_REJECTED);
+    assert(gm_final_status(0, true, FC_CANCELLED, G_ALL) == TS_DENIED);
+    assert(gm_final_status(0, false, FC_CANCELLED, 0) == TS_CANCELLED);
+    assert(gm_final_status(0, false, FC_TIMEOUT, 0) == TS_TIMED_OUT);
+    assert(gm_final_status(0, false, FC_EXIT_NONZERO, 0) == TS_FAILED);
+    assert(gm_final_status(0, false, FC_NONE, G_JOURNAL) == TS_FAILED);
+    assert(gm_final_status(0, false, FC_NONE, 0) == TS_COMPLETED);
+}
+
+test status_names {
+    assert(bytes_equal(gm_status_name(TS_COMPLETED), "completed"));
+    assert(bytes_equal(gm_status_name(TS_FAILED), "failed"));
+    assert(bytes_equal(gm_status_name(TS_REJECTED), "rejected"));
+    assert(bytes_equal(gm_status_name(TS_CANCELLED), "cancelled"));
+    assert(bytes_equal(gm_status_name(TS_TIMED_OUT), "timed_out"));
+    assert(bytes_equal(gm_status_name(TS_DENIED), "denied"));
+}
+
+test report_happy_row_is_byte_exact {
+    var buf : [512]u8 = undefined;
+    var n : usize = gm_report_row(buf[0..512], 0, "GODMODE-001", TS_COMPLETED, 0, FC_NONE, 1, 0, 42, 0, 9, "0123456789abcdef0123456789abcdef01234567");
+    const want : []const u8 = "{\"task\":\"GODMODE-001\",\"status\":\"completed\",\"diag\":\"GM-OK\",\"class\":\"none\",\"attempts\":1,\"exit_code\":0,\"duration_ms\":42,\"gates\":{\"test\":true,\"artifact\":true,\"policy\":true,\"journal\":true,\"rollback\":true},\"journal_seq\":9,\"head\":\"0123456789abcdef0123456789abcdef01234567\"}\n";
+    assert(same_bytes(buf[0..512], n, want));
+}
+
+test report_rejected_row_with_negative_exit {
+    var buf : [512]u8 = undefined;
+    var n : usize = gm_report_row(buf[0..512], 0, "GODMODE-002", TS_REJECTED, 6, FC_NONE, 0, -1, 0, G_ALL, 0, "0123456789abcdef0123456789abcdef01234567");
+    const want : []const u8 = "{\"task\":\"GODMODE-002\",\"status\":\"rejected\",\"diag\":\"GM-E006\",\"class\":\"none\",\"attempts\":0,\"exit_code\":-1,\"duration_ms\":0,\"gates\":{\"test\":false,\"artifact\":false,\"policy\":false,\"journal\":false,\"rollback\":false},\"journal_seq\":0,\"head\":\"0123456789abcdef0123456789abcdef01234567\"}\n";
+    assert(same_bytes(buf[0..512], n, want));
+}
+
+test report_one_failed_gate_only {
+    var buf : [512]u8 = undefined;
+    var n : usize = gm_report_row(buf[0..512], 0, "T", TS_FAILED, 0, FC_TEST_FAILED, 2, 1, 7, G_TEST, 3, "h");
+    const want : []const u8 = "{\"task\":\"T\",\"status\":\"failed\",\"diag\":\"GM-OK\",\"class\":\"test_failed\",\"attempts\":2,\"exit_code\":1,\"duration_ms\":7,\"gates\":{\"test\":false,\"artifact\":true,\"policy\":true,\"journal\":true,\"rollback\":true},\"journal_seq\":3,\"head\":\"h\"}\n";
+    assert(same_bytes(buf[0..512], n, want));
+}
+
+test report_small_buffer_writes_nothing {
+    var buf : [64]u8 = undefined;
+    var n : usize = gm_report_row(buf[0..64], 0, "GODMODE-001", TS_COMPLETED, 0, FC_NONE, 1, 0, 42, 0, 9, "0123456789abcdef0123456789abcdef01234567");
+    assert(n == 0);
+}
+
+test cli_verbs {
+    assert(gm_cli_verb("run") == CLI_RUN);
+    assert(gm_cli_verb("status") == CLI_STATUS);
+    assert(gm_cli_verb("stop") == CLI_STOP);
+    assert(gm_cli_verb("report") == CLI_REPORT);
+    assert(gm_cli_verb("doctor") == CLI_DOCTOR);
+    assert(gm_cli_verb("runs") == CLI_UNKNOWN);
+    assert(gm_cli_verb("") == CLI_UNKNOWN);
+}
+
+test cli_run_arg_rules {
+    assert(gm_cli_check(CLI_RUN, 1, "task.t27") == CX_OK);
+    assert(gm_cli_check(CLI_RUN, 1, "task.txt") == CX_BAD_ARG);
+    assert(gm_cli_check(CLI_RUN, 1, ".t27") == CX_BAD_ARG);
+    assert(gm_cli_check(CLI_RUN, 0, "") == CX_USAGE);
+    assert(gm_cli_check(CLI_RUN, 2, "a.t27") == CX_USAGE);
+}
+
+test cli_task_id_rules {
+    assert(gm_cli_check(CLI_STATUS, 1, "GODMODE-001") == CX_OK);
+    assert(gm_cli_check(CLI_STOP, 1, "a_b-9") == CX_OK);
+    assert(gm_cli_check(CLI_REPORT, 1, "GODMODE-001") == CX_OK);
+    assert(gm_cli_check(CLI_STATUS, 0, "") == CX_USAGE);
+    assert(gm_cli_check(CLI_STATUS, 1, "bad id") == CX_BAD_ARG);
+    assert(gm_cli_check(CLI_STOP, 1, "a/b") == CX_BAD_ARG);
+    assert(gm_cli_check(CLI_REPORT, 1, "") == CX_BAD_ARG);
+}
+
+test cli_doctor_and_unknown {
+    assert(gm_cli_check(CLI_DOCTOR, 0, "") == CX_OK);
+    assert(gm_cli_check(CLI_DOCTOR, 1, "x") == CX_USAGE);
+    assert(gm_cli_check(CLI_UNKNOWN, 0, "") == CX_USAGE);
+    assert(bytes_equal(gm_cli_usage(), "tri godmode run <task.t27> | status <task-id> | stop <task-id> | report <task-id> | doctor"));
+}
+
+test doctor_table {
+    assert(GM_NEEDS == 9);
+    assert(gm_doctor_gaps() == 5);
+    assert(gm_doctor_ready() == false);
+    assert(gm_need_state(0) == NS_SPEC_ONLY);
+    assert(gm_need_state(3) == NS_GAP);
+    assert(gm_need_state(7) == NS_GAP);
+    assert(gm_need_state(8) == NS_SPEC_ONLY);
+    assert(bytes_equal(gm_need_name(0), "pty spawn"));
+    assert(bytes_equal(gm_need_name(7), "tri godmode clap glue"));
+    assert(bytes_equal(gm_need_where(6), "none"));
+}
+
+test retry_cap_and_gate_constants {
+    assert(GM_RETRY_CAP == 3);
+    assert(G_ALL == G_TEST + G_ARTIFACT + G_POLICY + G_JOURNAL + G_ROLLBACK);
+}
+
+invariant gates_cover_five_bits {
+    assert(G_ALL == 31);
+    assert(GM_NEEDS == 9);
+}

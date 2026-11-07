@@ -1,0 +1,886 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/godmode_journal.t27 -- the GODMODE v1 event journal and the checkpoint/resume law.
+; GODMODE v1 is one green path: task -> isolated worktree -> supervised PTY -> allowlisted command -> validated report.
+; This spec is PURE (no @extern). It decides which event may follow which, renders the byte-exact JSON rows the host
+; appends to <worktree>/.godmode/journal.jsonl and the one-line checkpoint the host writes to checkpoint.json,
+; reads a journal back after a crash, and decides whether a run resumes.
+; Journal law: events are append-only, seq starts at 1 and grows by one, a row ends in a newline. A crash mid-write
+; loses at most the torn last line; gm_replay keeps every complete row before it and sets torn.
+; Secrets: the detail of every row passes through t27os::share::redact before it is escaped, then is cut at
+; GM_DETAIL_MAX bytes (cut text ends with "..."). gm_line_clean is the policy gate: no secret ever reaches the journal.
+; An invalid task is journaled as task.failed as the very first event, carrying its GM-E code in "code".
+; Choice not fixed by the brief: a second task.validated is refused with J_ORDER.
+; Host inventory (one need): GAP, writing a line to disk: proposed fn append_line(hb: []const u8, dir: []const u8, file: []const u8, line: []const u8) -> bool
+; (the same proposal as godmode_tick.t27 line 13). Until it exists the host cannot persist a row; this spec only renders it.
+; Row:        {"seq":1,"t":1762500000,"task":"GODMODE-001","ev":"task.validated","code":0,"detail":"..."}
+; Checkpoint: {"task":"GODMODE-001","completed":3,"current":3,"artifacts":0,"journal_seq":6,"head":"<40 hex>","attempts":0}
+module T27osGodmodeJournal;
+
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::share::redact;
+use t27os::share::redacted_total;
+use sync::schema::bytes_equal;
+
+// ---- event kinds: stable, never renumbered ----
+
+pub const EV_TASK_VALIDATED : u8 = 1;
+pub const EV_WORKTREE_CREATED : u8 = 2;
+pub const EV_PTY_STARTED : u8 = 3;
+pub const EV_COMMAND_STARTED : u8 = 4;
+pub const EV_COMMAND_COMPLETED : u8 = 5;
+pub const EV_APPROVAL_REQUESTED : u8 = 6;
+pub const EV_APPROVAL_DENIED : u8 = 7;
+pub const EV_VALIDATION_STARTED : u8 = 8;
+pub const EV_VALIDATION_COMPLETED : u8 = 9;
+pub const EV_CHECKPOINT_CREATED : u8 = 10;
+pub const EV_RETRY_ATTEMPTED : u8 = 11;
+pub const EV_TASK_FAILED : u8 = 12;
+pub const EV_TASK_COMPLETED : u8 = 13;
+pub const EV_COUNT : u8 = 13;
+
+/// Order-check results, stable.
+pub const J_OK : u8 = 0;
+pub const J_UNKNOWN_EVENT : u8 = 1;
+pub const J_AFTER_TERMINAL : u8 = 2;
+pub const J_ORDER : u8 = 3;
+pub const J_COMMAND_OPEN : u8 = 4;
+
+/// Checkpoint steps, stable.
+pub const ST_VALIDATE : u8 = 0;
+pub const ST_WORKTREE : u8 = 1;
+pub const ST_PTY : u8 = 2;
+pub const ST_COMMAND : u8 = 3;
+pub const ST_ACCEPTANCE : u8 = 4;
+pub const ST_GATES : u8 = 5;
+pub const ST_REPORT : u8 = 6;
+pub const ST_COUNT : u8 = 7;
+
+/// Resume results, stable.
+pub const RS_START_FRESH : u8 = 0;
+pub const RS_RESUME : u8 = 1;
+pub const RS_ALREADY_TERMINAL : u8 = 2;
+pub const RS_NO_CHECKPOINT : u8 = 3;
+pub const RS_HEAD_MOVED : u8 = 4;
+pub const RS_JOURNAL_BEHIND : u8 = 5;
+pub const RS_RETRIES_EXHAUSTED : u8 = 6;
+
+pub const GM_DETAIL_MAX : usize = 512;
+/// Scratch for the redacted detail; the redactor cuts a longer detail, which is then cut again at GM_DETAIL_MAX.
+pub const GM_SCRATCH : usize = 1024;
+/// Upper bound of one row: fixed text, a u32, a u64, a u16, a task id of up to 64 bytes and a detail escaped to 6 bytes a byte.
+pub const GM_ROW_MAX : usize = 3400;
+
+pub fn gm_event_name(ev: u8) -> []const u8 {
+    if (ev == EV_TASK_VALIDATED) { return "task.validated"; }
+    if (ev == EV_WORKTREE_CREATED) { return "worktree.created"; }
+    if (ev == EV_PTY_STARTED) { return "pty.started"; }
+    if (ev == EV_COMMAND_STARTED) { return "command.started"; }
+    if (ev == EV_COMMAND_COMPLETED) { return "command.completed"; }
+    if (ev == EV_APPROVAL_REQUESTED) { return "approval.requested"; }
+    if (ev == EV_APPROVAL_DENIED) { return "approval.denied"; }
+    if (ev == EV_VALIDATION_STARTED) { return "validation.started"; }
+    if (ev == EV_VALIDATION_COMPLETED) { return "validation.completed"; }
+    if (ev == EV_CHECKPOINT_CREATED) { return "checkpoint.created"; }
+    if (ev == EV_RETRY_ATTEMPTED) { return "retry.attempted"; }
+    if (ev == EV_TASK_FAILED) { return "task.failed"; }
+    if (ev == EV_TASK_COMPLETED) { return "task.completed"; }
+    return "unknown";
+}
+
+/// The kind of a name; 0 when unknown.
+pub fn gm_event_from_name(s: []const u8) -> u8 {
+    var ev : u8 = 1;
+    while (ev <= EV_COUNT) {
+        if (bytes_equal(s, gm_event_name(ev))) {
+            return ev;
+        }
+        ev = ev + 1;
+    }
+    return 0;
+}
+
+// ---- journal state ----
+
+pub struct GmJournal {
+    count: u32,
+    last_seq: u32,
+    seen: u32,
+    open_commands: u32,
+    retries: u32,
+    pending_approval: bool,
+    terminal: bool,
+    torn: bool,
+}
+
+pub fn gm_journal_new() -> GmJournal {
+    return GmJournal { count: 0, last_seq: 0, seen: 0, open_commands: 0, retries: 0, pending_approval: false, terminal: false, torn: false };
+}
+
+fn ev_bit(ev: u8) -> u32 {
+    return (1 as u32) << (ev as u32);
+}
+
+fn has_seen(j: GmJournal, ev: u8) -> bool {
+    return (j.seen & ev_bit(ev)) != 0;
+}
+
+/// The completion gate: every green-path event seen, nothing open, nothing pending, not terminal, not torn.
+pub fn gm_journal_complete(j: GmJournal) -> bool {
+    if (!has_seen(j, EV_TASK_VALIDATED)) { return false; }
+    if (!has_seen(j, EV_WORKTREE_CREATED)) { return false; }
+    if (!has_seen(j, EV_PTY_STARTED)) { return false; }
+    if (!has_seen(j, EV_COMMAND_STARTED)) { return false; }
+    if (!has_seen(j, EV_COMMAND_COMPLETED)) { return false; }
+    if (!has_seen(j, EV_VALIDATION_STARTED)) { return false; }
+    if (!has_seen(j, EV_VALIDATION_COMPLETED)) { return false; }
+    if (!has_seen(j, EV_CHECKPOINT_CREATED)) { return false; }
+    if (j.open_commands != 0) { return false; }
+    if (j.pending_approval) { return false; }
+    if (j.terminal) { return false; }
+    if (j.torn) { return false; }
+    return true;
+}
+
+/// May `ev` be appended to j? J_OK or the stable reason it may not.
+pub fn gm_journal_check(j: GmJournal, ev: u8) -> u8 {
+    if (ev == 0 or ev > EV_COUNT) { return J_UNKNOWN_EVENT; }
+    if (j.terminal) { return J_AFTER_TERMINAL; }
+    if (ev == EV_TASK_FAILED) { return J_OK; }
+    if (ev == EV_TASK_VALIDATED) {
+        if (has_seen(j, EV_TASK_VALIDATED)) { return J_ORDER; }
+        return J_OK;
+    }
+    if (ev == EV_TASK_COMPLETED) {
+        if (gm_journal_complete(j)) { return J_OK; }
+        return J_ORDER;
+    }
+    if (!has_seen(j, EV_TASK_VALIDATED)) { return J_ORDER; }
+    if (ev == EV_WORKTREE_CREATED or ev == EV_APPROVAL_REQUESTED or ev == EV_CHECKPOINT_CREATED) {
+        return J_OK;
+    }
+    if (ev == EV_PTY_STARTED) {
+        if (has_seen(j, EV_WORKTREE_CREATED)) { return J_OK; }
+        return J_ORDER;
+    }
+    if (ev == EV_COMMAND_STARTED) {
+        if (!has_seen(j, EV_PTY_STARTED)) { return J_ORDER; }
+        if (j.open_commands > 0) { return J_COMMAND_OPEN; }
+        return J_OK;
+    }
+    if (ev == EV_COMMAND_COMPLETED) {
+        if (j.open_commands > 0) { return J_OK; }
+        return J_ORDER;
+    }
+    if (ev == EV_APPROVAL_DENIED) {
+        if (j.pending_approval) { return J_OK; }
+        return J_ORDER;
+    }
+    if (ev == EV_VALIDATION_STARTED) {
+        if (has_seen(j, EV_COMMAND_COMPLETED) and j.open_commands == 0) { return J_OK; }
+        return J_ORDER;
+    }
+    if (ev == EV_VALIDATION_COMPLETED) {
+        if (has_seen(j, EV_VALIDATION_STARTED)) { return J_OK; }
+        return J_ORDER;
+    }
+    if (ev == EV_RETRY_ATTEMPTED) {
+        if ((has_seen(j, EV_COMMAND_COMPLETED) or has_seen(j, EV_VALIDATION_COMPLETED)) and j.open_commands == 0) { return J_OK; }
+        return J_ORDER;
+    }
+    return J_ORDER;
+}
+
+/// Record `ev`. The caller checks first; apply never refuses.
+pub fn gm_journal_apply(j: GmJournal, ev: u8) -> GmJournal {
+    var r : GmJournal = j;
+    r.count = j.count + 1;
+    r.last_seq = j.last_seq + 1;
+    if (ev >= 1 and ev <= EV_COUNT) {
+        r.seen = j.seen | ev_bit(ev);
+    }
+    if (ev == EV_COMMAND_STARTED) { r.open_commands = j.open_commands + 1; }
+    if (ev == EV_COMMAND_COMPLETED and j.open_commands > 0) { r.open_commands = j.open_commands - 1; }
+    if (ev == EV_RETRY_ATTEMPTED) { r.retries = j.retries + 1; }
+    if (ev == EV_APPROVAL_REQUESTED) { r.pending_approval = true; }
+    if (ev == EV_APPROVAL_DENIED) { r.pending_approval = false; }
+    if (ev == EV_TASK_FAILED or ev == EV_TASK_COMPLETED) { r.terminal = true; }
+    return r;
+}
+
+// ---- rows ----
+
+fn hex_digit(v: u8) -> u8 {
+    if (v < 10) { return 48 + v; }
+    return 87 + v;
+}
+
+/// Append the detail JSON-escaped: quote and backslash get a backslash, controls become \n, \t or \u00XX, bytes >= 0x7f become ?.
+fn put_escaped(out: []u8, at: usize, s: []const u8) -> usize {
+    var o : usize = at;
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (c == 34 or c == 92) {
+            out[o] = 92;
+            out[o + 1] = c;
+            o = o + 2;
+        } else if (c == 10) {
+            out[o] = 92;
+            out[o + 1] = 110;
+            o = o + 2;
+        } else if (c == 9) {
+            out[o] = 92;
+            out[o + 1] = 116;
+            o = o + 2;
+        } else if (c < 32) {
+            o = put_bytes(out, o, "\\u00");
+            out[o] = hex_digit(c / 16);
+            out[o + 1] = hex_digit(c % 16);
+            o = o + 2;
+        } else if (c >= 127) {
+            out[o] = 63;
+            o = o + 1;
+        } else {
+            out[o] = c;
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+/// Append one journal row and its newline at `at`; returns the new cursor. The caller provides GM_ROW_MAX free bytes.
+pub fn gm_row(out: []u8, at: usize, seq: u32, t: u64, task: []const u8, ev: u8, code: u16, detail: []const u8) -> usize {
+    var scratch : [1024]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    var n : usize = redact(detail, scratch[0..1024], cn[0..5]);
+    if (n > GM_DETAIL_MAX) {
+        scratch[509] = 46;
+        scratch[510] = 46;
+        scratch[511] = 46;
+        n = GM_DETAIL_MAX;
+    }
+    var o : usize = put_bytes(out, at, "{\"seq\":");
+    o = put_dec(out, o, @as(u64, seq));
+    o = put_bytes(out, o, ",\"t\":");
+    o = put_dec(out, o, t);
+    o = put_bytes(out, o, ",\"task\":\"");
+    o = put_bytes(out, o, task);
+    o = put_bytes(out, o, "\",\"ev\":\"");
+    o = put_bytes(out, o, gm_event_name(ev));
+    o = put_bytes(out, o, "\",\"code\":");
+    o = put_dec(out, o, @as(u64, code));
+    o = put_bytes(out, o, ",\"detail\":\"");
+    o = put_escaped(out, o, scratch[0..n]);
+    o = put_bytes(out, o, "\"}");
+    out[o] = 10;
+    return o + 1;
+}
+
+/// True when the redactor finds nothing in `line`.
+pub fn gm_line_clean(line: []const u8) -> bool {
+    var scratch : [4096]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const n : usize = redact(line, scratch[0..4096], cn[0..5]);
+    if (n == 0 and line.len > 0) { return false; }
+    return redacted_total(cn[0..5]) == 0 and cn[4] == 0;
+}
+
+// ---- parsing a row back ----
+
+fn starts_at(line: []const u8, pos: usize, lit: []const u8) -> bool {
+    if (pos + lit.len > line.len) { return false; }
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (line[pos + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// End index of the digit run starting at pos (pos itself when there is none).
+fn digits_end(line: []const u8, pos: usize) -> usize {
+    var p : usize = pos;
+    while (p < line.len and line[p] >= 48 and line[p] <= 57) {
+        p = p + 1;
+    }
+    return p;
+}
+
+/// Value of the digits in [pos, end); 0 past 18 digits.
+fn digits_val(line: []const u8, pos: usize, end: usize) -> u64 {
+    if (end - pos > 18) { return 0; }
+    var v : u64 = 0;
+    var p : usize = pos;
+    while (p < end) {
+        v = v * 10 + @as(u64, line[p] - 48);
+        p = p + 1;
+    }
+    return v;
+}
+
+/// Index just after `,"ev":"` when the line has the exact row shape up to there; 0 on any mismatch.
+fn row_shape(line: []const u8) -> usize {
+    if (!starts_at(line, 0, "{\"seq\":")) { return 0; }
+    const e1 : usize = digits_end(line, 7);
+    if (e1 == 7) { return 0; }
+    if (!starts_at(line, e1, ",\"t\":")) { return 0; }
+    const s2 : usize = e1 + 5;
+    const e2 : usize = digits_end(line, s2);
+    if (e2 == s2) { return 0; }
+    if (!starts_at(line, e2, ",\"task\":\"")) { return 0; }
+    const s3 : usize = e2 + 9;
+    var p : usize = s3;
+    while (p < line.len and line[p] != 34) {
+        p = p + 1;
+    }
+    if (p == s3 or p >= line.len) { return 0; }
+    if (!starts_at(line, p, "\",\"ev\":\"")) { return 0; }
+    return p + 8;
+}
+
+/// The seq of a row; 0 on any mismatch (seq 0 never occurs in a journal).
+pub fn gm_row_seq(line: []const u8) -> u32 {
+    if (row_shape(line) == 0) { return 0; }
+    const e1 : usize = digits_end(line, 7);
+    const v : u64 = digits_val(line, 7, e1);
+    if (v > 4294967295) { return 0; }
+    return @intCast(v);
+}
+
+/// The event kind of a row; 0 on any mismatch or unknown name.
+pub fn gm_row_ev(line: []const u8) -> u8 {
+    const s : usize = row_shape(line);
+    if (s == 0) { return 0; }
+    var p : usize = s;
+    while (p < line.len and line[p] != 34) {
+        p = p + 1;
+    }
+    if (p >= line.len) { return 0; }
+    return gm_event_from_name(line[s..p]);
+}
+
+/// Rebuild the journal from the file bytes. The first incomplete, malformed, out-of-sequence or out-of-order row
+/// stops the walk and sets torn; the rows before it stay applied.
+pub fn gm_replay(buf: []const u8) -> GmJournal {
+    var j : GmJournal = gm_journal_new();
+    var pos : usize = 0;
+    while (pos < buf.len) {
+        var nl : usize = pos;
+        while (nl < buf.len and buf[nl] != 10) {
+            nl = nl + 1;
+        }
+        if (nl >= buf.len) {
+            j.torn = true;
+            return j;
+        }
+        const line : []const u8 = buf[pos..nl];
+        const seq : u32 = gm_row_seq(line);
+        const ev : u8 = gm_row_ev(line);
+        if (seq == 0 or ev == 0 or seq != j.last_seq + 1 or gm_journal_check(j, ev) != J_OK) {
+            j.torn = true;
+            return j;
+        }
+        j = gm_journal_apply(j, ev);
+        pos = nl + 1;
+    }
+    return j;
+}
+
+// ---- checkpoint ----
+
+pub struct GmCheckpoint {
+    task_id: []const u8,
+    completed_steps: u32,
+    current_step: u8,
+    artifacts_done: u32,
+    journal_seq: u32,
+    head: []const u8,
+    attempts: u32,
+}
+
+/// Exactly 40 characters of 0-9a-f.
+pub fn gm_head_ok(h: []const u8) -> bool {
+    if (h.len != 40) { return false; }
+    var i : usize = 0;
+    while (i < 40) {
+        const c : u8 = h[i];
+        if (!((c >= 48 and c <= 57) or (c >= 97 and c <= 102))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Append the one-line checkpoint and its newline; returns the new cursor.
+pub fn gm_checkpoint_row(out: []u8, at: usize, cp: GmCheckpoint) -> usize {
+    var o : usize = put_bytes(out, at, "{\"task\":\"");
+    o = put_bytes(out, o, cp.task_id);
+    o = put_bytes(out, o, "\",\"completed\":");
+    o = put_dec(out, o, @as(u64, cp.completed_steps));
+    o = put_bytes(out, o, ",\"current\":");
+    o = put_dec(out, o, @as(u64, cp.current_step));
+    o = put_bytes(out, o, ",\"artifacts\":");
+    o = put_dec(out, o, @as(u64, cp.artifacts_done));
+    o = put_bytes(out, o, ",\"journal_seq\":");
+    o = put_dec(out, o, @as(u64, cp.journal_seq));
+    o = put_bytes(out, o, ",\"head\":\"");
+    o = put_bytes(out, o, cp.head);
+    o = put_bytes(out, o, "\",\"attempts\":");
+    o = put_dec(out, o, @as(u64, cp.attempts));
+    o = put_bytes(out, o, "}");
+    out[o] = 10;
+    return o + 1;
+}
+
+pub fn gm_checkpoint_valid(cp: GmCheckpoint, j: GmJournal) -> bool {
+    if (!gm_head_ok(cp.head)) { return false; }
+    if (cp.journal_seq < 1 or cp.journal_seq > j.last_seq) { return false; }
+    if (!has_seen(j, EV_CHECKPOINT_CREATED)) { return false; }
+    if (cp.current_step >= ST_COUNT) { return false; }
+    if ((cp.completed_steps & ((1 as u32) << (cp.current_step as u32))) != 0) { return false; }
+    return true;
+}
+
+// ---- resume ----
+
+pub fn gm_resume_decide(j: GmJournal, has_cp: bool, cp: GmCheckpoint, live_head: []const u8, max_retries: u32) -> u8 {
+    if (j.terminal) { return RS_ALREADY_TERMINAL; }
+    if (j.count == 0 and !has_cp) { return RS_START_FRESH; }
+    if (!has_cp) { return RS_NO_CHECKPOINT; }
+    if (cp.journal_seq > j.last_seq) { return RS_JOURNAL_BEHIND; }
+    if (!gm_checkpoint_valid(cp, j)) { return RS_NO_CHECKPOINT; }
+    if (!bytes_equal(live_head, cp.head)) { return RS_HEAD_MOVED; }
+    if (cp.current_step == ST_COMMAND and cp.attempts > max_retries) { return RS_RETRIES_EXHAUSTED; }
+    return RS_RESUME;
+}
+
+/// The step to re-run. The in-flight command step is a new attempt, never assumed done.
+pub fn gm_resume_step(cp: GmCheckpoint) -> u8 {
+    return cp.current_step;
+}
+
+pub fn gm_resume_name(rs: u8) -> []const u8 {
+    if (rs == RS_START_FRESH) { return "start_fresh"; }
+    if (rs == RS_RESUME) { return "resume"; }
+    if (rs == RS_ALREADY_TERMINAL) { return "already_terminal"; }
+    if (rs == RS_NO_CHECKPOINT) { return "no_checkpoint"; }
+    if (rs == RS_HEAD_MOVED) { return "head_moved"; }
+    if (rs == RS_JOURNAL_BEHIND) { return "journal_behind"; }
+    if (rs == RS_RETRIES_EXHAUSTED) { return "retries_exhausted"; }
+    return "unknown";
+}
+
+invariant event_count_is_thirteen { assert EV_COUNT == 13; }
+invariant step_count_is_seven { assert ST_COUNT == 7; }
+invariant detail_cap_fits_scratch { assert GM_DETAIL_MAX < GM_SCRATCH; }
+
+// ---- tests ----
+
+const HEAD_A : []const u8 = "0123456789abcdef0123456789abcdef01234567";
+const HEAD_B : []const u8 = "ffffffffffffffffffffffffffffffffffffffff";
+
+fn apply_ok(j: GmJournal, ev: u8) -> GmJournal {
+    assert gm_journal_check(j, ev) == J_OK;
+    return gm_journal_apply(j, ev);
+}
+
+fn through_checkpoint() -> GmJournal {
+    var j : GmJournal = gm_journal_new();
+    j = apply_ok(j, EV_TASK_VALIDATED);
+    j = apply_ok(j, EV_WORKTREE_CREATED);
+    j = apply_ok(j, EV_PTY_STARTED);
+    j = apply_ok(j, EV_COMMAND_STARTED);
+    j = apply_ok(j, EV_COMMAND_COMPLETED);
+    j = apply_ok(j, EV_CHECKPOINT_CREATED);
+    return j;
+}
+
+fn green() -> GmJournal {
+    var j : GmJournal = through_checkpoint();
+    j = apply_ok(j, EV_VALIDATION_STARTED);
+    j = apply_ok(j, EV_VALIDATION_COMPLETED);
+    return j;
+}
+
+fn cp_of(step: u8, done: u32, seq: u32, head: []const u8, attempts: u32) -> GmCheckpoint {
+    return GmCheckpoint { task_id: "GODMODE-001", completed_steps: done, current_step: step, artifacts_done: 0, journal_seq: seq, head: head, attempts: attempts };
+}
+
+fn row_to(out: []u8, at: usize, seq: u32, ev: u8) -> usize {
+    return gm_row(out, at, seq, 1762500000, "GODMODE-001", ev, 0, "ok");
+}
+
+test event_names_round_trip {
+    var ev : u8 = 1;
+    while (ev <= 13) {
+        assert gm_event_from_name(gm_event_name(ev)) == ev;
+        ev = ev + 1;
+    }
+    assert bytes_equal(gm_event_name(1), "task.validated");
+    assert bytes_equal(gm_event_name(13), "task.completed");
+    assert bytes_equal(gm_event_name(0), "unknown");
+    assert bytes_equal(gm_event_name(14), "unknown");
+    assert gm_event_from_name("nope") == 0;
+    assert gm_event_from_name("") == 0;
+}
+
+test unknown_event_refused {
+    const j : GmJournal = gm_journal_new();
+    assert gm_journal_check(j, 0) == J_UNKNOWN_EVENT;
+    assert gm_journal_check(j, 14) == J_UNKNOWN_EVENT;
+}
+
+test happy_path_completes {
+    var j : GmJournal = gm_journal_new();
+    assert !gm_journal_complete(j);
+    j = apply_ok(j, EV_TASK_VALIDATED);
+    j = apply_ok(j, EV_WORKTREE_CREATED);
+    j = apply_ok(j, EV_PTY_STARTED);
+    j = apply_ok(j, EV_COMMAND_STARTED);
+    assert j.open_commands == 1;
+    j = apply_ok(j, EV_COMMAND_COMPLETED);
+    assert j.open_commands == 0;
+    j = apply_ok(j, EV_CHECKPOINT_CREATED);
+    assert gm_journal_check(j, EV_TASK_COMPLETED) == J_ORDER;
+    j = apply_ok(j, EV_VALIDATION_STARTED);
+    j = apply_ok(j, EV_VALIDATION_COMPLETED);
+    assert j.count == 8 and j.last_seq == 8;
+    assert gm_journal_complete(j);
+    j = apply_ok(j, EV_TASK_COMPLETED);
+    assert j.terminal;
+    assert !gm_journal_complete(j);
+    assert gm_journal_check(j, EV_COMMAND_STARTED) == J_AFTER_TERMINAL;
+    assert gm_journal_check(j, EV_TASK_FAILED) == J_AFTER_TERMINAL;
+    assert gm_journal_check(j, EV_TASK_COMPLETED) == J_AFTER_TERMINAL;
+}
+
+test pty_before_worktree_is_order {
+    var j : GmJournal = apply_ok(gm_journal_new(), EV_TASK_VALIDATED);
+    assert gm_journal_check(j, EV_PTY_STARTED) == J_ORDER;
+    assert gm_journal_check(j, EV_COMMAND_STARTED) == J_ORDER;
+    j = apply_ok(j, EV_WORKTREE_CREATED);
+    assert gm_journal_check(j, EV_PTY_STARTED) == J_OK;
+}
+
+test nothing_before_validation_but_failure {
+    const j : GmJournal = gm_journal_new();
+    assert gm_journal_check(j, EV_WORKTREE_CREATED) == J_ORDER;
+    assert gm_journal_check(j, EV_APPROVAL_REQUESTED) == J_ORDER;
+    assert gm_journal_check(j, EV_CHECKPOINT_CREATED) == J_ORDER;
+    assert gm_journal_check(j, EV_TASK_VALIDATED) == J_OK;
+    assert gm_journal_check(j, EV_TASK_FAILED) == J_OK;
+}
+
+test two_commands_in_a_row_refused {
+    var j : GmJournal = apply_ok(through_checkpoint(), EV_COMMAND_STARTED);
+    assert gm_journal_check(j, EV_COMMAND_STARTED) == J_COMMAND_OPEN;
+    assert gm_journal_check(j, EV_VALIDATION_STARTED) == J_ORDER;
+    assert gm_journal_check(j, EV_RETRY_ATTEMPTED) == J_ORDER;
+    j = apply_ok(j, EV_COMMAND_COMPLETED);
+    assert gm_journal_check(j, EV_COMMAND_STARTED) == J_OK;
+}
+
+test command_completed_needs_open_command {
+    const j : GmJournal = apply_ok(apply_ok(apply_ok(gm_journal_new(), EV_TASK_VALIDATED), EV_WORKTREE_CREATED), EV_PTY_STARTED);
+    assert gm_journal_check(j, EV_COMMAND_COMPLETED) == J_ORDER;
+}
+
+test approval_denied_needs_request {
+    var j : GmJournal = apply_ok(gm_journal_new(), EV_TASK_VALIDATED);
+    assert gm_journal_check(j, EV_APPROVAL_DENIED) == J_ORDER;
+    j = apply_ok(j, EV_APPROVAL_REQUESTED);
+    assert j.pending_approval;
+    j = apply_ok(j, EV_APPROVAL_DENIED);
+    assert !j.pending_approval;
+    assert gm_journal_check(j, EV_APPROVAL_DENIED) == J_ORDER;
+}
+
+test pending_approval_blocks_completion {
+    var j : GmJournal = apply_ok(green(), EV_APPROVAL_REQUESTED);
+    assert !gm_journal_complete(j);
+    assert gm_journal_check(j, EV_TASK_COMPLETED) == J_ORDER;
+    j = apply_ok(j, EV_APPROVAL_DENIED);
+    assert gm_journal_complete(j);
+}
+
+test task_failed_first_event_is_ok {
+    var j : GmJournal = gm_journal_new();
+    assert gm_journal_check(j, EV_TASK_FAILED) == J_OK;
+    j = gm_journal_apply(j, EV_TASK_FAILED);
+    assert j.terminal and j.count == 1;
+    assert gm_journal_check(j, EV_TASK_VALIDATED) == J_AFTER_TERMINAL;
+}
+
+test task_failed_mid_run_is_ok {
+    const j : GmJournal = apply_ok(through_checkpoint(), EV_TASK_FAILED);
+    assert j.terminal;
+}
+
+test completion_before_validation_refused {
+    assert gm_journal_check(gm_journal_new(), EV_TASK_COMPLETED) == J_ORDER;
+    assert gm_journal_check(through_checkpoint(), EV_TASK_COMPLETED) == J_ORDER;
+    var j : GmJournal = apply_ok(through_checkpoint(), EV_VALIDATION_STARTED);
+    assert gm_journal_check(j, EV_TASK_COMPLETED) == J_ORDER;
+}
+
+test validation_completed_needs_started {
+    const j : GmJournal = through_checkpoint();
+    assert gm_journal_check(j, EV_VALIDATION_COMPLETED) == J_ORDER;
+}
+
+test retry_needs_a_finished_command {
+    var j : GmJournal = apply_ok(apply_ok(apply_ok(gm_journal_new(), EV_TASK_VALIDATED), EV_WORKTREE_CREATED), EV_PTY_STARTED);
+    assert gm_journal_check(j, EV_RETRY_ATTEMPTED) == J_ORDER;
+    j = apply_ok(apply_ok(j, EV_COMMAND_STARTED), EV_COMMAND_COMPLETED);
+    j = apply_ok(j, EV_RETRY_ATTEMPTED);
+    assert j.retries == 1;
+}
+
+test duplicate_validation_refused {
+    const j : GmJournal = apply_ok(gm_journal_new(), EV_TASK_VALIDATED);
+    assert gm_journal_check(j, EV_TASK_VALIDATED) == J_ORDER;
+}
+
+test torn_journal_is_never_complete {
+    var j : GmJournal = green();
+    j.torn = true;
+    assert !gm_journal_complete(j);
+    assert gm_journal_check(j, EV_TASK_COMPLETED) == J_ORDER;
+}
+
+test row_is_byte_exact {
+    var buf : [256]u8 = undefined;
+    const n : usize = gm_row(buf[0..256], 0, 1, 1762500000, "GODMODE-001", EV_TASK_VALIDATED, 0, "task ok");
+    const want : []const u8 = "{\"seq\":1,\"t\":1762500000,\"task\":\"GODMODE-001\",\"ev\":\"task.validated\",\"code\":0,\"detail\":\"task ok\"}\n";
+    assert n == want.len;
+    assert bytes_equal(buf[0..n], want);
+}
+
+test row_appends_at_cursor {
+    var buf : [512]u8 = undefined;
+    const a : usize = row_to(buf[0..512], 0, 1, EV_TASK_VALIDATED);
+    const b : usize = row_to(buf[0..512], a, 2, EV_WORKTREE_CREATED);
+    assert b > a and a > 0;
+    assert buf[a - 1] == 10 and buf[b - 1] == 10;
+    assert gm_row_seq(buf[a..b - 1]) == 2;
+}
+
+test detail_quote_and_newline_escaped {
+    var buf : [256]u8 = undefined;
+    const n : usize = gm_row(buf[0..256], 0, 7, 5, "T-1", EV_COMMAND_COMPLETED, 3, "say \"hi\"\nback\\slash\ttab");
+    const want : []const u8 = "{\"seq\":7,\"t\":5,\"task\":\"T-1\",\"ev\":\"command.completed\",\"code\":3,\"detail\":\"say \\\"hi\\\"\\nback\\\\slash\\ttab\"}\n";
+    assert bytes_equal(buf[0..n], want);
+}
+
+test detail_control_and_high_bytes {
+    var src : [3]u8 = undefined;
+    src[0] = 1;
+    src[1] = 200;
+    src[2] = 65;
+    var buf : [256]u8 = undefined;
+    const n : usize = gm_row(buf[0..256], 0, 1, 1, "T", EV_TASK_FAILED, 0, src[0..3]);
+    const want : []const u8 = "{\"seq\":1,\"t\":1,\"task\":\"T\",\"ev\":\"task.failed\",\"code\":0,\"detail\":\"\\u0001?A\"}\n";
+    assert bytes_equal(buf[0..n], want);
+}
+
+test secret_in_detail_is_redacted {
+    var raw : [64]u8 = undefined;
+    var r : usize = put_bytes(raw[0..64], 0, "key ");
+    r = put_bytes(raw[0..64], r, "sk-");
+    var k : usize = 0;
+    while (k < 24) {
+        raw[r] = 97;
+        r = r + 1;
+        k = k + 1;
+    }
+    assert !gm_line_clean(raw[0..r]);
+    var buf : [256]u8 = undefined;
+    const n : usize = gm_row(buf[0..256], 0, 1, 1, "T", EV_COMMAND_STARTED, 0, raw[0..r]);
+    const want : []const u8 = "{\"seq\":1,\"t\":1,\"task\":\"T\",\"ev\":\"command.started\",\"code\":0,\"detail\":\"key [REDACTED]\"}\n";
+    assert bytes_equal(buf[0..n], want);
+    assert gm_line_clean(buf[0..n]);
+}
+
+test clean_line_is_clean {
+    assert gm_line_clean("{\"seq\":1,\"detail\":\"cargo test passed\"}");
+    assert gm_line_clean("");
+}
+
+test long_detail_is_cut_with_dots {
+    var src : [600]u8 = undefined;
+    var i : usize = 0;
+    while (i < 600) {
+        src[i] = 120;
+        i = i + 1;
+    }
+    var buf : [1024]u8 = undefined;
+    const n : usize = gm_row(buf[0..1024], 0, 1, 1, "T", EV_TASK_FAILED, 0, src[0..600]);
+    const head : usize = 64;
+    assert n == head + 512 + 3;
+    assert buf[head + 508] == 120;
+    assert buf[head + 509] == 46 and buf[head + 510] == 46 and buf[head + 511] == 46;
+    assert buf[head + 512] == 34 and buf[n - 1] == 10;
+}
+
+test row_parses_back {
+    var buf : [256]u8 = undefined;
+    const n : usize = gm_row(buf[0..256], 0, 42, 1762500000, "GODMODE-001", EV_VALIDATION_COMPLETED, 0, "d");
+    assert gm_row_seq(buf[0..n - 1]) == 42;
+    assert gm_row_ev(buf[0..n - 1]) == EV_VALIDATION_COMPLETED;
+}
+
+test malformed_rows_parse_to_zero {
+    assert gm_row_seq("") == 0;
+    assert gm_row_seq("{\"seq\":x}") == 0;
+    assert gm_row_seq("{\"seq\":1,\"t\":2}") == 0;
+    assert gm_row_ev("{\"seq\":1,\"t\":2,\"task\":\"\",\"ev\":\"task.failed\"}") == 0;
+    assert gm_row_ev("{\"seq\":1,\"t\":2,\"task\":\"A\",\"ev\":\"bogus\"}") == 0;
+    assert gm_row_ev("{\"seq\":1,\"t\":2,\"task\":\"A\",\"ev\":\"task.failed") == 0;
+    assert gm_row_seq(" {\"seq\":1,\"t\":2,\"task\":\"A\",\"ev\":\"task.failed\"}") == 0;
+    assert gm_row_seq("{\"seq\":1,\"t\":2,\"task\":\"A\",\"ev\":\"task.failed\"}") == 1;
+}
+
+test replay_three_rows {
+    var buf : [1024]u8 = undefined;
+    var n : usize = row_to(buf[0..1024], 0, 1, EV_TASK_VALIDATED);
+    n = row_to(buf[0..1024], n, 2, EV_WORKTREE_CREATED);
+    n = row_to(buf[0..1024], n, 3, EV_PTY_STARTED);
+    const j : GmJournal = gm_replay(buf[0..n]);
+    assert j.count == 3 and j.last_seq == 3;
+    assert !j.torn;
+    assert !j.terminal;
+}
+
+test replay_empty_is_fresh {
+    const j : GmJournal = gm_replay("");
+    assert j.count == 0 and !j.torn;
+}
+
+test replay_torn_last_line_keeps_earlier_rows {
+    var buf : [1024]u8 = undefined;
+    var n : usize = row_to(buf[0..1024], 0, 1, EV_TASK_VALIDATED);
+    n = row_to(buf[0..1024], n, 2, EV_WORKTREE_CREATED);
+    n = row_to(buf[0..1024], n, 3, EV_PTY_STARTED);
+    const m : usize = row_to(buf[0..1024], n, 4, EV_COMMAND_STARTED);
+    const j : GmJournal = gm_replay(buf[0..m - 1]);
+    assert j.count == 3 and j.torn;
+    assert j.open_commands == 0;
+    const full : GmJournal = gm_replay(buf[0..m]);
+    assert full.count == 4 and !full.torn and full.open_commands == 1;
+}
+
+test replay_stops_at_seq_gap {
+    var buf : [1024]u8 = undefined;
+    var n : usize = row_to(buf[0..1024], 0, 1, EV_TASK_VALIDATED);
+    n = row_to(buf[0..1024], n, 3, EV_WORKTREE_CREATED);
+    const j : GmJournal = gm_replay(buf[0..n]);
+    assert j.count == 1 and j.torn;
+}
+
+test replay_stops_at_order_violation {
+    var buf : [1024]u8 = undefined;
+    var n : usize = row_to(buf[0..1024], 0, 1, EV_TASK_VALIDATED);
+    n = row_to(buf[0..1024], n, 2, EV_PTY_STARTED);
+    const j : GmJournal = gm_replay(buf[0..n]);
+    assert j.count == 1 and j.torn;
+}
+
+test replay_stops_at_garbage_row {
+    var buf : [1024]u8 = undefined;
+    var n : usize = row_to(buf[0..1024], 0, 1, EV_TASK_VALIDATED);
+    n = put_bytes(buf[0..1024], n, "garbage\n");
+    const j : GmJournal = gm_replay(buf[0..n]);
+    assert j.count == 1 and j.torn;
+}
+
+test replay_of_failed_first_row {
+    var buf : [512]u8 = undefined;
+    const n : usize = gm_row(buf[0..512], 0, 1, 1, "BAD", EV_TASK_FAILED, 12, "GM-E012");
+    const j : GmJournal = gm_replay(buf[0..n]);
+    assert j.count == 1 and j.terminal and !j.torn;
+}
+
+test checkpoint_row_is_byte_exact {
+    var buf : [256]u8 = undefined;
+    const cp : GmCheckpoint = cp_of(ST_COMMAND, 3, 6, HEAD_A, 1);
+    const n : usize = gm_checkpoint_row(buf[0..256], 0, cp);
+    const want : []const u8 = "{\"task\":\"GODMODE-001\",\"completed\":3,\"current\":3,\"artifacts\":0,\"journal_seq\":6,\"head\":\"0123456789abcdef0123456789abcdef01234567\",\"attempts\":1}\n";
+    assert n == want.len;
+    assert bytes_equal(buf[0..n], want);
+}
+
+test head_ok_cases {
+    assert gm_head_ok(HEAD_A);
+    assert gm_head_ok(HEAD_B);
+    assert !gm_head_ok("0123456789abcdef0123456789abcdef0123456");
+    assert !gm_head_ok("0123456789ABCDEF0123456789abcdef01234567");
+    assert !gm_head_ok("0123456789abcdef0123456789abcdef0123456g");
+    assert !gm_head_ok("");
+}
+
+test checkpoint_valid_cases {
+    const j : GmJournal = through_checkpoint();
+    assert gm_checkpoint_valid(cp_of(ST_ACCEPTANCE, 15, 6, HEAD_A, 0), j);
+    assert !gm_checkpoint_valid(cp_of(ST_ACCEPTANCE, 15, 0, HEAD_A, 0), j);
+    assert !gm_checkpoint_valid(cp_of(ST_ACCEPTANCE, 15, 7, HEAD_A, 0), j);
+    assert !gm_checkpoint_valid(cp_of(ST_ACCEPTANCE, 15, 6, "short", 0), j);
+    assert !gm_checkpoint_valid(cp_of(7, 15, 6, HEAD_A, 0), j);
+    assert !gm_checkpoint_valid(cp_of(ST_COMMAND, 15, 6, HEAD_A, 0), j);
+    const early : GmJournal = apply_ok(gm_journal_new(), EV_TASK_VALIDATED);
+    assert !gm_checkpoint_valid(cp_of(ST_WORKTREE, 1, 1, HEAD_A, 0), early);
+}
+
+test resume_start_fresh {
+    const cp : GmCheckpoint = cp_of(ST_VALIDATE, 0, 0, HEAD_A, 0);
+    assert gm_resume_decide(gm_journal_new(), false, cp, HEAD_A, 2) == RS_START_FRESH;
+}
+
+test resume_ok {
+    const cp : GmCheckpoint = cp_of(ST_ACCEPTANCE, 15, 6, HEAD_A, 0);
+    const rs : u8 = gm_resume_decide(through_checkpoint(), true, cp, HEAD_A, 2);
+    assert rs == RS_RESUME;
+    assert gm_resume_step(cp) == ST_ACCEPTANCE;
+    assert bytes_equal(gm_resume_name(rs), "resume");
+}
+
+test resume_already_terminal {
+    const cp : GmCheckpoint = cp_of(ST_ACCEPTANCE, 15, 6, HEAD_A, 0);
+    const j : GmJournal = gm_journal_apply(through_checkpoint(), EV_TASK_FAILED);
+    assert gm_resume_decide(j, true, cp, HEAD_A, 2) == RS_ALREADY_TERMINAL;
+}
+
+test resume_no_checkpoint {
+    const cp : GmCheckpoint = cp_of(ST_VALIDATE, 0, 0, HEAD_A, 0);
+    assert gm_resume_decide(through_checkpoint(), false, cp, HEAD_A, 2) == RS_NO_CHECKPOINT;
+    const bad : GmCheckpoint = cp_of(ST_COMMAND, 15, 6, HEAD_A, 0);
+    assert gm_resume_decide(through_checkpoint(), true, bad, HEAD_A, 2) == RS_NO_CHECKPOINT;
+}
+
+test resume_head_moved {
+    const cp : GmCheckpoint = cp_of(ST_ACCEPTANCE, 15, 6, HEAD_A, 0);
+    assert gm_resume_decide(through_checkpoint(), true, cp, HEAD_B, 2) == RS_HEAD_MOVED;
+}
+
+test resume_journal_behind {
+    const cp : GmCheckpoint = cp_of(ST_ACCEPTANCE, 15, 9, HEAD_A, 0);
+    assert gm_resume_decide(through_checkpoint(), true, cp, HEAD_A, 2) == RS_JOURNAL_BEHIND;
+}
+
+test resume_retries_exhausted {
+    const cp : GmCheckpoint = cp_of(ST_COMMAND, 7, 6, HEAD_A, 3);
+    assert gm_resume_decide(through_checkpoint(), true, cp, HEAD_A, 2) == RS_RETRIES_EXHAUSTED;
+    const ok : GmCheckpoint = cp_of(ST_COMMAND, 7, 6, HEAD_A, 2);
+    assert gm_resume_decide(through_checkpoint(), true, ok, HEAD_A, 2) == RS_RESUME;
+    assert gm_resume_step(ok) == ST_COMMAND;
+}
+
+test resume_names {
+    assert bytes_equal(gm_resume_name(RS_START_FRESH), "start_fresh");
+    assert bytes_equal(gm_resume_name(RS_ALREADY_TERMINAL), "already_terminal");
+    assert bytes_equal(gm_resume_name(RS_NO_CHECKPOINT), "no_checkpoint");
+    assert bytes_equal(gm_resume_name(RS_HEAD_MOVED), "head_moved");
+    assert bytes_equal(gm_resume_name(RS_JOURNAL_BEHIND), "journal_behind");
+    assert bytes_equal(gm_resume_name(RS_RETRIES_EXHAUSTED), "retries_exhausted");
+    assert bytes_equal(gm_resume_name(99), "unknown");
+}
