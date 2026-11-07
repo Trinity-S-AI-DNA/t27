@@ -2442,11 +2442,11 @@ the parser used to read it as `{}` followed by a negation",
                     self.advance(); // consume [
                     if let Ok(elem) = self.parse_expr() {
                         if self.current.kind == TokenKind::RBracket {
-                            self.advance(); // consume ]
+                            self.advance(); // consume ]; only `[x];` is a list, `[1]T{..}` was a dimension (#13285)
+                            one_element_handled = self.current.kind == TokenKind::Semicolon;
                             let mut lit = Node::new(NodeKind::ExprArrayLiteral);
                             lit.children.push(elem);
-                            decl.children.push(lit);
-                            one_element_handled = true;
+                            if one_element_handled { decl.children.push(lit); }
                         }
                     }
                     if !one_element_handled {

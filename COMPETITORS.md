@@ -91,6 +91,21 @@ this repo.
   TRI-NET chip repos (`tt-trinity-phi`, `tt-trinity-euler`,
   `tt-trinity-gamma`). It is part of our pipeline, not a competitor.
 
+
+### 1.8 Baud (baudlabs.ai)
+
+- **Vendor page:** https://baudlabs.ai/
+- **What they sell:** an ASIC architecture and an arithmetic representation that losslessly eliminates multiplications and compresses neural networks during forward and backward passes; a compiler that converts PyTorch-exportable models to their format "with bit exact results in most cases"; early access to a first cluster supporting pretraining, fine-tuning, RL post-training, and inference. They claim a multiplier-free design packs "an order of magnitude more compute and memory into the same die area" (comparison made at the same process node and memory bandwidth).
+- **What TRI-NET is not:** we do not sell a multiplier-free ASIC, a cluster for pretraining/fine-tuning, or a PyTorch-to-ASIC compiler. We do not claim TOPS, mW/TOPS, or any die-area or compute-density figure.
+- **What TRI-NET differs in:** TRI-NET's orthogonal value is an inspectable open-shuttle silicon line (Tiny Tapeout) with spec-to-RTL reproducibility, Coq proofs, and seal-based integrity -- research-tier and auditable, not a substitute for a multiplier-free ASIC cluster.
+
+### 1.9 XPU Grasshopper (Zettascale / zscc.ai)
+
+- **Vendor page:** https://zscc.ai/ (product page: https://zscc.ai/grasshopper)
+- **What they sell:** XPU Grasshopper (VU47P), described as "an AI chip co-designed with AI for the era of recursive self-improvement"; end-to-end inference live on FPGA today with a serving API coming soon; XPU frontends for PyTorch, tinygrad, and JAX; Monolith, a hosted cluster of XPUs "that behaves as one chip"; libxpu, a C ABI over the machine "planned to be fully open source". Their announcement states Grasshopper went "from 0.06 to 51 tokens per second, 816x faster" in 13 weeks, and the devkit is open for pre-order. Backed by Y Combinator.
+- **What TRI-NET is not:** we do not ship an FPGA inference prototype, a hosted XPU cluster, or a PyTorch/tinygrad/JAX frontend. We do not claim tokens-per-second, energy per token, or any speedup figure.
+- **What TRI-NET differs in:** TRI-NET's orthogonal value is open, spec-sealed, Tiny Tapeout-targeted silicon with formal proofs -- research-tier and auditable, not a hosted FPGA/silicon inference service.
+
 ---
 
 ## 2. What we do not claim
