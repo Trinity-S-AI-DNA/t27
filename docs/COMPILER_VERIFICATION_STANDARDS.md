@@ -223,8 +223,11 @@ Rings and issue numbers are **targets** — open or adjust GitHub issues when ex
 | 0.2 | **`docs/qualification/TOR.md`**, **`TVP.md`**, **`README.md`** | Draft sections traceable to **`tri` / CI** |
 | 0.3 | Template + **LANDSCAPE** index | No duplicate normative prose in **LANDSCAPE** |
 
+> `tri gen-zig` is not built (intentional: `t27c gen` is the Zig generator).
+
 ### Phase 1 — E2E evidence (**critical**; Rings 46–48)
 
+### Not built (planned surface only): tri gen-zig
 **Goal (NOW §3.2):** `seed.t27` → **`t27c gen`** / **`tri gen-zig`** → **Zig tests GREEN** in **one CI job**.
 
 | Step | Deliverable | Acceptance |

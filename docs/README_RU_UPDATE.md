@@ -1,4 +1,6 @@
-## Документация на русском языке
+#> `tri gen-zig` is not built (intentional: `t27c gen` is the Zig generator).
+
+# Документация на русском языке
 
 Документация на русском языке для Trinity S³AI / t27.
 
@@ -13,6 +15,7 @@ cd t27
 ./scripts/tri parse specs/base/types.t27
 
 # Генерация Zig кода
+### Not built (planned surface only): tri gen-zig
 ./scripts/tri gen-zig specs/numeric/gf16.t27
 
 # Или Verilog для FPGA

@@ -29,6 +29,7 @@
 
 **Пример протокола**:
 ```bash
+### Not built (planned surface only): tri cell begin
 tri cell begin --issue <N> --episode migrate-trinity-w1-specs
 tri cell checkpoint --step "VSA ops spec skeleton created"
 tri cell checkpoint --step "ISA registers spec skeleton created"
