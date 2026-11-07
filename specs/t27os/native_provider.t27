@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/native_provider.t27 -- the provider contract of the T27 OS native line and its one
+// adapter, LM Studio (Refs #13212, FR-002).
+//
+// THE CONTRACT (an adapter is a spec that answers these laws; t27 has no traits, so the contract is
+// this set of names and their tests):
+//   list models      models_request / nth_model_id / pick_chat_model
+//   chat request     chat_request_close (bytes of one non-streaming call)
+//   stream events    SE_DELTA / SE_DONE / SE_USAGE / SE_ERROR (alpha.1 emits DONE and USAGE only)
+//   cancellation     wait_verdict (cancel beats timeout)
+//   timeout          clamp_timeout / wait_verdict
+//   token usage      parse_reply -> prompt_tokens / completion_tokens
+//   redacted error   ERR_* classes and error_label: a class and a fixed word, never provider text
+//
+// WHAT IS NOT HERE, on purpose (order of 2026-11-07): no NVIDIA, no automatic fallback, no key or
+// account rotation. fallback_allowed and rotation_allowed answer false and a test holds them there.
+// The socket belongs to native_host.t27; this spec owns the BYTES and the decisions.
+//
+// LM Studio answers pretty-printed JSON ("content": "x", a space after the colon), which the byte
+// laws of provider/call.t27 do not read; compact_json squeezes the whitespace outside strings first,
+// so reply_content (reused, not copied) finds its tag.
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osNativeProvider;
+
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use provider::call::chat_body;
+use provider::call::reply_content;
+
+// ---- the provider set --------------------------------------------------------------------------------------
+
+pub const PROVIDER_LMSTUDIO : u32 = 1;
+pub const PROVIDER_COUNT : u32 = 1;
+
+/// No automatic fallback to another provider, ever, in this line.
+pub fn fallback_allowed() -> bool { return false; }
+
+/// No key or account rotation in this line.
+pub fn rotation_allowed() -> bool { return false; }
+
+// ---- the redacted error classes ----------------------------------------------------------------------------
+
+pub const ERR_NONE : u32 = 0;
+pub const ERR_CONNECT : u32 = 1;
+pub const ERR_TIMEOUT : u32 = 2;
+pub const ERR_CANCELLED : u32 = 3;
+pub const ERR_AUTH : u32 = 4;
+pub const ERR_RATE : u32 = 5;
+pub const ERR_SERVER : u32 = 6;
+pub const ERR_BAD_REPLY : u32 = 7;
+pub const ERR_BAD_REQUEST : u32 = 8;
+pub const ERR_REFUSED : u32 = 9;
+
+/// The fixed word of a class. The log and the report carry this word and nothing the provider said.
+pub fn error_label(c: u32) -> []const u8 {
+    if (c == ERR_NONE) { return "none"; }
+    if (c == ERR_CONNECT) { return "connect"; }
+    if (c == ERR_TIMEOUT) { return "timeout"; }
+    if (c == ERR_CANCELLED) { return "cancelled"; }
+    if (c == ERR_AUTH) { return "auth"; }
+    if (c == ERR_RATE) { return "rate"; }
+    if (c == ERR_SERVER) { return "server"; }
+    if (c == ERR_BAD_REPLY) { return "bad_reply"; }
+    if (c == ERR_BAD_REQUEST) { return "bad_request"; }
+    if (c == ERR_REFUSED) { return "refused"; }
+    return "unknown";
+}
+
+/// An HTTP status into an error class: 2xx is none; the rest are named, anything else is a bad reply.
+pub fn classify_status(status: u32) -> u32 {
+    if (status >= 200 and status < 300) { return ERR_NONE; }
+    if (status == 400 or status == 404 or status == 422) { return ERR_BAD_REQUEST; }
+    if (status == 401 or status == 403) { return ERR_AUTH; }
+    if (status == 408) { return ERR_TIMEOUT; }
+    if (status == 429) { return ERR_RATE; }
+    if (status >= 500 and status < 600) { return ERR_SERVER; }
+    return ERR_BAD_REPLY;
+}
+
+// ---- stream events -----------------------------------------------------------------------------------------
+
+pub const SE_DELTA : u32 = 0;
+pub const SE_DONE : u32 = 1;
+pub const SE_USAGE : u32 = 2;
+pub const SE_ERROR : u32 = 3;
+
+// ---- timeout and cancellation ------------------------------------------------------------------------------
+
+pub const TIMEOUT_DEFAULT_MS : u64 = 60000;
+pub const TIMEOUT_MAX_MS : u64 = 300000;
+
+/// A requested timeout, bounded: 0 means the default, anything above the maximum is the maximum.
+pub fn clamp_timeout(ms: u64) -> u64 {
+    if (ms == 0) { return TIMEOUT_DEFAULT_MS; }
+    if (ms > TIMEOUT_MAX_MS) { return TIMEOUT_MAX_MS; }
+    return ms;
+}
+
+/// What the wait loop does at one poll: keep waiting (ERR_NONE), stop as cancelled, or stop as timed out.
+/// Cancellation wins over a timeout. A clock that went backwards counts as timed out (fail closed).
+pub fn wait_verdict(cancelled: bool, start_ms: u64, now_ms: u64, limit_ms: u64) -> u32 {
+    if (cancelled) { return ERR_CANCELLED; }
+    if (now_ms < start_ms) { return ERR_TIMEOUT; }
+    if (now_ms - start_ms >= clamp_timeout(limit_ms)) { return ERR_TIMEOUT; }
+    return ERR_NONE;
+}
+
+// ---- the endpoint guard ------------------------------------------------------------------------------------
+
+/// True for a dotted IPv4 address whose first octet is 127 and nothing else: this adapter talks to
+/// loopback only. A name, a hex form or a trailing label is refused, so "127.0.0.1.evil.test" fails.
+pub fn endpoint_is_loopback(host: []const u8) -> bool {
+    if (host.len < 7 or host.len > 15) { return false; }
+    var dots : u32 = 0;
+    var octet : u32 = 0;
+    var digits : u32 = 0;
+    var first : u32 = 0;
+    var i : usize = 0;
+    while (i < host.len) {
+        const ch : u8 = host[i];
+        if (ch >= 48 and ch <= 57) {
+            octet = octet * 10 + @as(u32, ch - 48);
+            digits = digits + 1;
+            if (digits > 3 or octet > 255) { return false; }
+        } else if (ch == 46) {
+            if (digits == 0) { return false; }
+            if (dots == 0) { first = octet; }
+            dots = dots + 1;
+            octet = 0;
+            digits = 0;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    if (digits == 0 or dots != 3) { return false; }
+    return first == 127;
+}
+
+// ---- the request bytes -------------------------------------------------------------------------------------
+
+/// GET /v1/models, closing after the reply. Returns the length; 0 when `out` is too short or the host
+/// is not loopback.
+pub fn models_request(host: []const u8, out: []u8) -> usize {
+    if (out.len < 256 or endpoint_is_loopback(host) == false) { return 0; }
+    var n : usize = put_bytes(out, 0, "GET /v1/models HTTP/1.1\r\nHost: ");
+    n = put_bytes(out, n, host);
+    n = put_bytes(out, n, "\r\nConnection: close\r\n\r\n");
+    return n;
+}
+
+/// One non-streaming chat call, closing after the reply (the host reads to EOF). The body is the
+/// bytes of provider/call.t27 chat_body. `key` may be empty (LM Studio wants none); a non-empty key is
+/// sent as a bearer header and never anywhere else. Returns the length; 0 on a refusal.
+pub fn chat_request_close(host: []const u8, key: []const u8, model: []const u8, prompt: []const u8, max_tokens: u32, out: []u8) -> usize {
+    if (out.len < 1024 or endpoint_is_loopback(host) == false) { return 0; }
+    var body : [4096]u8 = undefined;
+    const bn : usize = chat_body(model, prompt, max_tokens, body[0..4096]);
+    if (bn == 0 or 400 + bn + key.len + host.len > out.len) { return 0; }
+    var n : usize = put_bytes(out, 0, "POST /v1/chat/completions HTTP/1.1\r\nHost: ");
+    n = put_bytes(out, n, host);
+    if (key.len > 0) {
+        n = put_bytes(out, n, "\r\nAuthorization: Bearer ");
+        n = put_bytes(out, n, key);
+    }
+    n = put_bytes(out, n, "\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ");
+    n = put_dec(out, n, @as(u64, bn));
+    n = put_bytes(out, n, "\r\n\r\n");
+    var j : usize = 0;
+    while (j < bn) {
+        out[n + j] = body[j];
+        j = j + 1;
+    }
+    return n + bn;
+}
+
+// ---- reading a reply ---------------------------------------------------------------------------------------
+
+/// "not found" for the finders below.
+pub const NOT_FOUND : usize = 4294967295;
+
+/// The index of the first `needle` in `hay` at or after `from`; NOT_FOUND when absent.
+pub fn find_from(hay: []const u8, needle: []const u8, from: usize) -> usize {
+    if (needle.len == 0) { return NOT_FOUND; }
+    var i : usize = from;
+    while (i + needle.len <= hay.len) {
+        var k : usize = 0;
+        var same : bool = true;
+        while (k < needle.len) {
+            if (hay[i + k] != needle[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return NOT_FOUND;
+}
+
+/// The HTTP status of a reply that starts with "HTTP/1.x NNN"; 0 on anything else.
+pub fn http_status(resp: []const u8) -> u32 {
+    if (resp.len < 12) { return 0; }
+    if (resp[0] != 72 or resp[1] != 84 or resp[2] != 84 or resp[3] != 80) { return 0; }
+    var i : usize = 4;
+    while (i < resp.len and resp[i] != 32) { i = i + 1; }
+    i = i + 1;
+    if (i + 3 > resp.len) { return 0; }
+    var v : u32 = 0;
+    var k : usize = 0;
+    while (k < 3) {
+        const c : u8 = resp[i + k];
+        if (c < 48 or c > 57) { return 0; }
+        v = v * 10 + @as(u32, c - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+/// Where the body of a reply starts: after the first blank line; 0 when there is no head.
+pub fn body_offset(resp: []const u8) -> usize {
+    const at : usize = find_from(resp, "\r\n\r\n", 0);
+    if (at == NOT_FOUND) { return 0; }
+    return at + 4;
+}
+
+/// JSON with the whitespace outside strings removed. Escapes inside strings are kept byte for byte.
+/// Returns the length; 0 when `out` is too short.
+pub fn compact_json(src: []const u8, out: []u8) -> usize {
+    var w : usize = 0;
+    var in_str : bool = false;
+    var i : usize = 0;
+    while (i < src.len) {
+        const c : u8 = src[i];
+        if (in_str) {
+            if (w >= out.len) { return 0; }
+            out[w] = c;
+            w = w + 1;
+            if (c == 92 and i + 1 < src.len) {
+                if (w >= out.len) { return 0; }
+                out[w] = src[i + 1];
+                w = w + 1;
+                i = i + 1;
+            } else if (c == 34) {
+                in_str = false;
+            }
+        } else {
+            if (c == 34) { in_str = true; }
+            if (c != 32 and c != 9 and c != 10 and c != 13) {
+                if (w >= out.len) { return 0; }
+                out[w] = c;
+                w = w + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return w;
+}
+
+/// The unsigned number right after `tag` in compact JSON ("prompt_tokens":22 -> 22); 0 when absent.
+/// At most 18 digits are read, so the value cannot overflow.
+pub fn json_u64_after(c: []const u8, tag: []const u8) -> u64 {
+    const at : usize = find_from(c, tag, 0);
+    if (at == NOT_FOUND) { return 0; }
+    var v : u64 = 0;
+    var d : u32 = 0;
+    var i : usize = at + tag.len;
+    while (i < c.len and d < 18 and c[i] >= 48 and c[i] <= 57) {
+        v = v * 10 + @as(u64, c[i] - 48);
+        d = d + 1;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// What one reply says, with no provider text in it.
+pub struct ReplyInfo {
+    err: u32,
+    status: u32,
+    content_len: usize,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+/// Reads one full HTTP reply: the status class, the assistant text into `content`, the token usage.
+/// `scratch` holds the compacted body (the host passes one at least as long as the reply). A 2xx reply
+/// with no content is ERR_BAD_REPLY, so an empty answer is never counted as a success.
+pub fn parse_reply(resp: []const u8, scratch: []u8, content: []u8) -> ReplyInfo {
+    var info : ReplyInfo = ReplyInfo { err: ERR_NONE, status: 0, content_len: 0, prompt_tokens: 0, completion_tokens: 0 };
+    info.status = http_status(resp);
+    info.err = classify_status(info.status);
+    if (info.err != ERR_NONE) { return info; }
+    const off : usize = body_offset(resp);
+    const cn : usize = compact_json(resp[off..resp.len], scratch);
+    if (cn == 0) {
+        info.err = ERR_BAD_REPLY;
+        return info;
+    }
+    info.content_len = reply_content(scratch[0..cn], content);
+    info.prompt_tokens = json_u64_after(scratch[0..cn], "\"prompt_tokens\":");
+    info.completion_tokens = json_u64_after(scratch[0..cn], "\"completion_tokens\":");
+    if (info.content_len == 0) { info.err = ERR_BAD_REPLY; }
+    return info;
+}
+
+// ---- the model list ----------------------------------------------------------------------------------------
+
+/// The n-th (from 0) model id of a compact /v1/models body, copied to `out`; returns its length, 0 when
+/// there is no such model.
+pub fn nth_model_id(c: []const u8, n: u32, out: []u8) -> usize {
+    const tag : []const u8 = "\"id\":\"";
+    var from : usize = 0;
+    var seen : u32 = 0;
+    while (true) {
+        const at : usize = find_from(c, tag, from);
+        if (at == NOT_FOUND) { return 0; }
+        const start : usize = at + tag.len;
+        var e : usize = start;
+        while (e < c.len and c[e] != 34) { e = e + 1; }
+        if (seen == n) {
+            if (e - start > out.len) { return 0; }
+            var k : usize = 0;
+            while (k < e - start) {
+                out[k] = c[start + k];
+                k = k + 1;
+            }
+            return e - start;
+        }
+        seen = seen + 1;
+        from = e;
+    }
+    return 0;
+}
+
+/// True when the id names an embedding model: it holds "embed". Those cannot answer a chat call.
+pub fn is_embedding_id(id: []const u8) -> bool {
+    return find_from(id, "embed", 0) != NOT_FOUND;
+}
+
+/// The first model of the list that can chat; 0 when there is none.
+pub fn pick_chat_model(c: []const u8, out: []u8) -> usize {
+    var n : u32 = 0;
+    while (n < 64) {
+        const len : usize = nth_model_id(c, n, out);
+        if (len == 0) { return 0; }
+        if (is_embedding_id(out[0..len]) == false) { return len; }
+        n = n + 1;
+    }
+    return 0;
+}
+
+// ---- the tests ---------------------------------------------------------------------------------------------
+
+test "no_fallback_and_no_rotation_and_one_provider" {
+    assert fallback_allowed() == false;
+    assert rotation_allowed() == false;
+    assert PROVIDER_COUNT == 1;
+    assert PROVIDER_LMSTUDIO == 1;
+}
+
+test "http_statuses_map_to_the_named_classes" {
+    assert classify_status(200) == ERR_NONE;
+    assert classify_status(204) == ERR_NONE;
+    assert classify_status(401) == ERR_AUTH;
+    assert classify_status(404) == ERR_BAD_REQUEST;
+    assert classify_status(408) == ERR_TIMEOUT;
+    assert classify_status(429) == ERR_RATE;
+    assert classify_status(503) == ERR_SERVER;
+    assert classify_status(302) == ERR_BAD_REPLY;
+    assert classify_status(0) == ERR_BAD_REPLY;
+}
+
+test "an_error_label_is_a_fixed_word_never_provider_text" {
+    assert error_label(ERR_TIMEOUT).len == 7;
+    assert error_label(ERR_CANCELLED).len == 9;
+    assert error_label(ERR_NONE).len == 4;
+    assert error_label(77).len == 7;
+}
+
+test "cancel_beats_timeout_and_a_backwards_clock_fails_closed" {
+    assert wait_verdict(false, 1000, 1500, 60000) == ERR_NONE;
+    assert wait_verdict(true, 1000, 1500, 60000) == ERR_CANCELLED;
+    assert wait_verdict(true, 1000, 999999, 5000) == ERR_CANCELLED;
+    assert wait_verdict(false, 1000, 66000, 5000) == ERR_TIMEOUT;
+    assert wait_verdict(false, 1000, 61000, 0) == ERR_TIMEOUT;
+    assert wait_verdict(false, 1000, 900, 5000) == ERR_TIMEOUT;
+}
+
+test "a_timeout_is_bounded" {
+    assert clamp_timeout(0) == TIMEOUT_DEFAULT_MS;
+    assert clamp_timeout(5000) == 5000;
+    assert clamp_timeout(99999999) == TIMEOUT_MAX_MS;
+}
+
+test "only_a_dotted_loopback_address_passes_the_endpoint_guard" {
+    assert endpoint_is_loopback("127.0.0.1");
+    assert endpoint_is_loopback("127.1.2.3");
+    assert endpoint_is_loopback("10.0.0.1") == false;
+    assert endpoint_is_loopback("localhost") == false;
+    assert endpoint_is_loopback("127.0.0.1.evil.test") == false;
+    assert endpoint_is_loopback("127.0.0") == false;
+    assert endpoint_is_loopback("127.0.0.256") == false;
+    assert endpoint_is_loopback("") == false;
+}
+
+test "the_models_request_is_a_get_that_closes" {
+    var out : [512]u8 = undefined;
+    const n : usize = models_request("127.0.0.1", out[0..512]);
+    const want : []const u8 = "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    assert n == want.len;
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+    assert models_request("8.8.8.8", out[0..512]) == 0;
+}
+
+test "the_chat_request_sends_no_bearer_header_when_the_key_is_empty" {
+    var out : [2048]u8 = undefined;
+    const n : usize = chat_request_close("127.0.0.1", "", "m", "hi", 16, out[0..2048]);
+    assert n > 100;
+    assert find_from(out[0..n], "Authorization", 0) == NOT_FOUND;
+    assert find_from(out[0..n], "Connection: close", 0) != NOT_FOUND;
+    assert find_from(out[0..n], "\r\n\r\n{\"model\":\"m\"", 0) != NOT_FOUND;
+    assert out[n - 1] == 125;
+}
+
+test "a_non_empty_key_travels_only_as_the_bearer_header" {
+    var out : [2048]u8 = undefined;
+    const n : usize = chat_request_close("127.0.0.1", "kk-test", "m", "hi", 16, out[0..2048]);
+    const first : usize = find_from(out[0..n], "kk-test", 0);
+    assert first != NOT_FOUND;
+    assert find_from(out[0..n], "kk-test", first + 1) == NOT_FOUND;
+    assert find_from(out[0..n], "Authorization: Bearer kk-test", 0) != NOT_FOUND;
+}
+
+test "the_chat_request_refuses_a_non_loopback_host" {
+    var out : [2048]u8 = undefined;
+    assert chat_request_close("203.0.113.9", "", "m", "hi", 16, out[0..2048]) == 0;
+}
+
+test "compact_json_drops_whitespace_outside_strings_only" {
+    var out : [64]u8 = undefined;
+    const src : []const u8 = "{ \"a\": \"x y\",\n  \"b\": 1 }";
+    const n : usize = compact_json(src, out[0..64]);
+    const want : []const u8 = "{\"a\":\"x y\",\"b\":1}";
+    assert n == want.len;
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+}
+
+test "compact_json_keeps_an_escaped_quote_inside_a_string" {
+    var out : [64]u8 = undefined;
+    const src : []const u8 = "{\"a\": \"p \\\" q\"}";
+    const n : usize = compact_json(src, out[0..64]);
+    const want : []const u8 = "{\"a\":\"p \\\" q\"}";
+    assert n == want.len;
+}
+
+test "a_pretty_printed_lm_studio_reply_parses_to_text_and_usage" {
+    const resp : []const u8 = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\n  \"choices\": [\n    {\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"Hello there\"\n      }\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 22,\n    \"completion_tokens\": 9,\n    \"total_tokens\": 31\n  }\n}";
+    var scratch : [1024]u8 = undefined;
+    var content : [128]u8 = undefined;
+    const info : ReplyInfo = parse_reply(resp, scratch[0..1024], content[0..128]);
+    assert info.err == ERR_NONE;
+    assert info.status == 200;
+    assert info.content_len == 11;
+    assert content[0] == 72 and content[10] == 101;
+    assert info.prompt_tokens == 22;
+    assert info.completion_tokens == 9;
+}
+
+test "an_http_error_is_classified_and_carries_no_text" {
+    const resp : []const u8 = "HTTP/1.1 429 Too Many Requests\r\n\r\n{\"error\":\"secret detail\"}";
+    var scratch : [256]u8 = undefined;
+    var content : [64]u8 = undefined;
+    const info : ReplyInfo = parse_reply(resp, scratch[0..256], content[0..64]);
+    assert info.err == ERR_RATE;
+    assert info.content_len == 0;
+}
+
+test "a_200_reply_with_no_content_is_a_bad_reply_not_a_success" {
+    const resp : []const u8 = "HTTP/1.1 200 OK\r\n\r\n{\"choices\":[],\"usage\":{\"prompt_tokens\":1}}";
+    var scratch : [256]u8 = undefined;
+    var content : [64]u8 = undefined;
+    const info : ReplyInfo = parse_reply(resp, scratch[0..256], content[0..64]);
+    assert info.err == ERR_BAD_REPLY;
+}
+
+test "the_chat_model_is_the_first_one_that_is_not_an_embedding_model" {
+    const body : []const u8 = "{\"data\":[{\"id\":\"text-embedding-nomic-embed-text-v1.5\",\"object\":\"model\"},{\"id\":\"qwen/qwen3-4b-2507\",\"object\":\"model\"}],\"object\":\"list\"}";
+    var out : [96]u8 = undefined;
+    const n : usize = pick_chat_model(body, out[0..96]);
+    const want : []const u8 = "qwen/qwen3-4b-2507";
+    assert n == want.len;
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+    assert nth_model_id(body, 2, out[0..96]) == 0;
+}
+
+test "a_list_of_only_embedding_models_has_no_chat_model" {
+    const body : []const u8 = "{\"data\":[{\"id\":\"text-embedding-x\"}]}";
+    var out : [64]u8 = undefined;
+    assert pick_chat_model(body, out[0..64]) == 0;
+}
+
+test "the_http_status_reader_rejects_a_non_http_text" {
+    assert http_status("HTTP/1.1 503 Service Unavailable") == 503;
+    assert http_status("hello world 200") == 0;
+    assert http_status("HTTP/1.1 2x0 X") == 0;
+}
