@@ -1,26 +1,3 @@
-//! One type name, more than one definition.
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! The quantifier census computes a domain size `|D|` from declared types. For
-//! fifteen names it had to answer "unbounded" — not because the type is
-//! infinite, but because **which type** is undetermined: the name has several
-//! definitions in the corpus and nothing says which one a spec means.
-//!
-//! Nothing else in this repository reports that. Every cross-spec type
-//! resolution — the census, any future enumerating lowering, any reader — is
-//! guessing on these names, and each of them guesses silently.
-//!
-//! WHAT IT DISTINGUISHES, AND WHY THE DISTINCTION MATTERS
-//! -----------------------------------------------------
-//!   * CONFLICTED — the field lists differ. Two specs disagree about one type.
-//!     A consumer that picks either one is wrong half the time and says nothing.
-//!   * DUPLICATED — the same fields written twice. Harmless to a resolver, and
-//!     still worth naming: it is the state a CONFLICT starts from, one edit ago.
-//!
-//! It reports and does not fail. Whether two `ProofStep` types in unrelated
-//! subsystems should be renamed is a judgement about the corpus, not a rule a
-//! tool may enforce.
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeMap;

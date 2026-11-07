@@ -1,19 +1,3 @@
-//! `tri pr ready` — is this pull request actually safe to merge?
-//!
-//! Written after merging a pull request whose language audit was red. The
-//! failure was there, in the list, and I read a summary line I had written
-//! myself instead of the list. The gate was correct; I was not.
-//!
-//! The judgement that matters is not "is anything failing" -- in these
-//! repositories something is always failing -- but "is anything failing HERE
-//! that is not already failing everywhere else". So this classifies every
-//! failure against the default branch and against recently merged pull
-//! requests, and prints one unambiguous verdict line at the end.
-//!
-//! It refuses to guess. A check whose status it cannot classify is reported as
-//! unclassified and blocks the verdict, because an unread check is exactly what
-//! this command exists to prevent.
-
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::collections::{BTreeMap, BTreeSet};

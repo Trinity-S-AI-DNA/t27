@@ -1,30 +1,3 @@
-//! Every quantified clause in the corpus, with the size of the domain it ranges
-//! over.
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! 90% of everything the t27 parser discards is universal quantification, in
-//! four notations. What to DO about that is #2774, an owner decision that binds
-//! four backends. Three independently written proposals for it disagreed about
-//! the lowering and agreed exactly about the first step: **report before you
-//! lower**, because the ceiling cannot be chosen without knowing the
-//! distribution of domain sizes, and nobody has ever measured it.
-//!
-//! This is that report and nothing else. It changes no parse, no lowering, no
-//! generated artefact, and no discard count. It reads the specs.
-//!
-//! WHAT A DOMAIN SIZE MEANS HERE
-//! -----------------------------
-//! `|D|` is computed from DECLARED TYPES ALONE -- never from a guard, never from
-//! a value. A binder over `Trit` ranges over 3 values whatever the body says
-//! about it. Guard narrowing (`x.len() == 4` collapsing a slice axis) is
-//! deliberately NOT implemented: it is the part that needs a semantics, and this
-//! command must not be the thing that quietly decides one.
-//!
-//! `BOTTOM` -- printed as `unbounded` -- is absorbing. A product with one
-//! unbounded axis is unbounded. That is the honest answer for `string`, for a
-//! slice with no pinned length, and for a type this command cannot resolve:
-//! **an unresolved name is not assumed small.**
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::collections::{BTreeMap, BTreeSet};

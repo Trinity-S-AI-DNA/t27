@@ -1,25 +1,3 @@
-//! The numbered sections of a SKILL.md, checked for collisions.
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! Two sessions worked this repository at the same time and both appended to
-//! `.claude/skills/ci-gates/SKILL.md`, both starting at `## 179.`. Git flagged
-//! the overlap as a conflict, which is the lucky case: the resolution that keeps
-//! BOTH sides is one keystroke away, and it leaves two sections numbered 179 in
-//! a file whose numbers are how every other document refers to them.
-//!
-//! A duplicate is silent. Nothing renders differently, nothing fails to build,
-//! and a later "see 179" points at either of two things.
-//!
-//! WHAT IT CHECKS
-//! --------------
-//!   * duplicates   -- two sections with one number. The merge hazard.
-//!   * out of order -- section 180 before 179. A hand edit gone wrong.
-//!   * gaps         -- 126 is missing today, from a removal nobody renumbered.
-//!
-//! Duplicates and disorder are FAILURES. A gap is reported and is not: renumbering
-//! a 185-section file to close one hole would rewrite every reference to every
-//! section after it, which is a worse outcome than a hole.
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeMap;
