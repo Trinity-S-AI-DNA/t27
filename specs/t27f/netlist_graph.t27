@@ -1,0 +1,688 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/netlist_graph.t27 -- the T27F circuit view: a netlist as a spec graph (Refs gHashTag/t27#10034;
+; epic gHashTag/trinity#1648, RFC gHashTag/trinity#1649). T27F is t27's frontend; its core is the visual spec
+; of .t27 (.claude/skills/t27f/SKILL.md, "What T27F is"): one model, many views. Until now the only model
+; was a .t27 spec. This file adds the second source: a SPICE netlist read by specs/tools/t27o/spice_convert.t27
+; (`emit_gates`), turned into the same graph IR (specs/t27f/spec_graph.t27) and drawn by the same view
+; (specs/t27f/spec_graph_view.t27). No second graph type, no second layout, no second drawing rule.
+; What the converter hands over is a text table: a line per net (`net i name`, root ports first, in the order
+; of the .subckt line) and a line per gate (`gate g name kind pins ...`, depth first, so the gates of one
+; subcircuit are consecutive). The table is the document the graph points into, line for line:
+;   line 1 and 2   the two header lines (count of gates and nets, count per kind);
+;   line 3 + n     net n;
+;   line 3 + M + g gate g (M nets).
+; Mapping, and the label each element carries:
+;   - the top subcircuit is node 0, the module, EXACT, spanning the whole table;
+;   - a root port is an OPAQUE node, EXACT, spanning the line of its net. It is a net the outside of the
+;     circuit reaches, so it is neither a gate nor a subcircuit;
+;   - an instance is a FN node whose name is a prefix of the dotted gate names under it (`x7`, `x7.x5`). It
+;     is DERIVED: the table names gates, the grouping is read from their paths. The level picks the depth:
+;     0 draws every gate (EXACT: the node is one gate under its full name), 1 the instances of the top, 2 the
+;     instances inside those. A group of one gate named in full stays EXACT;
+;   - a net is an edge, DERIVED data_flow: from the gate that drives it to a gate that reads it. The table
+;     says which pin is which (inputs, then the output; kind decides), not which way a net is meant to be
+;     read, so a direction is inferred from the pin roles and is never EXACT. A pin that is only a supply
+;     (the pins after the output) makes no edge. Several drivers of one net (a transmission gate and its
+;     keeper) each make their own edge. Two groups joined by many nets get one edge, the first net's;
+;   - an edge carries a real line of the table: the row of the driving gate, or for a port the row of its
+;     net. The view refuses an edge without a line.
+; Not claimed: nothing here parses a deck (spice_convert does), a direction is a reading and not a
+; measurement, and the view draws no routing around boxes. A deck the converter refuses gives a blank graph,
+; which validate_graph refuses with ERR_SPEC_PATH: nothing is drawn from a circuit nobody could read.
+; The negative controls are the swapped Set and Reset pins of sar_logic.t27 (the same wire flips its edges)
+; and graphs corrupted by hand (a ghost node, a dangling edge, an edge with no line).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_netlist_graph;
+
+use tools::t27o::spice_convert::{emit_gates, NONE, ERR_LINE, NDEF, DEF0, DEF_SLOTS, D_NAME_A, D_NAME_B, D_NPORTS, D_PARENT, GT_NGATE, GT_NNET, GT_NET0, GT_GATE0, GATE_SLOTS, top_is};
+use analog::sar_logic::{sl_kind, sl_pin, sl_n_in, sl_out_net, sl_cat, sl_deck};
+use t27f::spec_graph::{SpecGraph, validate_graph, blank_graph, with_node, with_edge, has_edge, count_node_kind, count_node_label, count_edge_kind, count_edge_label, NODE_MODULE, NODE_FN, NODE_OPAQUE, EDGE_DATA_FLOW, LABEL_EXACT, LABEL_DERIVED, NO_LINE, NO_INDEX, GRAPH_OK, ERR_SPEC_PATH, ERR_SPAN_OUTSIDE, ERR_EDGE_DANGLING};
+use t27f::spec_graph_view::{view_verdict, view_node_x, view_node_y, view_node_w, view_node_h, view_node_fill, view_node_stroke, view_node_dash, view_edge_x1, view_edge_y1, view_edge_x2, view_edge_y2, view_edge_stroke, view_edge_dash, view_width, view_height, view_overlap_count, VIEW_OK, VIEW_ERR_EDGE_NO_LINE, VIEW_BACKDROP, VIEW_TEXT, VIEW_FONT_PX};
+
+/// Where a gate row keeps the start and the end of its name in the work buffer (the row is GATE_SLOTS
+/// wide: kind, seven pins, name start, name end).
+pub const NL_G_NAME_A : usize = 8;
+pub const NL_G_NAME_B : usize = 9;
+
+/// The first line of the table that is a net: lines 1 and 2 are the headers.
+pub const NL_FIRST_NET_LINE : usize = 3;
+
+// ---------------------------------------------------------------- names and lines
+
+/// The end of the first `level` components of the dotted name w[a .. b]; level 0, or a name with fewer
+/// components than `level`, gives the whole name (b).
+pub fn nl_key_end(w: []const u8, a: usize, b: usize, level: usize) -> usize {
+    if (level == 0) { return b; }
+    var dots : usize = 0;
+    var i : usize = a;
+    while (i < b) {
+        if (w[i] == 46) {
+            dots = dots + 1;
+            if (dots == level) { return i; }
+        }
+        i = i + 1;
+    }
+    return b;
+}
+
+/// The line of the table that holds net n.
+pub fn nl_net_line(n: usize) -> u32 {
+    return (NL_FIRST_NET_LINE + n) as u32;
+}
+
+/// The line of the table that holds gate g, when the table has `nnet` net lines.
+pub fn nl_gate_line(nnet: usize, g: usize) -> u32 {
+    return (NL_FIRST_NET_LINE + nnet + g) as u32;
+}
+
+/// Do gates ga and gb have the same first `level` name components?
+pub fn nl_same_key(w: []const u8, gt: []const usize, ga: usize, gb: usize, level: usize) -> bool {
+    const ra : usize = GT_GATE0 + ga * GATE_SLOTS;
+    const rb : usize = GT_GATE0 + gb * GATE_SLOTS;
+    const sa : usize = gt[ra + NL_G_NAME_A];
+    const sb : usize = gt[rb + NL_G_NAME_A];
+    const ea : usize = nl_key_end(w, sa, gt[ra + NL_G_NAME_B], level);
+    const eb : usize = nl_key_end(w, sb, gt[rb + NL_G_NAME_B], level);
+    if (ea - sa != eb - sb) { return false; }
+    var k : usize = 0;
+    while (k < ea - sa) {
+        if (w[sa + k] != w[sb + k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// How many ports the top subcircuit has: the same lookup emit_gates makes for its root; 0 when there is none.
+pub fn nl_nports(w: []const u8, st: []const usize, top: []const u8) -> usize {
+    var d : usize = 0;
+    while (d < st[NDEF]) {
+        const row : usize = DEF0 + d * DEF_SLOTS;
+        if (st[row + D_PARENT] == NONE and top_is(w, st[row + D_NAME_A], st[row + D_NAME_B], top)) { return st[row + D_NPORTS]; }
+        d = d + 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- the graph
+
+/// One data_flow edge from node f to node t, DERIVED, on `line`; none when f is t or the edge is there.
+pub fn nl_flow(g: SpecGraph, f: usize, t: usize, line: u32) -> SpecGraph {
+    if (f == t or has_edge(g, EDGE_DATA_FLOW, f as u32, t as u32)) { return g; }
+    return with_edge(g, EDGE_DATA_FLOW, f as u16, t as u16, LABEL_DERIVED, line);
+}
+
+/// The node of the gates first .. last, which share their first `level` name components. A lone gate
+/// named in full is EXACT; anything else is a prefix of the gate names, so DERIVED. Its span is the
+/// table rows of the first and the last gate.
+pub fn nl_add_group(g: SpecGraph, w: []const u8, gt: []const usize, first: usize, last: usize, level: usize) -> SpecGraph {
+    const nnet : usize = gt[GT_NNET];
+    const r0 : usize = GT_GATE0 + first * GATE_SLOTS;
+    const a : usize = gt[r0 + NL_G_NAME_A];
+    const b : usize = gt[r0 + NL_G_NAME_B];
+    const ke : usize = nl_key_end(w, a, b, level);
+    const s : u32 = nl_gate_line(nnet, first);
+    const e : u32 = nl_gate_line(nnet, last);
+    if (first == last and ke == b) { return with_node(g, NODE_FN, LABEL_EXACT, w[a .. b], s, e); }
+    return with_node(g, NODE_FN, LABEL_DERIVED, w[a .. ke], s, e);
+}
+
+/// The circuit as a spec graph. `w` and `gt` are the converter's work buffer and gate table after
+/// emit_gates, `nports` the ports of `top`, `level` the depth (see the header), `top` the name of the
+/// top subcircuit and `path` the name the graph carries as its spec path. A table with no gates, or
+/// fewer nets than ports, gives the blank graph: it has no spec path, so validate_graph refuses it.
+pub fn nl_graph(w: []const u8, gt: []const usize, nports: usize, level: usize, top: str, path: str) -> SpecGraph {
+    var g : SpecGraph = blank_graph();
+    const ngate : usize = gt[GT_NGATE];
+    const nnet : usize = gt[GT_NNET];
+    if (ngate == 0 or nnet == 0 or nports > nnet or ngate > 256 or nnet > 256) { return g; }
+    const total : u32 = (2 + nnet + ngate) as u32;
+    g.spec_path = path;
+    g.line_count = total;
+    g = with_node(g, NODE_MODULE, LABEL_EXACT, top, 1, total);
+    // the instances: gates with one key are consecutive, so one walk finds every group
+    var gnode : [256]usize = [0] ** 256;
+    var first : usize = 0;
+    while (first < ngate) {
+        var last : usize = first;
+        var nxt : usize = first + 1;
+        while (nxt < ngate and nl_same_key(w, gt, first, nxt, level)) {
+            last = nxt;
+            nxt = nxt + 1;
+        }
+        const idx : usize = g.node_count as usize;
+        g = nl_add_group(g, w, gt, first, last, level);
+        var m : usize = first;
+        while (m <= last) {
+            gnode[m] = idx;
+            m = m + 1;
+        }
+        first = nxt;
+    }
+    // the ports of the top
+    var pnode : [256]usize = [0] ** 256;
+    var n : usize = 0;
+    while (n < nports) {
+        pnode[n] = g.node_count as usize;
+        const na : usize = gt[GT_NET0 + n * 2];
+        const nb : usize = gt[GT_NET0 + n * 2 + 1];
+        g = with_node(g, NODE_OPAQUE, LABEL_EXACT, w[na .. nb], nl_net_line(n), nl_net_line(n));
+        n = n + 1;
+    }
+    // a gate input is fed by the gates that drive its net
+    var rd : usize = 0;
+    while (rd < ngate) {
+        const nin : usize = sl_n_in(sl_kind(gt, rd));
+        var p : usize = 0;
+        while (p < nin) {
+            const net : usize = sl_pin(gt, rd, p);
+            var dr : usize = 0;
+            while (dr < ngate and net != NONE) {
+                if (sl_out_net(gt, dr) == net) { g = nl_flow(g, gnode[dr], gnode[rd], nl_gate_line(nnet, dr)); }
+                dr = dr + 1;
+            }
+            p = p + 1;
+        }
+        rd = rd + 1;
+    }
+    // a port feeds the gates that read it, and is driven by the gates that drive it
+    var q : usize = 0;
+    while (q < nports) {
+        var gi : usize = 0;
+        while (gi < ngate) {
+            const nin2 : usize = sl_n_in(sl_kind(gt, gi));
+            var p2 : usize = 0;
+            while (p2 < nin2) {
+                if (sl_pin(gt, gi, p2) == q) { g = nl_flow(g, pnode[q], gnode[gi], nl_net_line(q)); }
+                p2 = p2 + 1;
+            }
+            if (sl_out_net(gt, gi) == q) { g = nl_flow(g, gnode[gi], pnode[q], nl_net_line(q)); }
+            gi = gi + 1;
+        }
+        q = q + 1;
+    }
+    return g;
+}
+
+// ---------------------------------------------------------------- looking things up
+
+/// The node called `name`, NO_INDEX when there is none. The comparison is the reader's own, top_is
+/// of spice_convert: it ignores case, as SPICE does, and no second equality body is written here.
+pub fn nl_node_named(g: SpecGraph, name: []const u8) -> u32 {
+    var k : u32 = 0;
+    while (k < g.node_count) {
+        const have : []const u8 = g.node_name[k as usize];
+        if (top_is(have, 0, have.len, name)) { return k; }
+        k = k + 1;
+    }
+    return NO_INDEX;
+}
+
+/// Is there a data_flow edge from the node called `from` to the node called `to`?
+pub fn nl_flows(g: SpecGraph, from: []const u8, to: []const u8) -> bool {
+    const f : u32 = nl_node_named(g, from);
+    const t : u32 = nl_node_named(g, to);
+    if (f == NO_INDEX or t == NO_INDEX) { return false; }
+    return has_edge(g, EDGE_DATA_FLOW, f, t);
+}
+
+/// The spans of every node of this kind, added up (lines).
+pub fn nl_span_total(g: SpecGraph, kind: u8) -> u32 {
+    var total : u32 = 0;
+    var k : u32 = 0;
+    while (k < g.node_count) {
+        const i : usize = k as usize;
+        if (g.node_kind[i] == kind) { total = total + (g.line_end[i] - g.line_start[i] + 1); }
+        k = k + 1;
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------- reading the table back
+
+/// The offset where line `line` (1-based) of text[0 .. n] starts; n when there are fewer lines.
+pub fn nl_line_start(text: []const u8, n: usize, line: u32) -> usize {
+    var cur : u32 = 1;
+    var i : usize = 0;
+    while (i < n and cur < line) {
+        if (text[i] == 10) { cur = cur + 1; }
+        i = i + 1;
+    }
+    return i;
+}
+
+/// The offset of the end of the line that starts at s.
+pub fn nl_line_end(text: []const u8, n: usize, s: usize) -> usize {
+    var i : usize = s;
+    while (i < n and text[i] != 10) { i = i + 1; }
+    return i;
+}
+
+/// How many lines text[0 .. n] has (each ends with a newline).
+pub fn nl_count_lines(text: []const u8, n: usize) -> u32 {
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (text[i] == 10) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// Does text[i ..] begin with `lit`, with room for it before `stop`?
+pub fn nl_prefix_at(text: []const u8, i: usize, stop: usize, lit: []const u8) -> bool {
+    if (i + lit.len > stop) { return false; }
+    var k : usize = 0;
+    while (k < lit.len) {
+        if (text[i + k] != lit[k]) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// Does line `line` of the table begin with `lit`?
+pub fn nl_line_begins(text: []const u8, n: usize, line: u32, lit: []const u8) -> bool {
+    const s : usize = nl_line_start(text, n, line);
+    return nl_prefix_at(text, s, nl_line_end(text, n, s), lit);
+}
+
+/// Does line `line` of the table name `nm` as a whole word, or as the first components of a dotted name?
+pub fn nl_line_names(text: []const u8, n: usize, line: u32, nm: []const u8) -> bool {
+    const s : usize = nl_line_start(text, n, line);
+    const e : usize = nl_line_end(text, n, s);
+    var i : usize = s + 1;
+    while (i < e) {
+        const j : usize = i + nm.len;
+        if (j <= e and text[i - 1] == 32 and nl_prefix_at(text, i, e, nm) and (j == e or text[j] == 32 or text[j] == 46)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Does every edge of the graph point at a line that names both of its ends? A group edge points at the
+/// row of the driving gate, which names the group it is in; a port edge points at the row of its port.
+/// A group end is named by the row of the driver; the reader is checked through the port or the net, so
+/// this holds the ends the edge line is the evidence of: the driver of a group-to-group edge, the port of
+/// a port edge.
+pub fn nl_edges_have_evidence(g: SpecGraph, text: []const u8, n: usize) -> bool {
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        const k : usize = j as usize;
+        const f : usize = g.edge_from[k] as usize;
+        const t : usize = g.edge_to[k] as usize;
+        const ln : u32 = g.edge_line[k];
+        if (g.node_kind[f] == NODE_OPAQUE) {
+            if (nl_line_names(text, n, ln, g.node_name[f]) == false) { return false; }
+        } else if (g.node_kind[t] == NODE_OPAQUE) {
+            if (nl_line_names(text, n, ln, g.node_name[t]) == false) { return false; }
+        } else {
+            if (nl_line_names(text, n, ln, g.node_name[f]) == false) { return false; }
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- drawing
+
+/// Write v in decimal into dst at pos; the result is the position after it.
+pub fn nl_num(dst: []u8, pos: usize, v: u32) -> usize {
+    var digits : usize = 1;
+    var r : u32 = v;
+    while (r >= 10) {
+        r = r / 10;
+        digits = digits + 1;
+    }
+    const stop : usize = pos + digits;
+    var q : u32 = v;
+    var k : usize = stop;
+    while (k > pos) {
+        k = k - 1;
+        const dg : u32 = 48 + q % 10;
+        if (k < dst.len) { dst[k] = dg as u8; }
+        q = q / 10;
+    }
+    return stop;
+}
+
+/// Write a colour as `#rrggbb` (lower case hex) into dst at pos; the result is the position after it.
+pub fn nl_colour(dst: []u8, pos: usize, v: u32) -> usize {
+    var p : usize = sl_cat(dst, pos, "#");
+    var q : u32 = v;
+    var k : usize = 6;
+    while (k > 0) {
+        k = k - 1;
+        const d : u32 = q % 16;
+        var ch : u32 = 48 + d;
+        if (d > 9) { ch = 87 + d; }
+        const idx : usize = p + k;
+        if (idx < dst.len) { dst[idx] = ch as u8; }
+        q = q / 16;
+    }
+    return p + 6;
+}
+
+/// One attribute ` name='value'` with a number.
+pub fn nl_attr(dst: []u8, pos: usize, name: []const u8, v: u32) -> usize {
+    var p : usize = sl_cat(dst, pos, " ");
+    p = sl_cat(dst, p, name);
+    p = sl_cat(dst, p, "='");
+    p = nl_num(dst, p, v);
+    return sl_cat(dst, p, "'");
+}
+
+/// One attribute ` name='#rrggbb'`.
+pub fn nl_attr_colour(dst: []u8, pos: usize, name: []const u8, v: u32) -> usize {
+    var p : usize = sl_cat(dst, pos, " ");
+    p = sl_cat(dst, p, name);
+    p = sl_cat(dst, p, "='");
+    p = nl_colour(dst, p, v);
+    return sl_cat(dst, p, "'");
+}
+
+/// The view's boxes and lines as an SVG document in dst; the result is its length. Nothing is chosen
+/// here: every position, colour and dash is a number of spec_graph_view. A graph the view refuses gives
+/// an empty document (0).
+pub fn nl_svg(g: SpecGraph, dst: []u8) -> usize {
+    if (view_verdict(g) != VIEW_OK) { return 0; }
+    const wd : u32 = view_width(g);
+    const ht : u32 = view_height(g);
+    var p : usize = sl_cat(dst, 0, "<svg xmlns='http://www.w3.org/2000/svg'");
+    p = nl_attr(dst, p, "width", wd);
+    p = nl_attr(dst, p, "height", ht);
+    p = sl_cat(dst, p, " viewBox='0 0 ");
+    p = nl_num(dst, p, wd);
+    p = sl_cat(dst, p, " ");
+    p = nl_num(dst, p, ht);
+    p = sl_cat(dst, p, "'>\n<rect");
+    p = nl_attr(dst, p, "width", wd);
+    p = nl_attr(dst, p, "height", ht);
+    p = nl_attr_colour(dst, p, "fill", VIEW_BACKDROP);
+    p = sl_cat(dst, p, "/>\n");
+    var j : u32 = 0;
+    while (j < g.edge_count) {
+        p = sl_cat(dst, p, "<line");
+        p = nl_attr(dst, p, "x1", view_edge_x1(g, j));
+        p = nl_attr(dst, p, "y1", view_edge_y1(g, j));
+        p = nl_attr(dst, p, "x2", view_edge_x2(g, j));
+        p = nl_attr(dst, p, "y2", view_edge_y2(g, j));
+        p = nl_attr_colour(dst, p, "stroke", view_edge_stroke(g, j));
+        if (view_edge_dash(g, j) > 0) { p = nl_attr(dst, p, "stroke-dasharray", view_edge_dash(g, j)); }
+        p = sl_cat(dst, p, "/>\n");
+        j = j + 1;
+    }
+    var n : u32 = 0;
+    while (n < g.node_count) {
+        p = sl_cat(dst, p, "<rect");
+        p = nl_attr(dst, p, "x", view_node_x(g, n));
+        p = nl_attr(dst, p, "y", view_node_y(g, n));
+        p = nl_attr(dst, p, "width", view_node_w(g, n));
+        p = nl_attr(dst, p, "height", view_node_h(g, n));
+        p = nl_attr_colour(dst, p, "fill", view_node_fill(g, n));
+        p = nl_attr_colour(dst, p, "stroke", view_node_stroke(g, n));
+        if (view_node_dash(g, n) > 0) { p = nl_attr(dst, p, "stroke-dasharray", view_node_dash(g, n)); }
+        p = sl_cat(dst, p, "/>\n<text");
+        p = nl_attr(dst, p, "x", view_node_x(g, n) + 8);
+        p = nl_attr(dst, p, "y", view_node_y(g, n) + view_node_h(g, n) / 2 + 5);
+        p = nl_attr_colour(dst, p, "fill", VIEW_TEXT);
+        p = sl_cat(dst, p, " font-family='monospace'");
+        p = nl_attr(dst, p, "font-size", VIEW_FONT_PX);
+        p = sl_cat(dst, p, ">");
+        p = sl_cat(dst, p, g.node_name[n as usize]);
+        p = sl_cat(dst, p, "</text>\n");
+        n = n + 1;
+    }
+    return sl_cat(dst, p, "</svg>\n");
+}
+
+// ---------------------------------------------------------------- tests
+// The deck is the gate-level wiring of the golden SAR logic that sar_logic.t27 carries (113 gates, 100
+// nets, 21 ports). Buffers are the caller's, as for emit_gates.
+
+test the_table_has_one_line_per_net_and_per_gate_and_the_graph_points_into_it {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    assert(n > 0);
+    assert(st[ERR_LINE] == 0);
+    assert(gt[GT_NGATE] == 113);
+    assert(gt[GT_NNET] == 100);
+    assert(nl_nports(&w, &st, "sar_clk") == 21);
+    // the line map the graph relies on: 2 header lines, then the nets, then the gates
+    assert(nl_count_lines(&out, n) == 215);
+    assert(nl_line_begins(&out, n, 1, "gates of sar_clk"));
+    assert(nl_line_begins(&out, n, nl_net_line(0), "net 0 "));
+    assert(nl_line_begins(&out, n, nl_net_line(99), "net 99 "));
+    assert(nl_line_begins(&out, n, nl_gate_line(100, 0), "gate 0 "));
+    assert(nl_line_begins(&out, n, nl_gate_line(100, 112), "gate 112 "));
+}
+
+test level_one_draws_the_two_instances_of_the_top_and_its_ports {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    assert(n > 0);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "sar_clk"), 1, "sar_clk", "specs/analog/sar_logic.t27");
+    assert(validate_graph(g) == GRAPH_OK);
+    assert(view_verdict(g) == VIEW_OK);
+    assert(g.node_count == 24);
+    assert(count_node_kind(g, NODE_MODULE) == 1);
+    assert(count_node_kind(g, NODE_FN) == 2);
+    assert(count_node_kind(g, NODE_OPAQUE) == 21);
+    // the module and the ports are facts; an instance is read from the gate names
+    assert(count_node_label(g, LABEL_EXACT) == 22);
+    assert(count_node_label(g, LABEL_DERIVED) == 2);
+    assert(nl_node_named(g, "x7") != NO_INDEX);
+    assert(nl_node_named(g, "x4") != NO_INDEX);
+    // every gate is in exactly one instance
+    assert(nl_span_total(g, NODE_FN) == 113);
+    // the wiring joins them, and every edge is an inferred direction
+    assert(g.edge_count > 0);
+    assert(count_edge_kind(g, EDGE_DATA_FLOW) == g.edge_count);
+    assert(count_edge_label(g, LABEL_DERIVED) == g.edge_count);
+    assert(nl_flows(g, "clks", "x7"));
+    assert(nl_flows(g, "clks", "x4"));
+    assert(view_overlap_count(g) == 0);
+}
+
+test every_edge_line_is_a_row_of_the_table_that_names_its_end {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    assert(n > 0);
+    const nports : usize = nl_nports(&w, &st, "sar_clk");
+    const g1 : SpecGraph = nl_graph(&w, &gt, nports, 1, "sar_clk", "specs/analog/sar_logic.t27");
+    const g2 : SpecGraph = nl_graph(&w, &gt, nports, 2, "sar_clk", "specs/analog/sar_logic.t27");
+    assert(nl_edges_have_evidence(g1, &out, n));
+    assert(nl_edges_have_evidence(g2, &out, n));
+}
+
+test level_two_opens_the_eleven_flip_flops_and_leaves_the_clock_gates_as_facts {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    assert(n > 0);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "sar_clk"), 2, "sar_clk", "specs/analog/sar_logic.t27");
+    assert(validate_graph(g) == GRAPH_OK);
+    assert(view_verdict(g) == VIEW_OK);
+    assert(g.node_count == 36);
+    assert(count_node_kind(g, NODE_FN) == 14);
+    // eleven flip-flops of ten gates (derived), three clock_gen gates under their full names (exact)
+    assert(count_node_label(g, LABEL_DERIVED) == 11);
+    assert(nl_span_total(g, NODE_FN) == 113);
+    assert(nl_node_named(g, "x7.x5") != NO_INDEX);
+    assert(nl_node_named(g, "x4.x1") != NO_INDEX);
+    assert(nl_node_named(g, "x7") == NO_INDEX);
+}
+
+test level_zero_draws_every_gate_as_a_fact {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    assert(n > 0);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "sar_clk"), 0, "sar_clk", "specs/analog/sar_logic.t27");
+    assert(validate_graph(g) == GRAPH_OK);
+    assert(view_verdict(g) == VIEW_OK);
+    assert(g.node_count == 135);
+    assert(count_node_kind(g, NODE_FN) == 113);
+    assert(count_node_label(g, LABEL_EXACT) == 135);
+    assert(count_node_label(g, LABEL_DERIVED) == 0);
+    assert(count_edge_label(g, LABEL_DERIVED) == g.edge_count);
+    assert(nl_edges_have_evidence(g, &out, n));
+}
+
+test negative_control_swapping_set_and_reset_of_one_flip_flop_moves_the_edges {
+    var src : [4096]u8 = undefined;
+    var src2 : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var w2 : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var out2 : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var st2 : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    var gt2 : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    const len2 : usize = sl_deck(&src2, true);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    const n2 : usize = emit_gates(src2[0 .. len2], "sar_clk", &w2, &out2, &st2, &gt2);
+    assert(n > 0);
+    assert(n2 > 0);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "sar_clk"), 0, "sar_clk", "specs/analog/sar_logic.t27");
+    const s : SpecGraph = nl_graph(&w2, &gt2, nl_nports(&w2, &st2, "sar_clk"), 0, "sar_clk", "specs/analog/sar_logic.t27");
+    assert(validate_graph(g) == GRAPH_OK);
+    assert(validate_graph(s) == GRAPH_OK);
+    // the same gates, the same nets: only two wires differ
+    assert(g.node_count == s.node_count);
+    // Set feeds the Set nors of flip-flop x5 and clks its Reset nors; the swap puts each on the other pair
+    assert(nl_flows(g, "set", "x7.x5.x2"));
+    assert(nl_flows(g, "set", "x7.x5.x5"));
+    assert(nl_flows(g, "clks", "x7.x5.x4"));
+    assert(nl_flows(g, "clks", "x7.x5.x8"));
+    assert(nl_flows(g, "set", "x7.x5.x4") == false);
+    assert(nl_flows(g, "clks", "x7.x5.x2") == false);
+    assert(nl_flows(s, "set", "x7.x5.x4"));
+    assert(nl_flows(s, "set", "x7.x5.x8"));
+    assert(nl_flows(s, "clks", "x7.x5.x2"));
+    assert(nl_flows(s, "clks", "x7.x5.x5"));
+    assert(nl_flows(s, "set", "x7.x5.x2") == false);
+    assert(nl_flows(s, "clks", "x7.x5.x4") == false);
+}
+
+test negative_control_a_circuit_nobody_could_read_is_refused_not_drawn {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    // a top that is not in the deck
+    const n : usize = emit_gates(src[0 .. len], "nosuchtop", &w, &out, &st, &gt);
+    assert(n > 0);
+    assert(st[ERR_LINE] != 0);
+    assert(nl_nports(&w, &st, "nosuchtop") == 0);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "nosuchtop"), 1, "nosuchtop", "specs/analog/sar_logic.t27");
+    assert(validate_graph(g) == ERR_SPEC_PATH);
+    assert(view_verdict(g) == ERR_SPEC_PATH);
+    var svg : [1024]u8 = undefined;
+    assert(nl_svg(g, &svg) == 0);
+}
+
+test negative_control_an_invented_element_is_refused_by_the_graph_rules {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    assert(n > 0);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "sar_clk"), 1, "sar_clk", "specs/analog/sar_logic.t27");
+    assert(validate_graph(g) == GRAPH_OK);
+    // a gate the table does not have: a span past its last line
+    const ghost : SpecGraph = with_node(g, NODE_FN, LABEL_EXACT, "x9", g.line_count + 3, g.line_count + 4);
+    assert(validate_graph(ghost) == ERR_SPAN_OUTSIDE);
+    // an edge to a node that is not there
+    const dangling : SpecGraph = with_edge(g, EDGE_DATA_FLOW, 1, 900, LABEL_DERIVED, 100);
+    assert(validate_graph(dangling) == ERR_EDGE_DANGLING);
+    // an edge with no line: the graph is valid, the view refuses to draw it
+    var bare : SpecGraph = g;
+    bare.edge_line[0] = NO_LINE;
+    assert(validate_graph(bare) == GRAPH_OK);
+    assert(view_verdict(bare) == VIEW_ERR_EDGE_NO_LINE);
+}
+
+test the_svg_of_the_top_level_has_a_box_per_node_and_a_line_per_edge {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    var svg : [65536]u8 = undefined;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    assert(n > 0);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "sar_clk"), 1, "sar_clk", "specs/analog/sar_logic.t27");
+    const m : usize = nl_svg(g, &svg);
+    assert(m > 0);
+    assert(m < 65536);
+    assert(nl_prefix_at(&svg, 0, m, "<svg xmlns='http://www.w3.org/2000/svg'"));
+    assert(nl_prefix_at(&svg, m - 7, m, "</svg>\n"));
+    // one <rect> per node and one for the backdrop, one <line> per edge, one <text> per node
+    assert(nl_count_word(&svg, m, "<rect") == g.node_count + 1);
+    assert(nl_count_word(&svg, m, "<line") == g.edge_count);
+    assert(nl_count_word(&svg, m, "<text") == g.node_count);
+}
+
+/// How many times `lit` starts inside text[0 .. n].
+pub fn nl_count_word(text: []const u8, n: usize, lit: []const u8) -> u32 {
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (nl_prefix_at(text, i, n, lit)) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------- main
+
+/// `t27c gen` this spec and build it with zig to get the SVG of the top level of the reference SAR logic on
+/// stderr (std.debug.print); the circuit is the one of the tests, the level is 1.
+pub fn main() -> void {
+    var src : [4096]u8 = undefined;
+    var w : [24576]u8 = undefined;
+    var out : [24576]u8 = undefined;
+    var st : [3000]usize = [0] ** 3000;
+    var gt : [3200]usize = [0] ** 3200;
+    var svg : [65536]u8 = undefined;
+    const len : usize = sl_deck(&src, false);
+    const n : usize = emit_gates(src[0 .. len], "sar_clk", &w, &out, &st, &gt);
+    const g : SpecGraph = nl_graph(&w, &gt, nl_nports(&w, &st, "sar_clk"), 1, "sar_clk", "specs/analog/sar_logic.t27");
+    if (n == 0 or view_verdict(g) != VIEW_OK) {
+        std.debug.print("netlist_graph: the circuit is refused, nothing drawn\n", .{});
+        return;
+    }
+    const m : usize = nl_svg(g, &svg);
+    std.debug.print("{s}", .{svg[0 .. m]});
+}
