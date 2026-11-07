@@ -11,7 +11,7 @@ quoted above its proof:
 - **T3 literature** — external papers, with arXiv IDs from general knowledge;
   these IDs were NOT re-verified in this session (the web survey subagent hung
   and web_search returned no durable result), so they are marked UNVERIFIED
-  until `tri papers` or a fresh fetch confirms them.
+  until the paper-claims spec or a fresh fetch confirms them.
 
 ---
 
@@ -30,7 +30,7 @@ CUTLASS 3.5.1, sm_89, CUDA 12.4, 2026-10-18). All ratios stored in hundredths
 | Runner wired to `torch._int_mm` | no | `RUNNER_USES_INT_MM = false` |
 | Generated kernel ships only above CUTLASS s8 by | **10%** (`GEN_CUDA_BAR_E2`) | law |
 
-Audit discipline: `specs/numeric/paper_claims.t27` (`tri papers`) — of 45
+Audit discipline: `specs/numeric/paper_claims.t27` — of 45
 numbers printed in the three format papers, **34 recompute exactly, 8 misfit,
 3 cannot be checked**. A paper number that misfits is reported, never smoothed.
 
@@ -66,7 +66,7 @@ The following are the standard ternary/low-bit LLM kernel references named
 across the project's own docs (BitNet b1.58, llm.int8, SmoothQuant, AWQ, GPTQ,
 TWN, TTQ, DeepSeek-V3 FP8). Their IDs below are **from general knowledge and
 were not re-verified in this session** — do not cite them as confirmed until
-`tri papers` or a fresh web fetch closes the loop:
+the paper-claims spec or a fresh web fetch closes the loop:
 
 | Paper | ID (UNVERIFIED) | Relevance to the shelf |
 |---|---|---|
