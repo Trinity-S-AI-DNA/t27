@@ -1,7 +1,9 @@
-//! `tri payout`: the AUTHOR_ROYALTY table of one epoch from git history and the labs' receipts. Glue only (git, curl, `t27c corpus-receipt compare`, the maps, print): every rule is specs/tri/network/payout.t27, which calls specs/network/attribution.t27, usage.t27 and identity.t27 (agents, emails, signed claims, #8649); a squash's rows are the authors of its pull request's own commits and co-authors (#8816).
+
 #[path = "../../../gen/rust/tri/network/payout.rs"] #[allow(dead_code, unused_parens)]
 pub mod pay; // t27c gen-rust of specs/tri/network/payout.t27
 use {anyhow::Result, sha2::{Digest, Sha256}, std::collections::{BTreeMap, BTreeSet, HashMap}, std::io::Write, std::process::{Command, Stdio}};
+#[allow(dead_code, unused_parens)]
+pub use crate::payout_rules::*;
 /// Run `c` with `input` on its stdin; its stdout, leaked, since the generated rules read `&'static str`.
 pub(crate) fn sh(c: &str, a: &[&str], input: &str) -> &'static str { let mut p = Command::new(c).args(a).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect(c); let _ = p.stdin.take().map(|mut i| i.write_all(input.as_bytes())); String::from_utf8_lossy(&p.wait_with_output().map(|o| o.stdout).unwrap_or_default()).into_owned().leak() }
 /// GitHub's answer `name`: the memo, else the GH_CACHE file `ok` reads, else curl with `auth` on stdin (kept once `ok` reads it). `join` adds one author (pay::author_join).

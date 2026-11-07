@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod abandoned;
-mod census;
+#[path = "../../../gen/rust/tri/mutate/census.rs"] #[allow(dead_code, unused_parens)] mod census_rules; mod census; // t27c gen-rust of specs/tri/mutate/census.t27
 mod cibase;
 mod competitors;
 mod depin;
@@ -31,7 +31,7 @@ mod kinddrift;
 mod misread;
 mod night;
 #[path = "../../../gen/rust/tri/oneaway/oneaway.rs"] #[allow(dead_code, unused_parens)] mod oneaway_rules; mod oneaway; // t27c gen-rust + thin I/O glue
-mod payout;
+#[path = "../../../gen/rust/tri/network/payout.rs"] #[allow(dead_code, unused_parens)] mod payout_rules; mod payout; // t27c gen-rust of specs/verified/payout.t27
 mod window;
 mod modreach;
 mod mutate;

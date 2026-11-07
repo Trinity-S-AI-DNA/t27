@@ -1,37 +1,8 @@
-//! Does each census's printed population match one counted a different way?
-//!
-//! Three defects in three passes had one shape: a command narrowed the set it
-//! spoke about, and the narrowing was invisible because the only number on
-//! screen was the command's own.
-//!
-//!   * `unparsed locate` checked the message FORMAT before the error's STAGE,
-//!     so its buckets summed to 80 against a population of 76 (#2935).
-//!   * `quantifiers report` matched `find("forall ")` -- the spelling with a
-//!     trailing space -- and read 922 where the corpus holds 923 (#2938).
-//!   * `mods orphan` walked a hardcoded two crates of five and printed their
-//!     sum, 132, where the workspace holds 136 (#2941).
-//!
-//! Each was found the same way and none by reading the code: count the
-//! population by a DIFFERENT route and subtract. This is that subtraction, run
-//! for every census at once, so the fourth instance does not need a fourth
-//! accident to be noticed.
-//!
-//! A fourth row was built for `seals hollow` and REMOVED. Its counter tested
-//! json files for the text `"spec_path"` while the census parses the same
-//! field, so the obvious mutation -- planting one more seal file -- moved BOTH
-//! numbers to 1314 and the row stayed green. There is no realistic input that
-//! makes the two disagree, and a control that cannot fail is not a control.
-//! Three rows that bite are worth more than four where one is decoration.
-//!
-//! The counters below are written here, from scratch. A counter that called
-//! the census's own helper would agree with it by construction and measure
-//! nothing -- the precondition of differential testing is independence, and it
-//! is the precondition this file exists to keep.
-
 use anyhow::Result;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
-
+#[allow(dead_code, unused_parens)]
+pub use crate::census_rules::*;
 #[derive(Subcommand)]
 pub enum CensusCmd {
     /// Every census's printed population, against one counted another way.
