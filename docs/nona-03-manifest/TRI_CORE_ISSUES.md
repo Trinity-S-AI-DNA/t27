@@ -140,7 +140,7 @@ The coordination layer (`.trinity/`) is created but not integrated:
 3. **Add claim release to cleanup:**
    ```go
    func cleanupAfterSuccess(resource string) {
-       // Release claim after successful tri skill commit
+       // Release claim after successful tri git commit
        releaseClaim(resource, "clean")
    }
 
