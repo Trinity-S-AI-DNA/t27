@@ -32,6 +32,7 @@ Today, **Trinity** (not this repo) may contain **two parallel implementations**:
 Therefore:
 
 - **Hand-maintained `src/brain/*.zig` as SSOT is out of scope for t27** and is **technical debt** if it duplicates semantics that should be specified here.
+### Not built (planned surface only): tri gen-zig
 - **Brain region semantics** that must be **ring-sealed, versioned, and compiler-backed** should be expressed under **`specs/brain/`** and flow through **`tri`** (`tri parse`, `tri gen-zig`, `tri gen-c`, `tri gen-verilog`, `tri seal`, …) like every other domain.
 
 ### 1.3 Normative language: `.t27`, not application Zig
@@ -163,11 +164,13 @@ From repo root, after `cargo build --release` in `bootstrap/`:
 
 ```bash
 # Whole brain tree (path is a directory → batch under gen/{zig,c,verilog}/…)
+### Not built (planned surface only): tri gen-zig
 ./scripts/tri gen-zig       specs/brain
 ./scripts/tri gen-c         specs/brain
 ./scripts/tri gen-verilog   specs/brain
 
 # Single file (Zig on stdout)
+### Not built (planned surface only): tri gen-zig
 ./scripts/tri gen-zig       specs/brain/unified_state.t27
 
 ./scripts/tri parse         specs/brain/unified_state.t27
@@ -229,6 +232,7 @@ tri brain evolve --scenario baseline --cycles 1000
 
 ```bash
 tri skill begin --issue 501
+### Not built (planned surface only): tri spec
 tri spec edit specs/brain/cognitive/dlpfc.t27
 tri cell seal --hash
 tri gen
@@ -254,6 +258,7 @@ Only what **`t27c`** implements applies in this repo (`gen`, `skill-seal`, `test
 | 5 | Brain as core router | P0 | `api.t27` + `periphery/*.t27` contracts | TRI-27 / VSA / FPGA consume **generated** brain APIs |
 | 6 | File reorganization | P1 | Full tree under `specs/brain/**` (§4) | **trinity** integrates `gen/zig/brain/**` (or shims); **no** new handwritten brain Zig SSOT in **t27** |
 | 7 | Testing & validation | P0 | parse/gen/seal + conformance | Integration + legacy test port |
+### Not built (planned surface only): tri brain
 | 8 | CLI & visualization | P2 | spec for CLI surface if needed | `tri brain …` commands, docs site |
 
 ---
@@ -316,6 +321,7 @@ Exact ε and definitions of “coherence” and “connectivity statistic” are
 
 - Single **spec-defined** brain state and loop contracts in **`specs/brain/`**.
 - φ phase sum invariant **tested**.
+### Not built (planned surface only): tri gen-zig
 - `tri parse` / `tri gen-zig` / `tri gen-c` / `tri gen-verilog` / `tri seal` succeed for brain specs in CI (`tri test` → `t27c suite`).
 - No new hand-written Zig SSOT for those semantics in **t27** (`gen/` only).
 

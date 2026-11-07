@@ -42,6 +42,7 @@ On violation, PHI LOOP **MUST**:
 
 #### 1.3.2. NO-MUTATION-WITHOUT-SKILL
 
+### Not built (planned surface only): tri spec
 Any command that modifies `.trinity/` or specs `.tri/.t27` (including `tri spec edit`, `tri gen`, `tri verdict`, `tri cell seal`) **MUST** check for active skill.
 
 If no active skill exists, command **MUST** fail with error before any file changes.
@@ -83,6 +84,7 @@ State machine transitions (see §2 for diagram):
    - **MUST** create/update `.trinity/state/active-skill.json` and `.trinity/state/issue-binding.json` in consistent state
    - **MUST** refuse if there's already an active skill with different issue and lease wasn't properly closed
 
+### Not built (planned surface only): tri spec
 2. `tri spec edit ...`
    - **MUST** be allowed only with active skill + binding
 

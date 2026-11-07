@@ -489,6 +489,7 @@ $ tri status
   Guard: GREEN
 
 # 3. Do work (allowed paths only)
+### Not built (planned surface only): tri spec
 $ tri spec create specs/numeric/gf4.t27
 $ tri gen specs/numeric/gf4.t27
 $ tri test specs/numeric/gf4.t27
