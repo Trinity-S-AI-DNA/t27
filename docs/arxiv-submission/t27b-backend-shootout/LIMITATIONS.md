@@ -1,6 +1,11 @@
 # Limitations
 
 - Backend agreement is self-consistency behind one shared front end, not independent verification.
+- The corpus result (0 of 8,344) is not agreement on every program: the lab's random-program fuzzer at commit `8e2e44b7e` found 7 disagreements in 1,000 programs.
+- The 4.8 ms test-compile figure ends with code in memory, with no loading or linking; the Zig figures include building and linking a test binary, the C figures stop at an object.
+- Tier 1 is ranked by GCC -O0 instruction count, with no t27b measurement, but its pool is the 567 files every pipeline, t27b included, passes.
+- The 3-5x code gap is a tier-1 geometric mean; on the four crypto specifications it is 10.1x against Zig ReleaseFast.
+- t27b differs from GCC -O2 on 24 files and from Clang -O2 on 12, but GCC -O2 and Clang -O2 also differ from each other on 35, because gen-c output has undefined behaviour.
 - Code quality is measured by executed guest instructions, emulated run time and code size, on 20 tier-1 specifications.
 - All run times are qemu-aarch64 user-mode emulation on x86_64, not native arm64 speed.
 - Compile latency was measured on a shared cloud host (load 27-103 on 48 threads); millisecond samples are noisy.
@@ -10,10 +15,10 @@
 - Tier 1 excludes every specification gen-c cannot compile.
 - Clang -O2 folded the test at compile time on 11 of 20 specifications; its ratios use the remaining 9.
 - At the measured revision `t27b build` wrote Mach-O objects only and did not link.
-- Post-snapshot changes (ELF64 objects, `t27b run`, `t27b verilog`, the 2,991-spec corpus) were not re-measured.
+- Post-snapshot changes (ELF64 objects, `t27b run`, `t27b verilog`, the larger corpus) were not re-measured, and no later lab figure is used.
 - The measurement harness is not committed; the report lists its commands.
 - t27b is not an optimising compiler and not a replacement for LLVM.
 - No front end for C, Rust, Zig, Go or Python exists. Cross-language lowering is not claimed.
 - t27b reads no serialised IR. The external `t27_ir_v1` contract has no t27b reader.
 - The Zig ratios are against Zig Debug through LLVM for aarch64. Zig 0.15+ uses a self-hosted backend for x86-64 Debug builds, so the 640x figure does not carry over there.
-- No other baseline compiler (TinyCC, QBE, Liftoff, Winch, TPDE) was measured; related work is cited, not compared.
+- No other baseline compiler (TinyCC, QBE, Liftoff, Winch, copy-and-patch, TPDE, Umbra) was measured; related work is cited, not compared.
