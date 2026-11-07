@@ -1,7 +1,7 @@
 ---
 id: access-map
 name: Access map
-description: Which model and API accesses an agent can reach -- what the T27 OS key master wires (providers, profiles, models, failure codes), what is known but NOT wired (NVIDIA NIM, DeepSeek, Moonshot, MiniMax, direct Gemini or OpenAI), how each one fails, and how to add one without ever handling a key value. Use before choosing a provider or model, when a pane prints 401/429/1113/1305, when the owner says "use every key we have", "nvidia", "what accesses do we have", or before telling the owner a provider is or is not available.
+description: Which model and API accesses an agent can reach -- what the T27 OS key master wires (providers, profiles, models, failure codes), what is known but NOT wired (NVIDIA NIM, DeepSeek row added ring-01 but no profile yet, Moonshot, MiniMax, direct Gemini or OpenAI), how each one fails, and how to add one without ever handling a key value. Use before choosing a provider or model, when a pane prints 401/429/1113/1305, when the owner says "use every key we have", "nvidia", "deepseek", "what accesses do we have", or before telling the owner a provider is or is not available.
 argument-hint: "[none | add <provider>]"
 ---
 
@@ -43,7 +43,8 @@ server-side keys). The cost rules are skill `work-cheap`; the lane order is `wor
 |---|---|---|
 | **NVIDIA NIM**, direct (`integrate.api.nvidia.com/v1`) | Provider row `nvidia` added 2026-10-26 (keys.t27, 10 providers); 4 nvapi keys stored in the Keychain. Measured the same day: GET /v1/models 200 (85 models), chat-completions on three nemotron ids 403 "Authorization failed" -- the keys list the catalogue but their plan does not cover inference. Still NO profile: it speaks chat-completions, not the Anthropic protocol; a pane reaches NVIDIA through OpenRouter `nvidia/...:free` until the stage-2 router. |
 | **NVIDIA models through OpenRouter** | Wired: the second OpenRouter model is `nvidia/nemotron-3.5-super-vl:free` | Measured 2026-10-20: HTTP 200, it thinks first, so `max_tokens` 16 gives empty text; the key master applies a floor (`model_min_tokens`). `nvidia/nemotron-3.5-lightning:free` returned no parsable body: dropped |
-| DeepSeek, Moonshot (Kimi), MiniMax | Documented Anthropic-protocol pages exist, but each needs a provider row of its own (PROVIDER_COUNT 9 to 12, and the window and server size their tables by nine) | no profile; keys may exist on disk, which does not make them reachable |
+| **DeepSeek** | Provider row added 2026-11-07 (keys.t27 P_DEEPSEEK=10, 11 providers total, ring-01). Probe URL `https://api.deepseek.com/anthropic/v1/models`, AUTH_X_API_KEY. Account unfunded per t27#13034. | no profile yet; a pane cannot use it until a profile row exists |
+| Moonshot (Kimi), MiniMax | Documented Anthropic-protocol pages exist, but each needs a provider row of its own (PROVIDER_COUNT 11 to 13, and the window and server size their tables by eleven) | no profile; keys may exist on disk, which does not make them reachable |
 | Direct Gemini, OpenAI, Cursor, Gonka, GitHub | Provider rows only; no profile | not used by a pane |
 | `free-claude-code/*` routes | Third-party router | UNPROBED |
 | Queen server-side keys (contributor keys) | Per the `keys.t27` header, no route lets a client spend a stored key | work on them is the Queen's and the contributor's (consent, `PROVIDER_FEE`); never move a key |
