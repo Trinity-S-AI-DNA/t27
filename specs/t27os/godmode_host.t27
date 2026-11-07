@@ -5,8 +5,9 @@
 //   - gm_wt_add / gm_wt_status / gm_wt_remove: git worktree add, its porcelain status, git worktree remove
 // Not here: fsync (a separate, later change), CLI glue, PTY host changes, any Rust.
 //
-// Decisions live in pure fns below, each tested: the fixed git word lists, the minimal environment, the row
-// shape, the create-only-when-missing rule, the free-disk rule, the status verdict and the worktree-list check.
+// Decisions live in pure fns below, each tested: the fixed git word lists, the base word, the minimal
+// environment, the open flags, the row shape, the create-only-when-missing rule, the free-disk rule, the status
+// verdict and the worktree-list check.
 // Path syntax is godmode_policy.gm_path_syntax_ok, reused, never a second copy. The effect fns (gm_append_line,
 // gm_wt_*, gh_run, gh_errno) only move bytes. They are typechecked here and built by an extern-capable t27b.
 // Under t27c every @extern renders as a stub returning 0 or false (#5980), so the tests exercise the pure fns
@@ -15,21 +16,52 @@
 // FAKED: a test whose name starts with faked_ checks a verdict over hand-written text standing in for a host
 // result (porcelain output, worktree list output, statfs bytes, errno bytes). It proves the rule, not the host.
 //
-// Journal writes: ONE WRITER AT A TIME. gm_append_line opens with O_WRONLY|O_APPEND (no O_CREAT, no O_TRUNC)
-// and writes each row in one write(2) call. Only when that open fails with ENOENT does it call creat(2), close,
-// and open again. creat truncates, so two writers racing on a missing file can lose a row. The runner holds the
-// journal for one task at a time. Secret cleaning of a row is the producer's job (godmode_journal gm_row), not
-// this module's: here a row is checked for shape only.
+// Journal writes: ONE WRITER AT A TIME. gm_append_line opens with O_WRONLY|O_APPEND|O_NOFOLLOW (no O_CREAT, no
+// O_TRUNC) and writes each row in one write(2) call. A symbolic link at the journal path fails that open with
+// ELOOP, which is HR_OPEN, never a create. Only when the open fails with ENOENT does it call creat(2), close, and
+// open again with the same flags. Known limits, written down rather than hidden:
+//   - creat(2) takes no flags, so it cannot carry O_NOFOLLOW. A 3-argument open(O_CREAT|O_EXCL|O_NOFOLLOW, mode)
+//     would, but open is variadic and the extern ABI here passes no variadic mode, so the mode would be garbage.
+//     creat therefore runs only right after an O_NOFOLLOW open saw nothing at the path (ENOENT; a link, even a
+//     dangling one, gives ELOOP). A link planted between those two calls is followed by creat, which creates or
+//     truncates its target; the O_NOFOLLOW reopen then refuses the link, but the target is already touched.
+//   - creat truncates, so two writers racing on a missing file can lose a row.
+//   - O_NOFOLLOW guards the last path component only; a linked directory higher up is followed. Darwin's
+//     O_NOFOLLOW_ANY (0x20000000) would guard every component; it is a possible later change, not v1.
+// The runner holds the journal for one task at a time, which is what closes the first two windows.
 //
-// git runs as /usr/bin/git through posix_spawn with a fixed argument list (no shell between), a fixed minimal
-// environment (PATH=/usr/bin:/bin, LC_ALL=C, nothing inherited, so no GIT_DIR or GIT_* from the caller leaks
-// in), standard input and standard error on /dev/null, standard output on a pipe, and POSIX_SPAWN_CLOEXEC_DEFAULT
-// so no other descriptor reaches git. Paths are relative to the runner's working directory, which must be
-// the repository root. A run that stays silent past its timeout, or whose output overflows the buffer, is
-// killed with SIGKILL and reported as HR_TIMEOUT or HR_OVERFLOW.
+// What this module does not repeat: godmode_contract gm_validate already refuses a bad worktree_path (GM-E006),
+// and godmode_journal gm_row already cleans secrets out of a row. Here a row is checked for shape only, and a
+// path for syntax only (gm_path_syntax_ok).
 //
-// SIGCHLD: the window (editors_host.t27) sets SIGCHLD to ignore, and then waitpid cannot see an exit status.
-// gh_run sets the default for its own length and puts back what it found, as keys_host.t27 does.
+// git runs as /usr/bin/git through posix_spawn with a fixed argument list (no shell between) and a fixed minimal
+// environment, set explicitly and never inherited: PATH=/usr/bin:/bin, LC_ALL=C, HOME=/var/empty. HOME is set
+// rather than left out, so git never falls back to the caller's home, and no GIT_DIR or GIT_* leaks in. git
+// still reads its system config. Standard input is /dev/null, standard output a pipe, standard error is
+// appended to a log file the runner names (O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW, 0644; a link there fails the
+// spawn, HR_SPAWN), and POSIX_SPAWN_CLOEXEC_DEFAULT keeps every other descriptor from git. The log lives outside
+// the worktree, which does not exist before add and is gone after remove.
+// A run that stays silent past its timeout, or whose output overflows the buffer, is killed with SIGKILL and
+// reported as HR_TIMEOUT or HR_OVERFLOW.
+//
+// The argument lists are at most 7 argv words, and none uses `--` or `-c` (no -c core.hooksPath either): a path,
+// branch or base starting with `-` is refused instead of being put behind `--`. The base word `current` (the
+// godmode_contract default) is mapped to `HEAD` here (gh_base_ref) before the checks.
+//
+// PROCESS-WIDE STATE, documented because gh_run changes it for the whole process:
+//   - Working directory: paths are relative to it, and it must be the repository root. gh_run never calls chdir.
+//   - SIGCHLD: the window (editors_host.t27) sets SIGCHLD to ignore, and then waitpid cannot see an exit status.
+//     gh_run sets the default for its own length and puts back what it found, as keys_host.t27 does. While it
+//     runs, every thread of the process sees the default, so gh_run is called from one thread at a time.
+//
+// Known limitation, not a bug: gm_wt_remove removes the worktree, never its branch (`git worktree remove` keeps
+// it, and v1 deletes no branch). The branch made by gm_wt_add is left behind for the runner or a person.
+// A dirty worktree makes `git worktree remove` exit non-zero; that is HR_EXIT, and it is correct (never --force).
+//
+// Build and checks: the host build backend is t27b (an extern-capable t27b, see #5980 for the t27c stubs). The
+// effects themselves, including whether the post-checkout hook that `git worktree add` runs (lefthook in this
+// repository) passes under this environment, are checked only in a live T27 OS pane run on the owner's word,
+// never on the Mac. This spec, typechecked and tested, is not proof of host behaviour.
 //
 // The C imports are private copies (pipe, posix_spawn file actions and attributes, statfs, __error). One home
 // for them is pty_sys.t27, but that file is sealed and a stale seal has no builder to re-save it today, so
@@ -99,13 +131,24 @@ pub const GH_GIT : []const u8 = "/usr/bin/git";
 pub const GH_DEV_NULL : []const u8 = "/dev/null";
 pub const GH_ENV_PATH : []const u8 = "PATH=/usr/bin:/bin";
 pub const GH_ENV_LANG : []const u8 = "LC_ALL=C";
-/// Darwin open(2) flags: O_WRONLY = 1, O_APPEND = 8. O_CREAT (512) and O_TRUNC (1024) are never set.
+pub const GH_ENV_HOME : []const u8 = "HOME=/var/empty";
+/// Darwin open(2) flags (sys/fcntl.h): O_WRONLY 1, O_APPEND 0x8, O_NOFOLLOW 0x100, O_CREAT 0x200, O_TRUNC 0x400.
 pub const GH_O_WRONLY : u32 = 1;
 pub const GH_O_APPEND : u32 = 8;
-pub const GH_APPEND_FLAGS : i32 = 9;
-/// 0644: owner read and write, group and others read.
+pub const GH_O_NOFOLLOW : u32 = 256;
+pub const GH_O_CREAT : u32 = 512;
+pub const GH_O_TRUNC : u32 = 1024;
+/// The journal open: O_WRONLY|O_APPEND|O_NOFOLLOW. Never O_CREAT, never O_TRUNC.
+pub const GH_APPEND_FLAGS : i32 = 265;
+/// git's stderr log, opened in the child: O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW. Never O_TRUNC.
+pub const GH_LOG_FLAGS : i32 = 777;
+/// The gone-from-disk probe after a remove: O_RDONLY|O_NOFOLLOW, so a link left at the path is not "gone".
+pub const GH_PROBE_FLAGS : i32 = 256;
+/// 0644: owner read and write, group and others read. The journal and git's stderr log.
 pub const GH_JOURNAL_MODE : u32 = 420;
+/// Darwin errno (sys/errno.h): ENOENT 2; ELOOP 62, which an O_NOFOLLOW open of a symbolic link returns.
 pub const GH_ENOENT : u32 = 2;
+pub const GH_ELOOP : u32 = 62;
 pub const GH_ROW_MAX : usize = 4096;
 pub const GH_CPATH_CAP : usize = 1024;
 pub const GH_WORDS_CAP : usize = 4096;
@@ -167,6 +210,12 @@ pub fn gh_word_at(words: []const u8, at: usize) -> []const u8 {
 pub fn gh_cstr(out: []u8, s: []const u8) -> bool {
     kd_view_clear(out);
     return gh_put_word(out, 0, s) != 0;
+}
+
+/// git's stderr log path as a C string in out: it must pass gm_path_syntax_ok (relative, no `..`) and fit.
+pub fn gh_log_cstr(out: []u8, logp: []const u8) -> bool {
+    if (gm_path_syntax_ok(logp) == false) { return false; }
+    return gh_cstr(out, logp);
 }
 
 /// A branch or base word: non-empty, not starting with `-` (git would read it as an option), printable ASCII
@@ -261,17 +310,26 @@ pub fn gh_git_words(op: u8, path: []const u8, branch: []const u8, base: []const 
     return n;
 }
 
-/// The fixed environment git runs with: PATH=/usr/bin:/bin and LC_ALL=C, nothing else (no HOME, no GIT_*).
-/// Returns 2, or 0 when the buffers are too small.
+/// The fixed environment git runs with, set explicitly: PATH=/usr/bin:/bin, LC_ALL=C, HOME=/var/empty, nothing
+/// else (no GIT_*). Returns 3, or 0 when the buffers are too small (the words take 44 bytes).
 pub fn gh_env_words(words: []u8, offs: []u32) -> u32 {
-    if (offs.len < 2) { return 0; }
+    if (offs.len < 3) { return 0; }
     kd_view_clear(words);
     offs[0] = 0;
     const mid : usize = gh_put_word(words, 0, GH_ENV_PATH);
     if (mid == 0) { return 0; }
     offs[1] = @as(u32, @intCast(mid));
-    if (gh_put_word(words, mid, GH_ENV_LANG) == 0) { return 0; }
-    return 2;
+    const last : usize = gh_put_word(words, mid, GH_ENV_LANG);
+    if (last == 0) { return 0; }
+    offs[2] = @as(u32, @intCast(last));
+    if (gh_put_word(words, last, GH_ENV_HOME) == 0) { return 0; }
+    return 3;
+}
+
+/// The base word git gets: `current` (the godmode_contract default) is HEAD, any other word is itself.
+pub fn gh_base_ref(base: []const u8) -> []const u8 {
+    if (same_bytes(base, "current")) { return "HEAD"; }
+    return base;
 }
 
 // --- 5. journal rows and open flags (pure) ----------------------------------------------------------------------
@@ -288,12 +346,18 @@ pub fn gh_row_ok(row: []const u8) -> bool {
     return true;
 }
 
-/// Write-only and append, with neither O_CREAT nor O_TRUNC.
-pub fn gh_flags_append_only(f: u32) -> bool {
-    const creat_bit : u32 = (f / 512) % 2;
-    const trunc_bit : u32 = (f / 1024) % 2;
-    const append_bit : u32 = (f / GH_O_APPEND) % 2;
-    return f % 4 == GH_O_WRONLY and append_bit == 1 and creat_bit == 0 and trunc_bit == 0;
+/// Is flag bit b (a power of two) set in f?
+pub fn gh_bit(f: u32, b: u32) -> bool {
+    return (f / b) % 2 == 1;
+}
+
+/// Write-only, append and O_NOFOLLOW, never O_TRUNC, and O_CREAT exactly when creat is true. The journal open
+/// passes with creat false (GH_APPEND_FLAGS), git's stderr log with creat true (GH_LOG_FLAGS).
+pub fn gh_open_flags_ok(f: u32, creat: bool) -> bool {
+    if (f % 4 != GH_O_WRONLY or gh_bit(f, GH_O_TRUNC)) { return false; }
+    if (gh_bit(f, GH_O_APPEND) == false or gh_bit(f, GH_O_NOFOLLOW) == false) { return false; }
+    if (creat) { return gh_bit(f, GH_O_CREAT); }
+    return gh_bit(f, GH_O_CREAT) == false;
 }
 
 /// creat(2) is called only when the append open failed because the file does not exist.
@@ -371,10 +435,11 @@ pub fn gh_errno() -> u32 {
     return gh_errno_of(eb[0..8]);
 }
 
-/// Run words[offs[0]] with argv words 1 .. n-1, the fixed environment, stdin and stderr on /dev/null, stdout into
-/// out. got[0] = bytes read, got[1] = exit code (SEC_SIGNALED when a signal ended git or it was not reaped).
-/// HR_OK only when git exited 0 and its whole output fit in out.
-pub fn gh_run(words: []u8, offs: []const u32, n: u32, out: []u8, got: []u32, timeout: i32) -> u8 {
+/// Run words[offs[0]] with argv words 1 .. n-1, the fixed environment, stdin on /dev/null, stdout into out, and
+/// stderr appended to the log at logc (a C string, see gh_log_cstr). got[0] = bytes read, got[1] = exit code
+/// (SEC_SIGNALED when a signal ended git or it was not reaped). HR_OK only when git exited 0 and its whole
+/// output fit in out. A log that cannot be opened (a link there, a missing directory) fails the spawn: HR_SPAWN.
+pub fn gh_run(words: []u8, offs: []const u32, n: u32, out: []u8, got: []u32, timeout: i32, logc: []const u8) -> u8 {
     if (got.len < 2) { return HR_REFUSED; }
     got[0] = 0;
     got[1] = SEC_SIGNALED;
@@ -392,16 +457,17 @@ pub fn gh_run(words: []u8, offs: []const u32, n: u32, out: []u8, got: []u32, tim
         argv[w - 1] = wbase + @as(u64, offs[w]);
         w = w + 1;
     }
-    // envp: the two fixed words as a 0-ended pointer list
+    // envp: the three fixed words as a 0-ended pointer list
     var envw : [64]u8 = undefined;
-    var envo : [2]u32 = undefined;
-    if (gh_env_words(envw[0..64], envo[0..2]) != 2) { return HR_SPAWN; }
+    var envo : [3]u32 = undefined;
+    if (gh_env_words(envw[0..64], envo[0..3]) != 3) { return HR_SPAWN; }
     const ebase : u64 = sys_addr(envw[0..64], envw[0..64], 0);
-    var envl : [24]u8 = undefined;
-    kd_view_clear(envl[0..24]);
-    _ = put_u64(envl[0..24], 0, ebase + @as(u64, envo[0]));
-    _ = put_u64(envl[0..24], 8, ebase + @as(u64, envo[1]));
-    const envp : u64 = sys_addr(envl[0..24], envl[0..24], 0);
+    var envl : [32]u8 = undefined;
+    kd_view_clear(envl[0..32]);
+    _ = put_u64(envl[0..32], 0, ebase + @as(u64, envo[0]));
+    _ = put_u64(envl[0..32], 8, ebase + @as(u64, envo[1]));
+    _ = put_u64(envl[0..32], 16, ebase + @as(u64, envo[2]));
+    const envp : u64 = sys_addr(envl[0..32], envl[0..32], 0);
     var dn : [16]u8 = undefined;
     if (gh_cstr(dn[0..16], GH_DEV_NULL) == false) { return HR_SPAWN; }
     var po : [2]u32 = undefined;
@@ -410,7 +476,7 @@ pub fn gh_run(words: []u8, offs: []const u32, n: u32, out: []u8, got: []u32, tim
     if (gh_pipe(po) != 0) { return HR_SPAWN; }
     const rd : i32 = @as(i32, @intCast(po[0]));
     const wd : i32 = @as(i32, @intCast(po[1]));
-    // the child: 0 = /dev/null, 1 = the pipe, 2 = /dev/null, every other descriptor closed
+    // the child: 0 = /dev/null, 1 = the pipe, 2 = the log (appended), every other descriptor closed
     var fa : [8]u8 = undefined;
     var attr : [8]u8 = undefined;
     kd_view_clear(fa[0..8]);
@@ -422,7 +488,7 @@ pub fn gh_run(words: []u8, offs: []const u32, n: u32, out: []u8, got: []u32, tim
         if (gh_attr_flags(attr[0..8], GH_CLOEXEC_DEFAULT) != 0) { bad = true; }
         if (gh_fa_open(fa[0..8], 0, dn[0..16], 0, 0) != 0) { bad = true; }
         if (gh_fa_dup2(fa[0..8], wd, 1) != 0) { bad = true; }
-        if (gh_fa_open(fa[0..8], 2, dn[0..16], 1, 0) != 0) { bad = true; }
+        if (gh_fa_open(fa[0..8], 2, logc, GH_LOG_FLAGS, GH_JOURNAL_MODE) != 0) { bad = true; }
     }
     const prev : u64 = sys_signal(GH_SIGCHLD, GH_HANDLER_DFL);
     var pid : [2]u32 = undefined;
@@ -502,8 +568,9 @@ pub fn gh_run(words: []u8, offs: []const u32, n: u32, out: []u8, got: []u32, tim
 }
 
 /// Append one row to the journal at path (relative to the working directory). The row must pass gh_row_ok and
-/// the path gm_path_syntax_ok. open(O_WRONLY|O_APPEND), and only on ENOENT creat(0644), close, open again. One
-/// write(2) for the row, then close. One writer at a time (see the header).
+/// the path gm_path_syntax_ok. open(O_WRONLY|O_APPEND|O_NOFOLLOW), and only on ENOENT creat(0644), close, open
+/// again with the same flags (ELOOP, a link at the path, is HR_OPEN). One write(2) for the row, then close. One
+/// writer at a time, and the creat window, in the header.
 pub fn gm_append_line(path: []const u8, row: []const u8) -> u8 {
     if (gh_row_ok(row) == false or gm_path_syntax_ok(path) == false) { return HR_REFUSED; }
     var cpath : [1024]u8 = undefined;
@@ -524,13 +591,15 @@ pub fn gm_append_line(path: []const u8, row: []const u8) -> u8 {
     return HR_OK;
 }
 
-/// git worktree add -b branch path base, after the pure checks and the free-disk rule (statfs of the working
-/// directory). git's stdout goes into scratch.
-pub fn gm_wt_add(path: []const u8, branch: []const u8, base: []const u8, scratch: []u8) -> u8 {
+/// git worktree add -b branch path base (`current` becomes HEAD), after the pure checks and the free-disk rule
+/// (statfs of the working directory). git's stdout goes into scratch, its stderr is appended to the log at logp.
+pub fn gm_wt_add(path: []const u8, branch: []const u8, base: []const u8, scratch: []u8, logp: []const u8) -> u8 {
     var words : [4096]u8 = undefined;
     var offs : [8]u32 = undefined;
-    const n : u32 = gh_git_words(GH_OP_ADD, path, branch, base, words[0..4096], offs[0..8]);
+    const n : u32 = gh_git_words(GH_OP_ADD, path, branch, gh_base_ref(base), words[0..4096], offs[0..8]);
     if (n == 0) { return HR_REFUSED; }
+    var logc : [1024]u8 = undefined;
+    if (gh_log_cstr(logc[0..1024], logp) == false) { return HR_REFUSED; }
     var dot : [8]u8 = undefined;
     if (gh_cstr(dot[0..8], ".") == false) { return HR_NO_DISK; }
     var sb : [2304]u8 = undefined;
@@ -538,42 +607,48 @@ pub fn gm_wt_add(path: []const u8, branch: []const u8, base: []const u8, scratch
     if (gh_statfs(dot[0..8], sb[0..2304]) != 0) { return HR_NO_DISK; }
     if (gh_statfs_ok(sb[0..2304]) == false) { return HR_NO_DISK; }
     var got : [2]u32 = undefined;
-    return gh_run(words[0..4096], offs[0..8], n, scratch, got[0..2], GH_SLOW_MS);
+    return gh_run(words[0..4096], offs[0..8], n, scratch, got[0..2], GH_SLOW_MS, logc[0..1024]);
 }
 
-/// git -C path status --porcelain=v1 --untracked-files=all into out. got as in gh_run.
-pub fn gm_wt_status(path: []const u8, out: []u8, got: []u32) -> u8 {
+/// git -C path status --porcelain=v1 --untracked-files=all into out, stderr appended to the log at logp. got as
+/// in gh_run.
+pub fn gm_wt_status(path: []const u8, out: []u8, got: []u32, logp: []const u8) -> u8 {
     var words : [4096]u8 = undefined;
     var offs : [8]u32 = undefined;
     const n : u32 = gh_git_words(GH_OP_STATUS, path, "", "", words[0..4096], offs[0..8]);
     if (n == 0) { return HR_REFUSED; }
-    return gh_run(words[0..4096], offs[0..8], n, out, got, GH_QUICK_MS);
+    var logc : [1024]u8 = undefined;
+    if (gh_log_cstr(logc[0..1024], logp) == false) { return HR_REFUSED; }
+    return gh_run(words[0..4096], offs[0..8], n, out, got, GH_QUICK_MS, logc[0..1024]);
 }
 
-/// gm_wt_status, then gh_status_verdict over what it read.
-pub fn gm_wt_check(path: []const u8, out: []u8, wr: []const u8, cr: []const u8, de: []const u8, fb: []const u8) -> u8 {
+/// gm_wt_status, then gh_status_verdict over what it read. A refused log path is HR_REFUSED, so GS_UNREADABLE.
+pub fn gm_wt_check(path: []const u8, out: []u8, wr: []const u8, cr: []const u8, de: []const u8, fb: []const u8, logp: []const u8) -> u8 {
     var got : [2]u32 = undefined;
     got[0] = 0;
     got[1] = 0;
-    const hr : u8 = gm_wt_status(path, out, got[0..2]);
+    const hr : u8 = gm_wt_status(path, out, got[0..2], logp);
     const have : usize = @as(usize, got[0]);
     return gh_status_verdict(hr, out[0 .. have], wr, cr, de, fb);
 }
 
-/// git worktree remove path (never --force), then proof it is gone: opening path fails with ENOENT, and
-/// `git worktree list --porcelain` no longer names it. HR_LEFT when either proof fails.
-pub fn gm_wt_remove(path: []const u8, scratch: []u8) -> u8 {
+/// git worktree remove path (never --force), then proof it is gone: an O_NOFOLLOW open of path fails with ENOENT
+/// (a link left there gives ELOOP, so it is not gone), and `git worktree list --porcelain` no longer names it.
+/// HR_LEFT when either proof fails. A dirty worktree makes git exit non-zero: HR_EXIT. The branch stays (header).
+pub fn gm_wt_remove(path: []const u8, scratch: []u8, logp: []const u8) -> u8 {
     var words : [4096]u8 = undefined;
     var offs : [8]u32 = undefined;
     const n : u32 = gh_git_words(GH_OP_REMOVE, path, "", "", words[0..4096], offs[0..8]);
     if (n == 0) { return HR_REFUSED; }
+    var logc : [1024]u8 = undefined;
+    if (gh_log_cstr(logc[0..1024], logp) == false) { return HR_REFUSED; }
     var got : [2]u32 = undefined;
-    const hr : u8 = gh_run(words[0..4096], offs[0..8], n, scratch, got[0..2], GH_SLOW_MS);
+    const hr : u8 = gh_run(words[0..4096], offs[0..8], n, scratch, got[0..2], GH_SLOW_MS, logc[0..1024]);
     if (hr != HR_OK) { return hr; }
     // gone from disk
     var cpath : [1024]u8 = undefined;
     if (gh_cstr(cpath[0..1024], path) == false) { return HR_LEFT; }
-    const fd : i32 = sys_open_ro(cpath[0..1024], 0);
+    const fd : i32 = sys_open_ro(cpath[0..1024], GH_PROBE_FLAGS);
     if (fd >= 0) {
         _ = sys_close(fd);
         return HR_LEFT;
@@ -582,7 +657,7 @@ pub fn gm_wt_remove(path: []const u8, scratch: []u8) -> u8 {
     // gone from the list
     const ln : u32 = gh_git_words(GH_OP_LIST, "", "", "", words[0..4096], offs[0..8]);
     if (ln == 0) { return HR_LEFT; }
-    const lr : u8 = gh_run(words[0..4096], offs[0..8], ln, scratch, got[0..2], GH_QUICK_MS);
+    const lr : u8 = gh_run(words[0..4096], offs[0..8], ln, scratch, got[0..2], GH_QUICK_MS, logc[0..1024]);
     if (lr != HR_OK) { return HR_LEFT; }
     const listed : usize = @as(usize, got[0]);
     if (gh_list_has(scratch[0 .. listed], path)) { return HR_LEFT; }
@@ -598,14 +673,36 @@ test codes_are_stable_and_distinct {
     assert HR_LEFT != HR_OK;
 }
 
-test append_flags_never_create_or_truncate {
-    assert gh_flags_append_only(@as(u32, @intCast(GH_APPEND_FLAGS)));
-    assert @as(u32, @intCast(GH_APPEND_FLAGS)) == GH_O_WRONLY + GH_O_APPEND;
-    // negative controls: with O_CREAT, with O_TRUNC, read-write, no append
-    assert gh_flags_append_only(521) == false;
-    assert gh_flags_append_only(1033) == false;
-    assert gh_flags_append_only(10) == false;
-    assert gh_flags_append_only(1) == false;
+test append_flags_nofollow_never_create_or_truncate {
+    assert gh_open_flags_ok(@as(u32, @intCast(GH_APPEND_FLAGS)), false);
+    assert @as(u32, @intCast(GH_APPEND_FLAGS)) == GH_O_WRONLY + GH_O_APPEND + GH_O_NOFOLLOW;
+    // negative controls: no O_NOFOLLOW (the old 9), with O_CREAT, with O_TRUNC, read-write, no append
+    assert gh_open_flags_ok(9, false) == false;
+    assert gh_open_flags_ok(777, false) == false;
+    assert gh_open_flags_ok(1289, false) == false;
+    assert gh_open_flags_ok(266, false) == false;
+    assert gh_open_flags_ok(257, false) == false;
+}
+
+test log_flags_create_append_nofollow {
+    assert gh_open_flags_ok(@as(u32, @intCast(GH_LOG_FLAGS)), true);
+    assert @as(u32, @intCast(GH_LOG_FLAGS)) == GH_O_WRONLY + GH_O_APPEND + GH_O_NOFOLLOW + GH_O_CREAT;
+    // negative controls: log flags are not journal flags, no O_NOFOLLOW, with O_TRUNC, no O_CREAT
+    assert gh_open_flags_ok(@as(u32, @intCast(GH_LOG_FLAGS)), false) == false;
+    assert gh_open_flags_ok(521, true) == false;
+    assert gh_open_flags_ok(1801, true) == false;
+    assert gh_open_flags_ok(265, true) == false;
+}
+
+test probe_flags_read_only_nofollow {
+    const pf : u32 = @as(u32, @intCast(GH_PROBE_FLAGS));
+    assert pf % 4 == 0;
+    assert gh_bit(pf, GH_O_NOFOLLOW);
+    assert gh_bit(pf, GH_O_CREAT) == false and gh_bit(pf, GH_O_TRUNC) == false;
+    // negative controls: the old probe flags (0) followed a link; bit reads on known values
+    assert gh_bit(0, GH_O_NOFOLLOW) == false;
+    assert gh_bit(777, GH_O_CREAT);
+    assert gh_bit(265, GH_O_CREAT) == false;
 }
 
 test journal_mode_is_0644 {
@@ -647,6 +744,31 @@ test cstr_zeroes_and_copies {
     // negative controls: too long for the buffer, empty
     assert gh_cstr(buf[0..8], "/dev/null") == false;
     assert gh_cstr(buf[0..8], "") == false;
+}
+
+test log_path_is_checked {
+    var buf : [64]u8 = undefined;
+    assert gh_log_cstr(buf[0..64], ".claude/worktrees/gm-001.git.log");
+    assert same_bytes(gh_word_at(buf[0..64], 0), ".claude/worktrees/gm-001.git.log");
+    // negative controls: absolute (no /dev/null any more), a parent step, empty, too long for out
+    assert gh_log_cstr(buf[0..64], "/dev/null") == false;
+    assert gh_log_cstr(buf[0..64], "../git.log") == false;
+    assert gh_log_cstr(buf[0..64], "") == false;
+    assert gh_log_cstr(buf[0..8], "a/git.log") == false;
+}
+
+test base_current_is_head {
+    assert same_bytes(gh_base_ref("current"), "HEAD");
+    assert same_bytes(gh_base_ref("master"), "master");
+    var words : [256]u8 = undefined;
+    var offs : [8]u32 = undefined;
+    assert gh_git_words(GH_OP_ADD, "wt/a", "gm/a", gh_base_ref("current"), words[0..256], offs[0..8]) == 8;
+    assert same_bytes(gh_word_at(words[0..256], @as(usize, offs[7])), "HEAD");
+    // negative controls: only the exact word maps, and a mapped-through word still meets the word checks
+    assert same_bytes(gh_base_ref("Current"), "Current");
+    assert same_bytes(gh_base_ref("current2"), "current2");
+    assert same_bytes(gh_base_ref(""), "");
+    assert gh_git_words(GH_OP_ADD, "wt/a", "gm/a", gh_base_ref("-current"), words[0..256], offs[0..8]) == 0;
 }
 
 test word_ok_refuses_options_and_spaces {
@@ -750,14 +872,18 @@ test word_counts_fit_the_spawn_argv {
 
 test env_is_fixed_and_minimal {
     var words : [64]u8 = undefined;
-    var offs : [2]u32 = undefined;
-    assert gh_env_words(words[0..64], offs[0..2]) == 2;
+    var offs : [3]u32 = undefined;
+    assert gh_env_words(words[0..64], offs[0..3]) == 3;
     assert same_bytes(gh_word_at(words[0..64], @as(usize, offs[0])), "PATH=/usr/bin:/bin");
     assert same_bytes(gh_word_at(words[0..64], @as(usize, offs[1])), "LC_ALL=C");
-    // negative controls: nothing from the caller (no HOME), buffers too small
-    assert same_bytes(gh_word_at(words[0..64], @as(usize, offs[1]) + 9), "");
-    assert gh_env_words(words[0..64], offs[0..1]) == 0;
-    assert gh_env_words(words[0..20], offs[0..2]) == 0;
+    assert same_bytes(gh_word_at(words[0..64], @as(usize, offs[2])), "HOME=/var/empty");
+    // nothing after the three fixed words, so nothing from the caller
+    assert offs[2] + 16 == 44;
+    assert same_bytes(gh_word_at(words[0..64], 44), "");
+    assert gh_env_words(words[0..44], offs[0..3]) == 3;
+    // negative controls: offs too short, one byte short of the 44 the words need
+    assert gh_env_words(words[0..64], offs[0..2]) == 0;
+    assert gh_env_words(words[0..43], offs[0..3]) == 0;
 }
 
 test row_shape {
@@ -792,8 +918,9 @@ test row_refuses_zero_byte_and_overlength {
 
 test create_only_when_missing {
     assert gh_should_create(-1, GH_ENOENT);
-    // negative controls: EACCES, an open that worked
+    // negative controls: EACCES, a link at the path (ELOOP under O_NOFOLLOW), an open that worked
     assert gh_should_create(-1, 13) == false;
+    assert gh_should_create(-1, GH_ELOOP) == false;
     assert gh_should_create(3, GH_ENOENT) == false;
 }
 
