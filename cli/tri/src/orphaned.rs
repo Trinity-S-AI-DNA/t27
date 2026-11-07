@@ -1,60 +1,9 @@
-//! Checks whose input is not there.
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! The catalog gate's field-by-field comparison had never run. `gen/` is
-//! gitignored and a cleanup commit untracked the artifacts it read, so the check
-//! was left with nothing -- and it reported that into a variable the master gate
-//! does not print. Zero occurrences of the word in the output of the command
-//! that gates master (W702).
-//!
-//! **Removing a check's input does not make it fail. It makes it quiet.** That
-//! is a shape, not an incident, and this looks for it.
-//!
-//! WHAT IT LOOKS FOR
-//! -----------------
-//! Path-shaped string literals in gate and tool sources whose path does not
-//! exist in the tree, EXCLUDING the ones that are supposed to be absent:
-//!
-//!   * fixtures inside a self-check or a test module -- `specs/a.t27`,
-//!     `docs/planted.md` and friends are planted into temp directories on
-//!     purpose, and a first version that did not exclude them reported 126 hits
-//!     of which almost none were real
-//!   * outputs the code WRITES rather than reads
-//!   * anything under `target/`, `/tmp`, or carrying a format placeholder
-//!
-//! THE CONTROL FAILED, AND THAT IS IN THE DOCUMENTATION RATHER THAN FIXED AWAY
-//! ---------------------------------------------------------------------------
-//! Run against the commit before W702's fix, this command does **not** find the
-//! case it was written for. The pre-fix code built the path as
-//!
-//!     let json = emitted.join("formats_catalog.json");   // no slash
-//!     ... .unwrap_or_else(|| Path::new("gen/numeric"))   // no extension
-//!
-//! Neither literal is a path by this command's test, and the assembled one never
-//! appears as a literal at all. **Zero of one on its founding case.**
-//!
-//! The window is not being widened until it says one. Following `join` chains
-//! through variables is a dataflow problem, and a heuristic stretched until it
-//! hits its own motivating example has stopped being evidence (skill 177).
-//!
-//! What it does find is a different and real class: an input named outright in
-//! production code that is not in the tree. That is how `public/index.html` was
-//! found -- the Railway HTTP server's static fallback and its 404 page both point
-//! at a directory that has never existed in any commit.
-//!
-//! WHAT IT CANNOT DO
-//! -----------------
-//! It cannot tell a check that is silent about a missing input from one that
-//! reports it properly -- that needs the control flow, not the literal. It marks
-//! a line `quiet?` when the nearest handling looks like a bare early return with
-//! no report, and that mark is a HINT for a human, never a verdict.
-//!
-//! It also cannot see a path built by concatenation. Everything here is a lower
-//! bound.
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::orphaned_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum OrphanedCmd {

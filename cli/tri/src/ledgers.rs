@@ -1,34 +1,9 @@
-//! Does each ledger's gate notice when one of its entries stops being true?
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! This repository keeps several ledgers that name specs by path and say "this
-//! one is expected to fail". A line outliving its debt is a specific, silent
-//! defect: the spec is fixed, the ledger still excuses it, and nothing says so.
-//!
-//! It happened. A repair made `specs/pins/emitter_xdc.t27` typecheck, one
-//! ledger was updated and `docs/reports/suite_expectations.json` was not, and
-//! the corpus ratchet sat RED on master for three runs before anyone read it.
-//! That was found by accident, because that particular gate fails loudly.
-//!
-//! Measured deliberately afterwards, by planting a line naming a spec that
-//! passes and running each gate:
-//!
-//!     seal_baseline.txt              FAILS   -- the entry is caught
-//!     conflict_markers_baseline.txt  FAILS
-//!     suite_expectations.json        FAILS   -- "UNEXPECTED PASS"
-//!     specs_generate_baseline.txt    printed a NOTE and exited 0
-//!     verilog_width_baseline.txt     printed a note and exited 0
-//!
-//! Two of five announced the defect and returned success. Both now fail; this
-//! command is what keeps that true, and what will notice the next ledger added
-//! without the same property.
-//!
-//! It MUTATES the ledgers while it runs and restores them. It refuses to start
-//! if any of them is already dirty, because a restore would then discard work.
 use anyhow::Result;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::ledgers_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum LedgersCmd {

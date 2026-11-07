@@ -1,44 +1,12 @@
-//! `tri jumps census` -- what happened to every `break` and `continue` the
-//! Verilog emitter had to lower?
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! `break` was emitted as `disable fork;` and `continue` as `/* continue */;`.
-//! Both are legal Verilog. `iverilog -g2012` accepts them, `yosys` accepts
-//! them, the seal hashes are stable over them, and every one of them is a
-//! NO-OP: `disable fork` kills processes spawned by a `fork` in the current
-//! scope, and the token `fork` occurs nowhere in the generated corpus except
-//! inside that very line. Sixteen `break`s and one `continue` ran off the end
-//! of their loops for as long as the emitter has existed, and no instrument in
-//! this repository could say so, because every instrument asked whether the
-//! output PARSES.
-//!
-//! So this one asks a different question: for each jump the source wrote, what
-//! did the backend put there, and does it do anything?
-//!
-//! WHAT IT CHECKS THAT A COUNT CANNOT
-//! ----------------------------------
-//! A guard flag is two halves -- a `reg` the loop declares and an assignment
-//! the `break` writes. A lowering that declares the flag and binds the jump to
-//! the WRONG loop still declares exactly one flag per loop that needs one, so
-//! any count of declarations is satisfied. It is the PAIRING that fails. That
-//! mutant survived a five-test suite until the pairing was asserted, so the
-//! pairing is asserted here too, over the whole corpus.
-//!
-//! WHAT IT REFUSES
-//! ---------------
-//! With no compiler it says so and exits non-zero. "0 unlowered jumps" taken
-//! with no binary is a statement about this machine and reads exactly like
-//! health.
-//!
-//! It reports and never gates. See #2988; `return` inside a loop is #2989 and
-//! is a different question with a different answer.
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::jumps_rules::*;
+
 
 /// The dead lowerings, and what each one was written as.
 const NO_OPS: &[(&str, &str)] = &[("disable fork;", "break"), ("/* continue */;", "continue")];

@@ -1,74 +1,11 @@
-//! `tri red` — what is failing on main right now, and since when.
-//!
-//! This exists because of a specific evening. The publisher for t27.ai failed
-//! six consecutive times and the site served hours-old content. A watchdog
-//! caught it correctly and went red five times, on my own commits. I did not
-//! read it once. I found the outage by accident, hours later, when a page I
-//! had just published returned 404.
-//!
-//! The detection was never the problem. Reading it was. So the point of this
-//! command is that there is no longer an excuse: one call, every repository,
-//! newest failure first, with how long each has been failing.
-//!
-//! It deliberately reports the LATEST run per workflow on the default branch
-//! rather than a window average. "Is it broken now" and "how often does it
-//! break" are different questions, and only the first one stops a deploy.
-//!
-//! AND "NOW" NEEDED A DATE
-//! ----------------------
-//! The latest run is the newest one that EXISTS, which is not the same as a
-//! recent one. `Auto Merge Ready PRs` sat in this list reading `260+ in a row`
-//! while its newest run was eight days old, on a branch that no longer exists.
-//! Measured: 1541 runs, every one a failure, never a success -- because the
-//! file had not parsed since 2026-07-07, so GitHub could not read its triggers
-//! and created a failed run on every push. #2256 repaired the parse on
-//! 2026-08-20; the 96 runs after that date all came from two stale branches
-//! carrying the old file, and ZERO came from master. It has been dormant since.
-//!
-//! Reporting that as a live outage is the "repaired defect reported as live"
-//! shape this repository already records -- committed here by me, one pass
-//! earlier, from this command's own output. So every row now carries the
-//! instant of its latest run.
-//!
-//! THE DATE IS A BOUND TOO, AND IT WAS NOT MARKED AS ONE
-//! -----------------------------------------------------
-//! `streak()` reads ONE page and sets two values from it: the count, and the
-//! instant of the oldest failure it saw. The count was marked as a lower bound
-//! (`30+`) and the date, assigned on the next line of the same loop, was
-//! printed as a plain fact.
-//!
-//! Measured on `OpenSSF Scorecard` in this repository: the command printed
-//! `30+ in a row since 2026-09-04T06:01`. The true streak was **105**, running
-//! from **2026-09-03T07:19:43Z** -- the printed instant is exactly the 30th
-//! newest run, the edge of the page, **75 runs and 23 hours later than the
-//! truth**. It is an UPPER bound on the start: the outage began at or before it.
-//!
-//! That direction is the damaging one for this command's own purpose, which its
-//! closing line states: a streak is "the number of times nobody looked". A date
-//! that drifts newer makes an old outage read as a fresh one.
-//!
-//! So a bounded read now says so in BOTH values, and `--deep` paginates until
-//! the streak actually ends, for when the real number is wanted.
-//!
-//! AND THE LISTING ITSELF WAS ONE PAGE
-//! -----------------------------------
-//! The streak was not the only bounded read here. The workflow LISTING that
-//! decides which workflows to examine at all asked `per_page=100` and did not
-//! paginate. Measured: `gHashTag/trinity-fpga` carries **405** active
-//! workflows, so **305 of them were never looked at** -- by the command whose
-//! subject is "what is failing right now".
-//!
-//! The same fetch in `cibase.rs` has paginated all along, so this was one fix
-//! that did not travel to its sibling. It was invisible for a second reason:
-//! `tri gates fetches` takes the ENCLOSING FUNCTION as the subject of its
-//! guard question, and `fn now` held more than one fetch, so the site sat in
-//! `a guard, but two fetches` -- an honest "cannot tell" -- until the function
-//! changed shape and the census resolved it to `prints what it got`.
 
 use anyhow::{Context, Result};
 use chrono::{NaiveDate, Utc};
 use clap::Subcommand;
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::red_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum RedCmd {

@@ -1,45 +1,11 @@
-//! `tri fmt` -- run the formatter without authoring 155 files you did not touch.
-//!
-//! `cargo fmt -p t27c`, on a branch holding a TWO-file change, came back with
-//! **155 tracked files modified**: every `bootstrap/src/host/*.rs`, seventy test
-//! files, `build.rs`, and `bootstrap/src/compiler.rs` -- which is M5-frozen, with
-//! `bootstrap/stage0/FROZEN_HASH` holding its sha256, so the freeze gate goes red
-//! the moment the formatter touches it.
-//!
-//! Nothing is wrong with the formatter. This repository has never been through
-//! it, and one grep says why: no workflow invokes `cargo fmt`, so nothing keeps
-//! master formatted and the first person to run it locally does not tidy their
-//! own change -- they author a 155-file diff on top of it.
-//!
-//! This is not a new finding. The skill records it in &sect;72 (150 files, the
-//! same frozen file, the same grep), &sect;381, &sect;407 and &sect;447. It was
-//! recorded four times and the command was still run. Prose that has failed four
-//! times does not get a fifth paragraph; it gets a binary that does the safe
-//! thing by default.
-//!
-//! So: note what is dirty, format, and put back everything that was CLEAN before
-//! and is dirty after. A file that was clean before is identical to HEAD, so
-//! restoring it loses nothing -- which is the whole reason the revert is safe and
-//! the reason the dirty set is taken first rather than derived from a base ref.
-//!
-//! WHAT THIS DOES NOT COVER, FIRST. The file you are editing. It is dirty before,
-//! so it is kept -- correctly -- and the formatter's rewrite of the REST of it is
-//! kept with it. Formatting the thirteen lines this command added to `main.rs`
-//! also sorted that file's `mod` declarations, turning a 13-insertion diff into
-//! 31 insertions and 18 deletions. The tell is the shape: deletions on a pure
-//! addition. There is no fix inside this command; the fix is `git checkout --`
-//! that one file and re-apply the hunks.
-//!
-//! WHAT THIS DOES NOT COVER, SECOND. Between the first `git status` and the second, a
-//! concurrent process sharing this worktree can dirty a file that this command
-//! will then revert. The window is the formatter's runtime. Every reverted path
-//! is printed for that reason. Separate worktrees are unaffected: `git checkout`
-//! is per-worktree, unlike `git stash`, which is not.
 
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::fmtmine_rules::*;
+
 
 /// Files the formatter dirtied that were clean when it started.
 ///

@@ -1,38 +1,8 @@
-//! Per-pid scratch paths under the temp dir that do not outlive their run.
-//!
-//! Written for #5982. A test in `fpga.rs` built a lake package in
-//! `temp_dir()/tri_m2l_standalone_pkg_<pid>`, which `require trinity` grows to
-//! about 7.6 GB, and removed it only on the line after
-//! `assert!(status.success())`. A failed `lake build` panicked past the cleanup,
-//! a killed run skipped it entirely, and on 2026-10-04 the leftovers filled the
-//! owner's disk twice -- free space fell to about 300 MB and other runs died
-//! with ENOSPC. Every leftover carried a dead pid in its name.
-//!
-//! Two halves, because each covers what the other cannot:
-//!
-//! * [`PidPath`] removes its path when it drops, which happens on the success
-//!   path AND while a panic unwinds. It has to exist BEFORE the step that can
-//!   fail; a guard created after that step guards nothing.
-//! * [`sweep_dead`] removes siblings named for a pid that is no longer running.
-//!   `kill -9` runs no destructor, so the only cleanup a killed run can get is
-//!   the next run doing it.
-//!
-//! Liveness is asked of `ps -p <pid> -o pid=`, the one answer available without
-//! `unsafe` or a new dependency (this crate has neither `libc` nor `tempfile`).
-//! Exactly one answer reads as dead: exit status 1 with NOTHING on stdout and
-//! NOTHING on stderr, which is what macOS `ps` prints for a pid with no process
-//! (checked 2026-10-04). Everything else reads as running: `ps` missing or
-//! unable to start, killed by a signal, any other exit status, and exit 1 with
-//! even one byte on either stream. That last case matters most: a `ps` that
-//! rejects `-p` or `-o` also exits 1, and says why on stderr. Reading it as dead
-//! makes every pid dead, and runs then delete each other's live 7.6 GB packages
-//! -- the review of #5990 showed exactly that with a fake `ps` on PATH. Removing
-//! a live run's scratch is the one mistake this must not make; keeping a dead
-//! one costs only disk until a sweep that can tell. Linux procps was not
-//! checked; if it answers a missing pid any other way, the sweep keeps
-//! everything there.
 
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::piddir_rules::*;
+
 
 /// A file or directory that is removed when this guard drops -- on return and
 /// on unwind alike.

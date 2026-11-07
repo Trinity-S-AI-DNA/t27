@@ -1,20 +1,10 @@
-//! `tri now` -- write a docs/now/ entry without hand-writing the frame.
-//!
-//! No hook and no CI job asks for an entry any more: the NOW gate was removed
-//! by owner decision 2026-10-04 (#5935). When one is written, the entry format
-//! is rigid enough that writing it by hand invites drift: a forgotten date, a
-//! heading that does not match the section, a missing issue reference. This
-//! stamps the frame; the caller supplies only the content.
-//!
-//! Entries are one file per unit of work, `docs/now/<YYYY-MM-DD>-<slug>.md`.
-//! This used to prepend to the single file docs/NOW.md, which meant every PR
-//! rewrote the same first line and GitHub marked every concurrent PR
-//! CONFLICTING. Writing a distinct path removes the shared line entirely, and
-//! the writer gets simpler: a create, not a read-modify-write.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::nownote_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum NowCmd {

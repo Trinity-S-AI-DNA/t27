@@ -1,48 +1,12 @@
-//! `tri emit determinism` -- does the same binary produce the same output twice?
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! Every byte-comparison this repository makes over generated code assumes the
-//! generator is deterministic: `.trinity/seals/*.json` store `gen_hash_c`,
-//! `gen_hash_rust` and `gen_hash_zig`; `emit-bitexact-gate.yml` exists to assert
-//! that emission is reproducible; and `t27c corpus --per-spec` is diffed against
-//! another binary to name the specs a change moved.
-//!
-//! Three of the four emitters do not have it. Measured over 650 specs, same
-//! binary, two consecutive runs:
-//!
-//!   gen-c        1 file differs
-//!   gen-rust     3
-//!   gen  (Zig)   2
-//!   gen-verilog  0
-//!
-//! The one backend the seal gate is historically pointed at is the deterministic
-//! one, which is why the wobble has not been noticed. See #3006.
-//!
-//! WHAT IT PRINTS, AND WHY IT NAMES FILES
-//! --------------------------------------
-//! A count is what the accident produced; a NAME is what a repair needs. #3006
-//! says the cheapest next step is naming the differing specs rather than
-//! counting them, so that is what this does. A wobble of one file in 581 reads
-//! as a real change on the day it fires, and this repository's log already
-//! records the cost of that mistake -- "a gate going red on a change that cannot
-//! touch it".
-//!
-//! WHAT IT REFUSES
-//! ---------------
-//! With no compiler it says so and exits non-zero. A determinism report of
-//! "0 differences" taken with no binary is a statement about this machine, not
-//! about the emitters, and reads exactly like health.
-//!
-//! It reports and never gates. Whether a wobbling file is a defect worth fixing
-//! or an ordering that nothing downstream reads is not a walker's question, and
-//! a gate that reddens on it before anyone has decided would be muted.
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::gendet_rules::*;
+
 
 /// The emitters, in the order the corpus table prints them.
 const BACKENDS: &[(&str, &str)] = &[

@@ -1,34 +1,12 @@
-//! `tri elab` — classify a compiler's error output before you quote a number
-//! from it.
-//!
-//! This command exists because of a specific failure. `tools/check_elab_ratchet.py`
-//! counted every stderr line containing the substring `" error"`. iverilog closes
-//! each failing file with `N error(s) during elaboration.` — a TOTAL, which
-//! matched. One phantom per failing module: 25 of a reported 186, and the number
-//! reached commit messages, an issue comment and a status page before anyone
-//! looked at what it was made of.
-//!
-//! Counting lines is not classifying. What caught it was one pass that printed
-//! the distribution BY MESSAGE SHAPE and read every row. That pass was typed by
-//! hand, from memory, under time pressure — which is exactly the kind of step
-//! that does not get repeated, so it becomes a command.
-//!
-//! Two verbs:
-//!
-//!   * `classify` — the distribution of every elaboration diagnostic by shape,
-//!     with iverilog's own summary lines separated out rather than counted.
-//!     Run this BEFORE quoting a total anywhere a human will read it.
-//!   * `secondary` — how many diagnostics sit on the same source line as another
-//!     diagnostic above them. A condition-expression error under an unbound
-//!     identifier is not independent work: it disappears with its cause. In this
-//!     corpus 57 of 58 were secondary, so a third of the "remaining errors" were
-//!     never remaining at all.
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::elab_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum ElabCmd {

@@ -1,27 +1,10 @@
-//! `tri lean reach` -- which proof files the build root actually reaches.
-//!
-//! Lake builds a `lean_lib` by building its root module and, transitively, whatever
-//! that module imports. `roots` defaults to the library name and `globs` defaults to
-//! `Glob.one` of each root, so a lakefile that names no globs compiles exactly one
-//! file plus its import closure. `proofs/lean4/Trinity.lean` is twelve lines long and
-//! holds nine imports; every other file in the tree is reached only if one of those
-//! nine leads to it.
-//!
-//! Twelve do not. Fifteen thousand lines sit beside the seven thousand that compile,
-//! in the same directory, under the same lakefile, indistinguishable in an editor.
-//!
-//! A build graph is a claim about coverage that nothing prints. `lake build` prints
-//! what it compiled, never what it skipped, so a file outside the graph produces no
-//! output at all -- not an error, not a warning, not a line. The only way to see the
-//! omission is to ask the root what it reaches and compare that with what exists.
-//!
-//! This also re-populates a ratchet. `lean-proofs.yml` counts `sorry` by grepping the
-//! whole directory; the build compiles the closure. Those are different sets, and four
-//! of the five admitted proofs the gate counts are in files the build never opens.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::leanreach_rules::*;
+
 
 /// One proof file, as the tree holds it.
 pub struct LeanFile {

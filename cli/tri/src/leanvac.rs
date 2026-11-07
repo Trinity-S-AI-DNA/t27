@@ -1,20 +1,10 @@
-//! `tri lean vacuous` -- completeness theorems whose model is empty.
-//!
-//! `proofs/lean4/.../Completeness.lean` holds 250 hand-transcribed models, one per
-//! spec, each with a theorem asserting the module is Icarus-lowerable. A model with
-//! `functions := []` makes its theorem true by construction: `native_decide` on an
-//! empty structure proves something, and that something is not about the spec.
-//!
-//! 114 of the 250 are empty. The ledger's `max_vacuous` ratchet, which exists to stop
-//! that number growing, counts **44** -- because it only sees models that ALSO disagree
-//! with the Rust classifier. The other 70 are vacuous and invisible to it.
-//!
-//! A ratchet measuring a subset of its own subject is worse than no ratchet, because
-//! the number it reports looks like the number you care about.
 
 use anyhow::Result;
 use clap::Subcommand;
 use std::path::PathBuf;
+#[allow(dead_code, unused_parens)]
+pub use crate::leanvac_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum LeanCmd {

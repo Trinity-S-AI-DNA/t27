@@ -1,25 +1,9 @@
-//! What the parser reads and throws away, ranked, against what it is pinned at.
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! `parse-no-discard` reports 87 corpus failures and every one of them is
-//! amnestied by name in `docs/reports/suite_expectations.json`. The suite is
-//! green because every failure it can report is pre-approved -- which is the
-//! design working, not a defect, but it means the question "where is the next
-//! rung" has no answer in any suite output.
-//!
-//! Ranking is the answer. Two parser fixes in one day took 1 292 tokens out of
-//! the corpus by working the largest entries first, and the largest entry is not
-//! visible from a count of 87.
-//!
-//! This reads `t27c parse-complete` -- the same command the suite phase calls
-//! into -- rather than re-implementing the accounting. A second implementation
-//! of a measurement is a second number to disagree with the first, and this
-//! repository has paid for that more than once.
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[allow(dead_code, unused_parens)]
+pub use crate::discard_rules::*;
 
 #[derive(Subcommand)]
 pub enum DiscardCmd {

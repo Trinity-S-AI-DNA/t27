@@ -1,24 +1,10 @@
-//! A mutex for the loop, built from the one atomic operation git already gives
-//! us over a shared remote: creating a ref that does not exist.
-//!
-//! Two sessions of this loop ran concurrently and took the SAME three tasks
-//! from the same list of recommendations, opening PRs for all of them. Nothing
-//! in the flow says who is working on what.
-//!
-//! THE OBVIOUS VERSION DOES NOT LOCK. Pushing `origin/master` to a claim tag
-//! succeeds for the second claimant too: git treats re-pushing the SAME value
-//! to an existing tag as a no-op and exits 0, so both sessions believe they
-//! hold it. Measured before this was written -- first push exit 0, second push
-//! exit 0. Only a DIFFERENT value is rejected.
-//!
-//! So the claim is a commit that no other claimant can produce: an empty tree
-//! with a message naming this host, process and instant. Then the second
-//! claimant's push carries a different sha and git refuses it, and the tag's
-//! message says who holds it.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::loopclaim_rules::*;
+
 #[path = "../../../gen/rust/tri/loop/tick.rs"] #[allow(dead_code, unused_parens)]
 mod tick; // t27c gen-rust of specs/tri/loop/tick.t27: every rule of `tri loop plan`
 

@@ -1,23 +1,11 @@
-//! `tri fleet` — is the hardware this plan assumes actually attached?
-//!
-//! Written after an audit found three present-tense capability claims in the
-//! project's own notes — "3-board inference cluster PROVEN", "all three flash
-//! from software without replugging", "on-chip training PROVEN" — while not a
-//! single board was on the bus. Each was true when measured. None was true
-//! that day.
-//!
-//! A measurement stays true because it happened; a capability quietly becomes
-//! false when the environment regresses, and nothing announces it. The notes
-//! even said "a configured fleet is a perishable measurement" — the instinct
-//! was recorded and never turned into a check. This is that check.
-//!
-//! It refuses to guess: an empty bus is reported as an empty bus, with the
-//! sentence to send the owner, not as a problem to code around.
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use std::path::PathBuf;
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::fleet_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum FleetCmd {

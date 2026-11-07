@@ -12,37 +12,37 @@ mod census;
 mod cibase;
 mod competitors;
 mod depin;
-mod discard;
-mod elab;
-mod fleet;
-mod fmtmine;
+#[path = "../../../gen/rust/tri/discard/discard.rs"] #[allow(dead_code, unused_parens)] mod discard_rules; mod discard; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/elab/elab.rs"] #[allow(dead_code, unused_parens)] mod elab_rules; mod elab; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/fleet/fleet.rs"] #[allow(dead_code, unused_parens)] mod fleet_rules; mod fleet; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/fmtmine/fmtmine.rs"] #[allow(dead_code, unused_parens)] mod fmtmine_rules; mod fmtmine; // t27c gen-rust + thin I/O glue
 mod fpga;
 mod gates;
-mod gendet;
+#[path = "../../../gen/rust/tri/gendet/gendet.rs"] #[allow(dead_code, unused_parens)] mod gendet_rules; mod gendet; // t27c gen-rust + thin I/O glue
 mod hooks;
 mod inflight;
 mod issues;
-mod jumps;
+#[path = "../../../gen/rust/tri/jumps/jumps.rs"] #[allow(dead_code, unused_parens)] mod jumps_rules; mod jumps; // t27c gen-rust + thin I/O glue
 mod kinddrift;
-mod leanreach;
-mod leanvac;
-mod ledgers;
-mod loopclaim;
+#[path = "../../../gen/rust/tri/leanreach/leanreach.rs"] #[allow(dead_code, unused_parens)] mod leanreach_rules; mod leanreach; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/leanvac/leanvac.rs"] #[allow(dead_code, unused_parens)] mod leanvac_rules; mod leanvac; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/ledgers/ledgers.rs"] #[allow(dead_code, unused_parens)] mod ledgers_rules; mod ledgers; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/loopclaim/loopclaim.rs"] #[allow(dead_code, unused_parens)] mod loopclaim_rules; mod loopclaim; // t27c gen-rust + thin I/O glue
 mod misread;
 mod night;
-mod oneaway;
+#[path = "../../../gen/rust/tri/oneaway/oneaway.rs"] #[allow(dead_code, unused_parens)] mod oneaway_rules; mod oneaway; // t27c gen-rust + thin I/O glue
 mod payout;
 mod window;
 mod modreach;
 mod mutate;
-mod nownote;
-mod orphaned;
-mod piddir;
+#[path = "../../../gen/rust/tri/nownote/nownote.rs"] #[allow(dead_code, unused_parens)] mod nownote_rules; mod nownote; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/orphaned/orphaned.rs"] #[allow(dead_code, unused_parens)] mod orphaned_rules; mod orphaned; // t27c gen-rust + thin I/O glue
+#[path = "../../../gen/rust/tri/piddir/piddir.rs"] #[allow(dead_code, unused_parens)] mod piddir_rules; mod piddir; // t27c gen-rust + thin I/O glue
 mod prcheck;
-mod prose;
+#[path = "../../../gen/rust/tri/prose/prose.rs"] #[allow(dead_code, unused_parens)] mod prose_rules; mod prose; // t27c gen-rust + thin I/O glue
 mod quant;
 mod git;
-mod red;
+#[path = "../../../gen/rust/tri/red/red.rs"] #[allow(dead_code, unused_parens)] mod red_rules; mod red; // t27c gen-rust + thin I/O glue
 #[path = "../../../gen/rust/tri/test/report.rs"] #[allow(dead_code, unused_parens)]
 mod report; // t27c gen-rust of specs/tri/test/report.t27 (#7369): every rule of reading `t27c test-report`
 #[path = "../../../gen/rust/tri/lab/receipt.rs"] #[allow(dead_code, unused_parens)]

@@ -1,27 +1,12 @@
-//! Which failing specs are ONE defect from compiling, and what that defect is.
-//!
-//! WHY THIS EXISTS. Three correct emitter repairs in a row moved the Rust column by
-//! **zero**, each while demonstrably fixing the emission. The reason was never measured
-//! until it was: a fix flips a spec to OK only when it closes that spec's LAST error, and
-//! the largest first-error classes are spread across specs that carry three or four more
-//! defects each. Targeting the biggest class is a statement about FREQUENCY; moving the
-//! column is a question about TERMINATION, and they are different questions asked of the
-//! same data.
-//!
-//! Measured over 243 failing specs at the time this was written: 55 carry exactly one real
-//! error, 38 carry two, 150 carry three or more, median four. The 55 are the only specs a
-//! single repair can move, and this command names them and their sole class.
-//!
-//! THE COUNT HAS TO EXCLUDE ITS OWN SUMMARY LINE. `rustc` ends with
-//! `error: aborting due to N previous errors`, which matches `^error` like any other.
-//! Counting it inflates every bucket by one and turns "55 specs with one error" into
-//! "zero specs with one error" -- the opposite conclusion, and the one written down first.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[allow(dead_code, unused_parens)]
+pub use crate::oneaway_rules::*;
+
 
 #[derive(Parser, Debug)]
 /// Failing specs whose generated Rust has exactly ONE rustc error, by class.

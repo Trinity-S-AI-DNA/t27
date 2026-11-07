@@ -1,32 +1,10 @@
-//! Specs a literate author left prose in, and how far that prose is from code.
-//!
-//! WHY THIS EXISTS
-//! ---------------
-//! `#` starts a line comment in t27 -- deliberately, so that a Markdown heading
-//! in a `.t27` file becomes a comment "which is what they always were in
-//! intent" (bootstrap/src/compiler.rs). What was never handled is the PARAGRAPH
-//! under the heading. A spec written in the literate style
-//!
-//!     ## Specification
-//!
-//!     Zig-backed FFI bridge for Trinity VSA core.
-//!
-//! parses the heading and stops on the sentence. Measured the day this was
-//! written: 13 specs use the `## Specification` template and NONE of them
-//! generated; 16 carry any Markdown heading and none generated. Against a base
-//! rate of 104 non-generating specs in 650, that is not a coincidence -- but
-//! the heading is not the cause, the paragraph under it is. The first reading
-//! blamed the heading and a two-line probe disproved it.
-//!
-//! WHAT IT DOES NOT DO
-//! -------------------
-//! It never edits a line the compiler did not stop on, and it refuses outright
-//! when the line it stops on looks like code. A spec whose real obstacle is an
-//! unimplemented construct is reported as such and left alone.
 use crate::unparsed::parse_failures;
 use anyhow::Result;
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::prose_rules::*;
+
 
 #[derive(Subcommand)]
 pub enum ProseCmd {
