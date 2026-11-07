@@ -1,34 +1,3 @@
-//! The competitor table, read against its own contract.
-//!
-//! `specs/igla/coder/benchmark.t27` holds one `CompetitorScore` record per
-//! external system, and the struct's own doc line says what the fields are:
-//! "published Pass@K scores from external research". A record is therefore a
-//! citation -- it states what somebody else measured and published.
-//!
-//! Three ways that contract breaks, and this command counts each of them:
-//!
-//! 1. **A published score of zero that nobody published.** The struct has no
-//!    way to say "this competitor cites no Pass@K", so a record with no score
-//!    to cite states `0.0`. That value is legal, in range, and indistinguishable
-//!    from a measured zero. `compare_with_competitor` subtracts it, and returns
-//!    our own score as the margin -- a lead computed against an absent number.
-//!
-//! 2. **One paper entered as two competitors.** A later pass adds a system that
-//!    is already in the table under a different function name. Any count of
-//!    "systems surveyed" then double-counts it.
-//!
-//! 3. **One name defined twice.** `tri types redef` already reports this class
-//!    across the whole tree; it is repeated here only as the intersection with
-//!    this table, so the three readings come off one walk of one file.
-//!
-//! The attribution rule for (2) is stated in the output on purpose. The first
-//! version of this measurement took "the last arXiv id within 400 characters
-//! before the function" and reported 16 double-entered papers. Six were real;
-//! ten were the *neighbouring* record's citation, read across the boundary. A
-//! rule that a reader cannot see is a rule a reader cannot check, so the rule
-//! is printed beside the number, and `a_neighbours_citation_is_not_this_ones`
-//! holds it.
-
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

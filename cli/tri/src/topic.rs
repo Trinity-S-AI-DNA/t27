@@ -1,31 +1,3 @@
-//! `tri topic` -- has someone already done this, or are they doing it now?
-//!
-//! Twice in one session I started work another session had shipped or had open.
-//! `tri gates quiet` and `tri gates empty` (#3049) cover two of the four lenses a
-//! read-only fan-out of mine was scanning at the same moment, and `tri skill
-//! refs` (#3056) is the tool that would have caught a dangling cross-reference I
-//! had just written a paragraph about. The second one landed on master while my
-//! own branch was open on the same subject.
-//!
-//! Neither was expensive to discover afterwards and both were free to discover
-//! BEFORE: the first was an OPEN pull request the whole time, and the second was
-//! a merged commit. What was missing was one command instead of four.
-//!
-//! So: open pull requests, recent commits on the base branch, open issues, and
-//! the section titles of every SKILL.md. A row matches when it carries any of
-//! the keywords, and rows are ordered by how many DISTINCT keywords they carry,
-//! because a row matching three of your words is the one you have to read.
-//!
-//! WHAT THIS DOES NOT DO. It reads titles and headlines, not bodies or diffs --
-//! someone whose PR title does not name the subject is invisible here, and the
-//! ordering is a word count, not an understanding. It is a two-second check
-//! against a class of waste measured at two occurrences in one session, not a
-//! search engine.
-//!
-//! And it refuses rather than reporting an empty result when `gh` cannot run:
-//! "no one else is working on this" and "I could not ask" are the same empty
-//! list, which is the defect this repository has spent the week naming.
-
 use anyhow::{bail, Result};
 use std::path::Path;
 use std::process::Command;

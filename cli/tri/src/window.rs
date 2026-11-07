@@ -1,25 +1,3 @@
-//! Was the base you measured against still the tip when you reported?
-//!
-//! WHY THIS EXISTS. `origin/master` took **69 merges in twenty-four hours** here -- one
-//! every twenty-one minutes -- while a corpus measurement takes fifteen to thirty: build a
-//! pinned binary from the base, run 650 specs, build the change, run 650 again. The base
-//! therefore moves DURING almost every measurement, and two different failures follow from
-//! that one fact.
-//!
-//!   * A delta measured against a stale base is not a statement about the change. One
-//!     one-line repair here measured `338 -> 352, +14`; re-built against the base as it
-//!     stood at report time it measured **+0**. All fourteen were a neighbour's work that
-//!     landed in between, and the only reason they were not reported as mine is that the
-//!     base happened to be rebuilt.
-//!   * The defect may already be repaired. A `Box`-for-recursive-types fix was measured at
-//!     `357 -> 360, +3` and then found, at merge time, to be on master already -- both
-//!     shapes, all three specs green. `tri loop claim` had been taken before the work
-//!     started, and did not help: a claim separates two sessions only when BOTH take one.
-//!
-//! One question answers both: did the tip move between the start of the measurement and
-//! the moment of the claim? If it did, neither the delta nor the defect's existence has
-//! been established, and the honest move is to re-measure rather than to publish.
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;

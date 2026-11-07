@@ -1,9 +1,3 @@
-//! `tri hooks ...` -- pure-Rust ports of repository commit / push gates.
-//!
-//! Replaces the Bash gates that previously lived in `.claude/hooks/`. The
-//! original `.sh` files now forward to these subcommands so any existing
-//! harness wiring keeps working without re-introducing logic in shell.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
