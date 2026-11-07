@@ -120,10 +120,14 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
 13. **First machine signal, not an acceptance run.** CI `t27c test-report` (spec-guards, head e35edfa24e) scored
     `native_agent`, `native_provider`, `native_swarm`, `native_version` at 0 failing tests, `native_log` 2,
     `native_policy` 1, `native_host` 3, and `native_accept` as not building (it imports the `@extern` host).
-    The log and policy failures matched five asserts that read a field straight off a call result; they are bound
-    to a local const in 277d39ab34 (not re-scored yet). The three `native_host` failures are not identified:
-    the file says `@extern` specs run under `t27b`, and the owner's hold keeps `native_host` and `native_accept`
-    unrun, so they stay WAITING_RESOURCE. This does not change any status above; nothing here is EXECUTED.
+    The failing test names are not identified: the CI score keeps only counts. A first guess (five asserts that
+    read a field straight off a call result, bound to a local const in 277d39ab34) did not move the counts at
+    ceeb4e941c (`native_log` 2, `native_policy` 1, `native_host` 3, `native_accept` not building), so it is
+    withdrawn. Hand-tracing the 15 policy tests and reading the 13 log tests found no failing one. The `native_host`
+    and `native_accept` results are expected under `t27c`: the file says `@extern` specs run under `t27b`, and the
+    owner's hold keeps both unrun, so they stay WAITING_RESOURCE. Naming the three pure-spec failures needs one run
+    of `t27c test-report <spec> --specs-dir specs` per spec (owner's `MAC_HEAVY_OK=1`). This does not change any
+    status above; nothing here is EXECUTED.
 
 ## Safety defaults in force
 
@@ -132,5 +136,8 @@ Secrets come from the environment only (`T27OS_LMSTUDIO_API_KEY`) and live in a 
 tool outside the allowlist is rejected; command and network tools return "hold for approval"; an agent cannot
 hold or call the spawn tool, and a swarm refuses members without an explicit spawn policy.
 
-Requests out: owner -- run the two `t27b test` commands above (or say "pane" for a shell-cell pane); sent
-2026-11-07; default: statuses stay WAITING_RESOURCE and `VERSION_CREATED` stays NO; due: before any merge.
+Requests out: owner -- (1) run the two `t27b test` commands above (or say "pane" for a shell-cell pane); (2) run
+`MAC_HEAVY_OK=1 ./target/release/t27c test-report <spec> --specs-dir specs` for `native_log`, `native_policy`
+and `native_host`, and paste the lines that are not `pass`; (3) rule how spec-guards treats `@extern` specs;
+sent 2026-11-07; default: statuses stay WAITING_RESOURCE, `VERSION_CREATED` stays NO and spec-guards stays red on
+the unidentified failures; due: before any merge.
