@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 mod ct; // t27c gen-rust of specs/claw/text.t27: token_occurrences/is_ident_byte (the orphaned-tests boundary count) moved out of this file into the spec (#11783)
 use clap::Subcommand;
 use std::process::Command;
-
+#[allow(dead_code, unused_parens)]
+pub use crate::gates_rules::*;
 #[derive(Subcommand, Debug)]
 pub enum GatesCmd {
     /// Classify the compiler's own warnings. `rustc` already answers "is this
@@ -22,7 +23,6 @@ pub enum GatesCmd {
         #[arg(long)]
         gate: bool,
     },
-
     /// Run every gate script and its negative control; name the ones with none.
     Sweep {
         /// Skip the gates themselves and only report which have no control.

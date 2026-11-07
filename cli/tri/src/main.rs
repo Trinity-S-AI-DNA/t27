@@ -17,7 +17,7 @@ mod depin;
 #[path = "../../../gen/rust/tri/fleet/fleet.rs"] #[allow(dead_code, unused_parens)] mod fleet_rules; mod fleet; // t27c gen-rust + thin I/O glue
 #[path = "../../../gen/rust/tri/fmtmine/fmtmine.rs"] #[allow(dead_code, unused_parens)] mod fmtmine_rules; mod fmtmine; // t27c gen-rust + thin I/O glue
 mod fpga;
-mod gates;
+#[path = "../../../gen/rust/tri/gates/gates.rs"] #[allow(dead_code, unused_parens)] mod gates_rules; mod gates; // t27c gen-rust of specs/tools/tri/gates.t27
 #[path = "../../../gen/rust/tri/gendet/gendet.rs"] #[allow(dead_code, unused_parens)] mod gendet_rules; mod gendet; // t27c gen-rust + thin I/O glue
 mod hooks;
 mod inflight;
