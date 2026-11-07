@@ -4,10 +4,12 @@ Refs gHashTag/t27#13214 (T27F-007). One step of the T27F UI development history:
 per step, frames never overwritten, one manifest per step. A film is assembled later from the
 steps in folder order, each step as BEFORE, what changed, AFTER, DIFF, what remains.
 
-This file is prose on purpose. The owner asked for a `manifest.yaml`; a hand-written YAML file is
-a non-t27 file and the project describes itself in t27. The keys below are the owner's field
-list, one per line, so a typed `.t27` record (or a YAML file written by a tool) can be generated
-from them later. Not done yet.
+The source of truth for this step is the typed record `specs/t27f/ui_history_s01.t27` (schema and
+rules in `specs/t27f/ui_history.t27`, the ordered log in `specs/t27f/ui_history_log.t27`). It
+validates itself in its own tests, and the log is append-only: a correction is a new step, never an
+edit of this one. This file is the human reading copy of the same fields; where the two differ, the
+spec wins. The owner asked for a `manifest.yaml`; a hand-written YAML file is a non-t27 file and the
+project describes itself in t27, so there is none.
 
 ## Record
 
