@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::Subcommand;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-
+#[allow(dead_code, unused_parens)]
+pub use crate::unparsed_rules::*;
 #[derive(Subcommand)]
 pub enum UnparsedCmd {
     /// Rank the constructs that stop the compiler, most specs first.
@@ -24,7 +25,6 @@ pub enum UnparsedCmd {
         refuted: bool,
     },
     /// Cross-check the census against an INDEPENDENTLY built population.
-    ///
     /// `report`, `locate` and `prose` read ONE shared scope, so their agreeing
     /// with each other proves nothing about the numbers -- only that they read
     /// the same variable. This walks the working tree instead of asking git,
