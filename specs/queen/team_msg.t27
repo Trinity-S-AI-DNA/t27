@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/team_msg.t27 -- a team of agents and the mail between sessions, as actor messages.
+; gHashTag/t27#13310, order SWARM_BEST_PRACTICES (GODMODE epic #13260, actor epic #6971), 2026-11-08.
+; Studied: Claude Code agent teams (one fixed lead, teammates with their own context, a
+; shared task list with dependencies and a lock on claim, plan approval, shutdown requests that a
+; teammate may reject, idle notices, no nested teams) and cross-session messaging (ListAgents and
+; SendMessage: plain text only, accept/hold/refuse on the receiving side, size, queue and repeat
+; limits, and a message is never consent).
+; This file reads the tags, lanes and supervisors of specs/queen/actors.t27 and the fenced claim of
+; specs/queen/control.t27 and edits neither. Like claim_msg.t27 (16..18), key_rotation_msg.t27
+; (19..21), lab_job_msg.t27 (22..24) and payout_evidence_msg.t27 (25..27), it sits on tags of its own,
+; 28..35, under the 64 tags one control lane word holds. A team is NOT a new actor kind: it is a
+; supervisor with the flags actors.t27 already has (section 6: "a one_for_all team under a lead task is
+; where AUTO_ANY_SIGNIFICANT belongs"). The task list is NOT a second queue: a team task is claimed by
+; control.t27 claim_lands, behind one new gate, its dependencies (dispatch.t27 DEPENDENCY_RULE: none
+; read today). The numbers marked "docs" are read from the Claude Code docs on 2026-11-08, not measured.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenTeamMsg;
+
+use queen::actors;
+use queen::control::claim_lands;
+use queen::agent_card::ROLE_SOLO;
+use queen::agent_card::ROLE_LEAD;
+use queen::agent_card::ROLE_MATE;
+
+; --- 1. Tags and lanes ------------------------------------------------------------------------------
+
+/// A mate's finding, to the lead or to another mate.
+pub const TM_TAG_FINDING : u64 = 28;
+/// A mate in plan mode asks the lead to approve its plan before it edits.
+pub const TM_TAG_PLAN_ASK : u64 = 29;
+/// The lead's answer to a plan.
+pub const TM_TAG_PLAN_ANSWER : u64 = 30;
+/// The lead asks a mate to stop.
+pub const TM_TAG_STOP_ASK : u64 = 31;
+/// The mate's answer: it may approve or reject.
+pub const TM_TAG_STOP_ANSWER : u64 = 32;
+/// A mate went idle or exited. One notice per watch: the control lane coalesces it.
+pub const TM_TAG_IDLE : u64 = 33;
+/// A card was re-published (agent_card.t27): the receiver re-reads the row, the message carries no card.
+pub const TM_TAG_CARD : u64 = 34;
+/// A plain-text note between sessions: the only tag that crosses a session boundary.
+pub const TM_TAG_PEER : u64 = 35;
+pub const TM_TAG_FIRST : u64 = 28;
+pub const TM_TAG_LAST : u64 = 35;
+
+pub fn tm_known_tag(tag: u64) -> bool {
+    if (tag < TM_TAG_FIRST) { return false; }
+    return tag <= TM_TAG_LAST;
+}
+
+/// Answers, a stop and an idle notice ride the control lane (taken first, one per kind); the rest are
+/// data. The numbers are actors.t27's LANE_DATA and LANE_CONTROL.
+pub fn tm_lane(tag: u64) -> u8 {
+    if (tm_known_tag(tag) == false) { return LANE_NONE; }
+    if (tag == TM_TAG_PLAN_ANSWER) { return LANE_CONTROL; }
+    if (tag == TM_TAG_STOP_ASK) { return LANE_CONTROL; }
+    if (tag == TM_TAG_STOP_ANSWER) { return LANE_CONTROL; }
+    if (tag == TM_TAG_IDLE) { return LANE_CONTROL; }
+    return LANE_DATA;
+}
+
+/// Who may send what. Across sessions only a plain-text note (docs: structured protocol messages stay
+/// inside a team). Inside a team: the lead answers plans and asks stops; a mate asks plans, answers
+/// stops and goes idle; either sends findings, notes and card notices.
+pub fn tm_may_send(tag: u64, sender_role: u8, same_team: bool) -> bool {
+    if (tm_known_tag(tag) == false) { return false; }
+    if (tag == TM_TAG_PEER) { return true; }
+    if (same_team == false) { return false; }
+    if (sender_role == ROLE_SOLO) { return false; }
+    if (tag == TM_TAG_PLAN_ANSWER) { return sender_role == ROLE_LEAD; }
+    if (tag == TM_TAG_STOP_ASK) { return sender_role == ROLE_LEAD; }
+    if (tag == TM_TAG_PLAN_ASK) { return sender_role == ROLE_MATE; }
+    if (tag == TM_TAG_STOP_ANSWER) { return sender_role == ROLE_MATE; }
+    if (tag == TM_TAG_IDLE) { return sender_role == ROLE_MATE; }
+    return true;
+}
+
+; --- 2. A message is never consent ------------------------------------------------------------------
+
+/// What a message could be taken to allow. GRANT_PLAN: a mate starts editing after its plan was
+/// approved, a team's own workflow. GRANT_PERMISSION: anything a person approves -- a push, a merge, a
+/// message outside, a payment, a settings change.
+pub const GRANT_PLAN : u8 = 0;
+pub const GRANT_PERMISSION : u8 = 1;
+pub const PEER_MESSAGE_IS_CONSENT : bool = false;
+
+pub fn mail_may_grant(tag: u64, act: u8) -> bool {
+    if (act == GRANT_PERMISSION) { return PEER_MESSAGE_IS_CONSENT; }
+    if (act == GRANT_PLAN) { return tag == TM_TAG_PLAN_ANSWER; }
+    return false;
+}
+
+/// The plan gate: a mate that must plan first edits only after the lead approved.
+pub fn edit_allowed(plan_required: bool, plan_approved: bool) -> bool {
+    if (plan_required == false) { return true; }
+    return plan_approved;
+}
+
+; --- 3. The receiving side of a cross-session note --------------------------------------------------
+
+pub const IN_ACCEPT : u8 = 0;
+pub const IN_HOLD : u8 = 1;
+pub const IN_REFUSE : u8 = 2;
+/// docs: at most 100 held notes, a hold dialog closes after 5 minutes, at most 50 queued, a body of
+/// about one million characters.
+pub const HOLD_CAP : u32 = 100;
+pub const HOLD_EXPIRY_SECONDS : u32 = 300;
+pub const QUEUE_CAP : u32 = 50;
+pub const BODY_CAP_CHARS : u32 = 1000000;
+
+/// One note in, one answer. `policy` is the receiver's setting (accept, hold or refuse); `repeat` is a
+/// body identical to the sender's last; `rate_ok` is the per-sender limit. Limits come before policy:
+/// a note too big, repeated or too fast is refused whatever the policy, so a loop of two agents stops
+/// on its own.
+pub fn inbound_answer(policy: u8, held: u32, queued: u32, body_len: u32, repeat: bool, rate_ok: bool) -> u8 {
+    if (policy > IN_REFUSE) { return IN_REFUSE; }
+    if (policy == IN_REFUSE) { return IN_REFUSE; }
+    if (body_len > BODY_CAP_CHARS) { return IN_REFUSE; }
+    if (repeat) { return IN_REFUSE; }
+    if (rate_ok == false) { return IN_REFUSE; }
+    if (queued >= QUEUE_CAP) { return IN_REFUSE; }
+    if (policy == IN_HOLD) {
+        if (held >= HOLD_CAP) { return IN_REFUSE; }
+        return IN_HOLD;
+    }
+    return IN_ACCEPT;
+}
+
+/// A held note waits for a person. Whether the docs drop or deliver an expired hold is not
+/// established; this spec reads it as dropped, the side that grants nothing.
+pub fn hold_expired(age_seconds: u32) -> bool {
+    return age_seconds >= HOLD_EXPIRY_SECONDS;
+}
+
+pub fn is_repeat(last_body_hash: u64, body_hash: u64) -> bool {
+    if (last_body_hash == 0) { return false; }
+    return last_body_hash == body_hash;
+}
+
+; --- 4. Idle notices and stops ----------------------------------------------------------------------
+
+/// docs: a watch gives one notice when the watched agent goes idle or exits, and lapses after 12 hours.
+pub const IDLE_WATCH_SECONDS : u32 = 43200;
+
+pub fn idle_notice_due(watching: bool, sent: bool, went_idle: bool, exited: bool, watch_age_seconds: u32) -> bool {
+    if (watching == false) { return false; }
+    if (sent) { return false; }
+    if (watch_age_seconds >= IDLE_WATCH_SECONDS) { return false; }
+    if (went_idle) { return true; }
+    return exited;
+}
+
+pub const STOP_APPROVE : u8 = 0;
+pub const STOP_REJECT : u8 = 1;
+
+/// A mate rejects a stop while it holds a live task lease (control.t27), and approves otherwise.
+pub fn stop_answer(holds_live_lease: bool) -> u8 {
+    if (holds_live_lease) { return STOP_REJECT; }
+    return STOP_APPROVE;
+}
+
+/// An approved stop ends the mate with X_SHUTDOWN, which no restart type undoes. A rejected one leaves
+/// it running (X_NONE); the lead's supervisor can still stop it the actors.t27 way, stop_signal.
+pub fn stop_exit_reason(answer: u8) -> u8 {
+    if (answer == STOP_APPROVE) { return X_SHUTDOWN; }
+    return X_NONE;
+}
+
+; --- 5. A team is a supervisor --------------------------------------------------------------------
+
+/// Child 0 is the lead: transient and significant, so its normal end ends the team (the docs' lead
+/// cleans up the team) and its crash restarts it. Mates are temporary: a mate's crash touches nobody
+/// (stopped_by_restart is false when the failed child is not restarted), and a lead's crash stops the
+/// mates and restarts none of them (docs: in-process teammates are not resumed). The team supervisor
+/// is temporary itself, so its own auto shutdown sticks (auto_shutdown_sticks).
+pub const TEAM_STRATEGY : u8 = STRAT_ONE_FOR_ALL;
+pub const TEAM_AUTO_SHUTDOWN : u8 = AUTO_ANY_SIGNIFICANT;
+pub const LEAD_RESTART : u8 = RESTART_TRANSIENT;
+pub const MATE_RESTART : u8 = RESTART_TEMPORARY;
+pub const TEAM_SUP_RESTART : u8 = RESTART_TEMPORARY;
+pub const LEAD_CHILD : u32 = 0;
+/// docs' advice: 3 to 5 teammates, 5 or 6 tasks each. Chosen from it, not measured here.
+pub const TEAM_MAX_MATES : u32 = 5;
+pub const TEAM_TASKS_PER_MATE : u32 = 6;
+/// One task list is one u64 word of done bits.
+pub const TEAM_TASK_CAP : u32 = 64;
+
+/// One more mate starts only under the cap, counted the actors.t27 way (a stopping child still counts).
+pub fn team_may_start_mate(live: u32, stopping: u32) -> bool {
+    return start_answer(live, stopping, TEAM_MAX_MATES) == START_OK;
+}
+
+/// No nested teams: only an agent outside a team may start one, and a session leads at most one.
+pub fn may_start_team(role: u8, leads_now: u32) -> bool {
+    if (role != ROLE_SOLO) { return false; }
+    return leads_now == 0;
+}
+
+; --- 6. The shared task list: a dependency gate in front of the fenced claim ------------------------
+
+/// Tasks of one team are numbered 0..63; `deps` and `done` are masks over them.
+pub fn deps_ready(deps: u64, done: u64) -> bool {
+    return (deps & done) == deps;
+}
+
+/// A task that names itself as a dependency can never start: refuse it when the list is written.
+pub fn deps_without_self(task: u64, deps: u64) -> bool {
+    if (task >= 64) { return false; }
+    return (deps & bit(task)) == 0;
+}
+
+/// A claim lands when its dependencies are done AND the control.t27 fenced claim lands. The fence is
+/// the docs' lock on claim; this file adds only the dependency gate.
+pub fn team_claim_lands(deps: u64, done: u64, holder: u32, me: u32, expired: bool, fence: u64, fence_read: u64) -> bool {
+    if (deps_ready(deps, done) == false) { return false; }
+    return claim_lands(holder, me, expired, fence, fence_read);
+}
+
+; --- 7. The record of a cross-session note ----------------------------------------------------------
+
+/// The body itself is not in the row: only its hash and length, so the store keeps no free text
+/// beyond the receiver's own transcript.
+pub struct PeerNote {
+    from: u64,
+    to: u64,
+    tag: u64,
+    seq: u32,
+    body_hash: u64,
+    body_len: u32,
+}
+
+pub fn peer_note(from: u64, to: u64, seq: u32, body_hash: u64, body_len: u32) -> PeerNote {
+    return PeerNote{.from = from, .to = to, .tag = TM_TAG_PEER, .seq = seq, .body_hash = body_hash,
+        .body_len = body_len};
+}
+
+; --- Invariants and tests -------------------------------------------------------------------------
+
+invariant the_team_tags_sit_above_every_other_protocol { assert TM_TAG_FIRST == 28 and TM_TAG_LAST == TM_TAG_PEER and TM_TAG_LAST < CTL_TAGS; }
+invariant the_team_tags_are_contiguous { assert TM_TAG_PLAN_ASK == TM_TAG_FINDING + 1 and TM_TAG_PLAN_ANSWER == TM_TAG_PLAN_ASK + 1 and TM_TAG_STOP_ASK == TM_TAG_PLAN_ANSWER + 1 and TM_TAG_STOP_ANSWER == TM_TAG_STOP_ASK + 1 and TM_TAG_IDLE == TM_TAG_STOP_ANSWER + 1 and TM_TAG_CARD == TM_TAG_IDLE + 1 and TM_TAG_PEER == TM_TAG_CARD + 1; }
+invariant a_message_is_never_consent { assert PEER_MESSAGE_IS_CONSENT == false; }
+invariant the_team_shape_is_a_valid_supervisor { assert child_spec_valid(LEAD_RESTART, true, TEAM_AUTO_SHUTDOWN) and child_spec_valid(MATE_RESTART, false, TEAM_AUTO_SHUTDOWN) and auto_shutdown_sticks(TEAM_SUP_RESTART); }
+invariant a_full_team_fits_one_task_word { assert TEAM_MAX_MATES * TEAM_TASKS_PER_MATE <= TEAM_TASK_CAP; }
+
+test the_tags_ride_the_lanes_they_should {
+    assert tm_lane(TM_TAG_FINDING) == LANE_DATA;
+    assert tm_lane(TM_TAG_PEER) == LANE_DATA;
+    assert tm_lane(TM_TAG_STOP_ASK) == LANE_CONTROL;
+    assert tm_lane(TM_TAG_IDLE) == LANE_CONTROL;
+    assert tm_lane(27) == LANE_NONE;
+    assert tm_lane(36) == LANE_NONE;
+}
+
+test only_a_plain_note_crosses_a_session {
+    assert tm_may_send(TM_TAG_PEER, ROLE_SOLO, false) == true;
+    assert tm_may_send(TM_TAG_FINDING, ROLE_MATE, false) == false;
+    assert tm_may_send(TM_TAG_PLAN_ANSWER, ROLE_LEAD, false) == false;
+    assert tm_may_send(TM_TAG_FINDING, ROLE_MATE, true) == true;
+}
+
+test the_lead_answers_plans_and_the_mate_answers_stops {
+    assert tm_may_send(TM_TAG_PLAN_ANSWER, ROLE_LEAD, true) == true;
+    assert tm_may_send(TM_TAG_PLAN_ANSWER, ROLE_MATE, true) == false;
+    assert tm_may_send(TM_TAG_STOP_ASK, ROLE_MATE, true) == false;
+    assert tm_may_send(TM_TAG_STOP_ANSWER, ROLE_MATE, true) == true;
+    assert tm_may_send(TM_TAG_IDLE, ROLE_LEAD, true) == false;
+    assert tm_may_send(TM_TAG_FINDING, ROLE_SOLO, true) == false;
+}
+
+test no_message_grants_a_permission {
+    assert mail_may_grant(TM_TAG_PLAN_ANSWER, GRANT_PERMISSION) == false;
+    assert mail_may_grant(TM_TAG_PEER, GRANT_PERMISSION) == false;
+    assert mail_may_grant(TM_TAG_PLAN_ANSWER, GRANT_PLAN) == true;
+    assert mail_may_grant(TM_TAG_PEER, GRANT_PLAN) == false;
+    assert edit_allowed(true, false) == false;
+    assert edit_allowed(true, true) == true;
+    assert edit_allowed(false, false) == true;
+}
+
+test limits_refuse_before_the_policy_is_read {
+    assert inbound_answer(IN_ACCEPT, 0, 0, 10, false, true) == IN_ACCEPT;
+    assert inbound_answer(IN_HOLD, 0, 0, 10, false, true) == IN_HOLD;
+    assert inbound_answer(IN_REFUSE, 0, 0, 10, false, true) == IN_REFUSE;
+    assert inbound_answer(IN_ACCEPT, 0, 0, 1000001, false, true) == IN_REFUSE;
+    assert inbound_answer(IN_ACCEPT, 0, 0, 1000000, false, true) == IN_ACCEPT;
+    assert inbound_answer(IN_ACCEPT, 0, 0, 10, true, true) == IN_REFUSE;
+    assert inbound_answer(IN_ACCEPT, 0, 0, 10, false, false) == IN_REFUSE;
+    assert inbound_answer(IN_ACCEPT, 0, 50, 10, false, true) == IN_REFUSE;
+    assert inbound_answer(IN_ACCEPT, 0, 49, 10, false, true) == IN_ACCEPT;
+    assert inbound_answer(IN_HOLD, 100, 0, 10, false, true) == IN_REFUSE;
+    assert inbound_answer(IN_HOLD, 99, 0, 10, false, true) == IN_HOLD;
+    assert inbound_answer(7, 0, 0, 10, false, true) == IN_REFUSE;
+}
+
+test a_hold_lapses_at_five_minutes_and_a_repeat_needs_a_last {
+    assert hold_expired(299) == false;
+    assert hold_expired(300) == true;
+    assert is_repeat(0, 0) == false;
+    assert is_repeat(9, 9) == true;
+    assert is_repeat(9, 8) == false;
+}
+
+test one_idle_notice_per_watch_and_none_after_twelve_hours {
+    assert idle_notice_due(true, false, true, false, 10) == true;
+    assert idle_notice_due(true, false, false, true, 10) == true;
+    assert idle_notice_due(true, true, true, false, 10) == false;
+    assert idle_notice_due(false, false, true, false, 10) == false;
+    assert idle_notice_due(true, false, true, false, 43200) == false;
+    assert idle_notice_due(true, false, false, false, 10) == false;
+}
+
+test a_mate_mid_task_rejects_a_stop {
+    assert stop_answer(true) == STOP_REJECT;
+    assert stop_answer(false) == STOP_APPROVE;
+    assert stop_exit_reason(STOP_APPROVE) == X_SHUTDOWN;
+    assert stop_exit_reason(STOP_REJECT) == X_NONE;
+    assert should_restart(MATE_RESTART, X_SHUTDOWN) == false;
+    assert should_restart(LEAD_RESTART, X_SHUTDOWN) == false;
+}
+
+test a_mate_crash_touches_nobody_and_a_lead_crash_stops_the_mates {
+    assert should_restart(MATE_RESTART, X_CRASH) == false;
+    assert stopped_by_restart(TEAM_STRATEGY, 2, LEAD_CHILD, false) == false;
+    assert stopped_by_restart(TEAM_STRATEGY, 2, 1, false) == false;
+    assert should_restart(LEAD_RESTART, X_CRASH) == true;
+    assert stopped_by_restart(TEAM_STRATEGY, LEAD_CHILD, 1, true) == true;
+    assert restarted(TEAM_STRATEGY, LEAD_CHILD, 1, MATE_RESTART, true) == false;
+}
+
+test the_lead_ending_ends_the_team_and_a_mate_ending_does_not {
+    assert auto_shutdown_after_exit(TEAM_AUTO_SHUTDOWN, true, LEAD_RESTART, X_NORMAL, false, 0) == true;
+    assert auto_shutdown_after_exit(TEAM_AUTO_SHUTDOWN, true, LEAD_RESTART, X_CRASH, false, 1) == false;
+    assert auto_shutdown_after_exit(TEAM_AUTO_SHUTDOWN, false, MATE_RESTART, X_NORMAL, false, 1) == false;
+}
+
+test the_cap_and_no_nesting {
+    assert team_may_start_mate(4, 0) == true;
+    assert team_may_start_mate(5, 0) == false;
+    assert team_may_start_mate(4, 1) == false;
+    assert may_start_team(ROLE_SOLO, 0) == true;
+    assert may_start_team(ROLE_SOLO, 1) == false;
+    assert may_start_team(ROLE_MATE, 0) == false;
+    assert may_start_team(ROLE_LEAD, 0) == false;
+}
+
+test a_blocked_task_is_not_claimed_even_when_the_fence_agrees {
+    assert deps_ready(6, 6) == true;
+    assert deps_ready(6, 2) == false;
+    assert deps_ready(0, 0) == true;
+    assert team_claim_lands(6, 2, 0, 9, false, 5, 5) == false;
+    assert team_claim_lands(6, 7, 0, 9, false, 5, 5) == true;
+    assert team_claim_lands(6, 7, 0, 9, false, 5, 4) == false;
+    assert team_claim_lands(6, 7, 3, 9, false, 5, 5) == false;
+}
+
+test a_task_cannot_wait_on_itself {
+    assert deps_without_self(1, 6) == false;
+    assert deps_without_self(0, 6) == true;
+    assert deps_without_self(64, 0) == false;
+}
+
+test a_note_row_carries_no_body {
+    var n : PeerNote = peer_note(11, 12, 3, 99, 40);
+    assert n.tag == TM_TAG_PEER;
+    assert n.seq == 3;
+    assert n.body_len == 40;
+    assert tm_may_send(n.tag, ROLE_SOLO, false) == true;
+}
