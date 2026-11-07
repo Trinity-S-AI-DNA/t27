@@ -1,0 +1,566 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS native_accept (v0.1.0-alpha.1): the acceptance suite of the native foundation line. Six groups, A to F,
+// named in the order of the brief. Run it with
+//
+//     t27b test specs/t27os/native_accept.t27
+//
+// A test passes only if it ran and its assertions held. Which tests need what:
+//   - the LM Studio tests (b_*, c_live_*, d_one_agent_*, e_three_agents_*) need a server on 127.0.0.1:1234. The
+//     environment is optional: T27OS_LMSTUDIO_HOST, _PORT, _MODEL and _API_KEY override the defaults, and a
+//     missing model is taken from the first one the server lists. Each of them asserts the endpoint loads
+//     first, so with no server they FAIL; they never pass on a mock and never skip silently.
+//   - every other test needs nothing but a writable target/ directory.
+//
+// Files go to target/t27os/native-accept (gitignored). Session, agent and swarm ids come from the clock
+// (fresh_base), so a rerun never meets an old log; the one fixed id is 8102 in c_a_session_file_outlives_*,
+// which appends three events per run on purpose and so proves, from the second run on, that a file written
+// by an earlier process reads back whole. Delete the directory to reset it.
+//
+// The restart of acceptance C is a reload from the file: every in-memory copy is dropped and the session is
+// rebuilt from the bytes on disk by native_log. A separate process restart is only covered by running the suite
+// twice (c_a_session_file_outlives_* reads what the first run left).
+//
+// DSH is not imported anywhere in the native line, so no test here can need it.
+//
+// Refs gHashTag/t27#13212.
+module T27osNativeAccept;
+
+use std::mem::bytes_eq;
+use t27os::session_store::put_bytes;
+use t27os::native_version::version_report;
+use t27os::native_version::has_row;
+use t27os::native_provider::ERR_NONE;
+use t27os::native_log::LOG_MAX;
+use t27os::native_log::EV_USER_INPUT;
+use t27os::native_log::EV_PROVIDER_RESPONSE;
+use t27os::native_log::EV_ERROR;
+use t27os::native_log::EV_TOKEN_USAGE;
+use t27os::native_log::ST_IDLE;
+use t27os::native_log::Cur;
+use t27os::native_log::Recovered;
+use t27os::native_log::EventView;
+use t27os::native_log::cur_new;
+use t27os::native_log::cur_from;
+use t27os::native_log::emit;
+use t27os::native_log::emit_state;
+use t27os::native_log::recover;
+use t27os::native_log::continuable;
+use t27os::native_log::nth_event;
+use t27os::native_policy::Policy;
+use t27os::native_policy::default_policy;
+use t27os::native_policy::allow_tool;
+use t27os::native_policy::approve_tool;
+use t27os::native_policy::grant_spawn;
+use t27os::native_policy::decide;
+use t27os::native_policy::audit_line;
+use t27os::native_policy::leaks;
+use t27os::native_policy::redact_secret;
+use t27os::native_policy::env_is_secret;
+use t27os::native_policy::ENV_HOST;
+use t27os::native_policy::ENV_KEY;
+use t27os::native_policy::REDACT_FAIL;
+use t27os::native_policy::TOOL_CLOCK;
+use t27os::native_policy::TOOL_RUN_COMMAND;
+use t27os::native_policy::TOOL_HTTP_FETCH;
+use t27os::native_policy::TOOL_SPAWN_AGENT;
+use t27os::native_policy::DEC_ALLOW;
+use t27os::native_policy::DEC_HOLD_APPROVAL;
+use t27os::native_policy::DEC_DENY_NOT_LISTED;
+use t27os::native_policy::DEC_DENY_NO_SPAWN_POLICY;
+use t27os::native_policy::DEC_DENY_UNKNOWN;
+use t27os::native_agent::Agent;
+use t27os::native_agent::StatusView;
+use t27os::native_agent::agent_new;
+use t27os::native_agent::agent_start;
+use t27os::native_agent::agent_request_tool;
+use t27os::native_agent::agent_cancel;
+use t27os::native_agent::status_from_log;
+use t27os::native_agent::result_from_log;
+use t27os::native_agent::AG_NEW;
+use t27os::native_agent::AG_RUNNING;
+use t27os::native_agent::AG_DONE;
+use t27os::native_agent::AG_FAILED;
+use t27os::native_agent::AG_CANCELLED;
+use t27os::native_agent::AE_NONE;
+use t27os::native_agent::AE_BAD_CONTRACT;
+use t27os::native_agent::AE_SPAWN_REFUSED;
+use t27os::native_agent::AE_CANCELLED;
+use t27os::native_agent::AE_PROVIDER_BASE;
+use t27os::native_swarm::Swarm;
+use t27os::native_swarm::swarm_new;
+use t27os::native_swarm::swarm_assign;
+use t27os::native_swarm::swarm_aggregate;
+use t27os::native_swarm::member_text;
+use t27os::native_swarm::SW_DONE;
+use t27os::native_swarm::SW_CANCELLED;
+use t27os::native_swarm::SE_NONE;
+use t27os::native_swarm::SE_SPAWN_DENIED;
+use t27os::native_swarm::SE_FULL;
+use t27os::native_swarm::MEMBERS_MAX;
+use t27os::native_host::Endpoint;
+use t27os::native_host::Turn;
+use t27os::native_host::endpoint_new;
+use t27os::native_host::endpoint_clear;
+use t27os::native_host::host_now_ms;
+use t27os::native_host::host_ensure_dir;
+use t27os::native_host::host_load;
+use t27os::native_host::host_save;
+use t27os::native_host::host_log_exists;
+use t27os::native_host::host_cancel;
+use t27os::native_host::host_cancel_clear;
+use t27os::native_host::host_endpoint_load;
+use t27os::native_host::host_turn;
+use t27os::native_host::host_run_agent;
+use t27os::native_host::host_run_swarm;
+
+pub const ACCEPT_DIR : str = "target/t27os/native-accept";
+
+/// A clock-derived id base that no earlier run used. `tag` (1..9) keeps two tests that start in the same
+/// millisecond apart; the offsets +0..+9 are the test's own ids (swarm, members, parent session).
+fn fresh_base(tag: u64) -> u64 {
+    return host_now_ms() * 100 + tag * 10;
+}
+
+// ---- A: VERSION_REPORT -------------------------------------------------------------------------------------
+
+test a_version_report_names_the_version_and_the_four_components {
+    var out : [1024]u8 = [0] ** 1024;
+    const n : usize = version_report(out[0..1024]);
+    assert n > 0;
+    assert has_row(out[0..1024], n, "t27os_version=0.1.0-alpha.1\n");
+    assert has_row(out[0..1024], n, "line=native\n");
+    assert has_row(out[0..1024], n, "component.core=0.1.0-alpha.1\n");
+    assert has_row(out[0..1024], n, "component.contracts=0.1.0-alpha.1\n");
+    assert has_row(out[0..1024], n, "component.skills=0.1.0-alpha.1\n");
+    assert has_row(out[0..1024], n, "component.ui=0.1.0-alpha.1\n");
+    assert has_row(out[0..1024], n, "component.skills.state=empty\n");
+    assert has_row(out[0..1024], n, "component.ui.state=text-only\n");
+    assert has_row(out[0..1024], n, "t27os_version=0.2.0\n") == false;
+    var tiny : [64]u8 = [0] ** 64;
+    assert version_report(tiny[0..64]) == 0;
+}
+
+// ---- B: LOCAL_CHAT_SLICE (needs LM Studio) -----------------------------------------------------------------
+
+test b_one_prompt_creates_a_session_lmstudio_answers_and_the_event_is_persisted {
+    var e : Endpoint = endpoint_new();
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var resp : [16384]u8 = [0] ** 16384;
+    var scratch : [16384]u8 = [0] ** 16384;
+    var content : [4096]u8 = [0] ** 4096;
+    var ev : [4096]u8 = [0] ** 4096;
+    assert host_endpoint_load(&e, resp[0..16384], scratch[0..16384]) == ERR_NONE;
+    const id : u64 = fresh_base(1);
+    assert host_log_exists(ACCEPT_DIR, id) == false;
+    const t : Turn = host_turn(ACCEPT_DIR, id, &e, "Reply with the single word: ready",
+                               img[0..65536], resp[0..16384], scratch[0..16384], content[0..4096]);
+    assert t.err == ERR_NONE;
+    assert t.ok;
+    assert t.content_len > 0;
+    assert t.events == 6;
+    assert host_log_exists(ACCEPT_DIR, id);
+    const n : usize = host_load(ACCEPT_DIR, id, back[0..65536]);
+    assert n > 0;
+    const r : Recovered = recover(back[0..n], scratch[0..16384]);
+    assert r.count == 6;
+    assert r.valid_len == n;
+    assert r.last_state == ST_IDLE;
+    assert continuable(r);
+    const u : EventView = nth_event(back[0..n], scratch[0..16384], 0, ev[0..4096]);
+    assert u.ok;
+    assert u.kind == EV_USER_INPUT;
+    assert bytes_eq(ev[0..u.len], "Reply with the single word: ready");
+    const p : EventView = nth_event(back[0..n], scratch[0..16384], 3, ev[0..4096]);
+    assert p.ok;
+    assert p.kind == EV_PROVIDER_RESPONSE;
+    assert p.len == t.content_len;
+    assert bytes_eq(ev[0..p.len], content[0..t.content_len]);
+    const k : EventView = nth_event(back[0..n], scratch[0..16384], 4, ev[0..4096]);
+    assert k.ok;
+    assert k.kind == EV_TOKEN_USAGE;
+    assert k.len > 0;
+    assert leaks(back[0..n], e.key[0..e.key_len]) == false;
+    endpoint_clear(&e);
+}
+
+// ---- C: SESSION_RECOVERY -----------------------------------------------------------------------------------
+
+test c_live_session_continues_after_a_reload {
+    var e : Endpoint = endpoint_new();
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var resp : [16384]u8 = [0] ** 16384;
+    var scratch : [16384]u8 = [0] ** 16384;
+    var content : [4096]u8 = [0] ** 4096;
+    var ev : [4096]u8 = [0] ** 4096;
+    assert host_endpoint_load(&e, resp[0..16384], scratch[0..16384]) == ERR_NONE;
+    const id : u64 = fresh_base(2);
+    const t1 : Turn = host_turn(ACCEPT_DIR, id, &e, "Say one",
+                                img[0..65536], resp[0..16384], scratch[0..16384], content[0..4096]);
+    assert t1.ok;
+    assert t1.events == 6;
+    // The second turn rebuilds the session from the file alone (host_turn reloads and recovers it).
+    const t2 : Turn = host_turn(ACCEPT_DIR, id, &e, "Say two",
+                                img[0..65536], resp[0..16384], scratch[0..16384], content[0..4096]);
+    assert t2.ok;
+    assert t2.events == 12;
+    const n : usize = host_load(ACCEPT_DIR, id, back[0..65536]);
+    const r : Recovered = recover(back[0..n], scratch[0..16384]);
+    assert r.count == 12;
+    assert r.next_seq == 13;
+    assert r.valid_len == n;
+    assert continuable(r);
+    const first : EventView = nth_event(back[0..n], scratch[0..16384], 0, ev[0..4096]);
+    assert first.ok;
+    assert bytes_eq(ev[0..first.len], "Say one");
+    const second : EventView = nth_event(back[0..n], scratch[0..16384], 6, ev[0..4096]);
+    assert second.ok;
+    assert second.kind == EV_USER_INPUT;
+    assert bytes_eq(ev[0..second.len], "Say two");
+    endpoint_clear(&e);
+}
+
+test c_a_session_file_outlives_the_run_that_wrote_it {
+    assert host_ensure_dir(ACCEPT_DIR);
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var scratch : [16384]u8 = [0] ** 16384;
+    const n0 : usize = host_load(ACCEPT_DIR, 8102, img[0..65536]);
+    const r0 : Recovered = recover(img[0..n0], scratch[0..16384]);
+    // Whatever an earlier run left is whole and open for more.
+    assert r0.valid_len == n0;
+    assert n0 == 0 or continuable(r0);
+    var c : Cur = cur_from(r0);
+    c = emit(img[0..65536], c, EV_USER_INPUT, "persisted prompt");
+    c = emit(img[0..65536], c, EV_PROVIDER_RESPONSE, "persisted answer");
+    c = emit_state(img[0..65536], c, ST_IDLE);
+    assert c.ok;
+    assert host_save(ACCEPT_DIR, 8102, img[0..65536], c.len);
+    // The restart: only the bytes of the file are used from here.
+    const n1 : usize = host_load(ACCEPT_DIR, 8102, back[0..65536]);
+    assert n1 == c.len;
+    const r1 : Recovered = recover(back[0..n1], scratch[0..16384]);
+    assert r1.count == r0.count + 3;
+    assert r1.next_seq == r0.next_seq + 3;
+    assert r1.valid_len == n1;
+    assert r1.last_state == ST_IDLE;
+    assert continuable(r1);
+}
+
+test c_a_torn_tail_is_ignored_and_the_whole_events_remain {
+    assert host_ensure_dir(ACCEPT_DIR);
+    const id : u64 = fresh_base(3);
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var scratch : [16384]u8 = [0] ** 16384;
+    var c : Cur = cur_new();
+    c = emit(img[0..65536], c, EV_USER_INPUT, "whole one");
+    c = emit(img[0..65536], c, EV_PROVIDER_RESPONSE, "whole two");
+    c = emit_state(img[0..65536], c, ST_IDLE);
+    assert c.ok;
+    const whole : usize = c.len;
+    // A crash in the middle of an append: half a line and no newline.
+    const torn : usize = put_bytes(img[0..65536], whole, "9 broken li");
+    assert host_save(ACCEPT_DIR, id, img[0..65536], torn);
+    const n : usize = host_load(ACCEPT_DIR, id, back[0..65536]);
+    assert n == torn;
+    const r : Recovered = recover(back[0..n], scratch[0..16384]);
+    assert r.count == 3;
+    assert r.valid_len == whole;
+    assert continuable(r);
+    // The session goes on from the whole part; the next event replaces the torn bytes.
+    var d : Cur = cur_from(r);
+    d = emit(back[0..65536], d, EV_USER_INPUT, "after the tear");
+    assert d.ok;
+    assert host_save(ACCEPT_DIR, id, back[0..65536], d.len);
+    var again : [65536]u8 = [0] ** 65536;
+    const n2 : usize = host_load(ACCEPT_DIR, id, again[0..65536]);
+    const r2 : Recovered = recover(again[0..n2], scratch[0..16384]);
+    assert r2.count == 4;
+    assert r2.valid_len == n2;
+}
+
+// ---- D: AGENT_ONESHOT --------------------------------------------------------------------------------------
+
+test d_one_agent_runs_one_bounded_task_and_its_result_is_persisted {
+    var e : Endpoint = endpoint_new();
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var resp : [16384]u8 = [0] ** 16384;
+    var scratch : [16384]u8 = [0] ** 16384;
+    var content : [4096]u8 = [0] ** 4096;
+    var out : [512]u8 = [0] ** 512;
+    assert host_endpoint_load(&e, resp[0..16384], scratch[0..16384]) == ERR_NONE;
+    const id : u64 = fresh_base(4);
+    var a : Agent = agent_new(id, id + 9, 4, 120, "Name one colour.", "Answer with one word.");
+    assert a.status == AG_NEW;
+    const st : u32 = host_run_agent(ACCEPT_DIR, &a, TOOL_CLOCK, &e,
+                                    img[0..65536], resp[0..16384], scratch[0..16384], content[0..4096]);
+    assert st == AG_DONE;
+    assert a.error == AE_NONE;
+    assert a.result_len > 0;
+    const n : usize = host_load(ACCEPT_DIR, id, back[0..65536]);
+    assert n > 0;
+    const sv : StatusView = status_from_log(back[0..n], scratch[0..16384]);
+    assert sv.ok;
+    assert sv.status == AG_DONE;
+    assert sv.error == AE_NONE;
+    assert sv.result_len == a.result_len;
+    const rn : usize = result_from_log(back[0..n], scratch[0..16384], out[0..512]);
+    assert rn == a.result_len;
+    assert bytes_eq(out[0..rn], a.result[0..a.result_len]);
+    // One task, one result: a finished agent does not run again.
+    const again : u32 = host_run_agent(ACCEPT_DIR, &a, 0, &e,
+                                       img[0..65536], resp[0..16384], scratch[0..16384], content[0..4096]);
+    assert again == AG_DONE;
+    endpoint_clear(&e);
+}
+
+test d_cancellation_ends_the_agent_before_any_provider_call {
+    assert host_ensure_dir(ACCEPT_DIR);
+    var e : Endpoint = endpoint_new();
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var resp : [4096]u8 = [0] ** 4096;
+    var scratch : [4096]u8 = [0] ** 4096;
+    var content : [1024]u8 = [0] ** 1024;
+    var sc : [16384]u8 = [0] ** 16384;
+    const id : u64 = fresh_base(5);
+    var a : Agent = agent_new(id, id + 9, 4, 120, "task", "input");
+    assert host_cancel(ACCEPT_DIR, id);
+    const st : u32 = host_run_agent(ACCEPT_DIR, &a, TOOL_CLOCK, &e,
+                                    img[0..65536], resp[0..4096], scratch[0..4096], content[0..1024]);
+    assert st == AG_CANCELLED;
+    assert a.error == AE_CANCELLED;
+    const n : usize = host_load(ACCEPT_DIR, id, back[0..65536]);
+    assert n > 0;
+    const sv : StatusView = status_from_log(back[0..n], sc[0..16384]);
+    assert sv.ok;
+    assert sv.status == AG_CANCELLED;
+    assert sv.error == AE_CANCELLED;
+    host_cancel_clear(ACCEPT_DIR, id);
+    // The id is spent: a log is append-only and an agent id is never reused.
+    var b : Agent = agent_new(id, id + 9, 4, 120, "task", "input");
+    const reuse : u32 = host_run_agent(ACCEPT_DIR, &b, 0, &e,
+                                       img[0..65536], resp[0..4096], scratch[0..4096], content[0..1024]);
+    assert reuse == AG_FAILED;
+    assert b.error == AE_BAD_CONTRACT;
+    // A contract that breaks a bound (an agent may not hold the spawn tool) never runs and leaves no log.
+    var s : Agent = agent_new(id + 1, id + 9, 32, 120, "task", "input");
+    assert s.status == AG_FAILED;
+    assert s.error == AE_SPAWN_REFUSED;
+    const none : u32 = host_run_agent(ACCEPT_DIR, &s, 0, &e,
+                                      img[0..65536], resp[0..4096], scratch[0..4096], content[0..1024]);
+    assert none == AG_FAILED;
+    assert host_log_exists(ACCEPT_DIR, id + 1) == false;
+}
+
+// ---- E: SWARM_ONESHOT --------------------------------------------------------------------------------------
+
+test e_the_coordinator_takes_at_most_three_members_and_only_under_a_spawn_policy {
+    var sw : Swarm = swarm_new(9301, 9300, "bounds");
+    // No spawn policy at all, then a spawn tool that is listed but not granted: both refused.
+    assert swarm_assign(&sw, default_policy(), 9311, 0) == SE_SPAWN_DENIED;
+    assert swarm_assign(&sw, allow_tool(default_policy(), TOOL_SPAWN_AGENT), 9311, 0) == SE_SPAWN_DENIED;
+    assert sw.count == 0;
+    const p : Policy = grant_spawn(allow_tool(default_policy(), TOOL_SPAWN_AGENT));
+    assert swarm_assign(&sw, p, 9311, 0) == SE_NONE;
+    assert swarm_assign(&sw, p, 9312, 0) == SE_NONE;
+    assert swarm_assign(&sw, p, 9313, 3) == SE_NONE;
+    assert swarm_assign(&sw, p, 9314, 0) == SE_FULL;
+    assert sw.count == MEMBERS_MAX;
+}
+
+test e_three_agents_run_in_task_graph_order_and_the_coordinator_aggregates {
+    var e : Endpoint = endpoint_new();
+    var simg : [65536]u8 = [0] ** 65536;
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var resp : [16384]u8 = [0] ** 16384;
+    var scratch : [16384]u8 = [0] ** 16384;
+    var content : [4096]u8 = [0] ** 4096;
+    var agg : [4096]u8 = [0] ** 4096;
+    assert host_endpoint_load(&e, resp[0..16384], scratch[0..16384]) == ERR_NONE;
+    const base : u64 = fresh_base(6);
+    var sw : Swarm = swarm_new(base, base + 5, "Name three colours, one per member.");
+    const p : Policy = grant_spawn(allow_tool(default_policy(), TOOL_SPAWN_AGENT));
+    assert swarm_assign(&sw, p, base + 1, 0) == SE_NONE;
+    assert swarm_assign(&sw, p, base + 2, 0) == SE_NONE;
+    // Member 2 waits for members 0 and 1 (mask 3): an explicit task graph.
+    assert swarm_assign(&sw, p, base + 3, 3) == SE_NONE;
+    var a0 : Agent = agent_new(base + 1, base + 5, 4, 120, "Name one warm colour.", "One word.");
+    var a1 : Agent = agent_new(base + 2, base + 5, 4, 120, "Name one cold colour.", "One word.");
+    var a2 : Agent = agent_new(base + 3, base + 5, 4, 120, "Name one neutral colour.", "One word.");
+    const st : u32 = host_run_swarm(ACCEPT_DIR, &sw, &a0, &a1, &a2, &e,
+                                    simg[0..65536], img[0..65536], resp[0..16384], scratch[0..16384], content[0..4096]);
+    assert st == SW_DONE;
+    assert a0.status == AG_DONE;
+    assert a1.status == AG_DONE;
+    assert a2.status == AG_DONE;
+    const m0 : []const u8 = member_text(&sw, 0);
+    const m1 : []const u8 = member_text(&sw, 1);
+    const m2 : []const u8 = member_text(&sw, 2);
+    assert m0.len > 0;
+    assert m1.len > 0;
+    assert m2.len > 0;
+    const an : usize = swarm_aggregate(&sw, agg[0..4096]);
+    assert an > 0;
+    assert has_row(agg[0..4096], an, "member=0 ");
+    assert has_row(agg[0..4096], an, "member=1 ");
+    assert has_row(agg[0..4096], an, "member=2 ");
+    // Every record is durable: the coordinator's log and each child's log read back as done.
+    const sn : usize = host_load(ACCEPT_DIR, base, back[0..65536]);
+    assert sn > 0;
+    const sv : StatusView = status_from_log(back[0..sn], scratch[0..16384]);
+    assert sv.status == AG_DONE;
+    const n1 : usize = host_load(ACCEPT_DIR, base + 1, back[0..65536]);
+    const v1 : StatusView = status_from_log(back[0..n1], scratch[0..16384]);
+    assert v1.status == AG_DONE;
+    const n3 : usize = host_load(ACCEPT_DIR, base + 3, back[0..65536]);
+    const v3 : StatusView = status_from_log(back[0..n3], scratch[0..16384]);
+    assert v3.status == AG_DONE;
+    endpoint_clear(&e);
+}
+
+test e_cancellation_stops_every_pending_member_before_any_provider_call {
+    assert host_ensure_dir(ACCEPT_DIR);
+    var e : Endpoint = endpoint_new();
+    var simg : [65536]u8 = [0] ** 65536;
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var resp : [4096]u8 = [0] ** 4096;
+    var scratch : [4096]u8 = [0] ** 4096;
+    var content : [1024]u8 = [0] ** 1024;
+    var sc : [16384]u8 = [0] ** 16384;
+    var cimg : [4096]u8 = [0] ** 4096;
+    const base : u64 = fresh_base(7);
+    var sw : Swarm = swarm_new(base, base + 5, "cancelled before it starts");
+    const p : Policy = grant_spawn(allow_tool(default_policy(), TOOL_SPAWN_AGENT));
+    assert swarm_assign(&sw, p, base + 1, 0) == SE_NONE;
+    assert swarm_assign(&sw, p, base + 2, 0) == SE_NONE;
+    assert swarm_assign(&sw, p, base + 3, 0) == SE_NONE;
+    var a0 : Agent = agent_new(base + 1, base + 5, 4, 120, "task", "input");
+    var a1 : Agent = agent_new(base + 2, base + 5, 4, 120, "task", "input");
+    var a2 : Agent = agent_new(base + 3, base + 5, 4, 120, "task", "input");
+    assert host_cancel(ACCEPT_DIR, base);
+    const st : u32 = host_run_swarm(ACCEPT_DIR, &sw, &a0, &a1, &a2, &e,
+                                    simg[0..65536], img[0..65536], resp[0..4096], scratch[0..4096], content[0..1024]);
+    assert st == SW_CANCELLED;
+    assert sw.member_status[0] == AG_CANCELLED;
+    assert sw.member_status[1] == AG_CANCELLED;
+    assert sw.member_status[2] == AG_CANCELLED;
+    // No member ran: no child log exists, so no provider call was made for it.
+    assert host_log_exists(ACCEPT_DIR, base + 1) == false;
+    assert host_log_exists(ACCEPT_DIR, base + 2) == false;
+    assert host_log_exists(ACCEPT_DIR, base + 3) == false;
+    const n : usize = host_load(ACCEPT_DIR, base, back[0..65536]);
+    assert n > 0;
+    const sv : StatusView = status_from_log(back[0..n], sc[0..16384]);
+    assert sv.status == AG_CANCELLED;
+    assert sv.error == AE_CANCELLED;
+    host_cancel_clear(ACCEPT_DIR, base);
+    // The host then cancels the agents it still holds.
+    const c0 : Cur = agent_cancel(&a0, cimg[0..4096], cur_new());
+    assert c0.ok;
+    assert a0.status == AG_CANCELLED;
+    const c1 : Cur = agent_cancel(&a1, cimg[0..4096], cur_new());
+    assert c1.ok;
+    assert a1.status == AG_CANCELLED;
+    const c2 : Cur = agent_cancel(&a2, cimg[0..4096], cur_new());
+    assert c2.ok;
+    assert a2.status == AG_CANCELLED;
+}
+
+// ---- F: SAFETY_CHECK ---------------------------------------------------------------------------------------
+
+test f_an_unlisted_tool_is_rejected_and_command_and_network_tools_need_approval {
+    var img : [8192]u8 = [0] ** 8192;
+    var scratch : [4096]u8 = [0] ** 4096;
+    var ev : [256]u8 = [0] ** 256;
+    var want : [96]u8 = [0] ** 96;
+    // A clock-only agent: a command, a fetch, a spawn and an unknown tool are all rejected, and each
+    // rejection is one audit event naming the tool and the verdict.
+    var a : Agent = agent_new(9101, 9100, 4, 64, "task", "input");
+    var c : Cur = agent_start(&a, img[0..8192], cur_new());
+    assert a.status == AG_RUNNING;
+    c = agent_request_tool(&a, TOOL_RUN_COMMAND, img[0..8192], c);
+    assert a.last_decision == DEC_DENY_NOT_LISTED;
+    c = agent_request_tool(&a, TOOL_HTTP_FETCH, img[0..8192], c);
+    assert a.last_decision == DEC_DENY_NOT_LISTED;
+    c = agent_request_tool(&a, TOOL_SPAWN_AGENT, img[0..8192], c);
+    assert a.last_decision == DEC_DENY_NOT_LISTED;
+    c = agent_request_tool(&a, 99, img[0..8192], c);
+    assert a.last_decision == DEC_DENY_UNKNOWN;
+    assert a.status == AG_RUNNING;
+    assert c.ok;
+    // The first rejection is event 2 (after the contract and the state) and holds the audit line.
+    const first : EventView = nth_event(img[0..c.len], scratch[0..4096], 2, ev[0..256]);
+    assert first.ok;
+    assert first.kind == EV_ERROR;
+    const wn : usize = audit_line(TOOL_RUN_COMMAND, DEC_DENY_NOT_LISTED, want[0..96]);
+    assert wn > 0;
+    assert bytes_eq(ev[0..first.len], want[0..wn]);
+    // A listed command or network tool is held for approval, never run.
+    var b : Agent = agent_new(9102, 9100, 24, 64, "task", "input");
+    var d : Cur = agent_start(&b, img[0..8192], cur_new());
+    assert b.status == AG_RUNNING;
+    d = agent_request_tool(&b, TOOL_RUN_COMMAND, img[0..8192], d);
+    assert b.last_decision == DEC_HOLD_APPROVAL;
+    d = agent_request_tool(&b, TOOL_HTTP_FETCH, img[0..8192], d);
+    assert b.last_decision == DEC_HOLD_APPROVAL;
+    // Only an explicit approval in the policy turns the hold into an allow; an agent carries none.
+    const open : Policy = approve_tool(allow_tool(default_policy(), TOOL_RUN_COMMAND), TOOL_RUN_COMMAND);
+    assert decide(open, TOOL_RUN_COMMAND) == DEC_ALLOW;
+    assert decide(allow_tool(default_policy(), TOOL_RUN_COMMAND), TOOL_RUN_COMMAND) == DEC_HOLD_APPROVAL;
+    assert decide(default_policy(), TOOL_RUN_COMMAND) == DEC_DENY_NOT_LISTED;
+    assert decide(allow_tool(default_policy(), TOOL_SPAWN_AGENT), TOOL_SPAWN_AGENT) == DEC_DENY_NO_SPAWN_POLICY;
+}
+
+test f_a_secret_in_the_endpoint_never_reaches_a_log_or_the_report {
+    assert host_ensure_dir(ACCEPT_DIR);
+    // A synthetic canary stands for the API key; the port is closed, so the run fails with a connect error.
+    const probe : str = "zz-canary-7c1e90d4b8a35f26";
+    var e : Endpoint = endpoint_new();
+    e.port = 1;
+    e.host_len = put_bytes(e.host[0..64], 0, "127.0.0.1");
+    e.model_len = put_bytes(e.model[0..128], 0, "probe-model");
+    e.key_len = put_bytes(e.key[0..256], 0, probe);
+    var img : [65536]u8 = [0] ** 65536;
+    var back : [65536]u8 = [0] ** 65536;
+    var resp : [4096]u8 = [0] ** 4096;
+    var scratch : [4096]u8 = [0] ** 4096;
+    var content : [1024]u8 = [0] ** 1024;
+    const id : u64 = fresh_base(8);
+    var a : Agent = agent_new(id, id + 9, 4, 64, "task", "input");
+    const st : u32 = host_run_agent(ACCEPT_DIR, &a, TOOL_CLOCK, &e,
+                                    img[0..65536], resp[0..4096], scratch[0..4096], content[0..1024]);
+    assert st == AG_FAILED;
+    assert a.error == AE_PROVIDER_BASE + 1;
+    const n : usize = host_load(ACCEPT_DIR, id, back[0..65536]);
+    assert n > 0;
+    assert leaks(back[0..n], probe) == false;
+    assert leaks(img[0..n], probe) == false;
+    // The version report is an artifact too.
+    var rep : [1024]u8 = [0] ** 1024;
+    const rn : usize = version_report(rep[0..1024]);
+    assert leaks(rep[0..rn], probe) == false;
+    // Negative control: the detector does see the canary when it is there.
+    var raw : [128]u8 = [0] ** 128;
+    var w : usize = put_bytes(raw[0..128], 0, "Authorization: Bearer ");
+    w = put_bytes(raw[0..128], w, probe);
+    assert leaks(raw[0..w], probe);
+    // And the redactor removes it.
+    var red : [128]u8 = [0] ** 128;
+    const k : usize = redact_secret(raw[0..w], probe, red[0..128]);
+    assert k != REDACT_FAIL;
+    assert leaks(red[0..k], probe) == false;
+    endpoint_clear(&e);
+    assert e.key_len == 0;
+    assert e.key[0] == 0;
+}
+
+test f_only_the_api_key_is_a_secret_and_only_from_the_environment {
+    assert env_is_secret(ENV_KEY);
+    assert env_is_secret(ENV_HOST) == false;
+}
