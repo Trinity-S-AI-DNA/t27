@@ -37,13 +37,13 @@ and the chat slice reaches LM Studio only through `native_host` (libSystem socke
 | `native_agent.t27` | ONESHOT agent contract (9 fields), status machine, one optional read-only tool, one final result, cancel |
 | `native_swarm.t27` | coordinator, at most 3 members, explicit task graph, deterministic collection, aggregate, cancel |
 | `native_host.t27` | thin libSystem glue: env, loopback exchange, atomic log save, cancel file, `host_turn`, `host_run_agent`, `host_run_swarm` |
-| `native_accept.t27` | the acceptance suite, 13 tests in groups A-F |
+| `native_accept.t27` | the acceptance suite, 16 tests in groups A-G (G = the three host-file tests moved from `native_host`) |
 
 No Rust, JS, Python or shell was written. `git diff --stat origin/master` shows only these eight specs and this
 report. The seven staged `.t27` files that belong to another actor, `parser_fixtures.t27`, `glass_window.t27`,
 the LM Studio and NVIDIA settings, the DSH service and the stable chain were not touched.
 
-## Tests (13 in `native_accept.t27`)
+## Tests (16 in `native_accept.t27`)
 
 | Group | Test | Needs LM Studio | Status |
 |-------|------|-----------------|--------|
@@ -60,6 +60,9 @@ the LM Studio and NVIDIA settings, the DSH service and the stable chain were not
 | F | f_an_unlisted_tool_is_rejected_and_command_and_network_tools_need_approval | no | WAITING_RESOURCE |
 | F | f_a_secret_in_the_endpoint_never_reaches_a_log_or_the_report | no | WAITING_RESOURCE |
 | F | f_only_the_api_key_is_a_secret_and_only_from_the_environment | no | WAITING_RESOURCE |
+| G | g_a_log_is_saved_atomically_and_read_back_after_a_reload | no (t27b) | WAITING_RESOURCE |
+| G | g_a_missing_log_reads_as_nothing | no (t27b) | WAITING_RESOURCE |
+| G | g_a_cancel_file_is_seen_and_can_be_cleared | no (t27b) | WAITING_RESOURCE |
 
 What was actually done: `t27_check` (parse and typecheck, no import resolution) returned ok, 0 errors, 0
 warnings on `native_accept.t27`; imported names and signatures were checked by reading the source specs. The
@@ -88,7 +91,7 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
 
 ## REMAINING_GAPS
 
-1. **No test has run.** All thirteen acceptance tests and the existing spec tests are WAITING_RESOURCE.
+1. **No test has run.** All sixteen acceptance tests and the existing spec tests are WAITING_RESOURCE.
 2. **Version baseline corrected.** The first commits named 0.1.0-alpha.1, below the published T27 OS line
    (0.2.0, `release.t27`, tag `t27os-v0.2.0-b7645`, master build 7896). The native line is now 0.3.0, the next
    minor. Owner decision 2026-11-07: keep 0.3.0. Open: the branch name and issue #13212 still say
@@ -123,11 +126,21 @@ is the other sanctioned route. Delete `target/t27os/native-accept` to reset the 
     The failing test names are not identified: the CI score keeps only counts. A first guess (five asserts that
     read a field straight off a call result, bound to a local const in 277d39ab34) did not move the counts at
     ceeb4e941c (`native_log` 2, `native_policy` 1, `native_host` 3, `native_accept` not building), so it is
-    withdrawn. Hand-tracing the 15 policy tests and reading the 13 log tests found no failing one. The `native_host`
-    and `native_accept` results are expected under `t27c`: the file says `@extern` specs run under `t27b`, and the
-    owner's hold keeps both unrun, so they stay WAITING_RESOURCE. Naming the three pure-spec failures needs one run
-    of `t27c test-report <spec> --specs-dir specs` per spec (owner's `MAC_HEAVY_OK=1`). This does not change any
-    status above; nothing here is EXECUTED.
+    withdrawn. Hand-tracing the 15 policy tests and reading the 13 log tests found no failing one.
+    Owner decision 2026-11-07: fix only the `native_host` and `native_accept` blockers and run nothing. Two changes
+    (untested, because the Mac load hook denies `t27c`; WAITING_RESOURCE):
+    - `native_host`: under `t27c` every `@extern` is a stub of its return type, so `sys_open_ro` returns 0 (every
+      path "exists") and `sys_write` returns 0 (a save never succeeds). The three tests that need real files
+      (`a_log_is_saved_atomically_and_read_back_after_a_reload`, `a_missing_log_reads_as_nothing`,
+      `a_cancel_file_is_seen_and_can_be_cleared`) moved unchanged in substance to `native_accept` group G (4942a7f4a6),
+      which `t27b` runs. `native_host` keeps its four stub-safe tests.
+    - `native_accept`: the likely cause of "not building" is a name clash, not the `@extern`. `native_agent` and
+      `native_provider` each declared `pub fn error_label` with a different body, and `native_accept` reaches both
+      through `native_host` and `native_swarm`; the `use` splice marks such a name UNRESOLVED. The agent one is now
+      `agent_error_label` (65bfbda130). If the build still fails, the diagnostic is the next blocker; it is not known.
+    Even if `native_accept` builds under `t27c`, its LM Studio and file tests fail on the stubs, so spec-guards stays
+    red for it unless the owner rules how `@extern` specs are scored (request 3). Still unidentified: the `native_log`
+    2 and `native_policy` 1 failing pure tests; they are outside the three assigned blockers. Nothing here is EXECUTED.
 
 ## Safety defaults in force
 
@@ -136,8 +149,10 @@ Secrets come from the environment only (`T27OS_LMSTUDIO_API_KEY`) and live in a 
 tool outside the allowlist is rejected; command and network tools return "hold for approval"; an agent cannot
 hold or call the spawn tool, and a swarm refuses members without an explicit spawn policy.
 
-Requests out: owner -- (1) run the two `t27b test` commands above (or say "pane" for a shell-cell pane); (2) run
-`MAC_HEAVY_OK=1 ./target/release/t27c test-report <spec> --specs-dir specs` for `native_log`, `native_policy`
-and `native_host`, and paste the lines that are not `pass`; (3) rule how spec-guards treats `@extern` specs;
+Requests out: owner -- (1) run `MAC_HEAVY_OK=1 ./target/release/t27c test-report specs/t27os/native_host.t27
+--specs-dir specs` (intended: 4 of 4, a prediction) and then the same for `native_accept.t27` (expect it to build; paste the
+diagnostic if not), from `~/t27`; native_accept itself runs only after native_host is green; (2) run the same
+`t27c test-report` for `native_log` and `native_policy` and paste the lines that are not `pass`; (3) rule how
+spec-guards treats `@extern` specs; (4) only then say whether the two `t27b test` commands above may run;
 sent 2026-11-07; default: statuses stay WAITING_RESOURCE, `VERSION_CREATED` stays NO and spec-guards stays red on
 the unidentified failures; due: before any merge.
