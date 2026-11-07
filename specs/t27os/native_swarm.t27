@@ -1,0 +1,919 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/native_swarm.t27 -- the SWARM ONESHOT scaffold of the T27 OS native line (Refs #13212, FR-006).
+//
+// WHAT THIS IS: one coordinator and up to three bounded child agents. The coordinator assigns each child
+// explicitly (an agent id and the earlier members it waits for), the children run one at a time in member
+// order, and the results are collected deterministically. Cancellation stops every member that has not
+// finished. The swarm is a pure state machine over values: the host owns the Agent values (native_agent),
+// calls the provider, and tells the swarm what happened.
+//
+// WHAT THIS IS NOT: autonomous. Nothing here starts an agent, spawns an agent or loops by itself. An agent
+// joins the swarm only through swarm_assign, which needs the coordinator's spawn policy (native_policy
+// decide for TOOL_SPAWN_AGENT must return DEC_ALLOW). A child contract cannot hold the spawn tool at all
+// (native_agent refuses it), so a child can never spawn: no recursion.
+//
+// THE LOG: the swarm keeps its own session log in the native_log format, no new event types, and reuses
+// native_agent's status_from_log / result_from_log because its status values are the same numbers:
+//   user_input        the contract, then one row per member report
+//   session_state     ACTIVE at start, CLOSED at finish or cancel (the commit mark)
+//   provider_response the aggregate (all members, in member order)
+//   token_usage       the sum of the members' tokens
+//   error             "code=<n> label=<l>": terminal (member_failed, cancelled)
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osNativeSwarm;
+
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::native_provider::find_from;
+use t27os::native_provider::NOT_FOUND;
+use t27os::native_log::Cur;
+use t27os::native_log::cur_new;
+use t27os::native_log::emit;
+use t27os::native_log::emit_state;
+use t27os::native_log::nth_event;
+use t27os::native_log::EventView;
+use t27os::native_log::EV_USER_INPUT;
+use t27os::native_log::EV_PROVIDER_RESPONSE;
+use t27os::native_log::EV_ERROR;
+use t27os::native_log::EV_TOKEN_USAGE;
+use t27os::native_log::ST_ACTIVE;
+use t27os::native_log::ST_CLOSED;
+use t27os::native_policy::Policy;
+use t27os::native_policy::decide;
+use t27os::native_policy::default_policy;
+use t27os::native_policy::allow_tool;
+use t27os::native_policy::grant_spawn;
+use t27os::native_policy::TOOL_SPAWN_AGENT;
+use t27os::native_policy::DEC_ALLOW;
+use t27os::native_agent::Agent;
+use t27os::native_agent::agent_new;
+use t27os::native_agent::agent_start;
+use t27os::native_agent::agent_finish;
+use t27os::native_agent::agent_fail;
+use t27os::native_agent::agent_cancel;
+use t27os::native_agent::status_label;
+use t27os::native_agent::error_label;
+use t27os::native_agent::status_from_log;
+use t27os::native_agent::result_from_log;
+use t27os::native_agent::StatusView;
+use t27os::native_agent::AG_NEW;
+use t27os::native_agent::AG_RUNNING;
+use t27os::native_agent::AG_DONE;
+use t27os::native_agent::AG_FAILED;
+use t27os::native_agent::AG_CANCELLED;
+use t27os::native_agent::AE_NONE;
+use t27os::native_agent::AE_BAD_CONTRACT;
+use t27os::native_agent::AE_TOO_LONG;
+use t27os::native_agent::AE_SPAWN_REFUSED;
+use t27os::native_agent::AE_CANCELLED;
+use t27os::native_agent::AE_LOG_FULL;
+use t27os::native_agent::RESULT_MAX;
+
+// ---- bounds ------------------------------------------------------------------------------------------------
+
+pub const MEMBERS_MAX : usize = 3;
+pub const OBJECTIVE_MAX : usize = 128;
+/// The smallest buffer swarm_aggregate accepts; a shorter one gets 0, never a clipped aggregate.
+pub const AGG_MIN : usize = 2048;
+/// "No member": swarm_next found nothing to run, or no member is running.
+pub const NO_MEMBER : usize = 255;
+
+/// Swarm status. The numbers equal native_agent's AG_* on purpose, so status_from_log and status_label
+/// serve both records.
+pub const SW_NEW : u32 = 0;
+pub const SW_RUNNING : u32 = 1;
+pub const SW_DONE : u32 = 2;
+pub const SW_FAILED : u32 = 3;
+pub const SW_CANCELLED : u32 = 4;
+
+/// Swarm errors. Contract and log errors reuse native_agent's AE_* numbers (1 bad contract, 2 too long,
+/// 7 cancelled, 8 log full); the codes below are the swarm's own.
+pub const SE_NONE : u32 = 0;
+pub const SE_SPAWN_DENIED : u32 = 20;
+pub const SE_NOT_NEW : u32 = 21;
+pub const SE_FULL : u32 = 22;
+pub const SE_BAD_ID : u32 = 23;
+pub const SE_DUP_ID : u32 = 24;
+pub const SE_BAD_DEPS : u32 = 25;
+pub const SE_MEMBER_FAILED : u32 = 26;
+pub const SE_DEP_FAILED : u32 = 27;
+
+pub fn swarm_error_label(e: u32) -> []const u8 {
+    if (e == SE_SPAWN_DENIED) { return "spawn_denied"; }
+    if (e == SE_NOT_NEW) { return "not_new"; }
+    if (e == SE_FULL) { return "full"; }
+    if (e == SE_BAD_ID) { return "bad_id"; }
+    if (e == SE_DUP_ID) { return "dup_id"; }
+    if (e == SE_BAD_DEPS) { return "bad_deps"; }
+    if (e == SE_MEMBER_FAILED) { return "member_failed"; }
+    if (e == SE_DEP_FAILED) { return "dep_failed"; }
+    return error_label(e);
+}
+
+// ---- the swarm record --------------------------------------------------------------------------------------
+
+/// swarm_id, objective and the members (agent ids, the task graph, per-member status, error and result).
+/// session_id is the coordinator's session and the parent_session_id every child contract must carry.
+/// member_deps[i] is a mask over EARLIER members (bit j set: member i waits for member j), so the graph is
+/// acyclic by construction. Member results sit in three fixed 512-byte slots; nothing is ever truncated.
+pub struct Swarm {
+    swarm_id: u64,
+    session_id: u64,
+    status: u32,
+    error: u32,
+    count: usize,
+    running: usize,
+    tokens_used: u64,
+    objective_len: usize,
+    objective: [128]u8,
+    member_id: [3]u64,
+    member_deps: [3]u32,
+    member_status: [3]u32,
+    member_error: [3]u32,
+    member_len: [3]usize,
+    texts: [1536]u8,
+}
+
+/// Builds a swarm. A contract that breaks a bound comes back already SW_FAILED with the reason in `error`.
+pub fn swarm_new(swarm_id: u64, session_id: u64, objective: []const u8) -> Swarm {
+    var s : Swarm = Swarm {
+        swarm_id: swarm_id,
+        session_id: session_id,
+        status: SW_NEW,
+        error: SE_NONE,
+        count: 0,
+        running: NO_MEMBER,
+        tokens_used: 0,
+        objective_len: 0,
+        objective: [0] ** 128,
+        member_id: [0] ** 3,
+        member_deps: [0] ** 3,
+        member_status: [0] ** 3,
+        member_error: [0] ** 3,
+        member_len: [0] ** 3,
+        texts: [0] ** 1536,
+    };
+    if (swarm_id == 0 or session_id == 0 or objective.len == 0) {
+        s.status = SW_FAILED;
+        s.error = AE_BAD_CONTRACT;
+        return s;
+    }
+    if (objective.len > OBJECTIVE_MAX) {
+        s.status = SW_FAILED;
+        s.error = AE_TOO_LONG;
+        return s;
+    }
+    var i : usize = 0;
+    while (i < objective.len) {
+        s.objective[i] = objective[i];
+        i = i + 1;
+    }
+    s.objective_len = objective.len;
+    return s;
+}
+
+fn pow2(n: usize) -> u32 {
+    var v : u32 = 1;
+    var i : usize = 0;
+    while (i < n) {
+        v = v * 2;
+        i = i + 1;
+    }
+    return v;
+}
+
+fn dep_bit(deps: u32, j: usize) -> bool {
+    return (deps / pow2(j)) % 2 == 1;
+}
+
+pub fn objective_view(s: *Swarm) -> []const u8 {
+    return s.objective[0..s.objective_len];
+}
+
+/// The stored result of member i: its agent's final text; empty for a member that did not finish DONE.
+pub fn member_text(s: *Swarm, i: usize) -> []const u8 {
+    if (i >= s.count) { return ""; }
+    const start : usize = i * RESULT_MAX;
+    return s.texts[start..start + s.member_len[i]];
+}
+
+// ---- assignment --------------------------------------------------------------------------------------------
+
+/// Explicit task assignment: adds a member by agent id and the earlier members it waits for. Needs the
+/// coordinator's spawn policy (decide for TOOL_SPAWN_AGENT must return DEC_ALLOW). Refused, with the swarm
+/// unchanged, for: no spawn policy (SE_SPAWN_DENIED), a swarm that already started (SE_NOT_NEW), a fourth
+/// member (SE_FULL), agent id 0 (SE_BAD_ID), a repeated agent id (SE_DUP_ID), a dependency on itself or on
+/// a later member (SE_BAD_DEPS). Returns SE_NONE when the member was added.
+pub fn swarm_assign(s: *Swarm, p: Policy, agent_id: u64, deps: u32) -> u32 {
+    if (decide(p, TOOL_SPAWN_AGENT) != DEC_ALLOW) { return SE_SPAWN_DENIED; }
+    if (s.status != SW_NEW) { return SE_NOT_NEW; }
+    if (s.count >= MEMBERS_MAX) { return SE_FULL; }
+    if (agent_id == 0) { return SE_BAD_ID; }
+    var j : usize = 0;
+    while (j < s.count) {
+        if (s.member_id[j] == agent_id) { return SE_DUP_ID; }
+        j = j + 1;
+    }
+    if (deps >= pow2(s.count)) { return SE_BAD_DEPS; }
+    const i : usize = s.count;
+    s.member_id[i] = agent_id;
+    s.member_deps[i] = deps;
+    s.member_status[i] = AG_NEW;
+    s.member_error[i] = SE_NONE;
+    s.member_len[i] = 0;
+    s.count = i + 1;
+    return SE_NONE;
+}
+
+// ---- payloads ----------------------------------------------------------------------------------------------
+
+/// "code=<n> label=<label>": the terminal error payload of the swarm. 0 when `out` is shorter than 64 bytes.
+pub fn swarm_error_payload(code: u32, out: []u8) -> usize {
+    if (out.len < 64) { return 0; }
+    var n : usize = put_bytes(out, 0, "code=");
+    n = put_dec(out, n, @as(u64, code));
+    n = put_bytes(out, n, " label=");
+    n = put_bytes(out, n, swarm_error_label(code));
+    return n;
+}
+
+/// "swarm=<id> session=<id> members=<n>\nobjective=<text>\nm<i>=<agent> deps=<mask>\n...": the user_input
+/// event that opens the swarm's log. 0 when `out` is shorter than 512 bytes.
+fn start_payload(s: *Swarm, out: []u8) -> usize {
+    if (out.len < 512) { return 0; }
+    var n : usize = put_bytes(out, 0, "swarm=");
+    n = put_dec(out, n, s.swarm_id);
+    n = put_bytes(out, n, " session=");
+    n = put_dec(out, n, s.session_id);
+    n = put_bytes(out, n, " members=");
+    n = put_dec(out, n, @as(u64, s.count));
+    n = put_bytes(out, n, "\nobjective=");
+    n = put_bytes(out, n, objective_view(s));
+    n = put_bytes(out, n, "\n");
+    var i : usize = 0;
+    while (i < s.count) {
+        n = put_bytes(out, n, "m");
+        n = put_dec(out, n, @as(u64, i));
+        n = put_bytes(out, n, "=");
+        n = put_dec(out, n, s.member_id[i]);
+        n = put_bytes(out, n, " deps=");
+        n = put_dec(out, n, @as(u64, s.member_deps[i]));
+        n = put_bytes(out, n, "\n");
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The aggregate: "swarm=<id> members=<n>\n", then for each member in member order
+/// "member=<i> agent=<id> status=<s> error=<e> result_len=<n>\n<result>\n". The result length makes it
+/// parseable even when a result holds a line that looks like a header. Deterministic: the same member
+/// states give the same bytes. 0 when `out` is shorter than AGG_MIN.
+pub fn swarm_aggregate(s: *Swarm, out: []u8) -> usize {
+    if (out.len < AGG_MIN) { return 0; }
+    var n : usize = put_bytes(out, 0, "swarm=");
+    n = put_dec(out, n, s.swarm_id);
+    n = put_bytes(out, n, " members=");
+    n = put_dec(out, n, @as(u64, s.count));
+    n = put_bytes(out, n, "\n");
+    var i : usize = 0;
+    while (i < s.count) {
+        n = put_bytes(out, n, "member=");
+        n = put_dec(out, n, @as(u64, i));
+        n = put_bytes(out, n, " agent=");
+        n = put_dec(out, n, s.member_id[i]);
+        n = put_bytes(out, n, " status=");
+        n = put_bytes(out, n, status_label(s.member_status[i]));
+        n = put_bytes(out, n, " error=");
+        n = put_bytes(out, n, swarm_error_label(s.member_error[i]));
+        n = put_bytes(out, n, " result_len=");
+        n = put_dec(out, n, @as(u64, s.member_len[i]));
+        n = put_bytes(out, n, "\n");
+        n = put_bytes(out, n, member_text(s, i));
+        n = put_bytes(out, n, "\n");
+        i = i + 1;
+    }
+    return n;
+}
+
+// ---- the coordinator ---------------------------------------------------------------------------------------
+
+/// Opens the swarm's log: the contract as a user_input event, then session_state ACTIVE. Only a new swarm
+/// with at least one member starts; any other leaves both the swarm and the cursor untouched. A log that
+/// cannot take the two events ends the swarm SW_FAILED / AE_LOG_FULL.
+pub fn swarm_start(s: *Swarm, img: []u8, c: Cur) -> Cur {
+    if (c.ok == false or s.status != SW_NEW or s.count == 0) { return c; }
+    var p : [512]u8 = undefined;
+    const n : usize = start_payload(s, p[0..512]);
+    var d : Cur = emit(img, c, EV_USER_INPUT, p[0..n]);
+    d = emit_state(img, d, ST_ACTIVE);
+    if (d.ok == false) {
+        s.status = SW_FAILED;
+        s.error = AE_LOG_FULL;
+        return c;
+    }
+    s.status = SW_RUNNING;
+    return d;
+}
+
+/// True when every member member i waits for is DONE.
+fn deps_done(s: *Swarm, i: usize) -> bool {
+    var j : usize = 0;
+    while (j < i) {
+        if (dep_bit(s.member_deps[i], j) and s.member_status[j] != AG_DONE) { return false; }
+        j = j + 1;
+    }
+    return true;
+}
+
+/// The next member to run: the lowest index that is still new and whose dependencies are all done.
+/// NO_MEMBER when the swarm is not running, when a member is already running (members run one at a time),
+/// or when nothing is ready.
+pub fn swarm_next(s: *Swarm) -> usize {
+    if (s.status != SW_RUNNING or s.running != NO_MEMBER) { return NO_MEMBER; }
+    var i : usize = 0;
+    while (i < s.count) {
+        if (s.member_status[i] == AG_NEW and deps_done(s, i)) { return i; }
+        i = i + 1;
+    }
+    return NO_MEMBER;
+}
+
+/// Marks member idx running. True only for the member swarm_next would name; anything else changes nothing.
+pub fn swarm_begin(s: *Swarm, idx: usize) -> bool {
+    if (swarm_next(s) != idx or idx == NO_MEMBER) { return false; }
+    s.member_status[idx] = AG_RUNNING;
+    s.running = idx;
+    return true;
+}
+
+/// A member that waits for a failed or cancelled member can never run: it ends cancelled (dep_failed).
+/// Dependencies point only at earlier members, so one forward pass settles a whole chain.
+fn settle(s: *Swarm) -> void {
+    var i : usize = 0;
+    while (i < s.count) {
+        if (s.member_status[i] == AG_NEW) {
+            var j : usize = 0;
+            while (j < i) {
+                const dead : bool = s.member_status[j] == AG_FAILED or s.member_status[j] == AG_CANCELLED;
+                if (dep_bit(s.member_deps[i], j) and dead and s.member_status[i] == AG_NEW) {
+                    s.member_status[i] = AG_CANCELLED;
+                    s.member_error[i] = SE_DEP_FAILED;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// Collects the finished agent of member idx. Refused (cursor and swarm unchanged) unless the swarm is
+/// running, idx is the running member, the agent carries that member's id and this swarm's session as its
+/// parent, and the agent has reached a final status (done, failed or cancelled). A DONE agent's result is
+/// copied into the member's slot. One user_input row records the report; then members that wait for a
+/// failed member are cancelled.
+pub fn swarm_report(s: *Swarm, idx: usize, a: *Agent, img: []u8, c: Cur) -> Cur {
+    if (c.ok == false or s.status != SW_RUNNING or idx >= s.count or s.running != idx) { return c; }
+    if (a.agent_id != s.member_id[idx] or a.parent_session_id != s.session_id) { return c; }
+    if (a.status != AG_DONE and a.status != AG_FAILED and a.status != AG_CANCELLED) { return c; }
+    var p : [128]u8 = undefined;
+    var n : usize = put_bytes(p[0..128], 0, "member=");
+    n = put_dec(p[0..128], n, @as(u64, idx));
+    n = put_bytes(p[0..128], n, " agent=");
+    n = put_dec(p[0..128], n, a.agent_id);
+    n = put_bytes(p[0..128], n, " status=");
+    n = put_bytes(p[0..128], n, status_label(a.status));
+    n = put_bytes(p[0..128], n, " error=");
+    n = put_bytes(p[0..128], n, swarm_error_label(a.error));
+    n = put_bytes(p[0..128], n, " result_len=");
+    n = put_dec(p[0..128], n, @as(u64, a.result_len));
+    const d : Cur = emit(img, c, EV_USER_INPUT, p[0..n]);
+    if (d.ok == false) { return c; }
+    s.member_status[idx] = a.status;
+    s.member_error[idx] = a.error;
+    if (a.status == AG_DONE) {
+        const start : usize = idx * RESULT_MAX;
+        var k : usize = 0;
+        while (k < a.result_len) {
+            s.texts[start + k] = a.result[k];
+            k = k + 1;
+        }
+        s.member_len[idx] = a.result_len;
+    }
+    s.tokens_used = s.tokens_used + a.tokens_used;
+    s.running = NO_MEMBER;
+    settle(s);
+    return d;
+}
+
+fn all_final(s: *Swarm) -> bool {
+    var i : usize = 0;
+    while (i < s.count) {
+        const st : u32 = s.member_status[i];
+        if (st != AG_DONE and st != AG_FAILED and st != AG_CANCELLED) { return false; }
+        i = i + 1;
+    }
+    return s.count > 0;
+}
+
+fn all_done(s: *Swarm) -> bool {
+    var i : usize = 0;
+    while (i < s.count) {
+        if (s.member_status[i] != AG_DONE) { return false; }
+        i = i + 1;
+    }
+    return s.count > 0;
+}
+
+/// Closes a running swarm whose members are all final: the aggregate as provider_response, the token total,
+/// (for a swarm with a member that did not finish DONE) the terminal member_failed error, then session_state
+/// CLOSED. The swarm ends SW_DONE when every member is DONE, else SW_FAILED / SE_MEMBER_FAILED, and the
+/// aggregate is kept either way: partial results are results. Refused (nothing changes) while any member is
+/// new or running. A log that cannot take the events ends the swarm SW_FAILED / AE_LOG_FULL.
+pub fn swarm_finish(s: *Swarm, img: []u8, c: Cur) -> Cur {
+    if (c.ok == false or s.status != SW_RUNNING or s.running != NO_MEMBER or all_final(s) == false) { return c; }
+    var agg : [2048]u8 = undefined;
+    const an : usize = swarm_aggregate(s, agg[0..2048]);
+    var u : [48]u8 = undefined;
+    var un : usize = put_bytes(u[0..48], 0, "total_tokens=");
+    un = put_dec(u[0..48], un, s.tokens_used);
+    var d : Cur = emit(img, c, EV_PROVIDER_RESPONSE, agg[0..an]);
+    d = emit(img, d, EV_TOKEN_USAGE, u[0..un]);
+    var st : u32 = SW_DONE;
+    var code : u32 = SE_NONE;
+    if (all_done(s) == false) {
+        st = SW_FAILED;
+        code = SE_MEMBER_FAILED;
+        var e : [64]u8 = undefined;
+        const en : usize = swarm_error_payload(code, e[0..64]);
+        d = emit(img, d, EV_ERROR, e[0..en]);
+    }
+    d = emit_state(img, d, ST_CLOSED);
+    if (d.ok == false) {
+        s.status = SW_FAILED;
+        s.error = AE_LOG_FULL;
+        return c;
+    }
+    s.status = st;
+    s.error = code;
+    return d;
+}
+
+/// Cancellation: a new or running swarm ends SW_CANCELLED. Every member that is new or running ends
+/// cancelled at once (so swarm_next names nothing more and a late report is refused); members already
+/// final keep their status and results. The host then calls agent_cancel for each agent it still holds
+/// (a no-op for an agent that already finished). The terminal error and CLOSED are logged; if the log
+/// cannot take them the in-memory swarm is cancelled all the same and the cursor stays where it was.
+/// A swarm that is already final is left exactly as it is.
+pub fn swarm_cancel(s: *Swarm, img: []u8, c: Cur) -> Cur {
+    if (s.status != SW_NEW and s.status != SW_RUNNING) { return c; }
+    var i : usize = 0;
+    while (i < s.count) {
+        if (s.member_status[i] == AG_NEW or s.member_status[i] == AG_RUNNING) {
+            s.member_status[i] = AG_CANCELLED;
+            s.member_error[i] = AE_CANCELLED;
+        }
+        i = i + 1;
+    }
+    s.running = NO_MEMBER;
+    s.status = SW_CANCELLED;
+    s.error = AE_CANCELLED;
+    var p : [64]u8 = undefined;
+    const n : usize = swarm_error_payload(AE_CANCELLED, p[0..64]);
+    var d : Cur = emit(img, c, EV_ERROR, p[0..n]);
+    d = emit_state(img, d, ST_CLOSED);
+    if (d.ok == false) { return c; }
+    return d;
+}
+
+// ---- the tests ---------------------------------------------------------------------------------------------
+
+fn spawn_policy() -> Policy {
+    return grant_spawn(allow_tool(default_policy(), TOOL_SPAWN_AGENT));
+}
+
+/// A child that ran to a final result. 6 = the two read-only tools.
+fn done_agent(id: u64, parent: u64, result: []const u8) -> Agent {
+    var img : [2048]u8 = undefined;
+    var a : Agent = agent_new(id, parent, 6, 256, "task", "input");
+    var c : Cur = agent_start(&a, img[0..2048], cur_new());
+    c = agent_finish(&a, result, 10, 5, img[0..2048], c);
+    return a;
+}
+
+/// A child whose provider call failed (error class 1).
+fn failed_agent(id: u64, parent: u64) -> Agent {
+    var img : [2048]u8 = undefined;
+    var a : Agent = agent_new(id, parent, 6, 256, "task", "input");
+    var c : Cur = agent_start(&a, img[0..2048], cur_new());
+    c = agent_fail(&a, 1, img[0..2048], c);
+    return a;
+}
+
+/// A child that was started and has not answered.
+fn running_agent(id: u64, parent: u64) -> Agent {
+    var img : [2048]u8 = undefined;
+    var a : Agent = agent_new(id, parent, 6, 256, "task", "input");
+    const c : Cur = agent_start(&a, img[0..2048], cur_new());
+    return a;
+}
+
+/// The host step for one member: begin it, then report its finished agent.
+fn step(s: *Swarm, idx: usize, a: *Agent, img: []u8, c: Cur) -> Cur {
+    if (swarm_begin(s, idx) == false) { return c; }
+    return swarm_report(s, idx, a, img, c);
+}
+
+/// A swarm of three independent members 11, 12, 13 under the coordinator session 4.
+fn three_members() -> Swarm {
+    var s : Swarm = swarm_new(9, 4, "survey three files");
+    const p : Policy = spawn_policy();
+    const r0 : u32 = swarm_assign(&s, p, 11, 0);
+    const r1 : u32 = swarm_assign(&s, p, 12, 0);
+    const r2 : u32 = swarm_assign(&s, p, 13, 0);
+    return s;
+}
+
+test "a_swarm_contract_is_held_whole_and_starts_new" {
+    var s : Swarm = swarm_new(9, 4, "survey three files");
+    assert s.status == SW_NEW;
+    assert s.error == SE_NONE;
+    assert s.swarm_id == 9;
+    assert s.session_id == 4;
+    assert s.count == 0;
+    assert s.running == NO_MEMBER;
+    assert s.objective_len == 18;
+    const ov : []const u8 = objective_view(&s);
+    assert ov.len == 18;
+    assert ov[0] == 115;
+}
+
+test "a_swarm_contract_that_breaks_a_bound_is_refused_with_its_reason" {
+    // negative controls, one per bound
+    const a : Swarm = swarm_new(0, 4, "o");
+    assert a.status == SW_FAILED;
+    assert a.error == AE_BAD_CONTRACT;
+    const b : Swarm = swarm_new(9, 0, "o");
+    assert b.error == AE_BAD_CONTRACT;
+    const e : Swarm = swarm_new(9, 4, "");
+    assert e.error == AE_BAD_CONTRACT;
+    var long : [129]u8 = [97] ** 129;
+    const l : Swarm = swarm_new(9, 4, long[0..129]);
+    assert l.status == SW_FAILED;
+    assert l.error == AE_TOO_LONG;
+    // positive control: the exact bound is accepted
+    const ok : Swarm = swarm_new(9, 4, long[0..128]);
+    assert ok.status == SW_NEW;
+    assert ok.objective_len == 128;
+}
+
+test "assign_needs_the_spawn_policy_and_changes_nothing_without_it" {
+    var s : Swarm = swarm_new(9, 4, "o");
+    // negative controls: the default policy, listed-but-not-granted, granted-but-not-listed
+    assert swarm_assign(&s, default_policy(), 11, 0) == SE_SPAWN_DENIED;
+    assert swarm_assign(&s, allow_tool(default_policy(), TOOL_SPAWN_AGENT), 11, 0) == SE_SPAWN_DENIED;
+    assert swarm_assign(&s, grant_spawn(default_policy()), 11, 0) == SE_SPAWN_DENIED;
+    assert s.count == 0;
+    // positive control
+    assert swarm_assign(&s, spawn_policy(), 11, 0) == SE_NONE;
+    assert s.count == 1;
+    assert s.member_id[0] == 11;
+}
+
+test "a_fourth_member_is_refused_and_three_are_accepted" {
+    var s : Swarm = three_members();
+    assert s.count == 3;
+    assert swarm_assign(&s, spawn_policy(), 14, 0) == SE_FULL;
+    assert s.count == 3;
+    assert s.member_id[2] == 13;
+}
+
+test "ids_and_dependencies_are_checked_before_a_member_is_added" {
+    var s : Swarm = swarm_new(9, 4, "o");
+    const p : Policy = spawn_policy();
+    assert swarm_assign(&s, p, 0, 0) == SE_BAD_ID;
+    assert swarm_assign(&s, p, 11, 1) == SE_BAD_DEPS;
+    assert swarm_assign(&s, p, 11, 0) == SE_NONE;
+    assert swarm_assign(&s, p, 11, 0) == SE_DUP_ID;
+    assert swarm_assign(&s, p, 12, 2) == SE_BAD_DEPS;
+    assert swarm_assign(&s, p, 12, 4) == SE_BAD_DEPS;
+    assert s.count == 1;
+    // positive controls: member 1 waits for member 0, member 2 waits for both
+    assert swarm_assign(&s, p, 12, 1) == SE_NONE;
+    assert swarm_assign(&s, p, 13, 3) == SE_NONE;
+    assert s.count == 3;
+    assert s.member_deps[1] == 1;
+    assert s.member_deps[2] == 3;
+}
+
+test "start_logs_the_contract_then_active_and_the_log_reads_back_running" {
+    var img : [8192]u8 = undefined;
+    var scratch : [4096]u8 = undefined;
+    var out : [512]u8 = undefined;
+    // a swarm with no member does not start and writes nothing
+    var empty : Swarm = swarm_new(9, 4, "o");
+    const c0 : Cur = swarm_start(&empty, img[0..8192], cur_new());
+    assert c0.len == 0;
+    assert empty.status == SW_NEW;
+    var s : Swarm = three_members();
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    assert c.ok;
+    assert c.seq == 3;
+    assert s.status == SW_RUNNING;
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..4096]);
+    assert v.events == 2;
+    assert v.status == AG_RUNNING;
+    const ev : EventView = nth_event(img[0..c.len], scratch[0..4096], 0, out[0..512]);
+    assert ev.ok;
+    assert find_from(out[0..ev.len], "members=3", 0) != NOT_FOUND;
+    assert find_from(out[0..ev.len], "m2=13 deps=0", 0) != NOT_FOUND;
+    // a second start does nothing, and no member can be added any more
+    const c2 : Cur = swarm_start(&s, img[0..8192], c);
+    assert c2.len == c.len;
+    assert swarm_assign(&s, spawn_policy(), 14, 0) == SE_NOT_NEW;
+}
+
+test "a_log_that_cannot_hold_the_contract_fails_the_swarm" {
+    var img : [32]u8 = undefined;
+    var s : Swarm = three_members();
+    const c : Cur = swarm_start(&s, img[0..32], cur_new());
+    assert s.status == SW_FAILED;
+    assert s.error == AE_LOG_FULL;
+    assert c.len == 0;
+}
+
+test "three_children_run_in_member_order_and_the_aggregate_is_deterministic" {
+    var img : [8192]u8 = undefined;
+    var scratch : [4096]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var back : [2048]u8 = undefined;
+    var s : Swarm = three_members();
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    var a0 : Agent = done_agent(11, 4, "alpha");
+    var a1 : Agent = done_agent(12, 4, "beta");
+    var a2 : Agent = done_agent(13, 4, "gamma");
+    assert swarm_next(&s) == 0;
+    c = step(&s, 0, &a0, img[0..8192], c);
+    assert swarm_next(&s) == 1;
+    c = step(&s, 1, &a1, img[0..8192], c);
+    assert swarm_next(&s) == 2;
+    c = step(&s, 2, &a2, img[0..8192], c);
+    assert swarm_next(&s) == NO_MEMBER;
+    c = swarm_finish(&s, img[0..8192], c);
+    assert c.ok;
+    assert s.status == SW_DONE;
+    assert s.error == SE_NONE;
+    assert s.tokens_used == 45;
+    // 2 (start) + 3 (reports) + 3 (response, usage, closed)
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..4096]);
+    assert v.status == AG_DONE;
+    assert v.error == AE_NONE;
+    assert v.events == 8;
+    // the aggregate is exactly the members' results in member order
+    const want : []const u8 = "swarm=9 members=3\nmember=0 agent=11 status=done error=none result_len=5\nalpha\nmember=1 agent=12 status=done error=none result_len=4\nbeta\nmember=2 agent=13 status=done error=none result_len=5\ngamma\n";
+    const an : usize = swarm_aggregate(&s, out[0..2048]);
+    assert an == want.len;
+    var i : usize = 0;
+    while (i < an) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+    // and the persisted aggregate is the same bytes
+    const rn : usize = result_from_log(img[0..c.len], scratch[0..4096], back[0..2048]);
+    assert rn == an;
+    var k : usize = 0;
+    while (k < rn) {
+        assert back[k] == out[k];
+        k = k + 1;
+    }
+}
+
+test "members_run_one_at_a_time_and_only_the_named_member_may_begin" {
+    var img : [8192]u8 = undefined;
+    var s : Swarm = three_members();
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    // negative controls before anything runs: a later member and a nonsense index cannot begin
+    assert swarm_begin(&s, 1) == false;
+    assert swarm_begin(&s, 3) == false;
+    assert swarm_begin(&s, NO_MEMBER) == false;
+    assert swarm_begin(&s, 0);
+    assert s.member_status[0] == AG_RUNNING;
+    assert swarm_next(&s) == NO_MEMBER;
+    assert swarm_begin(&s, 1) == false;
+    assert s.member_status[1] == AG_NEW;
+}
+
+test "a_dependent_member_waits_for_its_dependency_and_runs_after_it_is_done" {
+    var img : [8192]u8 = undefined;
+    var s : Swarm = swarm_new(9, 4, "o");
+    const p : Policy = spawn_policy();
+    assert swarm_assign(&s, p, 11, 0) == SE_NONE;
+    assert swarm_assign(&s, p, 12, 1) == SE_NONE;
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    assert swarm_next(&s) == 0;
+    assert swarm_begin(&s, 1) == false;
+    var a0 : Agent = done_agent(11, 4, "first");
+    c = step(&s, 0, &a0, img[0..8192], c);
+    assert swarm_next(&s) == 1;
+    assert swarm_begin(&s, 1);
+}
+
+test "a_failed_member_cancels_its_dependents_and_the_swarm_ends_failed" {
+    var img : [8192]u8 = undefined;
+    var scratch : [4096]u8 = undefined;
+    var out : [2048]u8 = undefined;
+    var s : Swarm = swarm_new(9, 4, "o");
+    const p : Policy = spawn_policy();
+    assert swarm_assign(&s, p, 11, 0) == SE_NONE;
+    assert swarm_assign(&s, p, 12, 1) == SE_NONE;
+    assert swarm_assign(&s, p, 13, 0) == SE_NONE;
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    var a0 : Agent = failed_agent(11, 4);
+    var a2 : Agent = done_agent(13, 4, "gamma");
+    c = step(&s, 0, &a0, img[0..8192], c);
+    assert s.member_status[0] == AG_FAILED;
+    assert s.member_status[1] == AG_CANCELLED;
+    assert s.member_error[1] == SE_DEP_FAILED;
+    // the independent member still runs
+    assert swarm_next(&s) == 2;
+    c = step(&s, 2, &a2, img[0..8192], c);
+    assert swarm_next(&s) == NO_MEMBER;
+    c = swarm_finish(&s, img[0..8192], c);
+    assert s.status == SW_FAILED;
+    assert s.error == SE_MEMBER_FAILED;
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..4096]);
+    assert v.status == AG_FAILED;
+    assert v.error == SE_MEMBER_FAILED;
+    // the partial results are still there
+    const an : usize = swarm_aggregate(&s, out[0..2048]);
+    assert find_from(out[0..an], "member=1 agent=12 status=cancelled error=dep_failed", 0) != NOT_FOUND;
+    assert find_from(out[0..an], "member=2 agent=13 status=done error=none result_len=5\ngamma", 0) != NOT_FOUND;
+}
+
+test "a_failure_cancels_a_whole_chain_at_once" {
+    var img : [8192]u8 = undefined;
+    var s : Swarm = swarm_new(9, 4, "o");
+    const p : Policy = spawn_policy();
+    assert swarm_assign(&s, p, 11, 0) == SE_NONE;
+    assert swarm_assign(&s, p, 12, 1) == SE_NONE;
+    assert swarm_assign(&s, p, 13, 2) == SE_NONE;
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    var a0 : Agent = failed_agent(11, 4);
+    c = step(&s, 0, &a0, img[0..8192], c);
+    assert s.member_status[1] == AG_CANCELLED;
+    assert s.member_status[2] == AG_CANCELLED;
+    assert swarm_next(&s) == NO_MEMBER;
+    c = swarm_finish(&s, img[0..8192], c);
+    assert s.status == SW_FAILED;
+}
+
+test "cancel_stops_every_pending_member_and_keeps_what_is_done" {
+    var img : [8192]u8 = undefined;
+    var scratch : [4096]u8 = undefined;
+    var s : Swarm = three_members();
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    var a0 : Agent = done_agent(11, 4, "alpha");
+    var a1 : Agent = running_agent(12, 4);
+    c = step(&s, 0, &a0, img[0..8192], c);
+    assert swarm_begin(&s, 1);
+    c = swarm_cancel(&s, img[0..8192], c);
+    assert c.ok;
+    assert s.status == SW_CANCELLED;
+    assert s.error == AE_CANCELLED;
+    assert s.member_status[0] == AG_DONE;
+    assert s.member_status[1] == AG_CANCELLED;
+    assert s.member_status[2] == AG_CANCELLED;
+    assert s.running == NO_MEMBER;
+    const kept : []const u8 = member_text(&s, 0);
+    assert kept.len == 5;
+    assert kept[0] == 97;
+    // nothing more can run, report or finish
+    assert swarm_next(&s) == NO_MEMBER;
+    assert swarm_begin(&s, 2) == false;
+    const late : Cur = swarm_report(&s, 1, &a1, img[0..8192], c);
+    assert late.len == c.len;
+    const fin : Cur = swarm_finish(&s, img[0..8192], c);
+    assert fin.len == c.len;
+    // the host cancels the agent it still holds
+    var ai : [2048]u8 = undefined;
+    const ac : Cur = agent_cancel(&a1, ai[0..2048], cur_new());
+    assert a1.status == AG_CANCELLED;
+    // the swarm log reads back cancelled
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..4096]);
+    assert v.status == AG_CANCELLED;
+    assert v.error == AE_CANCELLED;
+    // a second cancel changes nothing
+    const c2 : Cur = swarm_cancel(&s, img[0..8192], c);
+    assert c2.len == c.len;
+}
+
+test "a_swarm_can_be_cancelled_before_it_starts" {
+    var img : [8192]u8 = undefined;
+    var scratch : [4096]u8 = undefined;
+    var s : Swarm = three_members();
+    const c : Cur = swarm_cancel(&s, img[0..8192], cur_new());
+    assert s.status == SW_CANCELLED;
+    assert s.member_status[0] == AG_CANCELLED;
+    assert s.member_status[2] == AG_CANCELLED;
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..4096]);
+    assert v.status == AG_CANCELLED;
+    // and it cannot be started afterwards
+    const c2 : Cur = swarm_start(&s, img[0..8192], c);
+    assert c2.len == c.len;
+    assert s.status == SW_CANCELLED;
+}
+
+test "a_report_is_refused_unless_agent_and_member_match" {
+    var img : [8192]u8 = undefined;
+    var s : Swarm = three_members();
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    assert swarm_begin(&s, 0);
+    var wrong_id : Agent = done_agent(99, 4, "x");
+    var wrong_parent : Agent = done_agent(11, 5, "x");
+    var not_final : Agent = running_agent(11, 4);
+    const r1 : Cur = swarm_report(&s, 0, &wrong_id, img[0..8192], c);
+    assert r1.len == c.len;
+    const r2 : Cur = swarm_report(&s, 0, &wrong_parent, img[0..8192], c);
+    assert r2.len == c.len;
+    const r3 : Cur = swarm_report(&s, 0, &not_final, img[0..8192], c);
+    assert r3.len == c.len;
+    // a report for a member that is not the running one
+    var other : Agent = done_agent(12, 4, "x");
+    const r4 : Cur = swarm_report(&s, 1, &other, img[0..8192], c);
+    assert r4.len == c.len;
+    assert s.member_status[0] == AG_RUNNING;
+    // positive control: the right agent is accepted
+    var right : Agent = done_agent(11, 4, "ok");
+    const r5 : Cur = swarm_report(&s, 0, &right, img[0..8192], c);
+    assert r5.len > c.len;
+    assert s.member_status[0] == AG_DONE;
+}
+
+test "finish_waits_until_every_member_is_final" {
+    var img : [8192]u8 = undefined;
+    var s : Swarm = three_members();
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    const f0 : Cur = swarm_finish(&s, img[0..8192], c);
+    assert f0.len == c.len;
+    assert s.status == SW_RUNNING;
+    var a0 : Agent = done_agent(11, 4, "alpha");
+    c = step(&s, 0, &a0, img[0..8192], c);
+    assert swarm_begin(&s, 1);
+    const f1 : Cur = swarm_finish(&s, img[0..8192], c);
+    assert f1.len == c.len;
+    assert s.status == SW_RUNNING;
+}
+
+test "a_child_that_holds_the_spawn_tool_is_refused_and_fails_its_member" {
+    var img : [8192]u8 = undefined;
+    var s : Swarm = swarm_new(9, 4, "o");
+    assert swarm_assign(&s, spawn_policy(), 11, 0) == SE_NONE;
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    // 38 = read_text + clock + spawn_agent: the contract is refused at agent_new
+    var bad : Agent = agent_new(11, 4, 38, 256, "task", "input");
+    assert bad.status == AG_FAILED;
+    assert bad.error == AE_SPAWN_REFUSED;
+    c = step(&s, 0, &bad, img[0..8192], c);
+    assert s.member_status[0] == AG_FAILED;
+    assert s.member_error[0] == AE_SPAWN_REFUSED;
+    c = swarm_finish(&s, img[0..8192], c);
+    assert s.status == SW_FAILED;
+}
+
+test "a_report_the_log_cannot_take_changes_nothing" {
+    var img : [8192]u8 = undefined;
+    var s : Swarm = three_members();
+    var c : Cur = swarm_start(&s, img[0..8192], cur_new());
+    assert swarm_begin(&s, 0);
+    var a0 : Agent = done_agent(11, 4, "alpha");
+    // a cursor parked at the end of the image: the row does not fit
+    const full : Cur = Cur { ok: true, len: 8190, seq: c.seq };
+    const r : Cur = swarm_report(&s, 0, &a0, img[0..8192], full);
+    assert r.len == 8190;
+    assert r.seq == c.seq;
+    assert s.member_status[0] == AG_RUNNING;
+    assert s.running == 0;
+    assert s.tokens_used == 0;
+}
+
+test "the_swarm_status_numbers_are_the_agent_status_numbers" {
+    assert SW_NEW == AG_NEW;
+    assert SW_RUNNING == AG_RUNNING;
+    assert SW_DONE == AG_DONE;
+    assert SW_FAILED == AG_FAILED;
+    assert SW_CANCELLED == AG_CANCELLED;
+}
+
+test "a_short_buffer_gets_no_aggregate_not_a_clipped_one" {
+    var small : [1024]u8 = undefined;
+    var s : Swarm = three_members();
+    assert swarm_aggregate(&s, small[0..1024]) == 0;
+}
+
+test "swarm_error_labels_name_each_code_and_fall_back_to_the_agent_labels" {
+    assert swarm_error_label(SE_SPAWN_DENIED).len == 12;
+    assert swarm_error_label(SE_MEMBER_FAILED).len == 13;
+    assert swarm_error_label(SE_DEP_FAILED).len == 10;
+    assert swarm_error_label(AE_CANCELLED).len == 9;
+    assert swarm_error_label(SE_NONE).len == 4;
+}
