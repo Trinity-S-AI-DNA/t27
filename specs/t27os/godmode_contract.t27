@@ -1,0 +1,637 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/godmode_contract.t27 -- the GODMODE v1 task contract: one struct, one validator, stable diagnostics.
+; A task is the whole request to run one allowlisted local command in an isolated worktree under a supervised PTY and
+; to get back a validated report. The contract is checked BEFORE anything runs; a task that fails is never started.
+; gm_validate returns the FIRST failing code in numeric order E001..E028, else GM_OK. The order and the numbers are
+; part of the contract (stable diagnostics, never renumber): a journal row or a test that says GM-E014 means the same
+; thing for ever. Policy lives in godmode_policy.t27; this module only applies it to a task. The failure classes and
+; gm_class_bit come from the sibling godmode_run.t27 (written in parallel; the names and values are trusted here).
+; Pure module, no @extern. Lists are newline-separated text, one entry per line; an empty text is an empty list.
+; Worktree root: the house rule is that every t27 worktree lives under `.claude/worktrees/`. The owner's draft said
+; `.worktrees/godmode-001`; the house rule wins and that draft path is refused (GM-E006).
+; token_budget 0 is VALID: a shell executor spends no model tokens, so there is nothing to cap.
+; The `.` entry (the whole tree) is accepted in read_paths only; in a write, create, delete or forbidden list it is a
+; bad entry (GM-E013), because it would open or close the entire repository in one line.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osGodmodeContract;
+
+use t27os::godmode_policy::AM_DENY_DANGEROUS;
+use t27os::godmode_policy::CV_ALLOW;
+use t27os::godmode_policy::gm_path_syntax_ok;
+use t27os::godmode_policy::gm_list_entries_ok;
+use t27os::godmode_policy::gm_list_hits_forbidden;
+use t27os::godmode_policy::gm_list_all_writable;
+use t27os::godmode_policy::gm_effective_approval;
+use t27os::godmode_policy::gm_command_verdict;
+use t27os::godmode_policy::gm_script_lines_verdict;
+use t27os::godmode_run::FC_NONE;
+use t27os::godmode_run::FC_EXIT_NONZERO;
+use t27os::godmode_run::FC_TEST_FAILED;
+use t27os::godmode_run::FC_TIMEOUT;
+use t27os::godmode_run::FC_TRANSIENT;
+use t27os::godmode_run::FC_CANCELLED;
+use t27os::godmode_run::FC_POLICY;
+use t27os::godmode_run::FC_INTERNAL;
+use t27os::godmode_run::gm_class_bit;
+
+; --- 1. codes and caps --------------------------------------------------------------------------------------------
+
+/// env_policy: only a minimal environment is accepted; inheriting would leak secrets into the child.
+pub const ENV_MINIMAL : u8 = 1;
+pub const STDIN_CLOSED : u8 = 1;
+pub const OUT_CAPTURE : u8 = 1;
+pub const OUT_DISCARD : u8 = 2;
+pub const NET_DENIED : u8 = 1;
+/// Refused in v1 (GM-E018).
+pub const NET_ALLOWED : u8 = 2;
+pub const CP_EACH_STEP : u8 = 1;
+pub const CP_END_ONLY : u8 = 2;
+
+pub const GM_MAX_RETRIES : u32 = 3;
+pub const GM_MAX_TIME_SECONDS : u32 = 3600;
+pub const GM_TASK_ID_MAX : u32 = 64;
+pub const GM_WORKTREE_ROOT : []const u8 = ".claude/worktrees/";
+
+/// Diagnostic codes. Stable, never renumber.
+pub const GM_OK : u16 = 0;
+pub const E001 : u16 = 1;
+pub const E002 : u16 = 2;
+pub const E003 : u16 = 3;
+pub const E004 : u16 = 4;
+pub const E005 : u16 = 5;
+pub const E006 : u16 = 6;
+pub const E007 : u16 = 7;
+pub const E008 : u16 = 8;
+pub const E009 : u16 = 9;
+pub const E010 : u16 = 10;
+pub const E011 : u16 = 11;
+pub const E012 : u16 = 12;
+pub const E013 : u16 = 13;
+pub const E014 : u16 = 14;
+pub const E015 : u16 = 15;
+pub const E016 : u16 = 16;
+pub const E017 : u16 = 17;
+pub const E018 : u16 = 18;
+pub const E019 : u16 = 19;
+pub const E020 : u16 = 20;
+pub const E021 : u16 = 21;
+pub const E022 : u16 = 22;
+pub const E023 : u16 = 23;
+pub const E024 : u16 = 24;
+pub const E025 : u16 = 25;
+pub const E026 : u16 = 26;
+pub const E027 : u16 = 27;
+pub const E028 : u16 = 28;
+
+; --- 2. the task ----------------------------------------------------------------------------------------------------
+
+/// One GODMODE task. Flat on purpose: no nested structs, so a host can fill it field by field.
+pub struct GmTask {
+    task_id: []const u8,
+    objective: []const u8,
+    repository: []const u8,
+    base_branch: []const u8,
+    worktree_path: []const u8,
+    exec_command: []const u8,
+    exec_args: []const u8,
+    env_policy: u8,
+    working_directory: []const u8,
+    stdin_policy: u8,
+    stdout_policy: u8,
+    stderr_policy: u8,
+    read_paths: []const u8,
+    write_paths: []const u8,
+    create_paths: []const u8,
+    delete_paths: []const u8,
+    forbidden_paths: []const u8,
+    allowed_tools: []const u8,
+    approval_mode: u8,
+    cpu_seconds: u32,
+    memory_mb: u32,
+    disk_mb: u32,
+    network: u8,
+    checkpoint_policy: u8,
+    retryable_mask: u32,
+    acceptance_commands: []const u8,
+    artifact_manifest: []const u8,
+    rollback_procedure: []const u8,
+    max_retries: u32,
+    time_budget_seconds: u32,
+    token_budget: u32,
+}
+
+; --- 3. helpers (private) ---------------------------------------------------------------------------------------
+
+/// Is the id made only of A-Z a-z 0-9 - _ and no longer than GM_TASK_ID_MAX? (The caller has checked it is not empty.)
+fn id_chars_ok(id: []const u8) -> bool {
+    if (id.len > GM_TASK_ID_MAX) { return false; }
+    var i : usize = 0;
+    while (i < id.len) {
+        const c : u8 = id[i];
+        const ok : bool = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45 or c == 95;
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Is the worktree path safe, under GM_WORKTREE_ROOT, with a non-empty name after the root? Case-sensitive on purpose.
+fn worktree_ok(p: []const u8) -> bool {
+    if (p.len == 0 or gm_path_syntax_ok(p) == false) { return false; }
+    if (p.len <= GM_WORKTREE_ROOT.len) { return false; }
+    var i : usize = 0;
+    while (i < GM_WORKTREE_ROOT.len) {
+        if (p[i] != GM_WORKTREE_ROOT[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The failure classes a retry may follow. Cancel, policy, internal and none are never retried.
+fn retryable_allowed() -> u32 {
+    return gm_class_bit(FC_EXIT_NONZERO) | gm_class_bit(FC_TEST_FAILED) | gm_class_bit(FC_TIMEOUT) | gm_class_bit(FC_TRANSIENT);
+}
+
+fn out_ok(p: u8) -> bool {
+    return p == OUT_CAPTURE or p == OUT_DISCARD;
+}
+
+/// Does any of the five path lists carry a bad entry? Only read_paths may use `.`.
+fn lists_bad(t: GmTask) -> bool {
+    if (gm_list_entries_ok(t.read_paths, true) == false) { return true; }
+    if (gm_list_entries_ok(t.write_paths, false) == false) { return true; }
+    if (gm_list_entries_ok(t.create_paths, false) == false) { return true; }
+    if (gm_list_entries_ok(t.delete_paths, false) == false) { return true; }
+    return gm_list_entries_ok(t.forbidden_paths, false) == false;
+}
+
+; --- 4. the validator ---------------------------------------------------------------------------------------------
+
+/// The executor command verdict (a gm_command_verdict number). The host journals approval.requested then
+/// approval.denied when gm_approval_needed(verdict) holds.
+pub fn gm_executor_verdict(t: GmTask) -> u8 {
+    return gm_command_verdict(t.exec_command, t.exec_args, t.allowed_tools, t.approval_mode);
+}
+
+/// The first failing diagnostic in numeric order E001..E028, else GM_OK. The order is part of the contract.
+pub fn gm_validate(t: GmTask) -> u16 {
+    if (t.task_id.len == 0) { return E001; }
+    if (id_chars_ok(t.task_id) == false) { return E002; }
+    if (t.objective.len == 0) { return E003; }
+    if (t.repository.len == 0) { return E004; }
+    if (t.base_branch.len == 0) { return E005; }
+    if (worktree_ok(t.worktree_path) == false) { return E006; }
+    if (t.exec_command.len == 0) { return E007; }
+    if (t.env_policy != ENV_MINIMAL) { return E008; }
+    if (t.stdin_policy != STDIN_CLOSED) { return E009; }
+    if (out_ok(t.stdout_policy) == false or out_ok(t.stderr_policy) == false) { return E010; }
+    if (t.working_directory.len > 0 and gm_path_syntax_ok(t.working_directory) == false) { return E011; }
+    if (t.write_paths.len == 0 and t.create_paths.len == 0) { return E012; }
+    if (lists_bad(t)) { return E013; }
+    if (gm_list_hits_forbidden(t.write_paths, t.forbidden_paths) or gm_list_hits_forbidden(t.create_paths, t.forbidden_paths) or gm_list_hits_forbidden(t.delete_paths, t.forbidden_paths)) { return E014; }
+    if (gm_list_all_writable(t.artifact_manifest, t.write_paths, t.create_paths, t.forbidden_paths) == false) { return E015; }
+    if (gm_effective_approval(t.approval_mode) != AM_DENY_DANGEROUS) { return E016; }
+    if (t.cpu_seconds == 0 or t.memory_mb == 0 or t.disk_mb == 0) { return E017; }
+    if (t.network != NET_DENIED) { return E018; }
+    if (t.checkpoint_policy != CP_EACH_STEP and t.checkpoint_policy != CP_END_ONLY) { return E019; }
+    if ((t.retryable_mask | retryable_allowed()) != retryable_allowed()) { return E020; }
+    if (t.acceptance_commands.len == 0) { return E021; }
+    if (t.artifact_manifest.len == 0) { return E022; }
+    if (t.rollback_procedure.len == 0) { return E023; }
+    if (t.max_retries > GM_MAX_RETRIES) { return E024; }
+    if (t.time_budget_seconds == 0) { return E025; }
+    if (t.time_budget_seconds > GM_MAX_TIME_SECONDS) { return E026; }
+    if (gm_executor_verdict(t) != CV_ALLOW) { return E027; }
+    if (gm_script_lines_verdict(t.acceptance_commands, t.allowed_tools, t.approval_mode) != CV_ALLOW) { return E028; }
+    return GM_OK;
+}
+
+; --- 5. diagnostic names and texts ----------------------------------------------------------------------------
+
+/// The journal name of a code: GM-OK, GM-E001 .. GM-E028, GM-E??? for an unknown code.
+pub fn gm_diag_name(code: u16) -> []const u8 {
+    if (code == GM_OK) { return "GM-OK"; }
+    if (code == E001) { return "GM-E001"; }
+    if (code == E002) { return "GM-E002"; }
+    if (code == E003) { return "GM-E003"; }
+    if (code == E004) { return "GM-E004"; }
+    if (code == E005) { return "GM-E005"; }
+    if (code == E006) { return "GM-E006"; }
+    if (code == E007) { return "GM-E007"; }
+    if (code == E008) { return "GM-E008"; }
+    if (code == E009) { return "GM-E009"; }
+    if (code == E010) { return "GM-E010"; }
+    if (code == E011) { return "GM-E011"; }
+    if (code == E012) { return "GM-E012"; }
+    if (code == E013) { return "GM-E013"; }
+    if (code == E014) { return "GM-E014"; }
+    if (code == E015) { return "GM-E015"; }
+    if (code == E016) { return "GM-E016"; }
+    if (code == E017) { return "GM-E017"; }
+    if (code == E018) { return "GM-E018"; }
+    if (code == E019) { return "GM-E019"; }
+    if (code == E020) { return "GM-E020"; }
+    if (code == E021) { return "GM-E021"; }
+    if (code == E022) { return "GM-E022"; }
+    if (code == E023) { return "GM-E023"; }
+    if (code == E024) { return "GM-E024"; }
+    if (code == E025) { return "GM-E025"; }
+    if (code == E026) { return "GM-E026"; }
+    if (code == E027) { return "GM-E027"; }
+    if (code == E028) { return "GM-E028"; }
+    return "GM-E???";
+}
+
+/// A short English reason for a code.
+pub fn gm_diag_text(code: u16) -> []const u8 {
+    if (code == GM_OK) { return "task is valid"; }
+    if (code == E001) { return "task_id is missing"; }
+    if (code == E002) { return "task_id may hold only A-Z a-z 0-9 - _ and at most 64 characters"; }
+    if (code == E003) { return "objective is missing"; }
+    if (code == E004) { return "repository is missing"; }
+    if (code == E005) { return "base_branch is missing"; }
+    if (code == E006) { return "worktree_path is missing, unsafe, or not under .claude/worktrees/ with a name"; }
+    if (code == E007) { return "exec_command is missing"; }
+    if (code == E008) { return "env_policy must be minimal"; }
+    if (code == E009) { return "stdin must be closed"; }
+    if (code == E010) { return "stdout and stderr must be capture or discard"; }
+    if (code == E011) { return "working_directory is not a safe relative path"; }
+    if (code == E012) { return "no write or create paths, so artifacts have no place"; }
+    if (code == E013) { return "a path list has a bad entry"; }
+    if (code == E014) { return "a write, create or delete entry is under a forbidden path"; }
+    if (code == E015) { return "an artifact is not covered by write or create paths, or is forbidden"; }
+    if (code == E016) { return "approval_mode must be deny-dangerous"; }
+    if (code == E017) { return "cpu_seconds, memory_mb and disk_mb must be above 0"; }
+    if (code == E018) { return "network must be denied in v1"; }
+    if (code == E019) { return "checkpoint_policy must be each-step or end-only"; }
+    if (code == E020) { return "retryable_mask has a class that is never retried"; }
+    if (code == E021) { return "no acceptance commands"; }
+    if (code == E022) { return "no artifact manifest"; }
+    if (code == E023) { return "no rollback procedure"; }
+    if (code == E024) { return "max_retries is over the cap of 3"; }
+    if (code == E025) { return "time budget must be above 0"; }
+    if (code == E026) { return "time budget is over 3600 seconds"; }
+    if (code == E027) { return "the executor command is refused by the command policy"; }
+    if (code == E028) { return "an acceptance command is refused by the command policy"; }
+    return "unknown diagnostic code";
+}
+
+; --- 6. the reference task ------------------------------------------------------------------------------------
+
+/// The reference task. The owner's draft printed `ok`, but its acceptance tests build/report.json, so the command
+/// must write that file or the gate can never pass; this one writes it. The script text has a backslash and an n
+/// inside the printf quotes (printf turns it into a newline), not a real newline: argv is newline-separated.
+pub fn gm_task_godmode_001() -> GmTask {
+    return GmTask {
+        task_id: "GODMODE-001",
+        objective: "Run one allowlisted local validation command",
+        repository: ".",
+        base_branch: "current",
+        worktree_path: ".claude/worktrees/godmode-001",
+        exec_command: "bash",
+        exec_args: "-lc\nmkdir -p build && printf '{\"ok\":true}\\n' > build/report.json",
+        env_policy: ENV_MINIMAL,
+        working_directory: "",
+        stdin_policy: STDIN_CLOSED,
+        stdout_policy: OUT_CAPTURE,
+        stderr_policy: OUT_CAPTURE,
+        read_paths: ".",
+        write_paths: "build",
+        create_paths: "build",
+        delete_paths: "",
+        forbidden_paths: "specs\ngen\ncli\n.github\nbootstrap",
+        allowed_tools: "bash\nmkdir\nprintf\ntest",
+        approval_mode: AM_DENY_DANGEROUS,
+        cpu_seconds: 30,
+        memory_mb: 512,
+        disk_mb: 64,
+        network: NET_DENIED,
+        checkpoint_policy: CP_EACH_STEP,
+        retryable_mask: gm_class_bit(FC_TIMEOUT) | gm_class_bit(FC_TRANSIENT),
+        acceptance_commands: "test -f build/report.json",
+        artifact_manifest: "build/report.json",
+        rollback_procedure: "remove worktree and restore base branch",
+        max_retries: 3,
+        time_budget_seconds: 120,
+        token_budget: 0,
+    };
+}
+
+; --- 7. tests -----------------------------------------------------------------------------------------------------
+
+test reference_task_validates {
+    assert gm_validate(gm_task_godmode_001()) == GM_OK;
+}
+
+test reference_executor_is_allowed {
+    assert gm_executor_verdict(gm_task_godmode_001()) == CV_ALLOW;
+}
+
+test e001_missing_task_id {
+    var t : GmTask = gm_task_godmode_001();
+    t.task_id = "";
+    assert gm_validate(t) == E001;
+}
+
+test e002_bad_task_id {
+    var t : GmTask = gm_task_godmode_001();
+    t.task_id = "bad id";
+    assert gm_validate(t) == E002;
+    t.task_id = "a/b";
+    assert gm_validate(t) == E002;
+    t.task_id = "x123456789012345678901234567890123456789012345678901234567890123456789";
+    assert gm_validate(t) == E002;
+    t.task_id = "ok_id-9";
+    assert gm_validate(t) == GM_OK;
+}
+
+test e003_missing_objective {
+    var t : GmTask = gm_task_godmode_001();
+    t.objective = "";
+    assert gm_validate(t) == E003;
+}
+
+test e004_missing_repository {
+    var t : GmTask = gm_task_godmode_001();
+    t.repository = "";
+    assert gm_validate(t) == E004;
+}
+
+test e005_missing_base_branch {
+    var t : GmTask = gm_task_godmode_001();
+    t.base_branch = "";
+    assert gm_validate(t) == E005;
+}
+
+test e006_bad_worktree_path {
+    var t : GmTask = gm_task_godmode_001();
+    t.worktree_path = "";
+    assert gm_validate(t) == E006;
+    t.worktree_path = ".worktrees/godmode-001";
+    assert gm_validate(t) == E006;
+    t.worktree_path = ".claude/worktrees/";
+    assert gm_validate(t) == E006;
+    t.worktree_path = ".claude/worktrees/../x";
+    assert gm_validate(t) == E006;
+    t.worktree_path = "/Users/me/.claude/worktrees/a";
+    assert gm_validate(t) == E006;
+    t.worktree_path = ".claude/worktrees/a";
+    assert gm_validate(t) == GM_OK;
+}
+
+test e007_missing_exec_command {
+    var t : GmTask = gm_task_godmode_001();
+    t.exec_command = "";
+    assert gm_validate(t) == E007;
+}
+
+test e008_env_not_minimal {
+    var t : GmTask = gm_task_godmode_001();
+    t.env_policy = 0;
+    assert gm_validate(t) == E008;
+    t.env_policy = 2;
+    assert gm_validate(t) == E008;
+}
+
+test e009_stdin_not_closed {
+    var t : GmTask = gm_task_godmode_001();
+    t.stdin_policy = 0;
+    assert gm_validate(t) == E009;
+}
+
+test e010_bad_output_policy {
+    var t : GmTask = gm_task_godmode_001();
+    t.stdout_policy = 3;
+    assert gm_validate(t) == E010;
+    var u : GmTask = gm_task_godmode_001();
+    u.stderr_policy = 0;
+    assert gm_validate(u) == E010;
+    u.stderr_policy = OUT_DISCARD;
+    assert gm_validate(u) == GM_OK;
+}
+
+test e011_bad_working_directory {
+    var t : GmTask = gm_task_godmode_001();
+    t.working_directory = "../x";
+    assert gm_validate(t) == E011;
+    t.working_directory = "/tmp";
+    assert gm_validate(t) == E011;
+    t.working_directory = "build";
+    assert gm_validate(t) == GM_OK;
+}
+
+test e012_no_write_or_create_paths {
+    var t : GmTask = gm_task_godmode_001();
+    t.write_paths = "";
+    t.create_paths = "";
+    assert gm_validate(t) == E012;
+    t.create_paths = "build";
+    assert gm_validate(t) == GM_OK;
+}
+
+test e013_bad_path_list_entry {
+    var t : GmTask = gm_task_godmode_001();
+    t.read_paths = "a//b";
+    assert gm_validate(t) == E013;
+    var u : GmTask = gm_task_godmode_001();
+    u.write_paths = "build\n\nother";
+    assert gm_validate(u) == E013;
+    var v : GmTask = gm_task_godmode_001();
+    v.delete_paths = "../x";
+    assert gm_validate(v) == E013;
+    var w : GmTask = gm_task_godmode_001();
+    w.write_paths = ".";
+    assert gm_validate(w) == E013;
+    var x : GmTask = gm_task_godmode_001();
+    x.forbidden_paths = "/etc";
+    assert gm_validate(x) == E013;
+}
+
+test e014_write_entry_under_forbidden {
+    var t : GmTask = gm_task_godmode_001();
+    t.write_paths = ".git/hooks";
+    assert gm_validate(t) == E014;
+    var u : GmTask = gm_task_godmode_001();
+    u.create_paths = "specs/new";
+    assert gm_validate(u) == E014;
+    var v : GmTask = gm_task_godmode_001();
+    v.delete_paths = ".claude/x";
+    assert gm_validate(v) == E014;
+}
+
+test e015_artifact_not_writable {
+    var t : GmTask = gm_task_godmode_001();
+    t.artifact_manifest = "other/report.json";
+    assert gm_validate(t) == E015;
+    var u : GmTask = gm_task_godmode_001();
+    u.forbidden_paths = "build/secret";
+    u.artifact_manifest = "build/secret/r.json";
+    assert gm_validate(u) == E015;
+    var v : GmTask = gm_task_godmode_001();
+    v.artifact_manifest = "build/report.json\nbuild/second.json";
+    assert gm_validate(v) == GM_OK;
+}
+
+test e016_bad_approval_mode {
+    var t : GmTask = gm_task_godmode_001();
+    t.approval_mode = 9;
+    assert gm_validate(t) == E016;
+    t.approval_mode = 0;
+    assert gm_validate(t) == GM_OK;
+}
+
+test e017_zero_resource_limit {
+    var t : GmTask = gm_task_godmode_001();
+    t.cpu_seconds = 0;
+    assert gm_validate(t) == E017;
+    var u : GmTask = gm_task_godmode_001();
+    u.memory_mb = 0;
+    assert gm_validate(u) == E017;
+    var v : GmTask = gm_task_godmode_001();
+    v.disk_mb = 0;
+    assert gm_validate(v) == E017;
+}
+
+test e018_network_allowed_is_refused {
+    var t : GmTask = gm_task_godmode_001();
+    t.network = NET_ALLOWED;
+    assert gm_validate(t) == E018;
+    t.network = 0;
+    assert gm_validate(t) == E018;
+}
+
+test e019_bad_checkpoint_policy {
+    var t : GmTask = gm_task_godmode_001();
+    t.checkpoint_policy = 0;
+    assert gm_validate(t) == E019;
+    t.checkpoint_policy = CP_END_ONLY;
+    assert gm_validate(t) == GM_OK;
+}
+
+test e020_retryable_policy_bit_refused {
+    var t : GmTask = gm_task_godmode_001();
+    t.retryable_mask = gm_class_bit(FC_POLICY);
+    assert gm_validate(t) == E020;
+    t.retryable_mask = gm_class_bit(FC_CANCELLED);
+    assert gm_validate(t) == E020;
+    t.retryable_mask = gm_class_bit(FC_INTERNAL);
+    assert gm_validate(t) == E020;
+    t.retryable_mask = gm_class_bit(FC_NONE);
+    assert gm_validate(t) == E020;
+    t.retryable_mask = gm_class_bit(FC_EXIT_NONZERO) | gm_class_bit(FC_TEST_FAILED);
+    assert gm_validate(t) == GM_OK;
+    t.retryable_mask = 0;
+    assert gm_validate(t) == GM_OK;
+}
+
+test e021_no_acceptance_commands {
+    var t : GmTask = gm_task_godmode_001();
+    t.acceptance_commands = "";
+    assert gm_validate(t) == E021;
+}
+
+test e022_no_artifact_manifest {
+    var t : GmTask = gm_task_godmode_001();
+    t.artifact_manifest = "";
+    assert gm_validate(t) == E022;
+}
+
+test e023_no_rollback_procedure {
+    var t : GmTask = gm_task_godmode_001();
+    t.rollback_procedure = "";
+    assert gm_validate(t) == E023;
+}
+
+test e024_max_retries_over_cap {
+    var t : GmTask = gm_task_godmode_001();
+    t.max_retries = 4;
+    assert gm_validate(t) == E024;
+    t.max_retries = 3;
+    assert gm_validate(t) == GM_OK;
+    t.max_retries = 0;
+    assert gm_validate(t) == GM_OK;
+}
+
+test e025_time_budget_zero {
+    var t : GmTask = gm_task_godmode_001();
+    t.time_budget_seconds = 0;
+    assert gm_validate(t) == E025;
+}
+
+test e026_time_budget_over_cap {
+    var t : GmTask = gm_task_godmode_001();
+    t.time_budget_seconds = 3601;
+    assert gm_validate(t) == E026;
+    t.time_budget_seconds = 3600;
+    assert gm_validate(t) == GM_OK;
+}
+
+test e027_executor_refused {
+    var t : GmTask = gm_task_godmode_001();
+    t.exec_command = "ls";
+    assert gm_validate(t) == E027;
+    assert gm_executor_verdict(t) != CV_ALLOW;
+    var u : GmTask = gm_task_godmode_001();
+    u.exec_command = "bash";
+    u.exec_args = "script.sh";
+    assert gm_validate(u) == E027;
+    var v : GmTask = gm_task_godmode_001();
+    v.exec_args = "-c\nrm -rf build";
+    v.allowed_tools = "bash\nrm\ntest";
+    assert gm_validate(v) == E027;
+}
+
+test e028_acceptance_line_refused {
+    var t : GmTask = gm_task_godmode_001();
+    t.acceptance_commands = "rm -f x";
+    assert gm_validate(t) == E028;
+    var u : GmTask = gm_task_godmode_001();
+    u.acceptance_commands = "test -f build/report.json\nls";
+    assert gm_validate(u) == E028;
+    var v : GmTask = gm_task_godmode_001();
+    v.acceptance_commands = "test -f build/report.json\n\ntest -d build";
+    assert gm_validate(v) == E028;
+}
+
+test order_reports_the_earlier_code {
+    var t : GmTask = gm_task_godmode_001();
+    t.rollback_procedure = "";
+    t.objective = "";
+    assert gm_validate(t) == E003;
+    var u : GmTask = gm_task_godmode_001();
+    u.time_budget_seconds = 0;
+    u.max_retries = 9;
+    assert gm_validate(u) == E024;
+}
+
+test diag_names_are_stable {
+    assert gm_diag_name(GM_OK) == "GM-OK";
+    assert gm_diag_name(E001) == "GM-E001";
+    assert gm_diag_name(E014) == "GM-E014";
+    assert gm_diag_name(E028) == "GM-E028";
+    assert gm_diag_name(29) == "GM-E???";
+    assert gm_diag_name(999) == "GM-E???";
+}
+
+test diag_texts_exist {
+    assert gm_diag_text(GM_OK).len > 0;
+    assert gm_diag_text(E001).len > 0;
+    assert gm_diag_text(E028).len > 0;
+    assert gm_diag_text(500).len > 0;
+}
+
+test token_budget_zero_is_valid {
+    var t : GmTask = gm_task_godmode_001();
+    assert t.token_budget == 0;
+    assert gm_validate(t) == GM_OK;
+    t.token_budget = 100000;
+    assert gm_validate(t) == GM_OK;
+}
+
+test code_numbers_never_move {
+    assert GM_OK == 0 and E001 == 1 and E010 == 10 and E020 == 20 and E028 == 28;
+    assert ENV_MINIMAL == 1 and STDIN_CLOSED == 1 and OUT_CAPTURE == 1 and OUT_DISCARD == 2;
+    assert NET_DENIED == 1 and NET_ALLOWED == 2 and CP_EACH_STEP == 1 and CP_END_ONLY == 2;
+    assert GM_MAX_RETRIES == 3 and GM_MAX_TIME_SECONDS == 3600 and GM_TASK_ID_MAX == 64;
+}
