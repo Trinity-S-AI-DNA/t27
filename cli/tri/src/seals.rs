@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[allow(dead_code, unused_parens)]
 pub use crate::seals_rules::*;
-
 #[path = "../../../gen/rust/tri/seals/drift.rs"] #[allow(dead_code, unused_parens)] mod drift; // t27c gen-rust of specs/tri/seals/drift.t27 (#11045)
 #[path = "../../../gen/rust/tri/seals/merge_driver.rs"] #[allow(dead_code, unused_parens)] mod merge_driver; // t27c gen-rust of specs/tri/seals/merge_driver.t27 (#11402)
 #[path = "../../../bootstrap/gen/rust/verified/suite_jobs.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] mod suite_jobs; // specs/verified/suite_jobs.t27

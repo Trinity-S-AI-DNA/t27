@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code, unused_parens)]
 pub use crate::piddir_rules::*;
 
-
 /// A file or directory that is removed when this guard drops -- on return and
 /// on unwind alike.
 pub struct PidPath {

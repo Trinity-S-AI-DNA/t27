@@ -6,7 +6,6 @@ use std::process::Command;
 #[allow(dead_code, unused_parens)]
 pub use crate::red_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum RedCmd {
     /// Show workflows whose most recent run on the default branch failed.

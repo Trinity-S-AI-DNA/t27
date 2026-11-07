@@ -79,7 +79,7 @@ mod pf; // t27c gen-rust of specs/tri/preflight/preflight.t27: the push prefligh
 #[path = "../../../gen/rust/tools/t27o/zig_convert.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, unused_assignments, clippy::all)] mod zig; // t27c gen-rust of specs/tools/t27o/zig_convert.t27: the Zig front end of `tri t27o` (#10765)
 #[path = "../../../gen/rust/tri/renum/renum.rs"] #[allow(dead_code, unused_parens)] mod renum_rules; mod renum; // t27c gen-rust + thin I/O glue
 mod reseal;
-mod rtl;
+#[path = "../../../gen/rust/tri/rtl/rtl.rs"] #[allow(dead_code, unused_parens)] mod rtl_rules; mod rtl; // t27c gen-rust + thin I/O glue
 mod scratch;
 #[path = "../../../gen/rust/tri/seals/seals.rs"] #[allow(dead_code, unused_parens)] mod seals_rules; mod seals; // t27c gen-rust + thin I/O glue
 mod skillnum;

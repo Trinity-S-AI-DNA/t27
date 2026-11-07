@@ -5,7 +5,6 @@ use std::process::Command;
 
 #[allow(dead_code, unused_parens)]
 pub use crate::sweep_rules::*;
-
 #[derive(Subcommand)]
 pub enum SweepCmd {
     /// Synthesise a top across values of one parameter and report the trend.

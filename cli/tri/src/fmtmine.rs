@@ -6,7 +6,6 @@ use std::process::Command;
 #[allow(dead_code, unused_parens)]
 pub use crate::fmtmine_rules::*;
 
-
 /// Files the formatter dirtied that were clean when it started.
 ///
 /// Set subtraction, not string work: `after` and `before` come from the same

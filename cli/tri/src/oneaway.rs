@@ -7,7 +7,6 @@ use std::process::Command;
 #[allow(dead_code, unused_parens)]
 pub use crate::oneaway_rules::*;
 
-
 #[derive(Parser, Debug)]
 /// Failing specs whose generated Rust has exactly ONE rustc error, by class.
 ///

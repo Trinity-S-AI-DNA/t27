@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[allow(dead_code, unused_parens)]
 pub use crate::discard_rules::*;
-
 #[derive(Subcommand)]
 pub enum DiscardCmd {
     /// Rank the discarding specs, largest first, against the pinned volume.

@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code, unused_parens)]
 pub use crate::prose_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum ProseCmd {
     /// Which specs are blocked only by prose, and how many lines that is.

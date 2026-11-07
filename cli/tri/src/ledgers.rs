@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code, unused_parens)]
 pub use crate::ledgers_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum LedgersCmd {
     /// Plant a stale entry in each ledger and demand its gate fail.

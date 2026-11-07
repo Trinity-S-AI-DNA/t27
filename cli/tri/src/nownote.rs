@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code, unused_parens)]
 pub use crate::nownote_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum NowCmd {
     /// Write a docs/now/ entry: title, bullets, optional issue ref.

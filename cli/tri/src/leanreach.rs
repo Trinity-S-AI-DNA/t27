@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code, unused_parens)]
 pub use crate::leanreach_rules::*;
 
-
 /// One proof file, as the tree holds it.
 pub struct LeanFile {
     pub module: String,

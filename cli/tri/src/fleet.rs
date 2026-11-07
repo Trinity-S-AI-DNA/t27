@@ -6,7 +6,6 @@ use std::process::Command;
 #[allow(dead_code, unused_parens)]
 pub use crate::fleet_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum FleetCmd {
     /// Scan the USB bus and say plainly what hardware is present.

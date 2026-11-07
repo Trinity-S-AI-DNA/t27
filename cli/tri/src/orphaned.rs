@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code, unused_parens)]
 pub use crate::orphaned_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum OrphanedCmd {
     /// List gate and tool sources that name an input which is not in the tree.

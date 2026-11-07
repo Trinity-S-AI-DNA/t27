@@ -7,7 +7,6 @@ use std::process::Command;
 #[allow(dead_code, unused_parens)]
 pub use crate::jumps_rules::*;
 
-
 /// The dead lowerings, and what each one was written as.
 const NO_OPS: &[(&str, &str)] = &[("disable fork;", "break"), ("/* continue */;", "continue")];
 

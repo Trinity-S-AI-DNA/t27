@@ -7,7 +7,6 @@ use std::process::Command;
 /// `base` plus an append.
 #[allow(dead_code, unused_parens)]
 pub use crate::renum_rules::*;
-
 pub fn appended_tail<'a>(base: &str, mine: &'a str) -> Option<&'a str> {
     // Trailing-newline differences are not an edit. Compare on the trimmed
     // prefix and hand back everything after it.

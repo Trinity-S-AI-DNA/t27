@@ -5,7 +5,6 @@ use std::path::PathBuf;
 #[allow(dead_code, unused_parens)]
 pub use crate::leanvac_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum LeanCmd {
     /// Completeness theorems whose model has no functions.

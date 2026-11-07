@@ -5,7 +5,6 @@ use std::process::Command;
 
 #[allow(dead_code, unused_parens)]
 pub use crate::synth_rules::*;
-
 #[derive(Subcommand)]
 pub enum SynthCmd {
     /// Synthesise a top module and report LUT/DSP/FF/CARRY4 counts.

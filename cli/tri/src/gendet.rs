@@ -7,7 +7,6 @@ use std::process::Command;
 #[allow(dead_code, unused_parens)]
 pub use crate::gendet_rules::*;
 
-
 /// The emitters, in the order the corpus table prints them.
 const BACKENDS: &[(&str, &str)] = &[
     ("gen-c", "C"),

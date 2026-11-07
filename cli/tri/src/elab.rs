@@ -7,7 +7,6 @@ use std::process::Command;
 #[allow(dead_code, unused_parens)]
 pub use crate::elab_rules::*;
 
-
 #[derive(Subcommand)]
 pub enum ElabCmd {
     /// Distribution of elaboration diagnostics by message shape.

@@ -1,27 +1,10 @@
-//! `tri rtl` — the structural check t27.ai offers, run locally.
-//!
-//! This is the same five checks the reusable workflow performs
-//! (`gHashTag/trinity .github/workflows/rtl-check.yml`), in one command, so a
-//! design can be checked without pushing anything and a CI number can be
-//! reproduced on demand.
-//!
-//! Two things it does that the hand-typed yosys invocation kept getting wrong:
-//!
-//! 1. **It names the instrument.** The cell count depends on which yosys ran.
-//!    Measured on one design with this exact script, 0.33 reports 45 cells
-//!    where 0.65 reports 49 — while wires and flip-flops agree exactly. A cell
-//!    count without its version is not reproducible, so the version is printed
-//!    beside it rather than left in the shell history.
-//!
-//! 2. **It counts its own verdicts.** Five checks must emit five lines. A
-//!    check that silently does not run looks exactly like one that passed, and
-//!    that has happened here before — so the count is asserted, not assumed.
-
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[allow(dead_code, unused_parens)]
+pub use crate::rtl_rules::*;
 #[derive(Subcommand)]
 pub enum RtlCmd {
     /// Run the five structural checks on a design directory.
@@ -345,6 +328,8 @@ fn check(dir: &Path, top: Option<&str>, json: bool, expect_flops: Option<u64>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+#[allow(dead_code, unused_parens)]
+pub use crate::rtl_rules::*;
 
     // Checked against real yosys output in BOTH field orders, because an
     // earlier version of this counter was checked against fixtures typed out
