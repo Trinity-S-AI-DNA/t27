@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/still_text_main.t27 -- a text view of a T27F still: a t27b program that reads one P6 file
+; on standard input and writes its pixels as characters, one character per cell of step x step pixels.
+; WHY. A still is checked by eye before it is published, and an agent whose session cannot carry an
+; image block has no eye. This view is that eye in text: the pixels of the file itself, read back from
+; the bytes the renderer wrote, so the glyphs can be read row by row.
+; WHAT IT WRITES. One line "ppm W x H step S cols C rows R mixed_cells M", then R rows of C characters.
+; A cell shows the top-left pixel of its block by luminance (77 R + 150 G + 29 B) / 256:
+; 192 and over '#', 96 and over '+', 48 and over ':', else '.'. mixed_cells counts the blocks whose
+; pixels are not all equal to that top-left pixel; an exact nearest-neighbour upscale by S gives 0.
+; The step is the smallest that keeps C at or under COLS_MAX.
+; NOT CLAIMED. That the text view equals what a browser shows for a PNG made from the file: a PNG
+; converter sits between them, and its output is checked by decoding it back, not here.
+; Not read: comments in the header ('#'), a maxval other than 255, files over IN_CAP bytes.
+; Exit codes: 0 written, 2 the header or the data length is wrong, 3 a short write, 4 the input is
+; IN_CAP bytes or more.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_still_text_main;
+
+use tri::t27b::macho::put_bytes;
+use tri::t27b::macho::put_dec;
+use t27f::frame_render::ppm_header_into;
+use t27f::frame_render::ppm_header_len;
+use t27f::frame_render::FRAME_OK;
+use t27f::frame_render::R_BG;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_exit;
+
+pub const IN_CAP : usize = 1048576;
+pub const OUT_CAP : usize = 1048576;
+pub const COLS_MAX : u32 = 240;
+pub const V_OK : u8 = 0;
+pub const V_BAD : u8 = 1;
+
+/// Luminance of an RGB pixel, 0..255.
+pub fn lum(r: u32, g: u32, b: u32) -> u32 {
+    return (r * 77 + g * 150 + b * 29) >> 8;
+}
+
+/// The character a luminance is drawn with.
+pub fn cell_char(l: u32) -> u8 {
+    if (l >= 192) { return 35; }
+    if (l >= 96) { return 43; }
+    if (l >= 48) { return 58; }
+    return 46;
+}
+
+/// The character of a 0xRRGGBB colour.
+pub fn color_char(c: i32) -> u8 {
+    return cell_char(lum(((c >> 16) & 255) as u32, ((c >> 8) & 255) as u32, (c & 255) as u32));
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 or c == 10 or c == 9 or c == 13;
+}
+
+/// Parse a P6 header of b[0..n] into hdr: hdr[0] width, hdr[1] height, hdr[2] the offset of the data.
+pub fn header_into(b: []const u8, n: usize, hdr: []u32) -> u8 {
+    if (n < 3) { return V_BAD; }
+    if (b[0] != 80 or b[1] != 54) { return V_BAD; }
+    var at : usize = 2;
+    var vals : [3]u32 = [0, 0, 0];
+    var k : u32 = 0;
+    while (k < 3) {
+        if (at >= n) { return V_BAD; }
+        if (!is_ws(b[at])) { return V_BAD; }
+        while (at < n and is_ws(b[at])) {
+            at = at + 1;
+        }
+        var digits : u32 = 0;
+        var v : u32 = 0;
+        while (at < n and b[at] >= 48 and b[at] <= 57 and digits < 9) {
+            v = v * 10 + ((b[at] - 48) as u32);
+            digits = digits + 1;
+            at = at + 1;
+        }
+        if (digits == 0) { return V_BAD; }
+        vals[k] = v;
+        k = k + 1;
+    }
+    if (vals[2] != 255) { return V_BAD; }
+    if (vals[0] == 0 or vals[1] == 0) { return V_BAD; }
+    if (at >= n) { return V_BAD; }
+    if (!is_ws(b[at])) { return V_BAD; }
+    hdr[0] = vals[0];
+    hdr[1] = vals[1];
+    hdr[2] = (at + 1) as u32;
+    return V_OK;
+}
+
+/// The smallest step that keeps ceil(w / step) at or under cols_max; at least 1.
+pub fn step_for(w: u32, cols_max: u32) -> u32 {
+    const s : u32 = (w + cols_max - 1) / cols_max;
+    if (s == 0) { return 1; }
+    return s;
+}
+
+/// The colour of pixel (x, y) of an RGB raster w wide, as 0xRRGGBB.
+pub fn px_at(rgb: []const u8, w: u32, x: u32, y: u32) -> i32 {
+    const p : usize = ((y * w + x) * 3) as usize;
+    return ((rgb[p] as i32) << 16) | ((rgb[p + 1] as i32) << 8) | (rgb[p + 2] as i32);
+}
+
+/// How many step x step blocks hold a pixel that differs from the block's top-left pixel.
+pub fn mixed_cells(rgb: []const u8, w: u32, h: u32, step: u32) -> u32 {
+    var m : u32 = 0;
+    var cy : u32 = 0;
+    while (cy < h) {
+        var cx : u32 = 0;
+        while (cx < w) {
+            const c0 : i32 = px_at(rgb, w, cx, cy);
+            var mixed : bool = false;
+            var y : u32 = cy;
+            while (y < cy + step and y < h) {
+                var x : u32 = cx;
+                while (x < cx + step and x < w) {
+                    if (px_at(rgb, w, x, y) != c0) { mixed = true; }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            if (mixed) { m = m + 1; }
+            cx = cx + step;
+        }
+        cy = cy + step;
+    }
+    return m;
+}
+
+/// The rows of the view into out from `at`, each ended by a newline; the index after the last byte.
+pub fn rows_into(out: []u8, at: usize, rgb: []const u8, w: u32, h: u32, step: u32) -> usize {
+    var o : usize = at;
+    var y : u32 = 0;
+    while (y < h) {
+        var x : u32 = 0;
+        while (x < w) {
+            out[o] = color_char(px_at(rgb, w, x, y));
+            o = o + 1;
+            x = x + step;
+        }
+        out[o] = 10;
+        o = o + 1;
+        y = y + step;
+    }
+    return o;
+}
+
+pub fn main() -> void {
+    var buf : [1048576]u8 = undefined;
+    var out : [1048576]u8 = undefined;
+    var n : usize = 0;
+    var going : bool = true;
+    while (going) {
+        if (n >= IN_CAP) {
+            going = false;
+        } else {
+            const r : i64 = sys_read(0, buf[n..1048576], (IN_CAP - n) as u64);
+            if (r <= 0) {
+                going = false;
+            } else {
+                n = n + (r as usize);
+            }
+        }
+    }
+    if (n >= IN_CAP) { sys_exit(4); }
+    var hdr : [3]u32 = [0, 0, 0];
+    if (header_into(buf[0..1048576], n, hdr[0..3]) != V_OK) { sys_exit(2); }
+    const w : u32 = hdr[0];
+    const h : u32 = hdr[1];
+    const off : usize = hdr[2] as usize;
+    const data : usize = (3 * w * h) as usize;
+    if (off + data > n) { sys_exit(2); }
+    const step : u32 = step_for(w, COLS_MAX);
+    const cols : u32 = (w + step - 1) / step;
+    const rows : u32 = (h + step - 1) / step;
+    if (((rows * (cols + 1)) as usize) + 128 > OUT_CAP) { sys_exit(4); }
+    const rgb = buf[off..off + data];
+    var o : usize = put_bytes(out[0..1048576], 0, "ppm ");
+    o = put_dec(out[0..1048576], o, w as usize);
+    o = put_bytes(out[0..1048576], o, " x ");
+    o = put_dec(out[0..1048576], o, h as usize);
+    o = put_bytes(out[0..1048576], o, " step ");
+    o = put_dec(out[0..1048576], o, step as usize);
+    o = put_bytes(out[0..1048576], o, " cols ");
+    o = put_dec(out[0..1048576], o, cols as usize);
+    o = put_bytes(out[0..1048576], o, " rows ");
+    o = put_dec(out[0..1048576], o, rows as usize);
+    o = put_bytes(out[0..1048576], o, " mixed_cells ");
+    o = put_dec(out[0..1048576], o, mixed_cells(rgb, w, h, step) as usize);
+    out[o] = 10;
+    o = o + 1;
+    o = rows_into(out[0..1048576], o, rgb, w, h, step);
+    const wr : i64 = sys_write(1, out[0..o], o as u64);
+    if (wr != (o as i64)) { sys_exit(3); }
+    sys_exit(0);
+}
+
+fn put_px(rgb: []u8, w: u32, x: u32, y: u32, c: i32) -> void {
+    const p : usize = ((y * w + x) * 3) as usize;
+    rgb[p] = ((c >> 16) & 255) as u8;
+    rgb[p + 1] = ((c >> 8) & 255) as u8;
+    rgb[p + 2] = (c & 255) as u8;
+}
+
+test the_still_s_three_colours_read_as_three_characters {
+    // INK and RULE_INK of specs/blog/course_bench_board_still.t27, and frame_render's background.
+    assert(color_char(0xF2F2F2) == 35);
+    assert(color_char(0x8A8F96) == 43);
+    assert(color_char(R_BG) == 46);
+    assert(lum(255, 255, 255) == 255);
+    // Negative control: the background is not ink.
+    assert(color_char(R_BG) != 35);
+}
+
+test the_header_frame_render_writes_is_read_back {
+    var b : [32]u8 = undefined;
+    assert(ppm_header_into(b[0..32], 642, 210) == FRAME_OK);
+    const n : usize = ppm_header_len(642, 210) as usize;
+    assert(n == 15);
+    var hdr : [3]u32 = [0, 0, 0];
+    assert(header_into(b[0..32], n, hdr[0..3]) == V_OK);
+    assert(hdr[0] == 642);
+    assert(hdr[1] == 210);
+    assert(hdr[2] == 15);
+}
+
+test a_wrong_header_is_refused {
+    var hdr : [3]u32 = [0, 0, 0];
+    // P5 is grey, not RGB.
+    assert(header_into("P5\n2 2\n255\n", 11, hdr[0..3]) == V_BAD);
+    // maxval 15 is not 255.
+    assert(header_into("P6\n2 2\n15\n", 10, hdr[0..3]) == V_BAD);
+    // The header ends before the height.
+    assert(header_into("P6\n2", 4, hdr[0..3]) == V_BAD);
+    // A comment is not read.
+    assert(header_into("P6\n# c\n2 2\n255\n", 15, hdr[0..3]) == V_BAD);
+    // Negative control: the same header with P6 and 255 is read.
+    assert(header_into("P6\n2 2\n255\n", 11, hdr[0..3]) == V_OK);
+}
+
+test the_step_keeps_the_columns_under_the_cap {
+    assert(step_for(642, 240) == 3);
+    assert(step_for(240, 240) == 1);
+    assert(step_for(241, 240) == 2);
+    assert(step_for(1, 240) == 1);
+}
+
+test a_uniform_upscale_has_no_mixed_cells_and_one_pixel_makes_one {
+    var r : [48]u8 = undefined;
+    var y : u32 = 0;
+    while (y < 4) {
+        var x : u32 = 0;
+        while (x < 4) {
+            put_px(r[0..48], 4, x, y, R_BG);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    put_px(r[0..48], 4, 2, 0, 0xF2F2F2);
+    put_px(r[0..48], 4, 3, 0, 0xF2F2F2);
+    put_px(r[0..48], 4, 2, 1, 0xF2F2F2);
+    put_px(r[0..48], 4, 3, 1, 0xF2F2F2);
+    assert(mixed_cells(r[0..48], 4, 4, 2) == 0);
+    var o : [16]u8 = undefined;
+    const n : usize = rows_into(o[0..16], 0, r[0..48], 4, 4, 2);
+    assert(n == 6);
+    assert(o[0] == 46);
+    assert(o[1] == 35);
+    assert(o[2] == 10);
+    assert(o[3] == 46);
+    assert(o[4] == 46);
+    // Negative control: one pixel off inside the ink block.
+    put_px(r[0..48], 4, 3, 1, R_BG);
+    assert(mixed_cells(r[0..48], 4, 4, 2) == 1);
+}
