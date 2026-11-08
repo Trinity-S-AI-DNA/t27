@@ -32,7 +32,8 @@ Run from the HUD worktree root. Each command is one short line (skill `short-ter
 each tab after reading it.
 
 1. **Native target.** Skill `visual-update` steps 1-4: `t27c gen` the HUD, `zig build-exe`, run it, diff against
-   `base/`. OK = build rc 0, run rc 0, 13 frames in `target/course/hud/`.
+   `base/`. OK = build rc 0, run rc 0, 13 frames in `target/course/hud/`. The render is a heavy run: prefer a free
+   T27 OS pane (skill `t27os-orchestra`); a Terminal tab is the fallback.
 2. **Web and FPGA targets.**
    - `t27c gen-js specs/course/course_hud_wasm.t27 > target/course/hud/hud_wasm.mjs; echo rc $?`
    - `t27c gen-verilog specs/course/course_hud_state.t27 > target/course/hud/hud_state.v; echo rc $?`
@@ -44,24 +45,36 @@ each tab after reading it.
    `http://localhost:8127/hud_init.png`. OK = the tab title reads `hud_init.png (375x812)`.
 4. **MCP and GitHub.**
    - `claude mcp list | grep -i playwright` -- OK when it says Connected. The built-in Browser pane already
-     screenshots, so Playwright is a second route, not a requirement.
+     screenshots, so Playwright is a second route, not a requirement. Measured 2026-11-08: registered but FAIL, since
+     it looks for Google Chrome at its default path and none is installed. The fix is the owner's: install a browser
+     for it, or give it an executable-path option that points at an installed Chromium.
    - `gh auth status` -- OK when logged in. `gh issue/pr create, merge, comment` is the GitHub route; a GitHub MCP
      server adds nothing `gh` lacks, so none is registered.
    - DeepSeek: FAIL by design until it has a key-master profile (skill `access-map`: provider row only, account
-     unfunded per t27#13034). Never name it available.
+     unfunded per t27#13034). Never name it available. The DSH web worker on `127.0.0.1:3080` (skill `dev-monitor`)
+     is a separate route: it answers 401 while auth is on, which means up, not down.
 5. **Provider health, names only.** Never print, echo, copy or move a key value (skill `secret-hygiene`).
    - z.ai: `grep -o '^ZAI_KEY_[0-9]*' ~/.claude/.env | sort -u` counts the key names.
-   - NVIDIA: `grep -o 'NVIDIA_API_KEY_[0-9]*' ~/.zshrc | sort -u` counts the key names.
+   - NVIDIA: `grep -o 'NVIDIA_API_KEY_[0-9]*' ~/.zshrc | sort -u` counts the key names. Its `/v1/models` answers
+     200 with no key at all, and a chat call to a wrong model answers 404 (a retired one 410) with or without a key,
+     so neither proves a key; only a chat call to a model that answers does (none did on 2026-11-08).
    - OpenCode Zen: `curl -s -m 15 -o /dev/null -w '%{http_code}' https://opencode.ai/zen/v1/models` (keyless
      catalog). 200 means the catalog answers, not that the free pool has quota (it answered 429 FreeUsageLimitError on
      2026-10-31).
    - Liveness per key is the T27 OS KEYS tab check button (`specs/t27os/keys_probe.t27`), or the last recorded probe.
-     Report the probe's time with its result; a probe older than a day is "stale", not "OK".
+     Report the probe's time with its result; a probe older than a day is "stale", not "OK". Codes: 200 live, 529
+     overload (rotate, retry later), 401 dead key.
 6. **First screenshot.** `computer` screenshot of the Browser pane tab; copy the frames you showed to
-   `docs/course/hud/` (`hud_init.png`, the menu frame `hud_07.png`, `hud_init_diff.png`). Never open a PNG with the
-   Read tool.
+   `docs/course/hud/` (`hud_init.png`, the menu frame `hud_07.png`, `hud_init_diff.png`), and commit a frame there
+   only after the owner has seen it. Never open a PNG with the Read tool.
 7. **Report.** One table, OK/FAIL per item: native, web gen-js, fpga gen-verilog, server, Browser pane, Playwright,
    GitHub, DeepSeek, z.ai, NVIDIA, OpenCode Zen, screenshot. A FAIL row names its cause and who holds the fix.
+
+## Iteration loop
+
+Change a spec, then skill `visual-update` (render, diff, PNG), reload the Browser pane, screenshot, open the `_diff`
+frame and read `diff.txt`, then say what changed with the counts. A screenshot that looks right is not a
+measurement; the diff count is.
 
 ## What is missing (say so, do not paper over it)
 
@@ -80,3 +93,7 @@ each tab after reading it.
 - `preview_start` refuses a port that another process holds; check `lsof -nP -iTCP:<port> -sTCP:LISTEN` and pick a
   free port in `launch.json` rather than stopping someone else's server.
 - `sips ... a/*.ppm b/*.ppm --out png/` overwrites same-named files; convert `base/` into `png/base/`.
+- The worktree-isolation hook refuses shell for-loops over variables, sourcing an env file with `.`, `git -C` into
+  another worktree and `$((...))`. Write each command with literal names.
+- HUD frames in another session's worktree are read-only to you: read them, never write there.
+- No expanded home path in this file or any committed file (the `scan` check refuses it); write `~/...`.
