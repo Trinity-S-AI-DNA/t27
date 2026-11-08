@@ -1,0 +1,1660 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/t27t.t27 -- T27T, the time layer: one source of truth for clocks, schedules, recurrence, timelines,
+; duration estimates, decay and the golden rhythm (owner order T27T_TIME_LAYER, 2026-11-08, accepted canonical
+; edition). No agent keeps a private timer or scheduler; every timing decision is a pure function in this file.
+; -
+; Non-negotiables: persisted timestamps are UTC epoch seconds, display always names a zone; elapsed time comes
+; from a monotonic pair (start, end), never from the wall clock; there is no floating "now" -- every function takes
+; `now` as an argument; recurrence follows RFC 5545 and its expansion is deterministic and bounded (a date range
+; AND an occurrence limit AND a step budget); daylight saving is computed from the EU rule, not tabled; a missed-run
+; policy is explicit (skip | run_once | run_all) and run_all is refused unless an allow flag is passed; every
+; timing action emits a T27L line (surface 15 "time", actions 85..99 and 105..107; 100..104 stay forbidden).
+; The golden rhythm is POLICY, not a law and not a performance guarantee; it governs background work only, and a
+; critical task bypasses it.
+; -
+; Prior art: RFC 5545 (iCalendar) is the only normative source used. AgenticTime (github.com/agentralabs/
+; agentic-time), Chronos, TReMu, TempReasoner and Taghvim are cited by the owner and are UNVERIFIED here; no claim
+; is attributed to any of them.
+; -
+; Sections: 1 clock and zones (wave A); 2 cron, missed runs, singleton lock (wave B); 3 timeline, duration (wave C);
+; 4 decay (wave C); 5 golden rhythm (wave D); 6 RRULE subset and DST (wave D); 7 T27L events, CLI id table, panel.
+; -
+; Owner table error (reported, not copied): for T = 24 h the order lists 9h17m and 62h43m; 86400 / phi^2 is
+; 33002 s = 9h10m and the slow phase is 226198 s = 62h50m (33002 + 226198 = 259200 = 3T). Section 5 tests the
+; computed values.
+; -
+; Scope limits: cron fields are evaluated in UTC; the zone layer knows UTC and Europe/Berlin only; RRULE expansion
+; stops after TT_RR_ITER steps, so a rule that started many years before the queried range is a refusal-by-bound,
+; not a silent truncation.
+; -
+; NOT BUILT: the host clock reader (wall and monotonic), the persistent scheduler, the atomic lock store (the
+; compare-and-set that tt_lock_decide describes), and the CLI dispatch behind the id table in section 7.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osT27t;
+
+use t27os::t27l::tl_event_line;
+use t27os::t27l::tl_validate_line;
+use t27os::t27l::tl_arg_ok;
+use t27os::t27l::TL_OK;
+use t27os::t27l::TL_T_TR;
+use t27os::t27l::TL_T_SP;
+use t27os::t27l::TL_T_SP2;
+use t27os::t27l::TL_SURFACE_LAST;
+use t27os::t27l::TL_ACTION_LAST;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use std::mem::bytes_eq;
+use std::mem::bytes_starts_with;
+
+; --- 1. Clock and zones (wave A) ---
+
+/// Sentinel for every refusal that returns a number. No valid epoch, count or mask reaches it.
+pub const TT_BAD : u64 = 99999999999999;
+/// 10000-01-01T00:00:00Z: the first epoch the ISO writer refuses (years stay four digits).
+pub const TT_EPOCH_MAX : u64 = 253402300800;
+
+/// zone ids: 1 UTC (fixed), 2 Europe/Berlin (CET +1, CEST +2).
+pub const TT_Z_UTC : u8 = 1;
+pub const TT_Z_BERLIN : u8 = 2;
+pub const TT_Z_LAST : u8 = 2;
+
+/// Leap year, Gregorian.
+pub fn tt_is_leap(y: u64) -> bool {
+    if (y % 400 == 0) { return true; }
+    if (y % 100 == 0) { return false; }
+    return y % 4 == 0;
+}
+
+/// Days in month m (1..12) of year y.
+pub fn tt_days_in_month(y: u64, m: u64) -> u64 {
+    if (m == 2) {
+        if (tt_is_leap(y)) { return 29; }
+        return 28;
+    }
+    if (m == 4 or m == 6 or m == 9 or m == 11) { return 30; }
+    return 31;
+}
+
+/// Days since 1970-01-01 of a civil date (civil-from-days family, era form). Valid for y >= 1970.
+pub fn tt_days_from_civil(y: u64, m: u64, d: u64) -> u64 {
+    var yy : u64 = y;
+    if (m <= 2) { yy = y - 1; }
+    const era : u64 = yy / 400;
+    const yoe : u64 = yy - era * 400;
+    var mp : u64 = m + 9;
+    if (m > 2) { mp = m - 3; }
+    const doy : u64 = (153 * mp + 2) / 5 + d - 1;
+    const doe : u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// The civil date of a day count, packed as year * 10000 + month * 100 + day.
+pub fn tt_civil_pack(days: u64) -> u64 {
+    const z : u64 = days + 719468;
+    const era : u64 = z / 146097;
+    const doe : u64 = z - era * 146097;
+    const yoe : u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const doy : u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp : u64 = (5 * doy + 2) / 153;
+    const d : u64 = doy - (153 * mp + 2) / 5 + 1;
+    var m : u64 = mp + 3;
+    if (mp >= 10) { m = mp - 9; }
+    var y : u64 = yoe + era * 400;
+    if (m <= 2) { y = y + 1; }
+    return y * 10000 + m * 100 + d;
+}
+
+/// Year of an epoch second.
+pub fn tt_year_of(t: u64) -> u64 {
+    return tt_civil_pack(t / 86400) / 10000;
+}
+
+/// Day of week of a day count: 0 Sunday .. 6 Saturday (1970-01-01 was a Thursday).
+pub fn tt_dow(days: u64) -> u64 {
+    return (days + 4) % 7;
+}
+
+/// Epoch seconds of a UTC civil time; TT_BAD for a year outside 1970..9999 or any field out of range.
+pub fn tt_epoch_from(y: u64, mo: u64, d: u64, h: u64, mi: u64, s: u64) -> u64 {
+    if (y < 1970 or y > 9999 or mo < 1 or mo > 12) { return TT_BAD; }
+    if (d < 1 or d > tt_days_in_month(y, mo)) { return TT_BAD; }
+    if (h > 23 or mi > 59 or s > 59) { return TT_BAD; }
+    return tt_days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+}
+
+/// Write v as exactly w decimal digits (zero padded) at `at`; returns the position after them.
+pub fn tt_put_n(out: []u8, at: usize, v: u64, w: usize) -> usize {
+    var x : u64 = v;
+    var i : usize = w;
+    while (i > 0) {
+        out[at + i - 1] = @intCast(48 + x % 10);
+        x = x / 10;
+        i = i - 1;
+    }
+    return at + w;
+}
+
+/// Write "YYYY-MM-DDTHH:MM:SSZ" at `at`; returns the position after it, or `at` when t is out of range or the
+/// buffer is short.
+pub fn tt_iso_at(out: []u8, at: usize, t: u64) -> usize {
+    if (t >= TT_EPOCH_MAX or out.len < at + 20) { return at; }
+    const p : u64 = tt_civil_pack(t / 86400);
+    const sod : u64 = t % 86400;
+    var o : usize = tt_put_n(out, at, p / 10000, 4);
+    out[o] = 45;
+    o = tt_put_n(out, o + 1, (p / 100) % 100, 2);
+    out[o] = 45;
+    o = tt_put_n(out, o + 1, p % 100, 2);
+    out[o] = 84;
+    o = tt_put_n(out, o + 1, sod / 3600, 2);
+    out[o] = 58;
+    o = tt_put_n(out, o + 1, (sod % 3600) / 60, 2);
+    out[o] = 58;
+    o = tt_put_n(out, o + 1, sod % 60, 2);
+    out[o] = 90;
+    return o + 1;
+}
+
+/// The ISO-8601 UTC string of an epoch second; 20 bytes, 0 on a refusal.
+pub fn tt_iso_format(out: []u8, t: u64) -> usize {
+    return tt_iso_at(out, 0, t);
+}
+
+/// One decimal digit at index i, or 99 when the byte is absent or not a digit.
+pub fn tt_dig(s: []const u8, i: usize) -> u64 {
+    if (i >= s.len) { return 99; }
+    if (s[i] < 48 or s[i] > 57) { return 99; }
+    const b : u64 = @intCast(s[i]);
+    return b - 48;
+}
+
+/// n decimal digits from `at`; TT_BAD when any is not a digit.
+pub fn tt_digits(s: []const u8, at: usize, n: usize) -> u64 {
+    var v : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        const d : u64 = tt_dig(s, at + i);
+        if (d > 9) { return TT_BAD; }
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Parse "YYYY-MM-DDTHH:MM:SSZ" to epoch seconds; TT_BAD for any other shape or an impossible date.
+pub fn tt_iso_parse(s: []const u8) -> u64 {
+    if (s.len != 20) { return TT_BAD; }
+    if (s[4] != 45 or s[7] != 45 or s[10] != 84 or s[13] != 58 or s[16] != 58 or s[19] != 90) { return TT_BAD; }
+    const y : u64 = tt_digits(s, 0, 4);
+    const mo : u64 = tt_digits(s, 5, 2);
+    const d : u64 = tt_digits(s, 8, 2);
+    const h : u64 = tt_digits(s, 11, 2);
+    const mi : u64 = tt_digits(s, 14, 2);
+    const sc : u64 = tt_digits(s, 17, 2);
+    if (y == TT_BAD or mo == TT_BAD or d == TT_BAD or h == TT_BAD or mi == TT_BAD or sc == TT_BAD) { return TT_BAD; }
+    return tt_epoch_from(y, mo, d, h, mi, sc);
+}
+
+/// Monotonic elapsed seconds between two monotonic readings; TT_BAD when end < start (never a negative duration).
+pub fn tt_elapsed(start: u64, end: u64) -> u64 {
+    if (end < start) { return TT_BAD; }
+    return end - start;
+}
+
+/// The id table of zones: name <-> id. Unknown is 0.
+pub fn tt_zone_name(z: u8) -> []const u8 {
+    if (z == TT_Z_UTC) { return "UTC"; }
+    if (z == TT_Z_BERLIN) { return "Europe/Berlin"; }
+    return "";
+}
+
+pub fn tt_zone_id(name: []const u8) -> u8 {
+    if (bytes_eq(name, "UTC")) { return TT_Z_UTC; }
+    if (bytes_eq(name, "Europe/Berlin")) { return TT_Z_BERLIN; }
+    return 0;
+}
+
+/// Day of month of the last Sunday of a 31-day month (March or October).
+pub fn tt_last_sunday(y: u64, m: u64) -> u64 {
+    return 31 - tt_dow(tt_days_from_civil(y, m, 31));
+}
+
+/// EU rule: summer time starts at 01:00 UTC on the last Sunday of March ...
+pub fn tt_eu_start(y: u64) -> u64 {
+    return tt_epoch_from(y, 3, tt_last_sunday(y, 3), 1, 0, 0);
+}
+
+/// ... and ends at 01:00 UTC on the last Sunday of October.
+pub fn tt_eu_end(y: u64) -> u64 {
+    return tt_epoch_from(y, 10, tt_last_sunday(y, 10), 1, 0, 0);
+}
+
+/// Offset east of UTC, in seconds, that a zone has at a UTC instant: UTC 0; Berlin 3600 (CET) or 7200 (CEST).
+/// Unknown zone: 0 (callers check the id first).
+pub fn tt_zone_offset(zone: u8, utc: u64) -> u64 {
+    if (zone != TT_Z_BERLIN) { return 0; }
+    const y : u64 = tt_year_of(utc);
+    if (utc >= tt_eu_start(y) and utc < tt_eu_end(y)) { return 7200; }
+    return 3600;
+}
+
+/// Write the local time "YYYY-MM-DDTHH:MM:SS+HH:MM" of a UTC instant in a zone at `at`; returns the position
+/// after it, or `at` for an unknown zone or a refusal.
+pub fn tt_local_at(out: []u8, at: usize, zone: u8, utc: u64) -> usize {
+    if (zone < 1 or zone > TT_Z_LAST or utc >= TT_EPOCH_MAX or out.len < at + 25) { return at; }
+    const off : u64 = tt_zone_offset(zone, utc);
+    var o : usize = tt_iso_at(out, at, utc + off);
+    out[o - 1] = 43;
+    o = tt_put_n(out, o, off / 3600, 2);
+    out[o] = 58;
+    o = tt_put_n(out, o + 1, (off % 3600) / 60, 2);
+    return o;
+}
+
+/// The local display string of a UTC instant; 25 bytes, 0 on a refusal.
+pub fn tt_local_format(out: []u8, zone: u8, utc: u64) -> usize {
+    return tt_local_at(out, 0, zone, utc);
+}
+
+/// Fold policy for a wall time that occurs twice (fall-back): 1 first (summer time), 2 second (winter time).
+pub const TT_FOLD_FIRST : u8 = 1;
+pub const TT_FOLD_SECOND : u8 = 2;
+
+/// A local wall time (seconds, read as if UTC) to a UTC instant. A spring-forward gap shifts the time forward
+/// (02:30 becomes 03:30 summer time); a fall-back overlap resolves by `fold`; TT_BAD for an unknown zone.
+pub fn tt_utc_from_local(zone: u8, l: u64, fold: u8) -> u64 {
+    if (zone == TT_Z_UTC) { return l; }
+    if (zone != TT_Z_BERLIN or l < 7200) { return TT_BAD; }
+    const y : u64 = tt_year_of(l);
+    const s : u64 = tt_eu_start(y);
+    const e : u64 = tt_eu_end(y);
+    if (l >= s + 3600 and l < s + 7200) { return l - 3600; }
+    if (l >= e + 3600 and l < e + 7200) {
+        if (fold == TT_FOLD_FIRST) { return l - 7200; }
+        return l - 3600;
+    }
+    if (l >= s + 7200 and l < e + 3600) { return l - 7200; }
+    return l - 3600;
+}
+
+; --- 2. Schedule: cron, one-shot, missed runs, singleton lock (wave B) ---
+
+/// Cron parse errors travel inside a mask as TT_ERR_BASE + code; a real mask has no bit above 59.
+pub const TT_ERR_BASE : u64 = 4611686018427387904;
+pub const TT_C_OK : u8 = 0;
+pub const TT_C_FIELDS : u8 = 1;
+pub const TT_C_NUM : u8 = 2;
+pub const TT_C_RANGE : u8 = 3;
+pub const TT_C_STEP : u8 = 4;
+pub const TT_C_EMPTY : u8 = 5;
+/// The day search of next_fire stops after this many days (four years plus a leap day).
+pub const TT_CRON_DAYS : u64 = 1500;
+/// The most missed runs counted for one decision.
+pub const TT_MISS_CAP : u64 = 100;
+
+/// Bit k of a mask.
+pub fn tt_bit(m: u64, k: u64) -> bool {
+    return ((m >> k) & 1) == 1;
+}
+
+/// The mask of a, a+step, a+2*step .. up to b.
+pub fn tt_range_mask(a: u64, b: u64, step: u64) -> u64 {
+    var m : u64 = 0;
+    var k : u64 = a;
+    while (k <= b) {
+        m = m | (@as(u64, 1) << @as(u6, @intCast(k)));
+        k = k + step;
+    }
+    return m;
+}
+
+/// Index of the first byte b in s, or s.len when absent.
+pub fn tt_find(s: []const u8, b: u8) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] == b) { return i; }
+        i = i + 1;
+    }
+    return s.len;
+}
+
+/// A plain decimal number of 1..6 digits; TT_BAD otherwise.
+pub fn tt_num(s: []const u8) -> u64 {
+    if (s.len == 0 or s.len > 6) { return TT_BAD; }
+    return tt_digits(s, 0, s.len);
+}
+
+/// One cron part (no commas): *, */n, a, a-b. The mask, or TT_ERR_BASE + code.
+pub fn tt_cron_part(p: []const u8, lo: u64, hi: u64) -> u64 {
+    if (p.len == 0) { return TT_ERR_BASE + 5; }
+    if (bytes_eq(p, "*")) { return tt_range_mask(lo, hi, 1); }
+    if (bytes_starts_with(p, "*/")) {
+        const n : u64 = tt_num(p[2..p.len]);
+        if (n == TT_BAD) { return TT_ERR_BASE + 2; }
+        if (n == 0 or n > hi) { return TT_ERR_BASE + 4; }
+        return tt_range_mask(lo, hi, n);
+    }
+    const dash : usize = tt_find(p, 45);
+    if (dash < p.len) {
+        const a : u64 = tt_num(p[0..dash]);
+        const b : u64 = tt_num(p[dash + 1..p.len]);
+        if (a == TT_BAD or b == TT_BAD) { return TT_ERR_BASE + 2; }
+        if (a < lo or b > hi or a > b) { return TT_ERR_BASE + 3; }
+        return tt_range_mask(a, b, 1);
+    }
+    const v : u64 = tt_num(p);
+    if (v == TT_BAD) { return TT_ERR_BASE + 2; }
+    if (v < lo or v > hi) { return TT_ERR_BASE + 3; }
+    return tt_range_mask(v, v, 1);
+}
+
+/// One cron field: parts joined by commas. The mask, or TT_ERR_BASE + code.
+pub fn tt_cron_field(s: []const u8, lo: u64, hi: u64) -> u64 {
+    var m : u64 = 0;
+    var start : usize = 0;
+    var i : usize = 0;
+    while (i <= s.len) {
+        if (i == s.len or s[i] == 44) {
+            const pm : u64 = tt_cron_part(s[start..i], lo, hi);
+            if (pm >= TT_ERR_BASE) { return pm; }
+            m = m | pm;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// The n-th (0-based) space-separated token of s, packed start * 65536 + end; TT_BAD when there is none.
+pub fn tt_tok(s: []const u8, n: u64) -> u64 {
+    var i : usize = 0;
+    var k : u64 = 0;
+    while (i < s.len) {
+        if (s[i] == 32) {
+            i = i + 1;
+        } else {
+            var j : usize = i;
+            while (j < s.len and s[j] != 32) { j = j + 1; }
+            if (k == n) {
+                const a : u64 = @intCast(i);
+                const b : u64 = @intCast(j);
+                return a * 65536 + b;
+            }
+            k = k + 1;
+            i = j;
+        }
+    }
+    return TT_BAD;
+}
+
+/// Field n (0 minute, 1 hour, 2 day of month, 3 month, 4 day of week) of a cron line as a mask or an error.
+pub fn tt_cron_field_n(cron: []const u8, n: u64) -> u64 {
+    const r : u64 = tt_tok(cron, n);
+    if (r == TT_BAD) { return TT_ERR_BASE + 1; }
+    const a : usize = @intCast(r / 65536);
+    const b : usize = @intCast(r % 65536);
+    var lo : u64 = 0;
+    var hi : u64 = 59;
+    if (n == 1) { hi = 23; }
+    if (n == 2) { lo = 1; hi = 31; }
+    if (n == 3) { lo = 1; hi = 12; }
+    if (n == 4) { hi = 6; }
+    return tt_cron_field(cron[a..b], lo, hi);
+}
+
+/// Validate a five-field cron line: 0 ok, else the first error code (a sixth field is TT_C_FIELDS).
+pub fn tt_cron_check(cron: []const u8) -> u8 {
+    if (tt_tok(cron, 5) != TT_BAD) { return TT_C_FIELDS; }
+    var k : u64 = 0;
+    while (k < 5) {
+        const m : u64 = tt_cron_field_n(cron, k);
+        if (m >= TT_ERR_BASE) { return @intCast(m - TT_ERR_BASE); }
+        k = k + 1;
+    }
+    return TT_C_OK;
+}
+
+/// Day-of-month and day-of-week rule of cron: when both are restricted either may match, otherwise both must.
+pub fn tt_day_match(dm: u64, dw: u64, dom: u64, dow: u64) -> bool {
+    const dm_all : bool = dm == tt_range_mask(1, 31, 1);
+    const dw_all : bool = dw == tt_range_mask(0, 6, 1);
+    if (!dm_all and !dw_all) { return tt_bit(dm, dom) or tt_bit(dw, dow); }
+    return tt_bit(dm, dom) and tt_bit(dw, dow);
+}
+
+/// The first fire strictly after `after` (UTC epoch seconds) of a cron line, searched over at most TT_CRON_DAYS
+/// days; TT_BAD for an invalid line or when nothing fires inside the bound.
+pub fn tt_next_fire(cron: []const u8, after: u64) -> u64 {
+    if (tt_cron_check(cron) != TT_C_OK) { return TT_BAD; }
+    const mi : u64 = tt_cron_field_n(cron, 0);
+    const hr : u64 = tt_cron_field_n(cron, 1);
+    const dm : u64 = tt_cron_field_n(cron, 2);
+    const mo : u64 = tt_cron_field_n(cron, 3);
+    const dw : u64 = tt_cron_field_n(cron, 4);
+    const t0 : u64 = (after / 60 + 1) * 60;
+    const day0 : u64 = t0 / 86400;
+    var dn : u64 = 0;
+    while (dn < TT_CRON_DAYS) {
+        const day : u64 = day0 + dn;
+        const p : u64 = tt_civil_pack(day);
+        if (tt_bit(mo, (p / 100) % 100) and tt_day_match(dm, dw, p % 100, tt_dow(day))) {
+            var h : u64 = 0;
+            while (h < 24) {
+                if (tt_bit(hr, h)) {
+                    var m : u64 = 0;
+                    while (m < 60) {
+                        if (tt_bit(mi, m)) {
+                            const c : u64 = day * 86400 + h * 3600 + m * 60;
+                            if (c >= t0) { return c; }
+                        }
+                        m = m + 1;
+                    }
+                }
+                h = h + 1;
+            }
+        }
+        dn = dn + 1;
+    }
+    return TT_BAD;
+}
+
+/// A one-shot timer at an absolute UTC instant is due when now has reached it and it has not fired.
+pub fn tt_oneshot_due(fire_at: u64, now: u64, fired: bool) -> bool {
+    return !fired and now >= fire_at;
+}
+
+/// Missed-run policy: 1 skip, 2 run_once, 3 run_all.
+pub const TT_MP_SKIP : u8 = 1;
+pub const TT_MP_ONCE : u8 = 2;
+pub const TT_MP_ALL : u8 = 3;
+/// Priority: 1 low, 2 maintenance, 3 normal, 4 critical.
+pub const TT_PR_LOW : u8 = 1;
+pub const TT_PR_MAINT : u8 = 2;
+pub const TT_PR_NORMAL : u8 = 3;
+pub const TT_PR_CRIT : u8 = 4;
+
+pub fn tt_policy_name(p: u8) -> []const u8 {
+    if (p == TT_MP_SKIP) { return "skip"; }
+    if (p == TT_MP_ONCE) { return "run_once"; }
+    if (p == TT_MP_ALL) { return "run_all"; }
+    return "";
+}
+
+/// The default policy of a priority: maintenance run_once, everything else skip. run_all is never a default.
+pub fn tt_default_policy(priority: u8) -> u8 {
+    if (priority == TT_PR_MAINT) { return TT_MP_ONCE; }
+    return TT_MP_SKIP;
+}
+
+/// How many fires of a cron line fall in (last_fire, now], counted up to TT_MISS_CAP.
+pub fn tt_missed_count(cron: []const u8, last_fire: u64, now: u64) -> u64 {
+    var n : u64 = 0;
+    var t : u64 = last_fire;
+    while (n < TT_MISS_CAP) {
+        const nx : u64 = tt_next_fire(cron, t);
+        if (nx == TT_BAD or nx > now) { return n; }
+        n = n + 1;
+        t = nx;
+    }
+    return n;
+}
+
+/// Runs to fire for `missed` missed fires: skip 0, run_once 1 (0 when nothing was missed), run_all the whole
+/// count only when allow_all is set; run_all without the flag, or an unknown policy, is TT_BAD (refused).
+pub fn tt_missed_decide(missed: u64, policy: u8, allow_all: bool) -> u64 {
+    if (policy == TT_MP_SKIP) { return 0; }
+    if (policy == TT_MP_ONCE) {
+        if (missed > 0) { return 1; }
+        return 0;
+    }
+    if (policy == TT_MP_ALL) {
+        if (!allow_all) { return TT_BAD; }
+        return missed;
+    }
+    return TT_BAD;
+}
+
+/// Lock decisions: 1 acquire, 2 skip (an overlap attempt, logged as schedule_skipped at warn).
+pub const TT_LK_ACQUIRE : u8 = 1;
+pub const TT_LK_SKIP : u8 = 2;
+
+/// A lock held since `acq` with a TTL is expired once now has reached acq + ttl.
+pub fn tt_lock_expired(acq: u64, ttl: u64, now: u64) -> bool {
+    return now >= acq + ttl;
+}
+
+/// SINGLETON_LOCK_PROTOCOL, decision half: acquire only when the lock is free or expired (the host does the
+/// atomic compare-and-set); a crash leaves the lock to expire and the next run takes over.
+pub fn tt_lock_decide(held: bool, acq: u64, ttl: u64, now: u64) -> u8 {
+    if (!held) { return TT_LK_ACQUIRE; }
+    if (tt_lock_expired(acq, ttl, now)) { return TT_LK_ACQUIRE; }
+    return TT_LK_SKIP;
+}
+
+/// Renewal is due once a third of the TTL has passed since the last acquire or renew.
+pub fn tt_lock_renew_due(last: u64, ttl: u64, now: u64) -> bool {
+    return now >= last + ttl / 3;
+}
+
+/// Only the owner renews, and only a lock that has not expired.
+pub fn tt_lock_renew_ok(owner: u64, caller: u64, acq: u64, ttl: u64, now: u64) -> bool {
+    return owner == caller and !tt_lock_expired(acq, ttl, now);
+}
+
+/// Release is check-and-delete: only the owner.
+pub fn tt_lock_release_ok(owner: u64, caller: u64) -> bool {
+    return owner == caller;
+}
+
+/// Lifecycle states: 1 active, 2 paused, 3 deleted. Verbs: 1 pause, 2 resume, 3 delete.
+pub const TT_S_ACTIVE : u8 = 1;
+pub const TT_S_PAUSED : u8 = 2;
+pub const TT_S_DELETED : u8 = 3;
+
+/// The next state, or 0 for a refused move. Pause needs active, resume needs paused, delete needs --confirm and
+/// a schedule that is not deleted already; deleted is final.
+pub fn tt_life_next(state: u8, verb: u8, confirm: bool) -> u8 {
+    if (verb == 1 and state == TT_S_ACTIVE) { return TT_S_PAUSED; }
+    if (verb == 2 and state == TT_S_PAUSED) { return TT_S_ACTIVE; }
+    if (verb == 3 and confirm and state != TT_S_DELETED) { return TT_S_DELETED; }
+    return 0;
+}
+
+; --- 3. Timeline and duration (wave C) ---
+
+/// The value after `key` (the key includes its '='), where the key starts the string or follows `delim`; empty
+/// when absent. The value ends at the next delim or at the end.
+pub fn tt_kv_val(s: []const u8, key: []const u8, delim: u8) -> []const u8 {
+    var i : usize = 0;
+    while (i + key.len <= s.len) {
+        if ((i == 0 or s[i - 1] == delim) and bytes_starts_with(s[i..s.len], key)) {
+            const a : usize = i + key.len;
+            var j : usize = a;
+            while (j < s.len and s[j] != delim) { j = j + 1; }
+            return s[a..j];
+        }
+        i = i + 1;
+    }
+    return s[0..0];
+}
+
+/// A word usable as a record field: 1..64 printable bytes, no space, no '=' or ';'.
+pub fn tt_word_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > 64) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] <= 32 or s[i] >= 127 or s[i] == 61 or s[i] == 59) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Append one timeline line "actor=A event=E ts=N tag=T eid=ID" plus byte 10 at `at`; returns the new end, or
+/// `at` for a refused field. Lines are append-only: a correction is a new event with a new eid.
+pub fn tt_timeline_put(out: []u8, at: usize, actor: []const u8, event: []const u8, ts: u64, tag: []const u8,
+                       eid: []const u8) -> usize {
+    if (!tt_word_ok(actor) or !tt_word_ok(event) or !tt_word_ok(tag) or !tt_word_ok(eid)) { return at; }
+    if (out.len < at + actor.len + event.len + tag.len + eid.len + 64) { return at; }
+    var o : usize = put_bytes(out, at, "actor=");
+    o = put_bytes(out, o, actor);
+    o = put_bytes(out, o, " event=");
+    o = put_bytes(out, o, event);
+    o = put_bytes(out, o, " ts=");
+    o = put_dec(out, o, ts);
+    o = put_bytes(out, o, " tag=");
+    o = put_bytes(out, o, tag);
+    o = put_bytes(out, o, " eid=");
+    o = put_bytes(out, o, eid);
+    out[o] = 10;
+    return o + 1;
+}
+
+/// True when `next` is `prev` with more appended (nothing earlier was rewritten).
+pub fn tt_append_only(prev: []const u8, next: []const u8) -> bool {
+    return next.len >= prev.len and bytes_starts_with(next, prev);
+}
+
+/// Lines of `buf` whose actor equals `actor` (any actor when empty) and whose ts is in [from, to).
+pub fn tt_timeline_count(buf: []const u8, actor: []const u8, from: u64, to: u64) -> u64 {
+    var n : u64 = 0;
+    var ls : usize = 0;
+    while (ls < buf.len) {
+        const le : usize = ls + tt_find(buf[ls..buf.len], 10);
+        const line : []const u8 = buf[ls..le];
+        const ts : u64 = tt_num_long(tt_kv_val(line, "ts=", 32));
+        const who : []const u8 = tt_kv_val(line, "actor=", 32);
+        if (ts >= from and ts < to and (actor.len == 0 or bytes_eq(who, actor))) { n = n + 1; }
+        ls = le + 1;
+    }
+    return n;
+}
+
+/// A decimal number of 1..12 digits (epoch seconds); TT_BAD otherwise.
+pub fn tt_num_long(s: []const u8) -> u64 {
+    if (s.len == 0 or s.len > 12) { return TT_BAD; }
+    return tt_digits(s, 0, s.len);
+}
+
+/// PERT estimate (O + 4M + P) / 6 in whole seconds, truncated; TT_BAD unless O <= M <= P. An estimate is never a
+/// commitment.
+pub fn tt_pert(o: u64, m: u64, p: u64) -> u64 {
+    if (o > m or m > p) { return TT_BAD; }
+    return (o + 4 * m + p) / 6;
+}
+
+/// The estimate record; it carries commitment=false and is a separate record from the actual. 0 on a refusal.
+pub fn tt_estimate_line(out: []u8, task: []const u8, o: u64, m: u64, p: u64) -> usize {
+    const e : u64 = tt_pert(o, m, p);
+    if (e == TT_BAD or !tt_word_ok(task) or out.len < task.len + 128) { return 0; }
+    var n : usize = put_bytes(out, 0, "kind=estimate task=");
+    n = put_bytes(out, n, task);
+    n = put_bytes(out, n, " o=");
+    n = put_dec(out, n, o);
+    n = put_bytes(out, n, " m=");
+    n = put_dec(out, n, m);
+    n = put_bytes(out, n, " p=");
+    n = put_dec(out, n, p);
+    n = put_bytes(out, n, " pert=");
+    n = put_dec(out, n, e);
+    n = put_bytes(out, n, " commitment=false");
+    return n;
+}
+
+/// The actual record from a monotonic start and end; 0 when end < start.
+pub fn tt_actual_line(out: []u8, task: []const u8, start: u64, end: u64) -> usize {
+    const d : u64 = tt_elapsed(start, end);
+    if (d == TT_BAD or !tt_word_ok(task) or out.len < task.len + 128) { return 0; }
+    var n : usize = put_bytes(out, 0, "kind=actual task=");
+    n = put_bytes(out, n, task);
+    n = put_bytes(out, n, " start=");
+    n = put_dec(out, n, start);
+    n = put_bytes(out, n, " end=");
+    n = put_dec(out, n, end);
+    n = put_bytes(out, n, " elapsed=");
+    n = put_dec(out, n, d);
+    return n;
+}
+
+/// Calibration needs at least this many actuals.
+pub const TT_CAL_MIN : u64 = 3;
+
+pub fn tt_calibrate_ready(actuals: u64) -> bool {
+    return actuals >= TT_CAL_MIN;
+}
+
+/// Actual over estimate in parts per million (1000000 = on target); TT_BAD before three actuals or for a zero
+/// estimate sum.
+pub fn tt_calibration_ppm(sum_est: u64, sum_act: u64, actuals: u64) -> u64 {
+    if (!tt_calibrate_ready(actuals) or sum_est == 0) { return TT_BAD; }
+    return sum_act * 1000000 / sum_est;
+}
+
+/// Duration methods: 1 pert, 2 actual, 3 compare.
+pub fn tt_method_id(name: []const u8) -> u8 {
+    if (bytes_eq(name, "pert")) { return 1; }
+    if (bytes_eq(name, "actual")) { return 2; }
+    if (bytes_eq(name, "compare")) { return 3; }
+    return 0;
+}
+
+; --- 4. Decay (wave C) ---
+
+/// Decay domains are separate: 1 memory confidence, 2 reputation.
+pub const TT_D_MEMORY : u8 = 1;
+pub const TT_D_REPUTATION : u8 = 2;
+pub const TT_D_LAST : u8 = 2;
+/// Fixed point: one is 1000000 parts per million.
+pub const TT_PPM : u64 = 1000000;
+
+pub fn tt_domain_name(d: u8) -> []const u8 {
+    if (d == TT_D_MEMORY) { return "memory_confidence"; }
+    if (d == TT_D_REPUTATION) { return "reputation"; }
+    return "";
+}
+
+/// Default half-life per domain, in seconds (30 days, 90 days); `decay configure` sets another one per domain.
+pub fn tt_domain_half_life(d: u8) -> u64 {
+    if (d == TT_D_MEMORY) { return 2592000; }
+    if (d == TT_D_REPUTATION) { return 7776000; }
+    return 0;
+}
+
+/// 0.5^(age / half_life) in parts per million: whole half-lives by halving, the fraction by the Taylor series of
+/// e^(-x), x = f ln 2, eight terms, integer arithmetic only. 0 for half_life 0 and after 64 half-lives.
+pub fn tt_decay_factor_ppm(age: u64, half_life: u64) -> u64 {
+    if (half_life == 0) { return 0; }
+    const whole : u64 = age / half_life;
+    if (whole >= 64) { return 0; }
+    const x : u64 = (age % half_life) * 693147 / half_life;
+    var term : u64 = TT_PPM;
+    var pos : u64 = TT_PPM;
+    var neg : u64 = 0;
+    var k : u64 = 1;
+    while (k < 8) {
+        term = term * x / (k * TT_PPM);
+        if (k % 2 == 1) { neg = neg + term; } else { pos = pos + term; }
+        k = k + 1;
+    }
+    var f : u64 = pos - neg;
+    var w : u64 = 0;
+    while (w < whole) {
+        f = f / 2;
+        w = w + 1;
+    }
+    return f;
+}
+
+/// The decayed value used for ranking and presentation. The raw value is the caller's input and stays as it is.
+pub fn tt_decay_ranked(raw: u64, age: u64, half_life: u64) -> u64 {
+    return raw * tt_decay_factor_ppm(age, half_life) / TT_PPM;
+}
+
+/// Both numbers in one record: "domain=D raw=V ranked=R factor_ppm=F half_life_s=H"; 0 for an unknown domain.
+pub fn tt_decay_line(out: []u8, domain: u8, raw: u64, age: u64, half_life: u64) -> usize {
+    if (domain < 1 or domain > TT_D_LAST or out.len < 160) { return 0; }
+    var n : usize = put_bytes(out, 0, "domain=");
+    n = put_bytes(out, n, tt_domain_name(domain));
+    n = put_bytes(out, n, " raw=");
+    n = put_dec(out, n, raw);
+    n = put_bytes(out, n, " ranked=");
+    n = put_dec(out, n, tt_decay_ranked(raw, age, half_life));
+    n = put_bytes(out, n, " factor_ppm=");
+    n = put_dec(out, n, tt_decay_factor_ppm(age, half_life));
+    n = put_bytes(out, n, " half_life_s=");
+    n = put_dec(out, n, half_life);
+    return n;
+}
+
+; --- 5. Golden rhythm (wave D) ---
+
+/// 1 / phi^2 = 0.381966011250105 as nine decimals, over 10^9. Policy, not a law and not a guarantee.
+pub const TT_INV_PHI2_NS : u64 = 381966011;
+pub const TT_NS : u64 = 1000000000;
+/// Base period T is 1 s .. 10 years, so T * 381966011 cannot overflow.
+pub const TT_T_MAX : u64 = 315360000;
+/// Phases: 1 fast, 2 slow.
+pub const TT_PH_FAST : u8 = 1;
+pub const TT_PH_SLOW : u8 = 2;
+
+/// fast = round(T / phi^2); TT_BAD for T = 0 or T above TT_T_MAX.
+pub fn tt_golden_fast(t: u64) -> u64 {
+    if (t == 0 or t > TT_T_MAX) { return TT_BAD; }
+    return (t * TT_INV_PHI2_NS + TT_NS / 2) / TT_NS;
+}
+
+/// slow = 3T - fast, so fast + slow is exactly 3T.
+pub fn tt_golden_slow(t: u64) -> u64 {
+    const f : u64 = tt_golden_fast(t);
+    if (f == TT_BAD) { return TT_BAD; }
+    return 3 * t - f;
+}
+
+/// The interval of a phase for base T.
+pub fn tt_golden_interval(t: u64, phase: u8) -> u64 {
+    if (phase == TT_PH_FAST) { return tt_golden_fast(t); }
+    if (phase == TT_PH_SLOW) { return tt_golden_slow(t); }
+    return TT_BAD;
+}
+
+pub fn tt_phase_name(p: u8) -> []const u8 {
+    if (p == TT_PH_FAST) { return "fast"; }
+    if (p == TT_PH_SLOW) { return "slow"; }
+    return "";
+}
+
+/// Background task kinds: 1 doctor loop, 2 mailbox backlog, 3 health check, 4 error rate (fast); 5 memory
+/// consolidation, 6 reputation decay, 7 research synthesis, 8 dependency update, 9 retrospective (slow).
+pub fn tt_golden_phase_of(kind: u8) -> u8 {
+    if (kind >= 1 and kind <= 4) { return TT_PH_FAST; }
+    if (kind >= 5 and kind <= 9) { return TT_PH_SLOW; }
+    return 0;
+}
+
+/// The next fire of a golden schedule: the last fire plus the phase interval; TT_BAD for a bad phase or T.
+pub fn tt_golden_next(last: u64, t: u64, phase: u8) -> u64 {
+    const iv : u64 = tt_golden_interval(t, phase);
+    if (iv == TT_BAD) { return TT_BAD; }
+    return last + iv;
+}
+
+/// Dispatch decisions: 1 now (critical bypass), 2 queue (background, not yet due), 3 due (background, due).
+pub const TT_DISP_NOW : u8 = 1;
+pub const TT_DISP_QUEUE : u8 = 2;
+pub const TT_DISP_DUE : u8 = 3;
+
+/// CRITICAL_BYPASS_RULE: a critical task (security, incident, resource emergency) fires at once with no
+/// queueing; the caller logs critical_bypass and escalates to the owner. The golden rhythm governs background
+/// work only.
+pub fn tt_dispatch(priority: u8, golden_due: bool) -> u8 {
+    if (priority == TT_PR_CRIT) { return TT_DISP_NOW; }
+    if (golden_due) { return TT_DISP_DUE; }
+    return TT_DISP_QUEUE;
+}
+
+; --- 6. RRULE subset and DST (wave D) ---
+
+/// RRULE check codes: 0 ok, 1 unsupported part, 2 no FREQ, 3 bad FREQ, 4 bad INTERVAL, 5 bad COUNT, 6 bad UNTIL,
+/// 7 bad BYHOUR, 8 bad BYDAY, 9 COUNT and UNTIL together, 10 empty or too long.
+pub const TT_R_OK : u8 = 0;
+pub const TT_R_UNSUP : u8 = 1;
+pub const TT_R_NOFREQ : u8 = 2;
+pub const TT_R_FREQ : u8 = 3;
+pub const TT_R_INTERVAL : u8 = 4;
+pub const TT_R_COUNT : u8 = 5;
+pub const TT_R_UNTIL : u8 = 6;
+pub const TT_R_BYHOUR : u8 = 7;
+pub const TT_R_BYDAY : u8 = 8;
+pub const TT_R_COUNT_UNTIL : u8 = 9;
+pub const TT_R_LEN : u8 = 10;
+/// Bounds: occurrences returned per call, query span in seconds (five years), steps walked per call.
+pub const TT_RR_MAX : u64 = 366;
+pub const TT_RR_SPAN : u64 = 157680000;
+pub const TT_RR_ITER : u64 = 4000;
+
+/// FREQ value: 1 HOURLY, 2 DAILY, 3 WEEKLY, 0 anything else.
+pub fn tt_rr_freq(v: []const u8) -> u64 {
+    if (bytes_eq(v, "HOURLY")) { return 1; }
+    if (bytes_eq(v, "DAILY")) { return 2; }
+    if (bytes_eq(v, "WEEKLY")) { return 3; }
+    return 0;
+}
+
+/// Weekday token to 0 Sunday .. 6 Saturday; 99 for anything else (an ordinal such as 1MO is refused).
+pub fn tt_rr_wd(v: []const u8) -> u64 {
+    if (bytes_eq(v, "SU")) { return 0; }
+    if (bytes_eq(v, "MO")) { return 1; }
+    if (bytes_eq(v, "TU")) { return 2; }
+    if (bytes_eq(v, "WE")) { return 3; }
+    if (bytes_eq(v, "TH")) { return 4; }
+    if (bytes_eq(v, "FR")) { return 5; }
+    if (bytes_eq(v, "SA")) { return 6; }
+    return 99;
+}
+
+/// A comma list as a mask: mode 0 hours 0..23, mode 1 weekday tokens. TT_BAD for an empty or bad list.
+pub fn tt_rr_list_mask(v: []const u8, mode: u8) -> u64 {
+    var m : u64 = 0;
+    var start : usize = 0;
+    var i : usize = 0;
+    while (i <= v.len) {
+        if (i == v.len or v[i] == 44) {
+            var k : u64 = 99;
+            if (mode == 0) {
+                k = tt_num(v[start..i]);
+                if (k != TT_BAD and k > 23) { k = 99; }
+            } else {
+                k = tt_rr_wd(v[start..i]);
+            }
+            if (k > 23 and mode == 0) { return TT_BAD; }
+            if (k > 6 and mode == 1) { return TT_BAD; }
+            m = m | (@as(u64, 1) << @as(u6, @intCast(k)));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// UNTIL in the RFC basic form YYYYMMDDTHHMMSSZ to epoch seconds; TT_BAD otherwise.
+pub fn tt_rr_until(v: []const u8) -> u64 {
+    if (v.len != 16 or v[8] != 84 or v[15] != 90) { return TT_BAD; }
+    const y : u64 = tt_digits(v, 0, 4);
+    const mo : u64 = tt_digits(v, 4, 2);
+    const d : u64 = tt_digits(v, 6, 2);
+    const h : u64 = tt_digits(v, 9, 2);
+    const mi : u64 = tt_digits(v, 11, 2);
+    const s : u64 = tt_digits(v, 13, 2);
+    if (y == TT_BAD or mo == TT_BAD or d == TT_BAD or h == TT_BAD or mi == TT_BAD or s == TT_BAD) { return TT_BAD; }
+    return tt_epoch_from(y, mo, d, h, mi, s);
+}
+
+/// The check code of one KEY=VALUE part.
+pub fn tt_rr_part_code(key: []const u8, val: []const u8) -> u8 {
+    if (bytes_eq(key, "FREQ")) {
+        if (tt_rr_freq(val) == 0) { return TT_R_FREQ; }
+        return TT_R_OK;
+    }
+    if (bytes_eq(key, "INTERVAL")) {
+        const n : u64 = tt_num(val);
+        if (n == TT_BAD or n == 0 or n > 1000) { return TT_R_INTERVAL; }
+        return TT_R_OK;
+    }
+    if (bytes_eq(key, "COUNT")) {
+        const n : u64 = tt_num(val);
+        if (n == TT_BAD or n == 0 or n > 1000) { return TT_R_COUNT; }
+        return TT_R_OK;
+    }
+    if (bytes_eq(key, "UNTIL")) {
+        if (tt_rr_until(val) == TT_BAD) { return TT_R_UNTIL; }
+        return TT_R_OK;
+    }
+    if (bytes_eq(key, "BYHOUR")) {
+        if (tt_rr_list_mask(val, 0) == TT_BAD) { return TT_R_BYHOUR; }
+        return TT_R_OK;
+    }
+    if (bytes_eq(key, "BYDAY")) {
+        if (tt_rr_list_mask(val, 1) == TT_BAD) { return TT_R_BYDAY; }
+        return TT_R_OK;
+    }
+    return TT_R_UNSUP;
+}
+
+/// Validate a rule of the supported subset (FREQ HOURLY|DAILY|WEEKLY, INTERVAL, COUNT, UNTIL, BYHOUR, BYDAY).
+/// Anything else is refused with a code. The rule is stored as given; occurrences are generated on demand.
+pub fn tt_rr_check(rule: []const u8) -> u8 {
+    if (rule.len == 0 or rule.len > 200) { return TT_R_LEN; }
+    var has_freq : bool = false;
+    var has_count : bool = false;
+    var has_until : bool = false;
+    var start : usize = 0;
+    var i : usize = 0;
+    while (i <= rule.len) {
+        if (i == rule.len or rule[i] == 59) {
+            const part : []const u8 = rule[start..i];
+            const eq : usize = tt_find(part, 61);
+            if (eq >= part.len) { return TT_R_UNSUP; }
+            const key : []const u8 = part[0..eq];
+            const c : u8 = tt_rr_part_code(key, part[eq + 1..part.len]);
+            if (c != TT_R_OK) { return c; }
+            if (bytes_eq(key, "FREQ")) { has_freq = true; }
+            if (bytes_eq(key, "COUNT")) { has_count = true; }
+            if (bytes_eq(key, "UNTIL")) { has_until = true; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (!has_freq) { return TT_R_NOFREQ; }
+    if (has_count and has_until) { return TT_R_COUNT_UNTIL; }
+    return TT_R_OK;
+}
+
+/// Is the local day acceptable for a DAILY (freq 2) or WEEKLY (freq 3) rule? Weeks start on Monday.
+pub fn tt_rr_day_ok(freq: u64, interval: u64, d0: u64, dmask: u64, day: u64) -> bool {
+    if (day < d0) { return false; }
+    if (freq == 2) {
+        if ((day - d0) % interval != 0) { return false; }
+        return dmask == 0 or tt_bit(dmask, tt_dow(day));
+    }
+    const mon0 : u64 = d0 - (tt_dow(d0) + 6) % 7;
+    const mon : u64 = day - (tt_dow(day) + 6) % 7;
+    if (((mon - mon0) / 7) % interval != 0) { return false; }
+    if (dmask == 0) { return tt_dow(day) == tt_dow(d0); }
+    return tt_bit(dmask, tt_dow(day));
+}
+
+/// The first local wall time >= lo of a rule, walking at most TT_RR_ITER steps; TT_BAD when none is found.
+pub fn tt_rr_next_wall(freq: u64, interval: u64, dtstart: u64, hmask: u64, dmask: u64, lo: u64) -> u64 {
+    if (freq == 1) {
+        var k : u64 = 0;
+        if (lo > dtstart) { k = (lo - dtstart + interval * 3600 - 1) / (interval * 3600); }
+        var step : u64 = 0;
+        while (step < TT_RR_ITER) {
+            const c : u64 = dtstart + k * interval * 3600;
+            const hour_ok : bool = hmask == 0 or tt_bit(hmask, (c / 3600) % 24);
+            const day_ok : bool = dmask == 0 or tt_bit(dmask, tt_dow(c / 86400));
+            if (hour_ok and day_ok) { return c; }
+            k = k + 1;
+            step = step + 1;
+        }
+        return TT_BAD;
+    }
+    const d0 : u64 = dtstart / 86400;
+    const tail : u64 = dtstart % 3600;
+    var day : u64 = lo / 86400;
+    if (day < d0) { day = d0; }
+    var n : u64 = 0;
+    while (n < TT_RR_ITER) {
+        if (tt_rr_day_ok(freq, interval, d0, dmask, day)) {
+            var h : u64 = 0;
+            while (h < 24) {
+                const want : bool = (hmask == 0 and h == (dtstart / 3600) % 24) or (hmask != 0 and tt_bit(hmask, h));
+                if (want) {
+                    const c : u64 = day * 86400 + h * 3600 + tail;
+                    if (c >= lo) { return c; }
+                }
+                h = h + 1;
+            }
+        }
+        day = day + 1;
+        n = n + 1;
+    }
+    return TT_BAD;
+}
+
+/// Expand a rule into UTC instants in [from, to), at most `limit` of them (limit <= TT_RR_MAX and <= out.len),
+/// over a span of at most TT_RR_SPAN. `dtstart` is local wall time in `zone`; each occurrence is generated in
+/// wall-clock time and then given the zone offset (gap shifts forward, overlap resolved by `fold`). COUNT counts
+/// from dtstart, UNTIL is a UTC instant. Returns the number written, or TT_BAD for an invalid rule, zone, fold
+/// or bound. Deterministic: the same arguments give the same output.
+pub fn tt_rr_expand(rule: []const u8, zone: u8, dtstart: u64, fold: u8, from: u64, to: u64, limit: u64,
+                    out: []u64) -> u64 {
+    if (tt_rr_check(rule) != TT_R_OK) { return TT_BAD; }
+    if (zone < 1 or zone > TT_Z_LAST or (fold != TT_FOLD_FIRST and fold != TT_FOLD_SECOND)) { return TT_BAD; }
+    if (dtstart < 7200 or dtstart >= TT_EPOCH_MAX or to < from or to - from > TT_RR_SPAN) { return TT_BAD; }
+    if (limit == 0 or limit > TT_RR_MAX or limit > out.len) { return TT_BAD; }
+    const freq : u64 = tt_rr_freq(tt_kv_val(rule, "FREQ=", 59));
+    var interval : u64 = tt_num(tt_kv_val(rule, "INTERVAL=", 59));
+    if (interval == TT_BAD) { interval = 1; }
+    const count : u64 = tt_num(tt_kv_val(rule, "COUNT=", 59));
+    const until : u64 = tt_rr_until(tt_kv_val(rule, "UNTIL=", 59));
+    var hmask : u64 = 0;
+    var dmask : u64 = 0;
+    const hv : []const u8 = tt_kv_val(rule, "BYHOUR=", 59);
+    const dv : []const u8 = tt_kv_val(rule, "BYDAY=", 59);
+    if (hv.len > 0) { hmask = tt_rr_list_mask(hv, 0); }
+    if (dv.len > 0) { dmask = tt_rr_list_mask(dv, 1); }
+    var lo : u64 = dtstart;
+    var seen : u64 = 0;
+    var n : u64 = 0;
+    var iter : u64 = 0;
+    var done : bool = false;
+    while (!done and iter < TT_RR_ITER) {
+        iter = iter + 1;
+        const w : u64 = tt_rr_next_wall(freq, interval, dtstart, hmask, dmask, lo);
+        if (w == TT_BAD) {
+            done = true;
+        } else {
+            const u : u64 = tt_utc_from_local(zone, w, fold);
+            lo = w + 1;
+            seen = seen + 1;
+            if (until != TT_BAD and u > until) {
+                done = true;
+            } else if (count != TT_BAD and seen > count) {
+                done = true;
+            } else if (u >= to) {
+                done = true;
+            } else if (u >= from) {
+                if (n < limit) {
+                    out[n] = u;
+                    n = n + 1;
+                } else {
+                    done = true;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+/// The first occurrence strictly after `after` (UTC), within TT_RR_SPAN; TT_BAD when there is none.
+pub fn tt_rr_next(rule: []const u8, zone: u8, dtstart: u64, fold: u8, after: u64) -> u64 {
+    var one : [1]u64 = undefined;
+    const n : u64 = tt_rr_expand(rule, zone, dtstart, fold, after + 1, after + 1 + TT_RR_SPAN, 1, one[0..1]);
+    if (n != 1) { return TT_BAD; }
+    return one[0];
+}
+
+; --- 7. T27L events, CLI id table, menu L panel ---
+
+/// T27L surface 15 "time". Actions 85..99 and 105..107; 100..104 are the forbidden ones and are skipped.
+pub const TT_SURFACE : u8 = 15;
+pub const TT_ACT_CLOCK_READ : u8 = 85;
+pub const TT_ACT_TZ_CHANGED : u8 = 86;
+pub const TT_ACT_SCHED_CREATED : u8 = 87;
+pub const TT_ACT_SCHED_FIRED : u8 = 88;
+pub const TT_ACT_SCHED_SKIPPED : u8 = 89;
+pub const TT_ACT_SCHED_PAUSED : u8 = 90;
+pub const TT_ACT_SCHED_RESUMED : u8 = 91;
+pub const TT_ACT_REC_CREATED : u8 = 92;
+pub const TT_ACT_REC_EXPANDED : u8 = 93;
+pub const TT_ACT_TIMELINE_ADDED : u8 = 94;
+pub const TT_ACT_DUR_ESTIMATED : u8 = 95;
+pub const TT_ACT_DUR_RECORDED : u8 = 96;
+pub const TT_ACT_DUR_CALIBRATED : u8 = 97;
+pub const TT_ACT_DECAY_CONFIGURED : u8 = 98;
+pub const TT_ACT_DECAY_APPLIED : u8 = 99;
+pub const TT_ACT_GOLDEN_COMPUTED : u8 = 105;
+pub const TT_ACT_GOLDEN_SCHEDULED : u8 = 106;
+pub const TT_ACT_CRIT_BYPASS : u8 = 107;
+pub const TT_T_EV : str = "55555555-6666-4777-8888-999999999999";
+pub const TT_T_TS : str = "2026-11-08T12:34:56Z";
+
+/// Is the action one of the time actions?
+pub fn tt_action_ok(a: u8) -> bool {
+    return (a >= 85 and a <= 99) or (a >= 105 and a <= 107);
+}
+
+/// One time event as a t27l/v1 line. 0 for an action outside the time set, for schedule_skipped or
+/// critical_bypass below warn (level 3), or for anything tl_event_line refuses.
+pub fn tt_event(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                actor: u8, action: u8, level: u8, trace_id: []const u8, span_id: []const u8,
+                parent_span_id: []const u8, payload: []const u8) -> usize {
+    if (!tt_action_ok(action)) { return 0; }
+    if ((action == TT_ACT_SCHED_SKIPPED or action == TT_ACT_CRIT_BYPASS) and level < 3) { return 0; }
+    return tl_event_line(out, event_id, ts, device_id, session_id, actor, TT_SURFACE, action, level, trace_id,
+                         span_id, parent_span_id, payload, "");
+}
+
+/// A key=value payload fit for tl_arg_ok: no secret, no '@', no home path.
+pub fn tt_payload_ok(p: []const u8) -> bool {
+    return tl_arg_ok(p) and tt_find(p, 64) == p.len;
+}
+
+/// schedule_fired payload: schedule_id, fired_at, next_fire, golden_phase, missed_run_policy. 0 on a refusal.
+pub fn tt_sched_payload(out: []u8, schedule_id: []const u8, fired_at: u64, next_fire: u64, phase: u8,
+                        policy: u8) -> usize {
+    if (out.len < 256 or !tt_word_ok(schedule_id) or !tt_payload_ok(schedule_id)) { return 0; }
+    if (fired_at >= TT_EPOCH_MAX or next_fire >= TT_EPOCH_MAX) { return 0; }
+    var o : usize = put_bytes(out, 0, "schedule_id=");
+    o = put_bytes(out, o, schedule_id);
+    o = put_bytes(out, o, " fired_at=");
+    o = tt_iso_at(out, o, fired_at);
+    o = put_bytes(out, o, " next_fire=");
+    o = tt_iso_at(out, o, next_fire);
+    o = put_bytes(out, o, " golden_phase=");
+    if (phase == 0) { o = put_bytes(out, o, "none"); } else { o = put_bytes(out, o, tt_phase_name(phase)); }
+    o = put_bytes(out, o, " missed_run_policy=");
+    o = put_bytes(out, o, tt_policy_name(policy));
+    return o;
+}
+
+/// schedule_skipped payload for an overlap attempt on a held lock (log it at level 3, warn).
+pub fn tt_skip_payload(out: []u8, schedule_id: []const u8, now: u64, owner_node: u64) -> usize {
+    if (out.len < 256 or !tt_word_ok(schedule_id) or !tt_payload_ok(schedule_id) or now >= TT_EPOCH_MAX) { return 0; }
+    var o : usize = put_bytes(out, 0, "schedule_id=");
+    o = put_bytes(out, o, schedule_id);
+    o = put_bytes(out, o, " skipped_at=");
+    o = tt_iso_at(out, o, now);
+    o = put_bytes(out, o, " reason=lock_held owner_node=");
+    o = put_dec(out, o, owner_node);
+    return o;
+}
+
+/// critical_bypass payload: the priority, the escalation target and a reason word (log it at level 3 or above).
+pub fn tt_bypass_payload(out: []u8, reason: []const u8) -> usize {
+    if (out.len < 160 or !tt_word_ok(reason) or !tt_payload_ok(reason)) { return 0; }
+    var o : usize = put_bytes(out, 0, "priority=critical escalate=owner queued=false reason=");
+    o = put_bytes(out, o, reason);
+    return o;
+}
+
+/// golden_interval_computed payload.
+pub fn tt_golden_payload(out: []u8, t: u64, phase: u8) -> usize {
+    const iv : u64 = tt_golden_interval(t, phase);
+    if (out.len < 160 or iv == TT_BAD) { return 0; }
+    var o : usize = put_bytes(out, 0, "base_s=");
+    o = put_dec(out, o, t);
+    o = put_bytes(out, o, " golden_phase=");
+    o = put_bytes(out, o, tt_phase_name(phase));
+    o = put_bytes(out, o, " interval_s=");
+    o = put_dec(out, o, iv);
+    o = put_bytes(out, o, " cycle_s=");
+    o = put_dec(out, o, 3 * t);
+    return o;
+}
+
+/// The CLI id table (no host code): ids 1..24, "group verb" strings.
+pub const TT_CLI_LAST : u8 = 24;
+
+pub fn tt_cli_name(id: u8) -> []const u8 {
+    if (id == 1) { return "now"; }
+    if (id == 2) { return "monotonic"; }
+    if (id == 3) { return "timezone list"; }
+    if (id == 4) { return "timezone set"; }
+    if (id == 5) { return "schedule add"; }
+    if (id == 6) { return "schedule list"; }
+    if (id == 7) { return "schedule show"; }
+    if (id == 8) { return "schedule pause"; }
+    if (id == 9) { return "schedule resume"; }
+    if (id == 10) { return "schedule delete"; }
+    if (id == 11) { return "recurrence add"; }
+    if (id == 12) { return "recurrence list"; }
+    if (id == 13) { return "recurrence expand"; }
+    if (id == 14) { return "recurrence next"; }
+    if (id == 15) { return "timeline add"; }
+    if (id == 16) { return "timeline query"; }
+    if (id == 17) { return "timeline range"; }
+    if (id == 18) { return "duration estimate"; }
+    if (id == 19) { return "decay configure"; }
+    if (id == 20) { return "decay apply"; }
+    if (id == 21) { return "decay curve"; }
+    if (id == 22) { return "golden config"; }
+    if (id == 23) { return "golden intervals"; }
+    if (id == 24) { return "golden schedule"; }
+    return "";
+}
+
+/// The id of a command string; 0 when unknown.
+pub fn tt_cli_id(cmd: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= TT_CLI_LAST) {
+        if (bytes_eq(tt_cli_name(k), cmd)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// schedule delete is the only command that needs --confirm.
+pub fn tt_cli_needs_confirm(id: u8) -> bool {
+    return id == 10;
+}
+
+/// A CLI argument is accepted only when tl_arg_ok accepts it: no secret value travels as an argument.
+pub fn tt_cli_arg_ok(arg: []const u8) -> bool {
+    return tl_arg_ok(arg);
+}
+
+/// Menu L time panel payload: wall time, the zone and local time, monotonic seconds, the next two events and the
+/// missed-run count. 0 on a refusal.
+pub fn tt_panel_payload(out: []u8, zone: u8, wall: u64, mono_s: u64, next1: u64, next2: u64, missed: u64) -> usize {
+    if (out.len < 320 or zone < 1 or zone > TT_Z_LAST) { return 0; }
+    if (wall >= TT_EPOCH_MAX or next1 >= TT_EPOCH_MAX or next2 >= TT_EPOCH_MAX) { return 0; }
+    var o : usize = put_bytes(out, 0, "wall=");
+    o = tt_iso_at(out, o, wall);
+    o = put_bytes(out, o, " local=");
+    o = tt_local_at(out, o, zone, wall);
+    o = put_bytes(out, o, " zone=");
+    o = put_bytes(out, o, tt_zone_name(zone));
+    o = put_bytes(out, o, " mono_s=");
+    o = put_dec(out, o, mono_s);
+    o = put_bytes(out, o, " next=");
+    o = tt_iso_at(out, o, next1);
+    o = put_bytes(out, o, " next2=");
+    o = tt_iso_at(out, o, next2);
+    o = put_bytes(out, o, " missed=");
+    o = put_dec(out, o, missed);
+    return o;
+}
+
+; --- 8. Tests ---
+
+test clock_leap_and_civil_roundtrip {
+    assert tt_is_leap(2024);
+    assert tt_is_leap(2000);
+    assert !tt_is_leap(1900);
+    assert !tt_is_leap(2100);
+    assert tt_days_in_month(2024, 2) == 29;
+    assert tt_days_in_month(2026, 2) == 28;
+    assert tt_days_from_civil(1970, 1, 1) == 0;
+    assert tt_days_from_civil(2026, 1, 1) == 20454;
+    assert tt_civil_pack(0) == 19700101;
+    assert tt_civil_pack(20454) == 20260101;
+    assert tt_civil_pack(tt_days_from_civil(2024, 2, 29)) == 20240229;
+    assert tt_civil_pack(tt_days_from_civil(2099, 12, 31)) == 20991231;
+    assert tt_epoch_from(2026, 1, 1, 0, 0, 0) == 1767225600;
+    assert tt_epoch_from(2026, 2, 29, 0, 0, 0) == TT_BAD;
+    assert tt_epoch_from(1969, 12, 31, 0, 0, 0) == TT_BAD;
+    assert tt_dow(20541) == 0;
+}
+
+test clock_iso_format_and_parse {
+    var b : [64]u8 = undefined;
+    const n0 : usize = tt_iso_format(b[0..64], 0);
+    assert n0 == 20;
+    assert bytes_eq(b[0..n0], "1970-01-01T00:00:00Z");
+    const n1 : usize = tt_iso_format(b[0..64], 1767225600);
+    assert bytes_eq(b[0..n1], "2026-01-01T00:00:00Z");
+    assert tt_iso_parse("2026-01-01T00:00:00Z") == 1767225600;
+    assert tt_iso_parse("2024-02-29T12:30:45Z") == tt_epoch_from(2024, 2, 29, 12, 30, 45);
+    const n2 : usize = tt_iso_format(b[0..64], tt_iso_parse("2024-02-29T12:30:45Z"));
+    assert bytes_eq(b[0..n2], "2024-02-29T12:30:45Z");
+    assert tt_iso_parse("2026-02-30T00:00:00Z") == TT_BAD;
+    assert tt_iso_parse("2026-13-01T00:00:00Z") == TT_BAD;
+    assert tt_iso_parse("2026-01-01 00:00:00Z") == TT_BAD;
+    assert tt_iso_parse("2026-01-01T24:00:00Z") == TT_BAD;
+    assert tt_iso_parse("2026-01-01T00:00:00") == TT_BAD;
+    assert tt_iso_format(b[0..64], TT_EPOCH_MAX) == 0;
+}
+
+test clock_monotonic_elapsed_refuses_backwards {
+    assert tt_elapsed(5, 10) == 5;
+    assert tt_elapsed(7, 7) == 0;
+    assert tt_elapsed(10, 5) == TT_BAD;
+}
+
+test zones_table_and_eu_rule {
+    assert tt_zone_id("UTC") == TT_Z_UTC;
+    assert tt_zone_id("Europe/Berlin") == TT_Z_BERLIN;
+    assert tt_zone_id("Mars/Olympus") == 0;
+    assert bytes_eq(tt_zone_name(TT_Z_BERLIN), "Europe/Berlin");
+    assert tt_last_sunday(2026, 3) == 29;
+    assert tt_last_sunday(2026, 10) == 25;
+    assert tt_last_sunday(2025, 3) == 30;
+    assert tt_last_sunday(2025, 10) == 26;
+    assert tt_epoch_from(2026, 3, 29, 0, 0, 0) == 1774742400;
+    assert tt_epoch_from(2026, 10, 25, 0, 0, 0) == 1792886400;
+    assert tt_eu_start(2026) == 1774746000;
+    assert tt_eu_end(2026) == 1792890000;
+    assert tt_zone_offset(TT_Z_BERLIN, tt_eu_start(2026) - 1) == 3600;
+    assert tt_zone_offset(TT_Z_BERLIN, tt_eu_start(2026)) == 7200;
+    assert tt_zone_offset(TT_Z_BERLIN, tt_eu_end(2026) - 1) == 7200;
+    assert tt_zone_offset(TT_Z_BERLIN, tt_eu_end(2026)) == 3600;
+    assert tt_zone_offset(TT_Z_UTC, tt_eu_start(2026)) == 0;
+}
+
+test local_display_names_the_zone {
+    var b : [64]u8 = undefined;
+    const n1 : usize = tt_local_format(b[0..64], TT_Z_BERLIN, tt_epoch_from(2026, 7, 1, 10, 0, 0));
+    assert n1 == 25;
+    assert bytes_eq(b[0..n1], "2026-07-01T12:00:00+02:00");
+    const n2 : usize = tt_local_format(b[0..64], TT_Z_BERLIN, tt_epoch_from(2026, 1, 15, 10, 0, 0));
+    assert bytes_eq(b[0..n2], "2026-01-15T11:00:00+01:00");
+    const n3 : usize = tt_local_format(b[0..64], TT_Z_UTC, tt_epoch_from(2026, 1, 15, 10, 0, 0));
+    assert bytes_eq(b[0..n3], "2026-01-15T10:00:00+00:00");
+    assert tt_local_format(b[0..64], 9, 0) == 0;
+}
+
+test local_to_utc_gap_and_overlap {
+    const gap : u64 = tt_epoch_from(2026, 3, 29, 2, 30, 0);
+    assert tt_utc_from_local(TT_Z_BERLIN, gap, TT_FOLD_FIRST) == tt_epoch_from(2026, 3, 29, 1, 30, 0);
+    assert tt_utc_from_local(TT_Z_BERLIN, gap, TT_FOLD_SECOND) == tt_epoch_from(2026, 3, 29, 1, 30, 0);
+    const ov : u64 = tt_epoch_from(2026, 10, 25, 2, 30, 0);
+    assert tt_utc_from_local(TT_Z_BERLIN, ov, TT_FOLD_FIRST) == tt_epoch_from(2026, 10, 25, 0, 30, 0);
+    assert tt_utc_from_local(TT_Z_BERLIN, ov, TT_FOLD_SECOND) == tt_epoch_from(2026, 10, 25, 1, 30, 0);
+    assert tt_utc_from_local(TT_Z_BERLIN, tt_epoch_from(2026, 7, 1, 12, 0, 0), TT_FOLD_FIRST) == tt_epoch_from(2026, 7, 1, 10, 0, 0);
+    assert tt_utc_from_local(TT_Z_BERLIN, tt_epoch_from(2026, 1, 15, 11, 0, 0), TT_FOLD_FIRST) == tt_epoch_from(2026, 1, 15, 10, 0, 0);
+    assert tt_utc_from_local(TT_Z_UTC, 12345, TT_FOLD_FIRST) == 12345;
+    assert tt_utc_from_local(7, 12345, TT_FOLD_FIRST) == TT_BAD;
+}
+
+test cron_validator_codes {
+    assert tt_cron_check("*/15 * * * *") == TT_C_OK;
+    assert tt_cron_check("0,30 8-10 * * 1-5") == TT_C_OK;
+    assert tt_cron_check("* * * *") == TT_C_FIELDS;
+    assert tt_cron_check("* * * * * *") == TT_C_FIELDS;
+    assert tt_cron_check("60 * * * *") == TT_C_RANGE;
+    assert tt_cron_check("5-3 * * * *") == TT_C_RANGE;
+    assert tt_cron_check("* * * * 7") == TT_C_RANGE;
+    assert tt_cron_check("*/0 * * * *") == TT_C_STEP;
+    assert tt_cron_check("a * * * *") == TT_C_NUM;
+    assert tt_cron_check("1,,2 * * * *") == TT_C_EMPTY;
+}
+
+test cron_next_fire_bounded_search {
+    const t0 : u64 = 1767225600;
+    assert tt_next_fire("*/15 * * * *", t0) == t0 + 900;
+    assert tt_next_fire("*/15 * * * *", t0 + 900) == t0 + 1800;
+    assert tt_next_fire("30 2 * * *", t0) == t0 + 9000;
+    assert tt_next_fire("0,30 8-10 * * *", t0 + 8 * 3600 + 1800) == t0 + 9 * 3600;
+    assert tt_next_fire("0 9 * * 1", t0) == tt_epoch_from(2026, 1, 5, 9, 0, 0);
+    assert tt_next_fire("0 0 1 * 1", t0) == tt_epoch_from(2026, 1, 5, 0, 0, 0);
+    assert tt_next_fire("0 0 29 2 *", t0) == tt_epoch_from(2028, 2, 29, 0, 0, 0);
+    assert tt_next_fire("0 0 31 2 *", t0) == TT_BAD;
+    assert tt_next_fire("bogus", t0) == TT_BAD;
+}
+
+test oneshot_and_lifecycle {
+    assert !tt_oneshot_due(1000, 999, false);
+    assert tt_oneshot_due(1000, 1000, false);
+    assert !tt_oneshot_due(1000, 2000, true);
+    assert tt_life_next(TT_S_ACTIVE, 1, false) == TT_S_PAUSED;
+    assert tt_life_next(TT_S_PAUSED, 2, false) == TT_S_ACTIVE;
+    assert tt_life_next(TT_S_ACTIVE, 2, false) == 0;
+    assert tt_life_next(TT_S_ACTIVE, 3, false) == 0;
+    assert tt_life_next(TT_S_PAUSED, 3, true) == TT_S_DELETED;
+    assert tt_life_next(TT_S_DELETED, 3, true) == 0;
+    assert tt_life_next(TT_S_DELETED, 2, true) == 0;
+}
+
+test missed_run_policy_decisions {
+    const last : u64 = 1767225600;
+    const now : u64 = last + 3 * 3600 + 10;
+    assert tt_missed_count("0 * * * *", last, now) == 3;
+    assert tt_missed_count("0 * * * *", last, last + 100) == 0;
+    assert tt_missed_decide(3, TT_MP_SKIP, false) == 0;
+    assert tt_missed_decide(3, TT_MP_ONCE, false) == 1;
+    assert tt_missed_decide(0, TT_MP_ONCE, false) == 0;
+    assert tt_missed_decide(3, TT_MP_ALL, false) == TT_BAD;
+    assert tt_missed_decide(3, TT_MP_ALL, true) == 3;
+    assert tt_missed_decide(3, 9, true) == TT_BAD;
+    assert tt_default_policy(TT_PR_LOW) == TT_MP_SKIP;
+    assert tt_default_policy(TT_PR_MAINT) == TT_MP_ONCE;
+    assert tt_default_policy(TT_PR_NORMAL) != TT_MP_ALL;
+    assert tt_next_fire("0 * * * *", now) == last + 4 * 3600;
+}
+
+test singleton_lock_protocol {
+    assert tt_lock_decide(false, 0, 0, 100) == TT_LK_ACQUIRE;
+    assert tt_lock_decide(true, 1000, 90, 1050) == TT_LK_SKIP;
+    assert tt_lock_decide(true, 1000, 90, 1089) == TT_LK_SKIP;
+    assert tt_lock_decide(true, 1000, 90, 1090) == TT_LK_ACQUIRE;
+    assert !tt_lock_renew_due(1000, 90, 1029);
+    assert tt_lock_renew_due(1000, 90, 1030);
+    assert tt_lock_renew_ok(7, 7, 1000, 90, 1030);
+    assert !tt_lock_renew_ok(7, 8, 1000, 90, 1030);
+    assert !tt_lock_renew_ok(7, 7, 1000, 90, 1090);
+    assert tt_lock_release_ok(7, 7);
+    assert !tt_lock_release_ok(7, 8);
+}
+
+test timeline_append_only_and_query {
+    var b : [1024]u8 = undefined;
+    const e1 : usize = tt_timeline_put(b[0..1024], 0, "queen", "deploy_started", 1000, "ops", "e-1");
+    assert e1 > 0;
+    assert bytes_eq(b[0..e1], "actor=queen event=deploy_started ts=1000 tag=ops eid=e-1\n");
+    const e2 : usize = tt_timeline_put(b[0..1024], e1, "doctor", "swap_high", 1500, "mem", "e-2");
+    assert e2 > e1;
+    const e3 : usize = tt_timeline_put(b[0..1024], e2, "queen", "correction", 1600, "fix", "e-3");
+    assert e3 > e2;
+    assert tt_append_only(b[0..e1], b[0..e3]);
+    assert !tt_append_only(b[0..e3], b[0..e1]);
+    assert tt_timeline_count(b[0..e3], "queen", 0, 5000) == 2;
+    assert tt_timeline_count(b[0..e3], "queen", 1001, 5000) == 1;
+    assert tt_timeline_count(b[0..e3], "doctor", 0, 1500) == 0;
+    assert tt_timeline_count(b[0..e3], "", 0, 5000) == 3;
+    assert tt_timeline_put(b[0..1024], e3, "bad actor", "x", 1, "t", "e") == e3;
+    assert tt_timeline_put(b[0..1024], e3, "a", "x=y", 1, "t", "e") == e3;
+}
+
+test duration_pert_actual_and_calibration {
+    assert tt_pert(60, 120, 300) == 140;
+    assert tt_pert(300, 120, 60) == TT_BAD;
+    var b : [256]u8 = undefined;
+    const n1 : usize = tt_estimate_line(b[0..256], "t1", 60, 120, 300);
+    assert bytes_eq(b[0..n1], "kind=estimate task=t1 o=60 m=120 p=300 pert=140 commitment=false");
+    const n2 : usize = tt_actual_line(b[0..256], "t1", 1000, 1150);
+    assert bytes_eq(b[0..n2], "kind=actual task=t1 start=1000 end=1150 elapsed=150");
+    assert tt_actual_line(b[0..256], "t1", 1150, 1000) == 0;
+    assert !tt_calibrate_ready(2);
+    assert tt_calibrate_ready(3);
+    assert tt_calibration_ppm(280, 420, 3) == 1500000;
+    assert tt_calibration_ppm(280, 420, 2) == TT_BAD;
+    assert tt_calibration_ppm(0, 420, 3) == TT_BAD;
+    assert tt_method_id("pert") == 1;
+    assert tt_method_id("compare") == 3;
+    assert tt_method_id("guess") == 0;
+}
+
+test decay_fixed_point_and_domains {
+    const hl : u64 = 2592000;
+    assert tt_decay_factor_ppm(0, hl) == 1000000;
+    assert tt_decay_factor_ppm(hl, hl) == 500000;
+    assert tt_decay_factor_ppm(2 * hl, hl) == 250000;
+    assert tt_decay_factor_ppm(hl / 2, hl) >= 707100;
+    assert tt_decay_factor_ppm(hl / 2, hl) <= 707115;
+    assert tt_decay_factor_ppm(70 * hl, hl) == 0;
+    assert tt_decay_factor_ppm(5, 0) == 0;
+    assert tt_decay_ranked(1000000, hl, hl) == 500000;
+    assert tt_domain_half_life(TT_D_MEMORY) != tt_domain_half_life(TT_D_REPUTATION);
+    assert !bytes_eq(tt_domain_name(TT_D_MEMORY), tt_domain_name(TT_D_REPUTATION));
+    var b : [256]u8 = undefined;
+    const n : usize = tt_decay_line(b[0..256], TT_D_MEMORY, 1000, hl, hl);
+    assert bytes_eq(b[0..n], "domain=memory_confidence raw=1000 ranked=500 factor_ppm=500000 half_life_s=2592000");
+    assert tt_decay_line(b[0..256], 0, 1000, hl, hl) == 0;
+}
+
+test golden_intervals_and_owner_table_error {
+    assert tt_golden_fast(3600) == 1375;
+    assert tt_golden_slow(3600) == 9425;
+    assert tt_golden_fast(14400) == 5500;
+    assert tt_golden_slow(14400) == 37700;
+    assert tt_golden_fast(86400) == 33002;
+    assert tt_golden_slow(86400) == 226198;
+    assert tt_golden_fast(86400) + tt_golden_slow(86400) == 259200;
+    assert tt_golden_fast(86400) != 33420;
+    assert tt_golden_slow(86400) != 225780;
+    assert tt_golden_fast(0) == TT_BAD;
+    assert tt_golden_fast(TT_T_MAX + 1) == TT_BAD;
+    assert tt_golden_fast(1) + tt_golden_slow(1) == 3;
+    assert tt_golden_fast(7) + tt_golden_slow(7) == 21;
+    assert tt_golden_interval(3600, TT_PH_FAST) == 1375;
+    assert tt_golden_interval(3600, TT_PH_SLOW) == 9425;
+    assert tt_golden_interval(3600, 0) == TT_BAD;
+    assert tt_golden_next(1000, 3600, TT_PH_FAST) == 2375;
+}
+
+test golden_phases_and_critical_bypass {
+    assert tt_golden_phase_of(1) == TT_PH_FAST;
+    assert tt_golden_phase_of(4) == TT_PH_FAST;
+    assert tt_golden_phase_of(5) == TT_PH_SLOW;
+    assert tt_golden_phase_of(9) == TT_PH_SLOW;
+    assert tt_golden_phase_of(10) == 0;
+    assert tt_dispatch(TT_PR_CRIT, false) == TT_DISP_NOW;
+    assert tt_dispatch(TT_PR_CRIT, true) == TT_DISP_NOW;
+    assert tt_dispatch(TT_PR_NORMAL, false) == TT_DISP_QUEUE;
+    assert tt_dispatch(TT_PR_LOW, true) == TT_DISP_DUE;
+}
+
+test rrule_subset_is_validated {
+    assert tt_rr_check("FREQ=DAILY") == TT_R_OK;
+    assert tt_rr_check("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;BYHOUR=9;COUNT=4") == TT_R_OK;
+    assert tt_rr_check("FREQ=HOURLY;INTERVAL=6;UNTIL=20261231T000000Z") == TT_R_OK;
+    assert tt_rr_check("FREQ=MONTHLY") == TT_R_FREQ;
+    assert tt_rr_check("FREQ=DAILY;BYSETPOS=1") == TT_R_UNSUP;
+    assert tt_rr_check("INTERVAL=2") == TT_R_NOFREQ;
+    assert tt_rr_check("FREQ=DAILY;INTERVAL=0") == TT_R_INTERVAL;
+    assert tt_rr_check("FREQ=DAILY;COUNT=0") == TT_R_COUNT;
+    assert tt_rr_check("FREQ=DAILY;UNTIL=2026") == TT_R_UNTIL;
+    assert tt_rr_check("FREQ=DAILY;BYHOUR=24") == TT_R_BYHOUR;
+    assert tt_rr_check("FREQ=WEEKLY;BYDAY=1MO") == TT_R_BYDAY;
+    assert tt_rr_check("FREQ=DAILY;COUNT=3;UNTIL=20261231T000000Z") == TT_R_COUNT_UNTIL;
+    assert tt_rr_check("") == TT_R_LEN;
+}
+
+test rrule_daily_across_spring_forward_gap {
+    var o : [16]u64 = undefined;
+    const dt : u64 = tt_epoch_from(2026, 3, 27, 2, 30, 0);
+    const from : u64 = tt_epoch_from(2026, 3, 26, 0, 0, 0);
+    const to : u64 = tt_epoch_from(2026, 4, 5, 0, 0, 0);
+    const n : u64 = tt_rr_expand("FREQ=DAILY;COUNT=5", TT_Z_BERLIN, dt, TT_FOLD_FIRST, from, to, 10, o[0..16]);
+    assert n == 5;
+    assert o[0] == tt_epoch_from(2026, 3, 27, 1, 30, 0);
+    assert o[1] == tt_epoch_from(2026, 3, 28, 1, 30, 0);
+    assert o[2] == tt_epoch_from(2026, 3, 29, 1, 30, 0);
+    assert o[3] == tt_epoch_from(2026, 3, 30, 0, 30, 0);
+    assert o[4] == tt_epoch_from(2026, 3, 31, 0, 30, 0);
+    assert o[1] > o[0] and o[2] > o[1] and o[3] > o[2] and o[4] > o[3];
+    var b : [64]u8 = undefined;
+    const ln : usize = tt_local_format(b[0..64], TT_Z_BERLIN, o[2]);
+    assert bytes_eq(b[0..ln], "2026-03-29T03:30:00+02:00");
+}
+
+test rrule_daily_across_fall_back_overlap {
+    var o : [16]u64 = undefined;
+    var p : [16]u64 = undefined;
+    const dt : u64 = tt_epoch_from(2026, 10, 24, 2, 30, 0);
+    const from : u64 = tt_epoch_from(2026, 10, 23, 0, 0, 0);
+    const to : u64 = tt_epoch_from(2026, 11, 2, 0, 0, 0);
+    const n1 : u64 = tt_rr_expand("FREQ=DAILY;COUNT=3", TT_Z_BERLIN, dt, TT_FOLD_FIRST, from, to, 10, o[0..16]);
+    const n2 : u64 = tt_rr_expand("FREQ=DAILY;COUNT=3", TT_Z_BERLIN, dt, TT_FOLD_SECOND, from, to, 10, p[0..16]);
+    assert n1 == 3;
+    assert n2 == 3;
+    assert o[1] == tt_epoch_from(2026, 10, 25, 0, 30, 0);
+    assert p[1] == tt_epoch_from(2026, 10, 25, 1, 30, 0);
+    assert o[0] == p[0];
+    assert o[2] == p[2];
+    assert o[2] == tt_epoch_from(2026, 10, 26, 1, 30, 0);
+    assert o[1] > o[0] and o[2] > o[1];
+    assert p[1] > p[0] and p[2] > p[1];
+    var b : [64]u8 = undefined;
+    const l1 : usize = tt_local_format(b[0..64], TT_Z_BERLIN, o[1]);
+    assert bytes_eq(b[0..l1], "2026-10-25T02:30:00+02:00");
+    const l2 : usize = tt_local_format(b[0..64], TT_Z_BERLIN, p[1]);
+    assert bytes_eq(b[0..l2], "2026-10-25T02:30:00+01:00");
+}
+
+test rrule_weekly_hourly_until_and_bounds {
+    var o : [16]u64 = undefined;
+    const mon : u64 = tt_epoch_from(2026, 11, 2, 9, 0, 0);
+    const far : u64 = tt_epoch_from(2026, 12, 31, 0, 0, 0);
+    const n : u64 = tt_rr_expand("FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=9;COUNT=4", TT_Z_UTC, mon, TT_FOLD_FIRST, mon, far, 10, o[0..16]);
+    assert n == 4;
+    assert o[0] == mon;
+    assert o[1] == tt_epoch_from(2026, 11, 4, 9, 0, 0);
+    assert o[2] == tt_epoch_from(2026, 11, 9, 9, 0, 0);
+    assert o[3] == tt_epoch_from(2026, 11, 11, 9, 0, 0);
+    const t0 : u64 = 1767225600;
+    const n2 : u64 = tt_rr_expand("FREQ=HOURLY;INTERVAL=6;COUNT=4", TT_Z_UTC, t0, TT_FOLD_FIRST, t0, t0 + 86400, 10, o[0..16]);
+    assert n2 == 4;
+    assert o[3] == t0 + 18 * 3600;
+    const n3 : u64 = tt_rr_expand("FREQ=HOURLY;INTERVAL=6;COUNT=4", TT_Z_UTC, t0, TT_FOLD_FIRST, t0, t0 + 86400, 2, o[0..16]);
+    assert n3 == 2;
+    const n4 : u64 = tt_rr_expand("FREQ=HOURLY;UNTIL=20260101T030000Z", TT_Z_UTC, t0, TT_FOLD_FIRST, t0, t0 + 86400, 10, o[0..16]);
+    assert n4 == 4;
+    assert tt_rr_expand("FREQ=DAILY", TT_Z_UTC, t0, TT_FOLD_FIRST, t0 + 10, t0, 10, o[0..16]) == TT_BAD;
+    assert tt_rr_expand("FREQ=DAILY", TT_Z_UTC, t0, TT_FOLD_FIRST, t0, t0 + 86400, 0, o[0..16]) == TT_BAD;
+    assert tt_rr_expand("FREQ=DAILY", TT_Z_UTC, t0, TT_FOLD_FIRST, t0, t0 + 86400, 367, o[0..16]) == TT_BAD;
+    assert tt_rr_expand("FREQ=DAILY", TT_Z_UTC, t0, TT_FOLD_FIRST, t0, t0 + TT_RR_SPAN + 1, 10, o[0..16]) == TT_BAD;
+    assert tt_rr_expand("FREQ=MONTHLY", TT_Z_UTC, t0, TT_FOLD_FIRST, t0, t0 + 86400, 10, o[0..16]) == TT_BAD;
+    assert tt_rr_expand("FREQ=DAILY", 5, t0, TT_FOLD_FIRST, t0, t0 + 86400, 10, o[0..16]) == TT_BAD;
+}
+
+test rrule_is_deterministic_and_next_works {
+    var a : [8]u64 = undefined;
+    var b : [8]u64 = undefined;
+    const dt : u64 = tt_epoch_from(2026, 3, 27, 2, 30, 0);
+    const to : u64 = tt_epoch_from(2026, 4, 5, 0, 0, 0);
+    const n1 : u64 = tt_rr_expand("FREQ=DAILY", TT_Z_BERLIN, dt, TT_FOLD_FIRST, dt - 7200, to, 8, a[0..8]);
+    const n2 : u64 = tt_rr_expand("FREQ=DAILY", TT_Z_BERLIN, dt, TT_FOLD_FIRST, dt - 7200, to, 8, b[0..8]);
+    assert n1 == 8;
+    assert n2 == 8;
+    assert a[0] == b[0] and a[3] == b[3] and a[7] == b[7];
+    assert tt_rr_next("FREQ=DAILY", TT_Z_BERLIN, dt, TT_FOLD_FIRST, a[1]) == a[2];
+    assert tt_rr_next("FREQ=DAILY;COUNT=1", TT_Z_BERLIN, dt, TT_FOLD_FIRST, a[0]) == TT_BAD;
+}
+
+test time_events_are_valid_t27l_lines {
+    var p : [320]u8 = undefined;
+    var ln : [2048]u8 = undefined;
+    const pn : usize = tt_sched_payload(p[0..320], "nightly-1", 1767225600, 1767229200, TT_PH_FAST, TT_MP_SKIP);
+    assert bytes_eq(p[0..pn], "schedule_id=nightly-1 fired_at=2026-01-01T00:00:00Z next_fire=2026-01-01T01:00:00Z golden_phase=fast missed_run_policy=skip");
+    assert tt_sched_payload(p[0..320], "bad id", 1, 2, 0, 1) == 0;
+    assert tt_sched_payload(p[0..320], "x@y", 1, 2, 0, 1) == 0;
+    assert tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, 100, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, 104, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, 84, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, TT_ACT_SCHED_SKIPPED, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, TT_ACT_CRIT_BYPASS, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert TL_SURFACE_LAST >= 15 and TL_ACTION_LAST >= 107;
+    const n1 : usize = tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, TT_ACT_SCHED_FIRED, 2, TL_T_TR, TL_T_SP, "", p[0..pn]);
+    assert n1 > 0;
+    assert tl_validate_line(ln[0..n1]) == TL_OK;
+    const sn : usize = tt_skip_payload(p[0..320], "nightly-1", 1767225600, 7);
+    assert bytes_eq(p[0..sn], "schedule_id=nightly-1 skipped_at=2026-01-01T00:00:00Z reason=lock_held owner_node=7");
+    const n2 : usize = tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, TT_ACT_SCHED_SKIPPED, 3, TL_T_TR, TL_T_SP2, TL_T_SP, p[0..sn]);
+    assert n2 > 0;
+    assert tl_validate_line(ln[0..n2]) == TL_OK;
+    const bn : usize = tt_bypass_payload(p[0..320], "security_incident");
+    const n3 : usize = tt_event(ln[0..2048], TT_T_EV, TT_T_TS, "mac-1", "sess-1", 3, TT_ACT_CRIT_BYPASS, 4, TL_T_TR, TL_T_SP, "", p[0..bn]);
+    assert n3 > 0;
+    assert tl_validate_line(ln[0..n3]) == TL_OK;
+    const gn : usize = tt_golden_payload(p[0..320], 3600, TT_PH_SLOW);
+    assert bytes_eq(p[0..gn], "base_s=3600 golden_phase=slow interval_s=9425 cycle_s=10800");
+    assert tt_golden_payload(p[0..320], 0, TT_PH_SLOW) == 0;
+    const bp : usize = tt_bypass_payload(p[0..320], "disk_full");
+    assert bytes_eq(p[0..bp], "priority=critical escalate=owner queued=false reason=disk_full");
+}
+
+test cli_id_table_and_arguments {
+    assert tt_cli_id("now") == 1;
+    assert tt_cli_id("timezone set") == 4;
+    assert tt_cli_id("schedule delete") == 10;
+    assert tt_cli_id("golden schedule") == TT_CLI_LAST;
+    assert tt_cli_id("golden nothing") == 0;
+    assert bytes_eq(tt_cli_name(13), "recurrence expand");
+    assert tt_cli_name(TT_CLI_LAST + 1).len == 0;
+    assert tt_cli_needs_confirm(10);
+    assert !tt_cli_needs_confirm(8);
+    assert tt_cli_arg_ok("Europe/Berlin");
+    assert tt_cli_arg_ok("FREQ=DAILY;BYHOUR=2");
+    assert !tt_cli_arg_ok("sk-abcdefgh12345678");
+}
+
+test menu_panel_payload {
+    var b : [320]u8 = undefined;
+    const n : usize = tt_panel_payload(b[0..320], TT_Z_UTC, 1767225600, 120, 1767226500, 1767227400, 0);
+    assert bytes_eq(b[0..n], "wall=2026-01-01T00:00:00Z local=2026-01-01T00:00:00+00:00 zone=UTC mono_s=120 next=2026-01-01T00:15:00Z next2=2026-01-01T00:30:00Z missed=0");
+    assert tt_panel_payload(b[0..320], 9, 1, 1, 1, 1, 1) == 0;
+}
+

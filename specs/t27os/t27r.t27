@@ -1,0 +1,1466 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/t27r.t27 -- T27R, the research layer: a knowledge base of topics, sources, notes, syntheses,
+; evidence and decisions, kept as a line-based corpus and checked by pure functions (owner order
+; T27R_RESEARCH_LAYER, 2026-11-08, mode C5_DM_LIFECYCLE). Sibling of specs/t27os/t27l.t27, whose event lines it emits.
+; -
+; The corpus is text: lines joined by byte 10, fields joined by byte 124. Six line kinds, one per layer:
+;   T|t-slug|question|scope
+;   S|id|type|status|year|title|authors|venue|address|tags            (a raw source: immutable once added)
+;   G|source|tag                                                     (one more tag on a source)
+;   N|nK|vK|date|source|topic|confidence|locator|claim              (one claim, one locator, one source)
+;   Y|yK|vK|date|topic|type|notes-csv|agree|disagree|gaps|limits    (a synthesis over at least two notes)
+;   D|dK|date|topic|decision|sources-csv|synth-or-dash|rationale|rollback
+; A claim is traceable: note -> source (verified or metadata, never unverified) -> address; synthesis -> notes;
+; decision -> sources and synthesis. A line is checked against the corpus BEFORE it (tr_check_line), so a corpus is
+; valid when every line is valid in order (tr_check_corpus). ATOMICITY_RULE: one note per item, one locator per note,
+; no bulk claim ("all papers ...") without per-item traceability.
+; -
+; Search comes after the core: tr_search is a plain case-folded substring scan over the latest version of every layer.
+; No vector index, no vector DB first; add one only after the core is proven and measured.
+; -
+; Stages of the C5-DM lifecycle (conceptualize, collect, curate, control, consume) are named by tr_stage_name. The
+; source for them, pmc:PMC13732382, is UNVERIFIED: the page served a CAPTCHA and was not bypassed (target/t27r/research.md
+; item 1), so no claim in the seed is attributed to it and it is used only as a negative control.
+; -
+; NOT BUILT: the `tri t27r` CLI. tr_cmd_id, tr_cmd_writes and tr_arg_ok are its contract (twenty commands); no command
+; reads or writes a file today. Raw sources are never deleted, so "source delete" has no id.
+; Events go to the T27L stream on surface 13 (research) with actions 58..67; a payload is a kind word and an id, never text.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osT27r;
+
+use t27os::t27l::tl_event_line;
+use t27os::t27l::tl_validate_line;
+use t27os::t27l::tl_text_safe;
+use t27os::t27l::tl_arg_ok;
+use t27os::t27l::TL_OK;
+use t27os::t27l::TL_T_TR;
+use t27os::t27l::TL_T_SP;
+use t27os::t27l::TL_T_EV1;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use queen::agent_registry::ar_fingerprint;
+use std::mem::bytes_eq;
+use std::mem::bytes_starts_with;
+
+; --- 1. Codes and kinds ---
+
+pub const TR_E_OK : u8 = 0;
+pub const TR_E_KIND : u8 = 1;
+pub const TR_E_FIELDS : u8 = 2;
+pub const TR_E_ID : u8 = 3;
+pub const TR_E_TYPE : u8 = 4;
+pub const TR_E_STATUS : u8 = 5;
+pub const TR_E_TEXT : u8 = 6;
+pub const TR_E_LOCATOR : u8 = 7;
+pub const TR_E_NO_SOURCE : u8 = 8;
+pub const TR_E_UNVERIFIED : u8 = 9;
+pub const TR_E_NOTE : u8 = 10;
+pub const TR_E_TOPIC : u8 = 11;
+pub const TR_E_DUP : u8 = 12;
+pub const TR_E_IMMUTABLE : u8 = 13;
+pub const TR_E_VERSION : u8 = 14;
+pub const TR_E_BULK : u8 = 15;
+pub const TR_E_SECTIONS : u8 = 16;
+pub const TR_E_ROLLBACK : u8 = 17;
+pub const TR_E_RATIONALE : u8 = 18;
+pub const TR_E_SECRET : u8 = 19;
+pub const TR_E_CONFIDENCE : u8 = 20;
+pub const TR_E_YEAR : u8 = 21;
+pub const TR_E_SYNTH : u8 = 22;
+pub const TR_E_DATE : u8 = 23;
+pub const TR_E_DISPUTED : u8 = 24;
+pub const TR_E_VERIFIER : u8 = 25;
+
+/// Kind bytes: T topic, S source, G tag, N note, Y synthesis, D decision, P provenance.
+pub const TR_K_P : u8 = 80;
+pub const TR_K_T : u8 = 84;
+pub const TR_K_S : u8 = 83;
+pub const TR_K_G : u8 = 71;
+pub const TR_K_N : u8 = 78;
+pub const TR_K_Y : u8 = 89;
+pub const TR_K_D : u8 = 68;
+
+/// Facets for tr_facet.
+pub const TR_F_TOPIC : u8 = 1;
+pub const TR_F_TAG : u8 = 2;
+pub const TR_F_AUTHOR : u8 = 3;
+pub const TR_F_YEAR : u8 = 4;
+pub const TR_F_DATE : u8 = 5;
+
+/// The T27L surface of the research layer and the number of CLI commands.
+pub const TR_SURFACE : u8 = 13;
+pub const TR_CMD_COUNT : u8 = 20;
+
+; --- 2. Byte helpers ---
+
+/// ASCII lower case of one byte.
+pub fn tr_fold(b: u8) -> u8 {
+    if (b < 65 or b > 90) { return b; }
+    return b + 32;
+}
+
+/// True for an ASCII digit.
+pub fn tr_dg(b: u8) -> bool {
+    if (b < 48) { return false; }
+    return b < 58;
+}
+
+fn tr_hexc(n: u64) -> u8 {
+    if (n > 9) { return @intCast(n + 87); }
+    return @intCast(n + 48);
+}
+
+/// Write 16 lower-case hex digits of v at `at`; returns the position after them.
+pub fn tr_put_hex(out: []u8, at: usize, v: u64) -> usize {
+    var rest : u64 = v;
+    var pos : usize = at + 16;
+    while (pos > at) {
+        pos -= 1;
+        out[pos] = tr_hexc(rest % 16);
+        rest = rest / 16;
+    }
+    return at + 16;
+}
+
+/// Case-folded substring test; both sides are folded.
+pub fn tr_has_fold(hay: []const u8, needle: []const u8) -> bool {
+    if (needle.len == 0 or needle.len > hay.len) { return false; }
+    var i : usize = 0;
+    while (i + needle.len <= hay.len) {
+        var j : usize = 0;
+        while (j < needle.len and tr_fold(hay[i + j]) == tr_fold(needle[j])) { j += 1; }
+        if (j == needle.len) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+/// s has between lo and hi bytes and every byte is a digit.
+pub fn tr_all_dg(s: []const u8, lo: usize, hi: usize) -> bool {
+    if (s.len < lo or s.len > hi) { return false; }
+    var k : usize = 0;
+    while (k < s.len) {
+        if (!tr_dg(s[k])) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// The decimal value of a digit run (callers check it with tr_all_dg first).
+pub fn tr_num(s: []const u8) -> usize {
+    var acc : usize = 0;
+    var k : usize = 0;
+    while (k < s.len) {
+        const d : usize = @intCast(s[k] - 48);
+        acc = acc * 10 + d;
+        k += 1;
+    }
+    return acc;
+}
+
+fn tr_slug_chars(s: []const u8, from: usize) -> bool {
+    var k : usize = from;
+    while (k < s.len) {
+        const c : u8 = s[k];
+        const ok : bool = (c >= 97 and c <= 122) or tr_dg(c) or c == 45;
+        if (!ok) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// A topic slug: "t-" then [a-z0-9-], 3 to 40 bytes in all.
+pub fn tr_slug_ok(s: []const u8) -> bool {
+    if (s.len < 3 or s.len > 40) { return false; }
+    if (!bytes_starts_with(s, "t-")) { return false; }
+    return tr_slug_chars(s, 2);
+}
+
+/// A tag: 1 to 24 bytes of [a-z0-9-].
+pub fn tr_tag_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > 24) { return false; }
+    return tr_slug_chars(s, 0);
+}
+
+/// An id made of one letter and 1 to 6 digits (n3, y2, d1).
+pub fn tr_id_ok(f: []const u8, letter: u8) -> bool {
+    if (f.len < 2 or f[0] != letter) { return false; }
+    return tr_all_dg(f[1..f.len], 1, 6);
+}
+
+/// The value of "vK" with K from 1; 0 when the field is not a version.
+pub fn tr_ver_parse(f: []const u8) -> usize {
+    if (f.len < 2 or f[0] != 118) { return 0; }
+    if (!tr_all_dg(f[1..f.len], 1, 6)) { return 0; }
+    return tr_num(f[1..f.len]);
+}
+
+/// YYYY-MM-DD with a month 01..12 and a day 01..31.
+pub fn tr_date_ok(s: []const u8) -> bool {
+    if (s.len != 10 or s[4] != 45 or s[7] != 45) { return false; }
+    if (!tr_all_dg(s[0..4], 4, 4) or !tr_all_dg(s[5..7], 2, 2) or !tr_all_dg(s[8..10], 2, 2)) { return false; }
+    const mo : usize = tr_num(s[5..7]);
+    const dy : usize = tr_num(s[8..10]);
+    return mo >= 1 and mo <= 12 and dy >= 1 and dy <= 31;
+}
+
+/// "-" or four digits starting with 1 or 2.
+pub fn tr_year_ok(s: []const u8) -> bool {
+    if (bytes_eq(s, "-")) { return true; }
+    if (!tr_all_dg(s, 4, 4)) { return false; }
+    return s[0] == 49 or s[0] == 50;
+}
+
+/// Number of space-separated words in s.
+pub fn tr_words(s: []const u8) -> usize {
+    var n : usize = 0;
+    var inside : bool = false;
+    var k : usize = 0;
+    while (k < s.len) {
+        if (s[k] == 32) {
+            inside = false;
+        } else if (!inside) {
+            inside = true;
+            n += 1;
+        }
+        k += 1;
+    }
+    return n;
+}
+
+; --- 3. Fields, lists and lines ---
+
+/// Number of fields of a line (one more than the count of byte 124).
+pub fn tr_nfields(line: []const u8) -> usize {
+    var n : usize = 1;
+    var k : usize = 0;
+    while (k < line.len) {
+        if (line[k] == 124) { n += 1; }
+        k += 1;
+    }
+    return n;
+}
+
+/// Field number idx (0 is the kind) as a slice of line; empty when there is no such field.
+pub fn tr_field(line: []const u8, idx: usize) -> []const u8 {
+    var start : usize = 0;
+    var seen : usize = 0;
+    var p : usize = 0;
+    while (p < line.len) {
+        if (line[p] == 124) {
+            if (seen == idx) { return line[start..p]; }
+            seen += 1;
+            start = p + 1;
+        }
+        p += 1;
+    }
+    if (seen == idx) { return line[start..line.len]; }
+    return line[0..0];
+}
+
+/// Number of comma-separated items (0 for an empty list).
+pub fn tr_csv_count(s: []const u8) -> usize {
+    if (s.len == 0) { return 0; }
+    var n : usize = 1;
+    var k : usize = 0;
+    while (k < s.len) {
+        if (s[k] == 44) { n += 1; }
+        k += 1;
+    }
+    return n;
+}
+
+/// Item number idx of a comma list; empty when there is none.
+pub fn tr_csv_item(s: []const u8, idx: usize) -> []const u8 {
+    var start : usize = 0;
+    var seen : usize = 0;
+    var p : usize = 0;
+    while (p < s.len) {
+        if (s[p] == 44) {
+            if (seen == idx) { return s[start..p]; }
+            seen += 1;
+            start = p + 1;
+        }
+        p += 1;
+    }
+    if (seen == idx) { return s[start..s.len]; }
+    return s[0..0];
+}
+
+/// The comma list holds `item` exactly.
+pub fn tr_csv_has(s: []const u8, item: []const u8) -> bool {
+    const n : usize = tr_csv_count(s);
+    var k : usize = 0;
+    while (k < n) {
+        if (bytes_eq(tr_csv_item(s, k), item)) { return true; }
+        k += 1;
+    }
+    return false;
+}
+
+/// The position of the next byte 10 at or after `from`, or buf.len.
+pub fn tr_eol(buf: []const u8, from: usize) -> usize {
+    var q : usize = from;
+    while (q < buf.len and buf[q] != 10) { q += 1; }
+    return q;
+}
+
+/// Number of non-empty lines.
+pub fn tr_count_lines(corpus: []const u8) -> usize {
+    var n : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p) { n += 1; }
+        p = e + 1;
+    }
+    return n;
+}
+
+/// The start position of non-empty line number n (from 0); corpus.len when there is none.
+pub fn tr_line_start(corpus: []const u8, n: usize) -> usize {
+    var seen : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p) {
+            if (seen == n) { return p; }
+            seen += 1;
+        }
+        p = e + 1;
+    }
+    return corpus.len;
+}
+
+/// The last line of `kind` whose field idx equals key, as start + 1; 0 when there is none.
+pub fn tr_find(pre: []const u8, kind: u8, idx: usize, key: []const u8) -> usize {
+    var hit : usize = 0;
+    var p : usize = 0;
+    while (p < pre.len) {
+        const e : usize = tr_eol(pre, p);
+        if (e > p + 1 and pre[p] == kind and pre[p + 1] == 124) {
+            if (bytes_eq(tr_field(pre[p..e], idx), key)) { hit = p + 1; }
+        }
+        p = e + 1;
+    }
+    return hit;
+}
+
+/// The line that a tr_find result points at; empty for 0.
+pub fn tr_line_from(pre: []const u8, found: usize) -> []const u8 {
+    if (found == 0) { return pre[0..0]; }
+    return pre[found - 1..tr_eol(pre, found - 1)];
+}
+
+/// The last line of kind whose id (field 1) is key; empty when there is none. For notes and syntheses the last line is the latest version.
+pub fn tr_get(pre: []const u8, kind: u8, key: []const u8) -> []const u8 {
+    return tr_line_from(pre, tr_find(pre, kind, 1, key));
+}
+
+/// The highest version of an id among the lines of kind; 0 when the id is new.
+pub fn tr_max_ver(pre: []const u8, kind: u8, id: []const u8) -> usize {
+    var best : usize = 0;
+    var p : usize = 0;
+    while (p < pre.len) {
+        const e : usize = tr_eol(pre, p);
+        if (e > p + 1 and pre[p] == kind and pre[p + 1] == 124) {
+            const ln : []const u8 = pre[p..e];
+            if (bytes_eq(tr_field(ln, 1), id)) {
+                const v : usize = tr_ver_parse(tr_field(ln, 2));
+                if (v > best) { best = v; }
+            }
+        }
+        p = e + 1;
+    }
+    return best;
+}
+
+/// The next version number of an id: the synthesis contract tr_y_next and the note twin share this.
+pub fn tr_next_ver(corpus: []const u8, kind: u8, id: []const u8) -> usize {
+    return tr_max_ver(corpus, kind, id) + 1;
+}
+
+/// The next version of a synthesis id (1 for a new id).
+pub fn tr_y_next(corpus: []const u8, id: []const u8) -> usize {
+    return tr_next_ver(corpus, TR_K_Y, id);
+}
+
+/// No line after position e (the end of a line) has the same kind and id: this line is the latest version.
+pub fn tr_latest_at(corpus: []const u8, e: usize, kind: u8, id: []const u8) -> bool {
+    return tr_find(corpus[e..corpus.len], kind, 1, id) == 0;
+}
+
+/// The latest decision of a topic as a tr_find result (start + 1); 0 when the topic has none.
+pub fn tr_latest_decision(corpus: []const u8, topic: []const u8) -> usize {
+    return tr_find(corpus, TR_K_D, 3, topic);
+}
+
+; --- 4. Text, secrets and bulk ---
+
+/// A claim or text that names every paper at once: refused, there is no per-item traceability.
+pub fn tr_bulk(s: []const u8) -> bool {
+    var k : usize = 0;
+    while (k < s.len) {
+        if (s[k] == 42) { return true; }
+        k += 1;
+    }
+    return tr_has_fold(s, "all papers") or tr_has_fold(s, "process all") or tr_has_fold(s, "every paper") or tr_has_fold(s, "all sources");
+}
+
+/// SECRET for a key, env secret, home path, e-mail or auth header; BULK for a bulk phrase; else OK. Empty text passes.
+pub fn tr_free(s: []const u8) -> u8 {
+    if (!tl_text_safe(s)) { return TR_E_SECRET; }
+    if (tr_bulk(s)) { return TR_E_BULK; }
+    return TR_E_OK;
+}
+
+/// A required free text: empty is TEXT, else tr_free.
+pub fn tr_need(s: []const u8) -> u8 {
+    if (s.len == 0) { return TR_E_TEXT; }
+    return tr_free(s);
+}
+
+/// A locator: q: and 1 to 14 words, or p. and a digit, or sec , tab , fig ; 3 to 120 bytes; no comma, no semicolon.
+pub fn tr_locator_ok(s: []const u8) -> bool {
+    if (s.len < 3 or s.len > 120) { return false; }
+    var k : usize = 0;
+    while (k < s.len) {
+        if (s[k] == 44 or s[k] == 59) { return false; }
+        k += 1;
+    }
+    if (bytes_starts_with(s, "q:")) {
+        const w : usize = tr_words(s[2..s.len]);
+        return w >= 1 and w <= 14;
+    }
+    if (bytes_starts_with(s, "p.")) { return tr_dg(s[2]); }
+    if (s.len < 5) { return false; }
+    return bytes_starts_with(s, "sec ") or bytes_starts_with(s, "tab ") or bytes_starts_with(s, "fig ");
+}
+
+; --- 5. Sources ---
+
+fn tr_tail_ok(t: []const u8) -> bool {
+    if (t.len < 3) { return false; }
+    var k : usize = 0;
+    while (k < t.len) {
+        if (t[k] == 32) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// The address a source id stands for, written into out; 0 for an unknown scheme or a bad tail.
+/// doi: arxiv: pmc: rfc: gh: are built here; url: ids are checked against their address in tr_id_addr_ok.
+pub fn tr_expect_addr(out: []u8, id: []const u8) -> usize {
+    if (id.len < 5 or id.len > 100 or out.len < id.len + 64) { return 0; }
+    var cut : usize = 0;
+    var head : []const u8 = "";
+    var post : []const u8 = "";
+    if (bytes_starts_with(id, "doi:")) {
+        cut = 4;
+        head = "https://doi.org/";
+    } else if (bytes_starts_with(id, "arxiv:")) {
+        cut = 6;
+        head = "https://arxiv.org/abs/";
+    } else if (bytes_starts_with(id, "pmc:")) {
+        cut = 4;
+        head = "https://pmc.ncbi.nlm.nih.gov/articles/";
+        post = "/";
+    } else if (bytes_starts_with(id, "rfc:")) {
+        cut = 4;
+        head = "https://www.rfc-editor.org/rfc/rfc";
+        post = ".html";
+    } else if (bytes_starts_with(id, "gh:")) {
+        cut = 3;
+        head = "https://github.com/";
+    }
+    if (cut == 0) { return 0; }
+    const tail : []const u8 = id[cut..id.len];
+    if (!tr_tail_ok(tail)) { return 0; }
+    if (bytes_starts_with(id, "rfc:") and !tr_all_dg(tail, 1, 5)) { return 0; }
+    var o : usize = put_bytes(out, 0, head);
+    o = put_bytes(out, o, tail);
+    return put_bytes(out, o, post);
+}
+
+/// The id fits the address: the scheme rule, or "url:" and 16 lower hex digits of ar_fingerprint(address).
+pub fn tr_id_addr_ok(id: []const u8, addr: []const u8) -> bool {
+    if (bytes_starts_with(id, "url:")) {
+        if (id.len != 20) { return false; }
+        var hb : [16]u8 = undefined;
+        const w : usize = tr_put_hex(hb[0..16], 0, ar_fingerprint(addr));
+        return w == 16 and bytes_eq(id[4..20], hb[0..16]);
+    }
+    var eb : [400]u8 = undefined;
+    const en : usize = tr_expect_addr(eb[0..400], id);
+    if (en == 0) { return false; }
+    return bytes_eq(eb[0..en], addr);
+}
+
+/// https, 12 to 300 bytes, no space, no query, passes tl_text_safe.
+pub fn tr_addr_ok(a: []const u8) -> bool {
+    if (a.len < 12 or a.len > 300) { return false; }
+    if (!bytes_starts_with(a, "https://")) { return false; }
+    var k : usize = 0;
+    while (k < a.len) {
+        if (a[k] == 32 or a[k] == 63) { return false; }
+        k += 1;
+    }
+    return tl_text_safe(a);
+}
+
+fn tr_check_s(pre: []const u8, line: []const u8) -> u8 {
+    if (tr_nfields(line) != 10) { return TR_E_FIELDS; }
+    const id : []const u8 = tr_field(line, 1);
+    const kind : []const u8 = tr_field(line, 2);
+    const status : []const u8 = tr_field(line, 3);
+    const addr : []const u8 = tr_field(line, 8);
+    const is_kind : bool = bytes_eq(kind, "paper") or bytes_eq(kind, "preprint") or bytes_eq(kind, "web") or bytes_eq(kind, "repo") or bytes_eq(kind, "standard");
+    if (!is_kind) { return TR_E_TYPE; }
+    if (!(bytes_eq(status, "verified") or bytes_eq(status, "metadata") or bytes_eq(status, "unverified") or bytes_eq(status, "disputed"))) { return TR_E_STATUS; }
+    if (!tr_year_ok(tr_field(line, 4))) { return TR_E_YEAR; }
+    if (!tr_addr_ok(addr)) { return TR_E_TEXT; }
+    if (id.len > 100 or !tr_id_addr_ok(id, addr)) { return TR_E_ID; }
+    var f : usize = 5;
+    while (f < 10) {
+        if (f == 5 or f == 8) {
+            const c : u8 = tr_need(tr_field(line, f));
+            if (c != TR_E_OK) { return c; }
+        } else if (f != 8) {
+            const c2 : u8 = tr_free(tr_field(line, f));
+            if (c2 != TR_E_OK) { return c2; }
+        }
+        f += 1;
+    }
+    if (tr_find(pre, TR_K_S, 1, id) > 0) { return TR_E_IMMUTABLE; }
+    return TR_E_OK;
+}
+
+; --- 6. Topics and tags ---
+
+fn tr_check_t(pre: []const u8, line: []const u8) -> u8 {
+    if (tr_nfields(line) != 4) { return TR_E_FIELDS; }
+    const slug : []const u8 = tr_field(line, 1);
+    if (!tr_slug_ok(slug)) { return TR_E_ID; }
+    const q : u8 = tr_need(tr_field(line, 2));
+    if (q != TR_E_OK) { return q; }
+    const sc : u8 = tr_need(tr_field(line, 3));
+    if (sc != TR_E_OK) { return sc; }
+    if (tr_find(pre, TR_K_T, 1, slug) > 0) { return TR_E_DUP; }
+    return TR_E_OK;
+}
+
+fn tr_check_g(pre: []const u8, line: []const u8) -> u8 {
+    if (tr_nfields(line) != 3) { return TR_E_FIELDS; }
+    if (tr_find(pre, TR_K_S, 1, tr_field(line, 1)) == 0) { return TR_E_NO_SOURCE; }
+    if (!tr_tag_ok(tr_field(line, 2))) { return TR_E_ID; }
+    return TR_E_OK;
+}
+
+; --- 7. Notes ---
+
+/// The source of a field is known and neither unverified nor disputed: OK, NO_SOURCE, UNVERIFIED or DISPUTED.
+pub fn tr_source_state(pre: []const u8, src: []const u8) -> u8 {
+    const at : usize = tr_find(pre, TR_K_S, 1, src);
+    if (at == 0) { return TR_E_NO_SOURCE; }
+    const st : []const u8 = tr_field(tr_line_from(pre, at), 3);
+    if (bytes_eq(st, "unverified")) { return TR_E_UNVERIFIED; }
+    if (bytes_eq(st, "disputed")) { return TR_E_DISPUTED; }
+    return TR_E_OK;
+}
+
+; --- 7b. Source provenance ---
+; P|source_id|retrieval_date|verifier|status|evidence_locator|confidence|tags (8 fields).
+; The T27L line for a recorded provenance is action source_provenance_recorded (131), see specs/t27os/t27l.t27.
+
+/// A provenance source id: a known scheme (doi: arxiv: pmc: rfc: gh: url: hash:) or an https:// address, no space, 5 to 200 bytes.
+pub fn tr_pid_ok(id: []const u8) -> bool {
+    if (id.len < 5 or id.len > 200) { return false; }
+    var cut : usize = 0;
+    if (bytes_starts_with(id, "doi:") or bytes_starts_with(id, "pmc:") or bytes_starts_with(id, "rfc:") or bytes_starts_with(id, "url:")) {
+        cut = 4;
+    } else if (bytes_starts_with(id, "arxiv:")) {
+        cut = 6;
+    } else if (bytes_starts_with(id, "hash:")) {
+        cut = 5;
+    } else if (bytes_starts_with(id, "gh:")) {
+        cut = 3;
+    } else if (bytes_starts_with(id, "https://")) {
+        cut = 8;
+    }
+    if (cut == 0) { return false; }
+    return tr_tail_ok(id[cut..id.len]);
+}
+
+/// A verifier: agent:<name> or human:<name>, name of 1 to 40 bytes without a space.
+pub fn tr_verifier_ok(v: []const u8) -> bool {
+    var cut : usize = 0;
+    if (bytes_starts_with(v, "agent:")) {
+        cut = 6;
+    } else if (bytes_starts_with(v, "human:")) {
+        cut = 6;
+    }
+    if (cut == 0 or v.len < cut + 1 or v.len > cut + 40) { return false; }
+    var k : usize = cut;
+    while (k < v.len) {
+        if (v[k] == 32) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+/// A confidence: an integer 0 to 100 (1 to 3 digits, no sign).
+pub fn tr_conf_int_ok(s: []const u8) -> bool {
+    if (!tr_all_dg(s, 1, 3)) { return false; }
+    return tr_num(s) <= 100;
+}
+
+fn tr_check_p(pre: []const u8, line: []const u8) -> u8 {
+    if (tr_nfields(line) != 8) { return TR_E_FIELDS; }
+    const status : []const u8 = tr_field(line, 4);
+    const loc : []const u8 = tr_field(line, 5);
+    if (!tr_pid_ok(tr_field(line, 1))) { return TR_E_ID; }
+    const ic : u8 = tr_free(tr_field(line, 1));
+    if (ic != TR_E_OK) { return ic; }
+    if (!tr_date_ok(tr_field(line, 2))) { return TR_E_DATE; }
+    if (!tr_verifier_ok(tr_field(line, 3))) { return TR_E_VERIFIER; }
+    if (!(bytes_eq(status, "verified") or bytes_eq(status, "unverified") or bytes_eq(status, "disputed"))) { return TR_E_STATUS; }
+    if (!tr_conf_int_ok(tr_field(line, 6))) { return TR_E_CONFIDENCE; }
+    if (bytes_eq(status, "verified") or loc.len > 0) {
+        if (!tr_locator_ok(loc)) { return TR_E_LOCATOR; }
+    }
+    const lc : u8 = tr_free(loc);
+    if (lc != TR_E_OK) { return lc; }
+    const tc : u8 = tr_free(tr_field(line, 7));
+    if (tc != TR_E_OK) { return tc; }
+    return TR_E_OK;
+}
+
+/// May the source back a note as a FACT: only when its S status is verified AND the latest P line for it says verified.
+/// Unverified, metadata-only and missing P are candidate-only (UNVERIFIED); disputed is DISPUTED; unknown is NO_SOURCE.
+pub fn tr_fact_state(pre: []const u8, src: []const u8) -> u8 {
+    const ss : u8 = tr_source_state(pre, src);
+    if (ss != TR_E_OK) { return ss; }
+    const sst : []const u8 = tr_field(tr_get(pre, TR_K_S, src), 3);
+    if (!bytes_eq(sst, "verified")) { return TR_E_UNVERIFIED; }
+    const pl : []const u8 = tr_line_from(pre, tr_find(pre, TR_K_P, 1, src));
+    if (pl.len == 0) { return TR_E_UNVERIFIED; }
+    const ps : []const u8 = tr_field(pl, 4);
+    if (bytes_eq(ps, "disputed")) { return TR_E_DISPUTED; }
+    if (!bytes_eq(ps, "verified")) { return TR_E_UNVERIFIED; }
+    return TR_E_OK;
+}
+
+/// Cite a source: as a candidate any known source passes (OK or NO_SOURCE); as a fact only tr_fact_state OK.
+pub fn tr_cite_state(pre: []const u8, src: []const u8, as_fact: bool) -> u8 {
+    if (as_fact) { return tr_fact_state(pre, src); }
+    if (tr_find(pre, TR_K_S, 1, src) == 0) { return TR_E_NO_SOURCE; }
+    return TR_E_OK;
+}
+
+fn tr_check_n(pre: []const u8, line: []const u8) -> u8 {
+    if (tr_nfields(line) != 9) { return TR_E_FIELDS; }
+    const id : []const u8 = tr_field(line, 1);
+    const vn : usize = tr_ver_parse(tr_field(line, 2));
+    const src : []const u8 = tr_field(line, 4);
+    const conf : []const u8 = tr_field(line, 6);
+    const loc : []const u8 = tr_field(line, 7);
+    if (!tr_id_ok(id, 110) or vn == 0) { return TR_E_ID; }
+    if (!tr_date_ok(tr_field(line, 3))) { return TR_E_DATE; }
+    if (!(bytes_eq(conf, "high") or bytes_eq(conf, "medium") or bytes_eq(conf, "low"))) { return TR_E_CONFIDENCE; }
+    if (!tr_locator_ok(loc)) { return TR_E_LOCATOR; }
+    const cl : u8 = tr_need(tr_field(line, 8));
+    if (cl != TR_E_OK) { return cl; }
+    const lc : u8 = tr_free(loc);
+    if (lc != TR_E_OK) { return lc; }
+    const ss : u8 = tr_source_state(pre, src);
+    if (ss != TR_E_OK) { return ss; }
+    if (tr_find(pre, TR_K_T, 1, tr_field(line, 5)) == 0) { return TR_E_TOPIC; }
+    const top : usize = tr_max_ver(pre, TR_K_N, id);
+    if (vn == 1) {
+        if (top != 0) { return TR_E_VERSION; }
+        return TR_E_OK;
+    }
+    if (vn != top + 1) { return TR_E_VERSION; }
+    if (!bytes_eq(tr_field(tr_get(pre, TR_K_N, id), 4), src)) { return TR_E_IMMUTABLE; }
+    return TR_E_OK;
+}
+
+; --- 8. Syntheses ---
+
+fn tr_notes_ok(pre: []const u8, topic: []const u8, csv: []const u8) -> bool {
+    const n : usize = tr_csv_count(csv);
+    if (n < 2) { return false; }
+    var k : usize = 0;
+    while (k < n) {
+        const nl : []const u8 = tr_get(pre, TR_K_N, tr_csv_item(csv, k));
+        if (nl.len == 0) { return false; }
+        if (!bytes_eq(tr_field(nl, 5), topic)) { return false; }
+        k += 1;
+    }
+    return true;
+}
+
+fn tr_section_ok(s: []const u8) -> bool {
+    return s.len > 0 and !bytes_eq(s, "-");
+}
+
+fn tr_check_y(pre: []const u8, line: []const u8) -> u8 {
+    if (tr_nfields(line) != 11) { return TR_E_FIELDS; }
+    const id : []const u8 = tr_field(line, 1);
+    const vn : usize = tr_ver_parse(tr_field(line, 2));
+    const topic : []const u8 = tr_field(line, 4);
+    const kind : []const u8 = tr_field(line, 5);
+    if (!tr_id_ok(id, 121) or vn == 0) { return TR_E_ID; }
+    if (!tr_date_ok(tr_field(line, 3))) { return TR_E_DATE; }
+    if (!(bytes_eq(kind, "review") or bytes_eq(kind, "competitor") or bytes_eq(kind, "gap") or bytes_eq(kind, "memo"))) { return TR_E_TYPE; }
+    if (tr_find(pre, TR_K_T, 1, topic) == 0) { return TR_E_TOPIC; }
+    if (!tr_notes_ok(pre, topic, tr_field(line, 6))) { return TR_E_NOTE; }
+    var f : usize = 7;
+    while (f < 11) {
+        if (!tr_section_ok(tr_field(line, f))) { return TR_E_SECTIONS; }
+        const c : u8 = tr_free(tr_field(line, f));
+        if (c != TR_E_OK) { return c; }
+        f += 1;
+    }
+    const top : usize = tr_max_ver(pre, TR_K_Y, id);
+    if (vn == 1) {
+        if (top != 0) { return TR_E_VERSION; }
+        return TR_E_OK;
+    }
+    if (vn != top + 1) { return TR_E_VERSION; }
+    if (!bytes_eq(tr_field(tr_get(pre, TR_K_Y, id), 4), topic)) { return TR_E_IMMUTABLE; }
+    return TR_E_OK;
+}
+
+; --- 9. Decisions ---
+
+fn tr_sources_state(pre: []const u8, csv: []const u8) -> u8 {
+    const n : usize = tr_csv_count(csv);
+    if (n == 0) { return TR_E_NO_SOURCE; }
+    var k : usize = 0;
+    while (k < n) {
+        const c : u8 = tr_source_state(pre, tr_csv_item(csv, k));
+        if (c != TR_E_OK) { return c; }
+        k += 1;
+    }
+    return TR_E_OK;
+}
+
+fn tr_check_d(pre: []const u8, line: []const u8) -> u8 {
+    if (tr_nfields(line) != 9) { return TR_E_FIELDS; }
+    const id : []const u8 = tr_field(line, 1);
+    const topic : []const u8 = tr_field(line, 3);
+    const syn : []const u8 = tr_field(line, 6);
+    if (!tr_id_ok(id, 100)) { return TR_E_ID; }
+    if (tr_find(pre, TR_K_D, 1, id) > 0) { return TR_E_DUP; }
+    if (!tr_date_ok(tr_field(line, 2))) { return TR_E_DATE; }
+    if (tr_find(pre, TR_K_T, 1, topic) == 0) { return TR_E_TOPIC; }
+    const dc : u8 = tr_need(tr_field(line, 4));
+    if (dc != TR_E_OK) { return dc; }
+    const ss : u8 = tr_sources_state(pre, tr_field(line, 5));
+    if (ss != TR_E_OK) { return ss; }
+    if (!bytes_eq(syn, "-")) {
+        const yl : []const u8 = tr_get(pre, TR_K_Y, syn);
+        if (yl.len == 0 or !bytes_eq(tr_field(yl, 4), topic)) { return TR_E_SYNTH; }
+    }
+    if (!tr_section_ok(tr_field(line, 7))) { return TR_E_RATIONALE; }
+    if (!tr_section_ok(tr_field(line, 8))) { return TR_E_ROLLBACK; }
+    const rc : u8 = tr_free(tr_field(line, 7));
+    if (rc != TR_E_OK) { return rc; }
+    return tr_free(tr_field(line, 8));
+}
+
+; --- 10. Checking a corpus ---
+
+/// Check one line against the corpus before it: pre is corpus[0..prefix_len]. TR_E_OK when the line is valid.
+pub fn tr_check_line(corpus: []const u8, prefix_len: usize, line: []const u8) -> u8 {
+    if (line.len < 2 or line[1] != 124) { return TR_E_KIND; }
+    const pre : []const u8 = corpus[0..prefix_len];
+    const k : u8 = line[0];
+    if (k == TR_K_T) { return tr_check_t(pre, line); }
+    if (k == TR_K_S) { return tr_check_s(pre, line); }
+    if (k == TR_K_G) { return tr_check_g(pre, line); }
+    if (k == TR_K_N) { return tr_check_n(pre, line); }
+    if (k == TR_K_Y) { return tr_check_y(pre, line); }
+    if (k == TR_K_D) { return tr_check_d(pre, line); }
+    if (k == TR_K_P) { return tr_check_p(pre, line); }
+    return TR_E_KIND;
+}
+
+/// The index (from 0) of the first bad line, or the line count when every line is valid.
+pub fn tr_first_bad(corpus: []const u8) -> usize {
+    var idx : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p) {
+            if (tr_check_line(corpus, p, corpus[p..e]) != TR_E_OK) { return idx; }
+            idx += 1;
+        }
+        p = e + 1;
+    }
+    return idx;
+}
+
+/// TR_E_OK for a valid corpus, else the code of the first bad line.
+pub fn tr_check_corpus(corpus: []const u8) -> u8 {
+    const bad : usize = tr_first_bad(corpus);
+    const at : usize = tr_line_start(corpus, bad);
+    if (at >= corpus.len) { return TR_E_OK; }
+    return tr_check_line(corpus, at, corpus[at..tr_eol(corpus, at)]);
+}
+
+; --- 11. Counts, search, facets, coverage ---
+
+/// Number of lines of one kind (every version).
+pub fn tr_count_kind(corpus: []const u8, kind: u8) -> usize {
+    var n : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p + 1 and corpus[p] == kind and corpus[p + 1] == 124) { n += 1; }
+        p = e + 1;
+    }
+    return n;
+}
+
+/// Number of distinct ids of one kind: only the latest version of each is counted.
+pub fn tr_count_latest(corpus: []const u8, kind: u8) -> usize {
+    var n : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p + 1 and corpus[p] == kind and corpus[p + 1] == 124) {
+            if (tr_latest_at(corpus, e, kind, tr_field(corpus[p..e], 1))) { n += 1; }
+        }
+        p = e + 1;
+    }
+    return n;
+}
+
+/// Lines (latest versions only) of any layer that hold q, case-folded. q is 2 to 64 bytes, text-safe and not bulk; else 0.
+/// This is a plain substring scan: search after the core, no vector DB first.
+pub fn tr_search(corpus: []const u8, q: []const u8) -> usize {
+    if (q.len < 2 or q.len > 64) { return 0; }
+    if (!tl_text_safe(q) or tr_bulk(q)) { return 0; }
+    var hits : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p + 2 and corpus[p + 1] == 124) {
+            const k : u8 = corpus[p];
+            const versioned : bool = k == TR_K_N or k == TR_K_Y;
+            const skip : bool = versioned and !tr_latest_at(corpus, e, k, tr_field(corpus[p..e], 1));
+            if (!skip and tr_has_fold(corpus[p + 2..e], q)) { hits += 1; }
+        }
+        p = e + 1;
+    }
+    return hits;
+}
+
+/// Count by one facet: TOPIC and DATE over the latest notes; TAG over source tags plus G lines; AUTHOR (folded
+/// substring) and YEAR over sources. value is 1 to 64 bytes and text-safe; an unknown facet or a bad value gives 0.
+pub fn tr_facet(corpus: []const u8, facet: u8, value: []const u8) -> usize {
+    if (value.len == 0 or value.len > 64 or !tl_text_safe(value)) { return 0; }
+    var hits : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p + 1 and corpus[p + 1] == 124) {
+            const ln : []const u8 = corpus[p..e];
+            const k : u8 = ln[0];
+            const note : bool = k == TR_K_N and tr_latest_at(corpus, e, k, tr_field(ln, 1));
+            if (facet == TR_F_TOPIC and note and bytes_eq(tr_field(ln, 5), value)) { hits += 1; }
+            if (facet == TR_F_DATE and note and bytes_eq(tr_field(ln, 3), value)) { hits += 1; }
+            if (facet == TR_F_TAG and k == TR_K_S and tr_csv_has(tr_field(ln, 9), value)) { hits += 1; }
+            if (facet == TR_F_TAG and k == TR_K_G and bytes_eq(tr_field(ln, 2), value)) { hits += 1; }
+            if (facet == TR_F_AUTHOR and k == TR_K_S and tr_has_fold(tr_field(ln, 6), value)) { hits += 1; }
+            if (facet == TR_F_YEAR and k == TR_K_S and bytes_eq(tr_field(ln, 4), value)) { hits += 1; }
+        }
+        p = e + 1;
+    }
+    return hits;
+}
+
+/// Evidence coverage in per mille: latest notes whose source is verified or metadata, over all latest notes; 0 when there are none.
+pub fn tr_coverage_pm(corpus: []const u8) -> usize {
+    var total : usize = 0;
+    var backed : usize = 0;
+    var p : usize = 0;
+    while (p < corpus.len) {
+        const e : usize = tr_eol(corpus, p);
+        if (e > p + 1 and corpus[p] == TR_K_N and corpus[p + 1] == 124) {
+            const ln : []const u8 = corpus[p..e];
+            if (tr_latest_at(corpus, e, TR_K_N, tr_field(ln, 1))) {
+                total += 1;
+                const st : []const u8 = tr_field(tr_get(corpus, TR_K_S, tr_field(ln, 4)), 3);
+                if (bytes_eq(st, "verified") or bytes_eq(st, "metadata")) { backed += 1; }
+            }
+        }
+        p = e + 1;
+    }
+    if (total == 0) { return 0; }
+    return backed * 1000 / total;
+}
+
+; --- 12. T27L events ---
+
+/// The T27L action of a valid line: 58 topic_created, 59 source_captured (a tag too), 61 or 62 note extracted or revised,
+/// 63 or 64 synthesis created or revised, 65 or 66 decision recorded or revisited; 0 for an unknown kind.
+pub fn tr_action_of(line: []const u8, is_revision: bool) -> u8 {
+    if (line.len < 2) { return 0; }
+    const k : u8 = line[0];
+    if (k == TR_K_T) { return 58; }
+    if (k == TR_K_S or k == TR_K_G) { return 59; }
+    if (k == TR_K_N) {
+        if (is_revision) { return 62; }
+        return 61;
+    }
+    if (k == TR_K_Y) {
+        if (is_revision) { return 64; }
+        return 63;
+    }
+    if (k == TR_K_D) {
+        if (is_revision) { return 66; }
+        return 65;
+    }
+    return 0;
+}
+
+/// The action for a refused line: 60 source_refused for a source, 67 evidence_refused for the other layers; 0 for an unknown kind.
+pub fn tr_refusal_action(line: []const u8) -> u8 {
+    if (line.len < 2) { return 0; }
+    const k : u8 = line[0];
+    if (k == TR_K_S) { return 60; }
+    if (k == TR_K_T or k == TR_K_G or k == TR_K_N or k == TR_K_Y or k == TR_K_D) { return 67; }
+    return 0;
+}
+
+/// The T27L payload: a kind word, a space and the id (field 1). Never text; 0 for an unknown kind or a short out.
+pub fn tr_payload(out: []u8, line: []const u8) -> usize {
+    if (line.len < 2 or out.len < 120) { return 0; }
+    const k : u8 = line[0];
+    var word : []const u8 = "";
+    if (k == TR_K_T) { word = "topic"; }
+    if (k == TR_K_S) { word = "source"; }
+    if (k == TR_K_G) { word = "tag"; }
+    if (k == TR_K_N) { word = "note"; }
+    if (k == TR_K_Y) { word = "synth"; }
+    if (k == TR_K_D) { word = "decision"; }
+    if (word.len == 0) { return 0; }
+    const id : []const u8 = tr_field(line, 1);
+    if (id.len == 0 or id.len > 100) { return 0; }
+    var o : usize = put_bytes(out, 0, word);
+    out[o] = 32;
+    o = put_bytes(out, o + 1, id);
+    return o;
+}
+
+fn tr_emit(out: []u8, event_id: []const u8, ts: []const u8, line: []const u8, act: u8, actor: u8, level: u8) -> usize {
+    if (act < 58 or act > 67) { return 0; }
+    var pl : [160]u8 = undefined;
+    const pn : usize = tr_payload(pl[0..160], line);
+    if (pn == 0) { return 0; }
+    return tl_event_line(out, event_id, ts, "mac-1", "sess-1", actor, TR_SURFACE, act, level, TL_T_TR, TL_T_SP, "", pl[0..pn], "");
+}
+
+/// One T27L line for an accepted corpus line; 0 on refusal (a revisited decision, action 66, needs level 3).
+pub fn tr_event(out: []u8, event_id: []const u8, ts: []const u8, line: []const u8, is_revision: bool, actor: u8, level: u8) -> usize {
+    return tr_emit(out, event_id, ts, line, tr_action_of(line, is_revision), actor, level);
+}
+
+/// One T27L line for a refused corpus line (60 or 67, both need level 3); 0 on refusal.
+pub fn tr_refusal_event(out: []u8, event_id: []const u8, ts: []const u8, line: []const u8, actor: u8, level: u8) -> usize {
+    return tr_emit(out, event_id, ts, line, tr_refusal_action(line), actor, level);
+}
+
+; --- 13. The tri t27r contract (NOT BUILT) ---
+
+/// Command id 1..20 for a command name; 0 for an unknown name. "source delete" is 0: raw sources are never deleted.
+pub fn tr_cmd_id(name: []const u8) -> u8 {
+    if (bytes_eq(name, "topic add")) { return 1; }
+    if (bytes_eq(name, "topic list")) { return 2; }
+    if (bytes_eq(name, "source add")) { return 3; }
+    if (bytes_eq(name, "source show")) { return 4; }
+    if (bytes_eq(name, "source list")) { return 5; }
+    if (bytes_eq(name, "note add")) { return 6; }
+    if (bytes_eq(name, "note revise")) { return 7; }
+    if (bytes_eq(name, "note list")) { return 8; }
+    if (bytes_eq(name, "synth add")) { return 9; }
+    if (bytes_eq(name, "synth revise")) { return 10; }
+    if (bytes_eq(name, "synth show")) { return 11; }
+    if (bytes_eq(name, "decision add")) { return 12; }
+    if (bytes_eq(name, "decision revisit")) { return 13; }
+    if (bytes_eq(name, "decision show")) { return 14; }
+    if (bytes_eq(name, "evidence check")) { return 15; }
+    if (bytes_eq(name, "search")) { return 16; }
+    if (bytes_eq(name, "facet")) { return 17; }
+    if (bytes_eq(name, "coverage")) { return 18; }
+    if (bytes_eq(name, "check")) { return 19; }
+    if (bytes_eq(name, "export")) { return 20; }
+    return 0;
+}
+
+/// The command appends a line to the corpus (add, revise, revisit); every other command only reads.
+pub fn tr_cmd_writes(id: u8) -> bool {
+    return id == 1 or id == 3 or id == 6 or id == 7 or id == 9 or id == 10 or id == 12 or id == 13;
+}
+
+/// A command argument is short and carries no key, env secret, e-mail or forbidden word.
+pub fn tr_arg_ok(word: []const u8) -> bool {
+    if (word.len > 200) { return false; }
+    return tl_arg_ok(word);
+}
+
+/// The five C5-DM areas, 1 to 5; empty outside. C5-DM itself is UNVERIFIED (page blocked), see the header.
+pub fn tr_stage_name(n: u8) -> []const u8 {
+    if (n == 1) { return "conceptualize"; }
+    if (n == 2) { return "collect"; }
+    if (n == 3) { return "curate"; }
+    if (n == 4) { return "control"; }
+    if (n == 5) { return "consume"; }
+    return "";
+}
+
+; --- 14. Seed corpus: three topics, ten sources, thirteen notes (twelve ids), three syntheses, two decisions ---
+; Sources are the verified entries of target/t27r/research.md, target/t27d/research.md and target/t27s/research.md;
+; pmc:PMC13732382 is the unverified negative control. Every claim is what the research file says; no invention.
+
+pub const TR_L01 : str = "T|t-research-kb|How do we keep a research knowledge base traceable from claim to source|T27R: topics, sources, notes, syntheses and decisions";
+pub const TR_L02 : str = "T|t-resource-doctor|How should a memory and swap doctor detect pressure and act safely|T27D: memory and swap health on the bench Mac";
+pub const TR_L03 : str = "T|t-breach-check|How can a secret custodian check compromised credentials without leaking them|T27S: breach checks and agent access to secrets";
+pub const TR_L04 : str = "S|doi:10.1145/3786149.3788301|paper|verified|2026|A Sustainable Data Extraction Documentation Process for Literature Studies|Angelika Kaplan, Marco Konersmann, Thomas Kuhn, Raffaela Mirandola, Ralf Reussner|WSESE 26, ICSE workshop, April 2026|https://doi.org/10.1145/3786149.3788301|literature,git";
+pub const TR_L05 : str = "S|gh:EurFelux/paper-manager|repo|verified|2026|paper-manager CLI|EurFelux|GitHub, MIT, TypeScript|https://github.com/EurFelux/paper-manager|cli,vector-search";
+pub const TR_L06 : str = "S|doi:10.1109/MC.2003.1160055|paper|verified|2003|The Vision of Autonomic Computing|J. O. Kephart, D. M. Chess|IEEE Computer 36(1), January 2003|https://doi.org/10.1109/MC.2003.1160055|autonomic,mape-k";
+pub const TR_L07 : str = "S|doi:10.1007/s00607-010-0107-y|paper|metadata|2011|A survey on self-healing systems: approaches and systems|H. Psaier, S. Dustdar|Computing 91, pp. 43-73, 2011|https://doi.org/10.1007/s00607-010-0107-y|self-healing";
+pub const TR_L08 : str = "S|arxiv:2501.06706|preprint|verified|2025|AIOpsLab: A Holistic Framework to Evaluate AI Agents for Enabling Autonomous Clouds|Y. Chen, M. Shetty, G. Somashekar, M. Ma, Y. Simmhan, J. Mace, C. Bansal, R. Wang, S. Rajmohan|arXiv, January 2025|https://arxiv.org/abs/2501.06706|aiops,agents";
+pub const TR_L09 : str = "S|arxiv:2407.12165|preprint|verified|2024|Building AI Agents for Autonomous Clouds: Challenges and Design Principles|M. Shetty, Y. Chen, G. Somashekar, M. Ma, Y. Simmhan, X. Zhang, J. Mace, D. Vandevoorde, P. Las-Casas, et al.|arXiv, July 2024|https://arxiv.org/abs/2407.12165|aiops,agents";
+pub const TR_L10 : str = "S|arxiv:1905.13737|preprint|verified|2019|Protocols for Checking Compromised Credentials|Li, Pal, Ali, Sullivan, Chatterjee, Ristenpart|arXiv, 2019|https://arxiv.org/abs/1905.13737|breach,k-anonymity";
+pub const TR_L11 : str = "S|rfc:9106|standard|verified|2021|Argon2 (RFC 9106)|Biryukov, Dinu, Khovratovich, Josefsson|RFC 9106, 2021|https://www.rfc-editor.org/rfc/rfc9106.html|argon2,kdf";
+pub const TR_L12 : str = "S|arxiv:2302.12173|preprint|verified|2023|Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection|Greshake, Abdelnabi, Mishra, Endres, Holz, Fritz|arXiv, 2023|https://arxiv.org/abs/2302.12173|prompt-injection,agents";
+pub const TR_L13 : str = "S|pmc:PMC13732382|paper|unverified|-|C5-DM framework (title not read)|-|-|https://pmc.ncbi.nlm.nih.gov/articles/PMC13732382/|c5-dm";
+pub const TR_L14 : str = "G|gh:EurFelux/paper-manager|local-first";
+pub const TR_L15 : str = "N|n1|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|The process uses a GitLab project as the foundation; the project bundles version control, issue tracking, wikis and access management";
+pub const TR_L16 : str = "N|n2|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.2|Each reviewer gets a branch and is assigned issues, one per included paper; instructions live in the GitLab wiki";
+pub const TR_L17 : str = "N|n3|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|medium|sec 2.4.1|The SLR Toolkit is a separate open-source Eclipse RCP tool by Sebastian Goetz and collaborators; the paper uses it for taxonomy-based classification";
+pub const TR_L18 : str = "N|n3|v2|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 2.4.1|The SLR Toolkit is a separate open-source Eclipse RCP tool by Sebastian Goetz and collaborators; the paper uses it for taxonomy-based classification and it is not the paper title";
+pub const TR_L19 : str = "N|n4|v1|2026-11-08|gh:EurFelux/paper-manager|t-research-kb|high|q:README intro|A CLI for managing academic papers with a knowledge base and vector search";
+pub const TR_L20 : str = "N|n5|v1|2026-11-08|gh:EurFelux/paper-manager|t-research-kb|high|q:README Features Local-first|Stores papers, knowledge bases and config locally in SQLite, FAISS and the filesystem with no cloud dependency";
+pub const TR_L21 : str = "N|n6|v1|2026-11-08|doi:10.1109/MC.2003.1160055|t-resource-doctor|high|q:self-managing systems|Frames self-managing systems (self-configuring, self-healing, self-optimizing, self-protecting) as the answer to management complexity";
+pub const TR_L22 : str = "N|n7|v1|2026-11-08|arxiv:2501.06706|t-resource-doctor|high|q:benchmark framework for LLM agents|A benchmark framework for LLM agents on detection, localization, root cause and mitigation";
+pub const TR_L23 : str = "N|n8|v1|2026-11-08|doi:10.1007/s00607-010-0107-y|t-resource-doctor|low|q:record page only|The record page was read but the abstract did not load; no claim about degraded states or human intervention is attributed";
+pub const TR_L24 : str = "N|n9|v1|2026-11-08|arxiv:2407.12165|t-resource-doctor|medium|q:design principles|Design principles for agents that run cloud operations; only the abstract was read";
+pub const TR_L25 : str = "N|n10|v1|2026-11-08|arxiv:1905.13737|t-breach-check|high|q:hash-prefix leakage|Hash-prefix leakage gave up to a 12x gain in remote guessing efficacy in some contexts; two stronger protocols are proposed";
+pub const TR_L26 : str = "N|n11|v1|2026-11-07|rfc:9106|t-breach-check|high|q:first recommended|First recommended: Argon2id with t 1, p 4, m 2^21 KiB (2 GiB), a 128-bit salt and a 256-bit tag";
+pub const TR_L27 : str = "N|n12|v1|2026-11-08|arxiv:2302.12173|t-breach-check|high|q:indirect prompt injection|Data an agent reads can carry instructions, so any text an agent sees is reachable by an attacker";
+pub const TR_L28 : str = "Y|y1|v1|2026-11-08|t-research-kb|competitor|n1,n2,n4|Both keep one item per paper under version control or a local store|The GitLab process is hosted while paper-manager is local-first|The C5-DM framework could not be read, so its claims are unsupported|Three notes from two sources";
+pub const TR_L29 : str = "Y|y1|v2|2026-11-08|t-research-kb|competitor|n1,n2,n4,n5|Both keep one item per paper under version control or a local store|The GitLab process is hosted while paper-manager is local-first|The C5-DM framework could not be read, so its claims are unsupported|Four notes from two sources";
+pub const TR_L30 : str = "Y|y2|v1|2026-11-08|t-resource-doctor|memo|n6,n7,n9|All three treat automated management as a response to operational complexity|Kephart and Chess describe a vision while the other two supply a benchmark and design principles|No source read here covers macOS memory pressure|Abstract-level reading only";
+pub const TR_L31 : str = "D|d1|2026-11-08|t-research-kb|Keep the corpus as a line-based file checked by pure functions; search after the core, no vector database first|gh:EurFelux/paper-manager,doi:10.1145/3786149.3788301|y1|Item-level records with a locator keep every claim traceable, and a vector index adds cost before the core is proven|Drop the check functions and fall back to the plain corpus file";
+pub const TR_L32 : str = "D|d2|2026-11-08|t-resource-doctor|Use one generic monitor, analyze, plan and execute loop with per-class rules|doi:10.1109/MC.2003.1160055,arxiv:2501.06706|y2|Autonomic computing frames self-management as one loop and AIOpsLab supplies a way to measure it|Revert to the observe-only doctor";
+
+/// Room for the seed corpus, and for lines tests add to it.
+pub const TR_BUF : usize = 12288;
+
+/// Append a line and byte 10 at `at`; returns the position after them.
+pub fn tr_add(out: []u8, at: usize, line: []const u8) -> usize {
+    const o : usize = put_bytes(out, at, line);
+    out[o] = 10;
+    return o + 1;
+}
+
+/// Write the 32 seed lines into out (at least TR_BUF bytes); returns the length, 0 when out is too small.
+pub fn tr_seed(out: []u8) -> usize {
+    if (out.len < TR_BUF) { return 0; }
+    var o : usize = tr_add(out, 0, TR_L01);
+    o = tr_add(out, o, TR_L02);
+    o = tr_add(out, o, TR_L03);
+    o = tr_add(out, o, TR_L04);
+    o = tr_add(out, o, TR_L05);
+    o = tr_add(out, o, TR_L06);
+    o = tr_add(out, o, TR_L07);
+    o = tr_add(out, o, TR_L08);
+    o = tr_add(out, o, TR_L09);
+    o = tr_add(out, o, TR_L10);
+    o = tr_add(out, o, TR_L11);
+    o = tr_add(out, o, TR_L12);
+    o = tr_add(out, o, TR_L13);
+    o = tr_add(out, o, TR_L14);
+    o = tr_add(out, o, TR_L15);
+    o = tr_add(out, o, TR_L16);
+    o = tr_add(out, o, TR_L17);
+    o = tr_add(out, o, TR_L18);
+    o = tr_add(out, o, TR_L19);
+    o = tr_add(out, o, TR_L20);
+    o = tr_add(out, o, TR_L21);
+    o = tr_add(out, o, TR_L22);
+    o = tr_add(out, o, TR_L23);
+    o = tr_add(out, o, TR_L24);
+    o = tr_add(out, o, TR_L25);
+    o = tr_add(out, o, TR_L26);
+    o = tr_add(out, o, TR_L27);
+    o = tr_add(out, o, TR_L28);
+    o = tr_add(out, o, TR_L29);
+    o = tr_add(out, o, TR_L30);
+    o = tr_add(out, o, TR_L31);
+    o = tr_add(out, o, TR_L32);
+    return o;
+}
+
+; --- 15. Tests ---
+
+pub const TR_T_URL : str = "https://www.designtokens.org/tr/drafts/format/";
+pub const TR_T_URL_TAIL : str = "|web|metadata|-|Design Tokens Format Module 2025.10|Louis Chenais, Kathleen McMahon|W3C Community Group|https://www.designtokens.org/tr/drafts/format/|tokens";
+pub const TR_T_N_OK : str = "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|A claim";
+
+test research_seed_passes_and_counts {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert sn > 0;
+    assert tr_check_corpus(sd[0..sn]) == TR_E_OK;
+    assert tr_first_bad(sd[0..sn]) == 32;
+    assert tr_count_lines(sd[0..sn]) == 32;
+    assert tr_count_kind(sd[0..sn], TR_K_T) == 3;
+    assert tr_count_kind(sd[0..sn], TR_K_S) == 10;
+    assert tr_count_kind(sd[0..sn], TR_K_G) == 1;
+    assert tr_count_kind(sd[0..sn], TR_K_N) == 13;
+    assert tr_count_kind(sd[0..sn], TR_K_Y) == 3;
+    assert tr_count_kind(sd[0..sn], TR_K_D) == 2;
+    assert tr_count_latest(sd[0..sn], TR_K_N) == 12;
+    assert tr_count_latest(sd[0..sn], TR_K_Y) == 2;
+    assert tr_count_latest(sd[0..sn], TR_K_S) == 10;
+    assert tr_y_next(sd[0..sn], "y1") == 3;
+    assert tr_y_next(sd[0..sn], "y2") == 2;
+    assert tr_y_next(sd[0..sn], "y9") == 1;
+    assert tr_next_ver(sd[0..sn], TR_K_N, "n3") == 3;
+}
+
+test research_fields_and_lines {
+    assert tr_nfields("a|b|c") == 3;
+    assert tr_nfields("abc") == 1;
+    assert bytes_eq(tr_field("N|n1|v1", 1), "n1");
+    assert bytes_eq(tr_field("N|n1|v1", 2), "v1");
+    assert tr_field("N|n1|v1", 5).len == 0;
+    assert tr_csv_count("n1,n2,n4") == 3;
+    assert tr_csv_count("") == 0;
+    assert bytes_eq(tr_csv_item("n1,n2,n4", 2), "n4");
+    assert tr_csv_has("n1,n2", "n2");
+    assert !tr_csv_has("n1,n22", "n2");
+    assert tr_words("one two  three") == 3;
+    assert tr_date_ok("2026-11-08");
+    assert !tr_date_ok("2026-13-01");
+    assert !tr_date_ok("2026/11/08");
+    assert tr_year_ok("-");
+    assert tr_year_ok("2019");
+    assert !tr_year_ok("3019");
+    assert !tr_year_ok("20x6");
+    assert tr_has_fold("The GitLab wiki", "GITLAB");
+    assert !tr_has_fold("short", "much longer needle");
+}
+
+test research_hex_and_url_ids {
+    var hx : [16]u8 = undefined;
+    const w : usize = tr_put_hex(hx[0..16], 0, 255);
+    assert w == 16;
+    assert bytes_eq(hx[0..16], "00000000000000ff");
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    var ln : [500]u8 = undefined;
+    var o : usize = put_bytes(ln[0..500], 0, "S|url:");
+    o = tr_put_hex(ln[0..500], o, ar_fingerprint(TR_T_URL));
+    o = put_bytes(ln[0..500], o, TR_T_URL_TAIL);
+    assert tr_check_line(sd[0..sn], sn, ln[0..o]) == TR_E_OK;
+    var bad : [500]u8 = undefined;
+    var q : usize = put_bytes(bad[0..500], 0, "S|url:0000000000000000");
+    q = put_bytes(bad[0..500], q, TR_T_URL_TAIL);
+    assert tr_check_line(sd[0..sn], sn, bad[0..q]) == TR_E_ID;
+}
+
+test research_source_negative_controls {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_check_line(sd[0..sn], sn, TR_L04) == TR_E_IMMUTABLE;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|verified|2020|A title|An author|A venue|https://doi.org/10.5555/12345678|x") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|blog|verified|2020|A title|An author|A venue|https://doi.org/10.5555/12345678|x") == TR_E_TYPE;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|maybe|2020|A title|An author|A venue|https://doi.org/10.5555/12345678|x") == TR_E_STATUS;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|verified|20x0|A title|An author|A venue|https://doi.org/10.5555/12345678|x") == TR_E_YEAR;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|verified|2020|A title|An author|A venue|http://doi.org/10.5555/12345678|x") == TR_E_TEXT;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|verified|2020|A title|An author|A venue|https://doi.org/10.5555/other|x") == TR_E_ID;
+    assert tr_check_line(sd[0..sn], sn, "S|ftp:1234567|paper|verified|2020|A title|An author|A venue|https://doi.org/10.5555/other|x") == TR_E_ID;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|verified|2020||An author|A venue|https://doi.org/10.5555/12345678|x") == TR_E_TEXT;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|verified|2020|A title|An author|A venue|https://doi.org/10.5555/12345678|API_KEY=abc123") == TR_E_SECRET;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|verified|2020|A title|An author") == TR_E_FIELDS;
+    assert tr_check_line(sd[0..sn], sn, "S|rfc:8693|standard|verified|2020|OAuth 2.0 Token Exchange|Jones et al.|RFC 8693|https://www.rfc-editor.org/rfc/rfc8693.html|oauth") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "Q|a|b") == TR_E_KIND;
+    assert tr_check_line(sd[0..sn], sn, "x") == TR_E_KIND;
+}
+
+test research_topic_and_tag_controls {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_check_line(sd[0..sn], sn, "T|t-new-topic|A question|A scope") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "T|t-research-kb|A question|A scope") == TR_E_DUP;
+    assert tr_check_line(sd[0..sn], sn, "T|T-Bad|A question|A scope") == TR_E_ID;
+    assert tr_check_line(sd[0..sn], sn, "T|t-|A question|A scope") == TR_E_ID;
+    assert tr_check_line(sd[0..sn], sn, "T|t-new-topic|A question") == TR_E_FIELDS;
+    assert tr_check_line(sd[0..sn], sn, "T|t-new-topic||A scope") == TR_E_TEXT;
+    assert tr_check_line(sd[0..sn], sn, "G|rfc:9106|kdf-default") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "G|rfc:0000|kdf-default") == TR_E_NO_SOURCE;
+    assert tr_check_line(sd[0..sn], sn, "G|rfc:9106|Bad Tag") == TR_E_ID;
+}
+
+test research_note_negative_controls {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_check_line(sd[0..sn], sn, TR_T_N_OK) == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|pmc:PMC13732382|t-research-kb|high|sec 3.1|A claim") == TR_E_UNVERIFIED;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.0000/none|t-research-kb|high|sec 3.1|A claim") == TR_E_NO_SOURCE;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-nope|high|sec 3.1|A claim") == TR_E_TOPIC;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|certain|sec 3.1|A claim") == TR_E_CONFIDENCE;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|p.3, p.4|A claim") == TR_E_LOCATOR;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|page 3|A claim") == TR_E_LOCATOR;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1; sec 3.2|A claim") == TR_E_LOCATOR;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|p.3|A claim") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|q:one two three|A claim") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|API_KEY=abc123") == TR_E_SECRET;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|All papers agree on this") == TR_E_BULK;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|Process all of them") == TR_E_BULK;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|") == TR_E_TEXT;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-13-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|A claim") == TR_E_DATE;
+    assert tr_check_line(sd[0..sn], sn, "N|n20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1") == TR_E_FIELDS;
+    assert tr_check_line(sd[0..sn], sn, "N|x20|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|A claim") == TR_E_ID;
+}
+
+test research_provenance_line_controls {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|90|literature") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "P|arxiv:2501.06706|2026-11-08|human:dmitrii|verified|q:holistic framework|100|aiops") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "P|pmc:PMC13732382|2026-11-08|agent:t27r|unverified||0|c5-dm") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "P|rfc:9106|2026-11-08|agent:t27r|disputed|sec 3|40|kdf") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "P|hash:0123abcd|2026-11-08|agent:t27r|disputed||40|") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "P|https://example.org/paper|2026-11-08|agent:t27r|unverified||10|x") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified||90|literature") == TR_E_LOCATOR;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|page 3|90|literature") == TR_E_LOCATOR;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-13-08|agent:t27r|verified|sec 2.1|90|literature") == TR_E_DATE;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-8|agent:t27r|verified|sec 2.1|90|literature") == TR_E_DATE;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|t27r|verified|sec 2.1|90|literature") == TR_E_VERIFIER;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:|verified|sec 2.1|90|literature") == TR_E_VERIFIER;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|bot:t27r|verified|sec 2.1|90|literature") == TR_E_VERIFIER;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|101|literature") == TR_E_CONFIDENCE;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|-1|literature") == TR_E_CONFIDENCE;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|high|literature") == TR_E_CONFIDENCE;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|0|literature") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|maybe|sec 2.1|90|literature") == TR_E_STATUS;
+    assert tr_check_line(sd[0..sn], sn, "P|ftp:12345|2026-11-08|agent:t27r|verified|sec 2.1|90|literature") == TR_E_ID;
+    assert tr_check_line(sd[0..sn], sn, "P||2026-11-08|agent:t27r|verified|sec 2.1|90|literature") == TR_E_ID;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|90") == TR_E_FIELDS;
+    assert tr_check_line(sd[0..sn], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|90|API_KEY=abc123") == TR_E_SECRET;
+}
+
+test research_provenance_fact_rule {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    const s1 : usize = tr_add(sd[0..12288], sn, "S|doi:10.5555/12345678|paper|disputed|2020|A title|An author|A venue|https://doi.org/10.5555/12345678|x");
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|disputed|2020|A title|An author|A venue|https://doi.org/10.5555/12345678|x") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "S|doi:10.5555/12345678|paper|doubtful|2020|A title|An author|A venue|https://doi.org/10.5555/12345678|x") == TR_E_STATUS;
+    assert tr_check_corpus(sd[0..s1]) == TR_E_OK;
+    assert tr_coverage_pm(sd[0..s1]) == 1000;
+    const s2 : usize = tr_add(sd[0..12288], s1, "N|n90|v1|2026-11-08|doi:10.5555/12345678|t-research-kb|low|sec 1|A disputed claim");
+    assert tr_coverage_pm(sd[0..s2]) == 923;
+    assert tr_check_line(sd[0..s1], s1, "N|n91|v1|2026-11-08|doi:10.5555/12345678|t-research-kb|low|sec 1|A claim") == TR_E_DISPUTED;
+    assert tr_source_state(sd[0..s1], "doi:10.5555/12345678") == TR_E_DISPUTED;
+    assert tr_fact_state(sd[0..s1], "doi:10.5555/12345678") == TR_E_DISPUTED;
+    assert tr_cite_state(sd[0..s1], "doi:10.5555/12345678", true) == TR_E_DISPUTED;
+    assert tr_cite_state(sd[0..s1], "doi:10.5555/12345678", false) == TR_E_OK;
+    assert tr_fact_state(sd[0..sn], "doi:10.1145/3786149.3788301") == TR_E_UNVERIFIED;
+    const p1 : usize = tr_add(sd[0..12288], sn, "P|doi:10.1145/3786149.3788301|2026-11-08|agent:t27r|verified|sec 2.1|90|literature");
+    assert tr_fact_state(sd[0..p1], "doi:10.1145/3786149.3788301") == TR_E_OK;
+    assert tr_cite_state(sd[0..p1], "doi:10.1145/3786149.3788301", true) == TR_E_OK;
+    const p2 : usize = tr_add(sd[0..12288], p1, "P|doi:10.1145/3786149.3788301|2026-11-09|human:dmitrii|disputed|sec 2.1|30|literature");
+    assert tr_fact_state(sd[0..p2], "doi:10.1145/3786149.3788301") == TR_E_DISPUTED;
+    const p3 : usize = tr_add(sd[0..12288], sn, "P|arxiv:2501.06706|2026-11-08|agent:t27r|unverified||20|aiops");
+    assert tr_fact_state(sd[0..p3], "arxiv:2501.06706") == TR_E_UNVERIFIED;
+    assert tr_cite_state(sd[0..p3], "arxiv:2501.06706", false) == TR_E_OK;
+    const p4 : usize = tr_add(sd[0..12288], sn, "P|pmc:PMC13732382|2026-11-08|agent:t27r|verified|sec 1|95|c5-dm");
+    assert tr_fact_state(sd[0..p4], "pmc:PMC13732382") == TR_E_UNVERIFIED;
+    assert tr_fact_state(sd[0..sn], "pmc:PMC13732382") == TR_E_UNVERIFIED;
+    assert tr_cite_state(sd[0..sn], "pmc:PMC13732382", false) == TR_E_OK;
+    assert tr_fact_state(sd[0..sn], "doi:10.0000/none") == TR_E_NO_SOURCE;
+    assert tr_cite_state(sd[0..sn], "doi:10.0000/none", false) == TR_E_NO_SOURCE;
+    assert tr_fact_state(sd[0..sn], "doi:10.1007/s00607-010-0107-y") == TR_E_UNVERIFIED;
+}
+
+test research_note_versions {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_check_line(sd[0..sn], sn, "N|n3|v3|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 2.4.1|A third version") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "N|n3|v5|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 2.4.1|A skipped version") == TR_E_VERSION;
+    assert tr_check_line(sd[0..sn], sn, "N|n1|v1|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|A repeated first version") == TR_E_VERSION;
+    assert tr_check_line(sd[0..sn], sn, "N|n21|v2|2026-11-08|doi:10.1145/3786149.3788301|t-research-kb|high|sec 3.1|A revision of nothing") == TR_E_VERSION;
+    assert tr_check_line(sd[0..sn], sn, "N|n3|v3|2026-11-08|gh:EurFelux/paper-manager|t-research-kb|high|sec 2.4.1|A revision with another source") == TR_E_IMMUTABLE;
+}
+
+test research_synthesis_controls {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|review|n1,n2|Agree|Disagree|Gaps|Limits") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "Y|y1|v3|2026-11-08|t-research-kb|review|n1,n2|Agree|Disagree|Gaps|Limits") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, "Y|y1|v4|2026-11-08|t-research-kb|review|n1,n2|Agree|Disagree|Gaps|Limits") == TR_E_VERSION;
+    assert tr_check_line(sd[0..sn], sn, "Y|y1|v3|2026-11-08|t-breach-check|review|n10,n11|Agree|Disagree|Gaps|Limits") == TR_E_IMMUTABLE;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|review|n1|Agree|Disagree|Gaps|Limits") == TR_E_NOTE;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|review|n1,n99|Agree|Disagree|Gaps|Limits") == TR_E_NOTE;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-resource-doctor|review|n1,n2|Agree|Disagree|Gaps|Limits") == TR_E_NOTE;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|review|n1,n2|Agree|Disagree|-|Limits") == TR_E_SECTIONS;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|review|n1,n2|Agree||Gaps|Limits") == TR_E_SECTIONS;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|essay|n1,n2|Agree|Disagree|Gaps|Limits") == TR_E_TYPE;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-nope|review|n1,n2|Agree|Disagree|Gaps|Limits") == TR_E_TOPIC;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|review|n1,n2|Agree|Disagree|Gaps|API_KEY=abc123") == TR_E_SECRET;
+    assert tr_check_line(sd[0..sn], sn, "Y|y3|v1|2026-11-08|t-research-kb|review|n1,n2|Agree|Disagree|Gaps") == TR_E_FIELDS;
+}
+
+test research_decision_controls {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|arxiv:1905.13737|-|Prefix leakage is real|Remove the breach check") == TR_E_OK;
+    assert tr_check_line(sd[0..sn], sn, TR_L31) == TR_E_DUP;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|pmc:PMC13732382|-|Prefix leakage is real|Remove the breach check") == TR_E_UNVERIFIED;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|doi:10.0000/none|-|Prefix leakage is real|Remove the breach check") == TR_E_NO_SOURCE;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only||-|Prefix leakage is real|Remove the breach check") == TR_E_NO_SOURCE;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|arxiv:1905.13737|y9|Prefix leakage is real|Remove the breach check") == TR_E_SYNTH;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|arxiv:1905.13737|y2|Prefix leakage is real|Remove the breach check") == TR_E_SYNTH;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|arxiv:1905.13737|-||Remove the breach check") == TR_E_RATIONALE;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|arxiv:1905.13737|-|Prefix leakage is real|-") == TR_E_ROLLBACK;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|arxiv:1905.13737|-|Prefix leakage is real|") == TR_E_ROLLBACK;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-31x|t-breach-check|Use padded range queries only|arxiv:1905.13737|-|Prefix leakage is real|Remove the breach check") == TR_E_DATE;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-nope|Use padded range queries only|arxiv:1905.13737|-|Prefix leakage is real|Remove the breach check") == TR_E_TOPIC;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Process all papers at once|arxiv:1905.13737|-|Prefix leakage is real|Remove the breach check") == TR_E_BULK;
+    assert tr_check_line(sd[0..sn], sn, "D|d3|2026-11-08|t-breach-check|Use padded range queries only|arxiv:1905.13737|-|API_KEY=abc123|Remove the breach check") == TR_E_SECRET;
+}
+
+test research_first_bad_line {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    const sn2 : usize = tr_add(sd[0..12288], sn, "N|n20|v1|2026-11-08|pmc:PMC13732382|t-research-kb|high|sec 3.1|A claim");
+    assert tr_first_bad(sd[0..sn2]) == 32;
+    assert tr_check_corpus(sd[0..sn2]) == TR_E_UNVERIFIED;
+    const sn3 : usize = tr_add(sd[0..12288], sn, TR_T_N_OK);
+    assert tr_check_corpus(sd[0..sn3]) == TR_E_OK;
+    assert tr_first_bad(sd[0..sn3]) == 33;
+}
+
+test research_search_facets_coverage {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    assert tr_search(sd[0..sn], "gitlab") == 3;
+    assert tr_search(sd[0..sn], "GITLAB") == 3;
+    assert tr_search(sd[0..sn], "faiss") == 1;
+    assert tr_search(sd[0..sn], "vector") == 3;
+    assert tr_search(sd[0..sn], "zzzzzz") == 0;
+    assert tr_search(sd[0..sn], "a") == 0;
+    assert tr_search(sd[0..sn], "all papers") == 0;
+    assert tr_search(sd[0..sn], "API_KEY=abc123") == 0;
+    assert tr_facet(sd[0..sn], TR_F_TOPIC, "t-research-kb") == 5;
+    assert tr_facet(sd[0..sn], TR_F_TOPIC, "t-resource-doctor") == 4;
+    assert tr_facet(sd[0..sn], TR_F_TOPIC, "t-breach-check") == 3;
+    assert tr_facet(sd[0..sn], TR_F_TAG, "agents") == 3;
+    assert tr_facet(sd[0..sn], TR_F_TAG, "local-first") == 1;
+    assert tr_facet(sd[0..sn], TR_F_TAG, "cli") == 1;
+    assert tr_facet(sd[0..sn], TR_F_AUTHOR, "chen") == 2;
+    assert tr_facet(sd[0..sn], TR_F_AUTHOR, "CHEN") == 2;
+    assert tr_facet(sd[0..sn], TR_F_YEAR, "2026") == 2;
+    assert tr_facet(sd[0..sn], TR_F_YEAR, "-") == 1;
+    assert tr_facet(sd[0..sn], TR_F_DATE, "2026-11-08") == 11;
+    assert tr_facet(sd[0..sn], TR_F_DATE, "2026-11-07") == 1;
+    assert tr_facet(sd[0..sn], 9, "x") == 0;
+    assert tr_facet(sd[0..sn], TR_F_YEAR, "") == 0;
+    assert tr_coverage_pm(sd[0..sn]) == 1000;
+    const sn2 : usize = tr_add(sd[0..12288], sn, "N|n99|v1|2026-11-08|pmc:PMC13732382|t-research-kb|low|sec 1|A claim");
+    assert tr_coverage_pm(sd[0..sn2]) == 923;
+    assert tr_coverage_pm(sd[0..0]) == 0;
+}
+
+test research_latest_decision_and_gets {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    const lp : usize = tr_latest_decision(sd[0..sn], "t-resource-doctor");
+    assert bytes_eq(tr_field(tr_line_from(sd[0..sn], lp), 1), "d2");
+    const lk : usize = tr_latest_decision(sd[0..sn], "t-research-kb");
+    assert bytes_eq(tr_field(tr_line_from(sd[0..sn], lk), 1), "d1");
+    assert tr_latest_decision(sd[0..sn], "t-breach-check") == 0;
+    assert bytes_eq(tr_field(tr_get(sd[0..sn], TR_K_N, "n3"), 2), "v2");
+    assert bytes_eq(tr_field(tr_get(sd[0..sn], TR_K_Y, "y1"), 2), "v2");
+    assert tr_get(sd[0..sn], TR_K_N, "n77").len == 0;
+    assert tr_max_ver(sd[0..sn], TR_K_N, "n3") == 2;
+    assert bytes_eq(tr_stage_name(1), "conceptualize");
+    assert bytes_eq(tr_stage_name(5), "consume");
+    assert tr_stage_name(6).len == 0;
+}
+
+test research_t27l {
+    var sd : [12288]u8 = undefined;
+    const sn : usize = tr_seed(sd[0..12288]);
+    var ev : [2048]u8 = undefined;
+    var i : usize = 0;
+    var failed : usize = 0;
+    while (i < 32) {
+        const s : usize = tr_line_start(sd[0..sn], i);
+        const ln : []const u8 = sd[s..tr_eol(sd[0..sn], s)];
+        const m : usize = tr_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", ln, false, 2, 2);
+        if (m == 0 or tl_validate_line(ev[0..m]) != TL_OK) { failed += 1; }
+        i += 1;
+    }
+    assert failed == 0;
+    const s27 : usize = tr_line_start(sd[0..sn], 31);
+    const dl : []const u8 = sd[s27..tr_eol(sd[0..sn], s27)];
+    assert tr_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", dl, true, 2, 2) == 0;
+    assert tr_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", dl, true, 2, 3) > 0;
+    assert tr_refusal_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", dl, 2, 2) == 0;
+    assert tr_refusal_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", dl, 2, 3) > 0;
+    assert tr_refusal_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", TR_L13, 2, 2) == 0;
+    assert tr_refusal_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", TR_L13, 2, 3) > 0;
+    assert tr_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "Q|a|b", false, 2, 2) == 0;
+    assert tr_event(ev[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", TR_L01, false, 0, 2) == 0;
+}
+
+test research_actions_and_payload {
+    assert tr_action_of(TR_L01, false) == 58;
+    assert tr_action_of(TR_L04, false) == 59;
+    assert tr_action_of(TR_L14, false) == 59;
+    assert tr_action_of(TR_L15, false) == 61;
+    assert tr_action_of(TR_L15, true) == 62;
+    assert tr_action_of(TR_L28, false) == 63;
+    assert tr_action_of(TR_L28, true) == 64;
+    assert tr_action_of(TR_L31, false) == 65;
+    assert tr_action_of(TR_L31, true) == 66;
+    assert tr_action_of("Q|a", false) == 0;
+    assert tr_refusal_action(TR_L04) == 60;
+    assert tr_refusal_action(TR_L15) == 67;
+    assert tr_refusal_action("Q|a") == 0;
+    var pl : [160]u8 = undefined;
+    const pn : usize = tr_payload(pl[0..160], TR_L15);
+    assert bytes_eq(pl[0..pn], "note n1");
+    const pt : usize = tr_payload(pl[0..160], TR_L01);
+    assert bytes_eq(pl[0..pt], "topic t-research-kb");
+    assert tr_payload(pl[0..160], "Q|a") == 0;
+    assert tr_payload(pl[0..20], TR_L01) == 0;
+}
+
+test research_cli_contract {
+    assert tr_cmd_id("topic add") == 1;
+    assert tr_cmd_id("note revise") == 7;
+    assert tr_cmd_id("decision revisit") == 13;
+    assert tr_cmd_id("evidence check") == 15;
+    assert tr_cmd_id("export") == TR_CMD_COUNT;
+    assert tr_cmd_id("source delete") == 0;
+    assert tr_cmd_id("") == 0;
+    assert tr_cmd_writes(1);
+    assert tr_cmd_writes(13);
+    assert !tr_cmd_writes(2);
+    assert !tr_cmd_writes(16);
+    assert !tr_cmd_writes(0);
+    assert tr_arg_ok("topic list");
+    assert !tr_arg_ok("API_KEY=abc123");
+}

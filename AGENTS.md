@@ -476,6 +476,19 @@ Every spec is a running cost: a seal, a ledger row, CI minutes on every pull req
 - **t27o (the converter) reuses.** It reuses an existing t27 function with the same input/output contract instead of emitting a new body, and reports how many it reused.
 - **Duplicates only go down.** `tools/duplicate_bodies_baseline.txt` only moves down. A pull request that adds a duplicate body is wrong even where the check is not required (#8963).
 
+## Choosing work: the Pareto roadmap rule (owner, 2026-11-08)
+
+Hard gates (safety, end-to-end flow, unblocking, repeated failure) beat the score; a high score never makes a task P0.
+The score is impact x confidence / effort, each 1 to 5. The rule and its checks live in `specs/queen/roadmap.t27`,
+with `specs/queen/priority.t27` (levels) and `specs/queen/claim_msg.t27` (claims). Read them; do not restate them.
+
+## Cost optimization: savings never beat correctness or privacy (owner, 2026-11-08)
+
+A cheaper route is taken only when correctness, privacy and review stay intact. Architecture, security, critical
+fixes and final review never go to a small model; an output that fails validation escalates and is never returned.
+The rule (cost score, prompt and response caching, routing, budget, anomalies, the T27L cost event) lives in
+`specs/claw/cost_policy.t27`; Claude tiers stay `specs/claw/model_route.t27`. Read them; do not restate them.
+
 ## trigit is the standard: our own git (owner rules, 2026-10-20; standard 2026-10-22)
 
 Owner, 2026-10-22: trigit is the standard, and the swarm uses it to go faster.

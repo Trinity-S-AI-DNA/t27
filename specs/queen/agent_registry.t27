@@ -1,0 +1,1583 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/agent_registry.t27 -- the agent registry MVP: identity first, then locks, then evidence-backed,
+; per-domain reputation, then a reputation-gated listing (owner order T27A_AGENT_MARKETPLACE, 2026-11-08).
+; This is the decision table with tests, a contract for the code that stores and serves it. Not here: the
+; store, the CLI dispatch, signature checking, credentials (P1), payments and tokens (P2, never in the MVP).
+; -
+; What it reuses instead of restating:
+;   - the claim protocol (claim, heartbeat, release, six-hour stale takeover): specs/queen/claim_msg.t27;
+;   - the scope overlap of two held paths: held_part in specs/queen/holds.t27;
+;   - SHA-256 for the key fingerprint: specs/numeric/sha256.t27;
+;   - the event envelope, redaction and the secret check of an argument: specs/t27os/t27l.t27
+;     (surface 11 "agent", actions 29..37).
+; -
+; Identity. An agent is a name 0xNAME, a public key (64 lowercase hex, the size of an Ed25519 public key)
+; and an owner id. Its identifier is the DID-shaped string did:t27:0xNAME bound to the first 64 bits of
+; SHA-256 over the key text. These are DID-shaped local identifiers: no DID method is registered, no DID
+; document is resolved, and this file does not claim W3C DID Core or VC Data Model conformance.
+; NOT BUILT: proof of possession. No Ed25519 or ECDSA primitive exists in specs/ yet, so a registration
+; proves nothing about who holds the private key; that gap is a compiler/stdlib issue, not a rule here.
+; No private key, password, token, e-mail or home path is ever a field: every free-text field passes
+; tl_arg_ok, which refuses them.
+; -
+; Reputation is per domain, never one global score; only outcomes with evidence that a reviewer other than
+; the agent approved count; no score is shown below three counted tasks; nothing sets a score directly.
+; The three-task minimum, the same-owner endorsement exclusion and the per-owner agent cap are this
+; project's own rules, not taken from a cited source.
+; Sybil: one identity per key and per name, at most AR_MAX_PER_OWNER agents per owner, a claim rate limit,
+; no self-review, a claim/abort anomaly flag. This is NOT sybil resistance: one person with several owner
+; ids can still mint identities. Graph-flow trust (Anduin, arXiv:2611.05586) and payment-graph trust are
+; future work and are not implemented here.
+; Background read for the design, none of it implemented or claimed: Douceur, "The Sybil Attack" (IPTPS
+; 2002); EigenTrust (WWW 2003); W3C DID Core 1.0 (2022) and VC Data Model 2.0 (2025); ERC-8004 (draft,
+; 2025); AgentReputation (arXiv:2605.00073).
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenAgentRegistry;
+
+use t27os::t27l::tl_event_line;
+use t27os::t27l::tl_validate_line;
+use t27os::t27l::tl_arg_ok;
+use t27os::t27l::TL_OK;
+use t27os::t27l::tl_put_hex16;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use queen::claim_msg::cm_decide;
+use queen::claim_msg::cm_beat_renews;
+use queen::claim_msg::cm_release_valid;
+use queen::claim_msg::cm_state;
+use queen::claim_msg::CM_GRANTED;
+use queen::claim_msg::CM_TAKEOVER;
+use queen::claim_msg::CM_STALE;
+use queen::holds::held_part;
+use queen::holds::HP_APART;
+use queen::holds::path_from;
+use queen::holds::path_to;
+use numeric::sha256::sha256_state;
+use std::mem::bytes_eq;
+
+; --- 1. Identity -----------------------------------------------------------------------------------
+
+pub const AR_MAX_AGENTS : usize = 27;
+/// Bytes one name slot holds: "0x" and up to 14 characters.
+pub const AR_NAME_MAX : usize = 16;
+pub const AR_KEY_HEX : usize = 64;
+pub const AR_MAX_PER_OWNER : usize = 9;
+
+pub const AR_OK : u8 = 0;
+pub const AR_E_NAME : u8 = 1;
+pub const AR_E_KEY : u8 = 2;
+pub const AR_E_DUP_NAME : u8 = 3;
+pub const AR_E_DUP_KEY : u8 = 4;
+pub const AR_E_FULL : u8 = 5;
+pub const AR_E_OWNER_CAP : u8 = 6;
+pub const AR_E_OWNER : u8 = 7;
+
+/// A name is "0x", then 2..14 characters of A-Z and 0-9, the first a letter: 0xALPHA, 0xQ27.
+pub fn ar_name_ok(name: []const u8) -> bool {
+    if (name.len < 4 or name.len > AR_NAME_MAX) { return false; }
+    if (name[0] != 48 or name[1] != 120) { return false; }
+    if (name[2] < 65 or name[2] > 90) { return false; }
+    var i : usize = 3;
+    while (i < name.len) {
+        const c : u8 = name[i];
+        if (!((c >= 65 and c <= 90) or (c >= 48 and c <= 57))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A public key is exactly 64 lowercase hex characters. Anything else, including a PEM block or a key
+/// with a prefix, is refused: the registry never parses a key format it cannot check.
+pub fn ar_key_ok(key: []const u8) -> bool {
+    if (key.len != AR_KEY_HEX) { return false; }
+    var i : usize = 0;
+    while (i < key.len) {
+        const c : u8 = key[i];
+        if (!((c >= 48 and c <= 57) or (c >= 97 and c <= 102))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The first 64 bits of SHA-256 over the key text. Two keys with one fingerprint: the second is refused
+/// as a duplicate (fails closed).
+pub fn ar_fingerprint(key: []const u8) -> u64 {
+    var st : [8]u64 = undefined;
+    sha256_state(key, key.len, st[0..8]);
+    return st[0] * 4294967296 + st[1];
+}
+
+/// "did:t27:0xNAME" into out; 0 when the name is not a valid name.
+pub fn ar_did(out: []u8, name: []const u8) -> usize {
+    if (!ar_name_ok(name)) { return 0; }
+    if (out.len < 8 + name.len) { return 0; }
+    const p : usize = put_bytes(out, 0, "did:t27:");
+    return put_bytes(out, p, name);
+}
+
+fn ar_slot_name(names: []const u8, lens: []const usize, slot: usize) -> []const u8 {
+    const a : usize = slot * AR_NAME_MAX;
+    return names[a..a + lens[slot]];
+}
+
+/// Register one agent in the next free slot (count). Checks, in order: name, key, owner id (0 is no
+/// owner), full table, duplicate name, duplicate key, the per-owner cap. On AR_OK the slot is written;
+/// on any refusal nothing is written. The caller emits agent_created on AR_OK and identity_rejected
+/// (level warn) otherwise.
+pub fn ar_register(names: []u8, lens: []usize, fps: []u64, owners: []u32, count: usize,
+                   name: []const u8, key: []const u8, owner: u32) -> u8 {
+    if (!ar_name_ok(name)) { return AR_E_NAME; }
+    if (!ar_key_ok(key)) { return AR_E_KEY; }
+    if (owner == 0) { return AR_E_OWNER; }
+    if (count >= AR_MAX_AGENTS) { return AR_E_FULL; }
+    const fp : u64 = ar_fingerprint(key);
+    var same_owner : usize = 0;
+    var s : usize = 0;
+    while (s < count) {
+        if (bytes_eq(ar_slot_name(names, lens, s), name)) { return AR_E_DUP_NAME; }
+        if (fps[s] == fp) { return AR_E_DUP_KEY; }
+        if (owners[s] == owner) { same_owner = same_owner + 1; }
+        s = s + 1;
+    }
+    if (same_owner >= AR_MAX_PER_OWNER) { return AR_E_OWNER_CAP; }
+    const a : usize = count * AR_NAME_MAX;
+    var i : usize = 0;
+    while (i < name.len) {
+        names[a + i] = name[i];
+        i = i + 1;
+    }
+    lens[count] = name.len;
+    fps[count] = fp;
+    owners[count] = owner;
+    return AR_OK;
+}
+
+/// A run of exactly 64 hex characters anywhere in text. share::redact keeps such runs (they are sha256
+/// sums), but an Ed25519 private seed has the same shape, so a profile may not carry one.
+fn ar_hex64_in(text: []const u8) -> bool {
+    var run : usize = 0;
+    var i : usize = 0;
+    while (i <= text.len) {
+        var hx : bool = false;
+        if (i < text.len) {
+            const c : u8 = text[i];
+            hx = (c >= 48 and c <= 57) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70);
+        }
+        if (hx) {
+            run = run + 1;
+        } else {
+            if (run == 64) { return true; }
+            run = 0;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Free text in a profile (a summary, a portfolio line) is allowed only when tl_arg_ok passes it (no
+/// key, no NAME=secret, no e-mail, no "private key" or PEM marker, no password) and it holds no 64-hex
+/// run: the public key has its own field, and a 64-hex private seed cannot be told from it.
+pub fn ar_profile_ok(text: []const u8) -> bool {
+    if (ar_hex64_in(text)) { return false; }
+    return tl_arg_ok(text);
+}
+
+; --- 2. Domains and status ---------------------------------------------------------------------------
+
+pub const AR_DOM_CODE_REVIEW : u8 = 1;
+pub const AR_DOM_SPEC : u8 = 2;
+pub const AR_DOM_TEST : u8 = 3;
+pub const AR_DOM_DOCS : u8 = 4;
+pub const AR_DOM_FPGA : u8 = 5;
+pub const AR_DOM_RESEARCH : u8 = 6;
+pub const AR_DOM_LAST : u8 = 6;
+
+pub fn ar_domain_name(d: u8) -> []const u8 {
+    if (d == 1) { return "code_review"; }
+    if (d == 2) { return "spec"; }
+    if (d == 3) { return "test"; }
+    if (d == 4) { return "docs"; }
+    if (d == 5) { return "fpga"; }
+    if (d == 6) { return "research"; }
+    return "";
+}
+
+pub fn ar_domain_id(name: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= AR_DOM_LAST) {
+        if (bytes_eq(ar_domain_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+pub const AR_OFFLINE : u8 = 0;
+pub const AR_ONLINE : u8 = 1;
+pub const AR_BUSY : u8 = 2;
+
+pub fn ar_status_name(s: u8) -> []const u8 {
+    if (s == 0) { return "offline"; }
+    if (s == 1) { return "online"; }
+    if (s == 2) { return "busy"; }
+    return "";
+}
+
+/// Offline when no heartbeat is recent, whatever it holds (its lock still ages towards stale); busy
+/// when online and holding a task lock; online otherwise.
+pub fn ar_status_of(online: bool, holds_task: bool) -> u8 {
+    if (!online) { return AR_OFFLINE; }
+    if (holds_task) { return AR_BUSY; }
+    return AR_ONLINE;
+}
+
+; --- 3. Locks: claim before work, release after ------------------------------------------------------
+
+pub const AR_LOCK_OK : u8 = 0;
+pub const AR_LOCK_CONFLICT : u8 = 1;
+pub const AR_LOCK_BUSY : u8 = 2;
+pub const AR_LOCK_RATE : u8 = 3;
+pub const AR_LOCK_SCOPE : u8 = 4;
+pub const AR_LOCK_TAKEOVER : u8 = 5;
+/// Claims one agent may make in one hour.
+pub const AR_MAX_CLAIMS_HOUR : u32 = 6;
+
+/// A scope is one repo-relative path in one spelling: not empty, not absolute, no "~", no "..", no "."
+/// segment, no "//", and tl_arg_ok passes it. One spelling matters because held_part compares bytes:
+/// "./", "." or "specs/./x" would never overlap anything and so would bypass every lock.
+pub fn ar_scope_ok(scope: []const u8) -> bool {
+    if (scope.len == 0 or scope.len > 200) { return false; }
+    if (scope[0] == 47 or scope[0] == 126) { return false; }
+    var i : usize = 0;
+    while (i < scope.len) {
+        const c : u8 = scope[i];
+        if (c < 33 or c > 126) { return false; }
+        if (c == 46 and i + 1 < scope.len and scope[i + 1] == 46) { return false; }
+        if (c == 47 and i + 1 < scope.len and scope[i + 1] == 47) { return false; }
+        if (c == 46 and (i == 0 or scope[i - 1] == 47) and (i + 1 == scope.len or scope[i + 1] == 47)) { return false; }
+        i = i + 1;
+    }
+    const a : usize = path_from(scope, scope.len);
+    if (path_to(scope, a, scope.len) <= a) { return false; }
+    return tl_arg_ok(scope);
+}
+
+/// Two scopes overlap when one lies within the other (the same file, or a file under a directory).
+pub fn ar_scope_overlap(a: []const u8, b: []const u8) -> bool {
+    return held_part(a, a.len, b, b.len) != HP_APART;
+}
+
+/// The answer to a claim. In order: a bad scope; the rate limit; one active task per agent (holding
+/// another task is BUSY, re-claiming its own is allowed); then the overlapping lock, if any, through
+/// cm_decide of claim_msg.t27: none or the claimant's own is OK, another's live lock is CONFLICT
+/// (emit lock_conflict at warn), another's stale lock is TAKEOVER (the timeout policy, six hours).
+pub fn ar_claim_decide(scope_ok: bool, claims_hour: u32, holds_other_task: bool,
+                       overlap_held: bool, overlap_idle_minutes: u32, overlap_same_holder: bool) -> u8 {
+    if (!scope_ok) { return AR_LOCK_SCOPE; }
+    if (claims_hour >= AR_MAX_CLAIMS_HOUR) { return AR_LOCK_RATE; }
+    if (holds_other_task) { return AR_LOCK_BUSY; }
+    const d : u8 = cm_decide(overlap_held, false, overlap_idle_minutes, overlap_same_holder);
+    if (d == CM_GRANTED) { return AR_LOCK_OK; }
+    if (d == CM_TAKEOVER) { return AR_LOCK_TAKEOVER; }
+    return AR_LOCK_CONFLICT;
+}
+
+/// A heartbeat renews only the sender's own lock.
+pub fn ar_beat_ok(lock_exists: bool, same_holder: bool) -> bool {
+    return cm_beat_renews(lock_exists, same_holder);
+}
+
+pub const AR_REL_COMPLETED : u8 = 1;
+pub const AR_REL_ABORTED : u8 = 2;
+pub const AR_REL_TIMEOUT : u8 = 3;
+
+pub const AR_REL_OK : u8 = 0;
+pub const AR_REL_NO_EVIDENCE : u8 = 1;
+pub const AR_REL_NOT_HOLDER : u8 = 2;
+pub const AR_REL_BAD_REASON : u8 = 3;
+pub const AR_REL_NO_LOCK : u8 = 4;
+
+/// The answer to a release. COMPLETED: only the holder, with at least one evidence id. ABORTED: only the
+/// holder, no evidence needed and no outcome recorded. TIMEOUT: anyone once the lock is stale
+/// (cm_release_valid), or the owner at any time; that is the only recovery of an expired lock.
+pub fn ar_release_decide(lock_exists: bool, same_holder: bool, idle_minutes: u32, reason: u8,
+                         evidence_count: u32, by_owner: bool) -> u8 {
+    if (!lock_exists) { return AR_REL_NO_LOCK; }
+    if (reason == AR_REL_COMPLETED) {
+        if (!same_holder) { return AR_REL_NOT_HOLDER; }
+        if (evidence_count == 0) { return AR_REL_NO_EVIDENCE; }
+        return AR_REL_OK;
+    }
+    if (reason == AR_REL_ABORTED) {
+        if (!same_holder) { return AR_REL_NOT_HOLDER; }
+        return AR_REL_OK;
+    }
+    if (reason == AR_REL_TIMEOUT) {
+        if (by_owner) { return AR_REL_OK; }
+        const stale : bool = cm_state(true, idle_minutes) == CM_STALE;
+        if (!same_holder and cm_release_valid(true, false, stale)) { return AR_REL_OK; }
+        return AR_REL_NOT_HOLDER;
+    }
+    return AR_REL_BAD_REASON;
+}
+
+; --- 4. Outcomes and per-domain reputation -----------------------------------------------------------
+
+pub const AR_FAILURE : u8 = 0;
+pub const AR_PARTIAL : u8 = 1;
+pub const AR_SUCCESS : u8 = 2;
+
+pub fn ar_outcome_name(o: u8) -> []const u8 {
+    if (o == 0) { return "failure"; }
+    if (o == 1) { return "partial"; }
+    if (o == 2) { return "success"; }
+    return "";
+}
+
+/// success 1.0, partial 0.5, failure 0.0, in permille.
+pub fn ar_outcome_permille(o: u8) -> u64 {
+    if (o == AR_SUCCESS) { return 1000; }
+    if (o == AR_PARTIAL) { return 500; }
+    return 0;
+}
+
+pub const AR_REV_OWNER : u8 = 1;
+pub const AR_REV_TRUSTED : u8 = 2;
+pub const AR_REV_TESTS : u8 = 3;
+pub const AR_REV_PEER : u8 = 4;
+
+pub fn ar_reviewer_name(r: u8) -> []const u8 {
+    if (r == 1) { return "owner"; }
+    if (r == 2) { return "trusted_reviewer"; }
+    if (r == 3) { return "test_suite"; }
+    if (r == 4) { return "peer"; }
+    return "";
+}
+
+pub const AR_PENDING : u8 = 0;
+pub const AR_APPROVED : u8 = 1;
+pub const AR_REJECTED : u8 = 2;
+
+/// Whether one recorded outcome counts towards reputation: at least one evidence id, approved, by the
+/// owner, a trusted reviewer or the test suite, and the reviewer is not the agent. A trusted reviewer
+/// that is another agent of the same owner does not count either (the owner reviewing in person is
+/// AR_REV_OWNER). A peer approval alone never counts (peers endorse, see ar_endorse_weight). There is no
+/// other way into a score.
+pub fn ar_counts(evidence_count: u32, review: u8, reviewer: u8, reviewer_is_agent: bool, reviewer_same_owner: bool) -> bool {
+    if (evidence_count == 0) { return false; }
+    if (review != AR_APPROVED) { return false; }
+    if (reviewer_is_agent) { return false; }
+    if (reviewer == AR_REV_TRUSTED and reviewer_same_owner) { return false; }
+    return reviewer == AR_REV_OWNER or reviewer == AR_REV_TRUSTED or reviewer == AR_REV_TESTS;
+}
+
+pub const AR_MIN_TASKS : u32 = 3;
+pub const AR_HALF_LIFE_DAYS : u32 = 30;
+pub const AR_NO_SCORE : u32 = 4294967295;
+
+/// Time decay: 1024 at age 0, halved every AR_HALF_LIFE_DAYS, never below 1.
+pub fn ar_decay(age_days: u32) -> u64 {
+    var w : u64 = 1024;
+    var h : u32 = age_days / AR_HALF_LIFE_DAYS;
+    while (h > 0 and w > 1) {
+        w = w / 2;
+        h = h - 1;
+    }
+    return w;
+}
+
+/// The weight of one counted outcome: complexity (1..5) x evidence quality (1 a log line, 2 a test
+/// report, 3 a test report and a commit or screenshot) x decay. Out-of-range inputs weigh 0.
+pub fn ar_weight(complexity: u8, quality: u8, age_days: u32) -> u64 {
+    if (complexity < 1 or complexity > 5 or quality < 1 or quality > 3) { return 0; }
+    return @as(u64, complexity) * @as(u64, quality) * ar_decay(age_days);
+}
+
+/// Counted tasks of one agent in one domain.
+pub fn ar_counted(slot: u8, domain: u8, t_agent: []const u8, t_domain: []const u8, t_ok: []const bool, n: usize) -> u32 {
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t_agent[i] == slot and t_domain[i] == domain and t_ok[i]) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+/// The score of one agent in one domain on a 0..50 scale (48 reads 4.8): the weighted mean of the
+/// counted outcomes, rounded. AR_NO_SCORE for a domain outside 1..AR_DOM_LAST, or below AR_MIN_TASKS
+/// counted tasks that also weigh more than 0 (a task with out-of-range complexity or quality is not one).
+pub fn ar_score_x10(slot: u8, domain: u8, t_agent: []const u8, t_domain: []const u8, t_outcome: []const u8,
+                    t_cx: []const u8, t_q: []const u8, t_age: []const u32, t_ok: []const bool, n: usize) -> u32 {
+    if (domain == 0 or domain > AR_DOM_LAST) { return AR_NO_SCORE; }
+    var cw : u32 = 0;
+    var sw : u64 = 0;
+    var swv : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t_agent[i] == slot and t_domain[i] == domain and t_ok[i]) {
+            const w : u64 = ar_weight(t_cx[i], t_q[i], t_age[i]);
+            if (w > 0) { cw = cw + 1; }
+            sw = sw + w;
+            swv = swv + w * ar_outcome_permille(t_outcome[i]);
+        }
+        i = i + 1;
+    }
+    if (cw < AR_MIN_TASKS or sw == 0) { return AR_NO_SCORE; }
+    const permille : u64 = swv / sw;
+    return @intCast((permille * 50 + 500) / 1000);
+}
+
+/// Success rate of the counted tasks, permille, unweighted; 0 when there are none.
+pub fn ar_success_permille(slot: u8, domain: u8, t_agent: []const u8, t_domain: []const u8, t_outcome: []const u8,
+                           t_ok: []const bool, n: usize) -> u32 {
+    const c : u32 = ar_counted(slot, domain, t_agent, t_domain, t_ok, n);
+    if (c == 0) { return 0; }
+    var s : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (t_agent[i] == slot and t_domain[i] == domain and t_ok[i] and t_outcome[i] == AR_SUCCESS) { s = s + 1; }
+        i = i + 1;
+    }
+    return s * 1000 / c;
+}
+
+/// The weight of one endorsement, kept outside the score: 0 from the agent itself, from an agent of the
+/// same owner, or from an endorser without a score in that domain; else the endorser's score.
+pub fn ar_endorse_weight(endorser_score_x10: u32, same_agent: bool, same_owner: bool) -> u32 {
+    if (same_agent or same_owner) { return 0; }
+    if (endorser_score_x10 == AR_NO_SCORE) { return 0; }
+    return endorser_score_x10;
+}
+
+/// A tier change (promotion or demotion) needs evidence and a review by the owner or a trusted reviewer;
+/// a test suite, a peer or the agent itself cannot move a tier.
+pub fn ar_tier_change_ok(evidence_count: u32, reviewer: u8, reviewer_is_agent: bool) -> bool {
+    if (evidence_count == 0 or reviewer_is_agent) { return false; }
+    return reviewer == AR_REV_OWNER or reviewer == AR_REV_TRUSTED;
+}
+
+/// A day's claims at or above 24, or at least 6 claims of which more than half were aborted, is flagged
+/// for the owner's review. The flag decides nothing by itself.
+pub fn ar_anomaly(claims_day: u32, aborts_day: u32) -> bool {
+    if (claims_day >= 24) { return true; }
+    return claims_day >= 6 and aborts_day * 2 > claims_day;
+}
+
+; --- 5. Credentials: what a credential can never grant (P1 shape, the denial is P0) -------------------
+
+pub const AR_RIGHT_SECRETS : u8 = 1;
+pub const AR_RIGHT_PROD_DEPLOY : u8 = 2;
+pub const AR_RIGHT_PROTECTED_BRANCH : u8 = 3;
+pub const AR_RIGHT_EXTERNAL_COMMS : u8 = 4;
+pub const AR_RIGHT_FINANCIAL : u8 = 5;
+pub const AR_RIGHT_REVIEW_DOMAIN : u8 = 6;
+pub const AR_RIGHT_CLAIM_DOMAIN : u8 = 7;
+
+/// Rights 1..5 are never granted by a credential, whoever issued it; 6 and 7 may be.
+pub fn ar_credential_grants(right: u8) -> bool {
+    return right == AR_RIGHT_REVIEW_DOMAIN or right == AR_RIGHT_CLAIM_DOMAIN;
+}
+
+; --- 6. Listing and hire (permissionless listing, reputation-gated hire, no price) --------------------
+
+pub const AR_MIN_HIRE_X10 : u32 = 30;
+
+pub const AR_HIRE_OK : u8 = 0;
+pub const AR_HIRE_NO_SCORE : u8 = 1;
+pub const AR_HIRE_LOW_REP : u8 = 2;
+pub const AR_HIRE_UNAVAILABLE : u8 = 3;
+pub const AR_HIRE_SELF : u8 = 4;
+
+/// A hire offers one task to an agent: it must have a score in the task's domain at or above the
+/// minimum (3.0 by default, the hirer may ask more but never less), be online and not busy, and not be
+/// the hirer. A hire carries no price and moves no value; the hired agent still claims the task.
+pub fn ar_hire_decide(score_x10: u32, status: u8, min_x10: u32, hirer_is_agent: bool) -> u8 {
+    if (hirer_is_agent) { return AR_HIRE_SELF; }
+    if (score_x10 == AR_NO_SCORE) { return AR_HIRE_NO_SCORE; }
+    var m : u32 = min_x10;
+    if (m < AR_MIN_HIRE_X10) { m = AR_MIN_HIRE_X10; }
+    if (score_x10 < m) { return AR_HIRE_LOW_REP; }
+    if (status != AR_ONLINE) { return AR_HIRE_UNAVAILABLE; }
+    return AR_HIRE_OK;
+}
+
+; --- 7. T27L lines (surface 11 "agent") --------------------------------------------------------------
+
+pub const AR_SURFACE : u8 = 11;
+pub const AR_ACT_FIRST : u8 = 29;
+pub const AR_ACT_LAST : u8 = 37;
+
+fn ar_put_score(out: []u8, at: usize, x10: u32) -> usize {
+    if (x10 == AR_NO_SCORE) { return put_bytes(out, at, "none"); }
+    return put_dec(out, at, x10);
+}
+
+/// "agent=0xNAME did=did:t27:0xNAME fp=<16 hex> caps=<mask>". The full key never enters a line.
+pub fn ar_created_payload(out: []u8, name: []const u8, fp: u64, caps: u32) -> usize {
+    if (!ar_name_ok(name) or out.len < 96) { return 0; }
+    var p : usize = put_bytes(out, 0, "agent=");
+    p = put_bytes(out, p, name);
+    p = put_bytes(out, p, " did=did:t27:");
+    p = put_bytes(out, p, name);
+    p = put_bytes(out, p, " fp=");
+    p = tl_put_hex16(out, p, fp);
+    p = put_bytes(out, p, " caps=");
+    return put_dec(out, p, caps);
+}
+
+/// "agent=0xNAME task=<id> scope=<path> domain=<d> rep_x10=<n|none>", the reputation snapshot of a claim.
+pub fn ar_claim_payload(out: []u8, name: []const u8, task: u64, scope: []const u8, domain: u8, rep_x10: u32) -> usize {
+    if (!ar_name_ok(name) or !ar_scope_ok(scope) or ar_domain_name(domain).len == 0) { return 0; }
+    if (out.len < 320) { return 0; }
+    var p : usize = put_bytes(out, 0, "agent=");
+    p = put_bytes(out, p, name);
+    p = put_bytes(out, p, " task=");
+    p = put_dec(out, p, task);
+    p = put_bytes(out, p, " scope=");
+    p = put_bytes(out, p, scope);
+    p = put_bytes(out, p, " domain=");
+    p = put_bytes(out, p, ar_domain_name(domain));
+    p = put_bytes(out, p, " rep_x10=");
+    return ar_put_score(out, p, rep_x10);
+}
+
+/// "agent=0xNAME task=<id> domain=<d> outcome=<o> reviewer=<r>"; the evidence ids ride in the line's
+/// evidence field, not in the payload.
+pub fn ar_outcome_payload(out: []u8, name: []const u8, task: u64, domain: u8, outcome: u8, reviewer: u8) -> usize {
+    if (!ar_name_ok(name) or ar_domain_name(domain).len == 0) { return 0; }
+    if (ar_outcome_name(outcome).len == 0 or ar_reviewer_name(reviewer).len == 0 or out.len < 160) { return 0; }
+    var p : usize = put_bytes(out, 0, "agent=");
+    p = put_bytes(out, p, name);
+    p = put_bytes(out, p, " task=");
+    p = put_dec(out, p, task);
+    p = put_bytes(out, p, " domain=");
+    p = put_bytes(out, p, ar_domain_name(domain));
+    p = put_bytes(out, p, " outcome=");
+    p = put_bytes(out, p, ar_outcome_name(outcome));
+    p = put_bytes(out, p, " reviewer=");
+    return put_bytes(out, p, ar_reviewer_name(reviewer));
+}
+
+/// A listing: "agent=0xNAME domain=<d> rep_x10=<n|none> status=<s>". No price, no credit, no value field.
+pub fn ar_listing_payload(out: []u8, name: []const u8, domain: u8, rep_x10: u32, status: u8) -> usize {
+    if (!ar_name_ok(name) or ar_domain_name(domain).len == 0 or ar_status_name(status).len == 0) { return 0; }
+    if (out.len < 96) { return 0; }
+    var p : usize = put_bytes(out, 0, "agent=");
+    p = put_bytes(out, p, name);
+    p = put_bytes(out, p, " domain=");
+    p = put_bytes(out, p, ar_domain_name(domain));
+    p = put_bytes(out, p, " rep_x10=");
+    p = ar_put_score(out, p, rep_x10);
+    p = put_bytes(out, p, " status=");
+    return put_bytes(out, p, ar_status_name(status));
+}
+
+/// One canonical T27L line for a registry action (29..37 only) on surface "agent". actor 1 user, 2 agent,
+/// 3 system. 0 when the action is not a registry action or the envelope refuses the line (for instance
+/// identity_rejected or lock_conflict below warn).
+pub fn ar_event(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                actor: u8, action: u8, level: u8, payload: []const u8, evidence_csv: []const u8) -> usize {
+    if (action < AR_ACT_FIRST or action > AR_ACT_LAST) { return 0; }
+    return tl_event_line(out, event_id, ts, device_id, session_id, actor, AR_SURFACE, action, level, "", "", "",
+                         payload, evidence_csv);
+}
+
+; --- 8. The MVP command table (dispatch NOT BUILT) --------------------------------------------------
+; Noun-verb, no prefix: the owner picks the prefix (t27a is taken by the assembler home in
+; specs/t27os/homes.t27, so it is not used by default). Common flags are --json, --plain, -h, --version,
+; -q, -v, -n/--dry-run, --confirm, --config; every argument passes ar_arg_ok.
+
+pub const AR_CMD_AGENT_CREATE : u8 = 1;
+pub const AR_CMD_AGENT_LIST : u8 = 2;
+pub const AR_CMD_TASK_CLAIM : u8 = 3;
+pub const AR_CMD_TASK_RELEASE : u8 = 4;
+pub const AR_CMD_REPUTATION_SHOW : u8 = 5;
+pub const AR_CMD_MARKETPLACE_HIRE : u8 = 6;
+pub const AR_CMD_AGENT_DELETE : u8 = 7;
+
+pub fn ar_cmd_id(noun: []const u8, verb: []const u8) -> u8 {
+    if (bytes_eq(noun, "agent") and bytes_eq(verb, "create")) { return 1; }
+    if (bytes_eq(noun, "agent") and bytes_eq(verb, "list")) { return 2; }
+    if (bytes_eq(noun, "task") and bytes_eq(verb, "claim")) { return 3; }
+    if (bytes_eq(noun, "task") and bytes_eq(verb, "release")) { return 4; }
+    if (bytes_eq(noun, "reputation") and bytes_eq(verb, "show")) { return 5; }
+    if (bytes_eq(noun, "marketplace") and bytes_eq(verb, "hire")) { return 6; }
+    if (bytes_eq(noun, "agent") and bytes_eq(verb, "delete")) { return 7; }
+    return 0;
+}
+
+/// A destructive command runs only with --confirm.
+pub fn ar_cmd_runs(cmd: u8, confirm: bool) -> bool {
+    if (cmd == 0 or cmd > 7) { return false; }
+    if (cmd == AR_CMD_AGENT_DELETE) { return confirm; }
+    return true;
+}
+
+/// No secret on the command line: a key, NAME=secret, e-mail or password is refused; a public key is
+/// given as a file path, never inline, so 64 hex is refused here too.
+pub fn ar_arg_ok(arg: []const u8) -> bool {
+    if (ar_hex64_in(arg)) { return false; }
+    return tl_arg_ok(arg);
+}
+
+; --- tests -------------------------------------------------------------------------------------------
+
+pub const AR_T_EV : str = "22222222-3333-4444-8555-666666666666";
+pub const AR_T_TS : str = "2026-11-08T12:34:56Z";
+pub const AR_T_KA : str = "0000000000000000000000000000000000000000000000000000000000000001";
+pub const AR_T_KB : str = "0000000000000000000000000000000000000000000000000000000000000002";
+pub const AR_T_KC : str = "00000000000000000000000000000000000000000000000000000000000000ff";
+pub const AR_T_KD : str = "abcdef0000000000000000000000000000000000000000000000000000000000";
+
+fn ar_t_has(s: []const u8, w: []const u8) -> bool {
+    if (w.len == 0 or w.len > s.len) { return false; }
+    var i : usize = 0;
+    while (i + w.len <= s.len) {
+        if (bytes_eq(s[i..i + w.len], w)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+test names_and_keys {
+    assert ar_name_ok("0xALPHA");
+    assert ar_name_ok("0xQ27");
+    assert !ar_name_ok("0xalpha");
+    assert !ar_name_ok("ALPHA");
+    assert !ar_name_ok("0x7ALPHA");
+    assert !ar_name_ok("0xA");
+    assert !ar_name_ok("0xABCDEFGHIJKLMNO");
+    assert ar_key_ok(AR_T_KA);
+    assert !ar_key_ok("00000000000000000000000000000000000000000000000000000000000000FF");
+    assert !ar_key_ok("0001");
+    assert !ar_key_ok("-----BEGIN PUBLIC KEY-----");
+}
+
+test fingerprint_is_sha256_prefix {
+    // FIPS 180-2 vector: SHA-256("abc") = ba7816bf 8f01cfea ...
+    const fp : u64 = ar_fingerprint("abc");
+    assert fp / 4294967296 == 3128432319;
+    assert fp - (fp / 4294967296) * 4294967296 == 2399260650;
+    assert ar_fingerprint(AR_T_KA) == ar_fingerprint(AR_T_KA);
+    assert ar_fingerprint(AR_T_KA) != ar_fingerprint(AR_T_KB);
+    var b : [32]u8 = undefined;
+    const n : usize = tl_put_hex16(b[0..32], 0, ar_fingerprint("abc"));
+    assert bytes_eq(b[0..n], "ba7816bf8f01cfea");
+}
+
+test did_string {
+    var b : [64]u8 = undefined;
+    const n : usize = ar_did(b[0..64], "0xALPHA");
+    assert bytes_eq(b[0..n], "did:t27:0xALPHA");
+    assert ar_did(b[0..64], "alpha") == 0;
+}
+
+test three_agents_register_and_duplicates_are_rejected {
+    var names : [432]u8 = undefined;
+    var lens : [27]usize = undefined;
+    var fps : [27]u64 = undefined;
+    var owners : [27]u32 = undefined;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 0, "0xALPHA", AR_T_KA, 1) == AR_OK;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 1, "0xBETA", AR_T_KB, 1) == AR_OK;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 2, "0xGAMMA", AR_T_KC, 2) == AR_OK;
+    assert bytes_eq(ar_slot_name(names[0..432], lens[0..27], 1), "0xBETA");
+    // one agent = one identity: the same name, or the same key under a new name, is refused
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 3, "0xBETA", AR_T_KD, 2) == AR_E_DUP_NAME;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 3, "0xDELTA", AR_T_KA, 2) == AR_E_DUP_KEY;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 3, "delta", AR_T_KD, 2) == AR_E_NAME;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 3, "0xDELTA", "0001", 2) == AR_E_KEY;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 3, "0xDELTA", AR_T_KD, 0) == AR_E_OWNER;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 27, "0xDELTA", AR_T_KD, 2) == AR_E_FULL;
+    // a refusal writes nothing: slot 3 is still free for a valid agent
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 3, "0xDELTA", AR_T_KD, 2) == AR_OK;
+}
+
+test the_per_owner_cap {
+    var names : [432]u8 = undefined;
+    var lens : [27]usize = undefined;
+    var fps : [27]u64 = undefined;
+    var owners : [27]u32 = undefined;
+    var s : usize = 0;
+    while (s < 9) {
+        lens[s] = 3;
+        names[s * 16] = 48; names[s * 16 + 1] = 120; names[s * 16 + 2] = @intCast(65 + s);
+        fps[s] = s + 1;
+        owners[s] = 5;
+        s = s + 1;
+    }
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 9, "0xZED", AR_T_KA, 5) == AR_E_OWNER_CAP;
+    assert ar_register(names[0..432], lens[0..27], fps[0..27], owners[0..27], 9, "0xZED", AR_T_KA, 6) == AR_OK;
+}
+
+test profiles_carry_no_secret_or_personal_data {
+    assert ar_profile_ok("reviews t27 specs and gates");
+    assert !ar_profile_ok("contact me at someone@example.com");
+    assert !ar_profile_ok("-----BEGIN PRIVATE KEY-----");
+    assert !ar_profile_ok("my password is hunter2");
+    assert !ar_profile_ok("API_TOKEN=abc123");
+    assert !ar_profile_ok("sk1234567890abcdefghijklmnopqrstuvwxyz");
+    // a 64-hex run passes tl_arg_ok (a sha256 is kept) but not a profile: it may be a private seed
+    assert tl_arg_ok(AR_T_KD);
+    assert !ar_profile_ok(AR_T_KD);
+    assert !ar_profile_ok("seed abcdef0000000000000000000000000000000000000000000000000000000000 here");
+    // a 40-hex commit id stays allowed in a portfolio line
+    assert ar_profile_ok("fixed in 3b5910839c0000000000000000000000000000ab");
+}
+
+test status_and_domains {
+    assert ar_status_of(false, true) == AR_OFFLINE;
+    assert ar_status_of(true, true) == AR_BUSY;
+    assert ar_status_of(true, false) == AR_ONLINE;
+    assert ar_domain_id("code_review") == AR_DOM_CODE_REVIEW;
+    assert ar_domain_id("research") == AR_DOM_LAST;
+    assert ar_domain_id("global") == 0;
+}
+
+test claim_and_release_cycle {
+    assert ar_scope_ok("specs/queen/agent_registry.t27");
+    assert !ar_scope_ok("/etc/passwd");
+    assert !ar_scope_ok("~/t27");
+    assert !ar_scope_ok("specs/../secrets");
+    assert !ar_scope_ok("");
+    // one spelling: "./", ".", "specs/./x" and "specs//x" overlap nothing and would bypass every lock
+    assert !ar_scope_ok("./");
+    assert !ar_scope_ok(".");
+    assert !ar_scope_ok("./specs");
+    assert !ar_scope_ok("specs/./queen");
+    assert !ar_scope_ok("specs//queen");
+    assert !ar_scope_ok("specs/.");
+    assert ar_scope_ok(".github/workflows");
+    assert ar_scope_ok("specs/queen/");
+    assert ar_scope_overlap("specs/queen", "specs/queen/holds.t27");
+    assert ar_scope_overlap("specs/queen/holds.t27", "specs/queen/holds.t27");
+    assert !ar_scope_overlap("specs/queen/holds.t27", "specs/queen/claim_msg.t27");
+    // 0xALPHA claims a free scope
+    assert ar_claim_decide(true, 0, false, false, 0, false) == AR_LOCK_OK;
+    // 0xBETA claims an overlapping scope 0xALPHA holds, 10 minutes after its last beat
+    assert ar_claim_decide(true, 0, false, true, 10, false) == AR_LOCK_CONFLICT;
+    // 0xALPHA re-claims its own lock after a restart
+    assert ar_claim_decide(true, 1, false, true, 10, true) == AR_LOCK_OK;
+    // one task per agent, the rate limit, a bad scope
+    assert ar_claim_decide(true, 0, true, false, 0, false) == AR_LOCK_BUSY;
+    assert ar_claim_decide(true, 6, false, false, 0, false) == AR_LOCK_RATE;
+    assert ar_claim_decide(false, 0, false, false, 0, false) == AR_LOCK_SCOPE;
+    // an abandoned lock is recoverable only by the timeout policy (six hours)
+    assert ar_claim_decide(true, 0, false, true, 359, false) == AR_LOCK_CONFLICT;
+    assert ar_claim_decide(true, 0, false, true, 360, false) == AR_LOCK_TAKEOVER;
+    assert ar_beat_ok(true, true);
+    assert !ar_beat_ok(true, false);
+    assert !ar_beat_ok(false, true);
+    // release: completion needs evidence, abort does not, a stranger only after the timeout
+    assert ar_release_decide(true, true, 5, AR_REL_COMPLETED, 0, false) == AR_REL_NO_EVIDENCE;
+    assert ar_release_decide(true, true, 5, AR_REL_COMPLETED, 1, false) == AR_REL_OK;
+    assert ar_release_decide(true, false, 5, AR_REL_COMPLETED, 1, false) == AR_REL_NOT_HOLDER;
+    assert ar_release_decide(true, true, 5, AR_REL_ABORTED, 0, false) == AR_REL_OK;
+    assert ar_release_decide(true, false, 5, AR_REL_ABORTED, 0, false) == AR_REL_NOT_HOLDER;
+    assert ar_release_decide(true, false, 359, AR_REL_TIMEOUT, 0, false) == AR_REL_NOT_HOLDER;
+    assert ar_release_decide(true, false, 360, AR_REL_TIMEOUT, 0, false) == AR_REL_OK;
+    assert ar_release_decide(true, false, 5, AR_REL_TIMEOUT, 0, true) == AR_REL_OK;
+    assert ar_release_decide(true, true, 5, 9, 1, false) == AR_REL_BAD_REASON;
+    assert ar_release_decide(false, true, 5, AR_REL_COMPLETED, 1, false) == AR_REL_NO_LOCK;
+}
+
+test only_reviewed_evidence_counts {
+    assert ar_counts(1, AR_APPROVED, AR_REV_OWNER, false, false);
+    assert ar_counts(2, AR_APPROVED, AR_REV_TESTS, false, false);
+    assert !ar_counts(0, AR_APPROVED, AR_REV_OWNER, false, false);
+    assert !ar_counts(1, AR_PENDING, AR_REV_OWNER, false, false);
+    assert !ar_counts(1, AR_REJECTED, AR_REV_OWNER, false, false);
+    assert !ar_counts(1, AR_APPROVED, AR_REV_PEER, false, false);
+    // no self-review: an agent approving its own work never counts, whatever role it claims
+    assert !ar_counts(1, AR_APPROVED, AR_REV_TRUSTED, true, false);
+    // a trusted reviewer that is another agent of the same owner does not count; the owner in person does
+    assert !ar_counts(1, AR_APPROVED, AR_REV_TRUSTED, false, true);
+    assert ar_counts(1, AR_APPROVED, AR_REV_TRUSTED, false, false);
+    assert ar_counts(1, AR_APPROVED, AR_REV_OWNER, false, true);
+}
+
+test per_domain_reputation_needs_three_counted_tasks {
+    // agent 0: three counted code_review tasks (success, success, partial), one self-reviewed success that does
+    // not count, and one counted spec task; agent 1: two counted code_review tasks.
+    var ta : [7]u8 = undefined;
+    var td : [7]u8 = undefined;
+    var to : [7]u8 = undefined;
+    var tc : [7]u8 = undefined;
+    var tq : [7]u8 = undefined;
+    var tg : [7]u32 = undefined;
+    var tk : [7]bool = undefined;
+    ta[0] = 0; td[0] = 1; to[0] = 2; tc[0] = 2; tq[0] = 2; tg[0] = 0; tk[0] = ar_counts(1, AR_APPROVED, AR_REV_OWNER, false, false);
+    ta[1] = 0; td[1] = 1; to[1] = 2; tc[1] = 2; tq[1] = 2; tg[1] = 0; tk[1] = ar_counts(1, AR_APPROVED, AR_REV_TESTS, false, false);
+    ta[2] = 0; td[2] = 1; to[2] = 1; tc[2] = 2; tq[2] = 2; tg[2] = 0; tk[2] = ar_counts(1, AR_APPROVED, AR_REV_OWNER, false, false);
+    ta[3] = 0; td[3] = 1; to[3] = 2; tc[3] = 5; tq[3] = 3; tg[3] = 0; tk[3] = ar_counts(1, AR_APPROVED, AR_REV_TRUSTED, true, false);
+    ta[4] = 0; td[4] = 2; to[4] = 2; tc[4] = 1; tq[4] = 1; tg[4] = 0; tk[4] = ar_counts(1, AR_APPROVED, AR_REV_OWNER, false, false);
+    ta[5] = 1; td[5] = 1; to[5] = 2; tc[5] = 1; tq[5] = 1; tg[5] = 0; tk[5] = ar_counts(1, AR_APPROVED, AR_REV_OWNER, false, false);
+    ta[6] = 1; td[6] = 1; to[6] = 2; tc[6] = 1; tq[6] = 1; tg[6] = 0; tk[6] = ar_counts(1, AR_APPROVED, AR_REV_OWNER, false, false);
+    assert ar_counted(0, 1, ta[0..7], td[0..7], tk[0..7], 7) == 3;
+    // equal weights: (1000 + 1000 + 500) / 3 = 833 permille -> 41.65 -> 42 (4.2); the self-review is not in it
+    assert ar_score_x10(0, 1, ta[0..7], td[0..7], to[0..7], tc[0..7], tq[0..7], tg[0..7], tk[0..7], 7) == 42;
+    assert ar_success_permille(0, 1, ta[0..7], td[0..7], to[0..7], tk[0..7], 7) == 666;
+    // one counted spec task and two counted code_review tasks are no score
+    assert ar_score_x10(0, 2, ta[0..7], td[0..7], to[0..7], tc[0..7], tq[0..7], tg[0..7], tk[0..7], 7) == AR_NO_SCORE;
+    assert ar_score_x10(1, 1, ta[0..7], td[0..7], to[0..7], tc[0..7], tq[0..7], tg[0..7], tk[0..7], 7) == AR_NO_SCORE;
+    // decay: the partial result 90 days old weighs 512 against 4096 for each success:
+    // (4096000 + 4096000 + 256000) / 8704 = 970 permille -> 48.5 -> 49
+    tg[2] = 90;
+    assert ar_score_x10(0, 1, ta[0..7], td[0..7], to[0..7], tc[0..7], tq[0..7], tg[0..7], tk[0..7], 7) == 49;
+    // a counted task that weighs 0 is not one of the three: complexity 0 on task 1 leaves two
+    tc[1] = 0;
+    assert ar_counted(0, 1, ta[0..7], td[0..7], tk[0..7], 7) == 3;
+    assert ar_score_x10(0, 1, ta[0..7], td[0..7], to[0..7], tc[0..7], tq[0..7], tg[0..7], tk[0..7], 7) == AR_NO_SCORE;
+    tc[1] = 2;
+    // three counted rows in domain 7, which does not exist, are no score
+    td[0] = 7; td[1] = 7; td[2] = 7;
+    assert ar_counted(0, 7, ta[0..7], td[0..7], tk[0..7], 7) == 3;
+    assert ar_score_x10(0, 7, ta[0..7], td[0..7], to[0..7], tc[0..7], tq[0..7], tg[0..7], tk[0..7], 7) == AR_NO_SCORE;
+}
+
+test decay_and_weight {
+    assert ar_decay(0) == 1024;
+    assert ar_decay(29) == 1024;
+    assert ar_decay(30) == 512;
+    assert ar_decay(90) == 128;
+    assert ar_decay(100000) == 1;
+    assert ar_weight(5, 3, 0) == 15360;
+    assert ar_weight(0, 3, 0) == 0;
+    assert ar_weight(2, 4, 0) == 0;
+}
+
+test endorsements_tiers_anomalies_credentials {
+    assert ar_endorse_weight(45, false, false) == 45;
+    assert ar_endorse_weight(45, true, false) == 0;
+    assert ar_endorse_weight(45, false, true) == 0;
+    assert ar_endorse_weight(AR_NO_SCORE, false, false) == 0;
+    assert ar_tier_change_ok(1, AR_REV_OWNER, false);
+    assert !ar_tier_change_ok(0, AR_REV_OWNER, false);
+    assert !ar_tier_change_ok(3, AR_REV_TESTS, false);
+    assert !ar_tier_change_ok(3, AR_REV_PEER, false);
+    assert !ar_tier_change_ok(3, AR_REV_TRUSTED, true);
+    assert !ar_anomaly(5, 5);
+    assert ar_anomaly(6, 4);
+    assert !ar_anomaly(6, 3);
+    assert ar_anomaly(24, 0);
+    var r : u8 = 1;
+    while (r <= 5) {
+        assert !ar_credential_grants(r);
+        r = r + 1;
+    }
+    assert ar_credential_grants(AR_RIGHT_REVIEW_DOMAIN);
+    assert ar_credential_grants(AR_RIGHT_CLAIM_DOMAIN);
+}
+
+test hire_is_reputation_gated {
+    assert ar_hire_decide(42, AR_ONLINE, 30, false) == AR_HIRE_OK;
+    assert ar_hire_decide(42, AR_ONLINE, 45, false) == AR_HIRE_LOW_REP;
+    // a hirer may not lower the floor below 3.0
+    assert ar_hire_decide(20, AR_ONLINE, 10, false) == AR_HIRE_LOW_REP;
+    assert ar_hire_decide(AR_NO_SCORE, AR_ONLINE, 30, false) == AR_HIRE_NO_SCORE;
+    assert ar_hire_decide(42, AR_BUSY, 30, false) == AR_HIRE_UNAVAILABLE;
+    assert ar_hire_decide(42, AR_OFFLINE, 30, false) == AR_HIRE_UNAVAILABLE;
+    assert ar_hire_decide(42, AR_ONLINE, 30, true) == AR_HIRE_SELF;
+}
+
+test listing_has_no_price_field {
+    var b : [128]u8 = undefined;
+    const n : usize = ar_listing_payload(b[0..128], "0xALPHA", AR_DOM_CODE_REVIEW, 42, AR_ONLINE);
+    assert bytes_eq(b[0..n], "agent=0xALPHA domain=code_review rep_x10=42 status=online");
+    assert !ar_t_has(b[0..n], "price");
+    assert !ar_t_has(b[0..n], "credit");
+    assert !ar_t_has(b[0..n], "usd");
+    const m : usize = ar_listing_payload(b[0..128], "0xBETA", AR_DOM_SPEC, AR_NO_SCORE, AR_BUSY);
+    assert bytes_eq(b[0..m], "agent=0xBETA domain=spec rep_x10=none status=busy");
+}
+
+test registry_events_are_valid_t27l_lines {
+    var p : [512]u8 = undefined;
+    var ln : [2048]u8 = undefined;
+    var pn : usize = ar_created_payload(p[0..512], "0xALPHA", ar_fingerprint("abc"), 1);
+    assert bytes_eq(p[0..pn], "agent=0xALPHA did=did:t27:0xALPHA fp=ba7816bf8f01cfea caps=1");
+    var n : usize = ar_event(ln[0..2048], AR_T_EV, AR_T_TS, "mac-1", "sess-1", 2, 29, 2, p[0..pn], "");
+    assert n > 0;
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    pn = ar_claim_payload(p[0..512], "0xALPHA", 13350, "specs/queen/agent_registry.t27", AR_DOM_CODE_REVIEW, 42);
+    assert bytes_eq(p[0..pn], "agent=0xALPHA task=13350 scope=specs/queen/agent_registry.t27 domain=code_review rep_x10=42");
+    n = ar_event(ln[0..2048], AR_T_EV, AR_T_TS, "mac-1", "sess-1", 2, 32, 2, p[0..pn], "");
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    // a lock conflict is a refusal: warn passes, info is refused by the envelope
+    n = ar_event(ln[0..2048], AR_T_EV, AR_T_TS, "mac-1", "sess-1", 2, 35, 3, p[0..pn], "");
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    assert ar_event(ln[0..2048], AR_T_EV, AR_T_TS, "mac-1", "sess-1", 2, 35, 2, p[0..pn], "") == 0;
+    // the completed task carries its evidence id
+    pn = ar_outcome_payload(p[0..512], "0xALPHA", 13350, AR_DOM_CODE_REVIEW, AR_SUCCESS, AR_REV_OWNER);
+    assert bytes_eq(p[0..pn], "agent=0xALPHA task=13350 domain=code_review outcome=success reviewer=owner");
+    n = ar_event(ln[0..2048], AR_T_EV, AR_T_TS, "mac-1", "sess-1", 2, 36, 2, p[0..pn], "ev-0123456789abcdef");
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    // a registry event never borrows another surface's action
+    assert ar_event(ln[0..2048], AR_T_EV, AR_T_TS, "mac-1", "sess-1", 2, 25, 2, p[0..pn], "") == 0;
+    assert ar_claim_payload(p[0..512], "0xALPHA", 1, "/etc/passwd", AR_DOM_SPEC, 42) == 0;
+}
+
+test cli_table_and_args {
+    assert ar_cmd_id("agent", "create") == AR_CMD_AGENT_CREATE;
+    assert ar_cmd_id("marketplace", "hire") == AR_CMD_MARKETPLACE_HIRE;
+    assert ar_cmd_id("agent", "pay") == 0;
+    assert ar_cmd_runs(AR_CMD_TASK_CLAIM, false);
+    assert !ar_cmd_runs(AR_CMD_AGENT_DELETE, false);
+    assert ar_cmd_runs(AR_CMD_AGENT_DELETE, true);
+    assert !ar_cmd_runs(0, true);
+    assert ar_arg_ok("0xALPHA");
+    assert ar_arg_ok("keys/alpha.pub");
+    assert !ar_arg_ok(AR_T_KA);
+    assert !ar_arg_ok("ZAI_API_KEY=abc123");
+    assert !ar_arg_ok("someone@example.com");
+    // a 64-hex run inside an argument, or in upper case, is refused too
+    assert !ar_arg_ok("--from 0000000000000000000000000000000000000000000000000000000000000001");
+    assert !ar_arg_ok("ABCDEF0000000000000000000000000000000000000000000000000000000000");
+}
+
+; --- 9. Naming convention V3: 27 domains, ids, spec ownership, capabilities ----------------------------
+; Owner order T27_DOMAIN_AGENT_NAMING / CANONICAL_NAMING_CONVENTION_V3, 2026-11-08. Everything here is a
+; decision table with tests; nothing renames an agent and nothing grants a capability.
+; Conflicts with existing meanings are NOT resolved here. The existing meaning stays; the order's meaning
+; is a candidate. Open conflicts (report: target/t27a/naming_report.md):
+;   - letters D (doctor vs Design), F (frontend vs Files), C (compiler vs Contracts), O (Ouroboros vs
+;     Operations) and 20 more differ; only B, J and Y keep their meaning (an_letter_status);
+;   - the order's examples name 0xOrchestrator@memory.t27, but no memory domain exists: T27K is
+;     Knowledge/Memory (slug knowledge) and 0xOrchestrator is listed under T27W; specs/queen/claim_msg.t27
+;     is therefore left without an owner row;
+;   - role names 0xIncident, 0xScheduler, 0xRegistry, 0xAuditor appear in two domains each; an id carries
+;     the domain, so ids stay unique, but accountability must be split by the owner;
+;   - ar_name_ok accepts only upper-case names (0xALPHA); canonical roles are CamelCase (0xLogger), so the
+;     identity table above refuses them until the owner picks one form;
+;   - the an_ rules live in a file the table gives to T27A, while the order puts registry rules in T27#.
+; TODO(T27L): specs/t27os/t27l.t27 has no capability surface and its actor field is u8 1..3 (user, agent,
+; system); an ownership or capability approval should log as surface "capability", action
+; "spec_owner_approved" / "capability_used" with the canonical id as actor. Not edited here.
+
+pub const AN_DOMAINS : usize = 27;
+pub const AN_ORPHAN : u8 = 0;
+pub const AN_D_KERNEL : u8 = 27;
+
+/// Domain codes in order; index + 1 is the domain number. T27# is the cross-cutting kernel, not a 28th domain.
+pub const AN_CODES : [27]str = ["T27A", "T27B", "T27C", "T27D", "T27E", "T27F", "T27G", "T27H", "T27I", "T27J", "T27K", "T27L", "T27M", "T27N", "T27O", "T27P", "T27Q", "T27R", "T27S", "T27T", "T27U", "T27V", "T27W", "T27X", "T27Y", "T27Z", "T27#"];
+
+/// Slugs in the same order: lower-case letters, unique. The order's own examples fix telemetry, design,
+/// operations, build, visual and economics; the rest are this file's pick.
+pub const AN_SLUGS : [27]str = ["identity", "build", "contracts", "design", "economics", "files", "governance", "health", "integration", "jobs", "knowledge", "telemetry", "messaging", "networking", "operations", "product", "quality", "research", "security", "time", "interface", "visual", "workflow", "extension", "delivery", "boundary", "kernel"];
+
+/// 1..27 for a known slug, AN_ORPHAN otherwise.
+pub fn an_domain_of_slug(slug: []const u8) -> u8 {
+    var i : usize = 0;
+    while (i < AN_DOMAINS) {
+        if (bytes_eq(AN_SLUGS[i], slug)) { return @intCast(i + 1); }
+        i = i + 1;
+    }
+    return AN_ORPHAN;
+}
+
+/// A role is CamelCase: an upper-case first letter, then letters and digits, 3..24 characters.
+pub fn an_role_ok(role: []const u8) -> bool {
+    if (role.len < 3 or role.len > 24) { return false; }
+    if (role[0] < 65 or role[0] > 90) { return false; }
+    var k : usize = 1;
+    while (k < role.len) {
+        const ch : u8 = role[k];
+        const alpha : bool = (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122);
+        if (!(alpha or (ch >= 48 and ch <= 57))) { return false; }
+        k = k + 1;
+    }
+    return true;
+}
+
+/// True when the last four bytes are ".t27".
+pub fn an_ends_t27(s: []const u8) -> bool {
+    if (s.len < 4) { return false; }
+    const n : usize = s.len;
+    return s[n - 4] == 46 and s[n - 3] == 116 and s[n - 2] == 50 and s[n - 1] == 55;
+}
+
+fn an_at_pos(id: []const u8) -> usize {
+    var j : usize = 0;
+    while (j < id.len) {
+        if (id[j] == 64) { return j; }
+        j = j + 1;
+    }
+    return id.len;
+}
+
+/// Canonical id: 0x<ROLE>@<slug>.t27 with a CamelCase role and a slug from AN_SLUGS.
+pub fn an_id_ok(id: []const u8) -> bool {
+    if (id.len < 12) { return false; }
+    if (id[0] != 48 or id[1] != 120) { return false; }
+    const at : usize = an_at_pos(id);
+    if (at + 6 > id.len) { return false; }
+    if (!an_ends_t27(id)) { return false; }
+    if (!an_role_ok(id[2..at])) { return false; }
+    return an_domain_of_slug(id[at + 1..id.len - 4]) != AN_ORPHAN;
+}
+
+/// The domain number of a canonical id, AN_ORPHAN when the id is not canonical.
+pub fn an_id_domain(id: []const u8) -> u8 {
+    if (!an_id_ok(id)) { return AN_ORPHAN; }
+    return an_domain_of_slug(id[an_at_pos(id) + 1..id.len - 4]);
+}
+
+/// Build 0x<role>@<slug>.t27 into out; 0 when the role or slug is invalid or out is too small.
+pub fn an_id_build(out: []u8, role: []const u8, slug: []const u8) -> usize {
+    if (!an_role_ok(role)) { return 0; }
+    if (an_domain_of_slug(slug) == AN_ORPHAN) { return 0; }
+    if (out.len < role.len + slug.len + 8) { return 0; }
+    var p : usize = put_bytes(out, 0, "0x");
+    p = put_bytes(out, p, role);
+    p = put_bytes(out, p, "@");
+    p = put_bytes(out, p, slug);
+    return put_bytes(out, p, ".t27");
+}
+
+; --- 9a. Spec ownership: one row per prefix, the longest prefix wins ------------------------------------
+; A directory row ends in "/", a file row ends in ".t27". A spec with no matching row is an orphan
+; (AN_ORPHAN). Only directories whose content has one clear domain have a row: ambiguous directories
+; (port, tri, t27f, t27os, fpga, tools, queen, claw, numeric, ml, ternary ...) are left orphan on purpose
+; until the owner decides; no row is a guess.
+
+pub const AN_ROWS : usize = 56;
+
+pub const AN_PFX : [56]str = [
+    "specs/a/", "specs/a_b/", "specs/agents/", "specs/ar/", "specs/base/", "specs/benchmarks/", "specs/bus/", "specs/ci/", "specs/compiler/", "specs/conformance/",
+    "specs/crons/", "specs/docs/", "specs/file/", "specs/github/", "specs/golden/", "specs/graph/", "specs/hosting/", "specs/hslm/", "specs/i18n/", "specs/igla/",
+    "specs/jit/", "specs/jobs/", "specs/math/", "specs/memory/", "specs/neural/", "specs/nn/", "specs/physics/", "specs/policy/", "specs/provider/", "specs/providers/",
+    "specs/rings/", "specs/std/", "specs/storage/", "specs/t27t/", "specs/test_framework/", "specs/trinet/", "specs/trinity/", "specs/ui/", "specs/vault/", "specs/verified/",
+    "specs/viz/", "specs/vm/", "specs/xilinx7/",
+    "specs/agents/a.t27", "specs/t27os/t27l.t27", "specs/t27os/t27m.t27", "specs/t27os/t27t.t27", "specs/claw/cost_policy.t27", "specs/queen/agent_registry.t27", "specs/queen/roadmap.t27", "specs/t27os/doctor_mem.t27",
+    "specs/t27os/t27r.t27", "specs/t27f/lukomorye_graph_terminal.t27", "specs/t27f/work_graph_ext.t27",
+    "specs/tri/trigit/roadmap_dashboard_sync.t27", "specs/tri/trigit/issue_hygiene_engine.t27"
+];
+
+/// Domain number of each row in AN_PFX (1 = T27A ... 27 = T27#).
+pub const AN_PFX_DOM : [56]u8 = [
+    17, 17, 1, 18, 2, 17, 13, 17, 2, 17,
+    10, 11, 6, 9, 18, 11, 5, 18, 21, 18,
+    2, 10, 18, 11, 18, 18, 18, 7, 9, 9,
+    18, 2, 6, 18, 17, 14, 2, 21, 19, 17,
+    22, 2, 2,
+    27, 12, 13, 20, 5, 1, 16, 15,
+    18, 22, 22,
+    16, 16
+];
+
+/// The table itself is valid: every prefix starts with "specs/", ends in "/" or ".t27", names a domain
+/// 1..27 and appears once. A duplicate prefix would be shared ownership, so it is refused.
+pub fn an_table_ok() -> bool {
+    var r : usize = 0;
+    while (r < AN_ROWS) {
+        const pre : []const u8 = AN_PFX[r];
+        if (pre.len < 8) { return false; }
+        if (!bytes_eq(pre[0..6], "specs/")) { return false; }
+        if (!(pre[pre.len - 1] == 47 or an_ends_t27(pre))) { return false; }
+        if (AN_PFX_DOM[r] < 1 or AN_PFX_DOM[r] > 27) { return false; }
+        var q : usize = 0;
+        while (q < r) {
+            if (bytes_eq(AN_PFX[q], pre)) { return false; }
+            q = q + 1;
+        }
+        r = r + 1;
+    }
+    return true;
+}
+
+fn an_best_len(path: []const u8) -> usize {
+    var best : usize = 0;
+    var r : usize = 0;
+    while (r < AN_ROWS) {
+        const pre : []const u8 = AN_PFX[r];
+        if (pre.len > best and path.len >= pre.len and bytes_eq(path[0..pre.len], pre)) { best = pre.len; }
+        r = r + 1;
+    }
+    return best;
+}
+
+/// How many rows match at the longest length: 0 (orphan) or 1. Two would be shared ownership.
+pub fn an_owner_ties(path: []const u8) -> usize {
+    const best : usize = an_best_len(path);
+    if (best == 0) { return 0; }
+    var hits : usize = 0;
+    var r : usize = 0;
+    while (r < AN_ROWS) {
+        const pre : []const u8 = AN_PFX[r];
+        if (pre.len == best and bytes_eq(path[0..best], pre)) { hits = hits + 1; }
+        r = r + 1;
+    }
+    return hits;
+}
+
+/// The owner domain (1..27) of a spec path, AN_ORPHAN when no row matches or the path is not a .t27 file.
+pub fn an_owner_of(path: []const u8) -> u8 {
+    if (!an_ends_t27(path)) { return AN_ORPHAN; }
+    const best : usize = an_best_len(path);
+    var r : usize = 0;
+    while (best > 0 and r < AN_ROWS) {
+        const pre : []const u8 = AN_PFX[r];
+        if (pre.len == best and bytes_eq(path[0..best], pre)) { return AN_PFX_DOM[r]; }
+        r = r + 1;
+    }
+    return AN_ORPHAN;
+}
+
+/// Coverage in permille (1000 = every spec owned); 0 when there are no specs.
+pub fn an_coverage_permille(total: u32, owned: u32) -> u32 {
+    if (total == 0) { return 0; }
+    return owned * 1000 / total;
+}
+
+; --- 9b. SPEC_OWNERSHIP_HISTORY: add-only change records ------------------------------------------------
+; A record is (seq, old owner, new owner). The first record of a spec has old = AN_ORPHAN. An owner change
+; needs an owner approval, so a record without one is refused.
+
+/// May the record be appended? seq must be last + 1, old must be the current owner, new must be a real,
+/// different domain, and the owner must have approved.
+pub fn an_hist_append_ok(last_seq: u32, cur_owner: u8, seq: u32, old_owner: u8, new_owner: u8, approved: bool) -> bool {
+    if (!approved) { return false; }
+    if (seq != last_seq + 1) { return false; }
+    if (old_owner != cur_owner) { return false; }
+    if (new_owner < 1 or new_owner > 27) { return false; }
+    return new_owner != old_owner;
+}
+
+/// Replay a whole history from nothing: every record must be a legal next record after the one before.
+pub fn an_hist_ok(seqs: []const u32, olds: []const u8, news: []const u8, n: usize) -> bool {
+    var cur : u8 = AN_ORPHAN;
+    var last : u32 = 0;
+    var h : usize = 0;
+    while (h < n) {
+        if (!an_hist_append_ok(last, cur, seqs[h], olds[h], news[h], true)) { return false; }
+        cur = news[h];
+        last = seqs[h];
+        h = h + 1;
+    }
+    return true;
+}
+
+; --- 9c. Capabilities: four classes, no implicit grant, no silent expansion ---------------------------
+
+pub const AN_CL_ALLOW : u8 = 1;
+pub const AN_CL_POLICY : u8 = 2;
+pub const AN_CL_OWNER : u8 = 3;
+pub const AN_CL_FORBIDDEN : u8 = 4;
+pub const AN_CAP_COUNT : usize = 15;
+
+pub const AN_CAP_NAMES : [15]str = ["read_spec", "write_own_spec", "compile", "link", "optimize", "restart_t27_component", "kill_external_process", "merge_pr", "mint_token", "read_secret_value", "assign_spec_owner", "write_cross_cutting_rule", "log_event", "spend_budget", "self_grant_capability"];
+
+/// Class of each capability in AN_CAP_NAMES. A capability set is one byte per capability, 1 = held.
+pub const AN_CAP_CLASS : [15]u8 = [1, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 1, 3, 4];
+
+/// Class of capability number i, 0 when out of range.
+pub fn an_cap_class(i: usize) -> u8 {
+    if (i >= AN_CAP_COUNT) { return 0; }
+    return AN_CAP_CLASS[i];
+}
+
+/// A capability set is exactly AN_CAP_COUNT bytes, each 0 or 1.
+pub fn an_cap_set_ok(set: []const u8) -> bool {
+    if (set.len != AN_CAP_COUNT) { return false; }
+    var c : usize = 0;
+    while (c < set.len) {
+        if (set[c] > 1) { return false; }
+        c = c + 1;
+    }
+    return true;
+}
+
+/// How many capabilities the new set holds that the old one did not.
+pub fn an_cap_added(old: []const u8, new: []const u8) -> usize {
+    var n : usize = 0;
+    var c : usize = 0;
+    while (c < AN_CAP_COUNT and c < old.len and c < new.len) {
+        if (old[c] == 0 and new[c] == 1) { n = n + 1; }
+        c = c + 1;
+    }
+    return n;
+}
+
+/// How many capabilities the old set held that the new one drops.
+pub fn an_cap_removed(old: []const u8, new: []const u8) -> usize {
+    var n : usize = 0;
+    var c : usize = 0;
+    while (c < AN_CAP_COUNT and c < old.len and c < new.len) {
+        if (old[c] == 1 and new[c] == 0) { n = n + 1; }
+        c = c + 1;
+    }
+    return n;
+}
+
+/// A rename keeps the capability set byte-equal: no addition, no removal, no approval path.
+pub fn an_rename_ok(old: []const u8, new: []const u8) -> bool {
+    if (!an_cap_set_ok(old) or !an_cap_set_ok(new)) { return false; }
+    return bytes_eq(old, new);
+}
+
+/// A migration may drop capabilities, but every added one needs an owner-gated approval record
+/// (approvals[i] == 1), and a forbidden capability can never be added, approved or not.
+pub fn an_migration_ok(old: []const u8, new: []const u8, approvals: []const u8) -> bool {
+    if (!an_cap_set_ok(old) or !an_cap_set_ok(new)) { return false; }
+    if (approvals.len != AN_CAP_COUNT) { return false; }
+    var c : usize = 0;
+    while (c < AN_CAP_COUNT) {
+        if (old[c] == 0 and new[c] == 1) {
+            if (AN_CAP_CLASS[c] == AN_CL_FORBIDDEN) { return false; }
+            if (approvals[c] != 1) { return false; }
+        }
+        c = c + 1;
+    }
+    return true;
+}
+
+/// Create an agent only when all four are true: distinct accountability, capability boundary, failure
+/// mode and audit trail. Otherwise it is a capability of an existing agent (no agent for symmetry).
+pub fn an_agent_create_ok(accountability: bool, boundary: bool, failure_mode: bool, audit_trail: bool) -> bool {
+    return accountability and boundary and failure_mode and audit_trail;
+}
+
+; --- 9d. Aliases: old name -> canonical id (candidates, none activated by this file) -------------------
+; A rename needs the owner's approval and a capability diff; until then the old name keeps working and
+; this table only records where it would point. Only roles with one clear domain are listed.
+
+pub const AN_ALIAS_COUNT : usize = 4;
+pub const AN_ALIAS_OLD : [4]str = ["agent-c", "agent-v", "agent-e", "review-warden"];
+pub const AN_ALIAS_NEW : [4]str = ["0xCompiler@build.t27", "0xVerifier@quality.t27", "0xMemory@knowledge.t27", "0xQualityGate@quality.t27"];
+
+/// Position + 1 of an old name in the alias table, 0 when it has no alias.
+pub fn an_alias_of(old: []const u8) -> usize {
+    var a : usize = 0;
+    while (a < AN_ALIAS_COUNT) {
+        if (bytes_eq(AN_ALIAS_OLD[a], old)) { return a + 1; }
+        a = a + 1;
+    }
+    return 0;
+}
+
+/// Every target is a canonical id, no old name is itself canonical, and no old name repeats.
+pub fn an_alias_table_ok() -> bool {
+    var a : usize = 0;
+    while (a < AN_ALIAS_COUNT) {
+        if (!an_id_ok(AN_ALIAS_NEW[a])) { return false; }
+        if (AN_ALIAS_OLD[a].len == 0 or an_id_ok(AN_ALIAS_OLD[a])) { return false; }
+        if (an_alias_of(AN_ALIAS_OLD[a]) != a + 1) { return false; }
+        a = a + 1;
+    }
+    return true;
+}
+
+pub const AN_LET_NONE : u8 = 0;
+pub const AN_LET_SAME : u8 = 1;
+pub const AN_LET_CONFLICT : u8 = 2;
+
+/// Legacy agent letter (A..Z) against the order's domain letter: AN_LET_SAME where the existing meaning
+/// matches (B, J, Y), AN_LET_CONFLICT everywhere else, AN_LET_NONE for a non-letter. A conflict keeps the
+/// existing meaning; it is never remapped silently.
+pub fn an_letter_status(c: u8) -> u8 {
+    if (c < 65 or c > 90) { return AN_LET_NONE; }
+    if (c == 66 or c == 74 or c == 89) { return AN_LET_SAME; }
+    return AN_LET_CONFLICT;
+}
+
+; --- 9e. T27H_KERNEL_READ_ONLY_RULE ---------------------------------------------------------------------
+; T27# reads and validates every domain but writes only the specs it owns (cross-cutting rules).
+
+pub fn an_kernel_may_read(path: []const u8) -> bool {
+    return an_ends_t27(path);
+}
+
+pub fn an_kernel_may_write(path: []const u8) -> bool {
+    return an_owner_of(path) == AN_D_KERNEL;
+}
+
+; --- 9f. SPEC_SCAN_FIX_PROTOCOL --------------------------------------------------------------------------
+; tri t27a spec scan [--fix --dry-run | --fix --approve <id>]. A dry run only proposes; an approval is
+; owner-gated and needs a prior dry run of the same id. TODO(T27L): every APPLY and every owner-gate
+; refusal logs through an_fix_logged (surface "capability", action "spec_owner_approved").
+
+pub const AN_FIX_NONE : u8 = 0;
+pub const AN_FIX_PROPOSE : u8 = 1;
+pub const AN_FIX_APPLY : u8 = 2;
+pub const AN_FIX_E_NEEDS_DRY_RUN : u8 = 3;
+pub const AN_FIX_E_NO_DRY_RUN : u8 = 4;
+pub const AN_FIX_E_OWNER_GATE : u8 = 5;
+pub const AN_FIX_E_FLAGS : u8 = 6;
+
+/// Decide one scan invocation. approve_id 0 means no --approve. proposed holds the ids of earlier dry runs.
+pub fn an_fix_decide(fix: bool, dry_run: bool, approve_id: u32, owner_confirmed: bool, proposed: []const u32, np: usize) -> u8 {
+    if (approve_id != 0) {
+        if (!fix or dry_run) { return AN_FIX_E_FLAGS; }
+        var seen : bool = false;
+        var d : usize = 0;
+        while (d < np) {
+            if (proposed[d] == approve_id) { seen = true; }
+            d = d + 1;
+        }
+        if (!seen) { return AN_FIX_E_NO_DRY_RUN; }
+        if (!owner_confirmed) { return AN_FIX_E_OWNER_GATE; }
+        return AN_FIX_APPLY;
+    }
+    if (fix) {
+        if (dry_run) { return AN_FIX_PROPOSE; }
+        return AN_FIX_E_NEEDS_DRY_RUN;
+    }
+    return AN_FIX_NONE;
+}
+
+/// Only an approved APPLY changes ownership; every other outcome writes nothing.
+pub fn an_fix_writes(code: u8) -> bool {
+    return code == AN_FIX_APPLY;
+}
+
+/// Outcomes that must reach T27L: the approval and the refused attempt at one.
+pub fn an_fix_logged(code: u8) -> bool {
+    return code == AN_FIX_APPLY or code == AN_FIX_E_OWNER_GATE;
+}
+
+; --- 9g. tests ---------------------------------------------------------------------------------------------
+
+fn an_t_fill(set: []u8, v: u8) -> usize {
+    var z : usize = 0;
+    while (z < set.len) {
+        set[z] = v;
+        z = z + 1;
+    }
+    return set.len;
+}
+
+test an_domains_and_slugs {
+    assert AN_CODES.len == 27;
+    assert AN_SLUGS.len == 27;
+    assert AN_CODES[0] == "T27A";
+    assert AN_CODES[25] == "T27Z";
+    assert AN_CODES[26] == "T27#";
+    assert an_domain_of_slug("telemetry") == 12;
+    assert an_domain_of_slug("kernel") == AN_D_KERNEL;
+    assert an_domain_of_slug("operations") == 15;
+    // the order's example slug "memory" is not a domain: T27K is knowledge
+    assert an_domain_of_slug("memory") == AN_ORPHAN;
+    assert an_domain_of_slug("") == AN_ORPHAN;
+    // slugs are pairwise distinct
+    var i : usize = 0;
+    var dup : usize = 0;
+    while (i < AN_DOMAINS) {
+        var j : usize = 0;
+        while (j < i) {
+            if (bytes_eq(AN_SLUGS[i], AN_SLUGS[j])) { dup = dup + 1; }
+            j = j + 1;
+        }
+        assert an_domain_of_slug(AN_SLUGS[i]) == i + 1;
+        i = i + 1;
+    }
+    assert dup == 0;
+}
+
+test an_canonical_ids {
+    assert an_id_ok("0xLogger@telemetry.t27");
+    assert an_id_ok("0xBrowserSteward@visual.t27");
+    assert an_id_ok("0xDoctor@operations.t27");
+    assert an_id_domain("0xCompiler@build.t27") == 2;
+    assert an_id_domain("0xConstitution@kernel.t27") == AN_D_KERNEL;
+    // negative controls: short form, wrong slug, bad role, missing suffix, double at, empty role
+    assert !an_id_ok("0xLogger");
+    assert !an_id_ok("0xLogger@nowhere.t27");
+    assert !an_id_ok("0xlogger@telemetry.t27");
+    assert !an_id_ok("Logger@telemetry.t27");
+    assert !an_id_ok("0xLogger@telemetry");
+    assert !an_id_ok("0xLogger@telemetry@build.t27");
+    assert !an_id_ok("0x@telemetry.t27");
+    assert !an_id_ok("0xLog ger@telemetry.t27");
+    assert an_id_domain("0xLogger@nowhere.t27") == AN_ORPHAN;
+    var b : [64]u8 = undefined;
+    const n : usize = an_id_build(b[0..64], "Designer", "design");
+    assert bytes_eq(b[0..n], "0xDesigner@design.t27");
+    assert an_id_ok(b[0..n]);
+    assert an_id_build(b[0..64], "designer", "design") == 0;
+    assert an_id_build(b[0..64], "Designer", "styles") == 0;
+    assert an_id_build(b[0..8], "Designer", "design") == 0;
+    // the identity table above still refuses a CamelCase role: listed as a conflict
+    assert !ar_name_ok("0xLogger");
+}
+
+test an_spec_ownership {
+    assert an_table_ok();
+    assert AN_PFX.len == AN_ROWS;
+    assert AN_PFX_DOM.len == AN_ROWS;
+    // the order's own examples
+    assert an_owner_of("specs/t27os/t27l.t27") == 12;
+    assert an_owner_of("specs/claw/cost_policy.t27") == 5;
+    // longest prefix wins: a file row beats the directory row
+    assert an_owner_of("specs/agents/a.t27") == AN_D_KERNEL;
+    assert an_owner_of("specs/agents/b.t27") == 1;
+    assert an_owner_of("specs/compiler/lexer.t27") == 2;
+    assert an_owner_of("specs/vault/custodian.t27") == 19;
+    assert an_owner_of("specs/t27os/t27r.t27") == 18;
+    assert an_owner_of("specs/t27os/t27rx.t27") == AN_ORPHAN;
+    // the Lukomorye graph terminal is T27V (visual); its neighbours in specs/t27f/ stay orphan
+    assert an_owner_of("specs/t27f/lukomorye_graph_terminal.t27") == 22;
+    assert an_owner_of("specs/t27f/work_graph.t27") == AN_ORPHAN;
+    // the graph extension is T27V too; the roadmap sync and the issue hygiene engine are T27P (product)
+    assert an_owner_of("specs/t27f/work_graph_ext.t27") == 22;
+    assert an_owner_of("specs/tri/trigit/roadmap_dashboard_sync.t27") == 16;
+    assert an_owner_of("specs/tri/trigit/issue_hygiene_engine.t27") == 16;
+    assert an_owner_of("specs/tri/trigit/verbs.t27") == AN_ORPHAN;
+    assert an_owner_ties("specs/tri/trigit/issue_hygiene_engine.t27") == 1;
+    // a directory row does not leak into a longer name: specs/a/ is not specs/agents/
+    assert an_owner_of("specs/a/x.t27") == 17;
+    assert an_owner_of("specs/ab/x.t27") == AN_ORPHAN;
+    // ambiguous directories, the unresolved order example, a non-spec and a loose file stay orphan
+    assert an_owner_of("specs/port/x.t27") == AN_ORPHAN;
+    assert an_owner_of("specs/queen/claim_msg.t27") == AN_ORPHAN;
+    assert an_owner_of("specs/compiler/lexer.zig") == AN_ORPHAN;
+    assert an_owner_of("specs/mesh_routing.t27") == AN_ORPHAN;
+    // shared ownership is impossible by construction: never more than one winning row
+    assert an_owner_ties("specs/agents/a.t27") == 1;
+    assert an_owner_ties("specs/agents/b.t27") == 1;
+    assert an_owner_ties("specs/t27os/t27l.t27") == 1;
+    assert an_owner_ties("specs/port/x.t27") == 0;
+    assert an_coverage_permille(4, 3) == 750;
+    assert an_coverage_permille(0, 0) == 0;
+}
+
+test an_ownership_history {
+    assert an_hist_append_ok(0, 0, 1, 0, 12, true);
+    assert an_hist_append_ok(1, 12, 2, 12, 13, true);
+    // negative controls: no approval, a gap, a repeat, a stale old owner, same owner, bad new owner
+    assert !an_hist_append_ok(0, 0, 1, 0, 12, false);
+    assert !an_hist_append_ok(1, 12, 3, 12, 13, true);
+    assert !an_hist_append_ok(1, 12, 1, 12, 13, true);
+    assert !an_hist_append_ok(1, 12, 2, 5, 13, true);
+    assert !an_hist_append_ok(1, 12, 2, 12, 12, true);
+    assert !an_hist_append_ok(1, 12, 2, 12, 28, true);
+    assert !an_hist_append_ok(1, 12, 2, 12, 0, true);
+    var sq : [3]u32 = undefined;
+    var ol : [3]u8 = undefined;
+    var nw : [3]u8 = undefined;
+    sq[0] = 1; ol[0] = 0; nw[0] = 12;
+    sq[1] = 2; ol[1] = 12; nw[1] = 13;
+    sq[2] = 3; ol[2] = 13; nw[2] = 12;
+    assert an_hist_ok(sq[0..3], ol[0..3], nw[0..3], 3);
+    assert an_hist_ok(sq[0..3], ol[0..3], nw[0..3], 0);
+    // rewriting an old record breaks the chain
+    ol[1] = 5;
+    assert !an_hist_ok(sq[0..3], ol[0..3], nw[0..3], 3);
+    ol[1] = 12;
+    sq[2] = 4;
+    assert !an_hist_ok(sq[0..3], ol[0..3], nw[0..3], 3);
+}
+
+test an_capabilities {
+    assert AN_CAP_NAMES.len == AN_CAP_COUNT;
+    assert AN_CAP_CLASS.len == AN_CAP_COUNT;
+    assert an_cap_class(0) == AN_CL_ALLOW;
+    assert an_cap_class(4) == AN_CL_POLICY;
+    assert an_cap_class(6) == AN_CL_OWNER;
+    assert an_cap_class(8) == AN_CL_FORBIDDEN;
+    assert an_cap_class(14) == AN_CL_FORBIDDEN;
+    assert an_cap_class(15) == 0;
+    assert AN_CAP_NAMES[2] == "compile";
+    assert AN_CAP_NAMES[4] == "optimize";
+    var o : [15]u8 = undefined;
+    var w : [15]u8 = undefined;
+    var ap : [15]u8 = undefined;
+    assert an_t_fill(o[0..15], 0) == 15;
+    assert an_t_fill(w[0..15], 0) == 15;
+    assert an_t_fill(ap[0..15], 0) == 15;
+    o[2] = 1; o[3] = 1;
+    w[2] = 1; w[3] = 1;
+    assert an_cap_set_ok(o[0..15]);
+    assert !an_cap_set_ok(o[0..14]);
+    // a rename that keeps the set byte-equal passes
+    assert an_rename_ok(o[0..15], w[0..15]);
+    assert an_cap_added(o[0..15], w[0..15]) == 0;
+    // the order's example: agent-c (compile, link) -> 0xCompiler (compile, link, optimize)
+    w[4] = 1;
+    assert an_cap_added(o[0..15], w[0..15]) == 1;
+    assert an_cap_removed(o[0..15], w[0..15]) == 0;
+    assert !an_rename_ok(o[0..15], w[0..15]);
+    assert !an_migration_ok(o[0..15], w[0..15], ap[0..15]);
+    ap[4] = 1;
+    assert an_migration_ok(o[0..15], w[0..15], ap[0..15]);
+    // an approval for a different capability does not cover the addition
+    ap[4] = 0;
+    ap[5] = 1;
+    assert !an_migration_ok(o[0..15], w[0..15], ap[0..15]);
+    // a forbidden capability is refused even with an approval record
+    w[4] = 0;
+    w[8] = 1;
+    ap[8] = 1;
+    assert !an_migration_ok(o[0..15], w[0..15], ap[0..15]);
+    // dropping a capability needs no approval, but a rename still refuses it
+    w[8] = 0;
+    w[3] = 0;
+    assert an_cap_removed(o[0..15], w[0..15]) == 1;
+    assert an_migration_ok(o[0..15], w[0..15], ap[0..15]);
+    assert !an_rename_ok(o[0..15], w[0..15]);
+    // a malformed set is never silently accepted
+    w[1] = 2;
+    assert !an_migration_ok(o[0..15], w[0..15], ap[0..15]);
+    assert an_agent_create_ok(true, true, true, true);
+    assert !an_agent_create_ok(true, true, true, false);
+    assert !an_agent_create_ok(false, true, true, true);
+}
+
+test an_aliases_and_letters {
+    assert an_alias_table_ok();
+    assert an_alias_of("agent-c") == 1;
+    assert an_alias_of("review-warden") == 4;
+    assert an_alias_of("agent-x") == 0;
+    assert an_alias_of("") == 0;
+    assert AN_ALIAS_NEW[an_alias_of("agent-v") - 1] == "0xVerifier@quality.t27";
+    assert an_id_domain(AN_ALIAS_NEW[0]) == 2;
+    assert an_letter_status(66) == AN_LET_SAME;
+    assert an_letter_status(74) == AN_LET_SAME;
+    assert an_letter_status(89) == AN_LET_SAME;
+    // D, F, C, O keep their existing meaning: a conflict, not a remap
+    assert an_letter_status(68) == AN_LET_CONFLICT;
+    assert an_letter_status(70) == AN_LET_CONFLICT;
+    assert an_letter_status(67) == AN_LET_CONFLICT;
+    assert an_letter_status(79) == AN_LET_CONFLICT;
+    assert an_letter_status(97) == AN_LET_NONE;
+    assert an_letter_status(35) == AN_LET_NONE;
+}
+
+test an_kernel_read_only {
+    assert an_kernel_may_read("specs/compiler/lexer.t27");
+    assert an_kernel_may_read("specs/port/x.t27");
+    assert !an_kernel_may_read("specs/compiler/lexer.zig");
+    assert an_kernel_may_write("specs/agents/a.t27");
+    // the kernel does not write a domain's internals, nor an orphan
+    assert !an_kernel_may_write("specs/compiler/lexer.t27");
+    assert !an_kernel_may_write("specs/t27os/t27l.t27");
+    assert !an_kernel_may_write("specs/port/x.t27");
+    assert !an_kernel_may_write("specs/agents/a.zig");
+}
+
+test an_scan_fix_protocol {
+    var pr : [2]u32 = undefined;
+    pr[0] = 7;
+    pr[1] = 9;
+    // plain scan, dry run, and the two-step path
+    assert an_fix_decide(false, false, 0, false, pr[0..2], 2) == AN_FIX_NONE;
+    assert an_fix_decide(true, true, 0, false, pr[0..2], 2) == AN_FIX_PROPOSE;
+    assert an_fix_decide(true, false, 9, true, pr[0..2], 2) == AN_FIX_APPLY;
+    // --fix without --dry-run is an error
+    assert an_fix_decide(true, false, 0, true, pr[0..2], 2) == AN_FIX_E_NEEDS_DRY_RUN;
+    // --approve without a prior dry run of the same id is an error
+    assert an_fix_decide(true, false, 8, true, pr[0..2], 2) == AN_FIX_E_NO_DRY_RUN;
+    assert an_fix_decide(true, false, 9, true, pr[0..2], 0) == AN_FIX_E_NO_DRY_RUN;
+    // approval is owner-gated
+    assert an_fix_decide(true, false, 9, false, pr[0..2], 2) == AN_FIX_E_OWNER_GATE;
+    // --approve alone, or with --dry-run, is a flag error
+    assert an_fix_decide(false, false, 9, true, pr[0..2], 2) == AN_FIX_E_FLAGS;
+    assert an_fix_decide(true, true, 9, true, pr[0..2], 2) == AN_FIX_E_FLAGS;
+    // only APPLY writes; the proposal and every error write nothing
+    assert an_fix_writes(AN_FIX_APPLY);
+    assert !an_fix_writes(AN_FIX_PROPOSE);
+    assert !an_fix_writes(AN_FIX_E_OWNER_GATE);
+    assert !an_fix_writes(AN_FIX_NONE);
+    assert an_fix_logged(AN_FIX_APPLY);
+    assert an_fix_logged(AN_FIX_E_OWNER_GATE);
+    assert !an_fix_logged(AN_FIX_PROPOSE);
+}
