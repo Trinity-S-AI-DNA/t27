@@ -19,10 +19,11 @@ a. The spec is `specs/course/course_hud_main.t27`. The state machine is in
    `course_hud_data.t27`; the browser contract is documented in `course_hud_wasm.t27`.
 b. `t27c gen specs/course/course_hud_main.t27 > target/course/hud/hm.zig` runs in a
    T27 OS pane, never in the Mac shell (hook mac-no-heavy).
-c. The export glue `target/course/hud/export.zig` is the one hand-written input, as
+c. The export glue `docs/course/hud/export.zig` is the one hand-written input, as
    `specs/t27f/build.t27` already names export.zig for t27f.wasm. It holds one global
    HudState, one Learner and one 913500-byte RGB raster, and wraps the generated pub
-   fns as `export fn`.
+   fns as `export fn`. Copy it next to `hm.zig` before linking:
+   `cp docs/course/hud/export.zig target/course/hud/`.
 d. Link in the pane: `zig build-exe export.zig -target wasm32-freestanding -fno-entry
    -rdynamic -O ReleaseSmall -femit-bin=course_hud.wasm`. `-rdynamic` is required: a
    `-fno-entry` wasm exports nothing without it.
@@ -52,10 +53,12 @@ foreign file is DENY unless listed in `tools/policy/foreign-exceptions.txt`, whi
 only the owner's `owner-approved-foreign` label unlocks. Budget: 40 added hand
 lines per file, 80 per PR, added <= deleted.
 
-So glue and shim stay uncommitted (`target/` is gitignored; `docs/course/hud/*.html`
-and `*.js` are left untracked) until the owner sets the label. The .wasm, the .png
-screenshots, `.claude/launch.json` and the .t27 specs land normally with
-`Refs #13251`. Never `--no-verify`.
+The three files are listed there since 2026-11-08 (owner: "Yes, add them", chat on
+PR #13304; entry PR #13342), so they are tracked under `docs/course/hud/`. Every
+further hand line in them is still budget: pay it with a deletion of foreign code in
+the same diff. A fourth hand-written file needs its own entry and the owner's word.
+The .wasm, the .png screenshots, `.claude/launch.json` and the .t27 specs land
+normally with `Refs #13251`. Never `--no-verify`.
 
 ## 5. Serve and see
 
@@ -99,7 +102,7 @@ ready.
 - A PPM->PNG as the preview.
 - Hand JS beyond the shim.
 - A canvas import design with `@extern` (t27c cannot compile @extern specs).
-- Committing the shim or the glue without the label.
+- A hand-written file beyond the three listed in `tools/policy/foreign-exceptions.txt`.
 - A bare `~/.t27os/t27os-pty`.
 - `--no-verify`.
 
