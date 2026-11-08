@@ -158,3 +158,18 @@ Indices in VTK_MANIFEST:
 ```
 
 Refs #13214
+
+## Radius, density and DPR (vf_style)
+
+These are not part of the 32 `vf_tokens` above. They live in `specs/t27f/vf_style.t27`, and its
+tests are the record of their values; this section only points there.
+
+- Radius: `RADIUS_SM`, `RADIUS_MD` (= `STYLE_RADIUS`), `RADIUS_LG`, plus `radius_full(w, h)` and
+  `radius_fit(r, w, h)`. The sm and lg values are style-guide picks, not phi steps.
+- Density: `DENSITY_COMPACT`, `DENSITY_DEFAULT`, `DENSITY_COMFORTABLE`. `space_at(step, d)` shifts
+  the phi spacing scale one step down or up, so density adds no new number.
+- DPR: `dpr_clamp` (1..3), `backing_px`, `backing_rgb_bytes`, `dpr_pct` (the `vf_scale` percent).
+  The course HUD raster is still 1x; wiring it is UIKIT Wave A slice A4.
+- Shadow: none, because no painter draws one.
+
+Refs #13251
