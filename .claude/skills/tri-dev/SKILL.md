@@ -45,9 +45,11 @@ each tab after reading it.
    `http://localhost:8127/hud_init.png`. OK = the tab title reads `hud_init.png (375x812)`.
 4. **MCP and GitHub.**
    - `claude mcp list | grep -i playwright` -- OK when it says Connected. The built-in Browser pane already
-     screenshots, so Playwright is a second route, not a requirement. Measured 2026-11-08: registered but FAIL, since
-     it looks for Google Chrome at its default path and none is installed. The fix is the owner's: install a browser
-     for it, or give it an executable-path option that points at an installed Chromium.
+     screenshots, so Playwright is a second route, not a requirement. Measured 2026-11-08: OK after an MCP restart.
+     It is registered with `--browser chromium` and uses Chrome for Testing 157 in ms-playwright; a restarted session
+     navigated to `http://localhost:8127/hud_init.png` and saved a 1200x759 screenshot to `target/course/hud/`. A
+     session started before the change still looks for Google Chrome and fails until it reconnects. Playwright writes
+     a `.playwright-mcp/` folder in the working directory (page snapshots, console log); never commit it.
    - `gh auth status` -- OK when logged in. `gh issue/pr create, merge, comment` is the GitHub route; a GitHub MCP
      server adds nothing `gh` lacks, so none is registered.
    - DeepSeek: FAIL by design until it has a key-master profile (skill `access-map`: provider row only, account
