@@ -1,0 +1,1668 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/t27m.t27 -- T27M, the memory-actor layer MVP (owner order T27M_MEMORY_ACTOR_LAYER, 2026-11-08).
+; Mode: ACTOR_MODEL -> MEMORY -> CRON -> SELF_HEALING, bounded cycles only. Sibling of specs/queen/actors.t27
+; (pid, mailbox, deliver, dead letter), specs/queen/agent_registry.t27 (identity, task locks) and
+; specs/t27os/t27l.t27 (the event line); nothing here restates those files, it imports them.
+; -
+; Actors talk only through messages and never touch another actor's state: every function below takes the
+; arrays it may change as arguments, so the owner of a mailbox, a lease table or a seen set is the caller.
+; Delivery is at-least-once through an outbox (state delta and message in ONE record), an ack, a retry and a
+; dedup by message_id. Exactly-once is an EFFECT, not a delivery: it holds only where the receiver keeps a
+; processed marker and its handler is idempotent. No other claim is made, and no framework is cited.
+; -
+; Line formats (pipe separated, no pipe or byte 10 inside a field, checked by the validators):
+;   M|message_id|correlation_id|from|to|type|ts|schema|trace_id|span_id|delivery|priority|attempt|redacted|payload
+;   X|outbox_seq|status|state_delta|<an M line>      D|message_id|reason|class|retries|replay|<an M line>
+;   A|agent_id|did|public_key|capabilities           R|memory_id|type|content|source|created|updated|accessed|
+;   count|confidence|evidence|tags|status|retention  C|conflict_id|memory_a|memory_b|status
+;   K|other_id|consolidated_into|primary_id          B|sequence|base_sequence|scope|delta
+;   P|epic|open_issues|active_agents|priorities|blockers|decisions|sequence|updated_at
+; Memory and messages never carry a secret or personal data: a writer refuses such content (tl_text_safe), it
+; does not redact it and store the rest.
+; -
+; Owner resolved the capacity conflict (2026-11-08): 1000 for a normal mailbox (TM_MBOX_CAP, high watermark
+; 800), 256 for a critical-path mailbox (TM_MBOX_CAP_CRIT, high watermark 204, as MAILBOX_CAP of
+; specs/queen/actors.t27); actors.t27 is untouched. Leases use the decision functions of claim_msg.t27 (the
+; same ones agent_registry.t27 builds its task locks on); the ttl is the T27M addition, a lease expires at
+; now + ttl where a task lock goes stale after 360 minutes.
+; -
+; Prior art, background read, no claim attributed: Hewitt, Bishop and Steiger, "A universal modular ACTOR
+; formalism" (IJCAI 1973); Kephart and Chess, "The vision of autonomic computing" (IEEE Computer 36(1), 2003,
+; doi 10.1109/MC.2003.1160055) for the MAPE-K loop; the transactional-outbox pattern for the one-record write.
+; -
+; NOT BUILT: the host store (outbox, seen set, memory and blackboard files), the dispatcher that polls the
+; outbox, the cron runner and the `tri` verbs behind the id table of section 11. This file is the pure part:
+; formats, validators, decisions and event lines. Self-healing restarts only T27-owned components, never a
+; system or unknown process; there is no kill, purge or delete code here (forget is a status).
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osT27m;
+
+use t27os::t27l::tl_event_line;
+use t27os::t27l::tl_validate_line;
+use t27os::t27l::tl_arg_ok;
+use t27os::t27l::tl_text_safe;
+use t27os::t27l::TL_OK;
+use t27os::t27l::TL_T_TR;
+use t27os::t27l::TL_T_SP;
+use t27os::t27l::TL_T_SP2;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::doctor_mem::dm_pattern_reliable;
+use queen::actors::deliver;
+use queen::actors::ordered;
+use queen::actors::is_dead_letter;
+use queen::actors::D_QUEUED;
+use queen::actors::D_DROPPED_FULL;
+use queen::agent_registry::ar_name_ok;
+use queen::agent_registry::ar_key_ok;
+use queen::agent_registry::ar_did;
+use queen::claim_msg::cm_decide;
+use queen::claim_msg::cm_beat_renews;
+use queen::claim_msg::cm_release_valid;
+use queen::claim_msg::CM_GRANTED;
+use queen::claim_msg::CM_TAKEOVER;
+use queen::claim_msg::CM_IDLE_MAX;
+use std::mem::bytes_eq;
+use std::mem::bytes_starts_with;
+use std::mem::bytes_index_of_byte;
+use std::mem::bytes_count;
+
+; --- 1. Constants: capacities, budgets, schema ---
+
+/// T27M mailbox capacity and high watermark (owner order). Not MAILBOX_CAP of actors.t27 (256, queen actors).
+pub const TM_MBOX_CAP : u32 = 1000;
+pub const TM_MBOX_HIGH : u32 = 800;
+/// Critical-path mailbox capacity (owner order 2026-11-08); its high watermark is tm_mbox_high(256) = 204.
+pub const TM_MBOX_CAP_CRIT : u32 = 256;
+pub const TM_RETRY_MAX : u32 = 5;
+pub const TM_HEAL_MAX : u32 = 3;
+pub const TM_LEASE_TTL_MAX : u64 = 3600;
+pub const TM_CONSOL_EPI_MIN : u32 = 5;
+pub const TM_SURFACE : u8 = 14;
+pub const TM_ACT_FIRST : u8 = 68;
+pub const TM_ACT_LAST : u8 = 84;
+pub const TM_SCHEMA : str = "t27m/v1";
+pub const TM_DELIVERY : str = "at_least_once";
+
+; --- 2. Small helpers: fields, numbers, ids ---
+
+/// The idx-th pipe-separated field of a line (0 based); empty when there is none.
+pub fn tm_fld(line: []const u8, idx: u32) -> []const u8 {
+    var start : usize = 0;
+    var k : u32 = 0;
+    var i : usize = 0;
+    while (i < line.len) {
+        if (line[i] == 124) {
+            if (k == idx) { return line[start..i]; }
+            k = k + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (k == idx) { return line[start..line.len]; }
+    return line[0..0];
+}
+
+/// The text after the n-th pipe (1 based); empty when the line has fewer pipes.
+pub fn tm_after_pipe(line: []const u8, n: u32) -> []const u8 {
+    var k : u32 = 0;
+    var i : usize = 0;
+    while (i < line.len) {
+        if (line[i] == 124) {
+            k = k + 1;
+            if (k == n) { return line[i + 1..line.len]; }
+        }
+        i = i + 1;
+    }
+    return line[0..0];
+}
+
+/// A decimal number; -1 for empty text, a non-digit or more than 15 digits.
+pub fn tm_num(s: []const u8) -> i64 {
+    if (s.len == 0 or s.len > 15) { return -1; }
+    var v : i64 = 0;
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] < 48 or s[i] > 57) { return -1; }
+        v = v * 10 + (s[i] as i64) - 48;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// A field that fits a line: not empty, at most max bytes, no pipe, no byte 10, nothing tl_text_safe refuses.
+pub fn tm_field_ok(s: []const u8, max: usize) -> bool {
+    if (s.len == 0 or s.len > max) { return false; }
+    if (bytes_index_of_byte(s, 124) >= 0 or bytes_index_of_byte(s, 10) >= 0) { return false; }
+    return tl_text_safe(s);
+}
+
+/// An identifier: 1..64 bytes of letters, digits and . _ : -
+pub fn tm_ident_ok(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > 64) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        const ok : bool = (c >= 48 and c <= 58) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 46 or c == 95 or c == 45;
+        if (!ok) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Exactly n lowercase hex bytes.
+pub fn tm_hexn(s: []const u8, n: usize) -> bool {
+    if (s.len != n) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (!((c >= 48 and c <= 57) or (c >= 97 and c <= 102))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// True when p occurs in s.
+pub fn tm_contains(s: []const u8, p: []const u8) -> bool {
+    if (p.len == 0) { return true; }
+    if (p.len > s.len) { return false; }
+    var i : usize = 0;
+    while (i + p.len <= s.len) {
+        if (bytes_starts_with(s[i..s.len], p)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// A 32-bit key for an id in the in-memory seen set and lease table (polynomial hash, modulus 4294967291, no
+/// overflow). Collisions are possible: the host store compares the full message_id before it trusts a match.
+pub fn tm_hash(s: []const u8) -> u64 {
+    var h : u64 = 7;
+    var i : usize = 0;
+    while (i < s.len) {
+        h = (h * 257 + (s[i] as u64)) % 4294967291;
+        i = i + 1;
+    }
+    return h;
+}
+
+; --- 3. Message types and priorities ---
+
+pub const TM_T_TASK_CLAIMED : u8 = 1;
+pub const TM_T_TASK_STARTED : u8 = 2;
+pub const TM_T_TASK_PROGRESS : u8 = 3;
+pub const TM_T_TASK_COMPLETED : u8 = 4;
+pub const TM_T_TASK_FAILED : u8 = 5;
+pub const TM_T_RESULT_READY : u8 = 6;
+pub const TM_T_RESOURCE_PRESSURE : u8 = 7;
+pub const TM_T_ESCALATION_NEEDED : u8 = 8;
+pub const TM_T_MEMORY_UPDATED : u8 = 9;
+pub const TM_T_SKILL_LEARNED : u8 = 10;
+pub const TM_T_SECURITY_ALERT : u8 = 11;
+pub const TM_T_HEARTBEAT : u8 = 12;
+pub const TM_T_STATUS_UPDATE : u8 = 13;
+pub const TM_T_LAST : u8 = 13;
+
+pub const TM_P_LOW : u8 = 1;
+pub const TM_P_NORMAL : u8 = 2;
+pub const TM_P_CRITICAL : u8 = 3;
+
+/// The wire name of a message type; empty for an unknown id.
+pub fn tm_type_name(t: u8) -> []const u8 {
+    if (t == 1) { return "task_claimed"; }
+    if (t == 2) { return "task_started"; }
+    if (t == 3) { return "task_progress"; }
+    if (t == 4) { return "task_completed"; }
+    if (t == 5) { return "task_failed"; }
+    if (t == 6) { return "result_ready"; }
+    if (t == 7) { return "resource_pressure"; }
+    if (t == 8) { return "escalation_needed"; }
+    if (t == 9) { return "memory_updated"; }
+    if (t == 10) { return "skill_learned"; }
+    if (t == 11) { return "security_alert"; }
+    if (t == 12) { return "heartbeat"; }
+    if (t == 13) { return "status_update"; }
+    return "";
+}
+
+/// The id of a wire name; 0 for an unknown name.
+pub fn tm_type_id(name: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= TM_T_LAST) {
+        if (bytes_eq(tm_type_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// critical: security_alert, resource_pressure, escalation_needed; low: heartbeat, status_update; the rest normal.
+pub fn tm_type_prio(t: u8) -> u8 {
+    if (t == TM_T_SECURITY_ALERT or t == TM_T_RESOURCE_PRESSURE or t == TM_T_ESCALATION_NEEDED) { return TM_P_CRITICAL; }
+    if (t == TM_T_HEARTBEAT or t == TM_T_STATUS_UPDATE) { return TM_P_LOW; }
+    return TM_P_NORMAL;
+}
+
+pub fn tm_prio_name(p: u8) -> []const u8 {
+    if (p == TM_P_LOW) { return "low"; }
+    if (p == TM_P_NORMAL) { return "normal"; }
+    if (p == TM_P_CRITICAL) { return "critical"; }
+    return "";
+}
+
+; --- 4. The envelope and its validator ---
+
+pub const TM_E_OK : u8 = 0;
+pub const TM_E_PREFIX : u8 = 1;
+pub const TM_E_FIELDS : u8 = 2;
+pub const TM_E_IDS : u8 = 3;
+pub const TM_E_TYPE : u8 = 4;
+pub const TM_E_SCHEMA : u8 = 5;
+pub const TM_E_DELIVERY : u8 = 6;
+pub const TM_E_PRIORITY : u8 = 7;
+pub const TM_E_ATTEMPT : u8 = 8;
+pub const TM_E_TRACE : u8 = 9;
+pub const TM_E_REDACTED : u8 = 10;
+pub const TM_E_PAYLOAD : u8 = 11;
+pub const TM_E_TS : u8 = 12;
+
+/// Check one M line; TM_E_OK or the first failing rule. Priority must equal the one the type implies.
+pub fn tm_envelope_check(line: []const u8) -> u8 {
+    if (line.len < 2 or line.len > 1024 or !bytes_starts_with(line, "M|")) { return TM_E_PREFIX; }
+    if (bytes_count(line, 124) != 14) { return TM_E_FIELDS; }
+    if (!tm_ident_ok(tm_fld(line, 1)) or !tm_ident_ok(tm_fld(line, 2)) or !tm_ident_ok(tm_fld(line, 3)) or !tm_ident_ok(tm_fld(line, 4))) { return TM_E_IDS; }
+    const t : u8 = tm_type_id(tm_fld(line, 5));
+    if (t == 0) { return TM_E_TYPE; }
+    if (!tm_ident_ok(tm_fld(line, 6))) { return TM_E_TS; }
+    if (!bytes_eq(tm_fld(line, 7), TM_SCHEMA)) { return TM_E_SCHEMA; }
+    if (!tm_hexn(tm_fld(line, 8), 32) or !tm_hexn(tm_fld(line, 9), 16)) { return TM_E_TRACE; }
+    if (!bytes_eq(tm_fld(line, 10), TM_DELIVERY)) { return TM_E_DELIVERY; }
+    if (!bytes_eq(tm_fld(line, 11), tm_prio_name(tm_type_prio(t)))) { return TM_E_PRIORITY; }
+    const a : i64 = tm_num(tm_fld(line, 12));
+    if (a < 1 or a > 99) { return TM_E_ATTEMPT; }
+    if (!bytes_eq(tm_fld(line, 13), "0") and !bytes_eq(tm_fld(line, 13), "1")) { return TM_E_REDACTED; }
+    if (!tm_field_ok(tm_fld(line, 14), 512)) { return TM_E_PAYLOAD; }
+    return TM_E_OK;
+}
+
+/// Build one M line (priority from the type, delivery at_least_once, redacted 0); 0 when any field fails its
+/// rule or the line does not validate. A payload that carries a secret is refused, never redacted-and-sent.
+pub fn tm_envelope(out: []u8, message_id: []const u8, correlation_id: []const u8, from: []const u8, to: []const u8,
+                   mtype: []const u8, ts: []const u8, trace_id: []const u8, span_id: []const u8, attempt: u32,
+                   payload: []const u8) -> usize {
+    if (out.len < 1024 or payload.len > 512) { return 0; }
+    const t : u8 = tm_type_id(mtype);
+    if (t == 0 or attempt < 1 or attempt > 99) { return 0; }
+    var o : usize = put_bytes(out, 0, "M|");
+    o = put_bytes(out, o, message_id);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, correlation_id);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, from);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, to);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, mtype);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, ts);
+    o = put_bytes(out, o, "|t27m/v1|");
+    o = put_bytes(out, o, trace_id);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, span_id);
+    o = put_bytes(out, o, "|at_least_once|");
+    o = put_bytes(out, o, tm_prio_name(tm_type_prio(t)));
+    o = put_bytes(out, o, "|");
+    o = put_dec(out, o, attempt as u64);
+    o = put_bytes(out, o, "|0|");
+    o = put_bytes(out, o, payload);
+    if (tm_envelope_check(out[0..o]) != TM_E_OK) { return 0; }
+    return o;
+}
+
+; --- 5. Mailbox: priority, watermark, overflow, FIFO per pair ---
+
+pub const TM_Q_OK : u8 = 0;
+pub const TM_Q_PRESSURE : u8 = 1;
+pub const TM_Q_THROTTLED : u8 = 2;
+pub const TM_Q_DEAD : u8 = 3;
+
+/// What a send does to a mailbox holding count messages, for a message of this priority. Full (cap reached,
+/// decided by actors.deliver) -> dead letter. At or above the high watermark: a low message is throttled (the
+/// sender backs off), normal and critical are queued with a pressure signal.
+pub fn tm_mbox_verdict(count: u32, cap: u32, high: u32, prio: u8) -> u8 {
+    const d : u8 = deliver(true, count, cap);
+    if (is_dead_letter(d)) { return TM_Q_DEAD; }
+    if (count >= high) {
+        if (prio == TM_P_LOW) { return TM_Q_THROTTLED; }
+        return TM_Q_PRESSURE;
+    }
+    return TM_Q_OK;
+}
+
+/// High watermark: 80 percent of the capacity, floor (1000 -> 800, 256 -> 204).
+pub fn tm_mbox_high(cap: u32) -> u32 {
+    return cap * 4 / 5;
+}
+
+/// Capacity of a mailbox: 256 on the critical path, 1000 otherwise.
+pub fn tm_mbox_cap(critical: bool) -> u32 {
+    if (critical) { return TM_MBOX_CAP_CRIT; }
+    return TM_MBOX_CAP;
+}
+
+/// Backpressure alert (T27L action mailbox_backpressure_triggered, level warn): raised at or above the high
+/// watermark, the same edge as tm_mbox_verdict; a mailbox holding exactly 800 of 1000 already alerts.
+pub fn tm_backpressure_alert(count: u32, cap: u32) -> bool {
+    return count >= tm_mbox_high(cap);
+}
+
+pub const TM_SEND_NOW : u8 = 0;
+pub const TM_SEND_RETRY_LATER : u8 = 1;
+pub const TM_SEND_DEAD_LETTER : u8 = 2;
+
+/// The decision after overflow attempt number `attempt`: schedule a retry (after tm_backoff_s(attempt)
+/// seconds, never waited on in the event loop) while attempt < TM_RETRY_MAX, else the dead letter. Never a wait.
+pub fn tm_send_next(attempt: u32) -> u8 {
+    if (attempt < TM_RETRY_MAX) { return TM_SEND_RETRY_LATER; }
+    return TM_SEND_DEAD_LETTER;
+}
+
+/// Repeated overflow within the window escalates to the supervisor from TM_HEAL_MAX overflows.
+pub fn tm_overflow_escalates(overflows_in_window: u32) -> bool {
+    return overflows_in_window >= TM_HEAL_MAX;
+}
+
+/// Append one message to the mailbox arrays; the new count (unchanged when the arrays have no room).
+pub fn tm_mbox_put(ids: []u64, prios: []u8, count: usize, id: u64, prio: u8) -> usize {
+    if (count >= ids.len or count >= prios.len) { return count; }
+    ids[count] = id;
+    prios[count] = prio;
+    return count + 1;
+}
+
+/// The index of the next message to take: the highest priority first, the oldest first within a priority
+/// (FIFO per sender-receiver pair holds because the scan keeps arrival order). count when empty.
+pub fn tm_mbox_next(prios: []const u8, count: usize) -> usize {
+    var best : usize = count;
+    var bp : u8 = 0;
+    var i : usize = 0;
+    while (i < count) {
+        if (prios[i] > bp) {
+            bp = prios[i];
+            best = i;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// Remove the message at idx, keeping the order of the rest; the new count.
+pub fn tm_mbox_remove(ids: []u64, prios: []u8, count: usize, idx: usize) -> usize {
+    if (idx >= count) { return count; }
+    var i : usize = idx;
+    while (i + 1 < count) {
+        ids[i] = ids[i + 1];
+        prios[i] = prios[i + 1];
+        i = i + 1;
+    }
+    return count - 1;
+}
+
+/// FIFO is promised for one sender and one receiver only (actors.ordered); causality is carried by correlation_id.
+pub fn tm_fifo_promised(same_sender: bool, same_receiver: bool) -> bool {
+    return ordered(same_sender, same_receiver);
+}
+
+; --- 6. Delivery: processed set, ack, retry, outbox, dead letter ---
+
+pub const TM_R_PROCESS : u8 = 0;
+pub const TM_R_DUP : u8 = 1;
+pub const TM_RT_RETRY : u8 = 0;
+pub const TM_RT_UNDELIVERABLE : u8 = 1;
+
+/// Receiver side: a message_id already in the processed set is acked and skipped; a new one is processed.
+pub fn tm_recv_decide(seen: []const u64, n: usize, id: u64) -> u8 {
+    var i : usize = 0;
+    while (i < n and i < seen.len) {
+        if (seen[i] == id) { return TM_R_DUP; }
+        i = i + 1;
+    }
+    return TM_R_PROCESS;
+}
+
+/// Write the processed marker (after the idempotent handler ran); the new count, unchanged when full.
+pub fn tm_seen_add(seen: []u64, n: usize, id: u64) -> usize {
+    if (n >= seen.len) { return n; }
+    seen[n] = id;
+    return n + 1;
+}
+
+/// Sender side after attempt number `attempt` went unacked: retry while attempt < TM_RETRY_MAX, else
+/// UNDELIVERABLE (owner alert, manual replay).
+pub fn tm_retry_decide(attempt: u32) -> u8 {
+    if (attempt >= TM_RETRY_MAX) { return TM_RT_UNDELIVERABLE; }
+    return TM_RT_RETRY;
+}
+
+/// Seconds to wait before attempt+1: 2^attempt, at most 60.
+pub fn tm_backoff_s(attempt: u32) -> u32 {
+    if (attempt >= 6) { return 60; }
+    var v : u32 = 1;
+    var i : u32 = 0;
+    while (i < attempt) {
+        v = v * 2;
+        i = i + 1;
+    }
+    return v;
+}
+
+pub const TM_OB_PENDING : u8 = 0;
+pub const TM_OB_SENT : u8 = 1;
+pub const TM_OB_ACKED : u8 = 2;
+
+pub fn tm_ob_name(s: u8) -> []const u8 {
+    if (s == TM_OB_PENDING) { return "pending"; }
+    if (s == TM_OB_SENT) { return "sent"; }
+    if (s == TM_OB_ACKED) { return "acked"; }
+    return "";
+}
+
+/// One outbox record: the state delta and the message in the same line, so a crash leaves both or neither.
+pub fn tm_outbox_record(out: []u8, seq: u64, status: u8, delta: []const u8, envelope: []const u8) -> usize {
+    if (out.len < envelope.len + 256) { return 0; }
+    if (tm_ob_name(status).len == 0 or !tm_field_ok(delta, 128)) { return 0; }
+    if (tm_envelope_check(envelope) != TM_E_OK) { return 0; }
+    var o : usize = put_bytes(out, 0, "X|");
+    o = put_dec(out, o, seq);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, tm_ob_name(status));
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, delta);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, envelope);
+    return o;
+}
+
+pub const TM_X_OK : u8 = 0;
+pub const TM_X_PREFIX : u8 = 1;
+pub const TM_X_FIELDS : u8 = 2;
+pub const TM_X_SEQ : u8 = 3;
+pub const TM_X_STATUS : u8 = 4;
+pub const TM_X_DELTA : u8 = 5;
+pub const TM_X_ENVELOPE : u8 = 6;
+
+/// Check one X line, including the message it carries.
+pub fn tm_outbox_check(line: []const u8) -> u8 {
+    if (!bytes_starts_with(line, "X|")) { return TM_X_PREFIX; }
+    if (bytes_count(line, 124) != 18) { return TM_X_FIELDS; }
+    if (tm_num(tm_fld(line, 1)) < 0) { return TM_X_SEQ; }
+    const st : []const u8 = tm_fld(line, 2);
+    if (!bytes_eq(st, "pending") and !bytes_eq(st, "sent") and !bytes_eq(st, "acked")) { return TM_X_STATUS; }
+    if (!tm_field_ok(tm_fld(line, 3), 128)) { return TM_X_DELTA; }
+    if (tm_envelope_check(tm_after_pipe(line, 4)) != TM_E_OK) { return TM_X_ENVELOPE; }
+    return TM_X_OK;
+}
+
+pub const TM_DL_OVERFLOW : u8 = 1;
+pub const TM_DL_UNDELIVERABLE : u8 = 2;
+pub const TM_DL_INVALID : u8 = 3;
+pub const TM_DL_POISON : u8 = 4;
+pub const TM_FC_TRANSIENT : u8 = 1;
+pub const TM_FC_PERMANENT : u8 = 2;
+pub const TM_FC_SECURITY : u8 = 3;
+
+pub fn tm_dl_reason_name(r: u8) -> []const u8 {
+    if (r == TM_DL_OVERFLOW) { return "overflow"; }
+    if (r == TM_DL_UNDELIVERABLE) { return "undeliverable"; }
+    if (r == TM_DL_INVALID) { return "invalid"; }
+    if (r == TM_DL_POISON) { return "poison"; }
+    return "";
+}
+
+pub fn tm_fc_name(c: u8) -> []const u8 {
+    if (c == TM_FC_TRANSIENT) { return "transient"; }
+    if (c == TM_FC_PERMANENT) { return "permanent"; }
+    if (c == TM_FC_SECURITY) { return "security"; }
+    return "";
+}
+
+/// Manual replay is eligible unless the failure is a security one or the envelope itself was invalid.
+pub fn tm_dl_replay_ok(reason: u8, class: u8) -> bool {
+    if (class == TM_FC_SECURITY or reason == TM_DL_INVALID) { return false; }
+    return tm_dl_reason_name(reason).len > 0 and tm_fc_name(class).len > 0;
+}
+
+pub const TM_APPROVER_NONE : u8 = 0;
+pub const TM_APPROVER_OWNER : u8 = 1;
+pub const TM_APPROVER_POLICY : u8 = 2;
+
+/// Replay of a dead letter needs eligibility and an approver (owner or policy).
+pub fn tm_dl_replay_allowed(reason: u8, class: u8, approver: u8) -> bool {
+    if (approver != TM_APPROVER_OWNER and approver != TM_APPROVER_POLICY) { return false; }
+    return tm_dl_replay_ok(reason, class);
+}
+
+/// A dead letter: a durable quarantine line (reason, failure class, retry count, replay eligibility, envelope).
+/// The envelope must itself validate except for reason invalid, where the raw text is kept for the owner.
+pub fn tm_dead_letter(out: []u8, message_id: []const u8, reason: u8, class: u8, retries: u32, envelope: []const u8) -> usize {
+    if (out.len < envelope.len + 256 or envelope.len > 1024) { return 0; }
+    if (tm_dl_reason_name(reason).len == 0 or tm_fc_name(class).len == 0 or retries > 99) { return 0; }
+    if (!tm_ident_ok(message_id)) { return 0; }
+    if (reason != TM_DL_INVALID and tm_envelope_check(envelope) != TM_E_OK) { return 0; }
+    if (reason == TM_DL_INVALID and !tm_field_ok(envelope, 1024)) { return 0; }
+    var o : usize = put_bytes(out, 0, "D|");
+    o = put_bytes(out, o, message_id);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, tm_dl_reason_name(reason));
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, tm_fc_name(class));
+    o = put_bytes(out, o, "|");
+    o = put_dec(out, o, retries as u64);
+    if (tm_dl_replay_ok(reason, class)) {
+        o = put_bytes(out, o, "|yes|");
+    } else {
+        o = put_bytes(out, o, "|no|");
+    }
+    o = put_bytes(out, o, envelope);
+    return o;
+}
+
+/// Check one D line: prefix, known reason and class, a numeric retry count, replay yes/no agreeing with the rule.
+pub fn tm_dl_check(line: []const u8) -> bool {
+    if (!bytes_starts_with(line, "D|") or bytes_count(line, 124) < 6) { return false; }
+    if (!tm_ident_ok(tm_fld(line, 1))) { return false; }
+    var r : u8 = 1;
+    var c : u8 = 1;
+    var rk : bool = false;
+    var ck : bool = false;
+    while (r <= TM_DL_POISON) {
+        if (bytes_eq(tm_dl_reason_name(r), tm_fld(line, 2))) { rk = true; break; }
+        r = r + 1;
+    }
+    while (c <= TM_FC_SECURITY) {
+        if (bytes_eq(tm_fc_name(c), tm_fld(line, 3))) { ck = true; break; }
+        c = c + 1;
+    }
+    if (!rk or !ck or tm_num(tm_fld(line, 4)) < 0) { return false; }
+    if (tm_dl_replay_ok(r, c)) { return bytes_eq(tm_fld(line, 5), "yes"); }
+    return bytes_eq(tm_fld(line, 5), "no");
+}
+
+; --- 7. Actor identity and leases ---
+
+/// One A line: agent_id (an agent_registry name), its did, a 64-hex public key and a capability list.
+pub fn tm_actor_line(out: []u8, agent_id: []const u8, public_key: []const u8, caps: []const u8) -> usize {
+    if (out.len < 512 or !ar_key_ok(public_key) or !tm_field_ok(caps, 128)) { return 0; }
+    var did : [64]u8 = undefined;
+    const dn : usize = ar_did(did[0..64], agent_id);
+    if (dn == 0) { return 0; }
+    var o : usize = put_bytes(out, 0, "A|");
+    o = put_bytes(out, o, agent_id);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, did[0..dn]);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, public_key);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, caps);
+    return o;
+}
+
+pub fn tm_actor_check(line: []const u8) -> bool {
+    if (!bytes_starts_with(line, "A|") or bytes_count(line, 124) != 4) { return false; }
+    if (!ar_name_ok(tm_fld(line, 1)) or !ar_key_ok(tm_fld(line, 3))) { return false; }
+    var did : [64]u8 = undefined;
+    const dn : usize = ar_did(did[0..64], tm_fld(line, 1));
+    return dn > 0 and bytes_eq(did[0..dn], tm_fld(line, 2)) and tm_field_ok(tm_fld(line, 4), 128);
+}
+
+pub const TM_LS_OK : u8 = 0;
+pub const TM_LS_CONFLICT : u8 = 1;
+pub const TM_LS_TAKEOVER : u8 = 2;
+pub const TM_LS_FULL : u8 = 3;
+pub const TM_LS_BAD_TTL : u8 = 4;
+pub const TM_LS_NOT_HELD : u8 = 5;
+pub const TM_LS_EXPIRED : u8 = 6;
+pub const TM_LS_BAD_REASON : u8 = 7;
+pub const TM_REL_COMPLETED : u8 = 1;
+pub const TM_REL_ABORTED : u8 = 2;
+
+/// The slot holding scope (live or expired); the table length when none. A slot with exps[i] == 0 is free.
+pub fn tm_lease_find(scopes: []const u32, exps: []const u64, scope: u32) -> usize {
+    var i : usize = 0;
+    while (i < scopes.len and i < exps.len) {
+        if (exps[i] != 0 and scopes[i] == scope) { return i; }
+        i = i + 1;
+    }
+    return scopes.len;
+}
+
+/// acquire(agent, scope, ttl): one holder per scope. Free scope -> granted. Same holder -> granted and the
+/// ttl restarts. Another live holder -> TM_LS_CONFLICT. Another holder whose lease expired -> TM_LS_TAKEOVER
+/// (claim_msg.cm_decide with the idle time set to its maximum for an expired lease).
+pub fn tm_lease_acquire(holders: []u32, scopes: []u32, exps: []u64, agent: u32, scope: u32, now: u64, ttl: u64) -> u8 {
+    if (ttl == 0 or ttl > TM_LEASE_TTL_MAX) { return TM_LS_BAD_TTL; }
+    const i : usize = tm_lease_find(scopes, exps, scope);
+    if (i < scopes.len) {
+        var idle : u32 = 0;
+        if (exps[i] <= now) { idle = CM_IDLE_MAX; }
+        const d : u8 = cm_decide(true, false, idle, holders[i] == agent);
+        if (d == CM_GRANTED) {
+            exps[i] = now + ttl;
+            return TM_LS_OK;
+        }
+        if (d == CM_TAKEOVER) {
+            holders[i] = agent;
+            exps[i] = now + ttl;
+            return TM_LS_TAKEOVER;
+        }
+        return TM_LS_CONFLICT;
+    }
+    var j : usize = 0;
+    while (j < scopes.len and j < exps.len and j < holders.len) {
+        if (exps[j] == 0) {
+            holders[j] = agent;
+            scopes[j] = scope;
+            exps[j] = now + ttl;
+            return TM_LS_OK;
+        }
+        j = j + 1;
+    }
+    return TM_LS_FULL;
+}
+
+/// renew(lease_id, ttl) is the heartbeat; lease_id is slot + 1. Only the live holder renews: an expired lease
+/// released its scope and must be acquired again.
+pub fn tm_lease_renew(holders: []const u32, exps: []u64, lease_id: usize, agent: u32, now: u64, ttl: u64) -> u8 {
+    if (ttl == 0 or ttl > TM_LEASE_TTL_MAX) { return TM_LS_BAD_TTL; }
+    if (lease_id == 0 or lease_id > exps.len or lease_id > holders.len) { return TM_LS_NOT_HELD; }
+    const i : usize = lease_id - 1;
+    if (!cm_beat_renews(exps[i] != 0, holders[i] == agent)) { return TM_LS_NOT_HELD; }
+    if (exps[i] <= now) { return TM_LS_EXPIRED; }
+    exps[i] = now + ttl;
+    return TM_LS_OK;
+}
+
+/// release(lease_id, reason completed|aborted): the holder, or anyone once the lease expired (cm_release_valid).
+pub fn tm_lease_release(holders: []const u32, exps: []u64, lease_id: usize, agent: u32, reason: u8, now: u64) -> u8 {
+    if (reason != TM_REL_COMPLETED and reason != TM_REL_ABORTED) { return TM_LS_BAD_REASON; }
+    if (lease_id == 0 or lease_id > exps.len or lease_id > holders.len) { return TM_LS_NOT_HELD; }
+    const i : usize = lease_id - 1;
+    if (!cm_release_valid(exps[i] != 0, holders[i] == agent, exps[i] != 0 and exps[i] <= now)) { return TM_LS_NOT_HELD; }
+    exps[i] = 0;
+    return TM_LS_OK;
+}
+
+/// Free every lease whose expiry has passed; the number freed (one lease_expired event each).
+pub fn tm_lease_expire(exps: []u64, now: u64) -> u32 {
+    var n : u32 = 0;
+    var i : usize = 0;
+    while (i < exps.len) {
+        if (exps[i] != 0 and exps[i] <= now) {
+            exps[i] = 0;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// How many leases are live at now.
+pub fn tm_lease_active(exps: []const u64, now: u64) -> u32 {
+    var n : u32 = 0;
+    var i : usize = 0;
+    while (i < exps.len) {
+        if (exps[i] > now) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+; --- 8. Memory: record, validator, confidence, conflict, consolidation, forget ---
+
+pub const TM_M_EPISODIC : u8 = 1;
+pub const TM_M_SEMANTIC : u8 = 2;
+pub const TM_M_PROCEDURAL : u8 = 3;
+pub const TM_ST_ACTIVE : u8 = 1;
+pub const TM_ST_SUPERSEDED : u8 = 2;
+pub const TM_ST_FORGOTTEN : u8 = 3;
+pub const TM_RET_SHORT : u8 = 1;
+pub const TM_RET_STANDARD : u8 = 2;
+pub const TM_RET_DURABLE : u8 = 3;
+
+pub fn tm_mtype_name(t: u8) -> []const u8 {
+    if (t == TM_M_EPISODIC) { return "episodic"; }
+    if (t == TM_M_SEMANTIC) { return "semantic"; }
+    if (t == TM_M_PROCEDURAL) { return "procedural"; }
+    return "";
+}
+
+pub fn tm_status_name(s: u8) -> []const u8 {
+    if (s == TM_ST_ACTIVE) { return "active"; }
+    if (s == TM_ST_SUPERSEDED) { return "superseded"; }
+    if (s == TM_ST_FORGOTTEN) { return "forgotten"; }
+    return "";
+}
+
+pub fn tm_ret_name(r: u8) -> []const u8 {
+    if (r == TM_RET_SHORT) { return "short"; }
+    if (r == TM_RET_STANDARD) { return "standard"; }
+    if (r == TM_RET_DURABLE) { return "durable"; }
+    return "";
+}
+
+
+pub const TM_MC_OK : u8 = 0;
+pub const TM_MC_PREFIX : u8 = 1;
+pub const TM_MC_FIELDS : u8 = 2;
+pub const TM_MC_ID : u8 = 3;
+pub const TM_MC_TYPE : u8 = 4;
+pub const TM_MC_CONTENT : u8 = 5;
+pub const TM_MC_SOURCE : u8 = 6;
+pub const TM_MC_TIME : u8 = 7;
+pub const TM_MC_COUNT : u8 = 8;
+pub const TM_MC_CONFIDENCE : u8 = 9;
+pub const TM_MC_EVIDENCE : u8 = 10;
+pub const TM_MC_STATUS : u8 = 11;
+pub const TM_MC_RETENTION : u8 = 12;
+pub const TM_MC_SHAPE : u8 = 13;
+
+/// Check one R line. No memory without a source; episodic needs evidence; semantic needs key=value content and a
+/// confidence; procedural needs trigger=, action= and verify= in its content; confidence is 0..1000 (permille).
+pub fn tm_mem_check(line: []const u8) -> u8 {
+    if (!bytes_starts_with(line, "R|") or line.len > 1024) { return TM_MC_PREFIX; }
+    if (bytes_count(line, 124) != 13) { return TM_MC_FIELDS; }
+    if (!tm_ident_ok(tm_fld(line, 1))) { return TM_MC_ID; }
+    const t : u8 = tm_name_idx(tm_fld(line, 2), TM_M_PROCEDURAL, 0);
+    if (t == 0) { return TM_MC_TYPE; }
+    const content : []const u8 = tm_fld(line, 3);
+    if (!tm_field_ok(content, 256)) { return TM_MC_CONTENT; }
+    if (!tm_field_ok(tm_fld(line, 4), 64)) { return TM_MC_SOURCE; }
+    if (!tm_ident_ok(tm_fld(line, 5)) or !tm_ident_ok(tm_fld(line, 6)) or !tm_ident_ok(tm_fld(line, 7))) { return TM_MC_TIME; }
+    if (tm_num(tm_fld(line, 8)) < 0) { return TM_MC_COUNT; }
+    const conf : i64 = tm_num(tm_fld(line, 9));
+    if (conf < 0 or conf > 1000) { return TM_MC_CONFIDENCE; }
+    if (!tm_field_ok(tm_fld(line, 10), 128) or !tm_field_ok(tm_fld(line, 11), 64)) { return TM_MC_EVIDENCE; }
+    if (tm_name_idx(tm_fld(line, 12), TM_ST_FORGOTTEN, 1) == 0) { return TM_MC_STATUS; }
+    if (tm_name_idx(tm_fld(line, 13), TM_RET_DURABLE, 2) == 0) { return TM_MC_RETENTION; }
+    if (t == TM_M_EPISODIC and bytes_eq(tm_fld(line, 10), "-")) { return TM_MC_EVIDENCE; }
+    if (t == TM_M_SEMANTIC and bytes_index_of_byte(content, 61) < 1) { return TM_MC_SHAPE; }
+    if (t == TM_M_PROCEDURAL) {
+        if (!tm_contains(content, "trigger=") or !tm_contains(content, "action=") or !tm_contains(content, "verify=")) { return TM_MC_SHAPE; }
+    }
+    return TM_MC_OK;
+}
+
+fn tm_name_idx(name: []const u8, last: u8, kind: u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= last) {
+        if (kind == 0 and bytes_eq(tm_mtype_name(k), name)) { return k; }
+        if (kind == 1 and bytes_eq(tm_status_name(k), name)) { return k; }
+        if (kind == 2 and bytes_eq(tm_ret_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// Write one active memory (created = updated = last_accessed = now, access_count 0); 0 when tm_mem_check
+/// refuses the result, which covers the empty source, a secret and a missing evidence or shape. Evidence and
+/// tags are ; and , lists, or "-" for none.
+pub fn tm_mem_line(out: []u8, memory_id: []const u8, mtype: u8, content: []const u8, source: []const u8,
+                   now: []const u8, confidence: u32, evidence: []const u8, tags: []const u8, retention: u8) -> usize {
+    if (out.len < 1024 or confidence > 1000) { return 0; }
+    if (tm_mtype_name(mtype).len == 0 or tm_ret_name(retention).len == 0) { return 0; }
+    if (content.len > 256 or source.len > 64 or evidence.len > 128 or tags.len > 64 or now.len > 64 or memory_id.len > 64) { return 0; }
+    var o : usize = put_bytes(out, 0, "R|");
+    o = put_bytes(out, o, memory_id);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, tm_mtype_name(mtype));
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, content);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, source);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, now);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, now);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, now);
+    o = put_bytes(out, o, "|0|");
+    o = put_dec(out, o, confidence as u64);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, evidence);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, tags);
+    o = put_bytes(out, o, "|active|");
+    o = put_bytes(out, o, tm_ret_name(retention));
+    if (tm_mem_check(out[0..o]) != TM_MC_OK) { return 0; }
+    return o;
+}
+
+/// Confidence (permille) rises by 100, at most to 1000, only when the new evidence is independent of the old.
+pub fn tm_conf_raise(conf: u32, independent: bool) -> u32 {
+    if (!independent) { return conf; }
+    if (conf + 100 > 1000) { return 1000; }
+    return conf + 100;
+}
+
+/// Decay by age in days: short loses 20 permille a day, standard 5, durable 0; never below 0.
+pub fn tm_conf_decay(conf: u32, age_days: u32, retention: u8) -> u32 {
+    var rate : u32 = 0;
+    if (retention == TM_RET_SHORT) { rate = 20; }
+    if (retention == TM_RET_STANDARD) { rate = 5; }
+    const loss : u32 = rate * age_days;
+    if (loss >= conf) { return 0; }
+    return conf - loss;
+}
+
+/// A procedural memory is reliable only after three verified occurrences (doctor_mem.dm_pattern_reliable).
+pub fn tm_proc_reliable(verified: u32) -> bool {
+    return dm_pattern_reliable(verified);
+}
+
+pub const TM_REL_UNRELATED : u8 = 0;
+pub const TM_REL_AGREE : u8 = 1;
+pub const TM_REL_CONFLICT : u8 = 2;
+
+/// Two semantic contents key=value: same key and value agree, same key and another value conflict.
+pub fn tm_sem_relation(a: []const u8, b: []const u8) -> u8 {
+    const ia : i64 = bytes_index_of_byte(a, 61);
+    const ib : i64 = bytes_index_of_byte(b, 61);
+    if (ia < 1 or ib < 1) { return TM_REL_UNRELATED; }
+    if (!bytes_eq(a[0..(ia as usize)], b[0..(ib as usize)])) { return TM_REL_UNRELATED; }
+    if (bytes_eq(a[(ia as usize)..a.len], b[(ib as usize)..b.len])) { return TM_REL_AGREE; }
+    return TM_REL_CONFLICT;
+}
+
+/// A contradiction becomes a record, never an overwrite: C|conflict_id|memory_a|memory_b|open.
+pub fn tm_conflict_line(out: []u8, conflict_id: []const u8, mem_a: []const u8, mem_b: []const u8) -> usize {
+    if (out.len < 256 or !tm_ident_ok(conflict_id) or !tm_ident_ok(mem_a) or !tm_ident_ok(mem_b)) { return 0; }
+    if (bytes_eq(mem_a, mem_b)) { return 0; }
+    var o : usize = put_bytes(out, 0, "C|");
+    o = put_bytes(out, o, conflict_id);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, mem_a);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, mem_b);
+    o = put_bytes(out, o, "|open");
+    return o;
+}
+
+/// Consolidation gate. episodic: 5 or more similar; semantic: a duplicate pair that agrees; procedural: a repeat
+/// whose trigger and action match. A semantic pair that disagrees is a conflict, not a merge.
+pub fn tm_consol_ok(mtype: u8, count: u32, agree: bool) -> bool {
+    if (mtype == TM_M_EPISODIC) { return count >= TM_CONSOL_EPI_MIN; }
+    if (mtype == TM_M_SEMANTIC or mtype == TM_M_PROCEDURAL) { return count >= 2 and agree; }
+    return false;
+}
+
+/// The primary of a group is the most recently updated (updated_at as a sortable number); the later index wins a tie.
+pub fn tm_primary_index(updated: []const u64, n: usize) -> usize {
+    var best : usize = 0;
+    var i : usize = 1;
+    while (i < n and i < updated.len) {
+        if (updated[i] >= updated[best]) { best = i; }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn tm_item_in(list: []const u8, item: []const u8) -> bool {
+    var start : usize = 0;
+    var i : usize = 0;
+    while (i <= list.len) {
+        if (i == list.len or list[i] == 59) {
+            if (bytes_eq(list[start..i], item)) { return true; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Merge two ; lists of evidence into out, a first, then the items of b not already present; the length.
+pub fn tm_evidence_merge(out: []u8, a: []const u8, b: []const u8) -> usize {
+    if (out.len < a.len + b.len + 2) { return 0; }
+    var o : usize = put_bytes(out, 0, a);
+    var start : usize = 0;
+    var i : usize = 0;
+    while (i <= b.len) {
+        if (i == b.len or b[i] == 59) {
+            const it : []const u8 = b[start..i];
+            if (it.len > 0 and !tm_item_in(a, it)) {
+                if (o > 0) { o = put_bytes(out, o, ";"); }
+                o = put_bytes(out, o, it);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+/// A consolidated memory keeps provenance: K|other_id|consolidated_into|primary_id.
+pub fn tm_consolidated_line(out: []u8, other_id: []const u8, primary_id: []const u8) -> usize {
+    if (out.len < 256 or !tm_ident_ok(other_id) or !tm_ident_ok(primary_id) or bytes_eq(other_id, primary_id)) { return 0; }
+    var o : usize = put_bytes(out, 0, "K|");
+    o = put_bytes(out, o, other_id);
+    o = put_bytes(out, o, "|consolidated_into|");
+    o = put_bytes(out, o, primary_id);
+    return o;
+}
+
+/// Forget is a soft delete: without --confirm nothing changes; with it the status becomes forgotten. The record
+/// stays. An already forgotten memory stays forgotten.
+pub fn tm_forget(status: u8, confirm: bool) -> u8 {
+    if (!confirm) { return status; }
+    return TM_ST_FORGOTTEN;
+}
+
+; --- 9. Blackboard: add-only log and snapshot ---
+
+pub const TM_BB_OK : u8 = 0;
+pub const TM_BB_STALE : u8 = 1;
+pub const TM_BB_NO_LEASE : u8 = 2;
+
+/// Apply a delta carrying base_sequence to a log at head. A stale base is a conflict (rebase or owner); a scoped
+/// write needs a live lease. The next sequence is head + 1.
+pub fn tm_bb_decide(head: u64, base: u64, scoped: bool, lease_held: bool) -> u8 {
+    if (base != head) { return TM_BB_STALE; }
+    if (scoped and !lease_held) { return TM_BB_NO_LEASE; }
+    return TM_BB_OK;
+}
+
+/// One log line: B|sequence|base_sequence|scope|delta, with sequence = base + 1 (add only, no rewrite).
+pub fn tm_bb_log_line(out: []u8, sequence: u64, base: u64, scope: []const u8, delta: []const u8) -> usize {
+    if (out.len < 512 or sequence != base + 1 or !tm_ident_ok(scope) or !tm_field_ok(delta, 256)) { return 0; }
+    var o : usize = put_bytes(out, 0, "B|");
+    o = put_dec(out, o, sequence);
+    o = put_bytes(out, o, "|");
+    o = put_dec(out, o, base);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, scope);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, delta);
+    return o;
+}
+
+pub fn tm_bb_log_check(line: []const u8) -> bool {
+    if (!bytes_starts_with(line, "B|") or bytes_count(line, 124) != 4) { return false; }
+    const s : i64 = tm_num(tm_fld(line, 1));
+    const b : i64 = tm_num(tm_fld(line, 2));
+    if (s < 1 or b < 0 or s != b + 1) { return false; }
+    return tm_ident_ok(tm_fld(line, 3)) and tm_field_ok(tm_fld(line, 4), 256);
+}
+
+/// The snapshot: epic, open_issues, active_agents, current_priorities, blockers, recent_decisions, sequence, updated_at.
+pub fn tm_bb_snapshot(out: []u8, epic: []const u8, open_issues: u32, active_agents: u32, priorities: []const u8,
+                      blockers: u32, decisions: []const u8, sequence: u64, updated_at: []const u8) -> usize {
+    if (out.len < 768 or !tm_field_ok(epic, 64) or !tm_field_ok(priorities, 128) or !tm_field_ok(decisions, 128)) { return 0; }
+    if (!tm_ident_ok(updated_at)) { return 0; }
+    var o : usize = put_bytes(out, 0, "P|");
+    o = put_bytes(out, o, epic);
+    o = put_bytes(out, o, "|");
+    o = put_dec(out, o, open_issues as u64);
+    o = put_bytes(out, o, "|");
+    o = put_dec(out, o, active_agents as u64);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, priorities);
+    o = put_bytes(out, o, "|");
+    o = put_dec(out, o, blockers as u64);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, decisions);
+    o = put_bytes(out, o, "|");
+    o = put_dec(out, o, sequence);
+    o = put_bytes(out, o, "|");
+    o = put_bytes(out, o, updated_at);
+    return o;
+}
+
+pub fn tm_bb_snapshot_check(line: []const u8) -> bool {
+    if (!bytes_starts_with(line, "P|") or bytes_count(line, 124) != 8) { return false; }
+    if (!tm_field_ok(tm_fld(line, 1), 64) or tm_num(tm_fld(line, 2)) < 0 or tm_num(tm_fld(line, 3)) < 0) { return false; }
+    if (!tm_field_ok(tm_fld(line, 4), 128) or tm_num(tm_fld(line, 5)) < 0 or !tm_field_ok(tm_fld(line, 6), 128)) { return false; }
+    return tm_num(tm_fld(line, 7)) >= 0 and tm_ident_ok(tm_fld(line, 8));
+}
+
+; --- 10. Cron cycle, self-healing, escalation ---
+
+pub const TM_PH_MONITOR : u8 = 1;
+pub const TM_PH_ANALYZE : u8 = 2;
+pub const TM_PH_PLAN : u8 = 3;
+pub const TM_PH_EXECUTE : u8 = 4;
+pub const TM_PH_KNOWLEDGE : u8 = 5;
+
+pub fn tm_phase_name(p: u8) -> []const u8 {
+    if (p == TM_PH_MONITOR) { return "MONITOR"; }
+    if (p == TM_PH_ANALYZE) { return "ANALYZE"; }
+    if (p == TM_PH_PLAN) { return "PLAN"; }
+    if (p == TM_PH_EXECUTE) { return "EXECUTE"; }
+    if (p == TM_PH_KNOWLEDGE) { return "KNOWLEDGE"; }
+    return "";
+}
+
+/// The phase after p; 0 after KNOWLEDGE (the cycle is over).
+pub fn tm_phase_next(p: u8) -> u8 {
+    if (p >= TM_PH_KNOWLEDGE) { return 0; }
+    return p + 1;
+}
+
+pub const TM_CR_RUN : u8 = 0;
+pub const TM_CR_DONE : u8 = 1;
+pub const TM_CR_THROTTLE : u8 = 2;
+
+/// Admit one more cycle: bounded by max_cycles, and a backlog at or over its limit throttles instead of running.
+pub fn tm_cron_admit(cycles_run: u32, max_cycles: u32, backlog: u32, backlog_limit: u32) -> u8 {
+    if (cycles_run >= max_cycles) { return TM_CR_DONE; }
+    if (backlog >= backlog_limit) { return TM_CR_THROTTLE; }
+    return TM_CR_RUN;
+}
+
+/// One safe task per cycle: a second task in the same cycle is refused.
+pub fn tm_cron_task_ok(tasks_this_cycle: u32, safe: bool) -> bool {
+    return safe and tasks_this_cycle == 0;
+}
+
+pub const TM_H_RESTART : u8 = 0;
+pub const TM_H_ESCALATE : u8 = 1;
+pub const TM_H_HALT : u8 = 2;
+pub const TM_H_REFUSE : u8 = 3;
+
+/// MAPE-K, and the supervisor with it (restart, then escalate): at most TM_HEAL_MAX attempts per incident;
+/// a component that is not T27-owned is never restarted; a security incident halts at once.
+pub fn tm_heal_decide(attempts: u32, owned: bool, security: bool) -> u8 {
+    if (security) { return TM_H_HALT; }
+    if (!owned) { return TM_H_REFUSE; }
+    if (attempts >= TM_HEAL_MAX) { return TM_H_ESCALATE; }
+    return TM_H_RESTART;
+}
+
+pub const TM_ES_NONE : u8 = 0;
+pub const TM_ES_BLOCKED_OWNER : u8 = 1;
+pub const TM_ES_HALT_OWNER : u8 = 2;
+pub const TM_ES_THROTTLE : u8 = 3;
+pub const TM_ES_FREEZE_OWNER : u8 = 4;
+pub const TM_ES_REBASE_OR_OWNER : u8 = 5;
+pub const TM_K_FAILURES3 : u8 = 1;
+pub const TM_K_SECURITY : u8 = 2;
+pub const TM_K_BACKLOG : u8 = 3;
+pub const TM_K_CONTRACT : u8 = 4;
+pub const TM_K_BLACKBOARD : u8 = 5;
+
+/// The escalation for an incident kind: 3 failures -> BLOCKED and owner; security -> halt and owner; backlog ->
+/// throttle; contract conflict -> freeze and owner; blackboard conflict -> rebase or owner.
+pub fn tm_escalation(kind: u8) -> u8 {
+    if (kind == TM_K_FAILURES3) { return TM_ES_BLOCKED_OWNER; }
+    if (kind == TM_K_SECURITY) { return TM_ES_HALT_OWNER; }
+    if (kind == TM_K_BACKLOG) { return TM_ES_THROTTLE; }
+    if (kind == TM_K_CONTRACT) { return TM_ES_FREEZE_OWNER; }
+    if (kind == TM_K_BLACKBOARD) { return TM_ES_REBASE_OR_OWNER; }
+    return TM_ES_NONE;
+}
+
+/// No auto-merge without a policy that allows it, green checks and a review.
+pub fn tm_merge_allowed(policy_allows: bool, checks_green: bool, reviewed: bool) -> bool {
+    return policy_allows and checks_green and reviewed;
+}
+
+; --- 11. T27L events and the CLI id table ---
+
+/// One memory-surface event as a t27l/v1 line (surface 14, actions 68..84); 0 for an action outside that range,
+/// a refused line, or a level below warn for message_deadlettered (72), heal_failed (83) and escalation_raised (84).
+pub fn tm_event(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                actor: u8, action: u8, level: u8, trace_id: []const u8, span_id: []const u8,
+                parent_span_id: []const u8, payload: []const u8) -> usize {
+    if (action < TM_ACT_FIRST or action > TM_ACT_LAST) { return 0; }
+    if ((action == 72 or action == 83 or action == 84) and level < 3) { return 0; }
+    return tl_event_line(out, event_id, ts, device_id, session_id, actor, TM_SURFACE, action, level, trace_id,
+                         span_id, parent_span_id, payload, "");
+}
+
+/// A CLI argument is safe when tl_arg_ok accepts it (no key, env secret, e-mail or forbidden word).
+pub fn tm_arg_ok(arg: []const u8) -> bool {
+    return tl_arg_ok(arg);
+}
+
+pub const TM_CLI_LAST : u8 = 31;
+
+/// The id of `noun verb` (the host dispatch is NOT BUILT); 0 when unknown.
+pub fn tm_cli_id(noun: []const u8, verb: []const u8) -> u8 {
+    if (bytes_eq(noun, "actor")) {
+        if (bytes_eq(verb, "create")) { return 1; }
+        if (bytes_eq(verb, "list")) { return 2; }
+        if (bytes_eq(verb, "status")) { return 3; }
+    }
+    if (bytes_eq(noun, "message")) {
+        if (bytes_eq(verb, "send")) { return 4; }
+        if (bytes_eq(verb, "list")) { return 5; }
+        if (bytes_eq(verb, "ack")) { return 6; }
+        if (bytes_eq(verb, "retry")) { return 7; }
+    }
+    if (bytes_eq(noun, "mailbox")) {
+        if (bytes_eq(verb, "status")) { return 8; }
+        if (bytes_eq(verb, "size")) { return 9; }
+        if (bytes_eq(verb, "peek")) { return 10; }
+        if (bytes_eq(verb, "drain")) { return 11; }
+    }
+    if (bytes_eq(noun, "deadletter")) {
+        if (bytes_eq(verb, "list")) { return 12; }
+        if (bytes_eq(verb, "replay")) { return 13; }
+    }
+    if (bytes_eq(noun, "config")) {
+        if (bytes_eq(verb, "show")) { return 14; }
+        if (bytes_eq(verb, "set")) { return 15; }
+    }
+    if (bytes_eq(noun, "memory")) {
+        if (bytes_eq(verb, "write")) { return 16; }
+        if (bytes_eq(verb, "read")) { return 17; }
+        if (bytes_eq(verb, "list")) { return 18; }
+        if (bytes_eq(verb, "consolidate")) { return 19; }
+        if (bytes_eq(verb, "forget")) { return 20; }
+    }
+    if (bytes_eq(noun, "blackboard")) {
+        if (bytes_eq(verb, "show")) { return 21; }
+        if (bytes_eq(verb, "update")) { return 22; }
+    }
+    if (bytes_eq(noun, "lease")) {
+        if (bytes_eq(verb, "acquire")) { return 23; }
+        if (bytes_eq(verb, "renew")) { return 24; }
+        if (bytes_eq(verb, "release")) { return 25; }
+    }
+    if (bytes_eq(noun, "cron")) {
+        if (bytes_eq(verb, "status")) { return 26; }
+        if (bytes_eq(verb, "run")) { return 27; }
+    }
+    if (bytes_eq(noun, "heal")) {
+        if (bytes_eq(verb, "status")) { return 28; }
+        if (bytes_eq(verb, "run")) { return 29; }
+    }
+    if (bytes_eq(noun, "skills")) {
+        if (bytes_eq(verb, "list")) { return 30; }
+        if (bytes_eq(verb, "update")) { return 31; }
+    }
+    return 0;
+}
+
+/// Destructive verbs need --confirm: mailbox drain (11), dead letter replay (13, owner order 2026-11-08) and
+/// memory forget (20).
+pub fn tm_cli_destructive(id: u8) -> bool {
+    return id == 11 or id == 13 or id == 20;
+}
+
+pub const TM_CLI_OK : u8 = 0;
+pub const TM_CLI_UNKNOWN : u8 = 1;
+pub const TM_CLI_CONFIRM : u8 = 2;
+pub const TM_CLI_ARG : u8 = 3;
+pub const TM_CLI_ATTEMPTS : u8 = 4;
+
+/// Gate one invocation: known id, --confirm for a destructive verb, a safe argument, and --max-attempts for
+/// heal run (29) of 1..3.
+pub fn tm_cli_check(id: u8, confirm: bool, arg: []const u8, max_attempts: u32) -> u8 {
+    if (id == 0 or id > TM_CLI_LAST) { return TM_CLI_UNKNOWN; }
+    if (tm_cli_destructive(id) and !confirm) { return TM_CLI_CONFIRM; }
+    if (!tm_arg_ok(arg)) { return TM_CLI_ARG; }
+    if (id == 29 and (max_attempts < 1 or max_attempts > TM_HEAL_MAX)) { return TM_CLI_ATTEMPTS; }
+    return TM_CLI_OK;
+}
+
+; --- 12. Test fixtures ---
+
+pub const TM_T_EV : str = "44444444-5555-4666-8777-888888888888";
+pub const TM_T_TS : str = "2026-11-08T12:34:56Z";
+pub const TM_T_KEY : str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+pub const TM_T_KEY2 : str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+; --- 13. Tests ---
+
+test constants_follow_the_order_not_actors {
+    assert TM_MBOX_CAP == 1000;
+    assert TM_MBOX_HIGH == 800;
+    assert TM_MBOX_CAP != 256;
+    assert TM_HEAL_MAX == 3;
+    assert bytes_eq(TM_SCHEMA, "t27m/v1");
+}
+
+test envelope_roundtrip_and_refusals {
+    var b : [1100]u8 = undefined;
+    const n : usize = tm_envelope(b[0..1100], "m-0001", "c-0001", "0xALPHA", "0xBETA", "task_claimed", TM_T_TS, TL_T_TR, TL_T_SP, 1, "claim issue 42");
+    assert n > 0;
+    assert tm_envelope_check(b[0..n]) == TM_E_OK;
+    assert bytes_eq(tm_fld(b[0..n], 11), "normal");
+    assert bytes_eq(tm_fld(b[0..n], 14), "claim issue 42");
+    assert tm_envelope(b[0..1100], "m-0002", "c-0001", "0xALPHA", "0xBETA", "no_such_type", TM_T_TS, TL_T_TR, TL_T_SP, 1, "x") == 0;
+    assert tm_envelope(b[0..1100], "m-0002", "c-0001", "0xALPHA", "0xBETA", "heartbeat", TM_T_TS, TL_T_TR, TL_T_SP, 0, "x") == 0;
+    assert tm_envelope(b[0..1100], "m|0002", "c-0001", "0xALPHA", "0xBETA", "heartbeat", TM_T_TS, TL_T_TR, TL_T_SP, 1, "x") == 0;
+    assert tm_envelope(b[0..1100], "m-0002", "c-0001", "0xALPHA", "0xBETA", "heartbeat", TM_T_TS, "short", TL_T_SP, 1, "x") == 0;
+    assert tm_envelope(b[0..1100], "m-0002", "c-0001", "0xALPHA", "0xBETA", "heartbeat", TM_T_TS, TL_T_TR, TL_T_SP, 1, "sk-abcdefgh12345678") == 0;
+    assert tm_envelope_check("M|only|a|few") == TM_E_FIELDS;
+    assert tm_envelope_check("X|a") == TM_E_PREFIX;
+}
+
+test envelope_validator_codes {
+    var b : [1100]u8 = undefined;
+    const n : usize = tm_envelope(b[0..1100], "m-0001", "c-0001", "0xALPHA", "0xBETA", "heartbeat", TM_T_TS, TL_T_TR, TL_T_SP, 2, "beat");
+    assert n > 0;
+    assert bytes_eq(tm_fld(b[0..n], 11), "low");
+    assert bytes_eq(tm_fld(b[0..n], 12), "2");
+    assert tm_envelope_check("M|m-1|c-1|a|b|heartbeat|2026-11-08T12:34:56Z|t27m/v2|0af7651916cd43dd8448eb211c80319c|b7ad6b7169203331|at_least_once|low|1|0|x") == TM_E_SCHEMA;
+    assert tm_envelope_check("M|m-1|c-1|a|b|heartbeat|2026-11-08T12:34:56Z|t27m/v1|0af7651916cd43dd8448eb211c80319c|b7ad6b7169203331|exactly_once|low|1|0|x") == TM_E_DELIVERY;
+    assert tm_envelope_check("M|m-1|c-1|a|b|heartbeat|2026-11-08T12:34:56Z|t27m/v1|0af7651916cd43dd8448eb211c80319c|b7ad6b7169203331|at_least_once|critical|1|0|x") == TM_E_PRIORITY;
+    assert tm_envelope_check("M|m-1|c-1|a|b|heartbeat|2026-11-08T12:34:56Z|t27m/v1|0af7651916cd43dd8448eb211c80319c|b7ad6b7169203331|at_least_once|low|0|0|x") == TM_E_ATTEMPT;
+    assert tm_envelope_check("M|m-1|c-1|a|b|heartbeat|2026-11-08T12:34:56Z|t27m/v1|0af7651916cd43dd8448eb211c80319c|b7ad6b7169203331|at_least_once|low|1|7|x") == TM_E_REDACTED;
+    assert tm_envelope_check("M|m-1|c-1|a|b|heartbeat|2026-11-08T12:34:56Z|t27m/v1|0af7651916cd43dd8448eb211c80319c|b7ad6b7169203331|at_least_once|low|1|0|") == TM_E_PAYLOAD;
+}
+
+test priorities_follow_the_order {
+    assert tm_type_prio(TM_T_SECURITY_ALERT) == TM_P_CRITICAL;
+    assert tm_type_prio(TM_T_RESOURCE_PRESSURE) == TM_P_CRITICAL;
+    assert tm_type_prio(TM_T_ESCALATION_NEEDED) == TM_P_CRITICAL;
+    assert tm_type_prio(TM_T_TASK_COMPLETED) == TM_P_NORMAL;
+    assert tm_type_prio(TM_T_RESULT_READY) == TM_P_NORMAL;
+    assert tm_type_prio(TM_T_HEARTBEAT) == TM_P_LOW;
+    assert tm_type_prio(TM_T_STATUS_UPDATE) == TM_P_LOW;
+    assert tm_type_id("skill_learned") == TM_T_SKILL_LEARNED;
+    assert tm_type_id("nope") == 0;
+}
+
+test mailbox_critical_first_fifo_within {
+    var ids : [8]u64 = undefined;
+    var pr : [8]u8 = undefined;
+    var c : usize = 0;
+    c = tm_mbox_put(ids[0..8], pr[0..8], c, 11, TM_P_NORMAL);
+    c = tm_mbox_put(ids[0..8], pr[0..8], c, 12, TM_P_LOW);
+    c = tm_mbox_put(ids[0..8], pr[0..8], c, 13, TM_P_CRITICAL);
+    c = tm_mbox_put(ids[0..8], pr[0..8], c, 14, TM_P_NORMAL);
+    assert c == 4;
+    var i : usize = tm_mbox_next(pr[0..8], c);
+    assert ids[i] == 13;
+    c = tm_mbox_remove(ids[0..8], pr[0..8], c, i);
+    i = tm_mbox_next(pr[0..8], c);
+    assert ids[i] == 11;
+    c = tm_mbox_remove(ids[0..8], pr[0..8], c, i);
+    i = tm_mbox_next(pr[0..8], c);
+    assert ids[i] == 14;
+    c = tm_mbox_remove(ids[0..8], pr[0..8], c, i);
+    assert ids[tm_mbox_next(pr[0..8], c)] == 12;
+    assert tm_mbox_next(pr[0..8], 0) == 0;
+    assert tm_fifo_promised(true, true);
+    assert !tm_fifo_promised(true, false);
+}
+
+test mailbox_watermark_and_overflow {
+    assert tm_mbox_verdict(0, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_NORMAL) == TM_Q_OK;
+    assert tm_mbox_verdict(799, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_LOW) == TM_Q_OK;
+    assert tm_mbox_verdict(800, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_LOW) == TM_Q_THROTTLED;
+    assert tm_mbox_verdict(800, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_NORMAL) == TM_Q_PRESSURE;
+    assert tm_mbox_verdict(900, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_CRITICAL) == TM_Q_PRESSURE;
+    assert tm_mbox_verdict(999, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_CRITICAL) == TM_Q_PRESSURE;
+    assert tm_mbox_verdict(1000, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_CRITICAL) == TM_Q_DEAD;
+    assert deliver(true, 0, 1) == D_QUEUED;
+    assert deliver(true, 1, 1) == D_DROPPED_FULL;
+}
+
+test dedup_ack_retry {
+    var seen : [4]u64 = undefined;
+    var n : usize = 0;
+    const id : u64 = tm_hash("m-0001");
+    assert id != tm_hash("m-0002");
+    assert tm_recv_decide(seen[0..4], n, id) == TM_R_PROCESS;
+    n = tm_seen_add(seen[0..4], n, id);
+    assert n == 1;
+    assert tm_recv_decide(seen[0..4], n, id) == TM_R_DUP;
+    assert tm_recv_decide(seen[0..4], n, tm_hash("m-0002")) == TM_R_PROCESS;
+    assert tm_retry_decide(1) == TM_RT_RETRY;
+    assert tm_retry_decide(4) == TM_RT_RETRY;
+    assert tm_retry_decide(5) == TM_RT_UNDELIVERABLE;
+    assert tm_backoff_s(0) == 1;
+    assert tm_backoff_s(3) == 8;
+    assert tm_backoff_s(9) == 60;
+}
+
+test outbox_record_is_one_transaction {
+    var e : [1100]u8 = undefined;
+    const en : usize = tm_envelope(e[0..1100], "m-0001", "c-0001", "0xALPHA", "0xBETA", "task_started", TM_T_TS, TL_T_TR, TL_T_SP, 1, "start");
+    assert en > 0;
+    var x : [1400]u8 = undefined;
+    const xn : usize = tm_outbox_record(x[0..1400], 7, TM_OB_PENDING, "current_task=issue42", e[0..en]);
+    assert xn > 0;
+    assert tm_outbox_check(x[0..xn]) == TM_X_OK;
+    assert bytes_eq(tm_fld(x[0..xn], 2), "pending");
+    assert bytes_eq(tm_after_pipe(x[0..xn], 4), e[0..en]);
+    assert tm_outbox_record(x[0..1400], 7, TM_OB_PENDING, "", e[0..en]) == 0;
+    assert tm_outbox_record(x[0..1400], 7, 9, "d", e[0..en]) == 0;
+    assert tm_outbox_record(x[0..1400], 7, TM_OB_SENT, "d", "M|broken") == 0;
+    assert tm_outbox_check("X|1|pending|d|M|broken") == TM_X_FIELDS;
+    assert tm_outbox_check("Y|1") == TM_X_PREFIX;
+}
+
+test dead_letter_is_a_durable_quarantine {
+    var e : [1100]u8 = undefined;
+    const en : usize = tm_envelope(e[0..1100], "m-0009", "c-0001", "0xALPHA", "0xGAMMA", "task_failed", TM_T_TS, TL_T_TR, TL_T_SP, 5, "gave up");
+    assert en > 0;
+    var d : [1500]u8 = undefined;
+    const dn : usize = tm_dead_letter(d[0..1500], "m-0009", TM_DL_UNDELIVERABLE, TM_FC_TRANSIENT, 5, e[0..en]);
+    assert dn > 0;
+    assert tm_dl_check(d[0..dn]);
+    assert bytes_eq(tm_fld(d[0..dn], 5), "yes");
+    const sn : usize = tm_dead_letter(d[0..1500], "m-0009", TM_DL_POISON, TM_FC_SECURITY, 0, e[0..en]);
+    assert sn > 0;
+    assert bytes_eq(tm_fld(d[0..sn], 5), "no");
+    assert tm_dl_check(d[0..sn]);
+    assert !tm_dl_replay_ok(TM_DL_INVALID, TM_FC_TRANSIENT);
+    assert tm_dead_letter(d[0..1500], "m-0009", 9, TM_FC_TRANSIENT, 0, e[0..en]) == 0;
+    assert tm_dead_letter(d[0..1500], "m-0009", TM_DL_OVERFLOW, TM_FC_TRANSIENT, 0, "M|junk") == 0;
+    assert !tm_dl_check("D|m-1|overflow|transient|0|no|M|x");
+}
+
+test actor_identity_lines {
+    var a : [512]u8 = undefined;
+    const n : usize = tm_actor_line(a[0..512], "0xALPHA", TM_T_KEY, "claim,review");
+    assert n > 0;
+    assert tm_actor_check(a[0..n]);
+    assert bytes_eq(tm_fld(a[0..n], 2), "did:t27:0xALPHA");
+    assert tm_actor_line(a[0..512], "alpha", TM_T_KEY, "claim") == 0;
+    assert tm_actor_line(a[0..512], "0xALPHA", "not-a-key", "claim") == 0;
+    assert !tm_actor_check("A|0xALPHA|did:t27:0xOTHER|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|claim");
+}
+
+test lease_acquire_renew_release {
+    var h : [4]u32 = undefined;
+    var s : [4]u32 = undefined;
+    var x : [4]u64 = [0, 0, 0, 0];
+    assert tm_lease_acquire(h[0..4], s[0..4], x[0..4], 1, 500, 100, 60) == TM_LS_OK;
+    assert x[0] == 160;
+    assert tm_lease_find(s[0..4], x[0..4], 500) == 0;
+    assert tm_lease_renew(h[0..4], x[0..4], 1, 1, 130, 60) == TM_LS_OK;
+    assert x[0] == 190;
+    assert tm_lease_renew(h[0..4], x[0..4], 1, 2, 130, 60) == TM_LS_NOT_HELD;
+    assert tm_lease_release(h[0..4], x[0..4], 1, 2, TM_REL_COMPLETED, 131) == TM_LS_NOT_HELD;
+    assert tm_lease_release(h[0..4], x[0..4], 1, 1, 7, 131) == TM_LS_BAD_REASON;
+    assert tm_lease_release(h[0..4], x[0..4], 1, 1, TM_REL_COMPLETED, 131) == TM_LS_OK;
+    assert x[0] == 0;
+    assert tm_lease_active(x[0..4], 131) == 0;
+}
+
+test lease_conflict_expiry_takeover {
+    var h : [2]u32 = undefined;
+    var s : [2]u32 = undefined;
+    var x : [2]u64 = [0, 0];
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 1, 77, 100, 60) == TM_LS_OK;
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 2, 77, 120, 60) == TM_LS_CONFLICT;
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 1, 77, 120, 60) == TM_LS_OK;
+    assert x[0] == 180;
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 2, 78, 120, 60) == TM_LS_OK;
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 3, 79, 120, 60) == TM_LS_FULL;
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 3, 79, 120, 0) == TM_LS_BAD_TTL;
+    assert tm_lease_active(x[0..2], 150) == 2;
+    assert tm_lease_renew(h[0..2], x[0..2], 1, 1, 181, 60) == TM_LS_EXPIRED;
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 2, 77, 181, 60) == TM_LS_TAKEOVER;
+    assert h[0] == 2;
+    assert tm_lease_expire(x[0..2], 400) == 2;
+    assert tm_lease_active(x[0..2], 400) == 0;
+    assert tm_lease_acquire(h[0..2], s[0..2], x[0..2], 3, 77, 400, 60) == TM_LS_OK;
+}
+
+test memory_three_types_validate {
+    var m : [1100]u8 = undefined;
+    const e : usize = tm_mem_line(m[0..1100], "mem-e1", TM_M_EPISODIC, "alpha fixed the seal on issue 42", "0xALPHA", TM_T_TS, 600, "pr-13344;run-1", "seal,fix", TM_RET_STANDARD);
+    assert e > 0;
+    assert tm_mem_check(m[0..e]) == TM_MC_OK;
+    assert bytes_eq(tm_fld(m[0..e], 12), "active");
+    assert bytes_eq(tm_fld(m[0..e], 8), "0");
+    const s : usize = tm_mem_line(m[0..1100], "mem-s1", TM_M_SEMANTIC, "mailbox_cap=1000", "order-t27m", TM_T_TS, 800, "-", "config", TM_RET_DURABLE);
+    assert s > 0;
+    const p : usize = tm_mem_line(m[0..1100], "mem-p1", TM_M_PROCEDURAL, "trigger=swap_high;action=close_idle_tabs;verify=swap_down", "0xBETA", TM_T_TS, 300, "run-2", "doctor", TM_RET_STANDARD);
+    assert p > 0;
+    assert tm_mem_check(m[0..p]) == TM_MC_OK;
+}
+
+test memory_refusals {
+    var m : [1100]u8 = undefined;
+    assert tm_mem_line(m[0..1100], "mem-x", TM_M_EPISODIC, "something happened", "", TM_T_TS, 500, "ev1", "-", TM_RET_SHORT) == 0;
+    assert tm_mem_line(m[0..1100], "mem-x", TM_M_EPISODIC, "something happened", "0xALPHA", TM_T_TS, 500, "-", "-", TM_RET_SHORT) == 0;
+    assert tm_mem_line(m[0..1100], "mem-x", TM_M_SEMANTIC, "no equals sign", "0xALPHA", TM_T_TS, 500, "-", "-", TM_RET_SHORT) == 0;
+    assert tm_mem_line(m[0..1100], "mem-x", TM_M_PROCEDURAL, "trigger=a;action=b", "0xALPHA", TM_T_TS, 500, "-", "-", TM_RET_SHORT) == 0;
+    assert tm_mem_line(m[0..1100], "mem-x", TM_M_SEMANTIC, "owner=dev@example.com", "0xALPHA", TM_T_TS, 500, "-", "-", TM_RET_SHORT) == 0;
+    assert tm_mem_line(m[0..1100], "mem-x", TM_M_SEMANTIC, "k=v", "0xALPHA", TM_T_TS, 1001, "-", "-", TM_RET_SHORT) == 0;
+    assert tm_mem_line(m[0..1100], "mem-x", 9, "k=v", "0xALPHA", TM_T_TS, 10, "-", "-", TM_RET_SHORT) == 0;
+    assert tm_mem_check("R|too|few") == TM_MC_FIELDS;
+}
+
+test confidence_decay_reliability {
+    assert tm_conf_raise(500, false) == 500;
+    assert tm_conf_raise(500, true) == 600;
+    assert tm_conf_raise(950, true) == 1000;
+    assert tm_conf_decay(500, 10, TM_RET_SHORT) == 300;
+    assert tm_conf_decay(500, 10, TM_RET_STANDARD) == 450;
+    assert tm_conf_decay(500, 100, TM_RET_DURABLE) == 500;
+    assert tm_conf_decay(100, 100, TM_RET_SHORT) == 0;
+    assert !tm_proc_reliable(2);
+    assert tm_proc_reliable(3);
+}
+
+test contradiction_becomes_a_conflict_record {
+    assert tm_sem_relation("mailbox_cap=1000", "mailbox_cap=1000") == TM_REL_AGREE;
+    assert tm_sem_relation("mailbox_cap=1000", "mailbox_cap=256") == TM_REL_CONFLICT;
+    assert tm_sem_relation("mailbox_cap=1000", "retry_max=5") == TM_REL_UNRELATED;
+    assert tm_sem_relation("nokey", "nokey") == TM_REL_UNRELATED;
+    var c : [256]u8 = undefined;
+    const n : usize = tm_conflict_line(c[0..256], "cf-1", "mem-s1", "mem-s2");
+    assert bytes_eq(c[0..n], "C|cf-1|mem-s1|mem-s2|open");
+    assert tm_conflict_line(c[0..256], "cf-1", "mem-s1", "mem-s1") == 0;
+}
+
+test consolidation_keeps_provenance {
+    assert !tm_consol_ok(TM_M_EPISODIC, 4, true);
+    assert tm_consol_ok(TM_M_EPISODIC, 5, false);
+    assert !tm_consol_ok(TM_M_SEMANTIC, 2, false);
+    assert tm_consol_ok(TM_M_SEMANTIC, 2, true);
+    assert !tm_consol_ok(TM_M_PROCEDURAL, 3, false);
+    assert tm_consol_ok(TM_M_PROCEDURAL, 3, true);
+    var u : [3]u64 = [10, 30, 20];
+    assert tm_primary_index(u[0..3], 3) == 1;
+    var o : [64]u8 = undefined;
+    const n : usize = tm_evidence_merge(o[0..64], "a;b", "b;c;a;d");
+    assert bytes_eq(o[0..n], "a;b;c;d");
+    var k : [256]u8 = undefined;
+    const kn : usize = tm_consolidated_line(k[0..256], "mem-e2", "mem-e1");
+    assert bytes_eq(k[0..kn], "K|mem-e2|consolidated_into|mem-e1");
+    assert tm_consolidated_line(k[0..256], "mem-e1", "mem-e1") == 0;
+}
+
+test forget_is_soft_and_needs_confirm {
+    assert tm_forget(TM_ST_ACTIVE, false) == TM_ST_ACTIVE;
+    assert tm_forget(TM_ST_ACTIVE, true) == TM_ST_FORGOTTEN;
+    assert tm_forget(TM_ST_FORGOTTEN, true) == TM_ST_FORGOTTEN;
+    assert bytes_eq(tm_status_name(TM_ST_FORGOTTEN), "forgotten");
+    assert bytes_eq(tm_status_name(TM_ST_SUPERSEDED), "superseded");
+}
+
+test blackboard_log_snapshot_and_conflict {
+    assert tm_bb_decide(4, 4, false, false) == TM_BB_OK;
+    assert tm_bb_decide(5, 4, false, false) == TM_BB_STALE;
+    assert tm_bb_decide(4, 4, true, false) == TM_BB_NO_LEASE;
+    assert tm_bb_decide(4, 4, true, true) == TM_BB_OK;
+    var l : [512]u8 = undefined;
+    const n : usize = tm_bb_log_line(l[0..512], 5, 4, "issues", "open_issues=3");
+    assert bytes_eq(l[0..n], "B|5|4|issues|open_issues=3");
+    assert tm_bb_log_check(l[0..n]);
+    assert tm_bb_log_line(l[0..512], 7, 4, "issues", "x") == 0;
+    assert !tm_bb_log_check("B|5|5|issues|x");
+    var p : [768]u8 = undefined;
+    const pn : usize = tm_bb_snapshot(p[0..768], "t27#13300", 3, 3, "t27m,t27l", 0, "cap=1000", 5, TM_T_TS);
+    assert pn > 0;
+    assert tm_bb_snapshot_check(p[0..pn]);
+    assert tm_bb_snapshot(p[0..768], "", 3, 3, "t27m", 0, "d", 5, TM_T_TS) == 0;
+}
+
+test cron_cycle_is_bounded {
+    assert bytes_eq(tm_phase_name(TM_PH_MONITOR), "MONITOR");
+    var ph : u8 = TM_PH_MONITOR;
+    var steps : u32 = 1;
+    while (tm_phase_next(ph) != 0) {
+        ph = tm_phase_next(ph);
+        steps = steps + 1;
+    }
+    assert steps == 5;
+    assert ph == TM_PH_KNOWLEDGE;
+    assert tm_cron_admit(0, 1, 0, 10) == TM_CR_RUN;
+    assert tm_cron_admit(1, 1, 0, 10) == TM_CR_DONE;
+    assert tm_cron_admit(0, 3, 10, 10) == TM_CR_THROTTLE;
+    assert tm_cron_task_ok(0, true);
+    assert !tm_cron_task_ok(1, true);
+    assert !tm_cron_task_ok(0, false);
+}
+
+test self_healing_and_escalation {
+    assert tm_heal_decide(0, true, false) == TM_H_RESTART;
+    assert tm_heal_decide(2, true, false) == TM_H_RESTART;
+    assert tm_heal_decide(3, true, false) == TM_H_ESCALATE;
+    assert tm_heal_decide(0, false, false) == TM_H_REFUSE;
+    assert tm_heal_decide(0, true, true) == TM_H_HALT;
+    assert tm_escalation(TM_K_FAILURES3) == TM_ES_BLOCKED_OWNER;
+    assert tm_escalation(TM_K_SECURITY) == TM_ES_HALT_OWNER;
+    assert tm_escalation(TM_K_BACKLOG) == TM_ES_THROTTLE;
+    assert tm_escalation(TM_K_CONTRACT) == TM_ES_FREEZE_OWNER;
+    assert tm_escalation(TM_K_BLACKBOARD) == TM_ES_REBASE_OR_OWNER;
+    assert tm_escalation(9) == TM_ES_NONE;
+    assert !tm_merge_allowed(true, true, false);
+    assert !tm_merge_allowed(false, true, true);
+    assert tm_merge_allowed(true, true, true);
+}
+
+test cli_table_and_gates {
+    assert tm_cli_id("actor", "create") == 1;
+    assert tm_cli_id("mailbox", "drain") == 11;
+    assert tm_cli_id("memory", "forget") == 20;
+    assert tm_cli_id("heal", "run") == 29;
+    assert tm_cli_id("skills", "update") == TM_CLI_LAST;
+    assert tm_cli_id("actor", "explode") == 0;
+    assert tm_cli_check(11, false, "", 0) == TM_CLI_CONFIRM;
+    assert tm_cli_check(11, true, "", 0) == TM_CLI_OK;
+    assert tm_cli_check(20, false, "mem-1", 0) == TM_CLI_CONFIRM;
+    assert tm_cli_check(15, false, "password", 0) == TM_CLI_ARG;
+    assert tm_cli_check(29, false, "", 4) == TM_CLI_ATTEMPTS;
+    assert tm_cli_check(29, false, "", 3) == TM_CLI_OK;
+    assert tm_cli_check(0, true, "", 0) == TM_CLI_UNKNOWN;
+}
+
+test mailbox_capacity_and_watermark {
+    assert TM_MBOX_CAP_CRIT == 256;
+    assert tm_mbox_high(1000) == 800;
+    assert tm_mbox_high(256) == 204;
+    assert tm_mbox_high(TM_MBOX_CAP) == TM_MBOX_HIGH;
+    assert tm_mbox_cap(false) == 1000;
+    assert tm_mbox_cap(true) == 256;
+    assert tm_mbox_verdict(203, 256, tm_mbox_high(256), TM_P_LOW) == TM_Q_OK;
+    assert tm_mbox_verdict(204, 256, tm_mbox_high(256), TM_P_LOW) == TM_Q_THROTTLED;
+    assert tm_mbox_verdict(256, 256, tm_mbox_high(256), TM_P_CRITICAL) == TM_Q_DEAD;
+}
+
+test backpressure_alert_edges {
+    assert !tm_backpressure_alert(799, 1000);
+    assert tm_backpressure_alert(800, 1000);
+    assert !tm_backpressure_alert(203, 256);
+    assert tm_backpressure_alert(204, 256);
+    assert tm_backpressure_alert(1000, 1000);
+}
+
+test send_retry_is_bounded_and_never_waits {
+    assert tm_send_next(0) == TM_SEND_RETRY_LATER;
+    assert tm_send_next(4) == TM_SEND_RETRY_LATER;
+    assert tm_send_next(5) == TM_SEND_DEAD_LETTER;
+    assert tm_send_next(99) == TM_SEND_DEAD_LETTER;
+    assert tm_backoff_s(4) == 16;
+    assert tm_backoff_s(9) == 60;
+}
+
+test repeated_overflow_escalates {
+    assert !tm_overflow_escalates(0);
+    assert !tm_overflow_escalates(2);
+    assert tm_overflow_escalates(3);
+    assert tm_overflow_escalates(10);
+}
+
+test dead_letter_replay_needs_approval {
+    assert !tm_dl_replay_allowed(TM_DL_OVERFLOW, TM_FC_TRANSIENT, TM_APPROVER_NONE);
+    assert tm_dl_replay_allowed(TM_DL_OVERFLOW, TM_FC_TRANSIENT, TM_APPROVER_OWNER);
+    assert tm_dl_replay_allowed(TM_DL_OVERFLOW, TM_FC_TRANSIENT, TM_APPROVER_POLICY);
+    assert !tm_dl_replay_allowed(TM_DL_OVERFLOW, TM_FC_SECURITY, TM_APPROVER_OWNER);
+    assert !tm_dl_replay_allowed(TM_DL_INVALID, TM_FC_TRANSIENT, TM_APPROVER_POLICY);
+    assert tm_cli_check(13, false, "m-1", 0) == TM_CLI_CONFIRM;
+    assert tm_cli_check(13, true, "m-1", 0) == TM_CLI_OK;
+}
+
+test backpressure_alert_line_is_t27l_warn {
+    var ln : [2048]u8 = undefined;
+    const n : usize = tl_event_line(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, TM_SURFACE, 130, 3, TL_T_TR, TL_T_SP, "", "mailbox 800 of 1000", "");
+    assert n > 0;
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    assert tl_event_line(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, TM_SURFACE, 130, 2, TL_T_TR, TL_T_SP, "", "x", "") == 0;
+}
+
+test events_validate_as_t27l {
+    var ln : [2048]u8 = undefined;
+    var a : u8 = TM_ACT_FIRST;
+    while (a <= TM_ACT_LAST) {
+        var lv : u8 = 2;
+        if (a == 72 or a == 83 or a == 84) { lv = 3; }
+        const n : usize = tm_event(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, a, lv, TL_T_TR, TL_T_SP, "", "t27m event");
+        assert n > 0;
+        assert tl_validate_line(ln[0..n]) == TL_OK;
+        a = a + 1;
+    }
+    assert tm_event(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, 72, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tm_event(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, 83, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tm_event(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, 84, 1, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tm_event(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, 67, 2, TL_T_TR, TL_T_SP, "", "x") == 0;
+    assert tm_event(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, 85, 2, TL_T_TR, TL_T_SP2, TL_T_SP, "x") == 0;
+}
+
+test mvp_acceptance_scenario {
+    var a : [512]u8 = undefined;
+    assert tm_actor_check(a[0..tm_actor_line(a[0..512], "0xALPHA", TM_T_KEY, "claim,review")]);
+    assert tm_actor_check(a[0..tm_actor_line(a[0..512], "0xBETA", TM_T_KEY2, "test")]);
+    assert tm_actor_check(a[0..tm_actor_line(a[0..512], "0xGAMMA", TM_T_KEY, "docs")]);
+    var ia : [4]u64 = undefined;
+    var pa : [4]u8 = undefined;
+    var ib : [4]u64 = undefined;
+    var pb : [4]u8 = undefined;
+    var ig : [4]u64 = undefined;
+    var pg : [4]u8 = undefined;
+    var ca : usize = 0;
+    var cb : usize = 0;
+    var cg : usize = 0;
+    var seen_b : [8]u64 = undefined;
+    var nb : usize = 0;
+    var e1 : [1100]u8 = undefined;
+    var e2 : [1100]u8 = undefined;
+    const n1 : usize = tm_envelope(e1[0..1100], "m-0001", "c-1", "0xALPHA", "0xBETA", "task_claimed", TM_T_TS, TL_T_TR, TL_T_SP, 1, "claim 42");
+    const n2 : usize = tm_envelope(e2[0..1100], "m-0002", "c-1", "0xALPHA", "0xGAMMA", "resource_pressure", TM_T_TS, TL_T_TR, TL_T_SP2, 1, "swap high");
+    assert n1 > 0 and n2 > 0;
+    var x : [1400]u8 = undefined;
+    assert tm_outbox_check(x[0..tm_outbox_record(x[0..1400], 1, TM_OB_PENDING, "current_task=42", e1[0..n1])]) == TM_X_OK;
+    const cbn : u32 = @intCast(cb);
+    assert tm_mbox_verdict(cbn, TM_MBOX_CAP, TM_MBOX_HIGH, TM_P_NORMAL) == TM_Q_OK;
+    cb = tm_mbox_put(ib[0..4], pb[0..4], cb, tm_hash("m-0001"), TM_P_NORMAL);
+    cg = tm_mbox_put(ig[0..4], pg[0..4], cg, tm_hash("m-0002"), TM_P_CRITICAL);
+    assert cb == 1 and cg == 1 and ca == 0;
+    assert tm_recv_decide(seen_b[0..8], nb, tm_hash("m-0001")) == TM_R_PROCESS;
+    nb = tm_seen_add(seen_b[0..8], nb, tm_hash("m-0001"));
+    cb = tm_mbox_remove(ib[0..4], pb[0..4], cb, tm_mbox_next(pb[0..4], cb));
+    assert cb == 0;
+    cb = tm_mbox_put(ib[0..4], pb[0..4], cb, tm_hash("m-0001"), TM_P_NORMAL);
+    assert tm_recv_decide(seen_b[0..8], nb, tm_hash("m-0001")) == TM_R_DUP;
+    cb = tm_mbox_remove(ib[0..4], pb[0..4], cb, 0);
+    assert cb == 0;
+    assert tm_retry_decide(1) == TM_RT_RETRY;
+    var h : [2]u32 = undefined;
+    var s : [2]u32 = undefined;
+    var lx : [2]u64 = [0, 0];
+    assert tm_lease_acquire(h[0..2], s[0..2], lx[0..2], 1, 42, 100, 60) == TM_LS_OK;
+    assert tm_lease_acquire(h[0..2], s[0..2], lx[0..2], 2, 42, 110, 60) == TM_LS_CONFLICT;
+    assert tm_lease_active(lx[0..2], 110) == 1;
+    assert tm_cron_admit(0, 1, 0, 10) == TM_CR_RUN;
+    assert tm_heal_decide(0, true, false) == TM_H_RESTART;
+    var ln : [2048]u8 = undefined;
+    assert tl_validate_line(ln[0..tm_event(ln[0..2048], TM_T_EV, TM_T_TS, "mac-1", "sess-1", 3, 69, 2, TL_T_TR, TL_T_SP, "", "m-0001")]) == TL_OK;
+}
+

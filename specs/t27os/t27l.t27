@@ -1,0 +1,2513 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/t27l.t27 -- T27L core: the unified telemetry of T27 OS (letter L, tool t27l, page LOGS in agent_parts.t27).
+; Schema "t27l/v1": every source (course HUD, dev view, panes, viewer, neko, Menu L, browser adapter) emits one JSON line.
+; This spec is PURE (no host I/O). It checks a line, redacts it, normalizes it to ONE canonical line, decides duplicates,
+; correlates traces, renders a Menu L row, exports a line and checks CLI arguments. Persisting and showing are the host's job.
+; Boundaries:
+;   1. No source writes to Menu L directly: only a stored, normalized line renders (tl_menu_row refuses anything else).
+;   2. No source bypasses validation: a line with a bad field, a forbidden action or an unredacted secret is refused.
+;   3. Redaction runs before persistence, export, render and evidence binding (tl_normalize first, tl_validate_line as gate).
+;   4. Never captured: keystrokes, clipboard, raw screen contents, private files. Those actions have their own reject code.
+;   5. Duplicates: the same event_id with the same line hash is ignored (idempotent), the same id with another hash is a conflict.
+; v1 simplifications, stated plainly: payload is ONE JSON string (not an object); ts must be UTC and end in Z; unknown keys
+; are rejected; evidence is a JSON array of ev-<16 hex> ids, at most 8; the line hash is a 32-bit FNV-1a (chat_log text_hash).
+; Canonical line (one key order, no spaces):
+;   {"schema","event_id","ts","device_id","session_id","actor","surface","action","level","trace_id","span_id",
+;    "parent_span_id","redacted","payload","evidence"}
+; CLI: the proposed commands `tri t27l tail`, `tri t27l validate`, `tri t27l export` are NOT BUILT. They would accept no
+; secret values as arguments; tl_arg_ok is that check.
+; Not here: the T27 OS window view, the browser adapter, evidence records and the screenshot gate (t27l_evidence.t27).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+module T27osT27l;
+
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::share::redact;
+use t27os::share::redacted_total;
+use t27os::chat_log::text_hash;
+use std::mem::bytes_eq;
+use t27os::keysync::hex_val;
+
+// ---- result codes: stable, never renumbered ----
+
+pub const TL_OK : u8 = 0;
+pub const E_SCHEMA : u8 = 1;
+pub const E_MISSING : u8 = 2;
+pub const E_EVENT_ID : u8 = 3;
+pub const E_TS : u8 = 4;
+pub const E_ACTOR : u8 = 5;
+pub const E_SURFACE : u8 = 6;
+pub const E_ACTION : u8 = 7;
+pub const E_LEVEL : u8 = 8;
+pub const E_TRACE : u8 = 9;
+pub const E_SPAN : u8 = 10;
+pub const E_PARENT : u8 = 11;
+pub const E_SECRET : u8 = 12;
+pub const E_FORBIDDEN_ACTION : u8 = 13;
+pub const E_TOO_LONG : u8 = 14;
+pub const E_MALFORMED : u8 = 15;
+pub const E_LEVEL_MISMATCH : u8 = 16;
+pub const E_EVIDENCE : u8 = 17;
+pub const E_ID_CONFLICT : u8 = 18;
+/// Ingest results: a first sight of the id, and a repeat that is ignored.
+pub const TL_NEW : u8 = 30;
+pub const TL_DUP : u8 = 31;
+
+pub const TL_PAYLOAD_MAX : usize = 1024;
+pub const TL_RAW_MAX : usize = 2048;
+pub const TL_ROW_PAYLOAD : usize = 60;
+/// Parsed spans: three u32 per field (start, end, kind), 15 fields.
+pub const TL_SPANS : usize = 45;
+/// The last surface and action ids; the id lookups and tl_check read these, never a literal.
+pub const TL_SURFACE_LAST : u8 = 19;
+pub const TL_ACTION_LAST : u8 = 174;
+
+// ---- enums: 0 is "unknown"; actions 100..104 are the forbidden ones ----
+
+/// actor: 1 user, 2 agent, 3 system.
+pub fn tl_actor_name(a: u8) -> []const u8 {
+    if (a == 1) { return "user"; }
+    if (a == 2) { return "agent"; }
+    if (a == 3) { return "system"; }
+    return "";
+}
+
+/// surface: 1 course_hud, 2 dev_view, 3 pane, 4 viewer, 5 neko, 6 menu_l, 7 browser, 8 other, 9 cost (claw/cost_policy.t27),
+/// 10 system (resource guards, queen/lab_job_msg.t27, and the resource doctor, t27os/doctor_mem.t27), 11 agent (the agent
+/// registry, queen/agent_registry.t27), 12 security (the secret custodian T27S, vault/custodian.t27), 13 research (the
+/// research knowledge base T27R, t27os/t27r.t27), 14 memory (the memory-actor layer T27M, t27os/t27m.t27), 15 time (the
+/// time layer T27T, t27os/t27t.t27), 16 ci (the CI runner policy, ci/runner_policy.t27), 17 migration (the command
+/// migration contracts of this file, section "tri t27l validate contract"), 18 visual (the Lukomorye graph terminal
+/// T27V, t27f/lukomorye_graph_terminal.t27), 19 roadmap (the roadmap dashboard sync and the issue hygiene engine,
+/// tri/trigit/roadmap_dashboard_sync.t27 and tri/trigit/issue_hygiene_engine.t27).
+pub fn tl_surface_name(s: u8) -> []const u8 {
+    if (s == 1) { return "course_hud"; }
+    if (s == 2) { return "dev_view"; }
+    if (s == 3) { return "pane"; }
+    if (s == 4) { return "viewer"; }
+    if (s == 5) { return "neko"; }
+    if (s == 6) { return "menu_l"; }
+    if (s == 7) { return "browser"; }
+    if (s == 8) { return "other"; }
+    if (s == 9) { return "cost"; }
+    if (s == 10) { return "system"; }
+    if (s == 11) { return "agent"; }
+    if (s == 12) { return "security"; }
+    if (s == 13) { return "research"; }
+    if (s == 14) { return "memory"; }
+    if (s == 15) { return "time"; }
+    if (s == 16) { return "ci"; }
+    if (s == 17) { return "migration"; }
+    if (s == 18) { return "visual"; }
+    if (s == 19) { return "roadmap"; }
+    return "";
+}
+
+/// level: 1 debug, 2 info, 3 warn, 4 error, 5 fatal.
+pub fn tl_level_name(l: u8) -> []const u8 {
+    if (l == 1) { return "debug"; }
+    if (l == 2) { return "info"; }
+    if (l == 3) { return "warn"; }
+    if (l == 4) { return "error"; }
+    if (l == 5) { return "fatal"; }
+    return "";
+}
+
+/// action 1..TL_ACTION_LAST (25 llm_call and 26 route_decision are the cost events, claw/cost_policy.t27;
+/// 27 resource_guard_triggered is the swap/load/disk gate, queen/lab_job_msg.t27; 28 evidence_approved is the owner's
+/// append-only approval record; 29..37 are the agent registry events, queen/agent_registry.t27; 38..46 are the resource
+/// doctor's MAPE-K events, t27os/doctor_mem.t27; 47..57 are the secret custodian's events, vault/custodian.t27, whose
+/// payloads carry an alias and codes, never a value; 58..67 are the research knowledge base's events, t27os/t27r.t27, one per
+/// item, never one per batch; 68..84 are the memory-actor layer's events, t27os/t27m.t27; 85..99 and 105..107 are the time
+/// layer's events, t27os/t27t.t27; 108..122 are the CI runner events, ci/runner_policy.t27, action = 107 + its CR_EV code;
+/// 123..128 are the command migration events of this file; 129..136 are the bounded recovery events; 137..156 are the
+/// Lukomorye graph terminal's events, t27f/lukomorye_graph_terminal.t27, and there is no view_switched; 157..174 are the
+/// roadmap dashboard sync and issue hygiene events, tri/trigit/, whose deadletter_created is message_deadlettered 72,
+/// so one event keeps one name). 100..104 are the forbidden ones, named only so a source can be flagged; they sit
+/// inside 1..TL_ACTION_LAST and tl_validate_line refuses them before the range check.
+pub fn tl_action_name(a: u8) -> []const u8 {
+    if (a == 1) { return "app_start"; }
+    if (a == 2) { return "app_stop"; }
+    if (a == 3) { return "ui_open"; }
+    if (a == 4) { return "ui_close"; }
+    if (a == 5) { return "agent_step"; }
+    if (a == 6) { return "agent_error"; }
+    if (a == 7) { return "log"; }
+    if (a == 8) { return "metric"; }
+    if (a == 9) { return "span_start"; }
+    if (a == 10) { return "span_end"; }
+    if (a == 11) { return "error"; }
+    if (a == 12) { return "crash"; }
+    if (a == 13) { return "test_result"; }
+    if (a == 14) { return "commit_ref"; }
+    if (a == 15) { return "pr_ref"; }
+    if (a == 16) { return "evidence_bound"; }
+    if (a == 17) { return "page_loaded"; }
+    if (a == 18) { return "console_error"; }
+    if (a == 19) { return "uncaught_exception"; }
+    if (a == 20) { return "network_error"; }
+    if (a == 21) { return "cdp_command"; }
+    if (a == 22) { return "screenshot_captured"; }
+    if (a == 23) { return "user_click"; }
+    if (a == 24) { return "navigate"; }
+    if (a == 25) { return "llm_call"; }
+    if (a == 26) { return "route_decision"; }
+    if (a == 27) { return "resource_guard_triggered"; }
+    if (a == 28) { return "evidence_approved"; }
+    if (a == 29) { return "agent_created"; }
+    if (a == 30) { return "identity_rejected"; }
+    if (a == 31) { return "agent_status"; }
+    if (a == 32) { return "task_claimed"; }
+    if (a == 33) { return "task_heartbeat"; }
+    if (a == 34) { return "task_released"; }
+    if (a == 35) { return "lock_conflict"; }
+    if (a == 36) { return "outcome_recorded"; }
+    if (a == 37) { return "reputation_updated"; }
+    if (a == 38) { return "resource_snapshot"; }
+    if (a == 39) { return "resource_diagnosis"; }
+    if (a == 40) { return "recovery_suggested"; }
+    if (a == 41) { return "recovery_approved"; }
+    if (a == 42) { return "recovery_executed"; }
+    if (a == 43) { return "recovery_verified"; }
+    if (a == 44) { return "pattern_recorded"; }
+    if (a == 45) { return "doctor_escalated"; }
+    if (a == 46) { return "gate_override"; }
+    if (a == 47) { return "secret_created"; }
+    if (a == 48) { return "secret_updated"; }
+    if (a == 49) { return "secret_rotated"; }
+    if (a == 50) { return "secret_revoked"; }
+    if (a == 51) { return "access_requested"; }
+    if (a == 52) { return "access_approved"; }
+    if (a == 53) { return "access_denied"; }
+    if (a == 54) { return "access_used"; }
+    if (a == 55) { return "access_expired"; }
+    if (a == 56) { return "secret_revealed_to_owner"; }
+    if (a == 57) { return "incident_opened"; }
+    if (a == 58) { return "topic_created"; }
+    if (a == 59) { return "source_captured"; }
+    if (a == 60) { return "source_refused"; }
+    if (a == 61) { return "note_extracted"; }
+    if (a == 62) { return "note_revised"; }
+    if (a == 63) { return "synthesis_created"; }
+    if (a == 64) { return "synthesis_revised"; }
+    if (a == 65) { return "decision_recorded"; }
+    if (a == 66) { return "decision_revisited"; }
+    if (a == 67) { return "evidence_refused"; }
+    if (a == 68) { return "actor_created"; }
+    if (a == 69) { return "message_sent"; }
+    if (a == 70) { return "message_acked"; }
+    if (a == 71) { return "message_redelivered"; }
+    if (a == 72) { return "message_deadlettered"; }
+    if (a == 73) { return "lease_acquired"; }
+    if (a == 74) { return "lease_renewed"; }
+    if (a == 75) { return "lease_released"; }
+    if (a == 76) { return "lease_expired"; }
+    if (a == 77) { return "memory_written"; }
+    if (a == 78) { return "memory_consolidated"; }
+    if (a == 79) { return "cron_cycle_started"; }
+    if (a == 80) { return "cron_cycle_completed"; }
+    if (a == 81) { return "heal_attempted"; }
+    if (a == 82) { return "heal_succeeded"; }
+    if (a == 83) { return "heal_failed"; }
+    if (a == 84) { return "escalation_raised"; }
+    if (a == 85) { return "clock_read"; }
+    if (a == 86) { return "timezone_changed"; }
+    if (a == 87) { return "schedule_created"; }
+    if (a == 88) { return "schedule_fired"; }
+    if (a == 89) { return "schedule_skipped"; }
+    if (a == 90) { return "schedule_paused"; }
+    if (a == 91) { return "schedule_resumed"; }
+    if (a == 92) { return "recurrence_created"; }
+    if (a == 93) { return "recurrence_expanded"; }
+    if (a == 94) { return "timeline_event_added"; }
+    if (a == 95) { return "duration_estimated"; }
+    if (a == 96) { return "duration_recorded"; }
+    if (a == 97) { return "duration_calibrated"; }
+    if (a == 98) { return "decay_configured"; }
+    if (a == 99) { return "decay_applied"; }
+    if (a == 100) { return "keystroke"; }
+    if (a == 101) { return "key_press"; }
+    if (a == 102) { return "clipboard_read"; }
+    if (a == 103) { return "clipboard_write"; }
+    if (a == 104) { return "screen_raw"; }
+    if (a == 105) { return "golden_interval_computed"; }
+    if (a == 106) { return "golden_schedule_created"; }
+    if (a == 107) { return "critical_bypass"; }
+    if (a == 108) { return "billing_status_checked"; }
+    if (a == 109) { return "runner_registered"; }
+    if (a == 110) { return "runner_started"; }
+    if (a == 111) { return "runner_stopped"; }
+    if (a == 112) { return "runner_offline"; }
+    if (a == 113) { return "workflow_dispatched"; }
+    if (a == 114) { return "workflow_completed"; }
+    if (a == 115) { return "workflow_failed"; }
+    if (a == 116) { return "cache_hit"; }
+    if (a == 117) { return "cache_miss"; }
+    if (a == 118) { return "cache_invalidated"; }
+    if (a == 119) { return "act_run_started"; }
+    if (a == 120) { return "act_run_completed"; }
+    if (a == 121) { return "secret_access_denied"; }
+    if (a == 122) { return "untrusted_pr_blocked"; }
+    if (a == 123) { return "migration_dry_run"; }
+    if (a == 124) { return "migration_checkpoint"; }
+    if (a == 125) { return "migration_applied"; }
+    if (a == 126) { return "migration_rolled_back"; }
+    if (a == 127) { return "effect_denied"; }
+    if (a == 128) { return "contract_promoted"; }
+    // bounded recovery (owner order 2026-11-08). The order's resource_snapshot_recorded, owner_action_suggested,
+    // owner_action_confirmed and deadletter_created are 38, 40, 41 and 72 already; recovery_verified is 43.
+    if (a == 129) { return "swap_gate_state_changed"; }
+    if (a == 130) { return "mailbox_backpressure_triggered"; }
+    if (a == 131) { return "source_provenance_recorded"; }
+    if (a == 132) { return "test_run_started"; }
+    if (a == 133) { return "test_run_completed"; }
+    if (a == 134) { return "commit_prepared"; }
+    if (a == 135) { return "commit_approved"; }
+    if (a == 136) { return "push_approved"; }
+    // the Lukomorye graph terminal (owner order V7, 2026-11-08): twenty events, one scene, no view switching
+    if (a == 137) { return "terminal_opened"; }
+    if (a == 138) { return "tree_node_clicked"; }
+    if (a == 139) { return "tree_node_hovered"; }
+    if (a == 140) { return "camera_moved"; }
+    if (a == 141) { return "tree_growth_started"; }
+    if (a == 142) { return "tree_growth_paused"; }
+    if (a == 143) { return "tree_neighborhood_expanded"; }
+    if (a == 144) { return "tree_structure_shown"; }
+    if (a == 145) { return "section_changed"; }
+    if (a == 146) { return "color_toggled"; }
+    if (a == 147) { return "labels_toggled"; }
+    if (a == 148) { return "live_feed_connected"; }
+    if (a == 149) { return "live_feed_missing"; }
+    if (a == 150) { return "replay_started"; }
+    if (a == 151) { return "replay_completed"; }
+    if (a == 152) { return "graph_backpressure_triggered"; }
+    if (a == 153) { return "graph_event_rejected"; }
+    if (a == 154) { return "bridge_event_unverified"; }
+    if (a == 155) { return "artifact_verified"; }
+    if (a == 156) { return "leaf_created"; }
+    // the roadmap dashboard sync and issue hygiene (owner order T27V_ROADMAP_DASHBOARD_SYNC V3, 2026-11-08)
+    if (a == 157) { return "roadmap_membership_changed"; }
+    if (a == 158) { return "priority_changed"; }
+    if (a == 159) { return "board_column_changed"; }
+    if (a == 160) { return "label_added"; }
+    if (a == 161) { return "label_removed"; }
+    if (a == 162) { return "label_sync_failed"; }
+    if (a == 163) { return "roadmap_synced"; }
+    if (a == 164) { return "sync_overflow"; }
+    if (a == 165) { return "owner_approval_required"; }
+    if (a == 166) { return "dashboard_view_changed"; }
+    if (a == 167) { return "issue_duplicate_detected"; }
+    if (a == 168) { return "issue_stale_detected"; }
+    if (a == 169) { return "issue_resolved_elsewhere_detected"; }
+    if (a == 170) { return "issue_close_recommended"; }
+    if (a == 171) { return "issue_closed_with_evidence"; }
+    if (a == 172) { return "issue_archive_recommended"; }
+    if (a == 173) { return "hygiene_cron_run"; }
+    if (a == 174) { return "hygiene_overflow"; }
+    return "";
+}
+
+pub fn tl_actor_id(name: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= 3) {
+        if (bytes_eq(tl_actor_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+pub fn tl_surface_id(name: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= TL_SURFACE_LAST) {
+        if (bytes_eq(tl_surface_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+pub fn tl_level_id(name: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= 5) {
+        if (bytes_eq(tl_level_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+pub fn tl_action_id(name: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= TL_ACTION_LAST) {
+        if (bytes_eq(tl_action_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    k = 100;
+    while (k <= 104) {
+        if (bytes_eq(tl_action_name(k), name)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// Error capture: crash only at fatal; error-class actions at error or fatal; network_error, a tripped resource
+/// guard, a rejected identity, a lock conflict, a doctor escalation, a gate override and a denied secret access at warn
+/// or above (a refusal is never filed as debug or info); an opened security incident at error or above.
+fn tl_level_ok(action: u8, level: u8) -> bool {
+    if (action == 12) { return level == 5; }
+    if (action == 11 or action == 6 or action == 19 or action == 18 or action == 57) { return level >= 4; }
+    if (action == 20 or action == 27 or action == 30 or action == 35) { return level >= 3; }
+    if (action == 45 or action == 46 or action == 53) { return level >= 3; }
+    // a refused source or claim and a decision whose rollback condition fired are never filed below warn
+    if (action == 60 or action == 66 or action == 67) { return level >= 3; }
+    // a dead-lettered message, a failed heal, a raised escalation and a skipped (overlapping) schedule at warn or above
+    if (action == 72 or action == 83 or action == 84 or action == 89) { return level >= 3; }
+    // a critical bypass of the golden rhythm escalates to the owner: error or above
+    if (action == 107) { return level >= 4; }
+    // an offline runner, a failed workflow, a denied secret and a blocked untrusted PR at warn or above
+    if (action == 112 or action == 115 or action == 121 or action == 122) { return level >= 3; }
+    // a rolled-back migration and a denied (undeclared) effect at warn or above
+    if (action == 126 or action == 127) { return level >= 3; }
+    // mailbox backpressure is a WARNING (owner order): warn or above
+    if (action == 130) { return level >= 3; }
+    // a missing live feed, graph backpressure, a rejected graph event and an unverified bridge event at warn or above
+    if (action == 149 or action == 152 or action == 153 or action == 154) { return level >= 3; }
+    // a failed label sync, a sync overflow and a hygiene overflow at warn or above
+    if (action == 162 or action == 164 or action == 174) { return level >= 3; }
+    return true;
+}
+
+// ---- small byte helpers (all private ones carry the tl_ prefix) ----
+
+fn tl_dig(c: u8) -> bool {
+    return c >= 48 and c <= 57;
+}
+
+fn tl_lower_hex(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 97 and c <= 102);
+}
+
+/// 0..15 for a hex digit of either case (a JSON \u escape may be written upper case), 255 otherwise; the lower case
+/// and the digits are keysync's decoder.
+pub fn tl_hexval(c: u8) -> u32 {
+    if (c >= 65 and c <= 70) { return @as(u32, c) - 55; }
+    return @as(u32, hex_val(c));
+}
+
+fn tl_hexd(v: u8) -> u8 {
+    if (v < 10) { return 48 + v; }
+    return 87 + v;
+}
+
+/// Write v as 16 lower-case hex digits at out[at..at + 16]; the caller sizes out. Returns at + 16.
+pub fn tl_put_hex16(out: []u8, at: usize, v: u64) -> usize {
+    var x : u64 = v;
+    var i : usize = 16;
+    while (i > 0) {
+        out[at + i - 1] = tl_hexd(@intCast(x % 16));
+        x = x / 16;
+        i = i - 1;
+    }
+    return at + 16;
+}
+
+/// n lower-case hex digits starting at `from`.
+fn tl_hex_run(s: []const u8, from: usize, n: usize) -> bool {
+    if (from + n > s.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (!tl_lower_hex(s[from + i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tl_all_zero(s: []const u8) -> bool {
+    var i : usize = 0;
+    while (i < s.len) {
+        if (s[i] != 48) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Exactly n lower-case hex digits, not all zero (trace_id 32, span_id 16).
+fn tl_hex_id(s: []const u8, n: usize) -> bool {
+    return s.len == n and tl_hex_run(s, 0, n) and !tl_all_zero(s);
+}
+
+fn tl_fold(c: u8, ci: bool) -> u8 {
+    if (ci and c >= 65 and c <= 90) { return c + 32; }
+    return c;
+}
+
+/// `needle` occurs in `hay`; with ci the haystack is lower-cased first (needle must be lower case).
+fn tl_has(hay: []const u8, needle: []const u8, ci: bool) -> bool {
+    if (needle.len == 0 or hay.len < needle.len) { return false; }
+    var s : usize = 0;
+    while (s + needle.len <= hay.len) {
+        var k : usize = 0;
+        while (k < needle.len and tl_fold(hay[s + k], ci) == needle[k]) { k = k + 1; }
+        if (k == needle.len) { return true; }
+        s = s + 1;
+    }
+    return false;
+}
+
+/// Words that mark a secret-bearing payload or argument: refused, never redacted.
+fn tl_forbidden(s: []const u8) -> bool {
+    return tl_has(s, "password", true) or tl_has(s, "passwd", true) or tl_has(s, "cookie", true)
+        or tl_has(s, "authorization:", true) or tl_has(s, "bearer ", true)
+        or tl_has(s, "-----begin", true) or tl_has(s, "private key", true);
+}
+
+fn tl_num(s: []const u8, at: usize, n: usize) -> u32 {
+    var v : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        v = v * 10 + (@as(u32, s[at + i]) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn tl_leap(y: u32) -> bool {
+    return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0;
+}
+
+fn tl_dim(y: u32, m: u32) -> u32 {
+    if (m == 2) {
+        if (tl_leap(y)) { return 29; }
+        return 28;
+    }
+    if (m == 4 or m == 6 or m == 9 or m == 11) { return 30; }
+    return 31;
+}
+
+// ---- field validators ----
+
+/// 36 chars, lower-case hex, dashes at 8, 13, 18, 23.
+fn tl_uuid_ok(s: []const u8) -> bool {
+    if (s.len != 36) { return false; }
+    var i : usize = 0;
+    while (i < 36) {
+        const c : u8 = s[i];
+        if (i == 8 or i == 13 or i == 18 or i == 23) {
+            if (c != 45) { return false; }
+        } else if (!tl_lower_hex(c)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// YYYY-MM-DDTHH:MM:SS, optional .d{1,3}, then Z. Real days per month, leap years, hour < 24, minute and second < 60.
+fn tl_ts_ok(s: []const u8) -> bool {
+    const n : usize = s.len;
+    if (n != 20 and !(n >= 22 and n <= 24)) { return false; }
+    if (s[n - 1] != 90) { return false; }
+    var i : usize = 0;
+    while (i < 19) {
+        const c : u8 = s[i];
+        if (i == 4 or i == 7) {
+            if (c != 45) { return false; }
+        } else if (i == 10) {
+            if (c != 84) { return false; }
+        } else if (i == 13 or i == 16) {
+            if (c != 58) { return false; }
+        } else if (!tl_dig(c)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    if (n > 20) {
+        if (s[19] != 46) { return false; }
+        var j : usize = 20;
+        while (j < n - 1) {
+            if (!tl_dig(s[j])) { return false; }
+            j = j + 1;
+        }
+    }
+    const y : u32 = tl_num(s, 0, 4);
+    const mo : u32 = tl_num(s, 5, 2);
+    const d : u32 = tl_num(s, 8, 2);
+    if (mo < 1 or mo > 12) { return false; }
+    if (d < 1 or d > tl_dim(y, mo)) { return false; }
+    return tl_num(s, 11, 2) < 24 and tl_num(s, 14, 2) < 60 and tl_num(s, 17, 2) < 60;
+}
+
+/// device_id and session_id: 1..64 of [a-z0-9_-].
+fn tl_id_ok(s: []const u8) -> bool {
+    if (s.len < 1 or s.len > 64) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (!((c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95 or c == 45)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// evidence as a comma list (no quotes): "ev-" plus 16 lower-case hex, at most 8; empty is fine.
+fn tl_evidence_ok(csv: []const u8) -> bool {
+    if (csv.len == 0) { return true; }
+    var p : usize = 0;
+    var n : usize = 0;
+    while (p < csv.len) {
+        if (p + 19 > csv.len) { return false; }
+        if (csv[p] != 101 or csv[p + 1] != 118 or csv[p + 2] != 45) { return false; }
+        if (!tl_hex_run(csv, p + 3, 16)) { return false; }
+        n = n + 1;
+        if (n > 8) { return false; }
+        p = p + 19;
+        if (p < csv.len) {
+            if (csv[p] != 44) { return false; }
+            p = p + 1;
+            if (p >= csv.len) { return false; }
+        }
+    }
+    return true;
+}
+
+/// An envelope value (id, ts) that the redactor would change is a secret in the wrong place: refused, not redacted.
+fn tl_secret_hit(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > 200) { return false; }
+    var out : [512]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const n : usize = redact(s, out[0..512], cn[0..5]);
+    if (n == 0) { return true; }
+    return redacted_total(cn[0..5]) > 0;
+}
+
+// ---- payload: query cut, then redaction ----
+
+/// Cut URL query strings: after "://", a "?" up to the next space, quote or end becomes "?[q]". cn[5] counts the cuts.
+fn tl_qcut(src: []const u8, out: []u8, cn: []u32) -> usize {
+    var o : usize = 0;
+    var i : usize = 0;
+    var in_url : bool = false;
+    cn[5] = 0;
+    while (i < src.len and o + 4 < out.len) {
+        const c : u8 = src[i];
+        if (c == 58 and i + 2 < src.len and src[i + 1] == 47 and src[i + 2] == 47) {
+            o = put_bytes(out, o, "://");
+            i = i + 3;
+            in_url = true;
+        } else if (in_url and c == 63) {
+            o = put_bytes(out, o, "?[q]");
+            cn[5] = cn[5] + 1;
+            i = i + 1;
+            while (i < src.len and src[i] != 32 and src[i] != 34 and src[i] != 39 and src[i] != 10 and src[i] != 9) {
+                i = i + 1;
+            }
+            in_url = false;
+        } else {
+            if (in_url and (c == 32 or c == 34 or c == 39 or c == 10 or c == 9)) { in_url = false; }
+            out[o] = c;
+            o = o + 1;
+            i = i + 1;
+        }
+    }
+    return o;
+}
+
+/// Query cut, then redact. cn holds 6 counters: 0..4 as redact (key, env, home, email, over), 5 = query cuts.
+/// out must be 4096 bytes. Returns the clean length (0 for an empty payload).
+fn tl_prep(raw: []const u8, out: []u8, cn: []u32) -> usize {
+    var k : usize = 0;
+    while (k < 6) { cn[k] = 0; k = k + 1; }
+    if (raw.len == 0) { return 0; }
+    var tmp : [4096]u8 = undefined;
+    const q : usize = tl_qcut(raw, tmp[0..4096], cn);
+    if (q == 0) { return 0; }
+    const n : usize = redact(tmp[0..q], out, cn[0..5]);
+    if (n == 0) { cn[4] = 1; }
+    return n;
+}
+
+// ---- JSON escape and unescape ----
+
+fn tl_put_escaped(out: []u8, at: usize, s: []const u8) -> usize {
+    var o : usize = at;
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (c == 34 or c == 92) {
+            out[o] = 92;
+            out[o + 1] = c;
+            o = o + 2;
+        } else if (c == 10) {
+            out[o] = 92;
+            out[o + 1] = 110;
+            o = o + 2;
+        } else if (c == 9) {
+            out[o] = 92;
+            out[o + 1] = 116;
+            o = o + 2;
+        } else if (c < 32) {
+            o = put_bytes(out, o, "\\u00");
+            out[o] = tl_hexd(c / 16);
+            out[o + 1] = tl_hexd(c % 16);
+            o = o + 2;
+        } else if (c >= 127) {
+            out[o] = 63;
+            o = o + 1;
+        } else {
+            out[o] = c;
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+fn tl_escaped_len(s: []const u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (c == 34 or c == 92 or c == 10 or c == 9) {
+            n = n + 2;
+        } else if (c < 32) {
+            n = n + 6;
+        } else {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Undo JSON escapes. Returns the length; 65535 when out is too small.
+fn tl_unescape(src: []const u8, out: []u8) -> usize {
+    var i : usize = 0;
+    var o : usize = 0;
+    while (i < src.len) {
+        if (o >= out.len) { return 65535; }
+        const c : u8 = src[i];
+        if (c == 92 and i + 1 < src.len) {
+            const d : u8 = src[i + 1];
+            if (d == 110) {
+                out[o] = 10;
+                i = i + 2;
+            } else if (d == 116) {
+                out[o] = 9;
+                i = i + 2;
+            } else if (d == 114) {
+                out[o] = 13;
+                i = i + 2;
+            } else if (d == 98) {
+                out[o] = 8;
+                i = i + 2;
+            } else if (d == 102) {
+                out[o] = 12;
+                i = i + 2;
+            } else if (d == 117) {
+                out[o] = 63;
+                if (i + 6 <= src.len) {
+                    const v : u32 = tl_hexval(src[i + 2]) * 4096 + tl_hexval(src[i + 3]) * 256 + tl_hexval(src[i + 4]) * 16 + tl_hexval(src[i + 5]);
+                    if (v < 128) { out[o] = @intCast(v); }
+                }
+                i = i + 6;
+            } else {
+                out[o] = d;
+                i = i + 2;
+            }
+        } else {
+            out[o] = c;
+            i = i + 1;
+        }
+        o = o + 1;
+    }
+    return o;
+}
+
+/// Evidence array body ("ev-..","ev-..") to a plain comma list. Anything that is not a quoted item yields "?".
+fn tl_ev_unquote(inner: []const u8, out: []u8) -> usize {
+    if (inner.len > 300) {
+        out[0] = 63;
+        return 1;
+    }
+    var i : usize = 0;
+    var o : usize = 0;
+    while (i < inner.len) {
+        while (i < inner.len and inner[i] == 32) { i = i + 1; }
+        if (i >= inner.len or inner[i] != 34) {
+            out[o] = 63;
+            return o + 1;
+        }
+        i = i + 1;
+        while (i < inner.len and inner[i] != 34) {
+            out[o] = inner[i];
+            o = o + 1;
+            i = i + 1;
+        }
+        if (i >= inner.len) {
+            out[o] = 63;
+            return o + 1;
+        }
+        i = i + 1;
+        while (i < inner.len and inner[i] == 32) { i = i + 1; }
+        if (i < inner.len) {
+            if (inner[i] != 44) {
+                out[o] = 63;
+                return o + 1;
+            }
+            i = i + 1;
+            out[o] = 44;
+            o = o + 1;
+            if (i >= inner.len) {
+                out[o] = 63;
+                return o + 1;
+            }
+        }
+    }
+    return o;
+}
+
+/// A checked comma list to the quoted JSON array body.
+fn tl_ev_json(csv: []const u8, out: []u8) -> usize {
+    if (csv.len == 0) { return 0; }
+    var o : usize = 0;
+    out[o] = 34;
+    o = o + 1;
+    var i : usize = 0;
+    while (i < csv.len) {
+        if (csv[i] == 44) {
+            out[o] = 34;
+            out[o + 1] = 44;
+            out[o + 2] = 34;
+            o = o + 3;
+        } else {
+            out[o] = csv[i];
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    out[o] = 34;
+    return o + 1;
+}
+
+// ---- the checks ----
+
+/// Every rule on already-split fields. trace_id, span_id and parent_span_id are empty when null. payload is raw (unescaped)
+/// text; evidence is a plain comma list. Returns TL_OK or the first failing code.
+pub fn tl_check(schema: []const u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                actor: u8, surface: u8, action: u8, level: u8, trace_id: []const u8, span_id: []const u8,
+                parent_span_id: []const u8, payload: []const u8, evidence: []const u8) -> u8 {
+    if (!bytes_eq(schema, "t27l/v1")) { return E_SCHEMA; }
+    if (tl_secret_hit(event_id) or tl_secret_hit(ts) or tl_secret_hit(device_id) or tl_secret_hit(session_id)) { return E_SECRET; }
+    if (!tl_uuid_ok(event_id)) { return E_EVENT_ID; }
+    if (!tl_ts_ok(ts)) { return E_TS; }
+    if (!tl_id_ok(device_id) or !tl_id_ok(session_id)) { return E_MALFORMED; }
+    if (actor < 1 or actor > 3) { return E_ACTOR; }
+    if (surface < 1 or surface > TL_SURFACE_LAST) { return E_SURFACE; }
+    if (action >= 100 and action <= 104) { return E_FORBIDDEN_ACTION; }
+    if (action < 1 or action > TL_ACTION_LAST) { return E_ACTION; }
+    if (level < 1 or level > 5) { return E_LEVEL; }
+    if (!tl_level_ok(action, level)) { return E_LEVEL_MISMATCH; }
+    if (trace_id.len > 0 and !tl_hex_id(trace_id, 32)) { return E_TRACE; }
+    if (span_id.len > 0) {
+        if (trace_id.len == 0 or !tl_hex_id(span_id, 16)) { return E_SPAN; }
+    }
+    if (parent_span_id.len > 0) {
+        if (span_id.len == 0 or !tl_hex_id(parent_span_id, 16) or bytes_eq(parent_span_id, span_id)) { return E_PARENT; }
+    }
+    if (!tl_evidence_ok(evidence)) { return E_EVIDENCE; }
+    if (payload.len > TL_RAW_MAX) { return E_TOO_LONG; }
+    if (tl_forbidden(payload)) { return E_SECRET; }
+    var buf : [4096]u8 = undefined;
+    var cn : [6]u32 = undefined;
+    const n : usize = tl_prep(payload, buf[0..4096], cn[0..6]);
+    if (cn[4] != 0 or n > TL_PAYLOAD_MAX) { return E_TOO_LONG; }
+    return TL_OK;
+}
+
+// ---- writing the canonical line ----
+
+fn tl_put_opt(out: []u8, at: usize, s: []const u8) -> usize {
+    if (s.len == 0) { return put_bytes(out, at, "null"); }
+    var o : usize = put_bytes(out, at, "\"");
+    o = put_bytes(out, o, s);
+    return put_bytes(out, o, "\"");
+}
+
+/// The one joiner of the canonical key order. payload_json and ev_json are already escaped/quoted. 0 when out is too small.
+fn tl_join(out: []u8, schema: []const u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+           actor: []const u8, surface: []const u8, action: []const u8, level: []const u8, trace_id: []const u8,
+           span_id: []const u8, parent_span_id: []const u8, red: bool, payload_json: []const u8, ev_json: []const u8) -> usize {
+    if (out.len < 520 + payload_json.len + ev_json.len) { return 0; }
+    var o : usize = put_bytes(out, 0, "{\"schema\":\"");
+    o = put_bytes(out, o, schema);
+    o = put_bytes(out, o, "\",\"event_id\":\"");
+    o = put_bytes(out, o, event_id);
+    o = put_bytes(out, o, "\",\"ts\":\"");
+    o = put_bytes(out, o, ts);
+    o = put_bytes(out, o, "\",\"device_id\":\"");
+    o = put_bytes(out, o, device_id);
+    o = put_bytes(out, o, "\",\"session_id\":\"");
+    o = put_bytes(out, o, session_id);
+    o = put_bytes(out, o, "\",\"actor\":\"");
+    o = put_bytes(out, o, actor);
+    o = put_bytes(out, o, "\",\"surface\":\"");
+    o = put_bytes(out, o, surface);
+    o = put_bytes(out, o, "\",\"action\":\"");
+    o = put_bytes(out, o, action);
+    o = put_bytes(out, o, "\",\"level\":\"");
+    o = put_bytes(out, o, level);
+    o = put_bytes(out, o, "\",\"trace_id\":");
+    o = tl_put_opt(out, o, trace_id);
+    o = put_bytes(out, o, ",\"span_id\":");
+    o = tl_put_opt(out, o, span_id);
+    o = put_bytes(out, o, ",\"parent_span_id\":");
+    o = tl_put_opt(out, o, parent_span_id);
+    if (red) {
+        o = put_bytes(out, o, ",\"redacted\":true,\"payload\":\"");
+    } else {
+        o = put_bytes(out, o, ",\"redacted\":false,\"payload\":\"");
+    }
+    o = put_bytes(out, o, payload_json);
+    o = put_bytes(out, o, "\",\"evidence\":[");
+    o = put_bytes(out, o, ev_json);
+    return put_bytes(out, o, "]}");
+}
+
+/// Check, redact, write. src_red: the source already said redacted:true.
+fn tl_build(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+            actor: u8, surface: u8, action: u8, level: u8, trace_id: []const u8, span_id: []const u8,
+            parent_span_id: []const u8, payload: []const u8, src_red: bool, evidence: []const u8) -> usize {
+    const rc : u8 = tl_check("t27l/v1", event_id, ts, device_id, session_id, actor, surface, action, level,
+                             trace_id, span_id, parent_span_id, payload, evidence);
+    if (rc != TL_OK) { return 0; }
+    var buf : [4096]u8 = undefined;
+    var cn : [6]u32 = undefined;
+    const n : usize = tl_prep(payload, buf[0..4096], cn[0..6]);
+    const red : bool = src_red or redacted_total(cn[0..5]) > 0 or cn[5] > 0;
+    var pj : [6200]u8 = undefined;
+    const pn : usize = tl_put_escaped(pj[0..6200], 0, buf[0..n]);
+    var ej : [512]u8 = undefined;
+    const en : usize = tl_ev_json(evidence, ej[0..512]);
+    return tl_join(out, "t27l/v1", event_id, ts, device_id, session_id, tl_actor_name(actor), tl_surface_name(surface),
+                   tl_action_name(action), tl_level_name(level), trace_id, span_id, parent_span_id, red, pj[0..pn], ej[0..en]);
+}
+
+/// Build one canonical line from typed fields; 0 when any rule fails. The payload is redacted first (query cut, keys,
+/// env values, home paths, emails). evidence_csv is "ev-<16 hex>,ev-<16 hex>" or empty. Null ids are empty slices.
+pub fn tl_event_line(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                     actor: u8, surface: u8, action: u8, level: u8, trace_id: []const u8, span_id: []const u8,
+                     parent_span_id: []const u8, payload: []const u8, evidence_csv: []const u8) -> usize {
+    return tl_build(out, event_id, ts, device_id, session_id, actor, surface, action, level, trace_id, span_id,
+                    parent_span_id, payload, false, evidence_csv);
+}
+
+// ---- parsing a line ----
+
+fn tl_skip(line: []const u8, p: usize) -> usize {
+    var q : usize = p;
+    while (q < line.len and (line[q] == 32 or line[q] == 9 or line[q] == 10 or line[q] == 13)) { q = q + 1; }
+    return q;
+}
+
+/// p is just after an opening quote; the index of the closing quote, or line.len when there is none.
+fn tl_str_end(line: []const u8, p: usize) -> usize {
+    var q : usize = p;
+    while (q < line.len) {
+        const c : u8 = line[q];
+        if (c == 92) {
+            q = q + 2;
+        } else if (c == 34) {
+            return q;
+        } else {
+            q = q + 1;
+        }
+    }
+    return line.len;
+}
+
+fn tl_lit_at(line: []const u8, p: usize, lit: []const u8) -> bool {
+    if (p + lit.len > line.len) { return false; }
+    var i : usize = 0;
+    while (i < lit.len) {
+        if (line[p + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Field index of a key: 0 schema, 1 event_id, 2 ts, 3 device_id, 4 session_id, 5 actor, 6 surface, 7 action, 8 level,
+/// 9 trace_id, 10 span_id, 11 parent_span_id, 12 redacted, 13 payload, 14 evidence; 99 for an unknown key.
+fn tl_key_idx(k: []const u8) -> usize {
+    if (bytes_eq(k, "schema")) { return 0; }
+    if (bytes_eq(k, "event_id")) { return 1; }
+    if (bytes_eq(k, "ts")) { return 2; }
+    if (bytes_eq(k, "device_id")) { return 3; }
+    if (bytes_eq(k, "session_id")) { return 4; }
+    if (bytes_eq(k, "actor")) { return 5; }
+    if (bytes_eq(k, "surface")) { return 6; }
+    if (bytes_eq(k, "action")) { return 7; }
+    if (bytes_eq(k, "level")) { return 8; }
+    if (bytes_eq(k, "trace_id")) { return 9; }
+    if (bytes_eq(k, "span_id")) { return 10; }
+    if (bytes_eq(k, "parent_span_id")) { return 11; }
+    if (bytes_eq(k, "redacted")) { return 12; }
+    if (bytes_eq(k, "payload")) { return 13; }
+    if (bytes_eq(k, "evidence")) { return 14; }
+    return 99;
+}
+
+/// Value kinds: 1 string, 2 null, 3 true, 4 false, 5 array. Each field accepts only its own.
+fn tl_kind_ok(f: usize, kind: u32) -> bool {
+    if (f == 12) { return kind == 3 or kind == 4; }
+    if (f == 14) { return kind == 5; }
+    if (f >= 9 and f <= 11) { return kind == 1 or kind == 2; }
+    return kind == 1;
+}
+
+/// Parse a flat t27l line: spans[3f] = start, spans[3f+1] = end (string and array bodies, quotes excluded), spans[3f+2] = kind
+/// (0 absent). spans must hold TL_SPANS. TL_OK, or E_MALFORMED for anything that is not one object of known keys.
+pub fn tl_parse(line: []const u8, spans: []u32) -> u8 {
+    if (spans.len < 45) { return E_MALFORMED; }
+    var z : usize = 0;
+    while (z < 45) { spans[z] = 0; z = z + 1; }
+    var p : usize = tl_skip(line, 0);
+    if (p >= line.len or line[p] != 123) { return E_MALFORMED; }
+    p = tl_skip(line, p + 1);
+    if (p < line.len and line[p] == 125) {
+        if (tl_skip(line, p + 1) != line.len) { return E_MALFORMED; }
+        return TL_OK;
+    }
+    var rc : u8 = TL_OK;
+    var done : bool = false;
+    while (!done) {
+        if (p >= line.len or line[p] != 34) {
+            rc = E_MALFORMED;
+            done = true;
+        } else {
+            const ke : usize = tl_str_end(line, p + 1);
+            if (ke >= line.len) {
+                rc = E_MALFORMED;
+                done = true;
+            } else {
+                const f : usize = tl_key_idx(line[(p + 1)..ke]);
+                var q : usize = tl_skip(line, ke + 1);
+                if (f > 14 or q >= line.len or line[q] != 58) {
+                    rc = E_MALFORMED;
+                    done = true;
+                } else if (spans[f * 3 + 2] != 0) {
+                    rc = E_MALFORMED;
+                    done = true;
+                } else {
+                    q = tl_skip(line, q + 1);
+                    var kind : u32 = 0;
+                    var vs : usize = 0;
+                    var ve : usize = 0;
+                    var np : usize = q;
+                    if (q < line.len) {
+                        const c : u8 = line[q];
+                        if (c == 34) {
+                            const se : usize = tl_str_end(line, q + 1);
+                            if (se < line.len) {
+                                kind = 1;
+                                vs = q + 1;
+                                ve = se;
+                                np = se + 1;
+                            }
+                        } else if (c == 91) {
+                            var ae : usize = q + 1;
+                            while (ae < line.len and line[ae] != 93) { ae = ae + 1; }
+                            if (ae < line.len) {
+                                kind = 5;
+                                vs = q + 1;
+                                ve = ae;
+                                np = ae + 1;
+                            }
+                        } else if (tl_lit_at(line, q, "null")) {
+                            kind = 2;
+                            np = q + 4;
+                        } else if (tl_lit_at(line, q, "true")) {
+                            kind = 3;
+                            np = q + 4;
+                        } else if (tl_lit_at(line, q, "false")) {
+                            kind = 4;
+                            np = q + 5;
+                        }
+                    }
+                    if (kind == 0 or !tl_kind_ok(f, kind)) {
+                        rc = E_MALFORMED;
+                        done = true;
+                    } else {
+                        spans[f * 3] = @intCast(vs);
+                        spans[f * 3 + 1] = @intCast(ve);
+                        spans[f * 3 + 2] = kind;
+                        p = tl_skip(line, np);
+                        if (p >= line.len) {
+                            rc = E_MALFORMED;
+                            done = true;
+                        } else if (line[p] == 44) {
+                            p = tl_skip(line, p + 1);
+                        } else if (line[p] == 125) {
+                            if (tl_skip(line, p + 1) != line.len) { rc = E_MALFORMED; }
+                            done = true;
+                        } else {
+                            rc = E_MALFORMED;
+                            done = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return rc;
+}
+
+/// The raw body of field f; empty for an absent, null, true or false field.
+fn tl_get(line: []const u8, sp: []const u32, f: usize) -> []const u8 {
+    const kind : u32 = sp[f * 3 + 2];
+    if (kind == 0 or kind == 2 or kind == 3 or kind == 4) { return ""; }
+    const s : usize = @as(usize, sp[f * 3]);
+    const e : usize = @as(usize, sp[f * 3 + 1]);
+    return line[s..e];
+}
+
+/// Like tl_get for the three nullable ids, but an empty string "" yields "?" (never valid) instead of null.
+fn tl_get_opt(line: []const u8, sp: []const u32, f: usize) -> []const u8 {
+    if (sp[f * 3 + 2] == 1 and sp[f * 3] == sp[f * 3 + 1]) { return "?"; }
+    return tl_get(line, sp, f);
+}
+
+/// Parse + check one line. strict (validate): all 15 keys present (the canonical form always writes them), the payload
+/// already in redacted form, nothing is written and 1 is returned. Otherwise (normalize): the first 9 keys are required,
+/// the canonical redacted line is written to out and its length returned. rc[0] = code.
+fn tl_process(line: []const u8, out: []u8, rc: []u8, strict: bool) -> usize {
+    var sp : [45]u32 = undefined;
+    const pr : u8 = tl_parse(line, sp[0..45]);
+    if (pr != TL_OK) {
+        rc[0] = pr;
+        return 0;
+    }
+    var need : usize = 9;
+    if (strict) { need = 15; }
+    var f : usize = 0;
+    while (f < need) {
+        if (sp[f * 3 + 2] == 0) {
+            rc[0] = E_MISSING;
+            return 0;
+        }
+        f = f + 1;
+    }
+    const s45 : []const u32 = sp[0..45];
+    var raw : [2048]u8 = undefined;
+    const rn : usize = tl_unescape(tl_get(line, s45, 13), raw[0..2048]);
+    if (rn > 2048) {
+        rc[0] = E_TOO_LONG;
+        return 0;
+    }
+    var ev : [320]u8 = undefined;
+    const en : usize = tl_ev_unquote(tl_get(line, s45, 14), ev[0..320]);
+    const actor : u8 = tl_actor_id(tl_get(line, s45, 5));
+    const surface : u8 = tl_surface_id(tl_get(line, s45, 6));
+    const action : u8 = tl_action_id(tl_get(line, s45, 7));
+    const level : u8 = tl_level_id(tl_get(line, s45, 8));
+    const ck : u8 = tl_check(tl_get(line, s45, 0), tl_get(line, s45, 1), tl_get(line, s45, 2), tl_get(line, s45, 3),
+                             tl_get(line, s45, 4), actor, surface, action, level, tl_get_opt(line, s45, 9),
+                             tl_get_opt(line, s45, 10), tl_get_opt(line, s45, 11), raw[0..rn], ev[0..en]);
+    if (ck != TL_OK) {
+        rc[0] = ck;
+        return 0;
+    }
+    rc[0] = TL_OK;
+    if (strict) {
+        var buf : [4096]u8 = undefined;
+        var cn : [6]u32 = undefined;
+        const n : usize = tl_prep(raw[0..rn], buf[0..4096], cn[0..6]);
+        if (!bytes_eq(buf[0..n], raw[0..rn])) {
+            rc[0] = E_SECRET;
+            return 0;
+        }
+        return 1;
+    }
+    return tl_build(out, tl_get(line, s45, 1), tl_get(line, s45, 2), tl_get(line, s45, 3), tl_get(line, s45, 4),
+                    actor, surface, action, level, tl_get_opt(line, s45, 9), tl_get_opt(line, s45, 10),
+                    tl_get_opt(line, s45, 11), raw[0..rn], sp[12 * 3 + 2] == 3, ev[0..en]);
+}
+
+/// The full gate: parse, every field rule, and the payload must already be clean (a raw secret is E_SECRET).
+pub fn tl_validate_line(line: []const u8) -> u8 {
+    var d : [1]u8 = undefined;
+    var rc : [1]u8 = undefined;
+    rc[0] = TL_OK;
+    const k : usize = tl_process(line, d[0..1], rc[0..1], true);
+    if (k == 0 and rc[0] == TL_OK) { return E_MALFORMED; }
+    return rc[0];
+}
+
+/// Parse a source line, apply the rules and the redaction, write the canonical line. 0 when the line is refused.
+pub fn tl_normalize(line: []const u8, out: []u8) -> usize {
+    var rc : [1]u8 = undefined;
+    rc[0] = TL_OK;
+    const k : usize = tl_process(line, out, rc[0..1], false);
+    if (rc[0] != TL_OK) { return 0; }
+    return k;
+}
+
+// ---- ingest ----
+
+pub fn tl_hash(line: []const u8) -> u64 {
+    return text_hash(line);
+}
+
+/// seen_ids is the concatenation of 36-byte ids. Unseen id: TL_NEW. Same id and same hash: TL_DUP (ignored, idempotent).
+/// Same id and another hash: E_ID_CONFLICT.
+pub fn tl_ingest(event_id: []const u8, hash: u64, seen_ids: []const u8, seen_hashes: []const u64, n_seen: usize) -> u8 {
+    if (event_id.len != 36 or seen_ids.len < n_seen * 36 or seen_hashes.len < n_seen) { return E_MALFORMED; }
+    var i : usize = 0;
+    while (i < n_seen) {
+        const b : usize = i * 36;
+        if (bytes_eq(seen_ids[b..(b + 36)], event_id)) {
+            if (seen_hashes[i] == hash) { return TL_DUP; }
+            return E_ID_CONFLICT;
+        }
+        i = i + 1;
+    }
+    return TL_NEW;
+}
+
+// ---- trace correlation ----
+
+/// "00-<32 hex>-<16 hex>-01"; 0 when an id is bad or out is too small.
+pub fn tl_traceparent(out: []u8, trace_id: []const u8, span_id: []const u8) -> usize {
+    if (!tl_hex_id(trace_id, 32) or !tl_hex_id(span_id, 16) or out.len < 55) { return 0; }
+    var o : usize = put_bytes(out, 0, "00-");
+    o = put_bytes(out, o, trace_id);
+    o = put_bytes(out, o, "-");
+    o = put_bytes(out, o, span_id);
+    return put_bytes(out, o, "-01");
+}
+
+/// Version 00, 55 bytes, lower-case hex, neither id all zero, two hex flag digits.
+pub fn tl_traceparent_ok(tp: []const u8) -> bool {
+    if (tp.len != 55) { return false; }
+    if (tp[0] != 48 or tp[1] != 48 or tp[2] != 45 or tp[35] != 45 or tp[52] != 45) { return false; }
+    return tl_hex_id(tp[3..35], 32) and tl_hex_id(tp[36..52], 16) and tl_hex_run(tp, 53, 2);
+}
+
+/// Both lines valid, same trace_id, and the child's parent_span_id is the parent's span_id.
+pub fn tl_child_of(child_line: []const u8, parent_line: []const u8) -> bool {
+    if (tl_validate_line(child_line) != TL_OK or tl_validate_line(parent_line) != TL_OK) { return false; }
+    var a : [45]u32 = undefined;
+    var b : [45]u32 = undefined;
+    if (tl_parse(child_line, a[0..45]) != TL_OK or tl_parse(parent_line, b[0..45]) != TL_OK) { return false; }
+    if (a[9 * 3 + 2] != 1 or a[11 * 3 + 2] != 1 or b[9 * 3 + 2] != 1 or b[10 * 3 + 2] != 1) { return false; }
+    const ca : []const u32 = a[0..45];
+    const pb : []const u32 = b[0..45];
+    return bytes_eq(tl_get(child_line, ca, 9), tl_get(parent_line, pb, 9))
+        and bytes_eq(tl_get(child_line, ca, 11), tl_get(parent_line, pb, 10));
+}
+
+// ---- Menu L, filter, export ----
+
+fn tl_put_upper(out: []u8, at: usize, s: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (c >= 97 and c <= 122) {
+            out[at + i] = c - 32;
+        } else {
+            out[at + i] = c;
+        }
+        i = i + 1;
+    }
+    return at + s.len;
+}
+
+/// "HH:MM:SS LEVEL surface action trace8 payload60": LEVEL upper case, trace8 = the first 8 hex digits or "-", the payload
+/// cut at 60 bytes with controls and non-ASCII bytes shown as spaces. 0 for any line tl_validate_line refuses, or when out holds under 128.
+pub fn tl_menu_row(line: []const u8, out: []u8) -> usize {
+    if (out.len < 128 or tl_validate_line(line) != TL_OK) { return 0; }
+    var sp : [45]u32 = undefined;
+    if (tl_parse(line, sp[0..45]) != TL_OK) { return 0; }
+    const s45 : []const u32 = sp[0..45];
+    const ts : []const u8 = tl_get(line, s45, 2);
+    const trace : []const u8 = tl_get(line, s45, 9);
+    var o : usize = put_bytes(out, 0, ts[11..19]);
+    out[o] = 32;
+    o = tl_put_upper(out, o + 1, tl_get(line, s45, 8));
+    out[o] = 32;
+    o = put_bytes(out, o + 1, tl_get(line, s45, 6));
+    out[o] = 32;
+    o = put_bytes(out, o + 1, tl_get(line, s45, 7));
+    out[o] = 32;
+    if (trace.len >= 8) {
+        o = put_bytes(out, o + 1, trace[0..8]);
+    } else {
+        out[o + 1] = 45;
+        o = o + 2;
+    }
+    var raw : [2048]u8 = undefined;
+    const rn : usize = tl_unescape(tl_get(line, s45, 13), raw[0..2048]);
+    if (rn > 0 and rn <= 2048) {
+        out[o] = 32;
+        o = o + 1;
+        var i : usize = 0;
+        while (i < rn and i < TL_ROW_PAYLOAD) {
+            if (raw[i] < 32 or raw[i] >= 127) {
+                out[o] = 32;
+            } else {
+                out[o] = raw[i];
+            }
+            o = o + 1;
+            i = i + 1;
+        }
+    }
+    return o;
+}
+
+/// 1, 2, 4 ... for surface 1, 2, 3 ...
+fn tl_surface_bit(s: u8) -> u32 {
+    var b : u32 = 1;
+    var k : u8 = 1;
+    while (k < s) {
+        b = b * 2;
+        k = k + 1;
+    }
+    return b;
+}
+
+/// A valid line at or above min_level (1 debug .. 5 fatal) on a surface whose bit is set in surface_mask (bit = 2^(id-1)).
+pub fn tl_filter(line: []const u8, min_level: u8, surface_mask: u32) -> bool {
+    if (tl_validate_line(line) != TL_OK) { return false; }
+    var sp : [45]u32 = undefined;
+    if (tl_parse(line, sp[0..45]) != TL_OK) { return false; }
+    const s45 : []const u32 = sp[0..45];
+    const lvl : u8 = tl_level_id(tl_get(line, s45, 8));
+    const sf : u8 = tl_surface_id(tl_get(line, s45, 6));
+    if (lvl < min_level) { return false; }
+    return (surface_mask / tl_surface_bit(sf)) % 2 == 1;
+}
+
+/// The validated line plus one newline; 0 for a refused line or a small out.
+pub fn tl_export(line: []const u8, out: []u8) -> usize {
+    if (tl_validate_line(line) != TL_OK) { return 0; }
+    var n : usize = line.len;
+    while (n > 0 and (line[n - 1] == 10 or line[n - 1] == 13)) { n = n - 1; }
+    if (out.len < n + 1) { return 0; }
+    const o : usize = put_bytes(out, 0, line[0..n]);
+    out[o] = 10;
+    return o + 1;
+}
+
+// ---- CLI arguments ----
+
+/// False when an argument carries a key, an env NAME=value secret, an e-mail address or a forbidden word. A bare trace or
+/// span id (32 or 16 hex) is allowed. The proposed `tri t27l` commands are NOT BUILT; this is the check they would use.
+pub fn tl_arg_ok(arg: []const u8) -> bool {
+    if (arg.len == 0) { return true; }
+    if (arg.len > 1024) { return false; }
+    if (tl_hex_id(arg, 32) or tl_hex_id(arg, 16)) { return true; }
+    if (tl_forbidden(arg)) { return false; }
+    var out : [2048]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const n : usize = redact(arg, out[0..2048], cn[0..5]);
+    if (n == 0) { return false; }
+    return cn[0] == 0 and cn[1] == 0 and cn[3] == 0;
+}
+
+/// Free text (a research claim, a rationale): may NAME a password or a cookie as a topic, never carry one. False on a PEM
+/// block, an auth header, a key, an env NAME=value secret, a home path or an e-mail address; empty text passes.
+pub fn tl_text_safe(arg: []const u8) -> bool {
+    if (arg.len == 0) { return true; }
+    if (arg.len > 1024) { return false; }
+    if (tl_has(arg, "-----begin", true) or tl_has(arg, "authorization:", true) or tl_has(arg, "bearer ", true)) { return false; }
+    var out : [2048]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const n : usize = redact(arg, out[0..2048], cn[0..5]);
+    if (n == 0) { return false; }
+    return redacted_total(cn[0..5]) == 0;
+}
+
+// ---- the `tri t27l validate` contract (owner order MIGRATE_TRI_RUST_TO_T27, 2026-11-08) ----
+//
+// Contract first, Rust shim only. Wave A measured that `tri t27l validate` has no Rust implementation (bootstrap/src
+// and cli hold no t27l command), so there is no legacy behaviour to capture: the golden cases below pin this spec as
+// the reference a shim must preserve. The regression case old_rust_behavior_preserved has nothing to compare against
+// and is reported as not applicable, never as a pass.
+//
+//   command tri.t27l.validate
+//     arg    target Path, required, must_exist
+//     flag   strict Bool, default false
+//     flag   format Enum text|json, default text
+//     effects read_filesystem(target), write_telemetry(t27l); any other effect is denied and logged as effect_denied
+//     output ok -> exit 0, invalid_input -> exit 2, failed -> exit 1
+//
+// The shim does I/O only: it stats and opens the target, hands each line to tl_vcmd_line, counts, and prints what
+// tl_vcmd_out writes. Every decision is made here.
+
+/// Exit codes of a migrated command: 0 ok, 1 failed, 2 invalid input.
+pub const TL_EXIT_OK : u8 = 0;
+pub const TL_EXIT_FAILED : u8 = 1;
+pub const TL_EXIT_INVALID : u8 = 2;
+
+/// Run status: 1 ok, 2 invalid_input, 3 failed; 0 is unknown.
+pub const TL_ST_OK : u8 = 1;
+pub const TL_ST_INVALID : u8 = 2;
+pub const TL_ST_FAILED : u8 = 3;
+
+pub fn tl_status_name(st: u8) -> []const u8 {
+    if (st == 1) { return "ok"; }
+    if (st == 2) { return "invalid_input"; }
+    if (st == 3) { return "failed"; }
+    return "";
+}
+
+/// The exit code of a status; an unknown status fails closed to 1.
+pub fn tl_vcmd_exit(st: u8) -> u8 {
+    if (st == TL_ST_OK) { return TL_EXIT_OK; }
+    if (st == TL_ST_INVALID) { return TL_EXIT_INVALID; }
+    return TL_EXIT_FAILED;
+}
+
+/// Output formats: 1 text (also for an absent flag), 2 json, 0 unknown.
+pub const TL_FMT_TEXT : u8 = 1;
+pub const TL_FMT_JSON : u8 = 2;
+
+pub fn tl_format_id(name: []const u8) -> u8 {
+    if (name.len == 0) { return TL_FMT_TEXT; }
+    if (bytes_eq(name, "text")) { return TL_FMT_TEXT; }
+    if (bytes_eq(name, "json")) { return TL_FMT_JSON; }
+    return 0;
+}
+
+/// Reasons, 0 none. 1..6 are validation errors (status invalid_input), 7..9 are run failures (status failed).
+pub const TL_VR_NONE : u8 = 0;
+pub const TL_VR_TARGET_MISSING : u8 = 1;
+pub const TL_VR_SECRET_ARG : u8 = 2;
+pub const TL_VR_TOO_LONG : u8 = 3;
+pub const TL_VR_FORMAT : u8 = 4;
+pub const TL_VR_NOT_FOUND : u8 = 5;
+pub const TL_VR_UNREADABLE : u8 = 6;
+pub const TL_VR_IO : u8 = 7;
+pub const TL_VR_BAD_LINES : u8 = 8;
+pub const TL_VR_NON_CANONICAL : u8 = 9;
+pub const TL_VR_LAST : u8 = 9;
+
+pub fn tl_vreason_name(r: u8) -> []const u8 {
+    if (r == 0) { return "none"; }
+    if (r == 1) { return "target_missing"; }
+    if (r == 2) { return "secret_argument"; }
+    if (r == 3) { return "target_too_long"; }
+    if (r == 4) { return "unknown_format"; }
+    if (r == 5) { return "target_not_found"; }
+    if (r == 6) { return "target_unreadable"; }
+    if (r == 7) { return "io_error"; }
+    if (r == 8) { return "bad_lines"; }
+    if (r == 9) { return "non_canonical"; }
+    return "";
+}
+
+/// The status a reason maps to; an unknown reason fails closed.
+pub fn tl_vreason_status(r: u8) -> u8 {
+    if (r == TL_VR_NONE) { return TL_ST_OK; }
+    if (r <= TL_VR_UNREADABLE) { return TL_ST_INVALID; }
+    return TL_ST_FAILED;
+}
+
+/// The arguments, checked in order: an empty target, a target over 1024 bytes, a target that carries a secret or a
+/// forbidden word (tl_arg_ok), an unknown format, then a target the shim found missing or unreadable. The shim stats
+/// the file and passes exists and readable; it never opens a target this refuses.
+pub fn tl_vcmd_check(target: []const u8, format: []const u8, exists: bool, readable: bool) -> u8 {
+    if (target.len == 0) { return TL_VR_TARGET_MISSING; }
+    if (target.len > 1024) { return TL_VR_TOO_LONG; }
+    if (!tl_arg_ok(target)) { return TL_VR_SECRET_ARG; }
+    if (tl_format_id(format) == 0) { return TL_VR_FORMAT; }
+    if (!exists) { return TL_VR_NOT_FOUND; }
+    if (!readable) { return TL_VR_UNREADABLE; }
+    return TL_VR_NONE;
+}
+
+/// One line of the target, newline stripped by the shim: 0 good, 1 bad (tl_validate_line refuses it), 2 valid but not
+/// canonical (tl_normalize changes it), 3 empty (not a line, not counted).
+pub fn tl_vcmd_line(line: []const u8) -> u8 {
+    if (line.len == 0) { return 3; }
+    if (tl_validate_line(line) != TL_OK) { return 1; }
+    var b : [2048]u8 = undefined;
+    const n : usize = tl_normalize(line, b[0..2048]);
+    if (n == line.len and bytes_eq(line, b[0..n])) { return 0; }
+    return 2;
+}
+
+/// The reason of a finished run: an I/O error mid-read fails; any bad line fails; in strict mode a non-canonical line
+/// fails too. A target with no lines is ok: an empty log is a valid log.
+pub fn tl_vcmd_result(io_error: bool, n_bad: u32, n_noncanon: u32, strict: bool) -> u8 {
+    if (io_error) { return TL_VR_IO; }
+    if (n_bad > 0) { return TL_VR_BAD_LINES; }
+    if (strict and n_noncanon > 0) { return TL_VR_NON_CANONICAL; }
+    return TL_VR_NONE;
+}
+
+/// The json output {"status":S,"reason":R,"lines":N,"bad":M,"first_bad":K}, K 1-based and 0 when there is none. It
+/// never echoes the target or a line, so no path and no secret reaches stdout. 0 when out holds under 160 bytes.
+pub fn tl_vcmd_json(out: []u8, reason: u8, lines: u32, bad: u32, first_bad: u32) -> usize {
+    if (out.len < 160) { return 0; }
+    var o : usize = put_bytes(out, 0, "{\"status\":\"");
+    o = put_bytes(out, o, tl_status_name(tl_vreason_status(reason)));
+    o = put_bytes(out, o, "\",\"reason\":\"");
+    o = put_bytes(out, o, tl_vreason_name(reason));
+    o = put_bytes(out, o, "\",\"lines\":");
+    o = put_dec(out, o, lines);
+    o = put_bytes(out, o, ",\"bad\":");
+    o = put_dec(out, o, bad);
+    o = put_bytes(out, o, ",\"first_bad\":");
+    o = put_dec(out, o, first_bad);
+    return put_bytes(out, o, "}");
+}
+
+/// The text output "<status> <reason> lines N bad M first_bad K": the json fields, in the same order, no target.
+pub fn tl_vcmd_text(out: []u8, reason: u8, lines: u32, bad: u32, first_bad: u32) -> usize {
+    if (out.len < 160) { return 0; }
+    var o : usize = put_bytes(out, 0, tl_status_name(tl_vreason_status(reason)));
+    o = put_bytes(out, o, " ");
+    o = put_bytes(out, o, tl_vreason_name(reason));
+    o = put_bytes(out, o, " lines ");
+    o = put_dec(out, o, lines);
+    o = put_bytes(out, o, " bad ");
+    o = put_dec(out, o, bad);
+    o = put_bytes(out, o, " first_bad ");
+    return put_dec(out, o, first_bad);
+}
+
+/// The output in the given format; an unknown format id prints text (its reason already says unknown_format).
+pub fn tl_vcmd_out(out: []u8, format: u8, reason: u8, lines: u32, bad: u32, first_bad: u32) -> usize {
+    if (format == TL_FMT_JSON) { return tl_vcmd_json(out, reason, lines, bad, first_bad); }
+    return tl_vcmd_text(out, reason, lines, bad, first_bad);
+}
+
+// ---- effects: what a migrated command may touch (EFFECTS_CAPABILITY_MODEL) ----
+
+/// One bit per effect: 1 read_filesystem, 2 write_filesystem, 4 network, 8 telemetry t27l, 16 secrets, 32 process.
+/// The shim grants only what the contract declares; bits 64 and 128 are no effect and are refused.
+pub const TL_EFF_READ_FS : u8 = 1;
+pub const TL_EFF_WRITE_FS : u8 = 2;
+pub const TL_EFF_NETWORK : u8 = 4;
+pub const TL_EFF_TELEMETRY : u8 = 8;
+pub const TL_EFF_SECRETS : u8 = 16;
+pub const TL_EFF_PROCESS : u8 = 32;
+/// `tri t27l validate` declares read_filesystem and telemetry t27l, nothing else.
+pub const TL_VALIDATE_EFFECTS : u8 = 9;
+
+/// True when every requested effect is declared (an empty request is). Unknown bits on either side are refused.
+pub fn tl_effect_allowed(declared: u8, requested: u8) -> bool {
+    if (declared >= 64 or requested >= 64) { return false; }
+    var bit : u8 = 1;
+    while (bit <= 32) {
+        if ((requested / bit) % 2 == 1 and (declared / bit) % 2 == 0) { return false; }
+        bit = bit * 2;
+    }
+    return true;
+}
+
+/// The T27L line the shim writes when it refuses an undeclared effect: actor system, surface migration, action
+/// effect_denied, level warn, payload "effect_denied command C requested R declared D". 0 when the effect is allowed
+/// (nothing to log) or the command name is empty, over 64 bytes or not a safe argument.
+pub fn tl_effect_denied_line(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                             trace_id: []const u8, span_id: []const u8, command: []const u8, declared: u8, requested: u8) -> usize {
+    if (tl_effect_allowed(declared, requested)) { return 0; }
+    if (command.len == 0 or command.len > 64 or !tl_arg_ok(command)) { return 0; }
+    var pay : [160]u8 = undefined;
+    var p : usize = put_bytes(pay[0..160], 0, "effect_denied command ");
+    p = put_bytes(pay[0..160], p, command);
+    p = put_bytes(pay[0..160], p, " requested ");
+    p = put_dec(pay[0..160], p, requested);
+    p = put_bytes(pay[0..160], p, " declared ");
+    p = put_dec(pay[0..160], p, declared);
+    return tl_event_line(out, event_id, ts, device_id, session_id, 3, 17, 127, 3, trace_id, span_id, "", pay[0..p], "");
+}
+
+// ---- the migration runner contract: tri migrate --command <cmd> --dry-run | --checkpoint | --rollback ----
+//
+// Every migration is reversible. A command moves through stages, and each mode is allowed only from the stages named:
+// 0 legacy (no contract), 1 contract (a .t27 contract typechecks and its own tests pass), 2 dry_run_passed (golden and
+// property tests green against the contract; changes, coverage delta and risks reported, nothing applied), 3
+// checkpointed (the previous .t27, shim and tests are saved), 4 applied (the shim routes to the t27 path), 5
+// rolled_back (the checkpoint restored). Apply is not a CLI flag: the merge gate (seven conditions plus security)
+// decides it, and only from a checkpoint with the regression green. The runner is NOT BUILT; this is its law.
+
+pub const TL_MIG_LEGACY : u8 = 0;
+pub const TL_MIG_CONTRACT : u8 = 1;
+pub const TL_MIG_DRY_OK : u8 = 2;
+pub const TL_MIG_CHECKPOINT : u8 = 3;
+pub const TL_MIG_APPLIED : u8 = 4;
+pub const TL_MIG_ROLLED_BACK : u8 = 5;
+pub const TL_MIG_REFUSED : u8 = 255;
+
+/// Modes: 1 dry_run, 2 checkpoint, 3 apply (the merge gate's), 4 rollback, 5 contract (the contract is promoted).
+pub const TL_MM_DRY_RUN : u8 = 1;
+pub const TL_MM_CHECKPOINT : u8 = 2;
+pub const TL_MM_APPLY : u8 = 3;
+pub const TL_MM_ROLLBACK : u8 = 4;
+pub const TL_MM_CONTRACT : u8 = 5;
+
+/// The mode of one CLI call: exactly one of the three flags, else 0 (refused).
+pub fn tl_mig_mode(dry_run: bool, checkpoint: bool, rollback: bool) -> u8 {
+    var n : u8 = 0;
+    var m : u8 = 0;
+    if (dry_run) {
+        n = n + 1;
+        m = TL_MM_DRY_RUN;
+    }
+    if (checkpoint) {
+        n = n + 1;
+        m = TL_MM_CHECKPOINT;
+    }
+    if (rollback) {
+        n = n + 1;
+        m = TL_MM_ROLLBACK;
+    }
+    if (n != 1) { return 0; }
+    return m;
+}
+
+/// The next stage, or TL_MIG_REFUSED. contract: from legacy, with its tests green. dry_run: from contract, a passed
+/// dry run or a rollback; green advances to dry_run_passed, red stays at contract. checkpoint: from a passed dry run.
+/// apply: from a checkpoint, with the regression green. rollback: from a checkpoint or an applied stage.
+pub fn tl_mig_next(stage: u8, mode: u8, green: bool) -> u8 {
+    if (mode == TL_MM_CONTRACT) {
+        if (stage == TL_MIG_LEGACY and green) { return TL_MIG_CONTRACT; }
+        return TL_MIG_REFUSED;
+    }
+    if (mode == TL_MM_DRY_RUN) {
+        if (stage != TL_MIG_CONTRACT and stage != TL_MIG_DRY_OK and stage != TL_MIG_ROLLED_BACK) { return TL_MIG_REFUSED; }
+        if (green) { return TL_MIG_DRY_OK; }
+        return TL_MIG_CONTRACT;
+    }
+    if (mode == TL_MM_CHECKPOINT) {
+        if (stage == TL_MIG_DRY_OK) { return TL_MIG_CHECKPOINT; }
+        return TL_MIG_REFUSED;
+    }
+    if (mode == TL_MM_APPLY) {
+        if (stage == TL_MIG_CHECKPOINT and green) { return TL_MIG_APPLIED; }
+        return TL_MIG_REFUSED;
+    }
+    if (mode == TL_MM_ROLLBACK) {
+        if (stage == TL_MIG_CHECKPOINT or stage == TL_MIG_APPLIED) { return TL_MIG_ROLLED_BACK; }
+        return TL_MIG_REFUSED;
+    }
+    return TL_MIG_REFUSED;
+}
+
+/// The T27L action a mode logs on surface migration: 123 dry run, 124 checkpoint, 125 applied, 126 rolled back,
+/// 128 contract promoted; 0 for no mode.
+pub fn tl_mig_action(mode: u8) -> u8 {
+    if (mode == TL_MM_DRY_RUN) { return 123; }
+    if (mode == TL_MM_CHECKPOINT) { return 124; }
+    if (mode == TL_MM_APPLY) { return 125; }
+    if (mode == TL_MM_ROLLBACK) { return 126; }
+    if (mode == TL_MM_CONTRACT) { return 128; }
+    return 0;
+}
+
+// ---- test fixtures ----
+
+pub const TL_T_EV1 : str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+pub const TL_T_EV2 : str = "11111111-2222-4333-8444-555555555555";
+pub const TL_T_TR : str = "0af7651916cd43dd8448eb211c80319c";
+pub const TL_T_SP : str = "b7ad6b7169203331";
+pub const TL_T_SP2 : str = "00f067aa0ba902b7";
+pub const TL_T_LINE : str = "{\"schema\":\"t27l/v1\",\"event_id\":\"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d\",\"ts\":\"2026-11-08T12:34:56Z\",\"device_id\":\"mac-1\",\"session_id\":\"sess-1\",\"actor\":\"agent\",\"surface\":\"pane\",\"action\":\"agent_step\",\"level\":\"info\",\"trace_id\":\"0af7651916cd43dd8448eb211c80319c\",\"span_id\":\"b7ad6b7169203331\",\"parent_span_id\":null,\"redacted\":false,\"payload\":\"step one\",\"evidence\":[]}";
+
+pub fn tl_t_fill(out: []u8, at: usize, c: u8, n: usize) -> usize {
+    var i : usize = 0;
+    while (i < n) {
+        out[at + i] = c;
+        i = i + 1;
+    }
+    return at + n;
+}
+
+/// A raw (unchecked, unescaped) line for negative tests; null ids are empty slices.
+fn tl_t_raw(out: []u8, schema: []const u8, ev: []const u8, ts: []const u8, dev: []const u8, sess: []const u8,
+            actor: []const u8, surface: []const u8, action: []const u8, level: []const u8, trace: []const u8,
+            span: []const u8, parent: []const u8, payload: []const u8, evidence: []const u8) -> usize {
+    return tl_join(out, schema, ev, ts, dev, sess, actor, surface, action, level, trace, span, parent, false, payload, evidence);
+}
+
+/// Vary the ids and the timestamp.
+fn tl_t_a(out: []u8, ev: []const u8, ts: []const u8, dev: []const u8, sess: []const u8) -> usize {
+    return tl_t_raw(out, "t27l/v1", ev, ts, dev, sess, "agent", "pane", "agent_step", "info", "", "", "", "x", "");
+}
+
+/// Vary the four enums.
+fn tl_t_b(out: []u8, actor: []const u8, surface: []const u8, action: []const u8, level: []const u8) -> usize {
+    return tl_t_raw(out, "t27l/v1", TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", actor, surface, action, level, "", "", "", "x", "");
+}
+
+/// Vary the trace ids, the payload and the evidence body (already quoted).
+fn tl_t_c(out: []u8, trace: []const u8, span: []const u8, parent: []const u8, payload: []const u8, evidence: []const u8) -> usize {
+    return tl_t_raw(out, "t27l/v1", TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", "agent", "pane", "agent_step", "info",
+                    trace, span, parent, payload, evidence);
+}
+
+// ---- tests ----
+
+test valid_event_round_trip {
+    var out : [2048]u8 = undefined;
+    const n : usize = tl_event_line(out[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, TL_T_TR, TL_T_SP, "", "step one", "");
+    assert n == TL_T_LINE.len;
+    assert bytes_eq(out[0..n], TL_T_LINE);
+    assert tl_validate_line(out[0..n]) == TL_OK;
+    var sp : [45]u32 = undefined;
+    assert tl_parse(out[0..n], sp[0..45]) == TL_OK;
+    assert bytes_eq(tl_get(out[0..n], sp[0..45], 2), "2026-11-08T12:34:56Z");
+    assert bytes_eq(tl_get(out[0..n], sp[0..45], 6), "pane");
+    assert bytes_eq(tl_get(out[0..n], sp[0..45], 7), "agent_step");
+    assert tl_validate_line(TL_T_LINE) == TL_OK;
+}
+
+test missing_required_key {
+    assert tl_validate_line("{\"schema\":\"t27l/v1\"}") == E_MISSING;
+    assert tl_validate_line("{}") == E_MISSING;
+    assert tl_validate_line("{\"schema\":\"t27l/v1\",\"event_id\":\"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d\",\"ts\":\"2026-11-08T12:34:56Z\",\"device_id\":\"mac-1\",\"session_id\":\"sess-1\",\"actor\":\"agent\",\"surface\":\"pane\",\"action\":\"agent_step\",\"payload\":\"x\"}") == E_MISSING;
+}
+
+test validate_needs_every_key_normalize_fills_them {
+    const src : str = "{\"schema\":\"t27l/v1\",\"event_id\":\"0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d\",\"ts\":\"2026-11-08T12:34:56Z\",\"device_id\":\"mac-1\",\"session_id\":\"sess-1\",\"actor\":\"agent\",\"surface\":\"pane\",\"action\":\"agent_step\",\"level\":\"info\",\"payload\":\"step one\"}";
+    assert tl_validate_line(src) == E_MISSING;
+    var out : [2048]u8 = undefined;
+    const n : usize = tl_normalize(src, out[0..2048]);
+    assert n > 0;
+    assert tl_validate_line(out[0..n]) == TL_OK;
+    assert tl_has(out[0..n], "\"trace_id\":null", false);
+    assert tl_has(out[0..n], "\"redacted\":false", false);
+    assert tl_has(out[0..n], "\"evidence\":[]", false);
+    var row : [256]u8 = undefined;
+    assert tl_menu_row(src, row[0..256]) == 0;
+}
+
+test uuid_negatives {
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_a(b[0..2048], "0A1B2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D", "2026-11-08T12:34:56Z", "mac-1", "sess-1");
+    assert tl_validate_line(b[0..n]) == E_EVENT_ID;
+    n = tl_t_a(b[0..2048], "0a1b2c3-d4e5f-4a6b-8c7d-9e0f1a2b3c4d", "2026-11-08T12:34:56Z", "mac-1", "sess-1");
+    assert tl_validate_line(b[0..n]) == E_EVENT_ID;
+    n = tl_t_a(b[0..2048], "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4", "2026-11-08T12:34:56Z", "mac-1", "sess-1");
+    assert tl_validate_line(b[0..n]) == E_EVENT_ID;
+    assert tl_uuid_ok(TL_T_EV1);
+    assert tl_uuid_ok(TL_T_EV2);
+    assert !tl_uuid_ok("");
+}
+
+test ts_negatives_and_leap_day {
+    var b : [2048]u8 = undefined;
+    assert !tl_ts_ok("2026-02-29T00:00:00Z");
+    assert !tl_ts_ok("2026-13-01T00:00:00Z");
+    assert !tl_ts_ok("2026-11-08T25:00:00Z");
+    assert !tl_ts_ok("2026-11-08T12:34:56");
+    assert !tl_ts_ok("2026-11-08T12:60:00Z");
+    assert !tl_ts_ok("2026-04-31T00:00:00Z");
+    assert tl_ts_ok("2028-02-29T00:00:00Z");
+    assert tl_ts_ok("2026-11-08T12:34:56.123Z");
+    assert !tl_ts_ok("2026-11-08T12:34:56.1234Z");
+    const n : usize = tl_t_a(b[0..2048], TL_T_EV1, "2026-02-29T00:00:00Z", "mac-1", "sess-1");
+    assert tl_validate_line(b[0..n]) == E_TS;
+    const m : usize = tl_t_a(b[0..2048], TL_T_EV1, "2028-02-29T00:00:00Z", "mac-1", "sess-1");
+    assert tl_validate_line(b[0..m]) == TL_OK;
+}
+
+test unknown_enum_values_and_schema {
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "bot", "pane", "agent_step", "info");
+    assert tl_validate_line(b[0..n]) == E_ACTOR;
+    n = tl_t_b(b[0..2048], "agent", "tv", "agent_step", "info");
+    assert tl_validate_line(b[0..n]) == E_SURFACE;
+    n = tl_t_b(b[0..2048], "agent", "pane", "dance", "info");
+    assert tl_validate_line(b[0..n]) == E_ACTION;
+    n = tl_t_b(b[0..2048], "agent", "pane", "agent_step", "loud");
+    assert tl_validate_line(b[0..n]) == E_LEVEL;
+    n = tl_t_raw(b[0..2048], "t27l/v2", TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", "agent", "pane", "agent_step", "info", "", "", "", "x", "");
+    assert tl_validate_line(b[0..n]) == E_SCHEMA;
+    assert tl_action_id("navigate") == 24;
+    assert tl_surface_id("browser") == 7;
+}
+
+test cost_surface_and_actions {
+    assert tl_surface_id("cost") == 9;
+    assert tl_action_id("llm_call") == 25;
+    assert tl_action_id("route_decision") == 26;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "agent", "cost", "llm_call", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    assert tl_filter(b[0..n], 2, 256);
+    assert !tl_filter(b[0..n], 2, 255);
+    n = tl_t_b(b[0..2048], "agent", "cost", "route_decision", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "cost", "llm_calls", "info");
+    assert tl_validate_line(b[0..n]) == E_ACTION;
+    n = tl_t_b(b[0..2048], "agent", "costs", "llm_call", "info");
+    assert tl_validate_line(b[0..n]) == E_SURFACE;
+}
+
+// The system and agent surfaces (owner, 2026-11-08: SWAP_GUARD_RULE, OWNER_APPROVE_AUDIT_TRAIL, T27A registry).
+test system_agent_surfaces_and_actions {
+    assert tl_surface_id("system") == 10;
+    assert tl_surface_id("agent") == 11;
+    assert tl_action_id("resource_guard_triggered") == 27;
+    assert tl_action_id("evidence_approved") == 28;
+    assert tl_action_id("agent_created") == 29;
+    assert tl_action_id("task_claimed") == 32;
+    assert tl_action_id("lock_conflict") == 35;
+    assert tl_action_id("reputation_updated") == 37;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "system", "system", "resource_guard_triggered", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    // a tripped guard is a refusal: never filed below warn
+    n = tl_t_b(b[0..2048], "system", "system", "resource_guard_triggered", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "agent", "lock_conflict", "debug");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "agent", "task_claimed", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "user", "menu_l", "evidence_approved", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "agents", "task_claimed", "info");
+    assert tl_validate_line(b[0..n]) == E_SURFACE;
+}
+
+// The resource doctor (T27D, MAPE-K) and secret custodian (T27S) events (owner, 2026-11-08).
+test doctor_and_security_events {
+    assert tl_surface_id("security") == 12;
+    assert tl_surface_name(12).len == 8;
+    assert tl_action_id("resource_snapshot") == 38;
+    assert tl_action_id("doctor_escalated") == 45;
+    assert tl_action_id("gate_override") == 46;
+    assert tl_action_id("secret_created") == 47;
+    assert tl_action_id("access_denied") == 53;
+    assert tl_action_id("incident_opened") == 57;
+    // every id from 1 to the last names itself and round-trips; none collides with a forbidden one
+    var k : u8 = 1;
+    while (k <= TL_ACTION_LAST) {
+        assert tl_action_name(k).len > 0;
+        assert tl_action_id(tl_action_name(k)) == k;
+        k = k + 1;
+    }
+    assert tl_action_name(TL_ACTION_LAST + 1).len == 0;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "system", "system", "resource_snapshot", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "system", "doctor_escalated", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "user", "system", "gate_override", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "security", "access_requested", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "security", "access_denied", "debug");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "security", "incident_opened", "warn");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "security", "incident_opened", "error");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "securty", "access_requested", "info");
+    assert tl_validate_line(b[0..n]) == E_SURFACE;
+}
+
+// The research knowledge base (T27R) events (owner, 2026-11-08): one line per item, refusals at warn or above.
+test research_events {
+    assert tl_surface_id("research") == 13;
+    assert tl_surface_name(13).len == 8;
+    assert tl_action_id("topic_created") == 58;
+    assert tl_action_id("source_captured") == 59;
+    assert tl_action_id("decision_recorded") == 65;
+    assert tl_action_id("evidence_refused") == 67;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "agent", "research", "source_captured", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "research", "note_extracted", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "user", "research", "decision_recorded", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    // negative controls: a refusal or a fired rollback below warn is a level mismatch
+    n = tl_t_b(b[0..2048], "agent", "research", "evidence_refused", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "research", "source_refused", "debug");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "research", "decision_revisited", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "research", "decision_revisited", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "reserch", "source_captured", "info");
+    assert tl_validate_line(b[0..n]) == E_SURFACE;
+}
+
+// The memory-actor layer (T27M) events (owner, 2026-11-08): a dead letter, a failed heal and an escalation at warn or above.
+test memory_events {
+    assert tl_surface_id("memory") == 14;
+    assert tl_surface_name(14).len == 6;
+    assert tl_action_id("actor_created") == 68;
+    assert tl_action_id("message_acked") == 70;
+    assert tl_action_id("lease_expired") == 76;
+    assert tl_action_id("memory_consolidated") == 78;
+    assert tl_action_id("escalation_raised") == 84;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "agent", "memory", "message_sent", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "memory", "lease_acquired", "debug");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "memory", "message_deadlettered", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "memory", "message_deadlettered", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "memory", "heal_failed", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "memory", "escalation_raised", "debug");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "memory", "escalation_raised", "error");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "memry", "message_sent", "info");
+    assert tl_validate_line(b[0..n]) == E_SURFACE;
+}
+
+// The time layer (T27T) events (owner, 2026-11-08): ids 85..99 and 105..107 straddle the forbidden 100..104, which stay
+// refused; a skipped schedule at warn or above, a critical bypass at error or above.
+test time_events {
+    assert tl_surface_id("time") == 15;
+    assert tl_surface_name(15).len == 4;
+    assert tl_surface_name(TL_SURFACE_LAST + 1).len == 0;
+    assert tl_action_id("clock_read") == 85;
+    assert tl_action_id("decay_applied") == 99;
+    assert tl_action_id("golden_interval_computed") == 105;
+    assert tl_action_id("critical_bypass") == 107;
+    assert tl_action_id("keystroke") == 100;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "system", "time", "schedule_fired", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "time", "golden_schedule_created", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "time", "schedule_skipped", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "time", "schedule_skipped", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "time", "critical_bypass", "warn");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "time", "critical_bypass", "error");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    // negative control: a forbidden id inside the widened range is still refused, on the new surface too
+    n = tl_t_b(b[0..2048], "agent", "time", "keystroke", "info");
+    assert tl_validate_line(b[0..n]) == E_FORBIDDEN_ACTION;
+}
+
+test trace_rules {
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_c(b[0..2048], "00000000000000000000000000000000", TL_T_SP, "", "x", "");
+    assert tl_validate_line(b[0..n]) == E_TRACE;
+    n = tl_t_c(b[0..2048], "0af7651916cd43dd8448eb211c80319", TL_T_SP, "", "x", "");
+    assert tl_validate_line(b[0..n]) == E_TRACE;
+    n = tl_t_c(b[0..2048], "", TL_T_SP, "", "x", "");
+    assert tl_validate_line(b[0..n]) == E_SPAN;
+    n = tl_t_c(b[0..2048], TL_T_TR, TL_T_SP, TL_T_SP, "x", "");
+    assert tl_validate_line(b[0..n]) == E_PARENT;
+    n = tl_t_c(b[0..2048], TL_T_TR, "", TL_T_SP, "x", "");
+    assert tl_validate_line(b[0..n]) == E_PARENT;
+    n = tl_t_c(b[0..2048], TL_T_TR, TL_T_SP, "", "x", "");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_c(b[0..2048], TL_T_TR, TL_T_SP2, TL_T_SP, "x", "");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+}
+
+test key_in_payload_is_redacted {
+    var pay : [128]u8 = undefined;
+    var s : usize = put_bytes(pay[0..128], 0, "use ");
+    s = put_bytes(pay[0..128], s, "sk-");
+    s = tl_t_fill(pay[0..128], s, 97, 24);
+    var raw : [2048]u8 = undefined;
+    const rn : usize = tl_t_c(raw[0..2048], TL_T_TR, TL_T_SP, "", pay[0..s], "");
+    assert tl_validate_line(raw[0..rn]) == E_SECRET;
+    var out : [2048]u8 = undefined;
+    const n : usize = tl_normalize(raw[0..rn], out[0..2048]);
+    assert n > 0;
+    assert tl_validate_line(out[0..n]) == TL_OK;
+    assert tl_has(out[0..n], "\"redacted\":true", false);
+    assert tl_has(out[0..n], "\"payload\":\"use [REDACTED]\"", false);
+    assert !tl_has(out[0..n], "sk-", true);
+    var out2 : [2048]u8 = undefined;
+    const m : usize = tl_event_line(out2[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, "", "", "", pay[0..s], "");
+    assert m > 0;
+    assert !tl_has(out2[0..m], "sk-", true);
+    assert tl_has(out2[0..m], "[REDACTED]", false);
+}
+
+test secret_words_are_refused {
+    var b : [2048]u8 = undefined;
+    var pay : [64]u8 = undefined;
+    var s : usize = put_bytes(pay[0..64], 0, "my pass");
+    s = put_bytes(pay[0..64], s, "word is x");
+    var n : usize = tl_t_c(b[0..2048], "", "", "", pay[0..s], "");
+    assert tl_validate_line(b[0..n]) == E_SECRET;
+    n = tl_t_c(b[0..2048], "", "", "", "Cookie: a=b", "");
+    assert tl_validate_line(b[0..n]) == E_SECRET;
+    n = tl_t_c(b[0..2048], "", "", "", "a Private Key b", "");
+    assert tl_validate_line(b[0..n]) == E_SECRET;
+    n = tl_t_c(b[0..2048], "", "", "", "Bearer abc", "");
+    assert tl_validate_line(b[0..n]) == E_SECRET;
+    assert tl_check("t27l/v1", TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, "", "", "", "-----BEGIN x", "") == E_SECRET;
+    assert tl_event_line(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, "", "", "", "Cookie: a=b", "") == 0;
+}
+
+test url_query_is_cut {
+    var raw : [2048]u8 = undefined;
+    const rn : usize = tl_t_c(raw[0..2048], "", "", "", "see http://h/p?token=zz ok", "");
+    assert tl_validate_line(raw[0..rn]) == E_SECRET;
+    var out : [2048]u8 = undefined;
+    const n : usize = tl_normalize(raw[0..rn], out[0..2048]);
+    assert n > 0;
+    assert tl_has(out[0..n], "\"payload\":\"see http://h/p?[q] ok\"", false);
+    assert tl_has(out[0..n], "\"redacted\":true", false);
+    assert !tl_has(out[0..n], "zz", false);
+    assert tl_validate_line(out[0..n]) == TL_OK;
+}
+
+test secrets_in_envelope_fields {
+    var key : [64]u8 = undefined;
+    var s : usize = put_bytes(key[0..64], 0, "sk-");
+    s = tl_t_fill(key[0..64], s, 97, 24);
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_a(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", key[0..s], "sess-1");
+    assert tl_validate_line(b[0..n]) == E_SECRET;
+    n = tl_t_a(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "bob@example.com");
+    assert tl_validate_line(b[0..n]) == E_SECRET;
+    assert tl_normalize(b[0..n], key[0..64]) == 0;
+}
+
+test duplicate_ingest {
+    var a : [2048]u8 = undefined;
+    var c : [2048]u8 = undefined;
+    const na : usize = tl_event_line(a[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, "", "", "", "one", "");
+    const nc : usize = tl_event_line(c[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, "", "", "", "two", "");
+    assert na > 0 and nc > 0;
+    const ha : u64 = tl_hash(a[0..na]);
+    const hc : u64 = tl_hash(c[0..nc]);
+    assert ha != hc;
+    var ids : [36]u8 = undefined;
+    var hs : [1]u64 = undefined;
+    const e : usize = put_bytes(ids[0..36], 0, TL_T_EV1);
+    assert e == 36;
+    hs[0] = ha;
+    assert tl_ingest(TL_T_EV1, ha, ids[0..0], hs[0..0], 0) == TL_NEW;
+    assert tl_ingest(TL_T_EV1, ha, ids[0..36], hs[0..1], 1) == TL_DUP;
+    assert tl_ingest(TL_T_EV1, hc, ids[0..36], hs[0..1], 1) == E_ID_CONFLICT;
+    assert tl_ingest(TL_T_EV2, ha, ids[0..36], hs[0..1], 1) == TL_NEW;
+    assert tl_ingest(TL_T_EV1, ha, ids[0..36], hs[0..1], 2) == E_MALFORMED;
+}
+
+test malformed_lines {
+    assert tl_validate_line("") == E_MALFORMED;
+    assert tl_validate_line("{") == E_MALFORMED;
+    assert tl_validate_line("{\"schema\":\"t27l/v1") == E_MALFORMED;
+    assert tl_validate_line("{\"schema:\"x\"}") == E_MALFORMED;
+    assert tl_validate_line("{\"unknown\":\"x\"}") == E_MALFORMED;
+    assert tl_validate_line("not json") == E_MALFORMED;
+    assert tl_validate_line("{\"schema\":\"t27l/v1\",\"schema\":\"t27l/v1\"}") == E_MALFORMED;
+    assert tl_validate_line("{\"schema\":t27l}") == E_MALFORMED;
+    assert tl_validate_line("{\"schema\":\"t27l/v1\",}") == E_MALFORMED;
+    assert tl_validate_line("{\"redacted\":\"yes\"}") == E_MALFORMED;
+    var out : [64]u8 = undefined;
+    assert tl_normalize("not json", out[0..64]) == 0;
+}
+
+test forbidden_actions {
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "user", "pane", "keystroke", "info");
+    assert tl_validate_line(b[0..n]) == E_FORBIDDEN_ACTION;
+    n = tl_t_b(b[0..2048], "user", "pane", "key_press", "info");
+    assert tl_validate_line(b[0..n]) == E_FORBIDDEN_ACTION;
+    n = tl_t_b(b[0..2048], "user", "pane", "clipboard_read", "info");
+    assert tl_validate_line(b[0..n]) == E_FORBIDDEN_ACTION;
+    n = tl_t_b(b[0..2048], "user", "pane", "clipboard_write", "info");
+    assert tl_validate_line(b[0..n]) == E_FORBIDDEN_ACTION;
+    n = tl_t_b(b[0..2048], "user", "browser", "screen_raw", "info");
+    assert tl_validate_line(b[0..n]) == E_FORBIDDEN_ACTION;
+    assert tl_event_line(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 1, 3, 100, 2, "", "", "", "x", "") == 0;
+}
+
+test level_rules {
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "system", "pane", "crash", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "pane", "crash", "error");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "pane", "crash", "fatal");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "pane", "error", "warn");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "pane", "error", "error");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "browser", "console_error", "warn");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "browser", "uncaught_exception", "fatal");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "browser", "network_error", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "browser", "network_error", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "pane", "log", "debug");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+}
+
+test traceparent_round_trip {
+    var tp : [64]u8 = undefined;
+    const n : usize = tl_traceparent(tp[0..64], TL_T_TR, TL_T_SP);
+    assert n == 55;
+    assert bytes_eq(tp[0..n], "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+    assert tl_traceparent_ok(tp[0..n]);
+    assert !tl_traceparent_ok("01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+    assert !tl_traceparent_ok("00-00000000000000000000000000000000-b7ad6b7169203331-01");
+    assert !tl_traceparent_ok("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331");
+    assert tl_traceparent(tp[0..64], "0af76519", TL_T_SP) == 0;
+}
+
+test child_of_follows_parent_span {
+    var p : [2048]u8 = undefined;
+    var c : [2048]u8 = undefined;
+    var d : [2048]u8 = undefined;
+    const np : usize = tl_t_c(p[0..2048], TL_T_TR, TL_T_SP, "", "root", "");
+    const nc : usize = tl_t_c(c[0..2048], TL_T_TR, TL_T_SP2, TL_T_SP, "child", "");
+    assert tl_child_of(c[0..nc], p[0..np]);
+    assert !tl_child_of(p[0..np], c[0..nc]);
+    const nd : usize = tl_t_c(d[0..2048], TL_T_TR, TL_T_SP2, "aaaaaaaaaaaaaaaa", "other", "");
+    assert !tl_child_of(d[0..nd], p[0..np]);
+    const ne : usize = tl_t_c(d[0..2048], "11111111111111111111111111111111", TL_T_SP2, TL_T_SP, "elsewhere", "");
+    assert !tl_child_of(d[0..ne], p[0..np]);
+}
+
+test menu_row_is_exact {
+    var out : [256]u8 = undefined;
+    const n : usize = tl_menu_row(TL_T_LINE, out[0..256]);
+    assert bytes_eq(out[0..n], "12:34:56 INFO pane agent_step 0af76519 step one");
+    var b : [2048]u8 = undefined;
+    var long : [128]u8 = undefined;
+    const ln : usize = tl_t_fill(long[0..128], 0, 121, 70);
+    const nb : usize = tl_t_c(b[0..2048], "", "", "", long[0..ln], "");
+    const m : usize = tl_menu_row(b[0..nb], out[0..256]);
+    assert m == 92;
+    assert bytes_eq(out[0..32], "12:34:56 INFO pane agent_step - ");
+    var key : [128]u8 = undefined;
+    var s : usize = put_bytes(key[0..128], 0, "ghp_");
+    s = tl_t_fill(key[0..128], s, 98, 36);
+    const nr : usize = tl_t_c(b[0..2048], "", "", "", key[0..s], "");
+    assert tl_menu_row(b[0..nr], out[0..256]) == 0;
+    assert tl_menu_row("not json", out[0..256]) == 0;
+    assert tl_menu_row(TL_T_LINE, out[0..64]) == 0;
+}
+
+test filter_by_level_and_surface {
+    assert tl_filter(TL_T_LINE, 1, 4);
+    assert tl_filter(TL_T_LINE, 2, 4);
+    assert !tl_filter(TL_T_LINE, 3, 4);
+    assert !tl_filter(TL_T_LINE, 1, 1);
+    assert tl_filter(TL_T_LINE, 1, 511);
+    assert !tl_filter(TL_T_LINE, 1, 0);
+    assert !tl_filter("not json", 1, 511);
+}
+
+test export_adds_one_newline {
+    var out : [2048]u8 = undefined;
+    const n : usize = tl_export(TL_T_LINE, out[0..2048]);
+    assert n == TL_T_LINE.len + 1;
+    assert out[n - 1] == 10;
+    assert bytes_eq(out[0..(n - 1)], TL_T_LINE);
+    var key : [128]u8 = undefined;
+    var s : usize = put_bytes(key[0..128], 0, "ghp_");
+    s = tl_t_fill(key[0..128], s, 98, 36);
+    var raw : [2048]u8 = undefined;
+    const rn : usize = tl_t_c(raw[0..2048], "", "", "", key[0..s], "");
+    assert tl_export(raw[0..rn], out[0..2048]) == 0;
+}
+
+test cli_args_take_no_secrets {
+    assert tl_arg_ok("validate");
+    assert tl_arg_ok("--session");
+    assert tl_arg_ok("sess-1");
+    assert tl_arg_ok(TL_T_TR);
+    var key : [128]u8 = undefined;
+    var s : usize = put_bytes(key[0..128], 0, "ghp_");
+    s = tl_t_fill(key[0..128], s, 98, 36);
+    assert !tl_arg_ok(key[0..s]);
+    assert !tl_arg_ok("bob@example.com");
+    assert !tl_arg_ok("API_KEY=abc123");
+    assert !tl_arg_ok("Cookie: a=b");
+}
+
+test free_text_names_topics_not_secrets {
+    const nist : str = "verifiers should not require periodic password changes";
+    assert tl_text_safe(nist);
+    assert !tl_arg_ok(nist);
+    assert tl_text_safe("");
+    assert !tl_text_safe("bob@example.com");
+    assert !tl_text_safe("API_KEY=abc123");
+    assert !tl_text_safe("Authorization: x");
+    assert !tl_text_safe("-----BEGIN RSA PRIVATE KEY-----");
+    var key : [128]u8 = undefined;
+    var s : usize = put_bytes(key[0..128], 0, "ghp_");
+    s = tl_t_fill(key[0..128], s, 98, 36);
+    assert !tl_text_safe(key[0..s]);
+}
+
+test evidence_rules {
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_c(b[0..2048], "", "", "", "x", "\"ev-0123456789abcdef\"");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_c(b[0..2048], "", "", "", "x", "\"ev-0123456789abcdef\",\"ev-fedcba9876543210\"");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_c(b[0..2048], "", "", "", "x", "\"ev-ZZZ\"");
+    assert tl_validate_line(b[0..n]) == E_EVIDENCE;
+    n = tl_t_c(b[0..2048], "", "", "", "x", "\"EV-0123456789abcdef\"");
+    assert tl_validate_line(b[0..n]) == E_EVIDENCE;
+    n = tl_t_c(b[0..2048], "", "", "", "x", "ev-0123456789abcdef");
+    assert tl_validate_line(b[0..n]) == E_EVIDENCE;
+    assert tl_evidence_ok("ev-0123456789abcdef,ev-fedcba9876543210");
+    assert !tl_evidence_ok("ev-0123456789abcdef,");
+    assert !tl_evidence_ok("ev-0123456789abcde");
+    assert tl_event_line(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, "", "", "", "x", "ev-bad") == 0;
+}
+
+test payload_over_limit {
+    var long : [1200]u8 = undefined;
+    const ln : usize = tl_t_fill(long[0..1200], 0, 120, 1100);
+    var b : [2048]u8 = undefined;
+    const n : usize = tl_t_c(b[0..2048], "", "", "", long[0..ln], "");
+    assert tl_validate_line(b[0..n]) == E_TOO_LONG;
+    const ok : usize = tl_t_fill(long[0..1200], 0, 120, 1024);
+    const m : usize = tl_t_c(b[0..2048], "", "", "", long[0..ok], "");
+    assert tl_validate_line(b[0..m]) == TL_OK;
+    assert tl_event_line(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, "", "", "", long[0..ln], "") == 0;
+}
+
+test normalize_is_idempotent_with_escapes {
+    var pay : [32]u8 = undefined;
+    var s : usize = put_bytes(pay[0..32], 0, "a \"q\" \\ b");
+    pay[s] = 10;
+    s = s + 1;
+    var a : [2048]u8 = undefined;
+    const na : usize = tl_event_line(a[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, TL_T_TR, TL_T_SP, "", pay[0..s], "ev-0123456789abcdef");
+    assert na > 0;
+    assert tl_validate_line(a[0..na]) == TL_OK;
+    var b : [2048]u8 = undefined;
+    const nb : usize = tl_normalize(a[0..na], b[0..2048]);
+    assert nb == na;
+    assert bytes_eq(a[0..na], b[0..nb]);
+    var out : [256]u8 = undefined;
+    const m : usize = tl_menu_row(a[0..na], out[0..256]);
+    assert bytes_eq(out[0..m], "12:34:56 INFO pane agent_step 0af76519 a \"q\" \\ b ");
+}
+
+// ---- the `tri t27l validate` contract: golden and property tests (owner order MIGRATE_TRI_RUST_TO_T27) ----
+
+/// The json and text outputs of a run on this target and format: both pass tl_text_safe and neither holds the target.
+fn tl_vt_no_echo(target: []const u8, format: []const u8) -> bool {
+    const r : u8 = tl_vcmd_check(target, format, true, true);
+    var out : [256]u8 = undefined;
+    const n : usize = tl_vcmd_out(out[0..256], TL_FMT_JSON, r, 2, 1, 2);
+    if (n == 0 or !tl_text_safe(out[0..n])) { return false; }
+    if (tl_has(out[0..n], target, false)) { return false; }
+    const m : usize = tl_vcmd_out(out[0..256], TL_FMT_TEXT, r, 2, 1, 2);
+    if (m == 0 or !tl_text_safe(out[0..m])) { return false; }
+    return !tl_has(out[0..m], target, false);
+}
+
+test valid_target_passes {
+    assert tl_vcmd_check("logs/t27l.jsonl", "", true, true) == TL_VR_NONE;
+    assert tl_vcmd_check("logs/t27l.jsonl", "json", true, true) == TL_VR_NONE;
+    var a : [2048]u8 = undefined;
+    const na : usize = tl_event_line(a[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", 2, 3, 5, 2, TL_T_TR, TL_T_SP, "", "step one", "");
+    assert na > 0;
+    assert tl_vcmd_line(a[0..na]) == 0;
+    assert tl_vcmd_line("") == 3;
+    const r : u8 = tl_vcmd_result(false, 0, 0, true);
+    assert r == TL_VR_NONE;
+    assert tl_vcmd_exit(tl_vreason_status(r)) == TL_EXIT_OK;
+    var out : [256]u8 = undefined;
+    const n : usize = tl_vcmd_out(out[0..256], TL_FMT_JSON, r, 1, 0, 0);
+    assert bytes_eq(out[0..n], "{\"status\":\"ok\",\"reason\":\"none\",\"lines\":1,\"bad\":0,\"first_bad\":0}");
+    const m : usize = tl_vcmd_out(out[0..256], TL_FMT_TEXT, r, 1, 0, 0);
+    assert bytes_eq(out[0..m], "ok none lines 1 bad 0 first_bad 0");
+}
+
+test missing_target_fails {
+    assert tl_vcmd_check("", "", false, false) == TL_VR_TARGET_MISSING;
+    assert tl_vcmd_check("logs/none.jsonl", "", false, false) == TL_VR_NOT_FOUND;
+    assert tl_vcmd_check("logs/locked.jsonl", "text", true, false) == TL_VR_UNREADABLE;
+    assert tl_vcmd_check("logs/t27l.jsonl", "yaml", true, true) == TL_VR_FORMAT;
+    // the format is checked before the file: an unknown format on a missing target says unknown_format
+    assert tl_vcmd_check("logs/none.jsonl", "yaml", false, false) == TL_VR_FORMAT;
+    assert tl_vcmd_check("API_KEY=abc123", "", true, true) == TL_VR_SECRET_ARG;
+    assert tl_vcmd_check("my-password.jsonl", "", true, true) == TL_VR_SECRET_ARG;
+    var long : [1100]u8 = undefined;
+    const ln : usize = tl_t_fill(long[0..1100], 0, 97, 1025);
+    assert tl_vcmd_check(long[0..ln], "", true, true) == TL_VR_TOO_LONG;
+    assert tl_vcmd_exit(tl_vreason_status(TL_VR_TARGET_MISSING)) == TL_EXIT_INVALID;
+    assert tl_vcmd_exit(tl_vreason_status(TL_VR_NOT_FOUND)) == TL_EXIT_INVALID;
+    assert tl_vcmd_exit(tl_vreason_status(TL_VR_IO)) == TL_EXIT_FAILED;
+}
+
+test json_output_schema {
+    assert tl_vcmd_line("{\"schema\":\"t27l/v1\"}") == 1;
+    assert tl_vcmd_result(false, 1, 0, false) == TL_VR_BAD_LINES;
+    assert tl_vcmd_result(false, 0, 2, false) == TL_VR_NONE;
+    assert tl_vcmd_result(false, 0, 2, true) == TL_VR_NON_CANONICAL;
+    assert tl_vcmd_result(true, 0, 0, false) == TL_VR_IO;
+    var out : [256]u8 = undefined;
+    var n : usize = tl_vcmd_json(out[0..256], TL_VR_BAD_LINES, 3, 1, 2);
+    assert bytes_eq(out[0..n], "{\"status\":\"failed\",\"reason\":\"bad_lines\",\"lines\":3,\"bad\":1,\"first_bad\":2}");
+    n = tl_vcmd_json(out[0..256], TL_VR_FORMAT, 0, 0, 0);
+    assert bytes_eq(out[0..n], "{\"status\":\"invalid_input\",\"reason\":\"unknown_format\",\"lines\":0,\"bad\":0,\"first_bad\":0}");
+    n = tl_vcmd_text(out[0..256], TL_VR_BAD_LINES, 3, 1, 2);
+    assert bytes_eq(out[0..n], "failed bad_lines lines 3 bad 1 first_bad 2");
+    assert tl_vcmd_json(out[0..159], TL_VR_NONE, 1, 0, 0) == 0;
+    assert tl_format_id("json") == TL_FMT_JSON;
+    assert tl_format_id("JSON") == 0;
+}
+
+// property: for every reason (and two past the last), the exit code matches the status, and an unknown one fails closed
+test exit_code_matches_status {
+    var r : u8 = 0;
+    while (r <= TL_VR_LAST + 2) {
+        const st : u8 = tl_vreason_status(r);
+        const ex : u8 = tl_vcmd_exit(st);
+        assert tl_status_name(st).len > 0;
+        assert (st == TL_ST_OK) == (ex == TL_EXIT_OK);
+        assert (st == TL_ST_INVALID) == (ex == TL_EXIT_INVALID);
+        assert (st == TL_ST_FAILED) == (ex == TL_EXIT_FAILED);
+        assert (r == TL_VR_NONE) == (ex == TL_EXIT_OK);
+        r = r + 1;
+    }
+    assert tl_vcmd_exit(0) == TL_EXIT_FAILED;
+    assert tl_vcmd_exit(9) == TL_EXIT_FAILED;
+    assert tl_vreason_name(TL_VR_LAST + 1).len == 0;
+}
+
+// property: no secret in the output regardless of the input; the output never echoes the target
+test no_secret_in_output {
+    assert tl_vt_no_echo("logs/t27l.jsonl", "json");
+    assert tl_vt_no_echo("API_KEY=abc123", "json");
+    assert tl_vt_no_echo("-----BEGIN RSA PRIVATE KEY-----", "text");
+    assert tl_vt_no_echo("bob@example.com", "");
+    assert tl_vt_no_echo("Authorization: x", "yaml");
+    assert tl_vt_no_echo("Cookie: a=b", "json");
+}
+
+test undeclared_effects_are_denied {
+    assert tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_EFF_READ_FS);
+    assert tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_EFF_TELEMETRY);
+    assert tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_VALIDATE_EFFECTS);
+    assert tl_effect_allowed(TL_VALIDATE_EFFECTS, 0);
+    assert !tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_EFF_WRITE_FS);
+    assert !tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_EFF_NETWORK);
+    assert !tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_EFF_SECRETS);
+    assert !tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_EFF_PROCESS);
+    assert !tl_effect_allowed(TL_VALIDATE_EFFECTS, TL_EFF_READ_FS + TL_EFF_NETWORK);
+    assert !tl_effect_allowed(TL_VALIDATE_EFFECTS, 64);
+    assert !tl_effect_allowed(255, TL_EFF_READ_FS);
+    var b : [2048]u8 = undefined;
+    const n : usize = tl_effect_denied_line(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", TL_T_TR, TL_T_SP, "validate", TL_VALIDATE_EFFECTS, TL_EFF_NETWORK);
+    assert n > 0;
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    assert tl_filter(b[0..n], 3, 65536);
+    assert !tl_filter(b[0..n], 4, 65536);
+    assert tl_effect_denied_line(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", TL_T_TR, TL_T_SP, "validate", TL_VALIDATE_EFFECTS, TL_EFF_READ_FS) == 0;
+    assert tl_effect_denied_line(b[0..2048], TL_T_EV1, "2026-11-08T12:34:56Z", "mac-1", "sess-1", TL_T_TR, TL_T_SP, "API_KEY=abc123", TL_VALIDATE_EFFECTS, TL_EFF_NETWORK) == 0;
+}
+
+test ci_and_migration_events {
+    assert tl_surface_id("ci") == 16;
+    assert tl_surface_id("migration") == 17;
+    assert tl_action_id("billing_status_checked") == 108;
+    assert tl_action_id("untrusted_pr_blocked") == 122;
+    assert tl_action_id("migration_dry_run") == 123;
+    assert tl_action_id("contract_promoted") == 128;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "system", "ci", "runner_offline", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "ci", "runner_offline", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "ci", "cache_hit", "debug");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "ci", "untrusted_pr_blocked", "debug");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "migration", "migration_rolled_back", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "migration", "effect_denied", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "migraton", "migration_dry_run", "info");
+    assert tl_validate_line(b[0..n]) == E_SURFACE;
+}
+
+test migration_runner_is_reversible {
+    assert tl_mig_mode(true, false, false) == TL_MM_DRY_RUN;
+    assert tl_mig_mode(false, true, false) == TL_MM_CHECKPOINT;
+    assert tl_mig_mode(false, false, true) == TL_MM_ROLLBACK;
+    assert tl_mig_mode(false, false, false) == 0;
+    assert tl_mig_mode(true, true, false) == 0;
+    assert tl_mig_mode(true, true, true) == 0;
+    assert tl_mig_next(TL_MIG_LEGACY, TL_MM_DRY_RUN, true) == TL_MIG_REFUSED;
+    assert tl_mig_next(TL_MIG_LEGACY, TL_MM_CONTRACT, true) == TL_MIG_CONTRACT;
+    assert tl_mig_next(TL_MIG_LEGACY, TL_MM_CONTRACT, false) == TL_MIG_REFUSED;
+    assert tl_mig_next(TL_MIG_CONTRACT, TL_MM_DRY_RUN, false) == TL_MIG_CONTRACT;
+    assert tl_mig_next(TL_MIG_CONTRACT, TL_MM_DRY_RUN, true) == TL_MIG_DRY_OK;
+    assert tl_mig_next(TL_MIG_CONTRACT, TL_MM_CHECKPOINT, true) == TL_MIG_REFUSED;
+    assert tl_mig_next(TL_MIG_DRY_OK, TL_MM_CHECKPOINT, true) == TL_MIG_CHECKPOINT;
+    assert tl_mig_next(TL_MIG_DRY_OK, TL_MM_APPLY, true) == TL_MIG_REFUSED;
+    assert tl_mig_next(TL_MIG_CHECKPOINT, TL_MM_APPLY, false) == TL_MIG_REFUSED;
+    assert tl_mig_next(TL_MIG_CHECKPOINT, TL_MM_APPLY, true) == TL_MIG_APPLIED;
+    assert tl_mig_next(TL_MIG_DRY_OK, TL_MM_ROLLBACK, true) == TL_MIG_REFUSED;
+    assert tl_mig_next(TL_MIG_APPLIED, TL_MM_ROLLBACK, false) == TL_MIG_ROLLED_BACK;
+    assert tl_mig_next(TL_MIG_APPLIED, TL_MM_DRY_RUN, true) == TL_MIG_REFUSED;
+    assert tl_mig_next(TL_MIG_ROLLED_BACK, TL_MM_DRY_RUN, true) == TL_MIG_DRY_OK;
+    assert tl_mig_next(TL_MIG_CONTRACT, 0, true) == TL_MIG_REFUSED;
+    assert bytes_eq(tl_action_name(tl_mig_action(TL_MM_ROLLBACK)), "migration_rolled_back");
+    assert bytes_eq(tl_action_name(tl_mig_action(TL_MM_CONTRACT)), "contract_promoted");
+    assert tl_mig_action(0) == 0;
+    // property: applied is reached only from a checkpoint with green tests; a rollback only from a checkpoint or applied
+    var s : u8 = 0;
+    while (s <= TL_MIG_ROLLED_BACK) {
+        var mo : u8 = 1;
+        while (mo <= TL_MM_CONTRACT) {
+            const red : u8 = tl_mig_next(s, mo, false);
+            const grn : u8 = tl_mig_next(s, mo, true);
+            assert red != TL_MIG_APPLIED;
+            assert (grn != TL_MIG_APPLIED) or (s == TL_MIG_CHECKPOINT);
+            assert (grn != TL_MIG_ROLLED_BACK) or (s == TL_MIG_CHECKPOINT or s == TL_MIG_APPLIED);
+            assert (red != TL_MIG_ROLLED_BACK) or (s == TL_MIG_CHECKPOINT or s == TL_MIG_APPLIED);
+            mo = mo + 1;
+        }
+        s = s + 1;
+    }
+}
+
+test hex_helpers_shared_with_importers {
+    assert tl_hexval(48) == 0;
+    assert tl_hexval(57) == 9;
+    assert tl_hexval(97) == 10;
+    assert tl_hexval(102) == 15;
+    assert tl_hexval(65) == 10;
+    assert tl_hexval(70) == 15;
+    assert tl_hexval(71) >= 16;
+    assert tl_hexval(103) >= 16;
+    assert tl_hexval(16) >= 16;
+    var out : [20]u8 = undefined;
+    const n : usize = tl_put_hex16(out[0..20], 2, 3054198966);
+    assert n == 18;
+    assert bytes_eq(out[2..18], "00000000b60b60b6");
+    const z : usize = tl_put_hex16(out[0..20], 0, 0);
+    assert bytes_eq(out[0..z], "0000000000000000");
+}
+
+// Bounded recovery events (owner order 2026-11-08): eight new ids; the order's other five names are existing
+// actions and get no second id, so one event keeps one name.
+test bounded_recovery_events {
+    assert tl_action_id("swap_gate_state_changed") == 129;
+    assert tl_action_id("mailbox_backpressure_triggered") == 130;
+    assert tl_action_id("source_provenance_recorded") == 131;
+    assert tl_action_id("test_run_started") == 132;
+    assert tl_action_id("test_run_completed") == 133;
+    assert tl_action_id("commit_prepared") == 134;
+    assert tl_action_id("commit_approved") == 135;
+    assert tl_action_id("push_approved") == 136;
+    assert tl_action_id("resource_snapshot_recorded") == 0;
+    assert tl_action_id("owner_action_suggested") == 0;
+    assert tl_action_id("owner_action_confirmed") == 0;
+    assert tl_action_id("deadletter_created") == 0;
+    assert tl_action_id("recovery_suggested") == 40;
+    assert tl_action_id("recovery_approved") == 41;
+    assert tl_action_id("recovery_verified") == 43;
+    assert tl_action_id("message_deadlettered") == 72;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "system", "system", "swap_gate_state_changed", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "system", "mailbox_backpressure_triggered", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "system", "mailbox_backpressure_triggered", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "user", "system", "push_approved", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+}
+
+test lukomorye_events {
+    assert tl_surface_id("visual") == 18;
+    assert tl_action_id("terminal_opened") == 137;
+    assert tl_action_id("tree_node_clicked") == 138;
+    assert tl_action_id("tree_node_hovered") == 139;
+    assert tl_action_id("camera_moved") == 140;
+    assert tl_action_id("tree_growth_started") == 141;
+    assert tl_action_id("tree_growth_paused") == 142;
+    assert tl_action_id("tree_neighborhood_expanded") == 143;
+    assert tl_action_id("tree_structure_shown") == 144;
+    assert tl_action_id("section_changed") == 145;
+    assert tl_action_id("color_toggled") == 146;
+    assert tl_action_id("labels_toggled") == 147;
+    assert tl_action_id("live_feed_connected") == 148;
+    assert tl_action_id("live_feed_missing") == 149;
+    assert tl_action_id("replay_started") == 150;
+    assert tl_action_id("replay_completed") == 151;
+    assert tl_action_id("graph_backpressure_triggered") == 152;
+    assert tl_action_id("graph_event_rejected") == 153;
+    assert tl_action_id("bridge_event_unverified") == 154;
+    assert tl_action_id("artifact_verified") == 155;
+    assert tl_action_id("leaf_created") == 156;
+    // one scene, no view switching; the V7 Live extras are not events of this contract
+    assert tl_action_id("view_switched") == 0;
+    assert tl_action_id("message_pulse_sent") == 0;
+    assert tl_action_id("error_lightning_struck") == 0;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "system", "visual", "graph_backpressure_triggered", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "system", "visual", "graph_backpressure_triggered", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "system", "visual", "live_feed_missing", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "user", "visual", "tree_node_clicked", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "user", "visual", "leaf_created", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+}
+
+// Roadmap dashboard sync and issue hygiene (owner order T27V_ROADMAP_DASHBOARD_SYNC V3, 2026-11-08): eighteen new
+// ids. The order's deadletter_created is message_deadlettered 72, so one event keeps one name. The order's actor
+// 0xPlanner@product.t27 is an agent; the actor field is one of user/agent/system, so the name lives in the payload.
+test roadmap_events {
+    assert tl_surface_id("roadmap") == 19;
+    assert tl_surface_id("roadmap") == TL_SURFACE_LAST;
+    assert tl_action_id("roadmap_membership_changed") == 157;
+    assert tl_action_id("priority_changed") == 158;
+    assert tl_action_id("board_column_changed") == 159;
+    assert tl_action_id("label_added") == 160;
+    assert tl_action_id("label_removed") == 161;
+    assert tl_action_id("label_sync_failed") == 162;
+    assert tl_action_id("roadmap_synced") == 163;
+    assert tl_action_id("sync_overflow") == 164;
+    assert tl_action_id("owner_approval_required") == 165;
+    assert tl_action_id("dashboard_view_changed") == 166;
+    assert tl_action_id("issue_duplicate_detected") == 167;
+    assert tl_action_id("issue_stale_detected") == 168;
+    assert tl_action_id("issue_resolved_elsewhere_detected") == 169;
+    assert tl_action_id("issue_close_recommended") == 170;
+    assert tl_action_id("issue_closed_with_evidence") == 171;
+    assert tl_action_id("issue_archive_recommended") == 172;
+    assert tl_action_id("hygiene_cron_run") == 173;
+    assert tl_action_id("hygiene_overflow") == 174;
+    assert tl_action_id("hygiene_overflow") == TL_ACTION_LAST;
+    assert tl_action_id("deadletter_created") == 0;
+    assert tl_action_id("message_deadlettered") == 72;
+    // one dashboard with filters: a filter change is dashboard_view_changed, there is no view switch
+    assert tl_action_id("view_switched") == 0;
+    // there is no delete verb for an issue: only close or archive
+    assert tl_action_id("issue_deleted") == 0;
+    var b : [2048]u8 = undefined;
+    var n : usize = tl_t_b(b[0..2048], "agent", "roadmap", "sync_overflow", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "roadmap", "sync_overflow", "warn");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "roadmap", "label_sync_failed", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "roadmap", "hygiene_overflow", "info");
+    assert tl_validate_line(b[0..n]) == E_LEVEL_MISMATCH;
+    n = tl_t_b(b[0..2048], "agent", "roadmap", "roadmap_synced", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+    n = tl_t_b(b[0..2048], "agent", "roadmap", "issue_close_recommended", "info");
+    assert tl_validate_line(b[0..n]) == TL_OK;
+}

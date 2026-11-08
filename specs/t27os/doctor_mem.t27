@@ -1,0 +1,751 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/doctor_mem.t27 -- T27D, the resource doctor: a bounded MAPE-K loop over memory and swap
+; (owner order T27D_DOCTOR_LOOP, 2026-11-08). Sibling of specs/t27os/doctor.t27, which keeps disk and repo
+; health and leaves memory out; nothing here restates that file.
+; -
+; MAPE-K, as Kephart and Chess frame autonomic computing (IEEE Computer 36(1), 2003, doi 10.1109/MC.2003.1160055):
+;   Monitor  = OBSERVE: one snapshot per tick, a T27L line system/resource_snapshot (section 7);
+;   Analyze  = DIAGNOSE: state, trend and alerts from at least two snapshots (sections 2 and 3);
+;   Plan     = a suggestion per consumer class (sections 4 and 5);
+;   Execute  = TREAT: only what dm_treat_check allows, then a settle window and dm_verify (section 5);
+;   Knowledge = LEARN: a pattern line after a verdict, reliable after three verified ones (section 6).
+; One generic loop with per-class rules follows the reusable-infrastructure idea of Rainbow (Garlan et al.,
+; IEEE Computer, Oct 2004). Background read, no claim attributed: Psaier and Dustdar, "A survey on
+; self-healing systems" (Computing 91, 2011, doi 10.1007/s00607-010-0107-y).
+; -
+; Hard limits (owner): no automatic kill of an external app, no restart of a system service, no deletion of
+; user data, no way past the swap gate. There is no kill, purge or delete code anywhere in this file.
+; The swap gate is LJ_MAX_SWAP_MB in specs/queen/lab_job_msg.t27 and lj_admit_host decides it; this file
+; calls it and never defines a second threshold for it.
+; -
+; Measured on the bench Mac 2026-11-08: hw.memsize 16 GiB, vm.swapusage total 20480 MB and growing (the total is
+; the size of swap files made so far, not a partition), kern.memorystatus_vm_pressure_level 2. The host reads
+; both at start; nothing here hard-codes the RAM size. Consumers are ranked by physical footprint (top MEM),
+; never RSS, which misses compressed and swapped pages; reclaim is measured, never promised.
+; -
+; Owner decision 2026-11-08 (hysteresis): BLOCKED from 6144 MB, DEGRADED 5000..6144 with half parallelism and
+; 30 s snapshots, READY (DM_HEALTHY) under 5000 MB. A closed gate opens only under 5000 MB (lj_swap_gate_next
+; in lab_job_msg.t27), so in the band the state depends on the way in: BLOCKED coming down, DEGRADED going up.
+; Every change of state is a T27L line, action swap_gate_state_changed (dm_gate_changed).
+; Deviation: the owner named skills/resource_patterns.md as the pattern store; no skills/ exists at the root,
+; so a pattern is a T27L line (action pattern_recorded) and no second store is written.
+; -
+; NOT BUILT: the 60-second host runner (sysctl and top reads, the osascript quit, the restart of an owned
+; pid), the `tri doctor` verbs beyond the existing start|stop|status (cli/tri/src/main.rs cmd_doctor), and the
+; TTY confirmation that makes owner_confirmed true. An agent's argument never sets owner_confirmed.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osDoctorMem;
+
+use t27os::t27l::tl_event_line;
+use t27os::t27l::tl_validate_line;
+use t27os::t27l::tl_arg_ok;
+use t27os::t27l::TL_OK;
+use t27os::t27l::TL_T_TR;
+use t27os::t27l::TL_T_SP;
+use t27os::t27l::TL_T_SP2;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use queen::lab_job_msg::lj_admit_host;
+use queen::lab_job_msg::LJ_ADMIT_SWAP;
+use queen::lab_job_msg::LJ_SWAP_REOPEN_MB;
+use queen::lab_job_msg::lj_swap_gate_next;
+use std::mem::bytes_eq;
+use std::mem::bytes_starts_with;
+
+; --- 1. Inputs: pressure colour and growth rate ---
+
+/// kern.memorystatus_vm_pressure_level as a colour: 1 green, 2 yellow, 4 red. Any other value is unknown,
+/// and unknown is never green (fail closed).
+pub const DM_P_UNKNOWN : u8 = 0;
+pub const DM_P_GREEN : u8 = 1;
+pub const DM_P_YELLOW : u8 = 2;
+pub const DM_P_RED : u8 = 3;
+
+pub fn dm_pressure_color(level: u32) -> u8 {
+    if (level == 1) { return DM_P_GREEN; }
+    if (level == 2) { return DM_P_YELLOW; }
+    if (level == 4) { return DM_P_RED; }
+    return DM_P_UNKNOWN;
+}
+
+pub fn dm_pressure_name(c: u8) -> []const u8 {
+    if (c == DM_P_GREEN) { return "green"; }
+    if (c == DM_P_YELLOW) { return "yellow"; }
+    if (c == DM_P_RED) { return "red"; }
+    return "unknown";
+}
+
+/// Swap growth in MB per minute between two readings dt_s seconds apart; 0 when swap fell or dt_s is 0.
+pub fn dm_growth_mb_per_min(prev_mb: u64, cur_mb: u64, dt_s: u64) -> u64 {
+    if (dt_s == 0 or cur_mb <= prev_mb) { return 0; }
+    return (cur_mb - prev_mb) * 60 / dt_s;
+}
+
+/// True when the last n rates are all strictly above limit. One reading is noise: n is 3 samples, which is
+/// 3 minutes at the healthy cadence.
+pub fn dm_sustained(rates: []const u64, n: usize, limit: u64) -> bool {
+    if (n == 0 or rates.len < n) { return false; }
+    var i : usize = rates.len - n;
+    while (i < rates.len) {
+        if (rates[i] <= limit) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+; --- 2. States, cadence, parallelism and the test gate ---
+
+pub const DM_HEALTHY : u8 = 0;
+pub const DM_DEGRADED : u8 = 1;
+pub const DM_BLOCKED : u8 = 2;
+
+pub const DM_SWAP_DEGRADED_MB : u64 = LJ_SWAP_REOPEN_MB;
+pub const DM_GROWTH_DEGRADED : u64 = 200;
+pub const DM_GROWTH_ALERT : u64 = 500;
+pub const DM_PROC_DEGRADED_MB : u64 = 500;
+pub const DM_PROC_ALERT_MB : u64 = 1024;
+pub const DM_SUSTAIN_SAMPLES : usize = 3;
+pub const DM_RED_ALERT_S : u64 = 300;
+pub const DM_TICK_HEALTHY_S : u32 = 60;
+pub const DM_TICK_DEGRADED_S : u32 = 30;
+
+/// The swap gate, read through lj_admit_host with an empty queue, no load and ample disk so that only the
+/// swap rule can refuse. One gate, one place.
+pub fn dm_gate_ready(swap_mb: u64) -> bool {
+    return lj_admit_host(0, 0, 1000, swap_mb) != LJ_ADMIT_SWAP;
+}
+
+/// BLOCKED when the gate is closed. HEALTHY (the order's READY) only when swap is under 5000 MB and pressure
+/// is green and nothing grows. DEGRADED: swap 5000..gate with the gate open, pressure not green, growth above
+/// 200 MB/min over 3 samples, or one process +500 MB in 5 minutes (proc_jump5_mb is the largest such growth).
+/// gate_open is lj_swap_gate_next of this reading, so a gate closed above 6144 stays BLOCKED down to 5000.
+pub fn dm_state_gated(gate_open: bool, swap_mb: u64, color: u8, growth_hot: bool, proc_jump5_mb: u64) -> u8 {
+    if (!gate_open) { return DM_BLOCKED; }
+    if (growth_hot or proc_jump5_mb >= DM_PROC_DEGRADED_MB) { return DM_DEGRADED; }
+    if (swap_mb < DM_SWAP_DEGRADED_MB and color == DM_P_GREEN) { return DM_HEALTHY; }
+    return DM_DEGRADED;
+}
+
+/// The state with no memory of the gate (a gate that was open): the stateless gate of lj_admit_host.
+pub fn dm_state(swap_mb: u64, color: u8, growth_hot: bool, proc_jump5_mb: u64) -> u8 {
+    return dm_state_gated(dm_gate_ready(swap_mb), swap_mb, color, growth_hot, proc_jump5_mb);
+}
+
+/// Whether a snapshot changed the state: then the host writes one T27L line, action swap_gate_state_changed.
+pub fn dm_gate_changed(prev_state: u8, next_state: u8) -> bool {
+    return prev_state != next_state;
+}
+
+pub fn dm_state_name(s: u8) -> []const u8 {
+    if (s == DM_HEALTHY) { return "healthy"; }
+    if (s == DM_DEGRADED) { return "degraded"; }
+    if (s == DM_BLOCKED) { return "blocked"; }
+    return "";
+}
+
+/// Seconds to the next snapshot: 60 when healthy, 30 otherwise (BLOCKED watches for recovery as closely).
+pub fn dm_tick_s(state: u8) -> u32 {
+    if (state == DM_HEALTHY) { return DM_TICK_HEALTHY_S; }
+    return DM_TICK_DEGRADED_S;
+}
+
+/// Test parallelism: full when healthy, half (at least 1) when degraded, none when blocked.
+pub fn dm_parallel(state: u8, max: u32) -> u32 {
+    if (state == DM_BLOCKED or max == 0) { return 0; }
+    if (state == DM_HEALTHY) { return max; }
+    return (max + 1) / 2;
+}
+
+/// DEGRADED and BLOCKED both warn the owner early; HEALTHY does not.
+pub fn dm_warn_owner(state: u8) -> bool {
+    return state != DM_HEALTHY;
+}
+
+; --- 3. Trend alerts (a bit set) ---
+
+pub const DM_AL_GROWTH : u32 = 1;
+pub const DM_AL_RED : u32 = 2;
+pub const DM_AL_PROC : u32 = 4;
+pub const DM_AL_STUCK : u32 = 8;
+pub const DM_AL_TEST : u32 = 16;
+
+/// GROWTH: above 500 MB/min over 3 samples. RED: pressure red for more than 300 s. PROC: one process +1024 MB
+/// in 10 minutes. STUCK: the gate refuses and swap has not fallen since a safe action. TEST: a test is running
+/// and the last rate is above the degraded rate.
+pub fn dm_alerts(rates: []const u64, red_s: u64, proc_jump10_mb: u64, swap_mb: u64, after_safe_action: bool,
+                 swap_drop_mb: u64, test_running: bool) -> u32 {
+    var a : u32 = 0;
+    if (dm_sustained(rates, DM_SUSTAIN_SAMPLES, DM_GROWTH_ALERT)) { a = a | DM_AL_GROWTH; }
+    if (red_s > DM_RED_ALERT_S) { a = a | DM_AL_RED; }
+    if (proc_jump10_mb >= DM_PROC_ALERT_MB) { a = a | DM_AL_PROC; }
+    if (!dm_gate_ready(swap_mb) and after_safe_action and swap_drop_mb == 0) { a = a | DM_AL_STUCK; }
+    if (test_running and rates.len > 0 and rates[rates.len - 1] > DM_GROWTH_DEGRADED) { a = a | DM_AL_TEST; }
+    return a;
+}
+
+/// The name of the lowest alert bit set, for a pattern trigger; "none" for 0.
+pub fn dm_alert_name(a: u32) -> []const u8 {
+    if ((a & DM_AL_GROWTH) != 0) { return "growth"; }
+    if ((a & DM_AL_RED) != 0) { return "red"; }
+    if ((a & DM_AL_PROC) != 0) { return "proc"; }
+    if ((a & DM_AL_STUCK) != 0) { return "stuck"; }
+    if ((a & DM_AL_TEST) != 0) { return "test"; }
+    return "none";
+}
+
+/// A diagnosis needs a trend, and a trend needs two snapshots.
+pub fn dm_diag_ready(samples: u32) -> bool {
+    return samples >= 2;
+}
+
+; --- 4. Consumer classes and the plan ---
+
+pub const DM_C_UNKNOWN : u8 = 0;
+pub const DM_C_SAFE : u8 = 1;
+pub const DM_C_OWNED : u8 = 2;
+pub const DM_C_CRITICAL : u8 = 3;
+pub const DM_C_LEAK : u8 = 4;
+
+fn dm_is_critical(name: []const u8, path: []const u8) -> bool {
+    if (bytes_starts_with(path, "/System/") or bytes_starts_with(path, "/usr/")) { return true; }
+    if (bytes_starts_with(path, "/sbin/") or bytes_starts_with(path, "/bin/")) { return true; }
+    if (bytes_eq(name, "kernel_task") or bytes_eq(name, "WindowServer") or bytes_eq(name, "launchd")) { return true; }
+    if (bytes_eq(name, "loginwindow")) { return true; }
+    return bytes_starts_with(name, "Claude");
+}
+
+fn dm_is_owned_name(name: []const u8) -> bool {
+    if (bytes_eq(name, "t27c") or bytes_eq(name, "t27b") or bytes_eq(name, "t27os-pty")) { return true; }
+    return bytes_eq(name, "tri") or bytes_eq(name, "T27OS");
+}
+
+fn dm_is_safe_name(name: []const u8) -> bool {
+    return bytes_eq(name, "BrowserOS") or bytes_eq(name, "Comet");
+}
+
+/// The class of a consumer. name is the app as the host would quit it (helpers counted into their app),
+/// path its executable, owned_pid true when a T27 session started it (the host's own spawn record),
+/// delta10_mb its footprint growth over 10 minutes. Exact names only: "BrowserOS neo" is not "BrowserOS",
+/// and a dev server no T27 session started is UNKNOWN. Critical wins over everything; a growth of 1024 MB in
+/// 10 minutes turns SAFE or UNKNOWN into LEAK_SUSPECT; an owned process stays owned (alert PROC still fires).
+pub fn dm_class(name: []const u8, path: []const u8, owned_pid: bool, delta10_mb: u64) -> u8 {
+    if (dm_is_critical(name, path)) { return DM_C_CRITICAL; }
+    if (owned_pid or dm_is_owned_name(name)) { return DM_C_OWNED; }
+    if (delta10_mb >= DM_PROC_ALERT_MB) { return DM_C_LEAK; }
+    if (dm_is_safe_name(name)) { return DM_C_SAFE; }
+    return DM_C_UNKNOWN;
+}
+
+pub fn dm_class_name(c: u8) -> []const u8 {
+    if (c == DM_C_SAFE) { return "safe_to_quit"; }
+    if (c == DM_C_OWNED) { return "t27_owned"; }
+    if (c == DM_C_CRITICAL) { return "critical"; }
+    if (c == DM_C_LEAK) { return "leak_suspect"; }
+    return "unknown";
+}
+
+pub const DM_A_OBSERVE : u8 = 0;
+pub const DM_A_SUGGEST_QUIT : u8 = 1;
+pub const DM_A_RESTART_OWNED : u8 = 2;
+pub const DM_A_ASK_OWNER : u8 = 3;
+pub const DM_A_ESCALATE : u8 = 4;
+
+/// The suggestion for one consumer. Nothing but observing while healthy; a critical process is only observed.
+pub fn dm_plan(cls: u8, state: u8) -> u8 {
+    if (state == DM_HEALTHY or cls == DM_C_CRITICAL) { return DM_A_OBSERVE; }
+    if (cls == DM_C_SAFE) { return DM_A_SUGGEST_QUIT; }
+    if (cls == DM_C_OWNED) { return DM_A_RESTART_OWNED; }
+    if (cls == DM_C_LEAK) { return DM_A_ESCALATE; }
+    return DM_A_ASK_OWNER;
+}
+
+pub fn dm_action_name(a: u8) -> []const u8 {
+    if (a == DM_A_SUGGEST_QUIT) { return "suggest_quit"; }
+    if (a == DM_A_RESTART_OWNED) { return "restart_owned"; }
+    if (a == DM_A_ASK_OWNER) { return "ask_owner"; }
+    if (a == DM_A_ESCALATE) { return "escalate"; }
+    return "observe";
+}
+
+/// At most one batch of blocking questions to the owner is open at a time.
+pub fn dm_may_ask(batches_open: u32) -> bool {
+    return batches_open == 0;
+}
+
+; --- 5. Treat, verify, escalate ---
+
+pub const DM_OK : u8 = 0;
+pub const DM_E_VERB : u8 = 1;
+pub const DM_E_CRITICAL : u8 = 2;
+pub const DM_E_NEEDS_OWNER : u8 = 3;
+pub const DM_E_NOT_OWNED : u8 = 4;
+pub const DM_E_RESTART_BUDGET : u8 = 5;
+pub const DM_E_REPEAT : u8 = 6;
+pub const DM_E_ARG : u8 = 7;
+pub const DM_E_NOT_OWNER : u8 = 8;
+pub const DM_E_REASON : u8 = 9;
+
+/// The only treat verbs: quit (a graceful Quit request, the app may refuse) and restart (owned only).
+/// kill, delete, purge and every other word are refused before anything else is looked at.
+pub const DM_T_QUIT : u8 = 1;
+pub const DM_T_RESTART : u8 = 2;
+
+pub fn dm_treat_verb(v: []const u8) -> u8 {
+    if (bytes_eq(v, "quit")) { return DM_T_QUIT; }
+    if (bytes_eq(v, "restart")) { return DM_T_RESTART; }
+    return 0;
+}
+
+pub const DM_MAX_RESTARTS : u32 = 2;
+pub const DM_RESTART_WINDOW_S : u32 = 600;
+
+/// May the treatment run? Critical never. An owned process within DM_MAX_RESTARTS per DM_RESTART_WINDOW_S
+/// needs nobody. Anything else is an external app: restart is refused, a quit already tried on it is never
+/// repeated, and a quit runs only with the owner's confirmation.
+pub fn dm_treat_check(verb: u8, cls: u8, owner_confirmed: bool, restarts_in_window: u32, already_tried: bool) -> u8 {
+    if (verb != DM_T_QUIT and verb != DM_T_RESTART) { return DM_E_VERB; }
+    if (cls == DM_C_CRITICAL) { return DM_E_CRITICAL; }
+    if (cls == DM_C_OWNED) {
+        if (restarts_in_window >= DM_MAX_RESTARTS) { return DM_E_RESTART_BUDGET; }
+        return DM_OK;
+    }
+    if (verb == DM_T_RESTART) { return DM_E_NOT_OWNED; }
+    if (already_tried) { return DM_E_REPEAT; }
+    if (!owner_confirmed) { return DM_E_NEEDS_OWNER; }
+    return DM_OK;
+}
+
+pub const DM_R_PENDING : u8 = 0;
+pub const DM_R_IMPROVED : u8 = 1;
+pub const DM_R_INSUFFICIENT : u8 = 2;
+pub const DM_R_FAILED : u8 = 3;
+pub const DM_SETTLE_S : u64 = 60;
+pub const DM_MIN_GAIN_MB : u64 = 256;
+
+/// Verdict on swap used before and after a treatment. No verdict before the settle window; no drop is
+/// FAILED; a drop under DM_MIN_GAIN_MB is INSUFFICIENT. The test gate is a separate question (dm_gate_ready).
+pub fn dm_verify(before_mb: u64, after_mb: u64, settled_s: u64) -> u8 {
+    if (settled_s < DM_SETTLE_S) { return DM_R_PENDING; }
+    if (after_mb >= before_mb) { return DM_R_FAILED; }
+    if (before_mb - after_mb < DM_MIN_GAIN_MB) { return DM_R_INSUFFICIENT; }
+    return DM_R_IMPROVED;
+}
+
+pub fn dm_verdict_name(r: u8) -> []const u8 {
+    if (r == DM_R_IMPROVED) { return "improved"; }
+    if (r == DM_R_INSUFFICIENT) { return "insufficient"; }
+    if (r == DM_R_FAILED) { return "failed"; }
+    return "pending";
+}
+
+/// After a verdict: keep observing when it improved, escalate otherwise. Never a second try of the same action.
+pub fn dm_after_verdict(r: u8) -> u8 {
+    if (r == DM_R_IMPROVED or r == DM_R_PENDING) { return DM_A_OBSERVE; }
+    return DM_A_ESCALATE;
+}
+
+pub const DM_DS_WATCHING : u8 = 1;
+pub const DM_DS_TREATING : u8 = 2;
+pub const DM_DS_ESCALATED : u8 = 3;
+pub const DM_DS_BLOCKED : u8 = 4;
+pub const DM_MAX_FAILURES : u32 = 2;
+
+/// The doctor's own status. Repeated failure is BLOCKED (the owner's move), never another retry.
+pub fn dm_doctor_status(pending_verdict: bool, escalations_open: u32, failures: u32) -> u8 {
+    if (failures >= DM_MAX_FAILURES) { return DM_DS_BLOCKED; }
+    if (escalations_open > 0) { return DM_DS_ESCALATED; }
+    if (pending_verdict) { return DM_DS_TREATING; }
+    return DM_DS_WATCHING;
+}
+
+/// Owner override of the test gate, the owner's own act. lj_admit_host is unchanged and takes no override, so an
+/// agent job, pane job or cron cycle still meets the gate; an approved override lets the owner's one command run
+/// once within DM_OVERRIDE_TTL_S and is recorded as system/gate_override at warn or above.
+pub const DM_OVERRIDE_TTL_S : u32 = 900;
+pub const DM_REASON_MAX : usize = 120;
+
+pub fn dm_override_check(actor: u8, owner_approved: bool, reason: []const u8) -> u8 {
+    if (actor != 1) { return DM_E_NOT_OWNER; }
+    if (!owner_approved) { return DM_E_NEEDS_OWNER; }
+    if (reason.len == 0 or reason.len > DM_REASON_MAX) { return DM_E_REASON; }
+    if (!tl_arg_ok(reason)) { return DM_E_ARG; }
+    return DM_OK;
+}
+
+; --- 6. Knowledge: patterns ---
+
+pub const DM_RELIABLE_MIN : u32 = 3;
+
+/// A pattern is reliable only after three verified occurrences of the same class and action.
+pub fn dm_pattern_reliable(verified: u32) -> bool {
+    return verified >= DM_RELIABLE_MIN;
+}
+
+/// What the next occurrence does: suggest early once reliable and improving, suggest as usual before that,
+/// escalate when the action did not help.
+pub fn dm_next_time(r: u8, verified: u32) -> []const u8 {
+    if (r != DM_R_IMPROVED) { return "escalate"; }
+    if (dm_pattern_reliable(verified)) { return "suggest_early"; }
+    return "suggest";
+}
+
+; --- 7. T27L lines (surface system 10, actions 38..46) ---
+
+pub const DM_SURFACE : u8 = 10;
+pub const DM_ACT_FIRST : u8 = 38;
+pub const DM_ACT_SNAPSHOT : u8 = 38;
+pub const DM_ACT_DIAGNOSIS : u8 = 39;
+pub const DM_ACT_SUGGESTED : u8 = 40;
+pub const DM_ACT_APPROVED : u8 = 41;
+pub const DM_ACT_EXECUTED : u8 = 42;
+pub const DM_ACT_VERIFIED : u8 = 43;
+pub const DM_ACT_PATTERN : u8 = 44;
+pub const DM_ACT_ESCALATED : u8 = 45;
+pub const DM_ACT_OVERRIDE : u8 = 46;
+pub const DM_ACT_LAST : u8 = 46;
+
+/// One doctor event as a t27l/v1 line; 0 for an action outside 38..46 or anything tl_event_line refuses.
+pub fn dm_event(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                actor: u8, action: u8, level: u8, trace_id: []const u8, span_id: []const u8,
+                parent_span_id: []const u8, payload: []const u8) -> usize {
+    if (action < DM_ACT_FIRST or action > DM_ACT_LAST) { return 0; }
+    return tl_event_line(out, event_id, ts, device_id, session_id, actor, DM_SURFACE, action, level, trace_id,
+                         span_id, parent_span_id, payload, "");
+}
+
+/// The snapshot payload: numbers and fixed words only, never a process path.
+pub fn dm_snapshot_payload(out: []u8, swap_mb: u64, total_mb: u64, growth: u64, color: u8, load_x100: u64,
+                           state: u8) -> usize {
+    if (out.len < 256) { return 0; }
+    var o : usize = put_bytes(out, 0, "swap_mb=");
+    o = put_dec(out, o, swap_mb);
+    o = put_bytes(out, o, " total_mb=");
+    o = put_dec(out, o, total_mb);
+    o = put_bytes(out, o, " growth_mb_min=");
+    o = put_dec(out, o, growth);
+    o = put_bytes(out, o, " pressure=");
+    o = put_bytes(out, o, dm_pressure_name(color));
+    o = put_bytes(out, o, " load_x100=");
+    o = put_dec(out, o, load_x100);
+    o = put_bytes(out, o, " state=");
+    o = put_bytes(out, o, dm_state_name(state));
+    return o;
+}
+
+/// The diagnosis payload: state, alerts, the trend and how many snapshots it rests on; the snapshots themselves
+/// are the evidence, linked as the parent span of the diagnosis line. 0 without a trend.
+pub fn dm_diag_payload(out: []u8, state: u8, alerts: u32, trend: u64, samples: u32, top_cls: u8, top_mb: u64) -> usize {
+    if (out.len < 256 or !dm_diag_ready(samples)) { return 0; }
+    var o : usize = put_bytes(out, 0, "state=");
+    o = put_bytes(out, o, dm_state_name(state));
+    o = put_bytes(out, o, " alerts=");
+    o = put_dec(out, o, @as(u64, alerts));
+    o = put_bytes(out, o, " trend_mb_min=");
+    o = put_dec(out, o, trend);
+    o = put_bytes(out, o, " samples=");
+    o = put_dec(out, o, @as(u64, samples));
+    o = put_bytes(out, o, " top_class=");
+    o = put_bytes(out, o, dm_class_name(top_cls));
+    o = put_bytes(out, o, " top_mb=");
+    o = put_dec(out, o, top_mb);
+    return o;
+}
+
+/// The pattern payload, written only after a verdict (0 while pending).
+pub fn dm_pattern_payload(out: []u8, alerts: u32, cls: u8, action: u8, before_mb: u64, after_mb: u64,
+                          recovery_s: u64, r: u8, verified: u32) -> usize {
+    if (out.len < 256 or r == DM_R_PENDING) { return 0; }
+    var o : usize = put_bytes(out, 0, "trigger=");
+    o = put_bytes(out, o, dm_alert_name(alerts));
+    o = put_bytes(out, o, " class=");
+    o = put_bytes(out, o, dm_class_name(cls));
+    o = put_bytes(out, o, " action=");
+    o = put_bytes(out, o, dm_action_name(action));
+    o = put_bytes(out, o, " before_mb=");
+    o = put_dec(out, o, before_mb);
+    o = put_bytes(out, o, " after_mb=");
+    o = put_dec(out, o, after_mb);
+    o = put_bytes(out, o, " recovery_s=");
+    o = put_dec(out, o, recovery_s);
+    o = put_bytes(out, o, " outcome=");
+    o = put_bytes(out, o, dm_verdict_name(r));
+    o = put_bytes(out, o, " next=");
+    o = put_bytes(out, o, dm_next_time(r, verified));
+    return o;
+}
+
+; --- 8. The tri doctor verbs (dispatch NOT BUILT; start|stop|status exist in cli/tri/src/main.rs) ---
+
+pub const DM_CMD_STATUS : u8 = 1;
+pub const DM_CMD_SNAPSHOT : u8 = 2;
+pub const DM_CMD_DIAGNOSE : u8 = 3;
+pub const DM_CMD_SUGGEST : u8 = 4;
+pub const DM_CMD_TREAT : u8 = 5;
+pub const DM_CMD_VERIFY : u8 = 6;
+pub const DM_CMD_LEARN : u8 = 7;
+pub const DM_CMD_GATE_STATUS : u8 = 8;
+pub const DM_CMD_GATE_OVERRIDE : u8 = 9;
+
+/// `tri doctor <verb> [<sub>]` to a command id; 0 for anything else (there is no kill or delete verb).
+pub fn dm_cmd_id(verb: []const u8, sub: []const u8) -> u8 {
+    if (bytes_eq(verb, "gate")) {
+        if (bytes_eq(sub, "status")) { return DM_CMD_GATE_STATUS; }
+        if (bytes_eq(sub, "override")) { return DM_CMD_GATE_OVERRIDE; }
+        return 0;
+    }
+    if (sub.len != 0) { return 0; }
+    if (bytes_eq(verb, "status")) { return DM_CMD_STATUS; }
+    if (bytes_eq(verb, "snapshot")) { return DM_CMD_SNAPSHOT; }
+    if (bytes_eq(verb, "diagnose")) { return DM_CMD_DIAGNOSE; }
+    if (bytes_eq(verb, "suggest")) { return DM_CMD_SUGGEST; }
+    if (bytes_eq(verb, "treat")) { return DM_CMD_TREAT; }
+    if (bytes_eq(verb, "verify")) { return DM_CMD_VERIFY; }
+    if (bytes_eq(verb, "learn")) { return DM_CMD_LEARN; }
+    return 0;
+}
+
+/// treat takes --confirm, gate override takes the owner's approval; both are the owner's word, from a TTY.
+pub fn dm_cmd_needs_owner(cmd: u8) -> bool {
+    return cmd == DM_CMD_TREAT or cmd == DM_CMD_GATE_OVERRIDE;
+}
+
+/// Every argument (a process name, a record id, a reason) is short and passes tl_arg_ok.
+pub fn dm_arg_ok(arg: []const u8) -> bool {
+    return arg.len <= DM_REASON_MAX and tl_arg_ok(arg);
+}
+
+; --- 9. Tests ---
+
+pub const DM_T_EV : str = "33333333-4444-4555-8666-777777777777";
+pub const DM_T_TS : str = "2026-11-08T12:34:56Z";
+
+test pressure_colours_fail_closed {
+    assert dm_pressure_color(1) == DM_P_GREEN;
+    assert dm_pressure_color(2) == DM_P_YELLOW;
+    assert dm_pressure_color(4) == DM_P_RED;
+    assert dm_pressure_color(0) == DM_P_UNKNOWN;
+    assert dm_pressure_color(3) == DM_P_UNKNOWN;
+    assert dm_pressure_color(7) == DM_P_UNKNOWN;
+    assert bytes_eq(dm_pressure_name(DM_P_YELLOW), "yellow");
+}
+
+test growth_rate_and_sustained {
+    assert dm_growth_mb_per_min(1000, 1600, 60) == 600;
+    assert dm_growth_mb_per_min(1000, 1100, 30) == 200;
+    assert dm_growth_mb_per_min(1600, 1000, 60) == 0;
+    assert dm_growth_mb_per_min(1000, 1600, 0) == 0;
+    var r : [4]u64 = undefined;
+    r[0] = 50; r[1] = 250; r[2] = 260; r[3] = 270;
+    assert dm_sustained(r[0..4], 3, 200);
+    assert !dm_sustained(r[0..4], 4, 200);
+    assert !dm_sustained(r[0..2], 3, 200);
+    r[2] = 200;
+    assert !dm_sustained(r[0..4], 3, 200);
+}
+
+test states_follow_the_owner_thresholds {
+    assert dm_state(3000, DM_P_GREEN, false, 0) == DM_HEALTHY;
+    assert dm_state(3000, DM_P_GREEN, false, 499) == DM_HEALTHY;
+    assert dm_state(3000, DM_P_GREEN, false, 500) == DM_DEGRADED;
+    assert dm_state(3000, DM_P_GREEN, true, 0) == DM_DEGRADED;
+    assert dm_state(5000, DM_P_YELLOW, false, 0) == DM_DEGRADED;
+    assert dm_state(6143, DM_P_RED, false, 0) == DM_DEGRADED;
+    assert dm_state(5000, DM_P_GREEN, false, 0) == DM_DEGRADED;
+    assert dm_state(3000, DM_P_YELLOW, false, 0) == DM_DEGRADED;
+    assert dm_state(3000, DM_P_UNKNOWN, false, 0) == DM_DEGRADED;
+    assert dm_state(6144, DM_P_GREEN, false, 0) == DM_BLOCKED;
+    assert dm_state(19215, DM_P_YELLOW, false, 0) == DM_BLOCKED;
+    assert dm_state(4999, DM_P_GREEN, false, 0) == DM_HEALTHY;
+    assert bytes_eq(dm_state_name(DM_BLOCKED), "blocked");
+}
+
+test the_band_state_depends_on_the_way_in {
+    var open : bool = lj_swap_gate_next(false, 14668);
+    assert dm_state_gated(open, 14668, DM_P_YELLOW, false, 0) == DM_BLOCKED;
+    open = lj_swap_gate_next(open, 5500);
+    assert dm_state_gated(open, 5500, DM_P_GREEN, false, 0) == DM_BLOCKED;
+    open = lj_swap_gate_next(open, 4999);
+    assert dm_state_gated(open, 4999, DM_P_GREEN, false, 0) == DM_HEALTHY;
+    open = lj_swap_gate_next(open, 5500);
+    assert dm_state_gated(open, 5500, DM_P_GREEN, false, 0) == DM_DEGRADED;
+    assert dm_parallel(dm_state_gated(open, 5500, DM_P_GREEN, false, 0), 8) == 4;
+    open = lj_swap_gate_next(open, 6144);
+    assert dm_state_gated(open, 6144, DM_P_GREEN, false, 0) == DM_BLOCKED;
+    assert dm_gate_changed(DM_DEGRADED, DM_BLOCKED);
+    assert !dm_gate_changed(DM_BLOCKED, DM_BLOCKED);
+}
+
+test gate_cadence_and_parallelism {
+    assert dm_gate_ready(6143);
+    assert !dm_gate_ready(6144);
+    assert !dm_gate_ready(6145);
+    assert dm_tick_s(DM_HEALTHY) == 60;
+    assert dm_tick_s(DM_DEGRADED) == 30;
+    assert dm_tick_s(DM_BLOCKED) == 30;
+    assert dm_parallel(DM_HEALTHY, 8) == 8;
+    assert dm_parallel(DM_DEGRADED, 8) == 4;
+    assert dm_parallel(DM_DEGRADED, 1) == 1;
+    assert dm_parallel(DM_BLOCKED, 8) == 0;
+    assert !dm_warn_owner(DM_HEALTHY);
+    assert dm_warn_owner(DM_DEGRADED);
+}
+
+test trend_alerts {
+    var r : [3]u64 = undefined;
+    r[0] = 600; r[1] = 600; r[2] = 600;
+    assert dm_alerts(r[0..3], 0, 0, 3000, false, 0, false) == DM_AL_GROWTH;
+    r[1] = 400;
+    assert dm_alerts(r[0..3], 0, 0, 3000, false, 0, false) == 0;
+    assert dm_alerts(r[0..3], 301, 0, 3000, false, 0, false) == DM_AL_RED;
+    assert dm_alerts(r[0..3], 300, 0, 3000, false, 0, false) == 0;
+    assert dm_alerts(r[0..3], 0, 1024, 3000, false, 0, false) == DM_AL_PROC;
+    assert dm_alerts(r[0..3], 0, 0, 7000, true, 0, false) == DM_AL_STUCK;
+    assert dm_alerts(r[0..3], 0, 0, 7000, true, 300, false) == 0;
+    assert dm_alerts(r[0..3], 0, 0, 7000, false, 0, false) == 0;
+    assert dm_alerts(r[0..3], 0, 0, 3000, false, 0, true) == DM_AL_TEST;
+    assert bytes_eq(dm_alert_name(DM_AL_RED | DM_AL_PROC), "red");
+    assert bytes_eq(dm_alert_name(0), "none");
+    assert !dm_diag_ready(1);
+    assert dm_diag_ready(2);
+}
+
+test consumer_classes {
+    assert dm_class("kernel_task", "", false, 0) == DM_C_CRITICAL;
+    assert dm_class("mediaanalysisd", "/System/Library/PrivateFrameworks/x", false, 0) == DM_C_CRITICAL;
+    assert dm_class("WindowServer", "", false, 4000) == DM_C_CRITICAL;
+    assert dm_class("Claude", "", false, 0) == DM_C_CRITICAL;
+    assert dm_class("Claude Helper", "", true, 0) == DM_C_CRITICAL;
+    assert dm_class("t27c", "", false, 0) == DM_C_OWNED;
+    assert dm_class("t27b", "", false, 2000) == DM_C_OWNED;
+    assert dm_class("python3", "", true, 0) == DM_C_OWNED;
+    assert dm_class("BrowserOS", "", false, 0) == DM_C_SAFE;
+    assert dm_class("Comet", "", false, 0) == DM_C_SAFE;
+    assert dm_class("Comet", "", false, 2000) == DM_C_LEAK;
+    assert dm_class("BrowserOS neo", "", false, 0) == DM_C_UNKNOWN;
+    assert dm_class("node", "", false, 0) == DM_C_UNKNOWN;
+    assert dm_class("python3", "", false, 0) == DM_C_UNKNOWN;
+    assert dm_class("node", "", false, 1024) == DM_C_LEAK;
+    assert bytes_eq(dm_class_name(DM_C_SAFE), "safe_to_quit");
+}
+
+test plan_per_class {
+    assert dm_plan(DM_C_SAFE, DM_HEALTHY) == DM_A_OBSERVE;
+    assert dm_plan(DM_C_SAFE, DM_BLOCKED) == DM_A_SUGGEST_QUIT;
+    assert dm_plan(DM_C_OWNED, DM_DEGRADED) == DM_A_RESTART_OWNED;
+    assert dm_plan(DM_C_UNKNOWN, DM_BLOCKED) == DM_A_ASK_OWNER;
+    assert dm_plan(DM_C_LEAK, DM_DEGRADED) == DM_A_ESCALATE;
+    assert dm_plan(DM_C_CRITICAL, DM_BLOCKED) == DM_A_OBSERVE;
+    assert dm_may_ask(0);
+    assert !dm_may_ask(1);
+}
+
+test treatments_are_bounded {
+    assert dm_treat_verb("quit") == DM_T_QUIT;
+    assert dm_treat_verb("restart") == DM_T_RESTART;
+    assert dm_treat_verb("kill") == 0;
+    assert dm_treat_verb("delete") == 0;
+    assert dm_treat_verb("purge") == 0;
+    assert dm_treat_verb("") == 0;
+    assert dm_treat_check(0, DM_C_SAFE, true, 0, false) == DM_E_VERB;
+    assert dm_treat_check(DM_T_QUIT, DM_C_SAFE, false, 0, false) == DM_E_NEEDS_OWNER;
+    assert dm_treat_check(DM_T_QUIT, DM_C_SAFE, true, 0, false) == DM_OK;
+    assert dm_treat_check(DM_T_QUIT, DM_C_UNKNOWN, false, 0, false) == DM_E_NEEDS_OWNER;
+    assert dm_treat_check(DM_T_QUIT, DM_C_UNKNOWN, true, 0, false) == DM_OK;
+    assert dm_treat_check(DM_T_QUIT, DM_C_LEAK, false, 0, false) == DM_E_NEEDS_OWNER;
+    assert dm_treat_check(DM_T_QUIT, DM_C_CRITICAL, true, 0, false) == DM_E_CRITICAL;
+    assert dm_treat_check(DM_T_RESTART, DM_C_CRITICAL, true, 0, false) == DM_E_CRITICAL;
+    assert dm_treat_check(DM_T_RESTART, DM_C_UNKNOWN, true, 0, false) == DM_E_NOT_OWNED;
+    assert dm_treat_check(DM_T_QUIT, DM_C_SAFE, true, 0, true) == DM_E_REPEAT;
+    assert dm_treat_check(DM_T_RESTART, DM_C_OWNED, false, 0, false) == DM_OK;
+    assert dm_treat_check(DM_T_RESTART, DM_C_OWNED, false, 1, false) == DM_OK;
+    assert dm_treat_check(DM_T_RESTART, DM_C_OWNED, false, 2, false) == DM_E_RESTART_BUDGET;
+}
+
+test verification_and_escalation {
+    assert dm_verify(19215, 15000, 30) == DM_R_PENDING;
+    assert dm_verify(19215, 19215, 60) == DM_R_FAILED;
+    assert dm_verify(19215, 19500, 60) == DM_R_FAILED;
+    assert dm_verify(19215, 19100, 60) == DM_R_INSUFFICIENT;
+    assert dm_verify(19215, 18959, 60) == DM_R_IMPROVED;
+    assert dm_verify(19215, 15000, 120) == DM_R_IMPROVED;
+    assert !dm_gate_ready(15000);
+    assert dm_gate_ready(6000);
+    assert dm_after_verdict(DM_R_IMPROVED) == DM_A_OBSERVE;
+    assert dm_after_verdict(DM_R_INSUFFICIENT) == DM_A_ESCALATE;
+    assert dm_after_verdict(DM_R_FAILED) == DM_A_ESCALATE;
+    assert dm_doctor_status(false, 0, 0) == DM_DS_WATCHING;
+    assert dm_doctor_status(true, 0, 0) == DM_DS_TREATING;
+    assert dm_doctor_status(true, 1, 1) == DM_DS_ESCALATED;
+    assert dm_doctor_status(false, 0, 2) == DM_DS_BLOCKED;
+}
+
+test override_is_the_owners_alone {
+    assert dm_override_check(2, true, "release") == DM_E_NOT_OWNER;
+    assert dm_override_check(3, true, "release") == DM_E_NOT_OWNER;
+    assert dm_override_check(1, false, "release") == DM_E_NEEDS_OWNER;
+    assert dm_override_check(1, true, "") == DM_E_REASON;
+    assert dm_override_check(1, true, "my password is here") == DM_E_ARG;
+    assert dm_override_check(1, true, "release blocker, swap stale after quit") == DM_OK;
+}
+
+test patterns_need_three_verdicts {
+    assert !dm_pattern_reliable(1);
+    assert !dm_pattern_reliable(2);
+    assert dm_pattern_reliable(3);
+    assert bytes_eq(dm_next_time(DM_R_IMPROVED, 1), "suggest");
+    assert bytes_eq(dm_next_time(DM_R_IMPROVED, 3), "suggest_early");
+    assert bytes_eq(dm_next_time(DM_R_FAILED, 5), "escalate");
+    var p : [512]u8 = undefined;
+    assert dm_pattern_payload(p[0..512], DM_AL_GROWTH, DM_C_SAFE, DM_A_SUGGEST_QUIT, 19215, 15000, 120, DM_R_PENDING, 0) == 0;
+    const n : usize = dm_pattern_payload(p[0..512], DM_AL_GROWTH, DM_C_SAFE, DM_A_SUGGEST_QUIT, 19215, 15000, 120,
+                                         DM_R_IMPROVED, 1);
+    assert bytes_eq(p[0..n], "trigger=growth class=safe_to_quit action=suggest_quit before_mb=19215 after_mb=15000 recovery_s=120 outcome=improved next=suggest");
+}
+
+test cli_verbs {
+    assert dm_cmd_id("status", "") == DM_CMD_STATUS;
+    assert dm_cmd_id("snapshot", "") == DM_CMD_SNAPSHOT;
+    assert dm_cmd_id("treat", "") == DM_CMD_TREAT;
+    assert dm_cmd_id("learn", "") == DM_CMD_LEARN;
+    assert dm_cmd_id("gate", "status") == DM_CMD_GATE_STATUS;
+    assert dm_cmd_id("gate", "override") == DM_CMD_GATE_OVERRIDE;
+    assert dm_cmd_id("gate", "open") == 0;
+    assert dm_cmd_id("kill", "") == 0;
+    assert dm_cmd_id("status", "x") == 0;
+    assert dm_cmd_needs_owner(DM_CMD_TREAT);
+    assert dm_cmd_needs_owner(DM_CMD_GATE_OVERRIDE);
+    assert !dm_cmd_needs_owner(DM_CMD_SNAPSHOT);
+    assert dm_arg_ok("Comet");
+    assert !dm_arg_ok("password");
+    assert !dm_arg_ok("sk-abcdefgh12345678");
+}
+
+test doctor_events_are_valid_t27l_lines {
+    var p : [512]u8 = undefined;
+    const pn : usize = dm_snapshot_payload(p[0..512], 19215, 20480, 12, DM_P_YELLOW, 17965, DM_BLOCKED);
+    assert bytes_eq(p[0..pn], "swap_mb=19215 total_mb=20480 growth_mb_min=12 pressure=yellow load_x100=17965 state=blocked");
+    var ln : [2048]u8 = undefined;
+    const n1 : usize = dm_event(ln[0..2048], DM_T_EV, DM_T_TS, "mac-1", "sess-1", 3, DM_ACT_SNAPSHOT, 2, TL_T_TR,
+                                TL_T_SP, "", p[0..pn]);
+    assert n1 > 0;
+    assert tl_validate_line(ln[0..n1]) == TL_OK;
+    var q : [512]u8 = undefined;
+    assert dm_diag_payload(q[0..512], DM_BLOCKED, DM_AL_STUCK, 12, 1, DM_C_UNKNOWN, 5809) == 0;
+    const qn : usize = dm_diag_payload(q[0..512], DM_BLOCKED, DM_AL_STUCK, 12, 5, DM_C_UNKNOWN, 5809);
+    assert bytes_eq(q[0..qn], "state=blocked alerts=8 trend_mb_min=12 samples=5 top_class=unknown top_mb=5809");
+    const n2 : usize = dm_event(ln[0..2048], DM_T_EV, DM_T_TS, "mac-1", "sess-1", 3, DM_ACT_DIAGNOSIS, 2, TL_T_TR,
+                                TL_T_SP2, TL_T_SP, q[0..qn]);
+    assert n2 > 0;
+    assert tl_validate_line(ln[0..n2]) == TL_OK;
+    assert dm_event(ln[0..2048], DM_T_EV, DM_T_TS, "mac-1", "sess-1", 3, DM_ACT_ESCALATED, 2, "", "", "", "x") == 0;
+    const n3 : usize = dm_event(ln[0..2048], DM_T_EV, DM_T_TS, "mac-1", "sess-1", 3, DM_ACT_ESCALATED, 3, "", "", "", "x");
+    assert n3 > 0;
+    const n4 : usize = dm_event(ln[0..2048], DM_T_EV, DM_T_TS, "mac-1", "sess-1", 1, DM_ACT_OVERRIDE, 3, "", "", "",
+                                "reason=release");
+    assert n4 > 0;
+    assert tl_validate_line(ln[0..n4]) == TL_OK;
+    assert dm_event(ln[0..2048], DM_T_EV, DM_T_TS, "mac-1", "sess-1", 3, 47, 2, "", "", "", "x") == 0;
+    assert dm_event(ln[0..2048], DM_T_EV, DM_T_TS, "mac-1", "sess-1", 3, 27, 3, "", "", "", "x") == 0;
+}
+
