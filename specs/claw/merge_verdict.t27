@@ -1,0 +1,604 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/merge_verdict.t27 -- the merge verdict of a session's own pull request, as a rule with tests.
+; Owner, 2026-11-08 (translated): a session merges its own PR when seven conditions hold, and every
+; verdict comes back as a record, not as prose. Until this file the rule lived only as prose in agent
+; memory (MERGE_VERDICT_FORMAT, SUBAGENT_MERGE). Three real cases pin it: #13350 (all seven held, merged
+; 3f32d4e6b5), #13351 (secret-scan answered 504 three times, then scanned clean on attempt 4; spec-guards
+; and coverage were red on master too; merged e9de4b7d44) and #13359 (re-saved two stale seals that made
+; master red, merged add5b200e9).
+; --
+; Why a new module: gates.t27 is the inventory of workflow files as data (names, classes, events), so a
+; verdict has no row there. merge_judge.t27 decides what the TRI CLAW bot merges, from the facts of every
+; open PR; this module decides what one session does with the PR it opened. Both lean on red_origin.t27
+; for the one thing they share, whole-line list matching (hits). One spec for the verdict, no second one.
+; --
+; The seven conditions, in the owner's order, and the bit each one sets in the blockers mask when it FAILS:
+;     ci_green        1   every required check passed, and none is still pending or never ran
+;     no_own_reds     2   each red check is red on master too, or comes from files outside the diff
+;     own_pr          4   the PR was opened by this session
+;     scope_match    8    the diff matches the stated scope
+;     no_conflict    16   no merge conflict with master
+;     no_scope_drift 32   the diff names no file outside the issue's Boundary (a Boundary spec's seal counts)
+;     no_regression  64   every existing test still passes, not only the new ones
+; The verdict label is decided by the six conditions other than own_pr, first match wins:
+;     MERGE_NOW   all six hold
+;     WAIT        the only failing condition is ci_green, and the wait has an end: checks are pending or
+;                 never scanned (events will finish them), or a required check is red because master is
+;                 red and a fix PR is named
+;     ESCALATE    anything else: an own red, scope mismatch or drift, a regression, a conflict, or a red
+;                 on master that nobody is fixing. "If any one fails: do not merge; escalate."
+; own_pr decides who acts, not the label (mv_act): the owner's text is "own_pr false -> the verdict is advice
+; to the owning session, which merges". So the act is A_MERGE only when all seven hold; for a PR that is not
+; this session's the same label travels as A_ADVISE to the session that opened it. An unknown mask (a bit
+; above the seven) escalates and never merges.
+; --
+; Reading CI, the facts the booleans come from:
+;   - A check class is one of K_PASS, K_PENDING, K_NO_SCAN, K_RED_OWN, K_RED_INHERITED (a red on a check
+;     that is not required: never blocks), K_RED_INHERITED_REQ (required: blocks until master is fixed).
+;     A class out of range is read as K_RED_OWN: fail closed.
+;   - NO_SCAN: a secret scan whose binary download failed (HTTP 400 or more) or which never ran produced no
+;     verdict. It is never a pass and never a red: it waits for the next attempt (#13351: 504 three times).
+;   - Inherited: a red is inherited only when master's head fails the same check (M_RED), the failure list
+;     is the same list as master's, it names at least one file, and no named file is in the PR's diff.
+;     This is stricter than red_origin.t27, which trusts a red master alone; the order asks for the same list.
+;     Lists are newline-separated paths matched as whole lines; a list with duplicate lines is not handled.
+;   - A stale seal on master is a master red. It gets its own fix PR that re-saves the seal (F_RESAVE,
+;     #13359), and an inherited red is never fixed inside the PR that inherited it (mv_push_here).
+;   - The GitHub API allows 5000 requests an hour, shared by every session: CI is read on events (a check
+;     finished, a push, master moved, another session's note), never on a timer.
+; The record line is   M TAB pr TAB VERDICT TAB act TAB blockers NL   (blockers: names joined by commas,
+; `-` for none, `?` for an unknown mask). This module decides; it merges and reads nothing.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module ClawMergeVerdict;
+
+use claw::text;
+use claw::red_origin::{hits, M_GREEN, M_RED, M_UNSEEN};
+
+/// Verdict labels.
+pub const V_MERGE_NOW : u8 = 0;
+pub const V_WAIT : u8 = 1;
+pub const V_ESCALATE : u8 = 2;
+pub const V_TEXTS : [3]str = ["MERGE_NOW", "WAIT", "ESCALATE"];
+pub const V_LENS : [3]usize = [9, 4, 8];
+
+/// What the session does with the verdict.
+pub const A_MERGE : u8 = 0;
+pub const A_ADVISE : u8 = 1;
+pub const A_HOLD : u8 = 2;
+pub const A_STOP : u8 = 3;
+pub const A_TEXTS : [4]str = ["merge", "advise", "hold", "stop"];
+pub const A_LENS : [4]usize = [5, 6, 4, 4];
+
+/// The seven conditions as bits of the blockers mask; a set bit is a condition that failed.
+pub const B_CI : u32 = 1;
+pub const B_OWN_RED : u32 = 2;
+pub const B_NOT_OWN : u32 = 4;
+pub const B_SCOPE : u32 = 8;
+pub const B_CONFLICT : u32 = 16;
+pub const B_DRIFT : u32 = 32;
+pub const B_REGRESSION : u32 = 64;
+pub const B_ALL : u32 = 127;
+pub const B_COUNT : usize = 7;
+pub const B_BITS : [7]u32 = [1, 2, 4, 8, 16, 32, 64];
+pub const B_NAMES : [7]str = ["ci_green", "no_own_reds", "own_pr", "scope_match", "no_conflict", "no_scope_drift", "no_regression"];
+pub const B_NAME_LENS : [7]usize = [8, 11, 6, 11, 11, 14, 13];
+
+/// Check classes.
+pub const K_PASS : u8 = 0;
+pub const K_PENDING : u8 = 1;
+pub const K_NO_SCAN : u8 = 2;
+pub const K_RED_OWN : u8 = 3;
+pub const K_RED_INHERITED : u8 = 4;
+pub const K_RED_INHERITED_REQ : u8 = 5;
+pub const K_COUNT : u8 = 6;
+
+/// What a red on master is.
+pub const RK_NONE : u8 = 0;
+pub const RK_STALE_SEAL : u8 = 1;
+pub const RK_OTHER : u8 = 2;
+
+/// The fix a red on master needs.
+pub const F_NONE : u8 = 0;
+pub const F_RESAVE : u8 = 1;
+pub const F_FIX : u8 = 2;
+
+/// Events that justify a CI read. Anything above E_ACK, the timer included, is polling.
+pub const E_CHECK_DONE : u8 = 0;
+pub const E_PUSH : u8 = 1;
+pub const E_MASTER_MOVED : u8 = 2;
+pub const E_ACK : u8 = 3;
+pub const E_TIMER : u8 = 4;
+
+/// GitHub API requests per hour, shared by every session on the token.
+pub const API_LIMIT_PER_HOUR : u32 = 5000;
+
+/// Whether bit b (a power of two) is set in mask.
+pub fn mv_bit(mask : u32, b : u32) -> bool {
+    return ((mask / b) % 2) == 1;
+}
+
+/// A class out of range is an own red.
+pub fn mv_class(k : u8) -> u8 {
+    if (k >= K_COUNT) { return K_RED_OWN; }
+    return k;
+}
+
+/// How many of classes[0..n) are of class k.
+pub fn mv_count(classes : []u8, n : usize, k : u8) -> u32 {
+    var c : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (mv_class(classes[i]) == k) { c += 1; }
+        i += 1;
+    }
+    return c;
+}
+
+/// One secret-scan attempt. A failed download (status 400 or more; 0 means no download was needed) or a
+/// scan that never ran is NO_SCAN, whatever else the log says. Only a scan that ran decides pass or red.
+pub fn mv_scan_class(download_status : u32, ran : bool, findings : u32) -> u8 {
+    if (download_status >= 400) { return K_NO_SCAN; }
+    if (ran == false) { return K_NO_SCAN; }
+    if (findings > 0) { return K_RED_OWN; }
+    return K_PASS;
+}
+
+/// Number of non-empty lines of list[0..n).
+pub fn mv_lines(list : str, n : usize) -> u32 {
+    return hits(list, n, list, n);
+}
+
+/// Inherited: master's head fails the same check, the failure list is master's list, it names a file, and
+/// no file it names is in the PR's diff. Anything weaker is the PR's own.
+pub fn mv_inherited(diff : str, diff_len : usize, fails : str, fails_len : usize, master_fails : str, master_len : usize, master : u8) -> bool {
+    if (master != M_RED) { return false; }
+    const n : u32 = mv_lines(fails, fails_len);
+    if (n == 0) { return false; }
+    if (hits(fails, fails_len, diff, diff_len) > 0) { return false; }
+    if (n != mv_lines(master_fails, master_len)) { return false; }
+    return hits(fails, fails_len, master_fails, master_len) == n;
+}
+
+/// The class of a red check from its reading and whether the check is required.
+pub fn mv_red_class(inherited : bool, required : bool) -> u8 {
+    if (inherited == false) { return K_RED_OWN; }
+    if (required) { return K_RED_INHERITED_REQ; }
+    return K_RED_INHERITED;
+}
+
+/// Whether a fix for this check belongs in this PR: only an own red. An inherited red is fixed on master.
+pub fn mv_push_here(k : u8) -> bool {
+    return mv_class(k) == K_RED_OWN;
+}
+
+/// The fix a red on master needs. A stale seal is re-saved; any other red, known or not, needs a fix PR.
+pub fn mv_master_fix(kind : u8) -> u8 {
+    if (kind == RK_NONE) { return F_NONE; }
+    if (kind == RK_STALE_SEAL) { return F_RESAVE; }
+    return F_FIX;
+}
+
+/// ci_green: nothing pending, nothing unscanned, no own red, no required red.
+pub fn mv_ci_green(classes : []u8, n : usize) -> bool {
+    if (mv_count(classes, n, K_PENDING) > 0) { return false; }
+    if (mv_count(classes, n, K_NO_SCAN) > 0) { return false; }
+    if (mv_count(classes, n, K_RED_OWN) > 0) { return false; }
+    return mv_count(classes, n, K_RED_INHERITED_REQ) == 0;
+}
+
+/// no_own_reds: every red is inherited.
+pub fn mv_no_own_reds(classes : []u8, n : usize) -> bool {
+    return mv_count(classes, n, K_RED_OWN) == 0;
+}
+
+/// Whether a CI that is not green has an end to wait for: a required inherited red needs a named fix PR.
+pub fn mv_can_wait(classes : []u8, n : usize, fix_pr : bool) -> bool {
+    if (mv_count(classes, n, K_RED_INHERITED_REQ) > 0 and fix_pr == false) { return false; }
+    return true;
+}
+
+/// The blockers mask of the seven conditions: a bit for each one that failed, 0 when all seven hold.
+pub fn mv_blockers(ci_green : bool, no_own_reds : bool, own_pr : bool, scope_match : bool, no_conflict : bool, no_scope_drift : bool, no_regression : bool) -> u32 {
+    var m : u32 = 0;
+    if (ci_green == false) { m += B_CI; }
+    if (no_own_reds == false) { m += B_OWN_RED; }
+    if (own_pr == false) { m += B_NOT_OWN; }
+    if (scope_match == false) { m += B_SCOPE; }
+    if (no_conflict == false) { m += B_CONFLICT; }
+    if (no_scope_drift == false) { m += B_DRIFT; }
+    if (no_regression == false) { m += B_REGRESSION; }
+    return m;
+}
+
+/// The label. Six conditions decide it; own_pr (B_NOT_OWN) only decides who acts.
+pub fn mv_verdict(mask : u32, can_wait : bool) -> u8 {
+    if (mask > B_ALL) { return V_ESCALATE; }
+    var six : u32 = mask;
+    if (mv_bit(mask, B_NOT_OWN)) { six = mask - B_NOT_OWN; }
+    if (six == 0) { return V_MERGE_NOW; }
+    if ((six == B_CI) and can_wait) { return V_WAIT; }
+    return V_ESCALATE;
+}
+
+/// The act: A_MERGE only when all seven hold; A_ADVISE for a PR that is not this session's.
+pub fn mv_act(mask : u32, can_wait : bool) -> u8 {
+    if (mask > B_ALL) { return A_STOP; }
+    if (mv_bit(mask, B_NOT_OWN)) { return A_ADVISE; }
+    const v : u8 = mv_verdict(mask, can_wait);
+    if (v == V_MERGE_NOW) { return A_MERGE; }
+    if (v == V_WAIT) { return A_HOLD; }
+    return A_STOP;
+}
+
+/// Whether CI may be read now: on an event, and with budget for the read. A timer is polling.
+pub fn mv_may_read(event : u8, left : u32, cost : u32) -> bool {
+    if (event > E_ACK) { return false; }
+    return left >= cost;
+}
+
+/// The record line into out at w, clipped at cap; returns the new cursor, which still advances when clipped.
+pub fn mv_line(pr : u32, mask : u32, can_wait : bool, out : []u8, cap : usize, w : usize) -> usize {
+    const v : usize = mv_verdict(mask, can_wait) as usize;
+    const a : usize = mv_act(mask, can_wait) as usize;
+    var x : usize = put_str(out, cap, w, "M\t", 2);
+    x = put_count(out, cap, x, pr);
+    x = put_str(out, cap, x, "\t", 1);
+    x = put_str(out, cap, x, V_TEXTS[v], V_LENS[v]);
+    x = put_str(out, cap, x, "\t", 1);
+    x = put_str(out, cap, x, A_TEXTS[a], A_LENS[a]);
+    x = put_str(out, cap, x, "\t", 1);
+    if (mask == 0) { x = put_str(out, cap, x, "-", 1); }
+    var first : bool = true;
+    var i : usize = 0;
+    if (mask > B_ALL) {
+        x = put_str(out, cap, x, "?", 1);
+        i = B_COUNT;
+    }
+    while (i < B_COUNT) {
+        if (mv_bit(mask, B_BITS[i])) {
+            if (first == false) { x = put_str(out, cap, x, ",", 1); }
+            x = put_str(out, cap, x, B_NAMES[i], B_NAME_LENS[i]);
+            first = false;
+        }
+        i += 1;
+    }
+    return put_str(out, cap, x, "\n", 1);
+}
+
+// ---- fixtures: synthetic file names in the shape of the real cases ----
+
+/// The files #13351 changed (a pty module pair and a closure seal).
+pub const DIFF : str = "specs/t27os/pty_logic.t27\nspecs/t27os/pty_server.t27\n.trinity/seals/closure_one.json\n";
+pub const DIFF_LEN : usize = 85;
+
+/// The two stale seals spec-guards named on both the PR and master.
+pub const STALE2 : str = ".trinity/seals/stale_one.json\n.trinity/seals/stale_two.json\n";
+pub const STALE2_LEN : usize = 60;
+
+/// One of them; and a list of two whose second file is not on master's list.
+pub const STALE1 : str = ".trinity/seals/stale_one.json\n";
+pub const STALE1_LEN : usize = 30;
+pub const STALE_OTHER : str = ".trinity/seals/stale_one.json\n.trinity/seals/stale_three.json\n";
+pub const STALE_OTHER_LEN : usize = 62;
+
+/// A failing file that is also in the diff.
+pub const IN_DIFF : str = "specs/t27os/pty_logic.t27\n";
+pub const IN_DIFF_LEN : usize = 26;
+
+// ---- tests: the three real cases ----
+
+test pr_13350_all_seven_hold_so_the_session_merges {
+    // 33 of 33 checks passed; the diff was exactly its Boundary.
+    var cl : [4]u8 = [0, 0, 0, 0];
+    const g : bool = mv_ci_green(&cl, 4);
+    const q : bool = mv_no_own_reds(&cl, 4);
+    assert g;
+    assert q;
+    const mask : u32 = mv_blockers(g, q, true, true, true, true, true);
+    assert mask == 0;
+    const w : bool = mv_can_wait(&cl, 4, false);
+    assert mv_verdict(mask, w) == V_MERGE_NOW;
+    assert mv_act(mask, w) == A_MERGE;
+    var out : [64]u8 = undefined;
+    assert mv_line(13350, mask, w, &out, 64, 0) == 26;
+    assert str_eq(&out, 26, "M\t13350\tMERGE_NOW\tmerge\t-\n", 26);
+}
+
+test pr_13351_gitleaks_504_is_no_scan_so_it_waits_on_every_attempt {
+    // secret-scan answered 504 on attempts 1 to 3; spec-guards and coverage were red on master too.
+    var attempt : u32 = 0;
+    while (attempt < 3) {
+        var cl : [4]u8 = [0, 0, 0, 0];
+        cl[1] = mv_scan_class(504, false, 0);
+        cl[2] = K_RED_INHERITED;
+        cl[3] = K_RED_INHERITED;
+        assert cl[1] == K_NO_SCAN;
+        const g : bool = mv_ci_green(&cl, 4);
+        const q : bool = mv_no_own_reds(&cl, 4);
+        assert g == false;
+        assert q;
+        const mask : u32 = mv_blockers(g, q, true, true, true, true, true);
+        assert mask == B_CI;
+        const w : bool = mv_can_wait(&cl, 4, false);
+        assert mv_verdict(mask, w) == V_WAIT;
+        assert mv_act(mask, w) == A_HOLD;
+        var out : [64]u8 = undefined;
+        assert mv_line(13351, mask, w, &out, 64, 0) == 27;
+        assert str_eq(&out, 27, "M\t13351\tWAIT\thold\tci_green\n", 27);
+        attempt += 1;
+    }
+}
+
+test pr_13351_attempt_four_scans_clean_and_the_inherited_reds_do_not_block {
+    var cl : [4]u8 = [0, 0, 0, 0];
+    cl[1] = mv_scan_class(0, true, 0);
+    cl[2] = K_RED_INHERITED;
+    cl[3] = K_RED_INHERITED;
+    assert cl[1] == K_PASS;
+    const g : bool = mv_ci_green(&cl, 4);
+    const q : bool = mv_no_own_reds(&cl, 4);
+    assert g;
+    assert q;
+    const w : bool = mv_can_wait(&cl, 4, false);
+    // The session that opened it merges.
+    const own : u32 = mv_blockers(g, q, true, true, true, true, true);
+    assert mv_verdict(own, w) == V_MERGE_NOW;
+    assert mv_act(own, w) == A_MERGE;
+    // Another session reads the same facts: the label is advice to the session that opened it.
+    const other : u32 = mv_blockers(g, q, false, true, true, true, true);
+    assert other == B_NOT_OWN;
+    assert mv_verdict(other, w) == V_MERGE_NOW;
+    assert mv_act(other, w) == A_ADVISE;
+    var out : [64]u8 = undefined;
+    assert mv_line(13351, other, w, &out, 64, 0) == 32;
+    assert str_eq(&out, 32, "M\t13351\tMERGE_NOW\tadvise\town_pr\n", 32);
+}
+
+test pr_13351_a_red_is_inherited_only_with_the_same_list_outside_the_diff {
+    // spec-guards named the same two stale seals on the PR and on master; neither is in the diff.
+    assert mv_lines(STALE2, STALE2_LEN) == 2;
+    assert mv_inherited(DIFF, DIFF_LEN, STALE2, STALE2_LEN, STALE2, STALE2_LEN, M_RED) == true;
+    // master green or unread: the red is the PR's.
+    assert mv_inherited(DIFF, DIFF_LEN, STALE2, STALE2_LEN, STALE2, STALE2_LEN, M_GREEN) == false;
+    assert mv_inherited(DIFF, DIFF_LEN, STALE2, STALE2_LEN, STALE2, STALE2_LEN, M_UNSEEN) == false;
+    // master fails the check on a different list: not the same failure.
+    assert mv_inherited(DIFF, DIFF_LEN, STALE_OTHER, STALE_OTHER_LEN, STALE2, STALE2_LEN, M_RED) == false;
+    // master fails more files than the PR's log names, or fewer.
+    assert mv_inherited(DIFF, DIFF_LEN, STALE1, STALE1_LEN, STALE2, STALE2_LEN, M_RED) == false;
+    assert mv_inherited(DIFF, DIFF_LEN, STALE2, STALE2_LEN, STALE1, STALE1_LEN, M_RED) == false;
+    // a failing file the PR changes is the PR's, even when master fails it too.
+    assert mv_inherited(DIFF, DIFF_LEN, IN_DIFF, IN_DIFF_LEN, IN_DIFF, IN_DIFF_LEN, M_RED) == false;
+    // a log that names no file cannot prove it is the same failure.
+    assert mv_inherited(DIFF, DIFF_LEN, "\n\n", 2, "\n\n", 2, M_RED) == false;
+    assert mv_inherited(DIFF, DIFF_LEN, "", 0, "", 0, M_RED) == false;
+}
+
+test pr_13359_a_stale_seal_on_master_gets_a_resave_pr_and_blocked_prs_wait_for_it {
+    assert mv_master_fix(RK_STALE_SEAL) == F_RESAVE;
+    assert mv_master_fix(RK_OTHER) == F_FIX;
+    assert mv_master_fix(RK_NONE) == F_NONE;
+    assert mv_master_fix(200) == F_FIX;
+    // A PR whose required check fails on the stale seals master has.
+    var cl : [4]u8 = [0, 0, 0, 0];
+    cl[3] = mv_red_class(mv_inherited(DIFF, DIFF_LEN, STALE2, STALE2_LEN, STALE2, STALE2_LEN, M_RED), true);
+    assert cl[3] == K_RED_INHERITED_REQ;
+    assert mv_push_here(cl[3]) == false;
+    const q : bool = mv_no_own_reds(&cl, 4);
+    assert q;
+    assert mv_ci_green(&cl, 4) == false;
+    // The re-save PR is named: wait. Nobody is fixing master: escalate.
+    const named : u32 = mv_blockers(false, q, true, true, true, true, true);
+    assert mv_verdict(named, mv_can_wait(&cl, 4, true)) == V_WAIT;
+    assert mv_verdict(named, mv_can_wait(&cl, 4, false)) == V_ESCALATE;
+    assert mv_act(named, mv_can_wait(&cl, 4, false)) == A_STOP;
+    // The re-save PR touched the two seals only and every check passed.
+    var fixed : [4]u8 = [0, 0, 0, 0];
+    const done : u32 = mv_blockers(mv_ci_green(&fixed, 4), mv_no_own_reds(&fixed, 4), true, true, true, true, true);
+    assert done == 0;
+    assert mv_act(done, true) == A_MERGE;
+}
+
+// ---- tests: the CI reading ----
+
+test negative_control_a_504_is_not_a_pass {
+    var status : u32 = 400;
+    while (status < 600) {
+        assert mv_scan_class(status, false, 0) != K_PASS;
+        assert mv_scan_class(status, true, 0) != K_PASS;
+        assert mv_scan_class(status, true, 9) != K_PASS;
+        assert mv_scan_class(status, false, 0) == K_NO_SCAN;
+        status += 1;
+    }
+    assert mv_scan_class(504, false, 0) == K_NO_SCAN;
+    assert mv_scan_class(504, true, 0) == K_NO_SCAN;
+}
+
+test the_control_is_not_vacuous_a_scan_that_ran_decides {
+    assert mv_scan_class(0, true, 0) == K_PASS;
+    assert mv_scan_class(200, true, 0) == K_PASS;
+    assert mv_scan_class(399, true, 0) == K_PASS;
+    assert mv_scan_class(0, true, 1) == K_RED_OWN;
+    assert mv_scan_class(0, false, 0) == K_NO_SCAN;
+    assert mv_scan_class(0, false, 5) == K_NO_SCAN;
+}
+
+test a_no_scan_check_blocks_ci_green_like_a_pending_one {
+    var cl : [3]u8 = [0, 0, 0];
+    assert mv_ci_green(&cl, 3);
+    cl[1] = K_NO_SCAN;
+    assert mv_ci_green(&cl, 3) == false;
+    assert mv_no_own_reds(&cl, 3);
+    cl[1] = K_PENDING;
+    assert mv_ci_green(&cl, 3) == false;
+    assert mv_no_own_reds(&cl, 3);
+}
+
+test an_unknown_check_class_is_read_as_an_own_red {
+    var cl : [2]u8 = [0, 0];
+    var k : u32 = 6;
+    while (k < 256) {
+        cl[1] = k as u8;
+        assert mv_ci_green(&cl, 2) == false;
+        assert mv_no_own_reds(&cl, 2) == false;
+        assert mv_push_here(k as u8);
+        k += 1;
+    }
+}
+
+test an_inherited_red_that_is_not_required_never_blocks {
+    var cl : [3]u8 = [0, 4, 4];
+    assert mv_ci_green(&cl, 3);
+    assert mv_no_own_reds(&cl, 3);
+    assert mv_push_here(K_RED_INHERITED) == false;
+    assert mv_push_here(K_RED_OWN);
+    assert mv_push_here(K_PASS) == false;
+}
+
+test only_an_own_red_is_fixed_in_this_pr_and_the_red_class_follows_the_reading {
+    assert mv_red_class(false, true) == K_RED_OWN;
+    assert mv_red_class(false, false) == K_RED_OWN;
+    assert mv_red_class(true, true) == K_RED_INHERITED_REQ;
+    assert mv_red_class(true, false) == K_RED_INHERITED;
+}
+
+// ---- tests: the verdict ----
+
+test pending_checks_wait_but_an_own_red_beats_pending {
+    var cl : [3]u8 = [0, 1, 0];
+    const g : bool = mv_ci_green(&cl, 3);
+    const q : bool = mv_no_own_reds(&cl, 3);
+    const w : bool = mv_can_wait(&cl, 3, false);
+    assert w;
+    const m : u32 = mv_blockers(g, q, true, true, true, true, true);
+    assert m == B_CI;
+    assert mv_verdict(m, w) == V_WAIT;
+    cl[2] = K_RED_OWN;
+    const g2 : bool = mv_ci_green(&cl, 3);
+    const q2 : bool = mv_no_own_reds(&cl, 3);
+    const m2 : u32 = mv_blockers(g2, q2, true, true, true, true, true);
+    assert m2 == B_CI + B_OWN_RED;
+    assert mv_verdict(m2, w) == V_ESCALATE;
+    assert mv_act(m2, w) == A_STOP;
+}
+
+test every_other_failing_condition_escalates {
+    assert mv_verdict(mv_blockers(true, false, true, true, true, true, true), true) == V_ESCALATE;
+    assert mv_verdict(mv_blockers(true, true, true, false, true, true, true), true) == V_ESCALATE;
+    assert mv_verdict(mv_blockers(true, true, true, true, false, true, true), true) == V_ESCALATE;
+    assert mv_verdict(mv_blockers(true, true, true, true, true, false, true), true) == V_ESCALATE;
+    assert mv_verdict(mv_blockers(true, true, true, true, true, true, false), true) == V_ESCALATE;
+    assert mv_act(mv_blockers(true, true, true, true, true, false, true), true) == A_STOP;
+    assert mv_act(mv_blockers(true, true, true, true, true, true, false), true) == A_STOP;
+}
+
+test a_wait_with_any_second_blocker_escalates {
+    assert mv_verdict(B_CI + B_DRIFT, true) == V_ESCALATE;
+    assert mv_verdict(B_CI + B_REGRESSION, true) == V_ESCALATE;
+    assert mv_verdict(B_CI + B_CONFLICT, true) == V_ESCALATE;
+    assert mv_verdict(B_CI + B_SCOPE, true) == V_ESCALATE;
+    assert mv_verdict(B_CI, true) == V_WAIT;
+    assert mv_verdict(B_CI, false) == V_ESCALATE;
+}
+
+test a_pr_that_is_not_this_sessions_is_advice_whatever_the_label {
+    assert mv_act(B_NOT_OWN, true) == A_ADVISE;
+    assert mv_verdict(B_NOT_OWN, true) == V_MERGE_NOW;
+    assert mv_act(B_NOT_OWN + B_CI, true) == A_ADVISE;
+    assert mv_verdict(B_NOT_OWN + B_CI, true) == V_WAIT;
+    assert mv_act(B_NOT_OWN + B_OWN_RED, true) == A_ADVISE;
+    assert mv_verdict(B_NOT_OWN + B_OWN_RED, true) == V_ESCALATE;
+}
+
+test every_blocker_set_has_one_verdict_and_only_the_empty_set_merges {
+    var m : u32 = 0;
+    var merge_now : u32 = 0;
+    var wait : u32 = 0;
+    var merges : u32 = 0;
+    var advice : u32 = 0;
+    var holds : u32 = 0;
+    var stops : u32 = 0;
+    var wait_without_end : u32 = 0;
+    while (m < 128) {
+        const g : bool = mv_bit(m, B_CI) == false;
+        const q : bool = mv_bit(m, B_OWN_RED) == false;
+        const o : bool = mv_bit(m, B_NOT_OWN) == false;
+        const s : bool = mv_bit(m, B_SCOPE) == false;
+        const c : bool = mv_bit(m, B_CONFLICT) == false;
+        const d : bool = mv_bit(m, B_DRIFT) == false;
+        const r : bool = mv_bit(m, B_REGRESSION) == false;
+        assert mv_blockers(g, q, o, s, c, d, r) == m;
+        const v : u8 = mv_verdict(m, true);
+        const a : u8 = mv_act(m, true);
+        if (v == V_MERGE_NOW) { merge_now += 1; }
+        if (v == V_WAIT) { wait += 1; }
+        if (mv_verdict(m, false) == V_WAIT) { wait_without_end += 1; }
+        if (a == A_MERGE) { merges += 1; assert m == 0; }
+        if (a == A_ADVISE) { advice += 1; assert o == false; }
+        if (a == A_HOLD) { holds += 1; assert m == B_CI; }
+        if (a == A_STOP) { stops += 1; }
+        m += 1;
+    }
+    assert merge_now == 2;
+    assert wait == 2;
+    assert wait_without_end == 0;
+    assert merges == 1;
+    assert advice == 64;
+    assert holds == 1;
+    assert stops == 62;
+}
+
+test a_mask_with_a_bit_above_the_seven_escalates_and_never_merges {
+    var m : u32 = 128;
+    while (m < 400) {
+        assert mv_verdict(m, true) == V_ESCALATE;
+        assert mv_act(m, true) == A_STOP;
+        m += 1;
+    }
+    assert mv_verdict(B_ALL, true) == V_ESCALATE;
+}
+
+// ---- tests: the API limit ----
+
+test ci_is_read_on_events_and_a_timer_is_polling {
+    assert API_LIMIT_PER_HOUR == 5000;
+    assert mv_may_read(E_CHECK_DONE, 5000, 3);
+    assert mv_may_read(E_PUSH, 5000, 3);
+    assert mv_may_read(E_MASTER_MOVED, 5000, 3);
+    assert mv_may_read(E_ACK, 5000, 3);
+    assert mv_may_read(E_TIMER, 5000, 3) == false;
+    var e : u32 = 4;
+    while (e < 256) {
+        assert mv_may_read(e as u8, 5000, 1) == false;
+        e += 1;
+    }
+}
+
+test a_read_needs_budget_even_on_an_event {
+    assert mv_may_read(E_CHECK_DONE, 3, 3);
+    assert mv_may_read(E_CHECK_DONE, 2, 3) == false;
+    assert mv_may_read(E_PUSH, 0, 1) == false;
+    assert mv_may_read(E_PUSH, 0, 0);
+}
+
+// ---- tests: the record line ----
+
+test the_record_line_spells_every_label_act_and_blocker {
+    var out : [160]u8 = undefined;
+    // all seven blockers, not this session's: every name and the escalate label
+    assert mv_line(1, 127, true, &out, 160, 0) == 101;
+    assert str_eq(&out, 101, "M\t1\tESCALATE\tadvise\tci_green,no_own_reds,own_pr,scope_match,no_conflict,no_scope_drift,no_regression\n", 101);
+    // an own red and a regression on its own PR
+    assert mv_line(13351, B_OWN_RED + B_REGRESSION, false, &out, 160, 0) == 48;
+    assert str_eq(&out, 48, "M\t13351\tESCALATE\tstop\tno_own_reds,no_regression\n", 48);
+    // an unknown mask
+    assert mv_line(7, 128, true, &out, 160, 0) == 20;
+    assert str_eq(&out, 20, "M\t7\tESCALATE\tstop\t?\n", 20);
+}
+
+test a_clipped_record_line_still_advances_the_cursor {
+    var out : [8]u8 = undefined;
+    assert mv_line(13350, 0, true, &out, 8, 0) == 26;
+    assert out[0] == 'M';
+    assert mv_line(13350, 0, true, &out, 8, 5) == 31;
+}

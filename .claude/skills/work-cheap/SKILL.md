@@ -40,6 +40,9 @@ COST RULES (owner, 2026-10-25: work cheaper). These bind you as much as the task
 8. Stop when the gate is green. No extra refactor, no extra test, no extra doc.
 9. No builds, tests or benchmarks on the Mac (hook mac-no-heavy): they run in the lab or a T27 OS pane.
 10. Hard rules, always: only .t27 for code; English and ASCII on GitHub; never print, copy or commit a secret.
+11. Prompt caching is the default: stable text first (instructions, tools, contracts, project context), the
+   task and session data last; append to history, never rewrite it; no secret or private data in a cached
+   part. A small model only on a validated task class; failed validation escalates. Law: specs/claw/cost_policy.t27.
 End your report with one line: model, tool calls, what you chose not to do.
 ```
 

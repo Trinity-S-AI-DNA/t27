@@ -1,0 +1,615 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27f/vf_type.t27 -- Outfit text with exact area-coverage anti-aliasing (T27F-007, ring 6)
+; WHY: the owner asked for real type, not the 5x7 pixel font. t27.ai sets its text in Outfit (400 and
+; 800). outfit_r_data.t27 and outfit_b_data.t27 hold those two faces as 1-bit strips drawn 80 px to the
+; em; this module reads them and paints text at any size from VT_MIN_PX to 80 px.
+; HOW: the strip holds the 94 printable ASCII glyphs side by side. vt_seg finds a glyph's ink columns in
+; the column OR (COLS): it walks the runs of ink in order, and when a run is narrower than the glyph's
+; own ink width (HarfBuzz WID at 80 px, less VT_SLACK) the next run belongs to the same glyph (a double
+; quote has two strokes). vt_glyph then maps every destination pixel back to the square of source
+; pixels it covers and takes the exact area: each source pixel counts by the part of it inside the
+; square, so a stem that falls half way across a pixel gives half the weight. Source edges are Q8
+; fractions multiplied by px so the arithmetic is exact integers: no float, no rounding of positions.
+; The glyph is placed by its left bearing (LSB) from the pen, the pen moves by the advance (ADV).
+; The blend is vf_s_blend, the same one the flat and scaled frames use.
+; LIMITS (said once, not hidden):
+;   - text is not hinted and pairs are not kerned: the pen moves by the table advance only
+;   - above 80 px the source would show its own pixels, so vt_draw_text refuses; below VT_MIN_PX it refuses
+;   - the blend is linear on stored bytes (no gamma), as everywhere in the visual factory
+;   - ASCII 33..126 and the space; any other byte advances like a space and draws nothing
+;   - the space advance is HarfBuzz's own, hb-shape --text=" " (HarfBuzz 14.4.0): 208 (400), 185 (800)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module t27f_vf_type;
+
+use t27f::outfit_r_data::OF_STRIP_W;
+use t27f::outfit_r_data::OF_STRIP_H;
+use t27f::outfit_r_data::OF_WORDS_PER_ROW;
+use t27f::outfit_r_data::OF_BASELINE;
+use t27f::outfit_r_data::OF_EM;
+use t27f::outfit_r_data::OF_GLYPHS;
+use t27f::outfit_r_data::OF_FIRST;
+use t27f::outfit_r_data::OF_UPM;
+use t27f::outfit_r_data::R_ADV;
+use t27f::outfit_r_data::R_LSB;
+use t27f::outfit_r_data::R_WID;
+use t27f::outfit_r_data::R_COLS;
+use t27f::outfit_r_data::R_INK;
+use t27f::outfit_b_data::B_ADV;
+use t27f::outfit_b_data::B_LSB;
+use t27f::outfit_b_data::B_WID;
+use t27f::outfit_b_data::B_COLS;
+use t27f::outfit_b_data::B_INK;
+use t27f::vf_scale::vf_s_blend;
+
+pub const VT_REGULAR : u32 = 400;
+pub const VT_BOLD : u32 = 800;
+pub const VT_MIN_PX : u32 = 6;
+pub const VT_MAX_PX : u32 = 80;
+pub const VT_SLACK : u32 = 3;
+pub const VT_SPACE_R : u32 = 208;
+pub const VT_SPACE_B : u32 = 185;
+
+pub const VT_OK : u32 = 0;
+pub const VT_BAD_SIZE : u32 = 1;
+pub const VT_BAD_WEIGHT : u32 = 2;
+pub const VT_BAD_RASTER : u32 = 3;
+
+pub var VT_A : [8064]u8 = [0] ** 8064;
+pub var VT_B : [8064]u8 = [0] ** 8064;
+pub var VT_G : [4800]u8 = [0] ** 4800;
+
+; one word of the ink strip of the chosen face
+fn vt_ink_word(weight: u32, at: u32) -> u32 {
+    var word : u32 = R_INK[at as usize];
+    if weight == VT_BOLD {
+        word = B_INK[at as usize];
+    }
+    return word;
+}
+
+; 1 when the source pixel (sx, sy) is ink, else 0
+fn vt_ink_px(weight: u32, sx: u32, sy: u32) -> u32 {
+    var word : u32 = vt_ink_word(weight, sy * OF_WORDS_PER_ROW + sx / 32);
+    return (word >> (31 - (sx % 32))) & 1;
+}
+
+; 1 when any row of the strip has ink in column c, else 0 (columns past the strip are blank)
+fn vt_col_on(weight: u32, c: u32) -> u32 {
+    if c >= OF_STRIP_W {
+        return 0;
+    }
+    var word : u32 = R_COLS[(c / 32) as usize];
+    if weight == VT_BOLD {
+        word = B_COLS[(c / 32) as usize];
+    }
+    return (word >> (31 - (c % 32))) & 1;
+}
+
+; advance width of glyph k in font units (1000 to the em)
+fn vt_adv(weight: u32, k: u32) -> u32 {
+    if weight == VT_BOLD {
+        return B_ADV[k as usize];
+    }
+    return R_ADV[k as usize];
+}
+
+; left bearing of glyph k in font units; negative for a glyph that leans out to the left of its pen
+fn vt_lsb(weight: u32, k: u32) -> i64 {
+    if weight == VT_BOLD {
+        return B_LSB[k as usize];
+    }
+    return R_LSB[k as usize];
+}
+
+; ink width of glyph k in font units
+fn vt_wid(weight: u32, k: u32) -> u32 {
+    if weight == VT_BOLD {
+        return B_WID[k as usize];
+    }
+    return R_WID[k as usize];
+}
+
+; advance of the space in font units
+pub fn vt_space(weight: u32) -> u32 {
+    if weight == VT_BOLD {
+        return VT_SPACE_B;
+    }
+    return VT_SPACE_R;
+}
+
+; font units to Q8 pixels at px to the em, rounded to the nearest
+pub fn vt_adv_q8(units: u32, px: u32) -> u32 {
+    return (units * px * 256 + 500) / 1000;
+}
+
+; start (end_flag 0) or end, exclusive (end_flag 1), of the ink of glyph k in the strip; OF_STRIP_W when the
+; strip holds no glyph k
+pub fn vt_seg(weight: u32, k: u32, end_flag: u32) -> u32 {
+    var c : u32 = 0;
+    var g : u32 = 0;
+    while g <= k {
+        while c < OF_STRIP_W and vt_col_on(weight, c) == 0 {
+            c = c + 1;
+        }
+        if c >= OF_STRIP_W {
+            return OF_STRIP_W;
+        }
+        var start : u32 = c;
+        var want : u32 = 0;
+        if g < OF_GLYPHS {
+            want = (vt_wid(weight, g) * OF_EM + 500) / OF_UPM;
+        }
+        var more : u32 = 1;
+        while more == 1 {
+            while c < OF_STRIP_W and vt_col_on(weight, c) == 1 {
+                c = c + 1;
+            }
+            more = 0;
+            if c - start + VT_SLACK < want {
+                var look : u32 = c;
+                while look < OF_STRIP_W and vt_col_on(weight, look) == 0 {
+                    look = look + 1;
+                }
+                if look < OF_STRIP_W {
+                    c = look;
+                    more = 1;
+                }
+            }
+        }
+        if g == k {
+            if end_flag == 1 {
+                return c;
+            }
+            return start;
+        }
+        g = g + 1;
+    }
+    return OF_STRIP_W;
+}
+
+; advance of one byte in Q8 pixels: the table advance for 33..126, the space's for anything else
+fn vt_char_adv_q8(ch: u32, px: u32, weight: u32) -> u32 {
+    var units : u32 = vt_space(weight);
+    if ch >= OF_FIRST and ch < OF_FIRST + OF_GLYPHS {
+        units = vt_adv(weight, ch - OF_FIRST);
+    }
+    return vt_adv_q8(units, px);
+}
+
+; width of the text in Q8 pixels at px to the em: the sum of the advances
+pub fn vt_text_width_q8(s: str, px: u32, weight: u32) -> u32 {
+    var total : u32 = 0;
+    var i : usize = 0;
+    while i < s.len {
+        total = total + vt_char_adv_q8(s[i] as u32, px, weight);
+        i = i + 1;
+    }
+    return total;
+}
+
+; paint glyph k with its pen at pen_q8 (Q8 pixels) and its baseline on row base_y. Every destination
+; pixel takes the exact area of ink inside the square of source pixels it covers; the arithmetic is in
+; units of Q8 times px so the square is always OF_EM * 256 wide and the weights add up exactly.
+fn vt_glyph(rgb: []u8, w: u32, h: u32, pen_q8: u32, base_y: u32, k: u32, px: u32, weight: u32, color: u32) -> void {
+    var x0 : u32 = vt_seg(weight, k, 0);
+    var x1 : u32 = vt_seg(weight, k, 1);
+    if x0 >= x1 {
+        return;
+    }
+    var pxl : i64 = px as i64;
+    var ems : i64 = OF_EM as i64;
+    var unit : i64 = 256 * pxl;
+    var left : i64 = (pen_q8 as i64) + vt_lsb(weight, k) * pxl * 256 / 1000;
+    var right : i64 = left + ((x1 - x0) as i64) * unit / ems;
+    if right < 0 {
+        return;
+    }
+    var dx_lo : i64 = 0;
+    if left > 0 {
+        dx_lo = left / 256;
+    }
+    var dx_hi : i64 = right / 256 + 1;
+    if dx_hi > (w as i64) - 1 {
+        dx_hi = (w as i64) - 1;
+    }
+    var by : i64 = base_y as i64;
+    var up : i64 = (OF_BASELINE as i64) * pxl / ems + 1;
+    var down : i64 = (((OF_STRIP_H - OF_BASELINE) as i64) * pxl + ems - 1) / ems + 1;
+    var dy_lo : i64 = by - up;
+    if dy_lo < 0 {
+        dy_lo = 0;
+    }
+    var dy_hi : i64 = by + down;
+    if dy_hi > (h as i64) - 1 {
+        dy_hi = (h as i64) - 1;
+    }
+    var cr : u32 = (color >> 16) & 255;
+    var cg : u32 = (color >> 8) & 255;
+    var cb : u32 = color & 255;
+    var den : i64 = 256 * ems * 256 * ems;
+    var foot : i64 = 256 * ems;
+    var x_lo_src : i64 = (x0 as i64) * unit;
+    var x_hi_src : i64 = (x1 as i64) * unit;
+    var y_hi_src : i64 = (OF_STRIP_H as i64) * unit;
+    var dy : i64 = dy_lo;
+    while dy <= dy_hi {
+        var ya : i64 = (dy - by) * foot + (OF_BASELINE as i64) * unit;
+        var yl : i64 = ya;
+        if yl < 0 {
+            yl = 0;
+        }
+        var yh : i64 = ya + foot;
+        if yh > y_hi_src {
+            yh = y_hi_src;
+        }
+        if yh > yl {
+            var dx : i64 = dx_lo;
+            while dx <= dx_hi {
+                var xa : i64 = (dx * 256 - left) * ems + x_lo_src;
+                var xl : i64 = xa;
+                if xl < x_lo_src {
+                    xl = x_lo_src;
+                }
+                var xh : i64 = xa + foot;
+                if xh > x_hi_src {
+                    xh = x_hi_src;
+                }
+                if xh > xl {
+                    var num : i64 = 0;
+                    var sy : i64 = yl / unit;
+                    var sy_end : i64 = (yh - 1) / unit;
+                    while sy <= sy_end {
+                        var oy_a : i64 = sy * unit;
+                        if oy_a < yl {
+                            oy_a = yl;
+                        }
+                        var oy_b : i64 = (sy + 1) * unit;
+                        if oy_b > yh {
+                            oy_b = yh;
+                        }
+                        var sx : i64 = xl / unit;
+                        var sx_end : i64 = (xh - 1) / unit;
+                        while sx <= sx_end {
+                            if vt_ink_px(weight, sx as u32, sy as u32) == 1 {
+                                var ox_a : i64 = sx * unit;
+                                if ox_a < xl {
+                                    ox_a = xl;
+                                }
+                                var ox_b : i64 = (sx + 1) * unit;
+                                if ox_b > xh {
+                                    ox_b = xh;
+                                }
+                                num = num + (ox_b - ox_a) * (oy_b - oy_a);
+                            }
+                            sx = sx + 1;
+                        }
+                        sy = sy + 1;
+                    }
+                    if num > 0 {
+                        var a : u32 = ((num * 256 + den / 2) / den) as u32;
+                        var at : usize = (((dy as u32) * w + (dx as u32)) * 3) as usize;
+                        rgb[at] = vf_s_blend(rgb[at] as u32, cr, a) as u8;
+                        rgb[at + 1] = vf_s_blend(rgb[at + 1] as u32, cg, a) as u8;
+                        rgb[at + 2] = vf_s_blend(rgb[at + 2] as u32, cb, a) as u8;
+                    }
+                }
+                dx = dx + 1;
+            }
+        }
+        dy = dy + 1;
+    }
+}
+
+; paint the text into rgb (w * h * 3 bytes, top row first): pen at x_q8 (Q8 pixels), baseline on row
+; base_y, px to the em (VT_MIN_PX..80), weight 400 or 800, colour 0xRRGGBB. Returns VT_OK or a refusal
+; with nothing painted.
+pub fn vt_draw_text(rgb: []u8, w: u32, h: u32, x_q8: u32, base_y: u32, s: str, px: u32, weight: u32, color: u32) -> u32 {
+    if px < VT_MIN_PX or px > VT_MAX_PX {
+        return VT_BAD_SIZE;
+    }
+    if weight != VT_REGULAR and weight != VT_BOLD {
+        return VT_BAD_WEIGHT;
+    }
+    if w == 0 or h == 0 or w > 4096 or h > 4096 {
+        return VT_BAD_RASTER;
+    }
+    var need : u32 = w * h * 3;
+    if need > (rgb.len as u32) {
+        return VT_BAD_RASTER;
+    }
+    var pen : u32 = x_q8;
+    var i : usize = 0;
+    while i < s.len {
+        var ch : u32 = s[i] as u32;
+        if ch >= OF_FIRST and ch < OF_FIRST + OF_GLYPHS {
+            vt_glyph(rgb, w, h, pen, base_y, ch - OF_FIRST, px, weight, color);
+        }
+        pen = pen + vt_char_adv_q8(ch, px, weight);
+        i = i + 1;
+    }
+    return VT_OK;
+}
+
+; ---- helpers for the tests below ----
+
+; zero every byte of the buffer
+fn vt_clear(buf: []u8) -> void {
+    var n : usize = 0;
+    while n < buf.len {
+        buf[n] = 0;
+        n = n + 1;
+    }
+}
+
+; sum of the bytes in [from, to)
+fn vt_sum_range(buf: []u8, from: u32, to: u32) -> u32 {
+    var total : u32 = 0;
+    var at : u32 = from;
+    while at < to {
+        total = total + (buf[at as usize] as u32);
+        at = at + 1;
+    }
+    return total;
+}
+
+; the largest red value on row y of a raster w wide
+fn vt_row_max(buf: []u8, w: u32, y: u32) -> u32 {
+    var best : u32 = 0;
+    var x : u32 = 0;
+    while x < w {
+        var v : u32 = buf[((y * w + x) * 3) as usize] as u32;
+        if v > best {
+            best = v;
+        }
+        x = x + 1;
+    }
+    return best;
+}
+
+; first row with any ink (h when none)
+fn vt_top_row(buf: []u8, w: u32, h: u32) -> u32 {
+    var y : u32 = 0;
+    while y < h {
+        if vt_row_max(buf, w, y) > 0 {
+            return y;
+        }
+        y = y + 1;
+    }
+    return h;
+}
+
+; last row with any ink (0 when none)
+fn vt_last_row(buf: []u8, w: u32, h: u32) -> u32 {
+    var last : u32 = 0;
+    var y : u32 = 0;
+    while y < h {
+        if vt_row_max(buf, w, y) > 0 {
+            last = y;
+        }
+        y = y + 1;
+    }
+    return last;
+}
+
+; how many bytes differ between two buffers over the first n bytes
+fn vt_diff_count(a: []u8, b: []u8, n: u32) -> u32 {
+    var count : u32 = 0;
+    var at : u32 = 0;
+    while at < n {
+        if a[at as usize] != b[at as usize] {
+            count = count + 1;
+        }
+        at = at + 1;
+    }
+    return count;
+}
+
+; red values in columns [c0, c1) of every row of a raster w wide and h tall
+fn vt_cols_sum(buf: []u8, w: u32, h: u32, c0: u32, c1: u32) -> u32 {
+    var total : u32 = 0;
+    var y : u32 = 0;
+    while y < h {
+        var x : u32 = c0;
+        while x < c1 {
+            total = total + (buf[((y * w + x) * 3) as usize] as u32);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return total;
+}
+
+; ink pixels of the strip in columns [x0, x1), all rows
+fn vt_ink_count(weight: u32, x0: u32, x1: u32) -> u32 {
+    var total : u32 = 0;
+    var sy : u32 = 0;
+    while sy < OF_STRIP_H {
+        var sx : u32 = x0;
+        while sx < x1 {
+            total = total + vt_ink_px(weight, sx, sy);
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+    return total;
+}
+
+; how many separate runs of ink the column OR holds
+fn vt_raw_runs(weight: u32) -> u32 {
+    var runs : u32 = 0;
+    var before : u32 = 0;
+    var c : u32 = 0;
+    while c < OF_STRIP_W {
+        var now : u32 = vt_col_on(weight, c);
+        if now == 1 and before == 0 {
+            runs = runs + 1;
+        }
+        before = now;
+        c = c + 1;
+    }
+    return runs;
+}
+
+; distance between two numbers
+fn vt_gap(a: u32, b: u32) -> u32 {
+    var d : u32 = 0;
+    if a > b {
+        d = a - b;
+    }
+    if b > a {
+        d = b - a;
+    }
+    return d;
+}
+
+; ---- tests ----
+
+test faces_split_into_94_glyphs {
+    var bad : u32 = 0;
+    var wt : u32 = 400;
+    while wt <= 800 {
+        var k : u32 = 0;
+        var prev_end : u32 = 0;
+        while k < 94 {
+            var s0 : u32 = vt_seg(wt, k, 0);
+            var s1 : u32 = vt_seg(wt, k, 1);
+            var want : u32 = (vt_wid(wt, k) * 80 + 500) / 1000;
+            var span : u32 = 0;
+            if s1 > s0 {
+                span = s1 - s0;
+            }
+            if span + 3 < want {
+                bad = bad + 1;
+            }
+            if span > want + 3 {
+                bad = bad + 1;
+            }
+            if k > 0 and s0 < prev_end + 8 {
+                bad = bad + 1;
+            }
+            prev_end = s1;
+            k = k + 1;
+        }
+        if vt_seg(wt, 94, 0) != OF_STRIP_W {
+            bad = bad + 1;
+        }
+        wt = wt + 400;
+    }
+    assert bad == 0;
+}
+
+test strip_starts_where_it_was_drawn {
+    var r0 : u32 = vt_seg(400, 0, 0);
+    var b0 : u32 = vt_seg(800, 0, 0);
+    assert r0 >= 20;
+    assert r0 <= 22;
+    assert b0 >= 18;
+    assert b0 <= 22;
+}
+
+test raw_runs_outnumber_glyphs {
+    assert vt_raw_runs(400) > 94;
+    assert vt_raw_runs(800) > 94;
+}
+
+test pen_advances_are_table_exact {
+    assert vt_text_width_q8("H", 80, 400) == 14459;
+    assert vt_text_width_q8("H", 40, 400) == 7229;
+    assert vt_text_width_q8("H", 40, 800) == 7567;
+    assert vt_text_width_q8(" ", 40, 400) == 2130;
+    assert vt_text_width_q8(" ", 40, 800) == 1894;
+    assert vt_text_width_q8("H H", 40, 400) == 7229 + 2130 + 7229;
+    assert vt_text_width_q8("H", 40, 400) != vt_text_width_q8("H", 40, 800);
+}
+
+test refusals {
+    vt_clear(&VT_A);
+    assert vt_draw_text(&VT_A, 48, 56, 0, 40, "H", 5, 400, 16777215) == VT_BAD_SIZE;
+    assert vt_draw_text(&VT_A, 48, 56, 0, 40, "H", 81, 400, 16777215) == VT_BAD_SIZE;
+    assert vt_draw_text(&VT_A, 48, 56, 0, 40, "H", 40, 500, 16777215) == VT_BAD_WEIGHT;
+    assert vt_draw_text(&VT_A, 0, 56, 0, 40, "H", 40, 400, 16777215) == VT_BAD_RASTER;
+    assert vt_draw_text(&VT_A, 48, 0, 0, 40, "H", 40, 400, 16777215) == VT_BAD_RASTER;
+    assert vt_draw_text(&VT_G, 48, 56, 0, 40, "H", 40, 400, 16777215) == VT_BAD_RASTER;
+    assert vt_sum_range(&VT_A, 0, 8064) == 0;
+    assert vt_sum_range(&VT_G, 0, 4800) == 0;
+    assert vt_draw_text(&VT_A, 48, 56, 0, 40, "H", 6, 400, 16777215) == VT_OK;
+    assert vt_draw_text(&VT_A, 48, 56, 0, 40, "H", 80, 800, 16777215) == VT_OK;
+}
+
+test h_stands_on_the_baseline {
+    vt_clear(&VT_A);
+    assert vt_draw_text(&VT_A, 48, 56, 2048, 40, "H", 40, 400, 16777215) == VT_OK;
+    assert vt_row_max(&VT_A, 48, 39) == 255;
+    assert vt_row_max(&VT_A, 48, 40) == 0;
+    assert vt_row_max(&VT_A, 48, 41) == 0;
+    var top : u32 = vt_top_row(&VT_A, 48, 56);
+    assert top >= 11;
+    assert top <= 12;
+}
+
+test g_hangs_below_the_baseline {
+    vt_clear(&VT_A);
+    assert vt_draw_text(&VT_A, 48, 56, 512, 30, "g", 24, 400, 16777215) == VT_OK;
+    var last : u32 = vt_last_row(&VT_A, 48, 56);
+    assert last >= 34;
+    assert last <= 35;
+}
+
+test ink_is_conserved_at_awkward_sizes {
+    var x0 : u32 = vt_seg(400, 39, 0);
+    var x1 : u32 = vt_seg(400, 39, 1);
+    var n : u32 = vt_ink_count(400, x0, x1);
+    assert n > 600;
+    assert n < 3000;
+    vt_clear(&VT_A);
+    assert vt_draw_text(&VT_A, 48, 56, 2048, 40, "H", 40, 400, 16777215) == VT_OK;
+    var s40 : u32 = vt_sum_range(&VT_A, 0, 8064);
+    var e40 : u32 = ((n as u64) * 40 * 40 * 765 / 6400) as u32;
+    assert vt_gap(s40, e40) * 100 <= e40 * 2;
+    vt_clear(&VT_A);
+    assert vt_draw_text(&VT_A, 48, 56, 2149, 40, "H", 33, 400, 16777215) == VT_OK;
+    var s33 : u32 = vt_sum_range(&VT_A, 0, 8064);
+    var e33 : u32 = ((n as u64) * 33 * 33 * 765 / 6400) as u32;
+    assert vt_gap(s33, e33) * 100 <= e33 * 2;
+    assert vt_gap(s33, e40) * 100 > e40 * 5;
+}
+
+test half_pixel_shift_moves_ink_not_amount {
+    vt_clear(&VT_A);
+    vt_clear(&VT_B);
+    assert vt_draw_text(&VT_A, 48, 56, 2048, 40, "I", 36, 400, 16777215) == VT_OK;
+    assert vt_draw_text(&VT_B, 48, 56, 2176, 40, "I", 36, 400, 16777215) == VT_OK;
+    assert vt_diff_count(&VT_A, &VT_B, 8064) > 0;
+    var sa : u32 = vt_sum_range(&VT_A, 0, 8064);
+    var sb : u32 = vt_sum_range(&VT_B, 0, 8064);
+    assert sa > 0;
+    assert vt_gap(sa, sb) * 100 <= sa;
+}
+
+test bold_is_heavier_than_regular {
+    vt_clear(&VT_A);
+    vt_clear(&VT_B);
+    assert vt_draw_text(&VT_A, 64, 40, 256, 30, "Ag", 24, 400, 16777215) == VT_OK;
+    assert vt_draw_text(&VT_B, 64, 40, 256, 30, "Ag", 24, 800, 16777215) == VT_OK;
+    var sr : u32 = vt_sum_range(&VT_A, 0, 7680);
+    var sb : u32 = vt_sum_range(&VT_B, 0, 7680);
+    assert sr > 0;
+    assert sb * 100 > sr * 115;
+}
+
+test clipped_glyphs_stay_inside_the_raster {
+    vt_clear(&VT_G);
+    assert vt_draw_text(&VT_G, 40, 20, 9216, 18, "W", 24, 400, 16777215) == VT_OK;
+    assert vt_sum_range(&VT_G, 0, 2400) > 0;
+    assert vt_cols_sum(&VT_G, 40, 20, 0, 8) == 0;
+    assert vt_sum_range(&VT_G, 2400, 4800) == 0;
+    vt_clear(&VT_G);
+    assert vt_draw_text(&VT_G, 40, 20, 512, 18, "g", 24, 400, 16777215) == VT_OK;
+    assert vt_sum_range(&VT_G, 0, 2400) > 0;
+    assert vt_sum_range(&VT_G, 2400, 4800) == 0;
+    vt_clear(&VT_G);
+    assert vt_draw_text(&VT_G, 40, 20, 0, 18, "j", 24, 400, 16777215) == VT_OK;
+    assert vt_sum_range(&VT_G, 0, 2400) > 0;
+    assert vt_sum_range(&VT_G, 2400, 4800) == 0;
+}

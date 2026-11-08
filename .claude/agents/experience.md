@@ -1,4 +1,5 @@
 ---
+name: experience
 model: sonnet
 description: Experience Agent - Manages learning history, provides context, retrieves patterns
 color: "#f59e0b"
