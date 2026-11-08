@@ -32,8 +32,8 @@ mod misread;
 mod night;
 mod oneaway;
 mod payout;
-mod window;
-mod modreach;
+#[path = "../../../gen/rust/tri/window/window.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] mod window_rules; mod window; // t27c gen-rust of specs/tri/window.t27
+#[path = "../../../gen/rust/tri/modreach/modreach.rs"] #[allow(dead_code, unused_parens)] mod modreach_rules; mod modreach; // t27c gen-rust of specs/tools/tri/modreach.t27
 mod mutate;
 mod nownote;
 mod orphaned;
@@ -80,7 +80,7 @@ mod pf; // t27c gen-rust of specs/tri/preflight/preflight.t27: the push prefligh
 mod renum;
 mod reseal;
 mod rtl;
-mod scratch;
+#[path = "../../../gen/rust/tri/scratch/scratch.rs"] #[allow(dead_code, unused_parens)] mod scratch_rules; mod scratch; // t27c gen-rust of specs/tools/tri/scratch.t27
 mod seals;
 mod skillnum;
 mod sweep;
