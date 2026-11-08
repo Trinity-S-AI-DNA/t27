@@ -10,10 +10,12 @@ description: Bring up the full T27F dev environment for the course HUD in one pa
 > (`python3 -m http.server`, `sips`, `gh`, `curl` on a keyless URL). A hand-written JS shim, `loader.js`, an HTML
 > `<script>` body or a Rust/wasm-pack crate is foreign code and is refused here, scratch included (skill `only-t27`).
 
-`tri dev` is **not a tri subcommand** (`tri dev` answers "unrecognized subcommand", 2026-11-08). The same goes for
-`tri visual-update`, `tri visual-show`, `tri visual-diff` and `tri visual-open`: they are names for the steps below,
-and this skill is the procedure until they exist. When they do, each must run exactly its steps and this file shrinks
-to a pointer.
+`tri dev` **does not exist** as a tri subcommand (it answers "unrecognized subcommand", 2026-11-08). Neither do
+`tri visual-update`, `tri visual-show`, `tri visual-diff` and `tri visual-open`: they are proposed names for the steps
+below, and this skill is the procedure until they are built. When they are, each must run exactly its steps and this
+file shrinks to a pointer.
+
+## Proposed subcommands (not built)
 
 | name | steps here |
 |---|---|

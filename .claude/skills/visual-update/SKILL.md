@@ -11,8 +11,8 @@ description: Re-render the course HUD (lesson 1, 375x812, 13 frames) after a cha
 > `t27f::vf_diff`), and PNG conversion is macOS `sips`. Writing a JS, Python or shell script to do any of this is
 > forbidden (`only-t27`), scratch included.
 
-`tri visual-update` is **not a tri subcommand** (the built tri has none). This skill is the procedure until it becomes
-one; when it does, the subcommand must run exactly these steps and this file shrinks to a pointer.
+`tri visual-update` **does not exist** as a tri subcommand (a proposed name; the built tri has none). This skill is the
+procedure until it is built; when it does, the subcommand must run exactly these steps and this file shrinks to a pointer.
 
 ## What one run produces
 
@@ -67,7 +67,8 @@ program writes its frames relative to the working directory.
 ## Scheduled run (every 4 hours)
 
 The owner asked for this run on a 4-hour schedule (2026-11-08). The scheduled task's prompt is one line: "Load
-skill visual-update and run one tick in /Users/playra/t27/.claude/worktrees/course-hud-style." Step 1 makes an idle
+skill visual-update and run one tick in the course-hud-style worktree" (`.claude/worktrees/course-hud-style` under the
+main clone). Step 1 makes an idle
 tick cost a single `git log`. A tick never commits, pushes or opens a PR; it only renders and reports.
 
 ## What this is not
