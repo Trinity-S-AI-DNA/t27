@@ -2,14 +2,19 @@
 // specs/crons/t27-pareto-improvement-loop.t27 -- the 15-minute continuous improvement cycle.
 // Every tick: audit the swarm state, find weak points by Pareto, fix the top one in .t27,
 // verify locally with real receipts, land green through the merge train, write the beat to the hive,
-// and never break a past merge. Self-healing: any tick that red-checks rolls back its own change
-// before the next tick starts. All logic in .t27; no foreign edits.
+// and never break a past merge. A failed tick leaves prior commits untouched: it may
+// commit only its own task files, and a red typecheck rolls that lane back to the
+// pre-tick HEAD. It never resets master, never force-pushes, and the window stays
+// blocked. All logic in .t27; no foreign edits.
 // phi^2 + 1/phi^2 = 3 | TRINITY
 ; Issue: #8220
 
 module CronParetoImprovementLoop;
 
 use crons::t27os-night-loop::pick_may_run;
+use t27os::orchestrator::oc_branch_ok;
+use t27os::orchestrator::oc_commit_ok;
+use t27os::orchestrator::oc_window_open;
 
 pub const KIND : str = "cron";
 pub const ID : str = "launchd/mac/t27-pareto-improvement-loop";
@@ -34,7 +39,9 @@ pub const CONTROL : str = "code-only";
 // 4 VERIFY -- t27c test + seal on the branch; real corpus receipt compare vs master.
 // 5 LAND   -- commit with L1 reference, push once per batch, open PR, merge when green.
 // 6 BEAT   -- post the tick's verdict (pass/fail/cost/n/repro footer) to the hive feed.
-// 7 SELF-HEAL-- if this tick's change red-checks anything, revert it before the next tick.
+// 7 SELF-HEAL-- a red typecheck rolls this lane back to its pre-tick HEAD
+//    (self_recovery_action). A change that stays red past ROLLBACK_WINDOW is reverted
+//    before the next tick. Neither path resets master or force-pushes.
 
 pub const STEP_AUDIT : u8 = 0;
 pub const STEP_PARETO : u8 = 1;
@@ -119,11 +126,106 @@ test verdicts_have_names {
     assert verdict_name(99).len > 0;
 }
 
+// ---- Self-recovery: a failed tick leaves prior commits untouched (Refs #13534) ----
+// Competitor note, 2026-11-10: a bounded improvement loop (detect, one fix,
+// keep the last green commit) is the pattern. This card states that contract.
+// No rate, cost, or pass count is claimed.
+// The commit gate is oc_commit_ok and the branch gate is oc_branch_ok. Neither
+// body is copied. pick_may_run stays the predicate for starting a fix.
+
+pub const SR_KEEP : u8 = 0;
+pub const SR_ROLLBACK_LANE : u8 = 1;
+pub const SR_REFUSE : u8 = 2;
+
+/// A tick may commit only its own task files, on its own lane, with no secret.
+pub fn tick_commit_allowed(own_lane: bool, task_files_only: bool, has_secret: bool) -> bool {
+    return oc_commit_ok(own_lane, task_files_only, has_secret);
+}
+
+/// Recovery may move only this lane. Master, a force-push, a shared rebase, and
+/// any request to open the window are refused. oc_window_open stays false.
+pub fn recovery_lane_ok(branch_is_master: bool, force_push: bool, rebase_shared: bool, window_requested: bool) -> bool {
+    if (oc_window_open()) { return false; }
+    if (window_requested) { return false; }
+    return oc_branch_ok(branch_is_master, force_push, rebase_shared);
+}
+
+/// SR_KEEP: the typecheck was green and the commit is only this tick's files.
+/// SR_ROLLBACK_LANE: the typecheck was red and this lane's pre-tick HEAD is known.
+/// SR_REFUSE: move no ref. lane_ok is recovery_lane_ok (not master, no force-push,
+/// no shared rebase, window stays shut). commit_ok is tick_commit_allowed.
+/// A red typecheck with no recorded HEAD does not guess an older commit.
+pub fn self_recovery_action(lane_ok: bool, own_lane: bool, commit_ok: bool, typecheck_red: bool, pre_tick_known: bool) -> u8 {
+    if (lane_ok == false) { return SR_REFUSE; }
+    if (own_lane == false) { return SR_REFUSE; }
+    if (typecheck_red) {
+        if (pre_tick_known) { return SR_ROLLBACK_LANE; }
+        return SR_REFUSE;
+    }
+    if (commit_ok == false) { return SR_REFUSE; }
+    return SR_KEEP;
+}
+
+/// True when the action leaves every commit older than the pre-tick HEAD in place.
+/// Rollback counts only when the target is that pre-tick HEAD on the lane.
+pub fn prior_commits_untouched(action: u8, target_is_pre_tick: bool, branch_is_master: bool, force_push: bool) -> bool {
+    if (force_push) { return false; }
+    if (action == SR_REFUSE) { return true; }
+    if (action == SR_KEEP) { return branch_is_master == false; }
+    if (action == SR_ROLLBACK_LANE) {
+        if (branch_is_master) { return false; }
+        return target_is_pre_tick;
+    }
+    return false;
+}
+
+test a_tick_commits_only_its_own_task_files {
+    assert tick_commit_allowed(true, true, false);
+    assert tick_commit_allowed(true, false, false) == false;
+    assert tick_commit_allowed(false, true, false) == false;
+    assert tick_commit_allowed(true, true, true) == false;
+    assert self_recovery_action(true, true, true, false, true) == SR_KEEP;
+    assert self_recovery_action(true, true, false, false, true) == SR_REFUSE;
+}
+
+test a_red_typecheck_rolls_the_lane_back_to_its_pre_tick_head {
+    assert self_recovery_action(true, true, true, true, true) == SR_ROLLBACK_LANE;
+    assert self_recovery_action(true, true, false, true, true) == SR_ROLLBACK_LANE;
+    assert self_recovery_action(true, true, true, true, false) == SR_REFUSE;
+    assert self_recovery_action(true, false, true, true, true) == SR_REFUSE;
+}
+
+test recovery_never_resets_master_never_force_pushes_and_the_window_stays_blocked {
+    assert oc_window_open() == false;
+    assert recovery_lane_ok(false, false, false, false);
+    assert recovery_lane_ok(true, false, false, false) == false;
+    assert recovery_lane_ok(false, true, false, false) == false;
+    assert recovery_lane_ok(false, false, true, false) == false;
+    assert recovery_lane_ok(false, false, false, true) == false;
+    assert self_recovery_action(false, true, true, true, true) == SR_REFUSE;
+    assert self_recovery_action(recovery_lane_ok(true, false, false, false), true, true, true, true) == SR_REFUSE;
+    assert self_recovery_action(recovery_lane_ok(false, true, false, false), true, true, true, true) == SR_REFUSE;
+    assert self_recovery_action(recovery_lane_ok(false, false, false, true), true, true, true, true) == SR_REFUSE;
+}
+
+test a_failed_tick_leaves_prior_commits_untouched {
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, true, false, false);
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, false, false, false) == false;
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, true, true, false) == false;
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, true, false, true) == false;
+    assert prior_commits_untouched(SR_KEEP, true, false, false);
+    assert prior_commits_untouched(SR_KEEP, true, true, false) == false;
+    assert prior_commits_untouched(SR_REFUSE, false, true, false);
+    assert prior_commits_untouched(99, true, false, false) == false;
+}
+
 invariant pareto_floors_are_sane {
     assert PARETO_IMPACT_FLOOR > 0 and PARETO_IMPACT_FLOOR <= 100;
     assert PARETO_FREQ_FLOOR > 0;
     assert ROLLBACK_WINDOW > 0;
     assert STEPS == 7;
+    assert SR_KEEP == 0 and SR_ROLLBACK_LANE == 1 and SR_REFUSE == 2;
+    assert oc_window_open() == false;
 }
 
 test negative_control_refutes_drifted_card {
