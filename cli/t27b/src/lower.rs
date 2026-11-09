@@ -7682,11 +7682,9 @@ fn shadow_names(body: &[Node], mod_vars: &HashMap<String, Place>) -> HashSet<Str
 fn mutated(ns: &[Node], name: &str) -> bool {
     let (a, t) = flat(ns); aw::mutated(&a, &t, name.as_bytes())
 }
-
 fn count_assigns(ns: &[Node], counts: &mut HashMap<String, u32>) {
     marked(ns, ax::assign_targets).for_each(|n| *counts.entry(n.name.clone()).or_insert(0) += 1);
 }
-
 /// A clause the front-end kept only as verbatim text: a childless StmtExpr
 /// named `<word>:` (`measure:`, `target:`), its text in `value`.
 fn is_prose_clause(n: &Node) -> bool {
@@ -7707,28 +7705,24 @@ fn undeclared_field_type(ty: &str, declared: &HashSet<&str>) -> Option<String> {
     let base = (r >= 0).then(|| &ty[(r / tt::HALF) as usize..(r % tt::HALF) as usize])?;
     tt::undeclared(base.as_bytes(), declared.contains(base)).then(|| base.to_string())
 }
-
 /// t27c's Zig backend writes every `_cse*` temporary the optimizer made at
 /// the very top of the fn body. One that reads a local of the body then
 /// names it before its declaration: "use of undeclared identifier".
 fn cse_hoist_defect(f: &Node) -> Option<String> {
     marked(&f.children, ax::cse_reads).find(|n| !f.params.iter().any(|(p, _)| *p == n.name)).map(|n| n.name.clone())
 }
-
 /// The reference's `collect_mutable_names`, exactly: assignment targets that
 /// are a name, or whose immediate base (index or field) is one, looking into
 /// `if`/`while`/`for` bodies and nowhere else.
 fn ref_mutable_names(ns: &[Node], out: &mut HashSet<String>) {
     out.extend(marked(ns, ax::mutable_names).map(|n| n.name.clone()));
 }
-
 /// Does Zig count `var name` as mutated anywhere in `ns`? An assignment whose
 /// target reaches `name` through fields and indexes but no `.*`, `&` of such
 /// a path, or a method call on it. Errs toward yes: a yes refuses nothing.
 fn zig_mutates(ns: &[Node], name: &str) -> bool {
     let (a, t) = flat(ns); aw::zig_mutates(&a, &t, name.as_bytes())
 }
-
 /// `x.len()` and `len(x)` lower as the length FIELD, as t27c's Zig backend
 /// prints both (W570; Zig has no `len` method on a slice or an array). Which
 /// call stands for which receiver is decided by the `lencall` module above;
@@ -7811,6 +7805,12 @@ fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
                     if ce::accumulator_elides(true, every, le, n, m, k, same, false, inner) { for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == a { relax(e, ArithOp::AddW); }); } }
                 }
             }
+            { let ExprKind::Cmp { op: o2, lhs: l2, rhs: r2 } = &cond.kind else { unreachable!() }; // countdown: specs/tri/t27b/countdown_plan.t27 Refs #13421
+              let (op2, iv_ty, rhs2) = (*o2 as u8, l2.ty, r2.clone());
+              if op2 == 2 && k == 1 && n == 1 && fixed && writes(body, iv) == 0 && init0(before, iv) == Some(0) {
+                for s in before.iter_mut().rev() { match s { Stmt::Assign { var, value } if *var == iv => { *value = rhs2; break; } Stmt::Assign { .. } => {} _ => break } }
+                for l in [&mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { if let ExprKind::Arith { op: ref mut ao, .. } = e.kind { if matches!(ao, ArithOp::Add | ArithOp::AddW) { *ao = ArithOp::SubW; } } }); }
+                cond.kind = ExprKind::Var(iv); cond.ty = iv_ty; } }
         }
         _ => {} } }
 }
