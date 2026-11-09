@@ -1880,14 +1880,7 @@ impl<'a> Gen<'a> {
 /// to 32 bits and zero-extend u8/u16/bool, which is the canonical form.
 fn ldst_op(ty: Ty, load: bool) -> (u32, u32) {
     let size = a64::size_log2(ty.bytes());
-    let opc = if !load {
-        a64::ST
-    } else if ty.signed() && size < 2 {
-        a64::LDS32
-    } else {
-        a64::LD
-    };
-    (size, opc)
+    (size, a64::ldst_opc(load, ty.signed(), size)) // a64.t27 ldst_opc
 }
 
 fn overflow_cond(ty: Ty, sub: bool) -> Cond { Cond::from_bits(ip::overflow_cond(ty.signed(), sub)) }
