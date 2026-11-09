@@ -96,6 +96,7 @@ BLOCKERS: <comma list>
 
 ## Traps
 
+- Empty ticks: `automation_empty_tick` in `t27-pareto-improvement-loop.t27` true → zero model calls; no tight `gh` polling.
 - **Timer-only sweeps** without new events waste tokens — prefer `subscribe_github_ci` on branches that just finished.
 - **Full open-PR scan (500+)** every turn violates bounded cycle — sample or event-filter first.
 - **Pareto / Queen crons** (`specs/crons/*.t27`) are cards; the **batch law** is still `roadmap_dashboard_sync.t27` + this skill when the host runs a tick.
