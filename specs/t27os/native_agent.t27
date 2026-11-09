@@ -1,0 +1,848 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/native_agent.t27 -- the ONESHOT agent contract and its runner state machine
+// (Refs #13212, FR-004; Matryoshka tracking #13020).
+//
+// WHAT THIS IS: one agent runs one bounded task: at most ONE read-only tool call, then ONE provider call
+// whose reply is the final result. The runner is a state machine over a session log image
+// (specs/t27os/native_log.t27): every step is an event, so status, result and error survive a restart and are
+// read back from the log alone (status_from_log, result_from_log). The host (native_host.t27) performs the
+// tool and the provider call; this spec decides, records and never touches a file or a socket.
+//
+// WHAT THIS IS NOT: a spawner. An agent contract cannot hold the spawn tool (AE_SPAWN_REFUSED), a tool call
+// is judged by the native_policy decision table (command and network tools are held, never run, because the
+// runner never approves anything), and there is no loop: one start, one tool slot, one finish.
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osNativeAgent;
+
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::native_provider::find_from;
+use t27os::native_provider::NOT_FOUND;
+use t27os::native_log::Cur;
+use t27os::native_log::cur_new;
+use t27os::native_log::EventView;
+use t27os::native_log::nth_event;
+use t27os::native_log::emit;
+use t27os::native_log::emit_state;
+use t27os::native_log::parse_line;
+use t27os::native_log::LineInfo;
+use t27os::native_log::usage_payload;
+use t27os::native_log::EV_USER_INPUT;
+use t27os::native_log::EV_PROVIDER_RESPONSE;
+use t27os::native_log::EV_ERROR;
+use t27os::native_log::EV_TOKEN_USAGE;
+use t27os::native_log::EV_SESSION_STATE;
+use t27os::native_log::ST_ACTIVE;
+use t27os::native_log::ST_CLOSED;
+use t27os::native_log::ST_NONE;
+use t27os::native_log::state_from_payload;
+use t27os::native_policy::NativePolicy;
+use t27os::native_policy::decide;
+use t27os::native_policy::audit_line;
+use t27os::native_policy::bit_of;
+use t27os::native_policy::mask_has;
+use t27os::native_policy::tool_class;
+use t27os::native_policy::tool_name;
+use t27os::native_policy::TOOL_SPAWN_AGENT;
+use t27os::native_policy::TOOL_MAX;
+use t27os::native_policy::DEC_ALLOW;
+use t27os::native_policy::DEC_DENY_LIMIT;
+use t27os::native_policy::DEC_UNSET;
+use t27os::native_policy::CLASS_READ_ONLY;
+
+// ---- the contract's bounds ---------------------------------------------------------------------------------
+
+pub const TASK_MAX : usize = 128;
+pub const INPUT_MAX : usize = 256;
+pub const RESULT_MAX : usize = 512;
+pub const TOOL_OUT_MAX : usize = 256;
+pub const BUDGET_TOKENS_MAX : u32 = 4096;
+/// The one tool slot: a second tool request is refused.
+pub const TOOL_CALLS_MAX : u32 = 1;
+
+// ---- status and error codes --------------------------------------------------------------------------------
+
+pub const AG_NEW : u32 = 0;
+pub const AG_RUNNING : u32 = 1;
+pub const AG_DONE : u32 = 2;
+pub const AG_FAILED : u32 = 3;
+pub const AG_CANCELLED : u32 = 4;
+/// A log whose events do not add up to any status above (never produced by this runner).
+pub const AG_UNKNOWN : u32 = 255;
+
+pub fn status_label(s: u32) -> []const u8 {
+    if (s == AG_NEW) { return "new"; }
+    if (s == AG_RUNNING) { return "running"; }
+    if (s == AG_DONE) { return "done"; }
+    if (s == AG_FAILED) { return "failed"; }
+    if (s == AG_CANCELLED) { return "cancelled"; }
+    return "unknown";
+}
+
+pub const AE_NONE : u32 = 0;
+pub const AE_BAD_CONTRACT : u32 = 1;
+pub const AE_TOO_LONG : u32 = 2;
+pub const AE_SPAWN_REFUSED : u32 = 3;
+pub const AE_NOT_RUNNING : u32 = 4;
+pub const AE_BUDGET : u32 = 5;
+pub const AE_EMPTY_RESULT : u32 = 6;
+pub const AE_CANCELLED : u32 = 7;
+pub const AE_LOG_FULL : u32 = 8;
+/// A provider failure is 100 + the native_provider error class (0..9), so 100 itself is never used.
+pub const AE_PROVIDER_BASE : u32 = 100;
+
+pub fn agent_error_label(e: u32) -> []const u8 {
+    if (e == AE_NONE) { return "none"; }
+    if (e == AE_BAD_CONTRACT) { return "bad_contract"; }
+    if (e == AE_TOO_LONG) { return "too_long"; }
+    if (e == AE_SPAWN_REFUSED) { return "spawn_refused"; }
+    if (e == AE_NOT_RUNNING) { return "not_running"; }
+    if (e == AE_BUDGET) { return "budget"; }
+    if (e == AE_EMPTY_RESULT) { return "empty_result"; }
+    if (e == AE_CANCELLED) { return "cancelled"; }
+    if (e == AE_LOG_FULL) { return "log_full"; }
+    if (e > AE_PROVIDER_BASE) { return "provider"; }
+    return "unknown";
+}
+
+// ---- the agent record --------------------------------------------------------------------------------------
+
+/// The contract (agent_id, task, input, allowed_tools, budget, parent_session_id) and the run state (status,
+/// result, error). allowed_tools is a native_policy tool mask (bit t = tool t); budget_tokens caps the provider
+/// call's completion tokens. The text fields are fixed arrays with their lengths: nothing is ever truncated,
+/// a longer value is refused (AE_TOO_LONG).
+pub struct NativeAgent {
+    agent_id: u64,
+    parent_session_id: u64,
+    allowed_tools: u32,
+    budget_tokens: u32,
+    status: u32,
+    error: u32,
+    tool_calls: u32,
+    tool_recorded: bool,
+    slot_tool: u32,
+    last_decision: u32,
+    tokens_used: u64,
+    task_len: usize,
+    input_len: usize,
+    result_len: usize,
+    task: [128]u8,
+    input: [256]u8,
+    result: [512]u8,
+}
+
+/// The largest legal tool mask: bits 1..TOOL_MAX set (bit 0 stands for no tool).
+fn mask_ceiling() -> u32 {
+    var m : u32 = 0;
+    var t : u32 = 1;
+    while (t <= TOOL_MAX) {
+        m = m + bit_of(t);
+        t = t + 1;
+    }
+    return m;
+}
+
+fn refused(a: NativeAgent, code: u32) -> NativeAgent {
+    var r : NativeAgent = a;
+    r.status = AG_FAILED;
+    r.error = code;
+    return r;
+}
+
+/// Builds an agent from a contract. A contract that breaks a bound comes back already AG_FAILED with the
+/// reason in `error`, and agent_start will not run it.
+pub fn agent_new(agent_id: u64, parent_session_id: u64, allowed_tools: u32, budget_tokens: u32,
+                 task: []const u8, input: []const u8) -> NativeAgent {
+    var a : NativeAgent = NativeAgent {
+        agent_id: agent_id,
+        parent_session_id: parent_session_id,
+        allowed_tools: allowed_tools,
+        budget_tokens: budget_tokens,
+        status: AG_NEW,
+        error: AE_NONE,
+        tool_calls: 0,
+        tool_recorded: false,
+        slot_tool: 0,
+        last_decision: DEC_UNSET,
+        tokens_used: 0,
+        task_len: 0,
+        input_len: 0,
+        result_len: 0,
+        task: [0] ** 128,
+        input: [0] ** 256,
+        result: [0] ** 512,
+    };
+    if (agent_id == 0 or task.len == 0 or budget_tokens == 0 or budget_tokens > BUDGET_TOKENS_MAX) {
+        return refused(a, AE_BAD_CONTRACT);
+    }
+    if (allowed_tools > mask_ceiling() or allowed_tools % 2 == 1) { return refused(a, AE_BAD_CONTRACT); }
+    if (mask_has(allowed_tools, TOOL_SPAWN_AGENT)) { return refused(a, AE_SPAWN_REFUSED); }
+    if (task.len > TASK_MAX or input.len > INPUT_MAX) { return refused(a, AE_TOO_LONG); }
+    var i : usize = 0;
+    while (i < task.len) {
+        a.task[i] = task[i];
+        i = i + 1;
+    }
+    a.task_len = task.len;
+    var k : usize = 0;
+    while (k < input.len) {
+        a.input[k] = input[k];
+        k = k + 1;
+    }
+    a.input_len = input.len;
+    return a;
+}
+
+pub fn task_view(a: *NativeAgent) -> []const u8 {
+    return a.task[0..a.task_len];
+}
+
+pub fn input_view(a: *NativeAgent) -> []const u8 {
+    return a.input[0..a.input_len];
+}
+
+pub fn result_view(a: *NativeAgent) -> []const u8 {
+    return a.result[0..a.result_len];
+}
+
+/// The agent's own policy: its allowed_tools mask, nothing approved, no spawn grant. Because the runner never
+/// approves, a command or network tool in the mask is HELD and a spawn tool is refused: only read-only tools
+/// can ever return DEC_ALLOW here.
+pub fn agent_policy(a: *NativeAgent) -> NativePolicy {
+    return NativePolicy { allow: a.allowed_tools, approved: 0, spawn_ok: false };
+}
+
+// ---- payloads ----------------------------------------------------------------------------------------------
+
+/// "agent=<id> parent=<id> tools=<mask> budget=<n>\ntask=<task>\ninput=<input>": the user_input event that
+/// opens the agent's log. Returns the length; 0 when `out` is too short (160 bytes plus task plus input).
+pub fn contract_payload(a: *NativeAgent, out: []u8) -> usize {
+    if (out.len < 160 + a.task_len + a.input_len) { return 0; }
+    var n : usize = put_bytes(out, 0, "agent=");
+    n = put_dec(out, n, a.agent_id);
+    n = put_bytes(out, n, " parent=");
+    n = put_dec(out, n, a.parent_session_id);
+    n = put_bytes(out, n, " tools=");
+    n = put_dec(out, n, @as(u64, a.allowed_tools));
+    n = put_bytes(out, n, " budget=");
+    n = put_dec(out, n, @as(u64, a.budget_tokens));
+    n = put_bytes(out, n, "\ntask=");
+    n = put_bytes(out, n, task_view(a));
+    n = put_bytes(out, n, "\ninput=");
+    n = put_bytes(out, n, input_view(a));
+    return n;
+}
+
+/// "code=<n> label=<label>": the terminal error payload (a failure or a cancel). Returns the length; 0 when
+/// `out` is shorter than 64 bytes.
+pub fn error_payload(code: u32, out: []u8) -> usize {
+    if (out.len < 64) { return 0; }
+    var n : usize = put_bytes(out, 0, "code=");
+    n = put_dec(out, n, @as(u64, code));
+    n = put_bytes(out, n, " label=");
+    n = put_bytes(out, n, agent_error_label(code));
+    return n;
+}
+
+/// "tool=<name> result=<bytes>": the user_input event that records an allowed tool call and its output.
+pub fn tool_result_payload(tool: u32, tool_out: []const u8, out: []u8) -> usize {
+    if (out.len < 32 + tool_out.len) { return 0; }
+    var n : usize = put_bytes(out, 0, "tool=");
+    n = put_bytes(out, n, tool_name(tool));
+    n = put_bytes(out, n, " result=");
+    return put_bytes(out, n, tool_out);
+}
+
+/// The prompt the host sends to the provider: "task: <task>\ninput: <input>\n", then "tool_result: <out>\n"
+/// when a tool ran. Returns the length; 0 when `out` is too short.
+pub fn compose_prompt(a: *NativeAgent, tool_out: []const u8, out: []u8) -> usize {
+    if (out.len < a.task_len + a.input_len + tool_out.len + 64) { return 0; }
+    var n : usize = put_bytes(out, 0, "task: ");
+    n = put_bytes(out, n, task_view(a));
+    n = put_bytes(out, n, "\ninput: ");
+    n = put_bytes(out, n, input_view(a));
+    n = put_bytes(out, n, "\n");
+    if (tool_out.len > 0) {
+        n = put_bytes(out, n, "tool_result: ");
+        n = put_bytes(out, n, tool_out);
+        n = put_bytes(out, n, "\n");
+    }
+    return n;
+}
+
+// ---- the runner --------------------------------------------------------------------------------------------
+
+/// Records the terminal error event and closes the session. When the log cannot take them the in-memory agent
+/// ends AG_FAILED / AE_LOG_FULL and the cursor stays where it was.
+fn close_with_error(a: *NativeAgent, img: []u8, c: Cur, status: u32, code: u32) -> Cur {
+    var p : [64]u8 = undefined;
+    const n : usize = error_payload(code, p[0..64]);
+    var d : Cur = emit(img, c, EV_ERROR, p[0..n]);
+    d = emit_state(img, d, ST_CLOSED);
+    if (d.ok == false) {
+        a.status = AG_FAILED;
+        a.error = AE_LOG_FULL;
+        return c;
+    }
+    a.status = status;
+    a.error = code;
+    return d;
+}
+
+/// Starts the run: the contract as a user_input event, then session_state ACTIVE. Only an AG_NEW agent starts;
+/// any other agent (a refused contract, a finished run) leaves both the agent and the cursor untouched.
+pub fn agent_start(a: *NativeAgent, img: []u8, c: Cur) -> Cur {
+    if (c.ok == false or a.status != AG_NEW) { return c; }
+    var p : [1024]u8 = undefined;
+    const n : usize = contract_payload(a, p[0..1024]);
+    if (n == 0) {
+        a.status = AG_FAILED;
+        a.error = AE_TOO_LONG;
+        return c;
+    }
+    var d : Cur = emit(img, c, EV_USER_INPUT, p[0..n]);
+    d = emit_state(img, d, ST_ACTIVE);
+    if (d.ok == false) {
+        a.status = AG_FAILED;
+        a.error = AE_LOG_FULL;
+        return c;
+    }
+    a.status = AG_RUNNING;
+    return d;
+}
+
+/// Judges one tool request. The verdict is left in a.last_decision. DEC_ALLOW takes the single tool slot
+/// (a.slot_tool names the tool) and writes nothing: the host runs the tool, then calls agent_tool_result.
+/// Every refusal, including a second request, is audited as an error event that names the tool and the
+/// verdict and nothing else; the agent stays running. A request while the agent is not running changes
+/// nothing but the verdict.
+pub fn agent_request_tool(a: *NativeAgent, tool: u32, img: []u8, c: Cur) -> Cur {
+    if (a.status != AG_RUNNING) {
+        a.last_decision = DEC_UNSET;
+        return c;
+    }
+    var dec : u32 = DEC_DENY_LIMIT;
+    if (a.tool_calls < TOOL_CALLS_MAX) { dec = decide(agent_policy(a), tool); }
+    a.last_decision = dec;
+    if (dec == DEC_ALLOW) {
+        a.tool_calls = a.tool_calls + 1;
+        a.slot_tool = tool;
+        return c;
+    }
+    var p : [96]u8 = undefined;
+    const n : usize = audit_line(tool, dec, p[0..96]);
+    return emit(img, c, EV_ERROR, p[0..n]);
+}
+
+/// Records the output of the one allowed tool call. Refused (cursor unchanged) unless the agent is running,
+/// `tool` is the tool that took the slot, nothing was recorded yet, and the output fits TOOL_OUT_MAX.
+pub fn agent_tool_result(a: *NativeAgent, tool: u32, tool_out: []const u8, img: []u8, c: Cur) -> Cur {
+    if (a.status != AG_RUNNING or a.tool_calls == 0 or a.slot_tool != tool or a.tool_recorded) { return c; }
+    if (tool_out.len > TOOL_OUT_MAX or tool_class(tool) != CLASS_READ_ONLY) { return c; }
+    var p : [320]u8 = undefined;
+    const n : usize = tool_result_payload(tool, tool_out, p[0..320]);
+    if (n == 0) { return c; }
+    const d : Cur = emit(img, c, EV_USER_INPUT, p[0..n]);
+    if (d.ok == false) { return c; }
+    a.tool_recorded = true;
+    return d;
+}
+
+/// The one final result. A running agent records provider_response, token_usage and session_state CLOSED, and
+/// ends AG_DONE. An empty result, one past RESULT_MAX, or more completion tokens than the budget ends the run
+/// AG_FAILED (AE_EMPTY_RESULT / AE_TOO_LONG / AE_BUDGET). A finish for an agent that is not running changes
+/// nothing: a cancelled agent stays cancelled.
+pub fn agent_finish(a: *NativeAgent, result: []const u8, prompt_tokens: u64, completion_tokens: u64,
+                    img: []u8, c: Cur) -> Cur {
+    if (c.ok == false or a.status != AG_RUNNING) { return c; }
+    if (result.len == 0) { return close_with_error(a, img, c, AG_FAILED, AE_EMPTY_RESULT); }
+    if (result.len > RESULT_MAX) { return close_with_error(a, img, c, AG_FAILED, AE_TOO_LONG); }
+    if (completion_tokens > @as(u64, a.budget_tokens)) {
+        return close_with_error(a, img, c, AG_FAILED, AE_BUDGET);
+    }
+    var u : [64]u8 = undefined;
+    const un : usize = usage_payload(prompt_tokens, completion_tokens, u[0..64]);
+    var d : Cur = emit(img, c, EV_PROVIDER_RESPONSE, result);
+    d = emit(img, d, EV_TOKEN_USAGE, u[0..un]);
+    d = emit_state(img, d, ST_CLOSED);
+    if (d.ok == false) {
+        a.status = AG_FAILED;
+        a.error = AE_LOG_FULL;
+        return c;
+    }
+    var i : usize = 0;
+    while (i < result.len) {
+        a.result[i] = result[i];
+        i = i + 1;
+    }
+    a.result_len = result.len;
+    a.tokens_used = prompt_tokens + completion_tokens;
+    a.status = AG_DONE;
+    return d;
+}
+
+/// A provider failure for a running agent: the error class from native_provider becomes 100 + class.
+pub fn agent_fail(a: *NativeAgent, provider_class: u32, img: []u8, c: Cur) -> Cur {
+    if (c.ok == false or a.status != AG_RUNNING) { return c; }
+    return close_with_error(a, img, c, AG_FAILED, AE_PROVIDER_BASE + provider_class);
+}
+
+/// Cancellation: a new or running agent ends AG_CANCELLED with a terminal error event; an agent that already
+/// finished (done, failed, cancelled) is left exactly as it is.
+pub fn agent_cancel(a: *NativeAgent, img: []u8, c: Cur) -> Cur {
+    if (c.ok == false) { return c; }
+    if (a.status != AG_NEW and a.status != AG_RUNNING) { return c; }
+    return close_with_error(a, img, c, AG_CANCELLED, AE_CANCELLED);
+}
+
+// ---- reading an agent back from its log --------------------------------------------------------------------
+
+pub struct StatusView {
+    ok: bool,
+    status: u32,
+    error: u32,
+    events: u32,
+    result_len: usize,
+}
+
+/// The number after "code=" in a terminal error payload; 0 for any payload that does not start with it.
+fn error_code_of(p: []const u8) -> u32 {
+    if (p.len < 6 or p[0] != 99 or p[1] != 111 or p[2] != 100 or p[3] != 101 or p[4] != 61) { return 0; }
+    var v : u32 = 0;
+    var i : usize = 5;
+    while (i < p.len and p[i] >= 48 and p[i] <= 57 and v < 100000) {
+        v = v * 10 + @as(u32, p[i] - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// Walks the complete events of an agent's log (a torn tail is ignored) and says where the run stands:
+///   no events                          -> AG_NEW
+///   a terminal "code=" error event     -> AG_CANCELLED (AE_CANCELLED) or AG_FAILED, error = that code
+///   state CLOSED and a final response  -> AG_DONE
+///   state ACTIVE, nothing terminal     -> AG_RUNNING (a crash mid-run looks like this)
+///   anything else                      -> AG_UNKNOWN
+/// Audit errors ("tool=...") are not terminal. The CLOSED state is the commit mark of a finished run.
+pub fn status_from_log(buf: []const u8, scratch: []u8) -> StatusView {
+    var v : StatusView = StatusView { ok: true, status: AG_NEW, error: AE_NONE, events: 0, result_len: 0 };
+    var at : usize = 0;
+    var seq : u64 = 1;
+    var state : u32 = ST_NONE;
+    var terminal : u32 = 0;
+    var answered : bool = false;
+    while (at < buf.len) {
+        const li : LineInfo = parse_line(buf, at, seq, scratch);
+        if (li.ok == false) { at = buf.len; }
+        else {
+            if (li.kind == EV_SESSION_STATE) { state = state_from_payload(scratch[0..li.plen]); }
+            if (li.kind == EV_ERROR and terminal == 0) { terminal = error_code_of(scratch[0..li.plen]); }
+            if (li.kind == EV_PROVIDER_RESPONSE) {
+                answered = true;
+                v.result_len = li.plen;
+            }
+            v.events = v.events + 1;
+            seq = seq + 1;
+            at = li.end;
+        }
+    }
+    if (v.events == 0) { return v; }
+    if (terminal != 0) {
+        v.error = terminal;
+        v.status = AG_FAILED;
+        if (terminal == AE_CANCELLED) { v.status = AG_CANCELLED; }
+        return v;
+    }
+    if (state == ST_CLOSED and answered) {
+        v.status = AG_DONE;
+        return v;
+    }
+    v.result_len = 0;
+    if (state == ST_ACTIVE) {
+        v.status = AG_RUNNING;
+        return v;
+    }
+    v.status = AG_UNKNOWN;
+    return v;
+}
+
+/// The final result as persisted: the payload of the last provider_response event, copied into `out`.
+/// Returns its length; 0 when there is none or it does not fit.
+pub fn result_from_log(buf: []const u8, scratch: []u8, out: []u8) -> usize {
+    var at : usize = 0;
+    var seq : u64 = 1;
+    var got : usize = 0;
+    while (at < buf.len) {
+        const li : LineInfo = parse_line(buf, at, seq, scratch);
+        if (li.ok == false) { at = buf.len; }
+        else {
+            if (li.kind == EV_PROVIDER_RESPONSE) {
+                if (li.plen > out.len) { return 0; }
+                var k : usize = 0;
+                while (k < li.plen) {
+                    out[k] = scratch[k];
+                    k = k + 1;
+                }
+                got = li.plen;
+            }
+            seq = seq + 1;
+            at = li.end;
+        }
+    }
+    return got;
+}
+
+// ---- the tests ---------------------------------------------------------------------------------------------
+
+fn has_sub(hay: []const u8, needle: []const u8) -> bool {
+    return find_from(hay, needle, 0) != NOT_FOUND;
+}
+
+fn st_of(buf: []const u8, scratch: []u8) -> u32 {
+    const v : StatusView = status_from_log(buf, scratch);
+    return v.status;
+}
+
+fn er_of(buf: []const u8, scratch: []u8) -> u32 {
+    const v : StatusView = status_from_log(buf, scratch);
+    return v.error;
+}
+
+/// tools mask with the two read-only tools (read_text = 2, clock = 4).
+fn read_only_mask() -> u32 {
+    return bit_of(1) + bit_of(2);
+}
+
+fn err_of(id: u64, parent: u64, mask: u32, budget: u32, task: []const u8, input: []const u8) -> u32 {
+    const a : NativeAgent = agent_new(id, parent, mask, budget, task, input);
+    return a.error;
+}
+
+test "a_valid_contract_is_held_whole_and_starts_new" {
+    var a : NativeAgent = agent_new(7, 3, read_only_mask(), 256, "summarize", "the quick brown fox");
+    assert a.status == AG_NEW;
+    assert a.error == AE_NONE;
+    assert a.agent_id == 7;
+    assert a.parent_session_id == 3;
+    assert a.allowed_tools == 6;
+    assert a.budget_tokens == 256;
+    assert a.task_len == 9;
+    assert a.input_len == 19;
+    assert a.result_len == 0;
+    const tv : []const u8 = task_view(&a);
+    const iv : []const u8 = input_view(&a);
+    assert tv.len == 9;
+    assert tv[0] == 115;
+    assert iv[0] == 116;
+    assert a.last_decision == DEC_UNSET;
+}
+
+test "a_contract_that_breaks_a_bound_is_refused_with_its_reason" {
+    // negative controls, one per bound
+    assert err_of(0, 1, 6, 256, "t", "i") == AE_BAD_CONTRACT;
+    assert err_of(1, 1, 6, 256, "", "i") == AE_BAD_CONTRACT;
+    assert err_of(1, 1, 6, 0, "t", "i") == AE_BAD_CONTRACT;
+    assert err_of(1, 1, 6, 4097, "t", "i") == AE_BAD_CONTRACT;
+    assert err_of(1, 1, 7, 256, "t", "i") == AE_BAD_CONTRACT;
+    assert err_of(1, 1, 64, 256, "t", "i") == AE_BAD_CONTRACT;
+    var long_task : [129]u8 = [97] ** 129;
+    assert err_of(1, 1, 6, 256, long_task[0..129], "i") == AE_TOO_LONG;
+    var long_input : [257]u8 = [97] ** 257;
+    assert err_of(1, 1, 6, 256, "t", long_input[0..257]) == AE_TOO_LONG;
+    // positive controls: the same shapes at their exact bounds are accepted
+    assert err_of(1, 1, 6, 256, "t", "i") == AE_NONE;
+    assert err_of(1, 1, 6, 4096, long_task[0..128], long_input[0..256]) == AE_NONE;
+    assert err_of(1, 1, 0, 256, "t", "") == AE_NONE;
+    assert err_of(1, 1, mask_ceiling() - bit_of(TOOL_SPAWN_AGENT), 256, "t", "i") == AE_NONE;
+}
+
+test "a_contract_cannot_hold_the_spawn_tool" {
+    const with_spawn : u32 = read_only_mask() + bit_of(TOOL_SPAWN_AGENT);
+    const a : NativeAgent = agent_new(1, 1, with_spawn, 256, "t", "i");
+    assert a.status == AG_FAILED;
+    assert a.error == AE_SPAWN_REFUSED;
+}
+
+test "start_logs_the_contract_then_active_and_the_log_reads_back_running" {
+    var img : [2048]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var a : NativeAgent = agent_new(7, 3, read_only_mask(), 256, "summarize", "the quick brown fox");
+    var c : Cur = agent_start(&a, img[0..2048], cur_new());
+    assert c.ok;
+    assert c.seq == 3;
+    assert a.status == AG_RUNNING;
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..1100]);
+    assert v.events == 2;
+    assert v.status == AG_RUNNING;
+    assert v.error == AE_NONE;
+    // a second start does nothing
+    const c2 : Cur = agent_start(&a, img[0..2048], c);
+    assert c2.len == c.len;
+    assert c2.seq == c.seq;
+}
+
+test "a_refused_contract_does_not_start_and_writes_nothing" {
+    var img : [512]u8 = undefined;
+    var a : NativeAgent = agent_new(0, 1, 6, 256, "t", "i");
+    const c : Cur = agent_start(&a, img[0..512], cur_new());
+    assert c.len == 0;
+    assert c.seq == 1;
+    assert a.status == AG_FAILED;
+}
+
+test "the_one_read_only_tool_is_allowed_once_and_the_second_request_is_refused" {
+    var img : [2048]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, read_only_mask(), 256, "t", "i");
+    var c : Cur = agent_start(&a, img[0..2048], cur_new());
+    c = agent_request_tool(&a, 2, img[0..2048], c);
+    assert a.last_decision == DEC_ALLOW;
+    assert a.tool_calls == 1;
+    const before : usize = c.len;
+    c = agent_tool_result(&a, 2, "1700000000", img[0..2048], c);
+    assert c.len > before;
+    assert a.tool_recorded;
+    // the slot is spent: the same tool again is refused, audited, and the agent keeps running
+    c = agent_request_tool(&a, 2, img[0..2048], c);
+    assert a.last_decision == DEC_DENY_LIMIT;
+    assert a.tool_calls == 1;
+    assert a.status == AG_RUNNING;
+    // the audit event is not terminal
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..1100]);
+    assert v.status == AG_RUNNING;
+    assert v.events == 4;
+}
+
+test "a_tool_outside_the_agent_mask_is_rejected_and_logged" {
+    var img : [2048]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, bit_of(2), 256, "t", "i");
+    var c : Cur = agent_start(&a, img[0..2048], cur_new());
+    const before : usize = c.len;
+    c = agent_request_tool(&a, 1, img[0..2048], c);
+    assert a.last_decision != DEC_ALLOW;
+    assert a.tool_calls == 0;
+    assert c.len > before;
+    // the refusal did not spend the slot: the listed tool still runs
+    c = agent_request_tool(&a, 2, img[0..2048], c);
+    assert a.last_decision == DEC_ALLOW;
+}
+
+test "a_command_or_network_tool_in_the_mask_is_held_and_never_runs" {
+    var img : [2048]u8 = undefined;
+    // run_command = 3, http_fetch = 4
+    var a : NativeAgent = agent_new(1, 1, bit_of(3) + bit_of(4), 256, "t", "i");
+    var c : Cur = agent_start(&a, img[0..2048], cur_new());
+    c = agent_request_tool(&a, 3, img[0..2048], c);
+    assert a.last_decision != DEC_ALLOW;
+    assert a.tool_calls == 0;
+    c = agent_request_tool(&a, 4, img[0..2048], c);
+    assert a.last_decision != DEC_ALLOW;
+    assert a.tool_calls == 0;
+    // and a tool result for a tool that was never allowed is not recorded
+    const d : Cur = agent_tool_result(&a, 3, "x", img[0..2048], c);
+    assert d.len == c.len;
+    // spawn is never reachable, listed or not
+    c = agent_request_tool(&a, TOOL_SPAWN_AGENT, img[0..2048], c);
+    assert a.last_decision != DEC_ALLOW;
+}
+
+test "a_tool_result_needs_the_slot_tool_and_fits_once" {
+    var img : [2048]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, read_only_mask(), 256, "t", "i");
+    var c : Cur = agent_start(&a, img[0..2048], cur_new());
+    // no request yet
+    const r0 : Cur = agent_tool_result(&a, 2, "x", img[0..2048], c);
+    assert r0.len == c.len;
+    c = agent_request_tool(&a, 2, img[0..2048], c);
+    assert a.slot_tool == 2;
+    var big : [257]u8 = [97] ** 257;
+    const r1 : Cur = agent_tool_result(&a, 2, big[0..257], img[0..2048], c);
+    assert r1.len == c.len;
+    // another tool than the one that took the slot
+    const r2 : Cur = agent_tool_result(&a, 1, "x", img[0..2048], c);
+    assert r2.len == c.len;
+    // a refused second request does not unseat the slot
+    c = agent_request_tool(&a, 1, img[0..2048], c);
+    assert a.last_decision != DEC_ALLOW;
+    assert a.slot_tool == 2;
+    c = agent_tool_result(&a, 2, "ok", img[0..2048], c);
+    assert a.tool_recorded;
+    // a second record is refused
+    const r3 : Cur = agent_tool_result(&a, 2, "again", img[0..2048], c);
+    assert r3.len == c.len;
+}
+
+test "finish_records_the_result_and_the_log_alone_reads_it_back_as_done" {
+    var img : [4096]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var out : [600]u8 = undefined;
+    var a : NativeAgent = agent_new(9, 4, read_only_mask(), 256, "summarize", "the quick brown fox");
+    var c : Cur = agent_start(&a, img[0..4096], cur_new());
+    c = agent_finish(&a, "A fox jumps.", 30, 12, img[0..4096], c);
+    assert c.ok;
+    assert a.status == AG_DONE;
+    assert a.result_len == 12;
+    assert a.tokens_used == 42;
+    const rv : []const u8 = result_view(&a);
+    assert rv.len == 12;
+    assert rv[0] == 65;
+    // restart: nothing but the bytes of the log
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..1100]);
+    assert v.status == AG_DONE;
+    assert v.error == AE_NONE;
+    assert v.result_len == 12;
+    assert v.events == 5;
+    const n : usize = result_from_log(img[0..c.len], scratch[0..1100], out[0..600]);
+    assert n == 12;
+    assert out[0] == 65;
+    assert out[11] == 46;
+}
+
+test "an_empty_oversize_or_over_budget_result_fails_the_run" {
+    var img : [4096]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, 0, 100, "t", "i");
+    var c : Cur = agent_start(&a, img[0..4096], cur_new());
+    c = agent_finish(&a, "", 1, 1, img[0..4096], c);
+    assert a.status == AG_FAILED;
+    assert a.error == AE_EMPTY_RESULT;
+    assert st_of(img[0..c.len], scratch[0..1100]) == AG_FAILED;
+    assert er_of(img[0..c.len], scratch[0..1100]) == AE_EMPTY_RESULT;
+
+    var b : NativeAgent = agent_new(2, 1, 0, 100, "t", "i");
+    var d : Cur = agent_start(&b, img[0..4096], cur_new());
+    d = agent_finish(&b, "ok", 5, 101, img[0..4096], d);
+    assert b.status == AG_FAILED;
+    assert b.error == AE_BUDGET;
+
+    var big : [513]u8 = [97] ** 513;
+    var e : NativeAgent = agent_new(3, 1, 0, 100, "t", "i");
+    var f : Cur = agent_start(&e, img[0..4096], cur_new());
+    f = agent_finish(&e, big[0..513], 5, 5, img[0..4096], f);
+    assert e.status == AG_FAILED;
+    assert e.error == AE_TOO_LONG;
+
+    // the boundary: exactly the budget and exactly RESULT_MAX are fine
+    var g : NativeAgent = agent_new(4, 1, 0, 100, "t", "i");
+    var h : Cur = agent_start(&g, img[0..4096], cur_new());
+    h = agent_finish(&g, big[0..512], 5, 100, img[0..4096], h);
+    assert g.status == AG_DONE;
+}
+
+test "cancel_ends_a_running_agent_and_a_late_finish_cannot_revive_it" {
+    var img : [4096]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, read_only_mask(), 256, "t", "i");
+    var c : Cur = agent_start(&a, img[0..4096], cur_new());
+    c = agent_cancel(&a, img[0..4096], c);
+    assert a.status == AG_CANCELLED;
+    assert a.error == AE_CANCELLED;
+    const len_after_cancel : usize = c.len;
+    // negative control: the provider answers anyway, the cancelled agent stays cancelled
+    c = agent_finish(&a, "late answer", 1, 1, img[0..4096], c);
+    assert a.status == AG_CANCELLED;
+    assert c.len == len_after_cancel;
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..1100]);
+    assert v.status == AG_CANCELLED;
+    assert v.error == AE_CANCELLED;
+    // a tool request after the cancel changes nothing
+    c = agent_request_tool(&a, 2, img[0..4096], c);
+    assert c.len == len_after_cancel;
+    assert a.tool_calls == 0;
+}
+
+test "cancelling_a_new_agent_logs_a_cancelled_run_and_cancel_after_done_changes_nothing" {
+    var img : [4096]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, 0, 256, "t", "i");
+    var c : Cur = agent_cancel(&a, img[0..4096], cur_new());
+    assert a.status == AG_CANCELLED;
+    assert st_of(img[0..c.len], scratch[0..1100]) == AG_CANCELLED;
+
+    var b : NativeAgent = agent_new(2, 1, 0, 256, "t", "i");
+    var d : Cur = agent_start(&b, img[0..4096], cur_new());
+    d = agent_finish(&b, "done", 1, 1, img[0..4096], d);
+    const len_done : usize = d.len;
+    d = agent_cancel(&b, img[0..4096], d);
+    assert b.status == AG_DONE;
+    assert d.len == len_done;
+}
+
+test "a_provider_failure_is_recorded_as_100_plus_the_class_and_reads_back_failed" {
+    var img : [4096]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, 0, 256, "t", "i");
+    var c : Cur = agent_start(&a, img[0..4096], cur_new());
+    c = agent_fail(&a, 3, img[0..4096], c);
+    assert a.status == AG_FAILED;
+    assert a.error == 103;
+    const v : StatusView = status_from_log(img[0..c.len], scratch[0..1100]);
+    assert v.status == AG_FAILED;
+    assert v.error == 103;
+    // failing an agent that is not running does nothing
+    const len_failed : usize = c.len;
+    c = agent_fail(&a, 4, img[0..4096], c);
+    assert c.len == len_failed;
+    assert a.error == 103;
+}
+
+test "a_torn_tail_and_a_crash_mid_run_are_read_from_the_complete_events_only" {
+    var img : [4096]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, read_only_mask(), 256, "t", "i");
+    var c : Cur = agent_start(&a, img[0..4096], cur_new());
+    // a torn half-line after the last complete event
+    const junk : []const u8 = "E 3 3 12 abc";
+    var k : usize = 0;
+    while (k < junk.len) {
+        img[c.len + k] = junk[k];
+        k = k + 1;
+    }
+    const v : StatusView = status_from_log(img[0..c.len + junk.len], scratch[0..1100]);
+    assert v.status == AG_RUNNING;
+    assert v.events == 2;
+    // an empty log is a new agent
+    assert st_of(img[0..0], scratch[0..1100]) == AG_NEW;
+}
+
+test "the_prompt_carries_task_input_and_the_tool_result_and_refuses_a_small_buffer" {
+    var out : [256]u8 = undefined;
+    var a : NativeAgent = agent_new(1, 1, read_only_mask(), 256, "summarize", "the quick brown fox");
+    const n : usize = compose_prompt(&a, "1700000000", out[0..256]);
+    assert n > 0;
+    assert has_sub(out[0..n], "task: summarize\n");
+    assert has_sub(out[0..n], "input: the quick brown fox\n");
+    assert has_sub(out[0..n], "tool_result: 1700000000\n");
+    const m : usize = compose_prompt(&a, "", out[0..256]);
+    assert has_sub(out[0..m], "tool_result") == false;
+    assert compose_prompt(&a, "1700000000", out[0..40]) == 0;
+}
+
+test "the_contract_payload_names_every_field_and_the_audit_event_names_no_argument" {
+    var out : [512]u8 = undefined;
+    var a : NativeAgent = agent_new(7, 3, read_only_mask(), 256, "summarize", "the quick brown fox");
+    const n : usize = contract_payload(&a, out[0..512]);
+    assert has_sub(out[0..n], "agent=7 parent=3 tools=6 budget=256\n");
+    assert has_sub(out[0..n], "task=summarize\n");
+    assert has_sub(out[0..n], "input=the quick brown fox");
+    assert contract_payload(&a, out[0..100]) == 0;
+    var img : [2048]u8 = undefined;
+    var scratch : [1100]u8 = undefined;
+    var s : Cur = agent_start(&a, img[0..2048], cur_new());
+    s = agent_request_tool(&a, 3, img[0..2048], s);
+    var line : [128]u8 = undefined;
+    const got : EventView = nth_event(img[0..s.len], scratch[0..1100], 2, line[0..128]);
+    assert got.ok;
+    assert got.kind == EV_ERROR;
+    assert has_sub(line[0..got.len], "tool=run_command decision=");
+}
+
+test "the_status_and_error_labels_are_total" {
+    assert status_label(AG_DONE).len == 4;
+    assert status_label(AG_CANCELLED).len == 9;
+    assert status_label(77).len == 7;
+    assert agent_error_label(AE_BUDGET).len == 6;
+    assert agent_error_label(103).len == 8;
+    assert agent_error_label(99).len == 7;
+}

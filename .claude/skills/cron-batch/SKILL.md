@@ -1,101 +1,101 @@
 ---
+id: cron-batch
 name: cron-batch
-description: >-
-  CRON_BATCH_V1 + T27L_AUTOMATION_CONTROL_V1: batched event-driven agent turns,
-  T27L lifecycle mapping, approved-scope inventory, empty tick = zero model
-  calls. No restart, no duplicate schedules. Load for loop-pareto-night and cloud.
+description: CRON_BATCH_V1 — batched event-driven cron ticks (500 ms debounce, max 100 actions/cycle, overflow to T27M dead letter, T27L emit). Load before any scheduled Queen/cron tick, merge sweep, or roadmap sync that would otherwise poll or spawn per event.
+argument-hint: "[tick-name]"
 ---
 
-# CRON_BATCH_V1 + T27L_AUTOMATION_CONTROL_V1
+# /cron-batch — one tick = one bounded batch job
 
-**SSOT:** `specs/tri/trigit/roadmap_dashboard_sync.t27` (`RD_DEBOUNCE_MS`, `RD_CYCLE_MAX`, `rd_debounce_fire`, `rd_cycle_overflow`, event `message_deadlettered` **72**).
+<!-- only-t27-rule -->
+> **Only t27.** Numbers and gates live in `.t27`; this skill is how agents run a tick.
 
-**Pareto cron wiring:** `specs/crons/t27-pareto-improvement-loop.t27` (`cron_tick_may_run`, `cron_actions_this_cycle`, `cron_actions_overflow`).
+Owner order **CRON_BATCH_V1** (2026-11-10): do **not** wake an agent per event or tight-poll. One cron tick collects pending work, debounces, runs **one** bounded job, emits **T27L**, then stops.
 
-**Wake sources:** `cursor-subscriptions` (CI branch, PR, timer `loop-pareto-night`) — skill `subscribe` under `$0/subscribe/SKILL.md`. Deliveries coalesce; on wake, **one** bounded job, not N poll turns.
+## SSOT map
 
-## Actionable work only (owner correction)
+| Spec | What it pins |
+|------|----------------|
+| `specs/tri/trigit/roadmap_dashboard_sync.t27` | `RD_DEBOUNCE_MS = 500`, `RD_DEBOUNCE_MAX_MS = 5000`, `rd_debounce_fire`; `RD_CYCLE_MAX = 100`, `rd_cycle_now` / `rd_cycle_overflow`; overflow → `TM_DL_OVERFLOW` |
+| `specs/t27os/t27m.t27` | Durable dead letter (`tm_dead_letter`); replay needs approval |
+| `specs/t27os/t27l.t27` | `message_deadlettered` = action **72**; emit one line per tick outcome |
+| `specs/claw/merge_verdict.t27` | CI reads on `E_CHECK_DONE` / `E_PUSH` / `E_MASTER_MOVED` / `E_ACK` — **not** `E_TIMER` |
+| `specs/claw/model_route.t27` + `work-cheap` | Local/deterministic first, then free tier, paid only with scope |
+| `.claude/skills/merge-queue/SKILL.md` | Squash-merge only on merge-verdict `MERGE_NOW` + `A_MERGE` |
 
-Wake **only** when the durable queue has pending events **and** debounce fires **and** reconciliation finds `state_changed` or a bounded action to run. If `automation_empty_tick` in `t27-pareto-improvement-loop.t27` is true → **SKIP**: zero model calls, zero status spam, no agent turn.
+## Root rules
 
-## Approved-scope inventory (discover before changing)
+1. **No tight polling** — no `sleep` loops waiting on `gh pr checks`; use `cursor-subscriptions` (CI, PR, timer as wake-only).
+2. **No per-event spawn** — one tick = one batch; do not launch N subagents for N webhooks.
+3. **No silent paid fallback** — escalate model only per `model_route.t27`.
+4. **No unbounded sync** — at most **100** actions this cycle (`rd_cycle_now`); plan overflow honestly.
 
-| Source | Read-only procedure |
-|--------|---------------------|
-| Cron cards | `specs/crons/*.t27` (`ID`, `HOST`, `SERVICE`, `ENABLED`) |
-| This cloud lane | `cursor-subscriptions` `list_subscriptions`; timer `loop-pareto-night` |
-| GitHub (repo) | `.github/workflows/*.yml` names only; `gh workflow list` if authorized |
-| Mac launchd / DSH | **not** from cloud — mark UNKNOWN; owner handoff via `dev-monitor` / `dsh-startup` |
-
-Per automation record (artifact or table): `automation_id`, `source`, `native_job_id`, `owner`, `trigger`, `status` (`CONFIGURED` \| `SCHEDULED` \| `RUNNING` \| `BLOCKED` \| `COMPLETED` \| `UNKNOWN`), `t27l_connection_status`.
-
-**Rules:** no restart of RUNNING jobs; no duplicate schedule; no foreign cron/workflow/pane edits; unclear ownership → UNKNOWN.
-
-## T27L lifecycle (reuse registered names — never invent action ids)
-
-| Intent | Registered `t27l` action | id |
-|--------|--------------------------|-----|
-| Batch / cron tick started | `cron_cycle_started` | 79 |
-| Batch completed | `cron_cycle_completed` | 80 |
-| Empty tick / no work | `schedule_skipped` | 89 |
-| Overflow → dead letter | `message_deadlettered` | 72 |
-| GH workflow life | `workflow_dispatched` / `workflow_completed` / `workflow_failed` | 113–115 |
-| Actor run | `act_run_started` / `act_run_completed` | 119–120 |
-| Seal / gate proof | `artifact_verified` | 155 |
-| Missing live feed (honest) | `bridge_event_unverified` | 154 |
-
-Names like `automation_registered` have **no** row in `specs/t27os/t27l.t27` yet → **INTEGRATION_GAP** (file issue; do not emit fake ids).
-
-**Writer:** `tl_event_line` + `tl_validate_line` in `specs/t27os/t27l.t27`. **`tri t27l` CLI is NOT BUILT** — cloud agents record INTEGRATION_GAP until a host persists lines.
-
-**Payload:** JSON string only; include `automation_id`, `run_id`, `batch_id`, `source_revision`, `trigger`, `status`, `evidence_locator`; redact secrets (`secret-hygiene`).
-
-**Telemetry ≠ authorization** — green batch does not permit merge, push, or schedule change.
-
-## One turn (when not empty)
-
-1. Collect pending events since last turn (timer + CI + PR notifications).
-2. If empty per `automation_empty_tick` → SKIP (no `gh`, no T27L except optional local artifact).
-3. If `quiet_ms >= 500` or oldest pending exceeded max wait → **one** bounded batch.
-4. Deterministic checks first (`t27c seal`, one compact `gh` JSON if CI event).
-5. Cap actions at **100**; overflow → dead-letter / next cycle (no silent drop).
-6. Merge only via `merge-queue` / `merge_verdict.t27` (`M\t` line); seven conditions, not ad hoc.
-7. Free-first: `.claude/skills/free-first/SKILL.md`; no paid fallback without approval.
-
-## Report footer (when batch ran)
+## Tick workflow
 
 ```text
-CRON_TICK_STATUS: PASS|HOLD|SKIP
-BATCH_SIZE:
-DEBOUNCE_STATUS: fired|waiting
-ROUTE_STATUS: local|free|paid
-ACTIONS_RUN:
-OVERFLOW_STATUS: 0|n
-BLOCKERS:
+Cron / notification wake
+  → collect pending events into one batch (PR CI done, master moved, labeled, etc.)
+  → debounce: fire when quiet_ms >= 500 OR oldest_ms >= 5000 (rd_debounce_fire)
+  → classify route: local checks → free model → paid (only if approved)
+  → run ONE bounded job (<= 100 actions)
+  → merge-queue verdict lines for merge candidates (advise/merge/hold/stop)
+  → emit T27L (surface per host card; deadletter 72 if overflow)
+  → end turn (subscriptions hold the next wake)
 ```
 
-## Report footer (T27L automation control)
+## Debounce (500 ms)
+
+Apply to **event accumulation**, not to “ignore work”:
+
+- While events keep arriving, **hold** the batch.
+- When the stream is quiet **500 ms**, or the oldest pending item is **5 s**, **fire once**.
+
+Same semantics as `rd_debounce_fire(pending, quiet_ms, oldest_ms)` in `roadmap_dashboard_sync.t27`.
+
+## Bounded cycle (100 actions)
+
+Count **actions**, not API calls or PRs alone. Examples: one `gh pr view` + check classification ≈ 2 actions; one squash-merge ≈ 1 action.
 
 ```text
-APPROVED_SCOPE:
-DISCOVERED_AUTOMATIONS:
-RUNNING_AUTOMATIONS:
-CONNECTED_TO_T27L:
-UNKNOWN_OR_UNCONNECTED:
-DUPLICATE_AUTOMATIONS_FOUND:
-EMPTY_TICK_MODEL_CALLS:
-REAL_T27L_EVENTS_EMITTED:
-FREE_ROUTE:
-SKILL_PATH: .claude/skills/cron-batch/SKILL.md
-TEST_EVIDENCE:
-INTEGRATION_GAPS:
-BLOCKERS:
-NEXT_ACTION:
+planned = <count after classify>
+run_now = min(planned, 100)
+overflow = planned - run_now  → dead letter (TM_DL_OVERFLOW), T27L action 72
+```
+
+Replay overflow only with owner/policy (`t27m` `dead_letter_replay_needs_approval`).
+
+## Routing (per tick)
+
+| Tier | When |
+|------|------|
+| **Local / deterministic** | Spec tests, `rd_*` pure functions, `gh` JSON that does not need LLM |
+| **Free** | Pane / Composer 2.5 / NIM free row — classify verdicts, short reports |
+| **Paid** | Only after failed free attempt or owner word; never for empty ticks |
+
+## Merge sweeps use this skill
+
+A “merge all open PRs” goal run is **one cron tick**:
+
+1. Subscribe (or single wake) — do not re-scan all 55 PRs every 60 s in a loop.
+2. Batch PRs whose **CI completed** since last tick (from notification or explicit list).
+3. Debounce 500 ms if multiple notifications arrived together.
+4. Run merge-queue on **at most 100** PR actions; overflow → dead letter + report.
+5. Emit report block below; **no merge** without `merge-queue` verdict.
+
+## End-of-tick report (paste verbatim)
+
+```text
+CRON_TICK_STATUS: <batched|empty|overflow>
+BATCH_SIZE: <pending collected>
+DEBOUNCE_STATUS: <held|fired quiet_ms=… oldest_ms=…>
+ROUTE_STATUS: <local|free|paid>
+ACTIONS_RUN: <n> (max 100)
+OVERFLOW_STATUS: <0|count → dead letter>
+BLOCKERS: <comma list>
 ```
 
 ## Traps
 
-- Repeated HOLD turns with identical `gh` output are **policy violations** — use subscriptions.
-- Empty ticks: `automation_empty_tick` true → zero model calls; `cron_tick_may_run(0, …)` is false.
-- Do not log an event that triggers another log (no feedback loops).
-- Cheaper never means skip gates or merge without verdict.
+- **Timer-only sweeps** without new events waste tokens — prefer `subscribe_github_ci` on branches that just finished.
+- **Full open-PR scan (500+)** every turn violates bounded cycle — sample or event-filter first.
+- **Pareto / Queen crons** (`specs/crons/*.t27`) are cards; the **batch law** is still `roadmap_dashboard_sync.t27` + this skill when the host runs a tick.

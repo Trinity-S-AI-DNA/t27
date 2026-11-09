@@ -53,6 +53,7 @@ The law is `self_recovery_action` and `prior_commits_untouched` in `specs/crons/
 
 Lesson, 2026-11-10: a failed tick that resets the lane to an ancestor older than the pre-tick HEAD, or that resets master, drops green commits the tick did not make. Record the lane HEAD before writing. On a red typecheck, `git reset --hard` that recorded commit on this lane only. Do not force-push. Do not open the window.
 
+
 ## Free-first routing (FREEFIRSTSUBAGENTMODE)
 
 The name is a bundle, not a second law. Load at tick start: `.claude/skills/work-cheap/SKILL.md`, `model-routing`, `swarm-economy`. The checked rules are `specs/claw/cost_policy.t27` and `specs/claw/model_route.t27`. Claude tiers stay in `model_route.t27`; do not copy them here. `cursor_route.t27` is not in the tree yet; on Cursor Cloud follow `work-cheap` (cheapest tier that passes the machine gate; Fast and 500k are not defaults).
@@ -66,6 +67,7 @@ Lesson, 2026-11-10 (Asia/Bangkok): resealing `crons_CronParetoImprovementLoop.js
 ## CRON_BATCH_V1 (cloud ticks)
 
 Load `.claude/skills/cron-batch/SKILL.md` at tick start (includes **T27L_AUTOMATION_CONTROL_V1**). Law: `roadmap_dashboard_sync.t27`, `specs/t27os/t27l.t27`, predicates `cron_tick_may_run`, `automation_empty_tick`, `t27l_action_*` on this cron card. Wake only when actionable; empty tick = zero model calls. **No** `gh pr checks` on empty or duplicate wakes.
+
 
 ## New `tri` commands (proposed, not built yet)
 

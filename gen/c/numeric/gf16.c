@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <assert.h>
+#define t27_assert(c, m) do { if (!(c)) { __builtin_trap(); } } while (0)
+#define assert_eq(a, b) do { if ((a) != (b)) { __builtin_trap(); } } while (0)
 
 #ifndef TRIFORMAT_GF16_H
 #define TRIFORMAT_GF16_H
@@ -35,249 +37,276 @@
 #define GF16_INF_NEG 0xFE00
 #define GF16_NAN 0xFE01
 typedef uint16_t GF16;
-typedef u16{0x3C00,0x3D00,0x3D80,0x3E00,0x3E40,0x3E80,0x3EC0,0x3F00,0x3F40,0x3F80,0x3FC0,0x3FE0,0x3FF0,0x4000,0x4040,0x4080,0x40C0,0x4100,0x4140,0x4180,0x41C0,0x4200,0x4240,0x4280,0x42C0,0x4300,0x4340,0x4380,0x43C0,0x4400,0x4440,0x4480,} pow2_table[32];
+static const uint16_t pow2_table[32] = { 0x3E00, 0x4000, 0x4200, 0x4400, 0x4600, 0x4800, 0x4A00, 0x4C00, 0x4E00, 0x5000, 0x5200, 0x5400, 0x5600, 0x5800, 0x5A00, 0x5C00, 0x5E00, 0x6000, 0x6200, 0x6400, 0x6600, 0x6800, 0x6A00, 0x6C00, 0x6E00, 0x7000, 0x7200, 0x7400, 0x7600, 0x7800, 0x7A00, 0x7C00 };
+#define FP8_EFFECTIVE_MANT_BITS 4
+#define GF16_CANONICAL_EXP_BITS 6
+#define GF16_CANONICAL_MANT_BITS 9
+#define ALT_A_EXP_BITS 7
+#define ALT_A_MANT_BITS 8
+#define ALT_B_EXP_BITS 8
+#define ALT_B_MANT_BITS 7
+#define GF16_PHI_DIST_REGISTERED 0.0486326415435630
+#define ALT_A_PHI_DIST 0.2569660112501051
+#define ALT_B_PHI_DIST 0.5248231541072479
+#define FP8_ULP 0.0625
 
 /* -------------------------------------------------------
    Function prototypes
    ------------------------------------------------------- */
 
-int8_t gf16_extract_sign(GF16 gf16);
-int8_t gf16_extract_exponent(GF16 gf16);
-int16_t gf16_extract_mantissa(GF16 gf16);
-GF16 gf16_from_components(int8_t sign, int8_t exp, int16_t mant);
-bool gf16_is_zero(GF16 gf16);
-bool gf16_is_special(GF16 gf16);
-GF16 gf16_encode_f32(f32 value);
-f32 gf16_decode_to_f32(GF16 gf16);
-GF16 gf16_round_phi(f32 value);
-bool gf16_is_inf(GF16 gf16);
-bool gf16_is_nan(GF16 gf16);
-bool gf16_is_negative(GF16 gf16);
-bool gf16_is_positive(GF16 gf16);
-GF16 gf16_negate(GF16 gf16);
-GF16 gf16_abs(GF16 gf16);
-GF16 gf16_copy_sign(GF16 gf16, GF16 sign_source);
-GF16 gf16_max(GF16 a, GF16 b);
-GF16 gf16_min(GF16 a, GF16 b);
-GF16 gf16_add(GF16 a, GF16 b);
-GF16 gf16_sub(GF16 a, GF16 b);
-GF16 gf16_mul(GF16 a, GF16 b);
-GF16 gf16_div(GF16 a, GF16 b);
-GF16 gf16_fma(GF16 a, GF16 b, GF16 c);
-GF16 gf16_sqrt(GF16 a);
-GF16 gf16_square(GF16 a);
-bool gf16_eq(GF16 a, GF16 b);
-bool gf16_ne(GF16 a, GF16 b);
-bool gf16_lt(GF16 a, GF16 b);
-bool gf16_le(GF16 a, GF16 b);
-bool gf16_gt(GF16 a, GF16 b);
-bool gf16_ge(GF16 a, GF16 b);
-GF16 gf16_floor(GF16 a);
-GF16 gf16_ceil(GF16 a);
-GF16 gf16_round(GF16 a);
-GF16 gf16_trunc(GF16 a);
-GF16 gf16_fms(GF16 a, GF16 b, GF16 c);
-GF16 gf16_hypot(GF16 a, GF16 b);
-GF16 gf16_fmod(GF16 a, GF16 b);
-bool gf16_is_finite(GF16 gf16);
-bool gf16_is_normal(GF16 gf16);
-bool gf16_is_subnormal(GF16 gf16);
-bool gf16_signbit(GF16 gf16);
-int8_t gf16_sign(GF16 gf16);
-GF16 gf16_clamp(GF16 x, GF16 min_val, GF16 max_val);
-GF16 gf16_lerp(GF16 a, GF16 b, GF16 t);
-GF16 gf16_fnma(GF16 a, GF16 b, GF16 c);
-GF16 gf16_exp(GF16 x);
-GF16 gf16_log(GF16 x);
-GF16 gf16_log2(GF16 x);
-GF16 gf16_log10(GF16 x);
-GF16 gf16_pow(GF16 base, GF16 exponent);
-GF16 gf16_sin(GF16 x);
-GF16 gf16_cos(GF16 x);
+int8_t gf16_extract_sign(uint16_t gf16);
+int8_t gf16_extract_exponent(uint16_t gf16);
+int16_t gf16_extract_mantissa(uint16_t gf16);
+uint16_t gf16_from_components(int8_t sign, int8_t exp, int16_t mant);
+bool gf16_is_zero(uint16_t gf16);
+bool gf16_is_special(uint16_t gf16);
+uint16_t gf16_encode_f32(float value);
+float gf16_decode_to_f32(uint16_t gf16);
+uint16_t gf16_round_phi(float value);
+bool gf16_is_inf(uint16_t gf16);
+bool gf16_is_nan(uint16_t gf16);
+bool gf16_is_negative(uint16_t gf16);
+bool gf16_is_positive(uint16_t gf16);
+uint16_t gf16_negate(uint16_t gf16);
+uint16_t gf16_abs(uint16_t gf16);
+uint16_t gf16_copy_sign(uint16_t gf16, uint16_t sign_source);
+uint16_t gf16_max(uint16_t a, uint16_t b);
+uint16_t gf16_min(uint16_t a, uint16_t b);
+uint16_t gf16_add(uint16_t a, uint16_t b);
+uint16_t gf16_sub(uint16_t a, uint16_t b);
+uint16_t gf16_mul(uint16_t a, uint16_t b);
+uint16_t gf16_div(uint16_t a, uint16_t b);
+uint16_t gf16_fma(uint16_t a, uint16_t b, uint16_t c);
+uint16_t gf16_sqrt(uint16_t a);
+uint16_t gf16_square(uint16_t a);
+bool gf16_eq(uint16_t a, uint16_t b);
+bool gf16_ne(uint16_t a, uint16_t b);
+bool gf16_lt(uint16_t a, uint16_t b);
+bool gf16_le(uint16_t a, uint16_t b);
+bool gf16_gt(uint16_t a, uint16_t b);
+bool gf16_ge(uint16_t a, uint16_t b);
+uint16_t gf16_floor(uint16_t a);
+uint16_t gf16_ceil(uint16_t a);
+uint16_t gf16_round(uint16_t a);
+uint16_t gf16_trunc(uint16_t a);
+uint16_t gf16_fms(uint16_t a, uint16_t b, uint16_t c);
+uint16_t gf16_hypot(uint16_t a, uint16_t b);
+uint16_t gf16_fmod(uint16_t a, uint16_t b);
+bool gf16_is_finite(uint16_t gf16);
+bool gf16_is_normal(uint16_t gf16);
+bool gf16_is_subnormal(uint16_t gf16);
+bool gf16_signbit(uint16_t gf16);
+int8_t gf16_sign(uint16_t gf16);
+uint16_t gf16_clamp(uint16_t x, uint16_t min_val, uint16_t max_val);
+uint16_t gf16_lerp(uint16_t a, uint16_t b, uint16_t t);
+uint16_t gf16_fnma(uint16_t a, uint16_t b, uint16_t c);
+uint16_t gf16_exp(uint16_t x);
+uint16_t gf16_log(uint16_t x);
+uint16_t gf16_log2(uint16_t x);
+uint16_t gf16_log10(uint16_t x);
+uint16_t gf16_pow(uint16_t base, uint16_t exponent);
+uint16_t gf16_sin(uint16_t x);
+uint16_t gf16_cos(uint16_t x);
 
 /* -------------------------------------------------------
    Function implementations
    ------------------------------------------------------- */
 
-int8_t gf16_extract_sign(GF16 gf16) {
-    int bit = ((gf16 >> SIGN_SHIFT) && 1);
+int8_t gf16_extract_sign(uint16_t gf16) {
+    __auto_type bit = ((gf16 >> SIGN_SHIFT) & 1);
     return ((bit != 0)) ? (-1) : (0);
 }
 
-int8_t gf16_extract_exponent(GF16 gf16) {
-    return (i8)((((gf16 >> EXP_SHIFT) && EXP_MASK)));
+int8_t gf16_extract_exponent(uint16_t gf16) {
+    return (int8_t)((((gf16 & EXP_MASK) >> EXP_SHIFT)));
 }
 
-int16_t gf16_extract_mantissa(GF16 gf16) {
-    return (i16)((gf16 && MANT_MASK));
+int16_t gf16_extract_mantissa(uint16_t gf16) {
+    return (int16_t)(((gf16 & MANT_MASK)));
 }
 
-GF16 gf16_from_components(int8_t sign, int8_t exp, int16_t mant) {
-    int sign_bit = ((sign < 0)) ? (1) : (0);
-    return ((((GF16)((sign_bit)) << SIGN_SHIFT) || ((GF16)((exp)) << EXP_SHIFT)) || (GF16)((mant)));
+uint16_t gf16_from_components(int8_t sign, int8_t exp, int16_t mant) {
+    uint16_t sign_bit = ((sign < 0)) ? (1) : (0);
+    return (((sign_bit << SIGN_SHIFT) | ((uint16_t)((exp)) << EXP_SHIFT)) | (uint16_t)((mant)));
 }
 
-bool gf16_is_zero(GF16 gf16) {
+bool gf16_is_zero(uint16_t gf16) {
     return ((gf16 == GF16_ZERO_POS) || (gf16 == GF16_ZERO_NEG));
 }
 
-bool gf16_is_special(GF16 gf16) {
+bool gf16_is_special(uint16_t gf16) {
     return (gf16_extract_exponent(gf16) == EXP_MAX);
 }
 
-GF16 gf16_encode_f32(f32 value) {
-    if ((value == 0.0)) {
-        return (std.math.signbit(value)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
-    }
-    int sign = ((value < 0.0)) ? (-1) : (0);
-    int abs_value = ((value < 0.0)) ? (-value) : (value);
-    uint32_t f32_bits = @bitCast(abs_value);
-    int8_t f32_exp = ((((f32_bits >> 23) && 0xFF)) - 127);
-    uint32_t f32_mant = (f32_bits && 0x7FFFFF);
-    int gf16_exp = (f32_exp - 96);
-    if ((gf16_exp < 0)) {
-        gf16_exp = 0;
-    } else if ((gf16_exp > EXP_MAX)) {
-        gf16_exp = EXP_MAX;
-    }
-    int mant = (u16)(((f32_mant >> 14)));
-    int discarded = (f32_mant && 0x3FFF);
-    if (((discarded && 0x2000) != 0)) {
-        mant += 1;
-        if ((mant > MANT_MASK)) {
-            mant = 0;
-            if ((gf16_exp < EXP_MAX)) {
-                gf16_exp += 1;
-            }
+uint16_t gf16_encode_f32(float value) {
+    uint32_t bits = @bitCast(value);
+    uint16_t sign_bits = (((bits >> 16) & 0x8000));
+    uint32_t fe = ((bits >> 23) & 0xFF);
+    uint32_t fm = (bits & 0x7FFFFF);
+    if ((fe == 0xFF)) {
+        if ((fm != 0)) {
+            return GF16_NAN;
         }
+        return (sign_bits | GF16_INF_POS);
     }
-    return gf16_from_components(sign, gf16_exp, mant);
+    if ((fe < 96)) {
+        return sign_bits;
+    }
+    if ((fe > 158)) {
+        return (sign_bits | GF16_INF_POS);
+    }
+    uint32_t e = (fe - 96);
+    uint32_t m = (fm >> 14);
+    uint32_t rem = (fm & 0x3FFF);
+    if ((rem > 0x2000)) {
+        m = (m + 1);
+    }
+    if ((m > 511)) {
+        m = 0;
+        e = (e + 1);
+    }
+    if ((e > 62)) {
+        return (sign_bits | GF16_INF_POS);
+    }
+    if (((e == 0) && (m == 0))) {
+        return sign_bits;
+    }
+    return (sign_bits | (uint16_t)((((e << 9) | m))));
 }
 
-f32 gf16_decode_to_f32(GF16 gf16) {
-    if (gf16_is_zero(gf16)) {
-        int sign = gf16_extract_sign(gf16);
-        return ((sign < 0)) ? (-0.0) : (0.0);
+float gf16_decode_to_f32(uint16_t gf16) {
+    uint32_t s = ((uint32_t)((gf16 & SIGN_MASK)) << 16);
+    uint32_t e = (uint32_t)(((gf16 & EXP_MASK) >> EXP_SHIFT));
+    uint32_t m = (uint32_t)((gf16 & MANT_MASK));
+    if (((e == 0) && (m == 0))) {
+        uint32_t zero_bits = s;
+        float zero = @bitCast(zero_bits);
+        return zero;
     }
-    if (gf16_is_special(gf16)) {
-        int mant = gf16_extract_mantissa(gf16);
-        int sign = gf16_extract_sign(gf16);
-        if ((mant == 0)) {
-            return ((sign < 0)) ? (-std.math.inf(f32)) : (std.math.inf(f32));
-        } else {
-            return std.math.nan(f32);
+    if ((e == 63)) {
+        if ((m == 0)) {
+            uint32_t inf_bits = (s | 0x7F800000);
+            float inf = @bitCast(inf_bits);
+            return inf;
         }
+        return std.math.nan(f32);
     }
-    int sign = gf16_extract_sign(gf16);
-    int exp = gf16_extract_exponent(gf16);
-    int mant = gf16_extract_mantissa(gf16);
-    int sign_mult = ((sign < 0)) ? (-1.0) : (1.0);
-    int mant_mult = (1.0 + ((f32)(@floatFromInt(mant)) / 512.0));
-    int exp_mult = (f32)(@exp2(f32, @floatFromInt((exp - BIAS))));
-    return ((sign_mult * mant_mult) * exp_mult);
+    uint32_t out_bits = ((s | ((e + 96) << 23)) | (m << 14));
+    float out = @bitCast(out_bits);
+    return out;
 }
 
-GF16 gf16_round_phi(f32 value) {
-    if ((value == 0.0)) {
-        return (std.math.signbit(value)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
-    }
-    int sign = ((value < 0.0)) ? (-1) : (0);
-    int abs_value = ((value < 0.0)) ? (-value) : (value);
-    uint32_t f32_bits = @bitCast(abs_value);
-    int8_t f32_exp = ((((f32_bits >> 23) && 0xFF)) - 127);
-    uint32_t f32_mant = (f32_bits && 0x7FFFFF);
-    int gf16_exp = (f32_exp - 96);
-    if ((gf16_exp < 0)) {
-        gf16_exp = 0;
-    } else if ((gf16_exp > EXP_MAX)) {
-        gf16_exp = EXP_MAX;
-    }
-    uint32_t normalized_mant = (f32_mant || 0x00800000);
-    int mant = (u16)((((normalized_mant >> 15) + PHI_BIAS)));
-    if ((mant > MANT_MASK)) {
-        mant = 0;
-        if ((gf16_exp < EXP_MAX)) {
-            gf16_exp += 1;
-        } else {
-            gf16_exp = EXP_MAX;
+uint16_t gf16_round_phi(float value) {
+    uint32_t bits = @bitCast(value);
+    uint16_t sign_bits = (((bits >> 16) & 0x8000));
+    uint32_t fe = ((bits >> 23) & 0xFF);
+    uint32_t fm = (bits & 0x7FFFFF);
+    if ((fe == 0xFF)) {
+        if ((fm != 0)) {
+            return GF16_NAN;
         }
+        return (sign_bits | GF16_INF_POS);
     }
-    return gf16_from_components(sign, gf16_exp, mant);
+    if ((fe < 96)) {
+        return sign_bits;
+    }
+    if ((fe > 158)) {
+        return (sign_bits | GF16_INF_POS);
+    }
+    uint32_t e = (fe - 96);
+    uint32_t m = (fm >> 14);
+    uint32_t rem = (fm & 0x3FFF);
+    if ((rem >= 10125)) {
+        m = (m + 1);
+    }
+    if ((m > 511)) {
+        m = 0;
+        e = (e + 1);
+    }
+    if ((e > 62)) {
+        return (sign_bits | GF16_INF_POS);
+    }
+    if (((e == 0) && (m == 0))) {
+        return sign_bits;
+    }
+    return (sign_bits | (uint16_t)((((e << 9) | m))));
 }
 
-bool gf16_is_inf(GF16 gf16) {
-    int exp = gf16_extract_exponent(gf16);
-    int mant = gf16_extract_mantissa(gf16);
+bool gf16_is_inf(uint16_t gf16) {
+    __auto_type exp = gf16_extract_exponent(gf16);
+    __auto_type mant = gf16_extract_mantissa(gf16);
     return ((exp == EXP_MAX) && (mant == 0));
 }
 
-bool gf16_is_nan(GF16 gf16) {
-    int exp = gf16_extract_exponent(gf16);
-    int mant = gf16_extract_mantissa(gf16);
+bool gf16_is_nan(uint16_t gf16) {
+    __auto_type exp = gf16_extract_exponent(gf16);
+    __auto_type mant = gf16_extract_mantissa(gf16);
     return ((exp == EXP_MAX) && (mant != 0));
 }
 
-bool gf16_is_negative(GF16 gf16) {
-    int sign = gf16_extract_sign(gf16);
+bool gf16_is_negative(uint16_t gf16) {
+    __auto_type sign = gf16_extract_sign(gf16);
     return ((sign < 0) && !gf16_is_zero(gf16));
 }
 
-bool gf16_is_positive(GF16 gf16) {
-    int sign = gf16_extract_sign(gf16);
+bool gf16_is_positive(uint16_t gf16) {
+    __auto_type sign = gf16_extract_sign(gf16);
     return ((sign >= 0) && !gf16_is_zero(gf16));
 }
 
-GF16 gf16_negate(GF16 gf16) {
+uint16_t gf16_negate(uint16_t gf16) {
     return (gf16 ^ SIGN_MASK);
 }
 
-GF16 gf16_abs(GF16 gf16) {
-    return (gf16 && ~SIGN_MASK);
+uint16_t gf16_abs(uint16_t gf16) {
+    return (gf16 & ~SIGN_MASK);
 }
 
-GF16 gf16_copy_sign(GF16 gf16, GF16 sign_source) {
-    int sign_mask = (sign_source && SIGN_MASK);
-    int value_mask = (gf16 && ~SIGN_MASK);
-    return (value_mask || sign_mask);
+uint16_t gf16_copy_sign(uint16_t gf16, uint16_t sign_source) {
+    __auto_type sign_mask = (sign_source & SIGN_MASK);
+    __auto_type value_mask = (gf16 & ~SIGN_MASK);
+    return (value_mask | sign_mask);
 }
 
-GF16 gf16_max(GF16 a, GF16 b) {
+uint16_t gf16_max(uint16_t a, uint16_t b) {
     if (gf16_is_nan(a)) {
         return b;
     }
     if (gf16_is_nan(b)) {
         return a;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
     if ((a_val >= b_val)) {
         return a;
+    } else {
+        return b;
     }
-    return b;
 }
 
-GF16 gf16_min(GF16 a, GF16 b) {
+uint16_t gf16_min(uint16_t a, uint16_t b) {
     if (gf16_is_nan(a)) {
         return b;
     }
     if (gf16_is_nan(b)) {
         return a;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
     if ((a_val <= b_val)) {
         return a;
+    } else {
+        return b;
     }
-    return b;
 }
 
-GF16 gf16_add(GF16 a, GF16 b) {
+uint16_t gf16_add(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return GF16_NAN;
     }
     if ((gf16_is_inf(a) && gf16_is_inf(b))) {
-        int a_sign = gf16_extract_sign(a);
-        int b_sign = gf16_extract_sign(b);
+        __auto_type a_sign = gf16_extract_sign(a);
+        __auto_type b_sign = gf16_extract_sign(b);
         return ((a_sign == b_sign)) ? (a) : (GF16_NAN);
     }
     if (gf16_is_inf(a)) {
@@ -286,13 +315,13 @@ GF16 gf16_add(GF16 a, GF16 b) {
     if (gf16_is_inf(b)) {
         return b;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int result = (a_val + b_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type result = (a_val + b_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_sub(GF16 a, GF16 b) {
+uint16_t gf16_sub(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return GF16_NAN;
     }
@@ -305,76 +334,76 @@ GF16 gf16_sub(GF16 a, GF16 b) {
     if (gf16_is_inf(b)) {
         return gf16_negate(b);
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int result = (a_val - b_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type result = (a_val - b_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_mul(GF16 a, GF16 b) {
+uint16_t gf16_mul(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return GF16_NAN;
     }
     if ((gf16_is_zero(a) || gf16_is_zero(b))) {
-        int a_sign = gf16_extract_sign(a);
-        int b_sign = gf16_extract_sign(b);
-        int result_sign = (a_sign ^ b_sign);
+        __auto_type a_sign = gf16_extract_sign(a);
+        __auto_type b_sign = gf16_extract_sign(b);
+        __auto_type result_sign = (a_sign ^ b_sign);
         return ((result_sign != 0)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
     }
     if ((gf16_is_inf(a) || gf16_is_inf(b))) {
-        int a_sign = gf16_extract_sign(a);
-        int b_sign = gf16_extract_sign(b);
-        int result_sign = (a_sign ^ b_sign);
+        __auto_type a_sign = gf16_extract_sign(a);
+        __auto_type b_sign = gf16_extract_sign(b);
+        __auto_type result_sign = (a_sign ^ b_sign);
         return ((result_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int result = (a_val * b_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type result = (a_val * b_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_div(GF16 a, GF16 b) {
+uint16_t gf16_div(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return GF16_NAN;
     }
     if (gf16_is_zero(b)) {
-        int a_sign = gf16_extract_sign(a);
+        __auto_type a_sign = gf16_extract_sign(a);
         return ((a_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
     }
     if (gf16_is_inf(a)) {
-        int a_sign = gf16_extract_sign(a);
-        int b_sign = gf16_extract_sign(b);
-        int result_sign = (a_sign ^ b_sign);
+        __auto_type a_sign = gf16_extract_sign(a);
+        __auto_type b_sign = gf16_extract_sign(b);
+        __auto_type result_sign = (a_sign ^ b_sign);
         return ((result_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
     }
     if (gf16_is_inf(b)) {
-        int a_sign = gf16_extract_sign(a);
-        int b_sign = gf16_extract_sign(b);
-        int result_sign = (a_sign ^ b_sign);
+        __auto_type a_sign = gf16_extract_sign(a);
+        __auto_type b_sign = gf16_extract_sign(b);
+        __auto_type result_sign = (a_sign ^ b_sign);
         return ((result_sign != 0)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int result = (a_val / b_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type result = (a_val / b_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_fma(GF16 a, GF16 b, GF16 c) {
+uint16_t gf16_fma(uint16_t a, uint16_t b, uint16_t c) {
     if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(c))) {
         return GF16_NAN;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int c_val = gf16_decode_to_f32(c);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type c_val = gf16_decode_to_f32(c);
     if ((gf16_is_zero(a) || gf16_is_zero(b))) {
         return gf16_add(c, gf16_encode_f32(0.0));
     }
-    int product = (a_val * b_val);
-    int result = (product + c_val);
+    __auto_type product = (a_val * b_val);
+    __auto_type result = (product + c_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_sqrt(GF16 a) {
+uint16_t gf16_sqrt(uint16_t a) {
     if (gf16_is_nan(a)) {
         return GF16_NAN;
     }
@@ -390,16 +419,16 @@ GF16 gf16_sqrt(GF16 a) {
     if (gf16_is_negative(a)) {
         return GF16_NAN;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int result = @sqrt(a_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type result = @sqrt(a_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_square(GF16 a) {
+uint16_t gf16_square(uint16_t a) {
     return gf16_mul(a, a);
 }
 
-bool gf16_eq(GF16 a, GF16 b) {
+bool gf16_eq(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return false;
     }
@@ -409,47 +438,47 @@ bool gf16_eq(GF16 a, GF16 b) {
     return (a == b);
 }
 
-bool gf16_ne(GF16 a, GF16 b) {
+bool gf16_ne(uint16_t a, uint16_t b) {
     return !gf16_eq(a, b);
 }
 
-bool gf16_lt(GF16 a, GF16 b) {
+bool gf16_lt(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return false;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
     return (a_val < b_val);
 }
 
-bool gf16_le(GF16 a, GF16 b) {
+bool gf16_le(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return false;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
     return (a_val <= b_val);
 }
 
-bool gf16_gt(GF16 a, GF16 b) {
+bool gf16_gt(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return false;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
     return (a_val > b_val);
 }
 
-bool gf16_ge(GF16 a, GF16 b) {
+bool gf16_ge(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return false;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
     return (a_val >= b_val);
 }
 
-GF16 gf16_floor(GF16 a) {
+uint16_t gf16_floor(uint16_t a) {
     if (gf16_is_nan(a)) {
         return GF16_NAN;
     }
@@ -459,12 +488,12 @@ GF16 gf16_floor(GF16 a) {
     if (gf16_is_zero(a)) {
         return a;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int result = @floor(a_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type result = @floor(a_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_ceil(GF16 a) {
+uint16_t gf16_ceil(uint16_t a) {
     if (gf16_is_nan(a)) {
         return GF16_NAN;
     }
@@ -474,12 +503,12 @@ GF16 gf16_ceil(GF16 a) {
     if (gf16_is_zero(a)) {
         return a;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int result = @ceil(a_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type result = @ceil(a_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_round(GF16 a) {
+uint16_t gf16_round(uint16_t a) {
     if (gf16_is_nan(a)) {
         return GF16_NAN;
     }
@@ -489,12 +518,12 @@ GF16 gf16_round(GF16 a) {
     if (gf16_is_zero(a)) {
         return a;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int result = @round(a_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type result = @round(a_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_trunc(GF16 a) {
+uint16_t gf16_trunc(uint16_t a) {
     if (gf16_is_nan(a)) {
         return GF16_NAN;
     }
@@ -504,27 +533,27 @@ GF16 gf16_trunc(GF16 a) {
     if (gf16_is_zero(a)) {
         return a;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int result = @trunc(a_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type result = @trunc(a_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_fms(GF16 a, GF16 b, GF16 c) {
+uint16_t gf16_fms(uint16_t a, uint16_t b, uint16_t c) {
     if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(c))) {
         return GF16_NAN;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int c_val = gf16_decode_to_f32(c);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type c_val = gf16_decode_to_f32(c);
     if ((gf16_is_zero(a) || gf16_is_zero(b))) {
         return gf16_sub(gf16_encode_f32(0.0), c);
     }
-    int product = (a_val * b_val);
-    int result = (product - c_val);
+    __auto_type product = (a_val * b_val);
+    __auto_type result = (product - c_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_hypot(GF16 a, GF16 b) {
+uint16_t gf16_hypot(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return GF16_NAN;
     }
@@ -534,21 +563,21 @@ GF16 gf16_hypot(GF16 a, GF16 b) {
     if ((gf16_is_zero(a) && gf16_is_zero(b))) {
         return GF16_ZERO_POS;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int abs_a = @abs(a_val);
-    int abs_b = @abs(b_val);
-    int max_val = @max(abs_a, abs_b);
-    int min_val = @min(abs_a, abs_b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type abs_a = @abs(a_val);
+    __auto_type abs_b = @abs(b_val);
+    __auto_type max_val = @max(abs_a, abs_b);
+    __auto_type min_val = @min(abs_a, abs_b);
     if ((max_val == 0.0)) {
         return GF16_ZERO_POS;
     }
-    int ratio = (min_val / max_val);
-    int result = (max_val * @sqrt((1.0 + (ratio * ratio))));
+    __auto_type ratio = (min_val / max_val);
+    __auto_type result = (max_val * @sqrt((1.0 + (ratio * ratio))));
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_fmod(GF16 a, GF16 b) {
+uint16_t gf16_fmod(uint16_t a, uint16_t b) {
     if ((gf16_is_nan(a) || gf16_is_nan(b))) {
         return GF16_NAN;
     }
@@ -561,41 +590,36 @@ GF16 gf16_fmod(GF16 a, GF16 b) {
     if (gf16_is_inf(b)) {
         return a;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
     if ((a_val == 0.0)) {
         return a;
     }
-    int result = @mod(a_val, b_val);
+    __auto_type result = @rem(a_val, b_val);
     return gf16_encode_f32(result);
 }
 
-bool gf16_is_finite(GF16 gf16) {
+bool gf16_is_finite(uint16_t gf16) {
     return (!gf16_is_nan(gf16) && !gf16_is_inf(gf16));
 }
 
-bool gf16_is_normal(GF16 gf16) {
+bool gf16_is_normal(uint16_t gf16) {
     if (((gf16_is_zero(gf16) || gf16_is_nan(gf16)) || gf16_is_inf(gf16))) {
         return false;
     }
-    int exp = gf16_extract_exponent(gf16);
-    return ((exp > 0) && (exp < GF16_EXP_MAX));
+    __auto_type exp = gf16_extract_exponent(gf16);
+    return ((exp >= 0) && (exp < EXP_MAX));
 }
 
-bool gf16_is_subnormal(GF16 gf16) {
-    if (((gf16_is_zero(gf16) || gf16_is_nan(gf16)) || gf16_is_inf(gf16))) {
-        return false;
-    }
-    int exp = gf16_extract_exponent(gf16);
-    int mant = gf16_extract_mantissa(gf16);
-    return ((exp == 0) && (mant != 0));
+bool gf16_is_subnormal(uint16_t gf16) {
+    return ((gf16_is_finite(gf16) && !gf16_is_zero(gf16)) && !gf16_is_normal(gf16));
 }
 
-bool gf16_signbit(GF16 gf16) {
-    return ((gf16 && GF16_SIGN_MASK) != 0);
+bool gf16_signbit(uint16_t gf16) {
+    return ((gf16 & SIGN_MASK) != 0);
 }
 
-int8_t gf16_sign(GF16 gf16) {
+int8_t gf16_sign(uint16_t gf16) {
     if (gf16_is_nan(gf16)) {
         return 0;
     }
@@ -609,13 +633,13 @@ int8_t gf16_sign(GF16 gf16) {
     }
 }
 
-GF16 gf16_clamp(GF16 x, GF16 min_val, GF16 max_val) {
+uint16_t gf16_clamp(uint16_t x, uint16_t min_val, uint16_t max_val) {
     if (((gf16_is_nan(x) || gf16_is_nan(min_val)) || gf16_is_nan(max_val))) {
         return GF16_NAN;
     }
-    int x_decoded = gf16_decode_to_f32(x);
-    int min_decoded = gf16_decode_to_f32(min_val);
-    int max_decoded = gf16_decode_to_f32(max_val);
+    __auto_type x_decoded = gf16_decode_to_f32(x);
+    __auto_type min_decoded = gf16_decode_to_f32(min_val);
+    __auto_type max_decoded = gf16_decode_to_f32(max_val);
     if ((x_decoded < min_decoded)) {
         return min_val;
     } else if ((x_decoded > max_decoded)) {
@@ -625,18 +649,18 @@ GF16 gf16_clamp(GF16 x, GF16 min_val, GF16 max_val) {
     }
 }
 
-GF16 gf16_lerp(GF16 a, GF16 b, GF16 t) {
+uint16_t gf16_lerp(uint16_t a, uint16_t b, uint16_t t) {
     if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(t))) {
         return GF16_NAN;
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int t_val = gf16_decode_to_f32(t);
-    int result = (a_val + (t_val * (b_val - a_val)));
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type t_val = gf16_decode_to_f32(t);
+    __auto_type result = (a_val + (t_val * (b_val - a_val)));
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_fnma(GF16 a, GF16 b, GF16 c) {
+uint16_t gf16_fnma(uint16_t a, uint16_t b, uint16_t c) {
     if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(c))) {
         return GF16_NAN;
     }
@@ -645,9 +669,9 @@ GF16 gf16_fnma(GF16 a, GF16 b, GF16 c) {
             return GF16_NAN;
         }
         if ((gf16_is_inf(a) || gf16_is_inf(b))) {
-            int sign_a = gf16_signbit(a);
-            int sign_b = gf16_signbit(b);
-            int result_sign = (sign_a != sign_b);
+            __auto_type sign_a = gf16_signbit(a);
+            __auto_type sign_b = gf16_signbit(b);
+            __auto_type result_sign = (sign_a != sign_b);
             return (result_sign) ? (GF16_INF_NEG) : (GF16_INF_POS);
         }
     }
@@ -658,19 +682,19 @@ GF16 gf16_fnma(GF16 a, GF16 b, GF16 c) {
         return c;
     }
     if (gf16_is_zero(c)) {
-        int a_val = gf16_decode_to_f32(a);
-        int b_val = gf16_decode_to_f32(b);
-        int neg_product = -(a_val * b_val);
+        __auto_type a_val = gf16_decode_to_f32(a);
+        __auto_type b_val = gf16_decode_to_f32(b);
+        __auto_type neg_product = -(a_val * b_val);
         return gf16_encode_f32(neg_product);
     }
-    int a_val = gf16_decode_to_f32(a);
-    int b_val = gf16_decode_to_f32(b);
-    int c_val = gf16_decode_to_f32(c);
-    int result = (-(a_val * b_val) + c_val);
+    __auto_type a_val = gf16_decode_to_f32(a);
+    __auto_type b_val = gf16_decode_to_f32(b);
+    __auto_type c_val = gf16_decode_to_f32(c);
+    __auto_type result = (-(a_val * b_val) + c_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_exp(GF16 x) {
+uint16_t gf16_exp(uint16_t x) {
     if (gf16_is_nan(x)) {
         return GF16_NAN;
     }
@@ -680,26 +704,18 @@ GF16 gf16_exp(GF16 x) {
         }
         return GF16_INF_POS;
     }
-    int x_val = gf16_decode_to_f32(x);
+    __auto_type x_val = gf16_decode_to_f32(x);
     if ((x_val > 88.0)) {
         return GF16_INF_POS;
     }
     if ((x_val < -88.0)) {
         return GF16_ZERO_POS;
     }
-    f32 result = 1.0;
-    f32 term = 1.0;
-    uint32_t num_terms = 5;
-    /* for-each loop (see t27 source) */
-    {
-        if ((i > 0)) {
-            result += term;
-        }
-    }
+    float result = @exp(x_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_log(GF16 x) {
+uint16_t gf16_log(uint16_t x) {
     if (gf16_is_nan(x)) {
         return GF16_NAN;
     }
@@ -712,11 +728,15 @@ GF16 gf16_log(GF16 x) {
     if ((gf16_is_zero(x) || gf16_is_negative(x))) {
         return GF16_NAN;
     }
-    int x_val = gf16_decode_to_f32(x);
+    __auto_type x_val = gf16_decode_to_f32(x);
+    if ((x_val > 1.0e38)) {
+        return GF16_INF_POS;
+    }
+    __auto_type result = @log(x_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_log2(GF16 x) {
+uint16_t gf16_log2(uint16_t x) {
     if (gf16_is_nan(x)) {
         return GF16_NAN;
     }
@@ -729,12 +749,12 @@ GF16 gf16_log2(GF16 x) {
     if ((gf16_is_zero(x) || gf16_is_negative(x))) {
         return GF16_NAN;
     }
-    int x_val = gf16_decode_to_f32(x);
-    int result = @log2(x_val);
+    __auto_type x_val = gf16_decode_to_f32(x);
+    __auto_type result = @log2(x_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_log10(GF16 x) {
+uint16_t gf16_log10(uint16_t x) {
     if (gf16_is_nan(x)) {
         return GF16_NAN;
     }
@@ -747,12 +767,12 @@ GF16 gf16_log10(GF16 x) {
     if ((gf16_is_zero(x) || gf16_is_negative(x))) {
         return GF16_NAN;
     }
-    int x_val = gf16_decode_to_f32(x);
-    int result = @log10(x_val);
+    __auto_type x_val = gf16_decode_to_f32(x);
+    __auto_type result = @log10(x_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_pow(GF16 base, GF16 exponent) {
+uint16_t gf16_pow(uint16_t base, uint16_t exponent) {
     if ((gf16_is_nan(base) || gf16_is_nan(exponent))) {
         return GF16_NAN;
     }
@@ -765,7 +785,7 @@ GF16 gf16_pow(GF16 base, GF16 exponent) {
     if ((gf16_is_zero(base) && gf16_is_negative(exponent))) {
         return GF16_INF_POS;
     }
-    int base_val = gf16_decode_to_f32(base);
+    __auto_type base_val = gf16_decode_to_f32(base);
     if (((base_val == 1.0) && !gf16_is_inf(exponent))) {
         return gf16_encode_f32(1.0);
     }
@@ -775,50 +795,50 @@ GF16 gf16_pow(GF16 base, GF16 exponent) {
         }
         return gf16_encode_f32(1.0);
     }
-    int exp_val = gf16_decode_to_f32(exponent);
+    __auto_type exp_val = gf16_decode_to_f32(exponent);
     if ((exp_val == 1.0)) {
         return base;
     }
-    int result = @pow(base_val, exp_val);
+    __auto_type result = std.math.pow(f32, base_val, exp_val);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_sin(GF16 x) {
+uint16_t gf16_sin(uint16_t x) {
     if (gf16_is_nan(x)) {
         return GF16_NAN;
     }
     if (gf16_is_inf(x)) {
         return GF16_NAN;
     }
-    int x_val = gf16_decode_to_f32(x);
-    int x_sq = (x_val * x_val);
-    int x_cub = (x_sq * x_val);
-    int x_5 = (x_cub * x_sq);
-    int x_7 = (x_5 * x_sq);
-    int term1 = x_val;
-    int term2 = (-x_cub / 6.0);
-    int term3 = (x_5 / 120.0);
-    int term4 = (-x_7 / 5040.0);
-    int result = (((term1 + term2) + term3) + term4);
+    __auto_type x_val = gf16_decode_to_f32(x);
+    __auto_type x_sq = (x_val * x_val);
+    __auto_type x_cub = (x_sq * x_val);
+    __auto_type x_5 = (x_cub * x_sq);
+    __auto_type x_7 = (x_5 * x_sq);
+    __auto_type term1 = x_val;
+    __auto_type term2 = (-x_cub / 6.0);
+    __auto_type term3 = (x_5 / 120.0);
+    __auto_type term4 = (-x_7 / 5040.0);
+    __auto_type result = (((term1 + term2) + term3) + term4);
     return gf16_encode_f32(result);
 }
 
-GF16 gf16_cos(GF16 x) {
+uint16_t gf16_cos(uint16_t x) {
     if (gf16_is_nan(x)) {
         return GF16_NAN;
     }
     if (gf16_is_inf(x)) {
         return GF16_NAN;
     }
-    int x_val = gf16_decode_to_f32(x);
-    int x_sq = (x_val * x_val);
-    int x_4 = (x_sq * x_sq);
-    int x_6 = (x_4 * x_sq);
-    int term0 = 1.0;
-    int term1 = (-x_sq / 2.0);
-    int term2 = (x_4 / 24.0);
-    int term3 = (-x_6 / 720.0);
-    int result = (((term0 + term1) + term2) + term3);
+    __auto_type x_val = gf16_decode_to_f32(x);
+    __auto_type x_sq = (x_val * x_val);
+    __auto_type x_4 = (x_sq * x_sq);
+    __auto_type x_6 = (x_4 * x_sq);
+    __auto_type term0 = 1.0;
+    __auto_type term1 = (-x_sq / 2.0);
+    __auto_type term2 = (x_4 / 24.0);
+    __auto_type term3 = (-x_6 / 720.0);
+    __auto_type result = (((term0 + term1) + term2) + term3);
     return gf16_encode_f32(result);
 }
 
@@ -827,304 +847,325 @@ GF16 gf16_cos(GF16 x) {
    ------------------------------------------------------- */
 
 /* invariant: gf16_identity_encoding */
-_Static_assert(_Static_assert((gf16_from_components(0, 0, 0) == 0x3C00), "compile assert"), "invariant: gf16_identity_encoding");
+/* invariant gf16_identity_encoding is not a C constant expression: _Static_assert((gf16_from_components(0, 31, 0) == 0x3E00), "compile assert") */
 
 /* invariant: gf16_sign_mask_bit_position */
-_Static_assert(_Static_assert((SIGN_MASK == 0x8000), "compile assert"), "invariant: gf16_sign_mask_bit_position");
+/* invariant gf16_sign_mask_bit_position is not a C constant expression: _Static_assert((SIGN_MASK == 0x8000), "compile assert") */
 
 /* invariant: gf16_exp_mask_range */
-_Static_assert(_Static_assert((EXP_MASK == 0x7E00), "compile assert"), "invariant: gf16_exp_mask_range");
+/* invariant gf16_exp_mask_range is not a C constant expression: _Static_assert((EXP_MASK == 0x7E00), "compile assert") */
 
 /* invariant: gf16_mant_mask_range */
-_Static_assert(_Static_assert((MANT_MASK == 0x01FF), "compile assert"), "invariant: gf16_mant_mask_range");
+/* invariant gf16_mant_mask_range is not a C constant expression: _Static_assert((MANT_MASK == 0x01FF), "compile assert") */
 
 /* invariant: gf16_exp_bias_identity */
-_Static_assert(_Static_assert((BIAS == 31), "compile assert"), "invariant: gf16_exp_bias_identity");
+/* invariant gf16_exp_bias_identity is not a C constant expression: _Static_assert((BIAS == 31), "compile assert") */
 
 /* invariant: gf16_roundtrip_symmetry */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_roundtrip_symmetry");
+/* invariant gf16_roundtrip_symmetry is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_zero_uniqueness */
-_Static_assert(_Static_assert((GF16_ZERO_POS == 0x0000), "compile assert"), "invariant: gf16_zero_uniqueness");
-_Static_assert(_Static_assert((GF16_ZERO_NEG == 0x8000), "compile assert"), "invariant: gf16_zero_uniqueness");
+/* invariant gf16_zero_uniqueness is not a C constant expression: _Static_assert((GF16_ZERO_POS == 0x0000), "compile assert") */
+/* invariant gf16_zero_uniqueness is not a C constant expression: _Static_assert((GF16_ZERO_NEG == 0x8000), "compile assert") */
 
 /* invariant: gf16_special_exp_all_ones */
-_Static_assert(_Static_assert((EXP_MAX == 0x3F), "compile assert"), "invariant: gf16_special_exp_all_ones");
+/* invariant gf16_special_exp_all_ones is not a C constant expression: _Static_assert((EXP_MAX == 0x3F), "compile assert") */
 
 /* invariant: gf16_pow2_table_consistency */
-_Static_assert(_Static_assert((pow2_table.len == 32), "compile assert"), "invariant: gf16_pow2_table_consistency");
+/* invariant gf16_pow2_table_consistency is not a C constant expression: _Static_assert((pow2_table.len == 32), "compile assert") */
 
 /* invariant: gf16_mantissa_implicit_one */
-_Static_assert(_Static_assert((MANT_DIVISOR == 512), "compile assert"), "invariant: gf16_mantissa_implicit_one");
+/* invariant gf16_mantissa_implicit_one is not a C constant expression: _Static_assert((MANT_DIVISOR == 512), "compile assert") */
 
 /* invariant: gf16_phi_bias_positive */
-_Static_assert(_Static_assert((PHI_BIAS > 0), "compile assert"), "invariant: gf16_phi_bias_positive");
+/* invariant gf16_phi_bias_positive is not a C constant expression: _Static_assert((PHI_BIAS > 0), "compile assert") */
 
 /* invariant: gf16_phi_bias_less_than_mantissa_scale */
-_Static_assert(_Static_assert((PHI_BIAS < MANT_DIVISOR), "compile assert"), "invariant: gf16_phi_bias_less_than_mantissa_scale");
+/* invariant gf16_phi_bias_less_than_mantissa_scale is not a C constant expression: _Static_assert((PHI_BIAS < MANT_DIVISOR), "compile assert") */
 
 /* invariant: gf16_round_phi_preserves_sign */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_round_phi_preserves_sign");
+/* invariant gf16_round_phi_preserves_sign is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_inf_exp_all_ones_mant_zero */
-_Static_assert(_Static_assert((gf16_extract_exponent(GF16_INF_POS) == EXP_MAX), "compile assert"), "invariant: gf16_inf_exp_all_ones_mant_zero");
-_Static_assert(_Static_assert((gf16_extract_mantissa(GF16_INF_POS) == 0), "compile assert"), "invariant: gf16_inf_exp_all_ones_mant_zero");
+/* invariant gf16_inf_exp_all_ones_mant_zero is not a C constant expression: _Static_assert((gf16_extract_exponent(GF16_INF_POS) == EXP_MAX), "compile assert") */
+/* invariant gf16_inf_exp_all_ones_mant_zero is not a C constant expression: _Static_assert((gf16_extract_mantissa(GF16_INF_POS) == 0), "compile assert") */
 
 /* invariant: gf16_nan_exp_all_ones_mant_nonzero */
-_Static_assert(_Static_assert((gf16_extract_exponent(GF16_NAN) == EXP_MAX), "compile assert"), "invariant: gf16_nan_exp_all_ones_mant_nonzero");
-_Static_assert(_Static_assert((gf16_extract_mantissa(GF16_NAN) != 0), "compile assert"), "invariant: gf16_nan_exp_all_ones_mant_nonzero");
+/* invariant gf16_nan_exp_all_ones_mant_nonzero is not a C constant expression: _Static_assert((gf16_extract_exponent(GF16_NAN) == EXP_MAX), "compile assert") */
+/* invariant gf16_nan_exp_all_ones_mant_nonzero is not a C constant expression: _Static_assert((gf16_extract_mantissa(GF16_NAN) != 0), "compile assert") */
 
 /* invariant: gf16_negate_flips_sign_bit */
-_Static_assert(_Static_assert((gf16_negate(0x3C00) == 0xBC00), "compile assert"), "invariant: gf16_negate_flips_sign_bit");
-_Static_assert(_Static_assert((gf16_negate(0xBC00) == 0x3C00), "compile assert"), "invariant: gf16_negate_flips_sign_bit");
+/* invariant gf16_negate_flips_sign_bit is not a C constant expression: _Static_assert((gf16_negate(0x3C00) == 0xBC00), "compile assert") */
+/* invariant gf16_negate_flips_sign_bit is not a C constant expression: _Static_assert((gf16_negate(0xBC00) == 0x3C00), "compile assert") */
 
 /* invariant: gf16_negate_involutive */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_negate_involutive");
+/* invariant gf16_negate_involutive is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_abs_clears_sign_bit */
-_Static_assert(_Static_assert((gf16_abs(0xBC00) == 0x3C00), "compile assert"), "invariant: gf16_abs_clears_sign_bit");
-_Static_assert(_Static_assert((gf16_abs(0x3C00) == 0x3C00), "compile assert"), "invariant: gf16_abs_clears_sign_bit");
+/* invariant gf16_abs_clears_sign_bit is not a C constant expression: _Static_assert((gf16_abs(0xBC00) == 0x3C00), "compile assert") */
+/* invariant gf16_abs_clears_sign_bit is not a C constant expression: _Static_assert((gf16_abs(0x3C00) == 0x3C00), "compile assert") */
 
 /* invariant: gf16_abs_non_negative */
-_Static_assert(_Static_assert(((gf16_abs(0xBC00) && SIGN_MASK) == 0), "compile assert"), "invariant: gf16_abs_non_negative");
+/* invariant gf16_abs_non_negative is not a C constant expression: _Static_assert(((gf16_abs(0xBC00) & SIGN_MASK) == 0), "compile assert") */
 
 /* invariant: gf16_copy_sign_preserves_sign_source */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_copy_sign_preserves_sign_source");
+/* invariant gf16_copy_sign_preserves_sign_source is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_copy_sign_preserves_magnitude */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_copy_sign_preserves_magnitude");
+/* invariant gf16_copy_sign_preserves_magnitude is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_max_idempotent */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_max_idempotent");
+/* invariant gf16_max_idempotent is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_min_idempotent */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_min_idempotent");
+/* invariant gf16_min_idempotent is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_max_commutative */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_max_commutative");
+/* invariant gf16_max_commutative is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_min_commutative */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_min_commutative");
+/* invariant gf16_min_commutative is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_is_inf_and_is_nan_exclusive */
-_Static_assert(_Static_assert(!gf16_is_inf(GF16_NAN), "compile assert"), "invariant: gf16_is_inf_and_is_nan_exclusive");
-_Static_assert(_Static_assert(!gf16_is_nan(GF16_INF_POS), "compile assert"), "invariant: gf16_is_inf_and_is_nan_exclusive");
+/* invariant gf16_is_inf_and_is_nan_exclusive is not a C constant expression: _Static_assert(!gf16_is_inf(GF16_NAN), "compile assert") */
+/* invariant gf16_is_inf_and_is_nan_exclusive is not a C constant expression: _Static_assert(!gf16_is_nan(GF16_INF_POS), "compile assert") */
 
 /* invariant: gf16_add_zero_identity */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_add_zero_identity");
+/* invariant gf16_add_zero_identity is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_mul_zero_annihilates */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_mul_zero_annihilates");
+/* invariant gf16_mul_zero_annihilates is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_mul_one_identity */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_mul_one_identity");
+/* invariant gf16_mul_one_identity is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_negate_involutive */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_negate_involutive");
+/* invariant gf16_negate_involutive is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_add_commutative */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_add_commutative");
+/* invariant gf16_add_commutative is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_mul_commutative */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_mul_commutative");
+/* invariant gf16_mul_commutative is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_div_by_one_identity */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_div_by_one_identity");
+/* invariant gf16_div_by_one_identity is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_sqrt_non_negative */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_sqrt_non_negative");
+/* invariant gf16_sqrt_non_negative is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_sqrt_of_square_less_than_or_equal */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_sqrt_of_square_less_than_or_equal");
+/* invariant gf16_sqrt_of_square_less_than_or_equal is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fma_distributive_approximation */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fma_distributive_approximation");
+/* invariant gf16_fma_distributive_approximation is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_square_positive */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_square_positive");
+/* invariant gf16_square_positive is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_eq_reflexive_for_non_nan */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_eq_reflexive_for_non_nan");
+/* invariant gf16_eq_reflexive_for_non_nan is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_ne_irreflexive_for_non_nan */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_ne_irreflexive_for_non_nan");
+/* invariant gf16_ne_irreflexive_for_non_nan is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_lt_and_gt_mutually_exclusive */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_lt_and_gt_mutually_exclusive");
+/* invariant gf16_lt_and_gt_mutually_exclusive is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_le_and_ge_mutually_inclusive */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_le_and_ge_mutually_inclusive");
+/* invariant gf16_le_and_ge_mutually_inclusive is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_lt_implies_le */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_lt_implies_le");
+/* invariant gf16_lt_implies_le is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_gt_implies_ge */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_gt_implies_ge");
+/* invariant gf16_gt_implies_ge is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_eq_implies_le_and_ge */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_eq_implies_le_and_ge");
+/* invariant gf16_eq_implies_le_and_ge is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_ne_nan_is_true */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_ne_nan_is_true");
+/* invariant gf16_ne_nan_is_true is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_lt_nan_is_false */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_lt_nan_is_false");
+/* invariant gf16_lt_nan_is_false is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_gt_nan_is_false */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_gt_nan_is_false");
+/* invariant gf16_gt_nan_is_false is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_floor_yields_integer */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_floor_yields_integer");
+/* invariant gf16_floor_yields_integer is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_ceil_yields_integer */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_ceil_yields_integer");
+/* invariant gf16_ceil_yields_integer is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_round_yields_integer */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_round_yields_integer");
+/* invariant gf16_round_yields_integer is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_trunc_yields_integer */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_trunc_yields_integer");
+/* invariant gf16_trunc_yields_integer is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_floor_le_value */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_floor_le_value");
+/* invariant gf16_floor_le_value is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_ceil_ge_value */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_ceil_ge_value");
+/* invariant gf16_ceil_ge_value is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_round_closest_integer */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_round_closest_integer");
+/* invariant gf16_round_closest_integer is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_trunc_magnitude_less_or_equal */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_trunc_magnitude_less_or_equal");
+/* invariant gf16_trunc_magnitude_less_or_equal is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_trunc_positive_equals_floor */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_trunc_positive_equals_floor");
+/* invariant gf16_trunc_positive_equals_floor is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_trunc_negative_equals_ceil */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_trunc_negative_equals_ceil");
+/* invariant gf16_trunc_negative_equals_ceil is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fms_related_to_fma */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fms_related_to_fma");
+/* invariant gf16_fms_related_to_fma is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fms_with_zero_subtractand */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fms_with_zero_subtractand");
+/* invariant gf16_fms_with_zero_subtractand is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_hypot_non_negative */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_hypot_non_negative");
+/* invariant gf16_hypot_non_negative is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_hypot_symmetric */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_hypot_symmetric");
+/* invariant gf16_hypot_symmetric is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_hypot_pythagorean_identity */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_hypot_pythagorean_identity");
+/* invariant gf16_hypot_pythagorean_identity is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_hypot_ge_max_input */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_hypot_ge_max_input");
+/* invariant gf16_hypot_ge_max_input is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_hypot_zero_with_zeros */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_hypot_zero_with_zeros");
+/* invariant gf16_hypot_zero_with_zeros is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fmod_result_sign_matches_dividend */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fmod_result_sign_matches_dividend");
+/* invariant gf16_fmod_result_sign_matches_dividend is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fmod_less_than_divisor */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fmod_less_than_divisor");
+/* invariant gf16_fmod_less_than_divisor is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fmod_with_divisible_values */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fmod_with_divisible_values");
+/* invariant gf16_fmod_with_divisible_values is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_is_finite_excludes_inf_nan */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_is_finite_excludes_inf_nan");
+/* invariant gf16_is_finite_excludes_inf_nan is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_is_normal_implies_finite */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_is_normal_implies_finite");
+/* invariant gf16_is_normal_implies_finite is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_is_subnormal_implies_finite */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_is_subnormal_implies_finite");
+/* invariant gf16_is_subnormal_implies_finite is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_is_normal_and_subnormal_mutually_exclusive */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_is_normal_and_subnormal_mutually_exclusive");
+/* invariant gf16_is_normal_and_subnormal_mutually_exclusive is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_zero_neither_normal_nor_subnormal */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_zero_neither_normal_nor_subnormal");
+/* invariant gf16_zero_neither_normal_nor_subnormal is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_classification_exhaustive */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_classification_exhaustive");
+/* invariant gf16_classification_exhaustive is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_signbit_positive_no_signbit */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_signbit_positive_no_signbit");
+/* invariant gf16_signbit_positive_no_signbit is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_signbit_negative_has_signbit */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_signbit_negative_has_signbit");
+/* invariant gf16_signbit_negative_has_signbit is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_sign_positive_returns_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_sign_positive_returns_one");
+/* invariant gf16_sign_positive_returns_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_sign_negative_returns_minus_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_sign_negative_returns_minus_one");
+/* invariant gf16_sign_negative_returns_minus_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_sign_zero_returns_zero */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_sign_zero_returns_zero");
+/* invariant gf16_sign_zero_returns_zero is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_sign_nan_returns_zero */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_sign_nan_returns_zero");
+/* invariant gf16_sign_nan_returns_zero is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_clamp_in_range_returns_value */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_clamp_in_range_returns_value");
+/* invariant gf16_clamp_in_range_returns_value is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_clamp_below_min_returns_min */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_clamp_below_min_returns_min");
+/* invariant gf16_clamp_below_min_returns_min is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_clamp_above_max_returns_max */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_clamp_above_max_returns_max");
+/* invariant gf16_clamp_above_max_returns_max is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_lerp_t_zero_returns_a */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_lerp_t_zero_returns_a");
+/* invariant gf16_lerp_t_zero_returns_a is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_lerp_t_one_returns_b */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_lerp_t_one_returns_b");
+/* invariant gf16_lerp_t_one_returns_b is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_lerp_monotonic */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_lerp_monotonic");
+/* invariant gf16_lerp_monotonic is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fnma_equals_neg_mul_plus_c */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fnma_equals_neg_mul_plus_c");
+/* invariant gf16_fnma_equals_neg_mul_plus_c is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_fnma_zero_multiplier_returns_c */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_fnma_zero_multiplier_returns_c");
+/* invariant gf16_fnma_zero_multiplier_returns_c is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_exp_zero_returns_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_exp_zero_returns_one");
+/* invariant gf16_exp_zero_returns_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_exp_positive_greater_than_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_exp_positive_greater_than_one");
+/* invariant gf16_exp_positive_greater_than_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_exp_negative_between_zero_and_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_exp_negative_between_zero_and_one");
+/* invariant gf16_exp_negative_between_zero_and_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_log_one_returns_zero */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_log_one_returns_zero");
+/* invariant gf16_log_one_returns_zero is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_log_zero_or_negative_nan */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_log_zero_or_negative_nan");
+/* invariant gf16_log_zero_or_negative_nan is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_pow_zero_to_zero_returns_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_pow_zero_to_zero_returns_one");
+/* invariant gf16_pow_zero_to_zero_returns_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_pow_any_to_zero_returns_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_pow_any_to_zero_returns_one");
+/* invariant gf16_pow_any_to_zero_returns_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_pow_one_to_any_returns_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_pow_one_to_any_returns_one");
+/* invariant gf16_pow_one_to_any_returns_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_sin_zero_returns_zero */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_sin_zero_returns_zero");
+/* invariant gf16_sin_zero_returns_zero is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_cos_zero_returns_one */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_cos_zero_returns_one");
+/* invariant gf16_cos_zero_returns_one is not a C constant expression: _Static_assert(true, "compile assert") */
 
 /* invariant: gf16_trig_identity_approx */
-_Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_trig_identity_approx");
+/* invariant gf16_trig_identity_approx is not a C constant expression: _Static_assert(true, "compile assert") */
+
+/* invariant: gf16_lp_ssot_split_unchanged */
+/* invariant gf16_lp_ssot_split_unchanged is not a C constant expression: _Static_assert((EXP_SHIFT == 9), "compile assert") */
+/* invariant gf16_lp_ssot_split_unchanged is not a C constant expression: _Static_assert((EXP_MASK == 0x7E00), "compile assert") */
+/* invariant gf16_lp_ssot_split_unchanged is not a C constant expression: _Static_assert((MANT_MASK == 0x01FF), "compile assert") */
+/* invariant gf16_lp_ssot_split_unchanged is not a C constant expression: _Static_assert((BIAS == 31), "compile assert") */
+/* invariant gf16_lp_ssot_split_unchanged is not a C constant expression: _Static_assert((GF16_CANONICAL_EXP_BITS == 6), "compile assert") */
+/* invariant gf16_lp_ssot_split_unchanged is not a C constant expression: _Static_assert((GF16_CANONICAL_MANT_BITS == 9), "compile assert") */
+
+/* invariant: gf16_lp_phi_dist_registered_positive */
+/* invariant gf16_lp_phi_dist_registered_positive is not a C constant expression: _Static_assert((GF16_PHI_DIST_REGISTERED > 0.0), "compile assert") */
+
+/* invariant: gf16_lp_fp8_depth_less_than_canonical */
+/* invariant gf16_lp_fp8_depth_less_than_canonical is not a C constant expression: _Static_assert((FP8_EFFECTIVE_MANT_BITS < GF16_CANONICAL_MANT_BITS), "compile assert") */
+
+/* invariant: gf16_lp_alt_splits_not_registered */
+/* invariant gf16_lp_alt_splits_not_registered is not a C constant expression: _Static_assert((ALT_A_EXP_BITS != GF16_CANONICAL_EXP_BITS), "compile assert") */
+/* invariant gf16_lp_alt_splits_not_registered is not a C constant expression: _Static_assert((ALT_A_MANT_BITS != GF16_CANONICAL_MANT_BITS), "compile assert") */
+
+/* invariant: gf16_lp_canonical_minimises_phi_dist */
+/* invariant gf16_lp_canonical_minimises_phi_dist is not a C constant expression: _Static_assert((GF16_PHI_DIST_REGISTERED < ALT_A_PHI_DIST), "compile assert") */
 
 
 /* -------------------------------------------------------
@@ -1132,46 +1173,54 @@ _Static_assert(_Static_assert(true, "compile assert"), "invariant: gf16_trig_ide
    ------------------------------------------------------- */
 
 void test_gf16_roundtrip_phi(void) {
-    f32 PHI = 1.6180339887498948;
-    int encoded = gf16_encode_f32(PHI);
-    int decoded = gf16_decode_to_f32(encoded);
+    float PHI = 1.6180339887498948;
+    __auto_type encoded = gf16_encode_f32(PHI);
+    __auto_type decoded = gf16_decode_to_f32(encoded);
     std.testing.expectApproxEqAbs(PHI, decoded, 0.001);
 }
 
 void test_gf16_zero_encoding(void) {
-    assert((GF16)(GF16_ZERO_POS) == gf16_encode_f32(0.0));
-    assert((GF16)(GF16_ZERO_NEG) == gf16_encode_f32(-0.0));
+    assert((uint16_t)(GF16_ZERO_POS) == gf16_encode_f32(0.0));
+    assert((uint16_t)(GF16_ZERO_NEG) == gf16_encode_f32(-0.0));
 }
 
 void test_gf16_phi_roundtrip_high_precision(void) {
-    f32 PHI = 1.6180339887498948;
-    int encoded = gf16_encode_f32(PHI);
-    int decoded = gf16_decode_to_f32(encoded);
+    float PHI = 1.6180339887498948;
+    __auto_type encoded = gf16_encode_f32(PHI);
+    __auto_type decoded = gf16_decode_to_f32(encoded);
     std.testing.expectApproxEqAbs(PHI, decoded, 0.01);
 }
 
 void test_gf16_inf_encoding(void) {
-    int encoded = gf16_encode_f32(1.0, e38);
+    __auto_type encoded = gf16_encode_f32(1.0e38);
     assert(gf16_is_special(encoded));
-    assert((i8)(0) == gf16_extract_sign(encoded));
+    assert((int8_t)(0) == gf16_extract_sign(encoded));
 }
 
 void test_gf16_sign_extraction(void) {
-    assert((i8)(-1) == gf16_extract_sign(0x8000));
-    assert((i8)(0) == gf16_extract_sign(0x3C00));
-    assert((i8)(1) == gf16_extract_sign(0x8000));
-    assert((i8)(0) == gf16_extract_sign(0x3C00));
+    assert((int8_t)(-1) == gf16_extract_sign(0x8000));
+    assert((int8_t)(-1) == gf16_extract_sign(0xBE00));
+    assert((int8_t)(0) == gf16_extract_sign(0x3E00));
+    assert((int8_t)(0) == gf16_extract_sign(0x0000));
 }
 
 void test_gf16_exponent_extraction(void) {
-    assert((i8)(0) == gf16_extract_exponent(0x3C00));
-    assert((i8)(1) == gf16_extract_exponent(0x3D00));
+    assert((int8_t)(31) == gf16_extract_exponent(0x3E00));
+    assert((int8_t)(30) == gf16_extract_exponent(0x3C00));
+    assert((int8_t)(30) == gf16_extract_exponent(0x3D00));
+    assert((int8_t)(32) == gf16_extract_exponent(0x4000));
+    assert((int8_t)(0) == gf16_extract_exponent(0x0001));
+    assert((int8_t)(0) == gf16_extract_exponent(0x8000));
+    assert((int8_t)(62) == gf16_extract_exponent(0x7DFF));
+    assert((int8_t)(63) == gf16_extract_exponent(0x7E00));
+    assert((int8_t)(63) == gf16_extract_exponent(0xFE01));
 }
 
 void test_gf16_mantissa_extraction(void) {
-    assert((i16)(0) == gf16_extract_mantissa(0x3C00));
-    assert((i16)(1) == gf16_extract_mantissa(0x3C01));
-    assert((i16)(511) == gf16_extract_mantissa(0x3DFF));
+    assert((int16_t)(0) == gf16_extract_mantissa(0x3E00));
+    assert((int16_t)(1) == gf16_extract_mantissa(0x3E01));
+    assert((int16_t)(511) == gf16_extract_mantissa(0x3DFF));
+    assert((int16_t)(1) == gf16_extract_mantissa(0xFE01));
 }
 
 void test_gf16_zero_detection(void) {
@@ -1183,30 +1232,123 @@ void test_gf16_zero_detection(void) {
 void test_gf16_special_detection(void) {
     assert(gf16_is_special(0x7E00));
     assert(gf16_is_special(0xFE01));
-    assert(!gf16_is_special(0x3C00));
+    assert(!gf16_is_special(0x3E00));
+    assert(!gf16_is_special(0x7DFF));
 }
 
 void test_gf16_from_components(void) {
-    int result = gf16_from_components(0, 0, 0);
-    assert((GF16)(0x3C00) == result);
+    assert((uint16_t)(0x0000) == gf16_from_components(0, 0, 0));
+    assert((uint16_t)(0x3E00) == gf16_from_components(0, 31, 0));
+    assert((uint16_t)(0xFE01) == gf16_from_components(-1, 63, 1));
+    assert((uint16_t)(0x7DFF) == gf16_from_components(0, 62, 511));
 }
 
 void test_gf16_nan_encoding(void) {
-    int nan_val = gf16_from_components(0, 63, 1);
-    int decoded = gf16_decode_to_f32(nan_val);
+    __auto_type nan_val = gf16_from_components(0, 63, 1);
+    __auto_type decoded = gf16_decode_to_f32(nan_val);
     assert(std.math.isNan(decoded));
 }
 
+void test_gf16_6940_ties_toward_zero(void) {
+    uint32_t tie_b = 0x3F802000;
+    float tie = @bitCast(tie_b);
+    assert((uint16_t)(0x3E00) == gf16_encode_f32(tie));
+    uint32_t above_b = 0x3F802001;
+    float above = @bitCast(above_b);
+    assert((uint16_t)(0x3E01) == gf16_encode_f32(above));
+    uint32_t below_b = 0x3F801FFF;
+    float below = @bitCast(below_b);
+    assert((uint16_t)(0x3E00) == gf16_encode_f32(below));
+    uint32_t odd_b = 0x3F806000;
+    float odd = @bitCast(odd_b);
+    assert((uint16_t)(0x3E01) == gf16_encode_f32(odd));
+    uint32_t neg_b = 0xBF802000;
+    float neg = @bitCast(neg_b);
+    assert((uint16_t)(0xBE00) == gf16_encode_f32(neg));
+}
+
+void test_gf16_6940_ties_at_overflow(void) {
+    uint32_t max_b = 0x4F7FC000;
+    float max_f = @bitCast(max_b);
+    assert((uint16_t)(0x7DFF) == gf16_encode_f32(max_f));
+    assert(max_f == gf16_decode_to_f32(0x7DFF));
+    uint32_t tie_b = 0x4F7FE000;
+    float tie = @bitCast(tie_b);
+    assert((uint16_t)(0x7DFF) == gf16_encode_f32(tie));
+    uint32_t over_b = 0x4F7FE001;
+    float over = @bitCast(over_b);
+    assert((uint16_t)(GF16_INF_POS) == gf16_encode_f32(over));
+    assert((uint16_t)(GF16_INF_NEG) == gf16_encode_f32(-over));
+}
+
+void test_gf16_6940_no_subnormals(void) {
+    uint32_t min_b = 0x30004000;
+    float min_f = @bitCast(min_b);
+    assert((uint16_t)(0x0001) == gf16_encode_f32(min_f));
+    assert(min_f == gf16_decode_to_f32(0x0001));
+    assert(-min_f == gf16_decode_to_f32(0x8001));
+    assert((uint16_t)(0x8001) == gf16_encode_f32(-min_f));
+    uint32_t top_b = 0x307FC000;
+    float top_f = @bitCast(top_b);
+    assert(top_f == gf16_decode_to_f32(0x01FF));
+    uint32_t next_b = 0x30800000;
+    float next_f = @bitCast(next_b);
+    assert(next_f == gf16_decode_to_f32(0x0200));
+    uint32_t p31_b = 0x30000000;
+    float p31 = @bitCast(p31_b);
+    assert((uint16_t)(GF16_ZERO_POS) == gf16_encode_f32(p31));
+    assert((uint16_t)(GF16_ZERO_NEG) == gf16_encode_f32(-p31));
+    uint32_t half_b = 0x30002000;
+    float half = @bitCast(half_b);
+    assert((uint16_t)(GF16_ZERO_POS) == gf16_encode_f32(half));
+    uint32_t half_up_b = 0x30002001;
+    float half_up = @bitCast(half_up_b);
+    assert((uint16_t)(0x0001) == gf16_encode_f32(half_up));
+    uint32_t p32_b = 0x2F800000;
+    float p32 = @bitCast(p32_b);
+    assert((uint16_t)(GF16_ZERO_POS) == gf16_encode_f32(p32));
+    uint32_t f32_sub_b = 0x00000001;
+    float f32_sub = @bitCast(f32_sub_b);
+    assert((uint16_t)(GF16_ZERO_POS) == gf16_encode_f32(f32_sub));
+    assert(gf16_is_normal(0x0001));
+    assert(!gf16_is_subnormal(0x0001));
+    assert(!gf16_is_subnormal(0x01FF));
+}
+
+void test_gf16_6940_canonical_nan(void) {
+    assert((uint16_t)(0xFE01) == GF16_NAN);
+    assert((uint16_t)(0xFE01) == gf16_encode_f32(std.math.nan(f32)));
+    assert((uint16_t)(0xFE01) == gf16_encode_f32(-std.math.nan(f32)));
+    uint32_t payload_b = 0x7FC00001;
+    float payload = @bitCast(payload_b);
+    assert((uint16_t)(0xFE01) == gf16_encode_f32(payload));
+    assert(gf16_is_nan(0xFE01));
+    assert(gf16_is_nan(0x7F01));
+    assert(gf16_is_nan(0x7FFF));
+    assert(std.math.isNan(gf16_decode_to_f32(0x7F01)));
+    assert((uint16_t)(0xFE01) == gf16_round(0x7F01));
+}
+
+void test_gf16_6940_decode_exact(void) {
+    assert((float)(1.0) == gf16_decode_to_f32(0x3E00));
+    assert((float)(0.5) == gf16_decode_to_f32(0x3C00));
+    assert((float)(2.0) == gf16_decode_to_f32(0x4000));
+    assert((float)(-1.0) == gf16_decode_to_f32(0xBE00));
+    assert((float)(1.001953125) == gf16_decode_to_f32(0x3E01));
+    assert(std.math.isPositiveInf(gf16_decode_to_f32(0x7E00)));
+    assert(std.math.isNegativeInf(gf16_decode_to_f32(0xFE00)));
+}
+
 void test_gf16_round_phi_preserves_phi(void) {
-    f32 PHI = 1.6180339887498948;
-    int encoded = gf16_round_phi(PHI);
-    int decoded = gf16_decode_to_f32(encoded);
+    float PHI = 1.6180339887498948;
+    __auto_type encoded = gf16_round_phi(PHI);
+    __auto_type decoded = gf16_decode_to_f32(encoded);
     std.testing.expectApproxEqAbs(PHI, decoded, 0.005);
 }
 
 void test_gf16_round_phi_zero(void) {
-    assert((GF16)(GF16_ZERO_POS) == gf16_round_phi(0.0));
-    assert((GF16)(GF16_ZERO_NEG) == gf16_round_phi(-0.0));
+    assert((uint16_t)(GF16_ZERO_POS) == gf16_round_phi(0.0));
+    assert((uint16_t)(GF16_ZERO_NEG) == gf16_round_phi(-0.0));
 }
 
 void test_gf16_round_phi_positive(void) {
@@ -1218,26 +1360,32 @@ void test_gf16_round_phi_positive(void) {
 void test_gf16_round_phi_negative(void) {
     std.testing.expectApproxEqAbs(-1.0, gf16_decode_to_f32(gf16_round_phi(-1.0)), 0.01);
     std.testing.expectApproxEqAbs(-2.0, gf16_decode_to_f32(gf16_round_phi(-2.0)), 0.01);
-    f32 PHI = 1.6180339887498948;
+    float PHI = 1.6180339887498948;
     std.testing.expectApproxEqAbs(-PHI, gf16_decode_to_f32(gf16_round_phi(-PHI)), 0.01);
 }
 
 void test_gf16_pow2_table_consistency(void) {
-    assert((u16)(0x3C00) == pow2_table[0]);
-    assert((u16)(0x3D00) == pow2_table[1]);
-    assert((u16)(0x3D80) == pow2_table[2]);
+    assert((uint16_t)(0x3E00) == pow2_table[0]);
+    assert((uint16_t)(0x4000) == pow2_table[1]);
+    assert((uint16_t)(0x4200) == pow2_table[2]);
+    assert((uint16_t)(0x7C00) == pow2_table[31]);
+    assert((float)(1.0) == gf16_decode_to_f32(pow2_table[0]));
+    assert((float)(1024.0) == gf16_decode_to_f32(pow2_table[10]));
+    assert((float)(2147483648.0) == gf16_decode_to_f32(pow2_table[31]));
 }
 
 void test_gf16_exp_bias_identity(void) {
-    assert((i8)(31) == BIAS);
+    assert((int8_t)(31) == BIAS);
 }
 
 void test_gf16_identity_encoding(void) {
-    assert((GF16)(0x3C00) == gf16_from_components(0, 0, 0));
+    assert((uint16_t)(0x3E00) == gf16_from_components(0, 31, 0));
+    assert((uint16_t)(0x3E00) == gf16_encode_f32(1.0));
+    assert((uint16_t)(GF16_ZERO_POS) == gf16_from_components(0, 0, 0));
 }
 
 void test_gf16_special_exp_all_ones(void) {
-    assert((u8)(0x3F) == EXP_MAX);
+    assert((uint8_t)(0x3F) == EXP_MAX);
 }
 
 void test_gf16_is_inf_positive(void) {
@@ -1272,36 +1420,37 @@ void test_gf16_is_positive_detection(void) {
 }
 
 void test_gf16_negate_sign_flip(void) {
-    int pos_one = gf16_encode_f32(1.0);
-    int neg_one = gf16_negate(pos_one);
-    int decoded = gf16_decode_to_f32(neg_one);
+    __auto_type pos_one = gf16_encode_f32(1.0);
+    __auto_type neg_one = gf16_negate(pos_one);
+    __auto_type decoded = gf16_decode_to_f32(neg_one);
     std.testing.expectApproxEqAbs(-1.0, decoded, 0.01);
 }
 
 void test_gf16_negate_zero_stays_zero(void) {
-    assert(GF16_ZERO_POS == gf16_negate(GF16_ZERO_POS));
-    assert(GF16_ZERO_NEG == gf16_negate(GF16_ZERO_NEG));
+    assert(GF16_ZERO_NEG == gf16_negate(GF16_ZERO_POS));
+    assert(GF16_ZERO_POS == gf16_negate(GF16_ZERO_NEG));
+    assert(gf16_is_zero(gf16_negate(GF16_ZERO_POS)));
 }
 
 void test_gf16_negate_double_negate(void) {
-    int original = gf16_encode_f32(1.5);
-    int negated = gf16_negate(original);
-    int double_negated = gf16_negate(negated);
-    int orig_decoded = gf16_decode_to_f32(original);
-    int double_decoded = gf16_decode_to_f32(double_negated);
+    __auto_type original = gf16_encode_f32(1.5);
+    __auto_type negated = gf16_negate(original);
+    __auto_type double_negated = gf16_negate(negated);
+    __auto_type orig_decoded = gf16_decode_to_f32(original);
+    __auto_type double_decoded = gf16_decode_to_f32(double_negated);
     std.testing.expectApproxEqAbs(orig_decoded, double_decoded, 0.001);
 }
 
 void test_gf16_abs_clears_sign(void) {
-    int neg_value = gf16_encode_f32(-2.5);
-    int abs_value = gf16_abs(neg_value);
-    int decoded = gf16_decode_to_f32(abs_value);
+    __auto_type neg_value = gf16_encode_f32(-2.5);
+    __auto_type abs_value = gf16_abs(neg_value);
+    __auto_type decoded = gf16_decode_to_f32(abs_value);
     std.testing.expectApproxEqAbs(2.5, decoded, 0.01);
 }
 
 void test_gf16_abs_positive_unchanged(void) {
-    int pos_value = gf16_encode_f32(3.5);
-    int abs_value = gf16_abs(pos_value);
+    __auto_type pos_value = gf16_encode_f32(3.5);
+    __auto_type abs_value = gf16_abs(pos_value);
     assert(pos_value == abs_value);
 }
 
@@ -1311,301 +1460,305 @@ void test_gf16_abs_zero_unchanged(void) {
 }
 
 void test_gf16_copy_sign_from_negative(void) {
-    int pos_value = gf16_encode_f32(2.5);
-    int neg_source = gf16_encode_f32(-1.0);
-    int result = gf16_copy_sign(pos_value, neg_source);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type pos_value = gf16_encode_f32(2.5);
+    __auto_type neg_source = gf16_encode_f32(-1.0);
+    __auto_type result = gf16_copy_sign(pos_value, neg_source);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-2.5, decoded, 0.01);
 }
 
 void test_gf16_copy_sign_from_positive(void) {
-    int neg_value = gf16_encode_f32(-2.5);
-    int pos_source = gf16_encode_f32(1.0);
-    int result = gf16_copy_sign(neg_value, pos_source);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type neg_value = gf16_encode_f32(-2.5);
+    __auto_type pos_source = gf16_encode_f32(1.0);
+    __auto_type result = gf16_copy_sign(neg_value, pos_source);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.5, decoded, 0.01);
 }
 
 void test_gf16_max_returns_greater(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(5.0);
-    int result = gf16_max(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(5.0);
+    __auto_type result = gf16_max(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(5.0, decoded, 0.01);
 }
 
 void test_gf16_max_equal_values(void) {
-    int a = gf16_encode_f32(3.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_max(a, b);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_max(a, b);
     assert(a == result);
 }
 
 void test_gf16_max_with_nan(void) {
-    int a = gf16_encode_f32(2.0);
-    int nan_val = GF16_NAN;
-    int result = gf16_max(a, nan_val);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type nan_val = GF16_NAN;
+    __auto_type result = gf16_max(a, nan_val);
     assert(a == result);
 }
 
 void test_gf16_min_returns_smaller(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(5.0);
-    int result = gf16_min(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(5.0);
+    __auto_type result = gf16_min(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.0, decoded, 0.01);
 }
 
 void test_gf16_min_equal_values(void) {
-    int a = gf16_encode_f32(3.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_min(a, b);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_min(a, b);
     assert(a == result);
 }
 
 void test_gf16_min_with_nan(void) {
-    int a = gf16_encode_f32(2.0);
-    int nan_val = GF16_NAN;
-    int result = gf16_min(a, nan_val);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type nan_val = GF16_NAN;
+    __auto_type result = gf16_min(a, nan_val);
     assert(a == result);
 }
 
+void test_negative_control_refutes_nan_is_inf(void) {
+    assert((GF16_NAN != GF16_INF_POS));
+}
+
 void test_gf16_add_positive_values(void) {
-    int a = gf16_encode_f32(1.5);
-    int b = gf16_encode_f32(2.5);
-    int result = gf16_add(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(1.5);
+    __auto_type b = gf16_encode_f32(2.5);
+    __auto_type result = gf16_add(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(4.0, decoded, 0.1);
 }
 
 void test_gf16_add_negative_values(void) {
-    int a = gf16_encode_f32(-1.5);
-    int b = gf16_encode_f32(-2.5);
-    int result = gf16_add(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-1.5);
+    __auto_type b = gf16_encode_f32(-2.5);
+    __auto_type result = gf16_add(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-4.0, decoded, 0.1);
 }
 
 void test_gf16_add_opposite_values(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(-2.0);
-    int result = gf16_add(a, b);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(-2.0);
+    __auto_type result = gf16_add(a, b);
     assert(gf16_is_zero(result));
 }
 
 void test_gf16_add_with_zero(void) {
-    int a = gf16_encode_f32(3.5);
-    int zero = gf16_encode_f32(0.0);
-    int result1 = gf16_add(a, zero);
-    int result2 = gf16_add(zero, a);
-    int decoded1 = gf16_decode_to_f32(result1);
-    int decoded2 = gf16_decode_to_f32(result2);
+    __auto_type a = gf16_encode_f32(3.5);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result1 = gf16_add(a, zero);
+    __auto_type result2 = gf16_add(zero, a);
+    __auto_type decoded1 = gf16_decode_to_f32(result1);
+    __auto_type decoded2 = gf16_decode_to_f32(result2);
     std.testing.expectApproxEqAbs(3.5, decoded1, 0.05);
     std.testing.expectApproxEqAbs(3.5, decoded2, 0.05);
 }
 
 void test_gf16_sub_positive_values(void) {
-    int a = gf16_encode_f32(5.0);
-    int b = gf16_encode_f32(2.0);
-    int result = gf16_sub(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type b = gf16_encode_f32(2.0);
+    __auto_type result = gf16_sub(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(3.0, decoded, 0.1);
 }
 
 void test_gf16_sub_negative_result(void) {
-    int a = gf16_encode_f32(1.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_sub(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(1.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_sub(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-2.0, decoded, 0.1);
 }
 
 void test_gf16_sub_with_zero(void) {
-    int a = gf16_encode_f32(2.5);
-    int zero = gf16_encode_f32(0.0);
-    int result1 = gf16_sub(a, zero);
-    int result2 = gf16_sub(zero, a);
-    int decoded1 = gf16_decode_to_f32(result1);
-    int decoded2 = gf16_decode_to_f32(result2);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result1 = gf16_sub(a, zero);
+    __auto_type result2 = gf16_sub(zero, a);
+    __auto_type decoded1 = gf16_decode_to_f32(result1);
+    __auto_type decoded2 = gf16_decode_to_f32(result2);
     std.testing.expectApproxEqAbs(2.5, decoded1, 0.05);
     std.testing.expectApproxEqAbs(-2.5, decoded2, 0.05);
 }
 
 void test_gf16_mul_positive_values(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_mul(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_mul(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(6.0, decoded, 0.1);
 }
 
 void test_gf16_mul_negative_positive(void) {
-    int a = gf16_encode_f32(-2.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_mul(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_mul(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-6.0, decoded, 0.1);
 }
 
 void test_gf16_mul_with_zero(void) {
-    int a = gf16_encode_f32(5.0);
-    int zero = gf16_encode_f32(0.0);
-    int result1 = gf16_mul(a, zero);
-    int result2 = gf16_mul(zero, a);
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result1 = gf16_mul(a, zero);
+    __auto_type result2 = gf16_mul(zero, a);
     assert(gf16_is_zero(result1));
     assert(gf16_is_zero(result2));
 }
 
 void test_gf16_mul_by_one(void) {
-    int a = gf16_encode_f32(3.5);
-    int one = gf16_encode_f32(1.0);
-    int result = gf16_mul(a, one);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(3.5);
+    __auto_type one = gf16_encode_f32(1.0);
+    __auto_type result = gf16_mul(a, one);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(3.5, decoded, 0.05);
 }
 
 void test_gf16_div_positive_values(void) {
-    int a = gf16_encode_f32(6.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_div(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(6.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_div(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.0, decoded, 0.1);
 }
 
 void test_gf16_div_negative_result(void) {
-    int a = gf16_encode_f32(6.0);
-    int b = gf16_encode_f32(-3.0);
-    int result = gf16_div(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(6.0);
+    __auto_type b = gf16_encode_f32(-3.0);
+    __auto_type result = gf16_div(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-2.0, decoded, 0.1);
 }
 
 void test_gf16_div_by_one(void) {
-    int a = gf16_encode_f32(2.5);
-    int one = gf16_encode_f32(1.0);
-    int result = gf16_div(a, one);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type one = gf16_encode_f32(1.0);
+    __auto_type result = gf16_div(a, one);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.5, decoded, 0.05);
 }
 
 void test_gf16_div_zero_by_value(void) {
-    int zero = gf16_encode_f32(0.0);
-    int a = gf16_encode_f32(5.0);
-    int result = gf16_div(zero, a);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type result = gf16_div(zero, a);
     assert(gf16_is_zero(result));
 }
 
 void test_gf16_div_value_by_zero(void) {
-    int a = gf16_encode_f32(5.0);
-    int zero = gf16_encode_f32(0.0);
-    int result = gf16_div(a, zero);
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result = gf16_div(a, zero);
     assert(gf16_is_inf(result));
 }
 
 void test_gf16_div_inf_by_finite(void) {
-    int inf = GF16_INF_POS;
-    int a = gf16_encode_f32(5.0);
-    int result = gf16_div(inf, a);
+    __auto_type inf = GF16_INF_POS;
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type result = gf16_div(inf, a);
     assert(gf16_is_inf(result));
 }
 
 void test_gf16_fma_basic(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(4.0);
-    int result = gf16_fma(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(4.0);
+    __auto_type result = gf16_fma(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(10.0, decoded, 0.2);
 }
 
 void test_gf16_fma_with_zero(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
-    int zero = gf16_encode_f32(0.0);
-    int result = gf16_fma(a, b, zero);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result = gf16_fma(a, b, zero);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(6.0, decoded, 0.15);
 }
 
 void test_gf16_sqrt_positive(void) {
-    int a = gf16_encode_f32(4.0);
-    int result = gf16_sqrt(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(4.0);
+    __auto_type result = gf16_sqrt(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.0, decoded, 0.05);
 }
 
 void test_gf16_sqrt_of_one(void) {
-    int a = gf16_encode_f32(1.0);
-    int result = gf16_sqrt(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(1.0);
+    __auto_type result = gf16_sqrt(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.05);
 }
 
 void test_gf16_sqrt_of_zero(void) {
-    int zero = gf16_encode_f32(0.0);
-    int result = gf16_sqrt(zero);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result = gf16_sqrt(zero);
     assert(gf16_is_zero(result));
 }
 
 void test_gf16_sqrt_negative_nan(void) {
-    int neg = gf16_encode_f32(-4.0);
-    int result = gf16_sqrt(neg);
+    __auto_type neg = gf16_encode_f32(-4.0);
+    __auto_type result = gf16_sqrt(neg);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_square_of_two(void) {
-    int a = gf16_encode_f32(2.0);
-    int result = gf16_square(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type result = gf16_square(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(4.0, decoded, 0.1);
 }
 
 void test_gf16_square_of_zero(void) {
-    int zero = gf16_encode_f32(0.0);
-    int result = gf16_square(zero);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result = gf16_square(zero);
     assert(gf16_is_zero(result));
 }
 
 void test_gf16_square_of_negative(void) {
-    int neg = gf16_encode_f32(-2.0);
-    int result = gf16_square(neg);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type neg = gf16_encode_f32(-2.0);
+    __auto_type result = gf16_square(neg);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(4.0, decoded, 0.1);
 }
 
 void test_gf16_add_commutative(void) {
-    int a = gf16_encode_f32(1.5);
-    int b = gf16_encode_f32(2.5);
-    int result1 = gf16_add(a, b);
-    int result2 = gf16_add(b, a);
+    __auto_type a = gf16_encode_f32(1.5);
+    __auto_type b = gf16_encode_f32(2.5);
+    __auto_type result1 = gf16_add(a, b);
+    __auto_type result2 = gf16_add(b, a);
     assert(result1 == result2);
 }
 
 void test_gf16_mul_commutative(void) {
-    int a = gf16_encode_f32(1.5);
-    int b = gf16_encode_f32(2.5);
-    int result1 = gf16_mul(a, b);
-    int result2 = gf16_mul(b, a);
+    __auto_type a = gf16_encode_f32(1.5);
+    __auto_type b = gf16_encode_f32(2.5);
+    __auto_type result1 = gf16_mul(a, b);
+    __auto_type result2 = gf16_mul(b, a);
     assert(result1 == result2);
 }
 
 void test_gf16_sqrt_square_roundtrip(void) {
-    int a = gf16_encode_f32(4.0);
-    int squared = gf16_square(a);
-    int rooted = gf16_sqrt(squared);
-    int decoded = gf16_decode_to_f32(rooted);
+    __auto_type a = gf16_encode_f32(4.0);
+    __auto_type squared = gf16_square(a);
+    __auto_type rooted = gf16_sqrt(squared);
+    __auto_type decoded = gf16_decode_to_f32(rooted);
     std.testing.expectApproxEqAbs(4.0, decoded, 0.2);
 }
 
 void test_gf16_eq_equal_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(2.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(2.5);
     assert(gf16_eq(a, b));
 }
 
 void test_gf16_eq_different_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(3.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(3.5);
     assert(!gf16_eq(a, b));
 }
 
@@ -1618,20 +1771,20 @@ void test_gf16_eq_nan_not_equal_nan(void) {
 }
 
 void test_gf16_eq_nan_not_equal_value(void) {
-    int value = gf16_encode_f32(1.5);
+    __auto_type value = gf16_encode_f32(1.5);
     assert(!gf16_eq(GF16_NAN, value));
     assert(!gf16_eq(value, GF16_NAN));
 }
 
 void test_gf16_ne_different_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(3.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(3.5);
     assert(gf16_ne(a, b));
 }
 
 void test_gf16_ne_equal_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(2.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(2.5);
     assert(!gf16_ne(a, b));
 }
 
@@ -1640,116 +1793,116 @@ void test_gf16_ne_nan_not_equal_nan(void) {
 }
 
 void test_gf16_ne_nan_not_equal_value(void) {
-    int value = gf16_encode_f32(1.5);
+    __auto_type value = gf16_encode_f32(1.5);
     assert(gf16_ne(GF16_NAN, value));
     assert(gf16_ne(value, GF16_NAN));
 }
 
 void test_gf16_lt_less_than(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
     assert(gf16_lt(a, b));
 }
 
 void test_gf16_lt_equal_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(2.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(2.5);
     assert(!gf16_lt(a, b));
 }
 
 void test_gf16_lt_greater_than(void) {
-    int a = gf16_encode_f32(3.0);
-    int b = gf16_encode_f32(2.0);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type b = gf16_encode_f32(2.0);
     assert(!gf16_lt(a, b));
 }
 
 void test_gf16_lt_negative_positive(void) {
-    int neg = gf16_encode_f32(-2.0);
-    int pos = gf16_encode_f32(1.0);
+    __auto_type neg = gf16_encode_f32(-2.0);
+    __auto_type pos = gf16_encode_f32(1.0);
     assert(gf16_lt(neg, pos));
 }
 
 void test_gf16_lt_with_nan(void) {
-    int value = gf16_encode_f32(1.5);
+    __auto_type value = gf16_encode_f32(1.5);
     assert(!gf16_lt(GF16_NAN, value));
     assert(!gf16_lt(value, GF16_NAN));
 }
 
 void test_gf16_le_less_than_or_equal(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
     assert(gf16_le(a, b));
 }
 
 void test_gf16_le_equal_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(2.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(2.5);
     assert(gf16_le(a, b));
 }
 
 void test_gf16_le_greater_than(void) {
-    int a = gf16_encode_f32(3.0);
-    int b = gf16_encode_f32(2.0);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type b = gf16_encode_f32(2.0);
     assert(!gf16_le(a, b));
 }
 
 void test_gf16_le_with_nan(void) {
-    int value = gf16_encode_f32(1.5);
+    __auto_type value = gf16_encode_f32(1.5);
     assert(!gf16_le(GF16_NAN, value));
     assert(!gf16_le(value, GF16_NAN));
 }
 
 void test_gf16_gt_greater_than(void) {
-    int a = gf16_encode_f32(3.0);
-    int b = gf16_encode_f32(2.0);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type b = gf16_encode_f32(2.0);
     assert(gf16_gt(a, b));
 }
 
 void test_gf16_gt_equal_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(2.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(2.5);
     assert(!gf16_gt(a, b));
 }
 
 void test_gf16_gt_less_than(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
     assert(!gf16_gt(a, b));
 }
 
 void test_gf16_gt_with_nan(void) {
-    int value = gf16_encode_f32(1.5);
+    __auto_type value = gf16_encode_f32(1.5);
     assert(!gf16_gt(GF16_NAN, value));
     assert(!gf16_gt(value, GF16_NAN));
 }
 
 void test_gf16_ge_greater_than_or_equal(void) {
-    int a = gf16_encode_f32(3.0);
-    int b = gf16_encode_f32(2.0);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type b = gf16_encode_f32(2.0);
     assert(gf16_ge(a, b));
 }
 
 void test_gf16_ge_equal_values(void) {
-    int a = gf16_encode_f32(2.5);
-    int b = gf16_encode_f32(2.5);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type b = gf16_encode_f32(2.5);
     assert(gf16_ge(a, b));
 }
 
 void test_gf16_ge_less_than(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
     assert(!gf16_ge(a, b));
 }
 
 void test_gf16_ge_with_nan(void) {
-    int value = gf16_encode_f32(1.5);
+    __auto_type value = gf16_encode_f32(1.5);
     assert(!gf16_ge(GF16_NAN, value));
     assert(!gf16_ge(value, GF16_NAN));
 }
 
 void test_gf16_comparison_consistency(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
     assert(gf16_lt(a, b));
     assert(gf16_le(a, b));
     assert(!gf16_gt(a, b));
@@ -1757,29 +1910,29 @@ void test_gf16_comparison_consistency(void) {
 }
 
 void test_gf16_floor_positive_value(void) {
-    int a = gf16_encode_f32(2.7);
-    int result = gf16_floor(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.7);
+    __auto_type result = gf16_floor(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.0, decoded, 0.1);
 }
 
 void test_gf16_floor_negative_value(void) {
-    int a = gf16_encode_f32(-2.7);
-    int result = gf16_floor(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-2.7);
+    __auto_type result = gf16_floor(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-3.0, decoded, 0.1);
 }
 
 void test_gf16_floor_integer(void) {
-    int a = gf16_encode_f32(5.0);
-    int result = gf16_floor(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type result = gf16_floor(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(5.0, decoded, 0.05);
 }
 
 void test_gf16_floor_zero(void) {
-    int pos_zero = gf16_encode_f32(0.0);
-    int neg_zero = gf16_encode_f32(-0.0);
+    __auto_type pos_zero = gf16_encode_f32(0.0);
+    __auto_type neg_zero = gf16_encode_f32(-0.0);
     assert(gf16_is_zero(gf16_floor(pos_zero)));
     assert(gf16_is_zero(gf16_floor(neg_zero)));
 }
@@ -1794,23 +1947,23 @@ void test_gf16_floor_nan_returns_nan(void) {
 }
 
 void test_gf16_ceil_positive_value(void) {
-    int a = gf16_encode_f32(2.3);
-    int result = gf16_ceil(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.3);
+    __auto_type result = gf16_ceil(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(3.0, decoded, 0.1);
 }
 
 void test_gf16_ceil_negative_value(void) {
-    int a = gf16_encode_f32(-2.7);
-    int result = gf16_ceil(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-2.7);
+    __auto_type result = gf16_ceil(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-2.0, decoded, 0.1);
 }
 
 void test_gf16_ceil_integer(void) {
-    int a = gf16_encode_f32(5.0);
-    int result = gf16_ceil(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type result = gf16_ceil(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(5.0, decoded, 0.05);
 }
 
@@ -1824,30 +1977,30 @@ void test_gf16_ceil_nan_returns_nan(void) {
 }
 
 void test_gf16_round_half_up(void) {
-    int a = gf16_encode_f32(2.5);
-    int result = gf16_round(a);
-    int decoded = gf16_decode_to_f32(result);
-    std.testing.expectApproxEqAbs(2.0, decoded, 0.1);
+    __auto_type a = gf16_encode_f32(2.5);
+    __auto_type result = gf16_round(a);
+    assert((float)(3.0) == gf16_decode_to_f32(result));
+    assert((float)(-3.0) == gf16_decode_to_f32(gf16_round(gf16_encode_f32(-2.5))));
 }
 
 void test_gf16_round_positive_value(void) {
-    int a = gf16_encode_f32(2.7);
-    int result = gf16_round(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.7);
+    __auto_type result = gf16_round(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(3.0, decoded, 0.1);
 }
 
 void test_gf16_round_negative_value(void) {
-    int a = gf16_encode_f32(-2.7);
-    int result = gf16_round(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-2.7);
+    __auto_type result = gf16_round(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-3.0, decoded, 0.1);
 }
 
 void test_gf16_round_fractional_down(void) {
-    int a = gf16_encode_f32(2.3);
-    int result = gf16_round(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.3);
+    __auto_type result = gf16_round(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.0, decoded, 0.1);
 }
 
@@ -1861,22 +2014,22 @@ void test_gf16_round_nan_returns_nan(void) {
 }
 
 void test_gf16_trunc_positive_value(void) {
-    int a = gf16_encode_f32(2.7);
-    int result = gf16_trunc(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.7);
+    __auto_type result = gf16_trunc(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.0, decoded, 0.1);
 }
 
 void test_gf16_trunc_negative_value(void) {
-    int a = gf16_encode_f32(-2.7);
-    int result = gf16_trunc(a);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-2.7);
+    __auto_type result = gf16_trunc(a);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-2.0, decoded, 0.1);
 }
 
 void test_gf16_trunc_zero(void) {
-    int pos_zero = gf16_encode_f32(0.0);
-    int neg_zero = gf16_encode_f32(-0.0);
+    __auto_type pos_zero = gf16_encode_f32(0.0);
+    __auto_type neg_zero = gf16_encode_f32(-0.0);
     assert(gf16_is_zero(gf16_trunc(pos_zero)));
     assert(gf16_is_zero(gf16_trunc(neg_zero)));
 }
@@ -1891,69 +2044,69 @@ void test_gf16_trunc_nan_returns_nan(void) {
 }
 
 void test_gf16_rounding_floor_vs_trunc_negative(void) {
-    int a = gf16_encode_f32(-2.7);
-    int floored = gf16_decode_to_f32(gf16_floor(a));
-    int truncated = gf16_decode_to_f32(gf16_trunc(a));
+    __auto_type a = gf16_encode_f32(-2.7);
+    __auto_type floored = gf16_decode_to_f32(gf16_floor(a));
+    __auto_type truncated = gf16_decode_to_f32(gf16_trunc(a));
     std.testing.expectApproxEqAbs(-3.0, floored, 0.1);
     std.testing.expectApproxEqAbs(-2.0, truncated, 0.1);
 }
 
 void test_gf16_rounding_ceil_vs_trunc_positive(void) {
-    int a = gf16_encode_f32(2.3);
-    int ceiled = gf16_decode_to_f32(gf16_ceil(a));
-    int truncated = gf16_decode_to_f32(gf16_trunc(a));
+    __auto_type a = gf16_encode_f32(2.3);
+    __auto_type ceiled = gf16_decode_to_f32(gf16_ceil(a));
+    __auto_type truncated = gf16_decode_to_f32(gf16_trunc(a));
     std.testing.expectApproxEqAbs(3.0, ceiled, 0.1);
     std.testing.expectApproxEqAbs(2.0, truncated, 0.1);
 }
 
 void test_gf16_fms_basic(void) {
-    int a = gf16_encode_f32(5.0);
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(2.0);
-    int result = gf16_fms(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(5.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(2.0);
+    __auto_type result = gf16_fms(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(13.0, decoded, 0.2);
 }
 
 void test_gf16_fms_with_zero_c(void) {
-    int a = gf16_encode_f32(4.0);
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(0.0);
-    int result = gf16_fms(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(4.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(0.0);
+    __auto_type result = gf16_fms(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(12.0, decoded, 0.2);
 }
 
 void test_gf16_fms_negative_result(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(10.0);
-    int result = gf16_fms(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(10.0);
+    __auto_type result = gf16_fms(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-4.0, decoded, 0.2);
 }
 
 void test_gf16_fms_with_nan(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_fms(a, b, GF16_NAN);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_fms(a, b, GF16_NAN);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_fms_zero_a(void) {
-    int a = gf16_encode_f32(0.0);
-    int b = gf16_encode_f32(5.0);
-    int c = gf16_encode_f32(3.0);
-    int result = gf16_fms(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(0.0);
+    __auto_type b = gf16_encode_f32(5.0);
+    __auto_type c = gf16_encode_f32(3.0);
+    __auto_type result = gf16_fms(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-3.0, decoded, 0.2);
 }
 
 void test_gf16_hypot_pythagorean_triple(void) {
-    int a = gf16_encode_f32(3.0);
-    int b = gf16_encode_f32(4.0);
-    int result = gf16_hypot(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type b = gf16_encode_f32(4.0);
+    __auto_type result = gf16_hypot(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(5.0, decoded, 0.1);
 }
 
@@ -1962,94 +2115,94 @@ void test_gf16_hypot_both_zero(void) {
 }
 
 void test_gf16_hypot_one_zero(void) {
-    int a = gf16_encode_f32(3.0);
-    int result = gf16_hypot(a, GF16_ZERO_POS);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type result = gf16_hypot(a, GF16_ZERO_POS);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(3.0, decoded, 0.05);
 }
 
 void test_gf16_hypot_negative_inputs(void) {
-    int a = gf16_encode_f32(-3.0);
-    int b = gf16_encode_f32(-4.0);
-    int result = gf16_hypot(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-3.0);
+    __auto_type b = gf16_encode_f32(-4.0);
+    __auto_type result = gf16_hypot(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(5.0, decoded, 0.1);
 }
 
 void test_gf16_hypot_with_nan(void) {
-    int a = gf16_encode_f32(3.0);
-    int result = gf16_hypot(a, GF16_NAN);
+    __auto_type a = gf16_encode_f32(3.0);
+    __auto_type result = gf16_hypot(a, GF16_NAN);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_hypot_with_inf(void) {
-    int a = gf16_encode_f32(3.0);
+    __auto_type a = gf16_encode_f32(3.0);
     assert(GF16_INF_POS == gf16_hypot(a, GF16_INF_POS));
 }
 
 void test_gf16_fmod_basic(void) {
-    int a = gf16_encode_f32(10.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_fmod(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(10.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_fmod(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.1);
 }
 
 void test_gf16_fmod_exact_division(void) {
-    int a = gf16_encode_f32(12.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_fmod(a, b);
+    __auto_type a = gf16_encode_f32(12.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_fmod(a, b);
     assert(gf16_is_zero(result));
 }
 
 void test_gf16_fmod_negative_dividend(void) {
-    int a = gf16_encode_f32(-10.0);
-    int b = gf16_encode_f32(3.0);
-    int result = gf16_fmod(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(-10.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type result = gf16_fmod(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-1.0, decoded, 0.1);
 }
 
 void test_gf16_fmod_fractional(void) {
-    int a = gf16_encode_f32(5.5);
-    int b = gf16_encode_f32(2.0);
-    int result = gf16_fmod(a, b);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(5.5);
+    __auto_type b = gf16_encode_f32(2.0);
+    __auto_type result = gf16_fmod(a, b);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.5, decoded, 0.1);
 }
 
 void test_gf16_fmod_zero_divisor(void) {
-    int a = gf16_encode_f32(10.0);
-    int zero = gf16_encode_f32(0.0);
-    int result = gf16_fmod(a, zero);
+    __auto_type a = gf16_encode_f32(10.0);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type result = gf16_fmod(a, zero);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_fmod_with_nan(void) {
-    int a = gf16_encode_f32(10.0);
-    int result = gf16_fmod(a, GF16_NAN);
+    __auto_type a = gf16_encode_f32(10.0);
+    __auto_type result = gf16_fmod(a, GF16_NAN);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_is_finite_normal_numbers(void) {
-    int n1 = gf16_encode_f32(1.0);
-    int n2 = gf16_encode_f32(-1.0);
-    int n3 = gf16_encode_f32(100.5);
+    __auto_type n1 = gf16_encode_f32(1.0);
+    __auto_type n2 = gf16_encode_f32(-1.0);
+    __auto_type n3 = gf16_encode_f32(100.5);
     assert(gf16_is_finite(n1));
     assert(gf16_is_finite(n2));
     assert(gf16_is_finite(n3));
 }
 
 void test_gf16_is_finite_zero(void) {
-    int z1 = gf16_encode_f32(0.0);
-    int z2 = gf16_encode_f32(-0.0);
+    __auto_type z1 = gf16_encode_f32(0.0);
+    __auto_type z2 = gf16_encode_f32(-0.0);
     assert(gf16_is_finite(z1));
     assert(gf16_is_finite(z2));
 }
 
 void test_gf16_is_finite_false_for_inf(void) {
-    int pos_inf = GF16_INF_POS;
-    int neg_inf = GF16_INF_NEG;
+    __auto_type pos_inf = GF16_INF_POS;
+    __auto_type neg_inf = GF16_INF_NEG;
     assert(!gf16_is_finite(pos_inf));
     assert(!gf16_is_finite(neg_inf));
 }
@@ -2059,17 +2212,17 @@ void test_gf16_is_finite_false_for_nan(void) {
 }
 
 void test_gf16_is_normal_true_for_normal(void) {
-    int n1 = gf16_encode_f32(1.0);
-    int n2 = gf16_encode_f32(-2.5);
-    int n3 = gf16_encode_f32(100.0);
+    __auto_type n1 = gf16_encode_f32(1.0);
+    __auto_type n2 = gf16_encode_f32(-2.5);
+    __auto_type n3 = gf16_encode_f32(100.0);
     assert(gf16_is_normal(n1));
     assert(gf16_is_normal(n2));
     assert(gf16_is_normal(n3));
 }
 
 void test_gf16_is_normal_false_for_zero(void) {
-    int z1 = gf16_encode_f32(0.0);
-    int z2 = gf16_encode_f32(-0.0);
+    __auto_type z1 = gf16_encode_f32(0.0);
+    __auto_type z2 = gf16_encode_f32(-0.0);
     assert(!gf16_is_normal(z1));
     assert(!gf16_is_normal(z2));
 }
@@ -2083,25 +2236,25 @@ void test_gf16_is_normal_false_for_nan(void) {
     assert(!gf16_is_normal(GF16_NAN));
 }
 
-void test_gf16_is_subnormal_true_for_subnormal(void) {
-    int sub = gf16_encode_f32(0.000001);
-    int decoded = gf16_decode_to_f32(sub);
-    int is_sub = gf16_is_subnormal(sub);
-    (void)decoded;
-    (void)is_sub;
-    assert(true);
+void test_gf16_is_subnormal_false_for_tiny_values(void) {
+    __auto_type tiny = gf16_encode_f32(0.000001);
+    assert(!gf16_is_subnormal(tiny));
+    assert(gf16_is_normal(tiny));
+    assert(!gf16_is_subnormal(0x0001));
+    assert(gf16_is_normal(0x0001));
+    assert(!gf16_is_subnormal(0x81FF));
 }
 
 void test_gf16_is_subnormal_false_for_normal(void) {
-    int n1 = gf16_encode_f32(1.0);
-    int n2 = gf16_encode_f32(100.0);
+    __auto_type n1 = gf16_encode_f32(1.0);
+    __auto_type n2 = gf16_encode_f32(100.0);
     assert(!gf16_is_subnormal(n1));
     assert(!gf16_is_subnormal(n2));
 }
 
 void test_gf16_is_subnormal_false_for_zero(void) {
-    int z1 = gf16_encode_f32(0.0);
-    int z2 = gf16_encode_f32(-0.0);
+    __auto_type z1 = gf16_encode_f32(0.0);
+    __auto_type z2 = gf16_encode_f32(-0.0);
     assert(!gf16_is_subnormal(z1));
     assert(!gf16_is_subnormal(z2));
 }
@@ -2113,35 +2266,35 @@ void test_gf16_is_subnormal_false_for_special(void) {
 }
 
 void test_gf16_classification_complete_coverage(void) {
-    int test_values = (f32[]){ 0.0, -0.0, 1.0, -1.0, 100.0, -100.0, 0.0001, -0.0001 };
-    /* for-each loop (see t27 source) */
+    float test_values[8] = { 0.0, -0.0, 1.0, -1.0, 100.0, -100.0, 0.0001, -0.0001 };
+    /* for-each over a non-range iterable: body emitted ONCE, not looped */
     {
-        int gf = gf16_encode_f32(val);
-        int is_fin = gf16_is_finite(gf);
-        int is_inf = gf16_is_inf(gf);
-        int is_nan = gf16_is_nan(gf);
-        int count = (((u8)(@intFromBool(is_fin)) + (u8)(@intFromBool(is_inf))) + (u8)(@intFromBool(is_nan)));
-        assert((u8)(1) == count);
+        __auto_type gf = gf16_encode_f32(val);
+        __auto_type is_fin = gf16_is_finite(gf);
+        __auto_type is_inf = gf16_is_inf(gf);
+        __auto_type is_nan = gf16_is_nan(gf);
+        __auto_type count = (((uint8_t)(@intFromBool(is_fin)) + (uint8_t)(@intFromBool(is_inf))) + (uint8_t)(@intFromBool(is_nan)));
+        assert((uint8_t)(1) == count);
     }
 }
 
 void test_gf16_signbit_positive(void) {
-    int val = gf16_encode_f32(1.5);
+    __auto_type val = gf16_encode_f32(1.5);
     assert(!gf16_signbit(val));
 }
 
 void test_gf16_signbit_negative(void) {
-    int val = gf16_encode_f32(-1.5);
+    __auto_type val = gf16_encode_f32(-1.5);
     assert(gf16_signbit(val));
 }
 
 void test_gf16_signbit_positive_zero(void) {
-    int zero_pos = GF16_ZERO_POS;
+    __auto_type zero_pos = GF16_ZERO_POS;
     assert(!gf16_signbit(zero_pos));
 }
 
 void test_gf16_signbit_negative_zero(void) {
-    int zero_neg = GF16_ZERO_NEG;
+    __auto_type zero_neg = GF16_ZERO_NEG;
     assert(gf16_signbit(zero_neg));
 }
 
@@ -2151,285 +2304,356 @@ void test_gf16_signbit_infinity(void) {
 }
 
 void test_gf16_signbit_nan(void) {
-    int nan_with_sign = (GF16_NAN || 0x8000);
+    __auto_type nan_with_sign = (GF16_NAN | 0x8000);
     assert(gf16_signbit(nan_with_sign));
 }
 
 void test_gf16_sign_positive(void) {
-    int v1 = gf16_encode_f32(1.0);
-    int v2 = gf16_encode_f32(100.5);
-    assert((i8)(1) == gf16_sign(v1));
-    assert((i8)(1) == gf16_sign(v2));
+    __auto_type v1 = gf16_encode_f32(1.0);
+    __auto_type v2 = gf16_encode_f32(100.5);
+    assert((int8_t)(1) == gf16_sign(v1));
+    assert((int8_t)(1) == gf16_sign(v2));
 }
 
 void test_gf16_sign_negative(void) {
-    int v1 = gf16_encode_f32(-1.0);
-    int v2 = gf16_encode_f32(-100.5);
-    assert((i8)(-1) == gf16_sign(v1));
-    assert((i8)(-1) == gf16_sign(v2));
+    __auto_type v1 = gf16_encode_f32(-1.0);
+    __auto_type v2 = gf16_encode_f32(-100.5);
+    assert((int8_t)(-1) == gf16_sign(v1));
+    assert((int8_t)(-1) == gf16_sign(v2));
 }
 
 void test_gf16_sign_zero(void) {
-    assert((i8)(0) == gf16_sign(GF16_ZERO_POS));
-    assert((i8)(0) == gf16_sign(GF16_ZERO_NEG));
+    assert((int8_t)(0) == gf16_sign(GF16_ZERO_POS));
+    assert((int8_t)(0) == gf16_sign(GF16_ZERO_NEG));
 }
 
 void test_gf16_sign_nan(void) {
-    assert((i8)(0) == gf16_sign(GF16_NAN));
+    assert((int8_t)(0) == gf16_sign(GF16_NAN));
 }
 
 void test_gf16_sign_infinity(void) {
-    assert((i8)(1) == gf16_sign(GF16_INF_POS));
-    assert((i8)(-1) == gf16_sign(GF16_INF_NEG));
+    assert((int8_t)(1) == gf16_sign(GF16_INF_POS));
+    assert((int8_t)(-1) == gf16_sign(GF16_INF_NEG));
 }
 
 void test_gf16_sign_matches_signbit(void) {
-    int pos_val = gf16_encode_f32(5.5);
-    int neg_val = gf16_encode_f32(-5.5);
+    __auto_type pos_val = gf16_encode_f32(5.5);
+    __auto_type neg_val = gf16_encode_f32(-5.5);
     assert((!gf16_signbit(pos_val) && (gf16_sign(pos_val) > 0)));
     assert((gf16_signbit(neg_val) && (gf16_sign(neg_val) < 0)));
 }
 
 void test_gf16_clamp_in_range(void) {
-    int x = gf16_encode_f32(5.0);
-    int min_val = gf16_encode_f32(0.0);
-    int max_val = gf16_encode_f32(10.0);
-    int result = gf16_clamp(x, min_val, max_val);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(5.0);
+    __auto_type min_val = gf16_encode_f32(0.0);
+    __auto_type max_val = gf16_encode_f32(10.0);
+    __auto_type result = gf16_clamp(x, min_val, max_val);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(5.0, decoded, 0.1);
 }
 
 void test_gf16_clamp_below_min(void) {
-    int x = gf16_encode_f32(-5.0);
-    int min_val = gf16_encode_f32(0.0);
-    int max_val = gf16_encode_f32(10.0);
-    int result = gf16_clamp(x, min_val, max_val);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(-5.0);
+    __auto_type min_val = gf16_encode_f32(0.0);
+    __auto_type max_val = gf16_encode_f32(10.0);
+    __auto_type result = gf16_clamp(x, min_val, max_val);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(0.0, decoded, 0.1);
 }
 
 void test_gf16_clamp_above_max(void) {
-    int x = gf16_encode_f32(15.0);
-    int min_val = gf16_encode_f32(0.0);
-    int max_val = gf16_encode_f32(10.0);
-    int result = gf16_clamp(x, min_val, max_val);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(15.0);
+    __auto_type min_val = gf16_encode_f32(0.0);
+    __auto_type max_val = gf16_encode_f32(10.0);
+    __auto_type result = gf16_clamp(x, min_val, max_val);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(10.0, decoded, 0.1);
 }
 
 void test_gf16_clamp_with_nan(void) {
-    int x = GF16_NAN;
-    int min_val = gf16_encode_f32(0.0);
-    int max_val = gf16_encode_f32(10.0);
-    int result = gf16_clamp(x, min_val, max_val);
+    __auto_type x = GF16_NAN;
+    __auto_type min_val = gf16_encode_f32(0.0);
+    __auto_type max_val = gf16_encode_f32(10.0);
+    __auto_type result = gf16_clamp(x, min_val, max_val);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_lerp_t_zero(void) {
-    int a = gf16_encode_f32(10.0);
-    int b = gf16_encode_f32(20.0);
-    int t = gf16_encode_f32(0.0);
-    int result = gf16_lerp(a, b, t);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(10.0);
+    __auto_type b = gf16_encode_f32(20.0);
+    __auto_type t = gf16_encode_f32(0.0);
+    __auto_type result = gf16_lerp(a, b, t);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(10.0, decoded, 0.1);
 }
 
 void test_gf16_lerp_t_one(void) {
-    int a = gf16_encode_f32(10.0);
-    int b = gf16_encode_f32(20.0);
-    int t = gf16_encode_f32(1.0);
-    int result = gf16_lerp(a, b, t);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(10.0);
+    __auto_type b = gf16_encode_f32(20.0);
+    __auto_type t = gf16_encode_f32(1.0);
+    __auto_type result = gf16_lerp(a, b, t);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(20.0, decoded, 0.1);
 }
 
 void test_gf16_lerp_t_half(void) {
-    int a = gf16_encode_f32(0.0);
-    int b = gf16_encode_f32(10.0);
-    int t = gf16_encode_f32(0.5);
-    int result = gf16_lerp(a, b, t);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(0.0);
+    __auto_type b = gf16_encode_f32(10.0);
+    __auto_type t = gf16_encode_f32(0.5);
+    __auto_type result = gf16_lerp(a, b, t);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(5.0, decoded, 0.1);
 }
 
 void test_gf16_lerp_with_nan(void) {
-    int a = GF16_NAN;
-    int b = gf16_encode_f32(20.0);
-    int t = gf16_encode_f32(0.5);
-    int result = gf16_lerp(a, b, t);
+    __auto_type a = GF16_NAN;
+    __auto_type b = gf16_encode_f32(20.0);
+    __auto_type t = gf16_encode_f32(0.5);
+    __auto_type result = gf16_lerp(a, b, t);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_fnma_basic(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(10.0);
-    int result = gf16_fnma(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(10.0);
+    __auto_type result = gf16_fnma(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs((-(2.0 * 3.0) + 10.0), decoded, 0.1);
 }
 
 void test_gf16_fnma_zero_multiplier(void) {
-    int a = gf16_encode_f32(0.0);
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(10.0);
-    int result = gf16_fnma(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(0.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(10.0);
+    __auto_type result = gf16_fnma(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(10.0, decoded, 0.1);
 }
 
 void test_gf16_fnma_zero_addend(void) {
-    int a = gf16_encode_f32(2.0);
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(0.0);
-    int result = gf16_fnma(a, b, c);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type a = gf16_encode_f32(2.0);
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(0.0);
+    __auto_type result = gf16_fnma(a, b, c);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(-(2.0 * 3.0), decoded, 0.1);
 }
 
 void test_gf16_fnma_with_nan(void) {
-    int a = GF16_NAN;
-    int b = gf16_encode_f32(3.0);
-    int c = gf16_encode_f32(10.0);
-    int result = gf16_fnma(a, b, c);
+    __auto_type a = GF16_NAN;
+    __auto_type b = gf16_encode_f32(3.0);
+    __auto_type c = gf16_encode_f32(10.0);
+    __auto_type result = gf16_fnma(a, b, c);
     assert(gf16_is_nan(result));
 }
 
 void test_gf16_exp_zero(void) {
-    int x = gf16_encode_f32(0.0);
-    int result = gf16_exp(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(0.0);
+    __auto_type result = gf16_exp(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.1);
 }
 
 void test_gf16_exp_one(void) {
-    int x = gf16_encode_f32(1.0);
-    int result = gf16_exp(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(1.0);
+    __auto_type result = gf16_exp(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(2.718, decoded, 0.1);
 }
 
 void test_gf16_exp_negative(void) {
-    int x = gf16_encode_f32(-1.0);
-    int result = gf16_exp(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(-1.0);
+    __auto_type result = gf16_exp(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(0.368, decoded, 0.05);
 }
 
 void test_gf16_exp_large_positive(void) {
-    int x = gf16_encode_f32(88.0);
-    int result = gf16_exp(x);
+    __auto_type x = gf16_encode_f32(88.0);
+    __auto_type result = gf16_exp(x);
     assert(gf16_is_inf(result));
 }
 
 void test_gf16_log_one(void) {
-    int x = gf16_encode_f32(1.0);
-    int result = gf16_log(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(1.0);
+    __auto_type result = gf16_log(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(0.0, decoded, 0.05);
 }
 
 void test_gf16_log_e(void) {
-    int e = gf16_encode_f32(2.71828);
-    int result = gf16_log(e);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type e = gf16_encode_f32(2.71828);
+    __auto_type result = gf16_log(e);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.1);
 }
 
 void test_gf16_log_zero_or_negative(void) {
-    int zero = gf16_encode_f32(0.0);
-    int neg = gf16_encode_f32(-1.0);
+    __auto_type zero = gf16_encode_f32(0.0);
+    __auto_type neg = gf16_encode_f32(-1.0);
     assert(gf16_is_nan(gf16_log(zero)));
     assert(gf16_is_nan(gf16_log(neg)));
 }
 
 void test_gf16_log2_eight(void) {
-    int x = gf16_encode_f32(8.0);
-    int result = gf16_log2(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(8.0);
+    __auto_type result = gf16_log2(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(3.0, decoded, 0.1);
 }
 
 void test_gf16_log10_ten(void) {
-    int x = gf16_encode_f32(10.0);
-    int result = gf16_log10(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(10.0);
+    __auto_type result = gf16_log10(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.1);
 }
 
 void test_gf16_pow_two_cubed(void) {
-    int base = gf16_encode_f32(2.0);
-    int exp = gf16_encode_f32(3.0);
-    int result = gf16_pow(base, exp);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type base = gf16_encode_f32(2.0);
+    __auto_type exp = gf16_encode_f32(3.0);
+    __auto_type result = gf16_pow(base, exp);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(8.0, decoded, 0.1);
 }
 
 void test_gf16_pow_zero_to_zero(void) {
-    int base = gf16_encode_f32(0.0);
-    int exp = gf16_encode_f32(0.0);
-    int result = gf16_pow(base, exp);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type base = gf16_encode_f32(0.0);
+    __auto_type exp = gf16_encode_f32(0.0);
+    __auto_type result = gf16_pow(base, exp);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.01);
 }
 
 void test_gf16_pow_any_to_zero(void) {
-    int base = gf16_encode_f32(5.5);
-    int exp = gf16_encode_f32(0.0);
-    int result = gf16_pow(base, exp);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type base = gf16_encode_f32(5.5);
+    __auto_type exp = gf16_encode_f32(0.0);
+    __auto_type result = gf16_pow(base, exp);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.01);
 }
 
 void test_gf16_pow_zero_to_positive(void) {
-    int base = gf16_encode_f32(0.0);
-    int exp = gf16_encode_f32(2.0);
-    int result = gf16_pow(base, exp);
+    __auto_type base = gf16_encode_f32(0.0);
+    __auto_type exp = gf16_encode_f32(2.0);
+    __auto_type result = gf16_pow(base, exp);
     assert(gf16_is_zero(result));
 }
 
 void test_gf16_pow_one_to_any(void) {
-    int base = gf16_encode_f32(1.0);
-    int exp = gf16_encode_f32(5.0);
-    int result = gf16_pow(base, exp);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type base = gf16_encode_f32(1.0);
+    __auto_type exp = gf16_encode_f32(5.0);
+    __auto_type result = gf16_pow(base, exp);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.01);
 }
 
 void test_gf16_sin_zero(void) {
-    int x = gf16_encode_f32(0.0);
-    int result = gf16_sin(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(0.0);
+    __auto_type result = gf16_sin(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(0.0, decoded, 0.05);
 }
 
 void test_gf16_sin_small_angle(void) {
-    int pi_six = gf16_encode_f32((3.14159 / 6.0));
-    int result = gf16_sin(pi_six);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type pi_six = gf16_encode_f32((3.14159 / 6.0));
+    __auto_type result = gf16_sin(pi_six);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(0.5, decoded, 0.05);
 }
 
 void test_gf16_cos_zero(void) {
-    int x = gf16_encode_f32(0.0);
-    int result = gf16_cos(x);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type x = gf16_encode_f32(0.0);
+    __auto_type result = gf16_cos(x);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(1.0, decoded, 0.05);
 }
 
 void test_gf16_cos_small_angle(void) {
-    int pi_six = gf16_encode_f32((3.14159 / 6.0));
-    int result = gf16_cos(pi_six);
-    int decoded = gf16_decode_to_f32(result);
+    __auto_type pi_six = gf16_encode_f32((3.14159 / 6.0));
+    __auto_type result = gf16_cos(pi_six);
+    __auto_type decoded = gf16_decode_to_f32(result);
     std.testing.expectApproxEqAbs(0.866, decoded, 0.05);
 }
 
 void test_gf16_trig_identity(void) {
-    int x = gf16_encode_f32(0.5);
-    int sin_val = gf16_decode_to_f32(gf16_sin(x));
-    int cos_val = gf16_decode_to_f32(gf16_cos(x));
-    int sum = ((sin_val * sin_val) + (cos_val * cos_val));
+    __auto_type x = gf16_encode_f32(0.5);
+    __auto_type sin_val = gf16_decode_to_f32(gf16_sin(x));
+    __auto_type cos_val = gf16_decode_to_f32(gf16_cos(x));
+    __auto_type sum = ((sin_val * sin_val) + (cos_val * cos_val));
     std.testing.expectApproxEqAbs(1.0, sum, 0.1);
+}
+
+void test_gf16_lp_ssot_split_constants(void) {
+    assert((EXP_SHIFT == 9));
+    assert((SIGN_SHIFT == 15));
+    assert((EXP_MASK == 0x7E00));
+    assert((MANT_MASK == 0x01FF));
+    assert((BIAS == 31));
+    assert((GF16_CANONICAL_EXP_BITS == 6));
+    assert((GF16_CANONICAL_MANT_BITS == 9));
+}
+
+void test_gf16_lp_phi_dist_registered(void) {
+    double phi_inv = 0.6180339887498949;
+    double ratio_canonical = (6.0 / 9.0);
+    __auto_type phi_dist_canonical = ((ratio_canonical > phi_inv)) ? ((ratio_canonical - phi_inv)) : ((phi_inv - ratio_canonical));
+    __auto_type d = (phi_dist_canonical - GF16_PHI_DIST_REGISTERED);
+    __auto_type d_abs = ((d < 0.0)) ? (-d) : (d);
+    assert((d_abs < 1e-4));
+}
+
+void test_gf16_lp_alternate_split_phi_dist_larger(void) {
+    double phi_inv = 0.6180339887498949;
+    double ratio_canonical = (6.0 / 9.0);
+    double ratio_alt_a = (7.0 / 8.0);
+    double ratio_alt_b = (8.0 / 7.0);
+    __auto_type d_canonical = (ratio_canonical - phi_inv);
+    __auto_type d_alt_a = (ratio_alt_a - phi_inv);
+    __auto_type d_alt_b = (ratio_alt_b - phi_inv);
+    __auto_type pd_canonical = ((d_canonical < 0.0)) ? (-d_canonical) : (d_canonical);
+    __auto_type pd_alt_a = ((d_alt_a < 0.0)) ? (-d_alt_a) : (d_alt_a);
+    __auto_type pd_alt_b = ((d_alt_b < 0.0)) ? (-d_alt_b) : (d_alt_b);
+    assert((pd_canonical < pd_alt_a));
+    assert((pd_canonical < pd_alt_b));
+}
+
+void test_gf16_lp_fp8_effective_precision(void) {
+    float test_vals[4] = { 1.0, 1.618034, 0.5, 2.0 };
+    /* for-each over a non-range iterable: body emitted ONCE, not looped */
+    {
+        __auto_type gf16_encoded = gf16_encode_f32(v);
+        __auto_type mant_full = (gf16_encoded & MANT_MASK);
+        u4 trunc_shift = (GF16_CANONICAL_MANT_BITS - FP8_EFFECTIVE_MANT_BITS);
+        __auto_type mant_truncated = ((mant_full >> trunc_shift) << trunc_shift);
+        __auto_type gf16_truncated = ((gf16_encoded & ~MANT_MASK) | mant_truncated);
+        __auto_type decoded_trunc = gf16_decode_to_f32(gf16_truncated);
+        __auto_type err_val = (decoded_trunc - v);
+        __auto_type err_abs = ((err_val < 0.0)) ? (-err_val) : (err_val);
+        assert((err_abs < (float)(@floatCast((FP8_ULP * 2.0)))));
+    }
+}
+
+void test_gf16_lp_fp8_canonical_vs_alt_error_comparison(void) {
+    float v = 1.6180339;
+    __auto_type gf16_enc = gf16_encode_f32(v);
+    __auto_type mant_9 = (gf16_enc & MANT_MASK);
+    u4 shift_canonical = (9 - FP8_EFFECTIVE_MANT_BITS);
+    __auto_type mant_9_trunc = ((mant_9 >> shift_canonical) << shift_canonical);
+    __auto_type gf16_trunc = ((gf16_enc & ~MANT_MASK) | mant_9_trunc);
+    __auto_type decoded_canonical = gf16_decode_to_f32(gf16_trunc);
+    __auto_type err_canonical = ((decoded_canonical > v)) ? ((decoded_canonical - v)) : ((v - decoded_canonical));
+    __auto_type mant_8 = (gf16_enc & 0x00FF);
+    u4 shift_alt = (8 - FP8_EFFECTIVE_MANT_BITS);
+    __auto_type mant_8_trunc = ((mant_8 >> shift_alt) << shift_alt);
+    __auto_type gf16_alt = ((gf16_enc & 0xFF00) | mant_8_trunc);
+    __auto_type decoded_alt = gf16_decode_to_f32(gf16_alt);
+    __auto_type err_alt = ((decoded_alt > v)) ? ((decoded_alt - v)) : ((v - decoded_alt));
+    __auto_type diff = ((err_canonical > err_alt)) ? ((err_canonical - err_alt)) : ((err_alt - err_canonical));
+    assert((diff >= 0.0));
+    assert((err_canonical >= 0.0));
+    assert((err_alt >= 0.0));
 }
 
 
@@ -2440,9 +2664,8 @@ void test_gf16_trig_identity(void) {
 void bench_gf16_encode_throughput(void) {
     /* bench: gf16_encode_throughput */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_encode_f32(1.5);
     }
     (void)result;
@@ -2451,9 +2674,8 @@ void bench_gf16_encode_throughput(void) {
 void bench_gf16_decode_throughput(void) {
     /* bench: gf16_decode_throughput */
     /* @setEvalBranchQuota(10000) */;
-    f32 result = 0;
-    /* for-each loop (see t27 source) */
-    {
+    float result = 0;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_decode_to_f32(0x3C00);
     }
     (void)result;
@@ -2462,10 +2684,9 @@ void bench_gf16_decode_throughput(void) {
 void bench_gf16_roundtrip_latency(void) {
     /* bench: gf16_roundtrip_latency */
     /* @setEvalBranchQuota(10000) */;
-    f32 result = 0;
-    f32 value = 1.5;
-    /* for-each loop (see t27 source) */
-    {
+    float result = 0;
+    float value = 1.5;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_decode_to_f32(gf16_encode_f32(value));
     }
     (void)result;
@@ -2474,9 +2695,8 @@ void bench_gf16_roundtrip_latency(void) {
 void bench_gf16_round_phi_latency(void) {
     /* bench: gf16_round_phi_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_round_phi(1.0);
     }
     (void)result;
@@ -2486,8 +2706,7 @@ void bench_gf16_extract_sign_latency(void) {
     /* bench: gf16_extract_sign_latency */
     /* @setEvalBranchQuota(10000) */;
     int8_t result = 0;
-    /* for-each loop (see t27 source) */
-    {
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_extract_sign(0x8000);
     }
     (void)result;
@@ -2497,8 +2716,7 @@ void bench_gf16_extract_exponent_latency(void) {
     /* bench: gf16_extract_exponent_latency */
     /* @setEvalBranchQuota(10000) */;
     int8_t result = 0;
-    /* for-each loop (see t27 source) */
-    {
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_extract_exponent(0x3C00);
     }
     (void)result;
@@ -2508,8 +2726,7 @@ void bench_gf16_is_inf_latency(void) {
     /* bench: gf16_is_inf_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    /* for-each loop (see t27 source) */
-    {
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_is_inf(0x7E00);
     }
     (void)result;
@@ -2519,8 +2736,7 @@ void bench_gf16_is_nan_latency(void) {
     /* bench: gf16_is_nan_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    /* for-each loop (see t27 source) */
-    {
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_is_nan(0xFE01);
     }
     (void)result;
@@ -2529,9 +2745,8 @@ void bench_gf16_is_nan_latency(void) {
 void bench_gf16_negate_latency(void) {
     /* bench: gf16_negate_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_negate(0x3C00);
     }
     (void)result;
@@ -2540,9 +2755,8 @@ void bench_gf16_negate_latency(void) {
 void bench_gf16_abs_latency(void) {
     /* bench: gf16_abs_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_abs(0xBC00);
     }
     (void)result;
@@ -2551,11 +2765,10 @@ void bench_gf16_abs_latency(void) {
 void bench_gf16_max_latency(void) {
     /* bench: gf16_max_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3C00;
-    GF16 b = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3C00;
+    uint16_t b = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_max(a, b);
     }
     (void)result;
@@ -2564,11 +2777,10 @@ void bench_gf16_max_latency(void) {
 void bench_gf16_min_latency(void) {
     /* bench: gf16_min_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3C00;
-    GF16 b = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3C00;
+    uint16_t b = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_min(a, b);
     }
     (void)result;
@@ -2577,11 +2789,10 @@ void bench_gf16_min_latency(void) {
 void bench_gf16_add_latency(void) {
     /* bench: gf16_add_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_add(a, b);
     }
     (void)result;
@@ -2590,11 +2801,10 @@ void bench_gf16_add_latency(void) {
 void bench_gf16_sub_latency(void) {
     /* bench: gf16_sub_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_sub(a, b);
     }
     (void)result;
@@ -2603,11 +2813,10 @@ void bench_gf16_sub_latency(void) {
 void bench_gf16_mul_latency(void) {
     /* bench: gf16_mul_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3D80;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3D80;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_mul(a, b);
     }
     (void)result;
@@ -2616,11 +2825,10 @@ void bench_gf16_mul_latency(void) {
 void bench_gf16_div_latency(void) {
     /* bench: gf16_div_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C80;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C80;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_div(a, b);
     }
     (void)result;
@@ -2629,10 +2837,9 @@ void bench_gf16_div_latency(void) {
 void bench_gf16_sqrt_latency(void) {
     /* bench: gf16_sqrt_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_sqrt(a);
     }
     (void)result;
@@ -2641,12 +2848,11 @@ void bench_gf16_sqrt_latency(void) {
 void bench_gf16_fma_latency(void) {
     /* bench: gf16_fma_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C80;
-    GF16 c = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C80;
+    uint16_t c = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_fma(a, b, c);
     }
     (void)result;
@@ -2655,10 +2861,9 @@ void bench_gf16_fma_latency(void) {
 void bench_gf16_square_latency(void) {
     /* bench: gf16_square_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_square(a);
     }
     (void)result;
@@ -2668,10 +2873,9 @@ void bench_gf16_eq_latency(void) {
     /* bench: gf16_eq_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 a = 0x3C00;
-    GF16 b = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t a = 0x3C00;
+    uint16_t b = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_eq(a, b);
     }
     (void)result;
@@ -2681,10 +2885,9 @@ void bench_gf16_ne_latency(void) {
     /* bench: gf16_ne_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 a = 0x3C00;
-    GF16 b = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t a = 0x3C00;
+    uint16_t b = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_ne(a, b);
     }
     (void)result;
@@ -2694,10 +2897,9 @@ void bench_gf16_lt_latency(void) {
     /* bench: gf16_lt_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 a = 0x3C00;
-    GF16 b = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t a = 0x3C00;
+    uint16_t b = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_lt(a, b);
     }
     (void)result;
@@ -2707,10 +2909,9 @@ void bench_gf16_le_latency(void) {
     /* bench: gf16_le_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 a = 0x3C00;
-    GF16 b = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t a = 0x3C00;
+    uint16_t b = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_le(a, b);
     }
     (void)result;
@@ -2720,10 +2921,9 @@ void bench_gf16_gt_latency(void) {
     /* bench: gf16_gt_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_gt(a, b);
     }
     (void)result;
@@ -2733,10 +2933,9 @@ void bench_gf16_ge_latency(void) {
     /* bench: gf16_ge_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_ge(a, b);
     }
     (void)result;
@@ -2745,10 +2944,9 @@ void bench_gf16_ge_latency(void) {
 void bench_gf16_floor_latency(void) {
     /* bench: gf16_floor_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D40;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D40;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_floor(a);
     }
     (void)result;
@@ -2757,10 +2955,9 @@ void bench_gf16_floor_latency(void) {
 void bench_gf16_ceil_latency(void) {
     /* bench: gf16_ceil_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D40;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D40;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_ceil(a);
     }
     (void)result;
@@ -2769,10 +2966,9 @@ void bench_gf16_ceil_latency(void) {
 void bench_gf16_round_latency(void) {
     /* bench: gf16_round_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D40;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D40;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_round(a);
     }
     (void)result;
@@ -2781,10 +2977,9 @@ void bench_gf16_round_latency(void) {
 void bench_gf16_trunc_latency(void) {
     /* bench: gf16_trunc_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D40;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D40;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_trunc(a);
     }
     (void)result;
@@ -2793,12 +2988,11 @@ void bench_gf16_trunc_latency(void) {
 void bench_gf16_fms_latency(void) {
     /* bench: gf16_fms_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C80;
-    GF16 c = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C80;
+    uint16_t c = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_fms(a, b, c);
     }
     (void)result;
@@ -2807,11 +3001,10 @@ void bench_gf16_fms_latency(void) {
 void bench_gf16_hypot_latency(void) {
     /* bench: gf16_hypot_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D80;
-    GF16 b = 0x3E00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D80;
+    uint16_t b = 0x3E00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_hypot(a, b);
     }
     (void)result;
@@ -2820,11 +3013,10 @@ void bench_gf16_hypot_latency(void) {
 void bench_gf16_fmod_latency(void) {
     /* bench: gf16_fmod_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3F00;
-    GF16 b = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3F00;
+    uint16_t b = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_fmod(a, b);
     }
     (void)result;
@@ -2834,9 +3026,8 @@ void bench_gf16_is_finite_latency(void) {
     /* bench: gf16_is_finite_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 val = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t val = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_is_finite(val);
     }
     (void)result;
@@ -2846,9 +3037,8 @@ void bench_gf16_is_normal_latency(void) {
     /* bench: gf16_is_normal_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 val = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t val = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_is_normal(val);
     }
     (void)result;
@@ -2858,9 +3048,8 @@ void bench_gf16_is_subnormal_latency(void) {
     /* bench: gf16_is_subnormal_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 val = 0x0001;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t val = 0x0001;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_is_subnormal(val);
     }
     (void)result;
@@ -2870,9 +3059,8 @@ void bench_gf16_signbit_latency(void) {
     /* bench: gf16_signbit_latency */
     /* @setEvalBranchQuota(10000) */;
     bool result = false;
-    GF16 val = 0x8000;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t val = 0x8000;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_signbit(val);
     }
     (void)result;
@@ -2882,9 +3070,8 @@ void bench_gf16_sign_latency(void) {
     /* bench: gf16_sign_latency */
     /* @setEvalBranchQuota(10000) */;
     int8_t result = 0;
-    GF16 val = 0xBC00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t val = 0xBC00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_sign(val);
     }
     (void)result;
@@ -2893,12 +3080,11 @@ void bench_gf16_sign_latency(void) {
 void bench_gf16_clamp_latency(void) {
     /* bench: gf16_clamp_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 x = 0x3F00;
-    GF16 min_val = 0x3C00;
-    GF16 max_val = 0x4800;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t x = 0x3F00;
+    uint16_t min_val = 0x3C00;
+    uint16_t max_val = 0x4800;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_clamp(x, min_val, max_val);
     }
     (void)result;
@@ -2907,12 +3093,11 @@ void bench_gf16_clamp_latency(void) {
 void bench_gf16_lerp_latency(void) {
     /* bench: gf16_lerp_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3C00;
-    GF16 b = 0x4800;
-    GF16 t = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3C00;
+    uint16_t b = 0x4800;
+    uint16_t t = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_lerp(a, b, t);
     }
     (void)result;
@@ -2921,12 +3106,11 @@ void bench_gf16_lerp_latency(void) {
 void bench_gf16_fnma_latency(void) {
     /* bench: gf16_fnma_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 a = 0x3D00;
-    GF16 b = 0x3C80;
-    GF16 c = 0x3C00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t a = 0x3D00;
+    uint16_t b = 0x3C80;
+    uint16_t c = 0x3C00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_fnma(a, b, c);
     }
     (void)result;
@@ -2935,10 +3119,9 @@ void bench_gf16_fnma_latency(void) {
 void bench_gf16_exp_latency(void) {
     /* bench: gf16_exp_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 x = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t x = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_exp(x);
     }
     (void)result;
@@ -2947,10 +3130,9 @@ void bench_gf16_exp_latency(void) {
 void bench_gf16_log_latency(void) {
     /* bench: gf16_log_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 x = 0x3E00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t x = 0x3E00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_log(x);
     }
     (void)result;
@@ -2959,11 +3141,10 @@ void bench_gf16_log_latency(void) {
 void bench_gf16_pow_latency(void) {
     /* bench: gf16_pow_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 base = 0x3D00;
-    GF16 exp = 0x3D80;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t base = 0x3D00;
+    uint16_t exp = 0x3D80;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_pow(base, exp);
     }
     (void)result;
@@ -2972,10 +3153,9 @@ void bench_gf16_pow_latency(void) {
 void bench_gf16_sin_latency(void) {
     /* bench: gf16_sin_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 x = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t x = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_sin(x);
     }
     (void)result;
@@ -2984,14 +3164,255 @@ void bench_gf16_sin_latency(void) {
 void bench_gf16_cos_latency(void) {
     /* bench: gf16_cos_latency */
     /* @setEvalBranchQuota(10000) */;
-    GF16 result = 0;
-    GF16 x = 0x3D00;
-    /* for-each loop (see t27 source) */
-    {
+    uint16_t result = 0;
+    uint16_t x = 0x3D00;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
         result = gf16_cos(x);
     }
     (void)result;
 }
 
+void bench_gf16_lp_encode_fp8_projection(void) {
+    /* bench: bench_gf16_lp_encode_fp8_projection */
+    /* @setEvalBranchQuota(10000) */;
+    float v = 1.5;
+    u4 fp8_shift = (GF16_CANONICAL_MANT_BITS - FP8_EFFECTIVE_MANT_BITS);
+    float result = 0.0;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
+        __auto_type enc = gf16_encode_f32(v);
+        __auto_type mant = (enc & MANT_MASK);
+        __auto_type mant_trunc = ((mant >> fp8_shift) << fp8_shift);
+        __auto_type enc_trunc = ((enc & ~MANT_MASK) | mant_trunc);
+        result = gf16_decode_to_f32(enc_trunc);
+    }
+    (void)result;
+}
+
+void bench_gf16_lp_roundtrip_baseline(void) {
+    /* bench: bench_gf16_lp_roundtrip_baseline */
+    /* @setEvalBranchQuota(10000) */;
+    float v = 1.5;
+    float result = 0.0;
+    for (size_t __t27_i = 0; __t27_i < 1000; __t27_i++) {
+        __auto_type enc = gf16_encode_f32(v);
+        result = gf16_decode_to_f32(enc);
+    }
+    (void)result;
+}
+
+
+/* -------------------------------------------------------
+   Test runner (compile with -DT27_TEST_MAIN to execute)
+   ------------------------------------------------------- */
+
+#ifdef T27_TEST_MAIN
+#include <stdio.h>
+int main(void) {
+    test_gf16_roundtrip_phi();
+    test_gf16_zero_encoding();
+    test_gf16_phi_roundtrip_high_precision();
+    test_gf16_inf_encoding();
+    test_gf16_sign_extraction();
+    test_gf16_exponent_extraction();
+    test_gf16_mantissa_extraction();
+    test_gf16_zero_detection();
+    test_gf16_special_detection();
+    test_gf16_from_components();
+    test_gf16_nan_encoding();
+    test_gf16_6940_ties_toward_zero();
+    test_gf16_6940_ties_at_overflow();
+    test_gf16_6940_no_subnormals();
+    test_gf16_6940_canonical_nan();
+    test_gf16_6940_decode_exact();
+    test_gf16_round_phi_preserves_phi();
+    test_gf16_round_phi_zero();
+    test_gf16_round_phi_positive();
+    test_gf16_round_phi_negative();
+    test_gf16_pow2_table_consistency();
+    test_gf16_exp_bias_identity();
+    test_gf16_identity_encoding();
+    test_gf16_special_exp_all_ones();
+    test_gf16_is_inf_positive();
+    test_gf16_is_inf_negative();
+    test_gf16_is_nan_detection();
+    test_gf16_is_negative_detection();
+    test_gf16_is_positive_detection();
+    test_gf16_negate_sign_flip();
+    test_gf16_negate_zero_stays_zero();
+    test_gf16_negate_double_negate();
+    test_gf16_abs_clears_sign();
+    test_gf16_abs_positive_unchanged();
+    test_gf16_abs_zero_unchanged();
+    test_gf16_copy_sign_from_negative();
+    test_gf16_copy_sign_from_positive();
+    test_gf16_max_returns_greater();
+    test_gf16_max_equal_values();
+    test_gf16_max_with_nan();
+    test_gf16_min_returns_smaller();
+    test_gf16_min_equal_values();
+    test_gf16_min_with_nan();
+    test_negative_control_refutes_nan_is_inf();
+    test_gf16_add_positive_values();
+    test_gf16_add_negative_values();
+    test_gf16_add_opposite_values();
+    test_gf16_add_with_zero();
+    test_gf16_sub_positive_values();
+    test_gf16_sub_negative_result();
+    test_gf16_sub_with_zero();
+    test_gf16_mul_positive_values();
+    test_gf16_mul_negative_positive();
+    test_gf16_mul_with_zero();
+    test_gf16_mul_by_one();
+    test_gf16_div_positive_values();
+    test_gf16_div_negative_result();
+    test_gf16_div_by_one();
+    test_gf16_div_zero_by_value();
+    test_gf16_div_value_by_zero();
+    test_gf16_div_inf_by_finite();
+    test_gf16_fma_basic();
+    test_gf16_fma_with_zero();
+    test_gf16_sqrt_positive();
+    test_gf16_sqrt_of_one();
+    test_gf16_sqrt_of_zero();
+    test_gf16_sqrt_negative_nan();
+    test_gf16_square_of_two();
+    test_gf16_square_of_zero();
+    test_gf16_square_of_negative();
+    test_gf16_add_commutative();
+    test_gf16_mul_commutative();
+    test_gf16_sqrt_square_roundtrip();
+    test_gf16_eq_equal_values();
+    test_gf16_eq_different_values();
+    test_gf16_eq_pos_zero_eq_neg_zero();
+    test_gf16_eq_nan_not_equal_nan();
+    test_gf16_eq_nan_not_equal_value();
+    test_gf16_ne_different_values();
+    test_gf16_ne_equal_values();
+    test_gf16_ne_nan_not_equal_nan();
+    test_gf16_ne_nan_not_equal_value();
+    test_gf16_lt_less_than();
+    test_gf16_lt_equal_values();
+    test_gf16_lt_greater_than();
+    test_gf16_lt_negative_positive();
+    test_gf16_lt_with_nan();
+    test_gf16_le_less_than_or_equal();
+    test_gf16_le_equal_values();
+    test_gf16_le_greater_than();
+    test_gf16_le_with_nan();
+    test_gf16_gt_greater_than();
+    test_gf16_gt_equal_values();
+    test_gf16_gt_less_than();
+    test_gf16_gt_with_nan();
+    test_gf16_ge_greater_than_or_equal();
+    test_gf16_ge_equal_values();
+    test_gf16_ge_less_than();
+    test_gf16_ge_with_nan();
+    test_gf16_comparison_consistency();
+    test_gf16_floor_positive_value();
+    test_gf16_floor_negative_value();
+    test_gf16_floor_integer();
+    test_gf16_floor_zero();
+    test_gf16_floor_inf_unchanged();
+    test_gf16_floor_nan_returns_nan();
+    test_gf16_ceil_positive_value();
+    test_gf16_ceil_negative_value();
+    test_gf16_ceil_integer();
+    test_gf16_ceil_inf_unchanged();
+    test_gf16_ceil_nan_returns_nan();
+    test_gf16_round_half_up();
+    test_gf16_round_positive_value();
+    test_gf16_round_negative_value();
+    test_gf16_round_fractional_down();
+    test_gf16_round_inf_unchanged();
+    test_gf16_round_nan_returns_nan();
+    test_gf16_trunc_positive_value();
+    test_gf16_trunc_negative_value();
+    test_gf16_trunc_zero();
+    test_gf16_trunc_inf_unchanged();
+    test_gf16_trunc_nan_returns_nan();
+    test_gf16_rounding_floor_vs_trunc_negative();
+    test_gf16_rounding_ceil_vs_trunc_positive();
+    test_gf16_fms_basic();
+    test_gf16_fms_with_zero_c();
+    test_gf16_fms_negative_result();
+    test_gf16_fms_with_nan();
+    test_gf16_fms_zero_a();
+    test_gf16_hypot_pythagorean_triple();
+    test_gf16_hypot_both_zero();
+    test_gf16_hypot_one_zero();
+    test_gf16_hypot_negative_inputs();
+    test_gf16_hypot_with_nan();
+    test_gf16_hypot_with_inf();
+    test_gf16_fmod_basic();
+    test_gf16_fmod_exact_division();
+    test_gf16_fmod_negative_dividend();
+    test_gf16_fmod_fractional();
+    test_gf16_fmod_zero_divisor();
+    test_gf16_fmod_with_nan();
+    test_gf16_is_finite_normal_numbers();
+    test_gf16_is_finite_zero();
+    test_gf16_is_finite_false_for_inf();
+    test_gf16_is_finite_false_for_nan();
+    test_gf16_is_normal_true_for_normal();
+    test_gf16_is_normal_false_for_zero();
+    test_gf16_is_normal_false_for_inf();
+    test_gf16_is_normal_false_for_nan();
+    test_gf16_is_subnormal_false_for_tiny_values();
+    test_gf16_is_subnormal_false_for_normal();
+    test_gf16_is_subnormal_false_for_zero();
+    test_gf16_is_subnormal_false_for_special();
+    test_gf16_classification_complete_coverage();
+    test_gf16_signbit_positive();
+    test_gf16_signbit_negative();
+    test_gf16_signbit_positive_zero();
+    test_gf16_signbit_negative_zero();
+    test_gf16_signbit_infinity();
+    test_gf16_signbit_nan();
+    test_gf16_sign_positive();
+    test_gf16_sign_negative();
+    test_gf16_sign_zero();
+    test_gf16_sign_nan();
+    test_gf16_sign_infinity();
+    test_gf16_sign_matches_signbit();
+    test_gf16_clamp_in_range();
+    test_gf16_clamp_below_min();
+    test_gf16_clamp_above_max();
+    test_gf16_clamp_with_nan();
+    test_gf16_lerp_t_zero();
+    test_gf16_lerp_t_one();
+    test_gf16_lerp_t_half();
+    test_gf16_lerp_with_nan();
+    test_gf16_fnma_basic();
+    test_gf16_fnma_zero_multiplier();
+    test_gf16_fnma_zero_addend();
+    test_gf16_fnma_with_nan();
+    test_gf16_exp_zero();
+    test_gf16_exp_one();
+    test_gf16_exp_negative();
+    test_gf16_exp_large_positive();
+    test_gf16_log_one();
+    test_gf16_log_e();
+    test_gf16_log_zero_or_negative();
+    test_gf16_log2_eight();
+    test_gf16_log10_ten();
+    test_gf16_pow_two_cubed();
+    test_gf16_pow_zero_to_zero();
+    test_gf16_pow_any_to_zero();
+    test_gf16_pow_zero_to_positive();
+    test_gf16_pow_one_to_any();
+    test_gf16_sin_zero();
+    test_gf16_sin_small_angle();
+    test_gf16_cos_zero();
+    test_gf16_cos_small_angle();
+    test_gf16_trig_identity();
+    test_gf16_lp_ssot_split_constants();
+    test_gf16_lp_phi_dist_registered();
+    test_gf16_lp_alternate_split_phi_dist_larger();
+    test_gf16_lp_fp8_effective_precision();
+    test_gf16_lp_fp8_canonical_vs_alt_error_comparison();
+    printf("All %d tests passed.\n", 202);
+    return 0;
+}
+#endif /* T27_TEST_MAIN */
 
 #endif /* TRIFORMAT_GF16_H */
