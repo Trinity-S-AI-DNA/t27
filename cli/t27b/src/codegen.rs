@@ -1395,14 +1395,14 @@ impl<'a> Gen<'a> {
                 let reg = |y: &Expr| match (y.ty, &y.kind) { (Ty::U64, ExprKind::Var(w)) if !own.contains(w) => match self.homes[*w as usize] { Home::Reg(r) => Some(r), _ => None }, _ => None };
                 side[n] = match p.map(|i| a[i].1).map(|y| (y, &y.kind)) {
                     None => (ifc::AK_NONE, 0, h),
-                    Some((y, _)) if y.ty != Ty::U64 => return false,
+                    Some((y, _)) if y.ty != Ty::U64 => { return false },
                     Some((_, ExprKind::Const(0))) => (ifc::AK_CONST, 0, ZR),
                     Some((y, ExprKind::Const(k))) if *k > 0 => { srcs.push((X17, y)); (ifc::AK_CONST, *k as u64, X17) }
-                    Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => return false },
-                    Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::Sub), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
-                        (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
-                        _ => return false, },
-                    _ => return false, };
+                    Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => { return false } },
+                    Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::AddW | ArithOp::Sub | ArithOp::SubW), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
+                        (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub | ArithOp::SubW) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
+                        _ => { return false } },
+                    _ => { return false } };
             }
             if !ifc::may_if_convert(ifc::guard_of_cmp(*op as u8), *c as u64, side[0].0, side[0].1, side[1].0, side[1].1, vars.len() as u32, srcs.iter().filter(|s| s.0 == X16).count() as u32, true, true) { return false; } regs.push((h, side[0].2, side[1].2));
         }
