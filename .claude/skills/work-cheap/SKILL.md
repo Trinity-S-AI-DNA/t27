@@ -28,6 +28,7 @@ COST RULES (owner, 2026-10-25: work cheaper). These bind you as much as the task
 1. Cheapest tier that can pass the gate. A free T27 OS pane (z.ai glm-4.5-flash) takes attempts 1-2; a Sonnet
    subagent takes over after 2 failed attempts; Opus after 4 or on the owner's word. Free-model output is judged
    by a machine (compiler, test), never by its own word. Law: specs/claw/model_route.t27.
+   A Cursor subagent starts on composer-2.5; Fast is not the default. Law: specs/claw/cursor_route.t27.
 2. Read only what the brief names. Find a symbol with grep, then Read with offset and limit. Never read a whole
    large spec to find one function. Never re-read a file you just edited; the tool would have failed.
 3. Batch independent tool calls in one message. One round trip beats five.
