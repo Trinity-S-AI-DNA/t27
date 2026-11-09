@@ -10,3 +10,4 @@ here disagrees with that spec, the spec wins.
 - `docs/promotion/publish-gate.md` -- widget, screenshot, test, human yes.
 - `docs/promotion/baseline.md` -- GitHub counts, cited X impressions, course not ready.
 - `docs/promotion/metrics.md` -- tracked metrics and the weekly report.
+- `docs/promotion/funnel.md` -- one CTA per step, paid checkout off.
