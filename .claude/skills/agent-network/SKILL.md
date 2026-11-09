@@ -37,7 +37,7 @@ The letter cards in `specs/agents/` stay the path owners. This layer does not re
 
 - A use is real only when the orchestrator allows the act and an audit bit is written.
 - Merge, publish, cron, a lab run, a Mac test-report, and the window shell stay gated.
-- `tri t27a spec scan` is classified to T27A and is not a live command.
+- `tri t27a spec scan` is classified to T27A and does not exist as a command.
 - No command body moves in this layer (`AN_MIGRATED` is 0).
 
 `an_window_stays_blocked` stays true. This skill does not open the window.
