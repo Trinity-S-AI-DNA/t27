@@ -5,5 +5,5 @@
 // the Zig and Verilog outputs; do not read this file as verified.
 
 pub fn cinc_ok(sf: bool, op_is_addw: bool, d_eq_rx: bool, ry_is_cset: bool, cset_sf: bool, rd_ne_rx: bool) -> bool {
-    return sf && op_is_addw && d_eq_rx && ry_is_cset && cset_sf && rd_ne_rx;
+    return (((((sf && op_is_addw) && d_eq_rx) && ry_is_cset) && cset_sf) && rd_ne_rx);
 }
