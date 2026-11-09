@@ -34,6 +34,9 @@ pub(crate) mod home_plan;
 #[path = "../../../gen/rust/tri/t27b/frame_layout.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod frame_layout;
+#[path = "../../../gen/rust/tri/t27b/flow_plan.rs"] #[allow(dead_code, unused_parens)] // specs/tri/t27b/flow_plan.t27
+pub(crate) mod flow_plan;
+use flow_plan as fp;
 // t27b-generated trap stub law: specs/tri/t27b/trap_plan.t27.
 #[path = "../../../gen/rust/tri/t27b/trap_plan.rs"]
 #[allow(dead_code, unused_parens)]
@@ -1958,18 +1961,14 @@ fn ldst_op(ty: Ty, load: bool) -> (u32, u32) {
 
 fn overflow_cond(ty: Ty, sub: bool) -> Cond { Cond::from_bits(ip::overflow_cond(ty.signed(), sub)) }
 
-/// Conservative: false only when control certainly cannot reach the end.
+fn last_kind(ss: &[Stmt]) -> u8 { match ss.last() { Some(Stmt::Return(_)) => fp::SK_RETURN, Some(Stmt::Break) => fp::SK_BREAK,
+    Some(Stmt::Continue) => fp::SK_CONTINUE, Some(Stmt::If { .. }) => fp::SK_IF, Some(_) => fp::SK_OTHER, None => fp::SK_NONE } }
+/// flow_plan.t27 falls_through; the walk only recurses into the arms of a trailing `if`.
 fn may_fall_through(ss: &[Stmt]) -> bool {
-    match ss.last() {
-        Some(Stmt::Return(_)) => false,
-        Some(Stmt::If { then, els, .. }) => may_fall_through(then) || els.is_empty() || may_fall_through(els),
-        _ => true,
-    }
+    let (tf, ee, ef) = match ss.last() { Some(Stmt::If { then, els, .. }) => (may_fall_through(then), els.is_empty(), may_fall_through(els)), _ => (false, false, false) };
+    fp::falls_through(last_kind(ss), tf, ee, ef)
 }
-
-fn ends_in_jump(ss: &[Stmt]) -> bool {
-    matches!(ss.last(), Some(Stmt::Return(_)) | Some(Stmt::Break) | Some(Stmt::Continue))
-}
+fn ends_in_jump(ss: &[Stmt]) -> bool { fp::ends_in_jump_kind(last_kind(ss)) }
 
 /// middle_end.t27 LICM_CONST: the constant side of each `while` condition's integer compare, as `compare` sees it.
 fn loop_limits(ss: &[Stmt], out: &mut Vec<(i128, bool)>) {
@@ -2138,7 +2137,7 @@ pub fn data_layout(data: &[Vec<u8>]) -> (Vec<usize>, usize) {
     let mut offs = Vec::with_capacity(data.len());
     let mut at = 0usize;
     for b in data {
-        at = (at + 7) & !7;
+        at = frame_layout::data_blob_at(at as u64) as usize;
         offs.push(at);
         at += b.len();
     }
