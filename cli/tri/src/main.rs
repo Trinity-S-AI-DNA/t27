@@ -81,6 +81,35 @@ mod renum;
 mod reseal;
 mod rtl;
 mod scratch;
+#[path = "../../../gen/rust/tri/health/health.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod health_rules; // t27c gen-rust of specs/tools/tri/health.t27
+pub use crate::health_rules::*;
+#[path = "../../../gen/rust/tri/elab/elab.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod elab_rules; // t27c gen-rust of specs/tools/tri/elab.t27
+// elab_rules is deliberately NOT glob-re-exported: no symbol from it is used in
+// main.rs (`elab::run` comes from the hand-written `mod elab;` at line 16).
+// `pub use crate::elab_rules::*;` would collide with health_rules' identically
+// named metadata consts (KIND, FAMILY, ID, …) and raise ~20
+// ambiguous_glob_reexports warnings.
+#[path = "../../../gen/rust/tri/skill/skill.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod skill_rules; // t27c gen-rust of specs/tools/tri/skill.t27
+#[path = "../../../gen/rust/tri/kinds/kinds.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod kinds_rules; // t27c gen-rust of specs/tools/tri/kinds.t27
+// kinds_rules is deliberately NOT glob-re-exported: its metadata consts
+// (KIND, FAMILY, ID, …) would collide with health_rules', raising
+// ambiguous_glob_reexports warnings, same as elab_rules/skill_rules.
+#[path = "../../../gen/rust/tri/lean/lean.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod lean_rules; // t27c gen-rust of specs/tools/tri/lean.t27
+// lean_rules is deliberately NOT glob-re-exported: its metadata consts
+// (KIND, FAMILY, ID, …) would collide with health_rules', raising
+// ambiguous_glob_reexports warnings, same as elab_rules/skill_rules/kinds_rules.
+#[path = "../../../gen/rust/tri/serve/serve.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod serve_rules; // t27c gen-rust of specs/tools/tri/serve.t27
+// serve_rules is deliberately NOT glob-re-exported: its metadata consts
+// (KIND, FAMILY, ID, …) would collide with health_rules', raising
+// ambiguous_glob_reexports warnings, same as elab_rules/skill_rules/kinds_rules.
+#[path = "../../../gen/rust/tri/cell/cell.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod cell_rules; // t27c gen-rust of specs/tools/tri/cell.t27
+#[path = "../../../gen/rust/tri/fleet/fleet.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod fleet_rules; // t27c gen-rust of specs/tools/tri/fleet.t27: the `tri fleet` tool card's contract consts
+#[path = "../../../gen/rust/tri/night/night.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod night_rules; // t27c gen-rust of specs/tri/loop/tick.t27: the `tri loop tick` pure functions (gen-rust backend emits declarations only)
+#[path = "../../../gen/rust/tri/red/red.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod red_rules; // t27c gen-rust of specs/tools/tri/red.t27
+#[path = "../../../gen/rust/tri/gates/gates.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod gates_rules; // t27c gen-rust of specs/tools/tri/gates.t27
+#[path = "../../../gen/rust/tri/misread/misread.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod misread_rules; // t27c gen-rust of specs/tools/tri/misread.t27
+#[path = "../../../gen/rust/tri/oneaway/oneaway.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod oneaway_rules; // t27c gen-rust of specs/tools/tri/one-away.t27
+#[path = "../../../gen/rust/tri/orphaned/orphaned.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod orphaned_rules;
 mod seals;
 mod skillnum;
 mod sweep;
@@ -91,11 +120,6 @@ mod types_dup;
 mod unparsed;
 mod vectors;
 mod vsim;
-
-#[path = "../../../gen/rust/tri/search_cmd.rs"] #[allow(dead_code)] mod search_cmd; // t27c gen-rust of specs/tri/search_cmd/search_cmd.t27: `tri search`
-#[path = "../../../gen/rust/tri/math_verify.rs"] #[allow(dead_code)] mod math_verify; // t27c gen-rust of specs/tri/math_verify/math_verify.t27: `tri math-verify`
-#[path = "../../../gen/rust/tri/issue_cmd.rs"] #[allow(dead_code)] mod issue_cmd; // t27c gen-rust of specs/tri/issue_cmd/issue_cmd.t27: `tri issue`
-#[path = "../../../gen/rust/tri/sync_cmd.rs"] #[allow(dead_code)] mod sync_cmd; // t27c gen-rust of specs/tri/sync_cmd/sync_cmd.t27: `tri sync`
 
 #[derive(Parser)]
 #[command(name = "tri", about = "PHI LOOP CLI wrapper")]
@@ -483,33 +507,8 @@ enum Commands {
     Coverage { patterns: Vec<String>, #[arg(long)] strict: bool, #[arg(long)] t27c: Option<String> },
     /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
     Learn { #[command(subcommand)] action: loopclaim::LearnCmd },
-    /// Search across a haystack for a needle (rules: specs/tri/search_cmd/search_cmd.t27).
-    Search { haystack: String, needle: String },
-    /// Verify numeric identities (rules: specs/tri/math_verify/math_verify.t27).
-    MathVerify { #[arg(long, default_value = "all")] suite: String },
-    /// Create a GitHub issue (rules: specs/tri/issue_cmd/issue_cmd.t27).
-    Issue { #[command(subcommand)] action: IssueAction },
-    /// Sync GitHub entities to NotebookLM (rules: specs/tri/sync_cmd/sync_cmd.t27).
-    Sync { #[command(subcommand)] action: SyncAction },
 }
 
-#[derive(Subcommand)]
-enum IssueAction {
-    /// Create a GitHub issue.
-    Create { title: String, #[arg(default_value = "")] desc: String },
-}
-
-#[derive(Subcommand)]
-enum SyncAction {
-    /// Sync everything.
-    All,
-    /// Sync GitHub issues only.
-    Issues,
-    /// Sync GitHub PRs only.
-    Prs,
-    /// Sync documentation.
-    Doc,
-}
 #[derive(Subcommand)]
 enum SkillAction {
     /// Write a new lesson to the spool, unnumbered.
@@ -1297,10 +1296,10 @@ fn cmd_health(root: &Path, target: Option<&str>) -> Result<()> {
                 let data = fs::read_to_string(&p)?;
                 println!("{}", data.trim());
             } else {
-                println!("queen: no health data");
+                println!("{}", HEALTH_NONE_TEXT);
             }
         }
-        Some(other) => bail!("unknown health target: {}", other),
+        Some(other) => bail!("{}{}", BAIL_PREFIX, other),
     }
     Ok(())
 }
@@ -1455,45 +1454,6 @@ fn main() -> Result<()> {
         Commands::Preflight => { let mut wg = pf::GATE_COUNT; std::process::exit(pf::pf_exit_code(pf_run(&mut wg)) as i32) },
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
         Commands::Learn { action } => loopclaim::learn_run(action)?,
-        Commands::Search { haystack, needle } => {
-            let idx = search_cmd::find(haystack.clone().leak(), needle.clone().leak());
-            println!("search: {haystack} contains {needle} at index {idx}");
-        }
-        Commands::MathVerify { suite } => {
-            let ok = math_verify::verify_pythagorean(3, 4, 5) == 0
-                && math_verify::verify_trinity_identity() == 0;
-            if suite == "all" && ok {
-                println!("math-verify: suite all passed");
-            } else {
-                println!("math-verify: suite {suite}");
-            }
-        }
-        Commands::Issue { action } => match action {
-            IssueAction::Create { title, .. } => {
-                if issue_cmd::title_ok(title.clone().leak()) == 0 {
-                    println!("issue: {title}");
-                } else {
-                    bail!("issue title must not be empty")
-                }
-            }
-        },
-        Commands::Sync { action } => match action {
-            SyncAction::All => {
-                println!("sync: all entities");
-            }
-            SyncAction::Issues => {
-                let n = sync_cmd::entity_count(sync_cmd::ISSUES);
-                println!("sync issues: {n}");
-            }
-            SyncAction::Prs => {
-                let n = sync_cmd::entity_count(sync_cmd::PRS);
-                println!("sync prs: {n}");
-            }
-            SyncAction::Doc => {
-                let n = sync_cmd::entity_count(sync_cmd::DOC);
-                println!("sync doc: {n}");
-            }
-        },
     }
 
     Ok(())
