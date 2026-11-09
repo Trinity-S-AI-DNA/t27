@@ -543,3 +543,57 @@ same list:
   after re-evolving against clean benchmarks. Any system that edits its own
   toolchain, including this one, owes that finding an answer it does not yet
   have.
+
+---
+
+## 7. 2026-10/11 recent competitor research
+
+This section records arXiv preprints from 2026-10 to 2026-11 in the five
+adjacent fields tracked by IGLA CODER / IGLA RACE / t27. Numbers are taken
+from the papers' abstracts and reported tables; they are given as reported
+without independent reproduction.
+
+### 7.1 RTL generation — LLMs that emit Verilog
+
+#### 7.1.1 EvolVE: Evolutionary Search for LLM-based Verilog Generation
+- **arXiv:** 2601.18067 [cs.AI]
+- **What it claims:** MCTS excels at maximizing functional correctness; Idea-Guided Refinement is superior for optimisation. Structured Testbench Generation accelerates evolution.
+- **Reported numbers:** 98.1% on VerilogEval v2, 92% on RTLLM v2. On the industry-scale IC-RTL suite, Power-Performance-Area product reduced by up to 66% in Huffman Coding and 17% geometric mean across all problems.
+- **Relation to IGLA CODER:** Direct competitor in the LLM-for-RTL generation field. Pass rates are reported on the same VerilogEval / RTLLM benchmarks against which IGLA CODER has no published score.
+
+#### 7.1.2 Search-Guided Reasoning Trace Curation for Verilog Generation
+- **arXiv:** 2610.37706 [cs.AR]
+- **What it claims:** MCTS-SFT curates reasoning traces for supervised fine-tuning of Verilog generation models. Plan-MCTS searches over compact hardware-design plans.
+- **Reported numbers:** Plan-MCTS functional trace yield 84.2% vs 81.9% one-shot structured planning and 82.0% unguided tree exploration. For identical Plan-MCTS trajectories, retaining explicit plan raises pass@10 from 52.56% to 57.7%. In a 6,000-trace study, MCTS-curated supervision improves pass@10 over full-response chain-of-thought distillation by up to 3.7 points while reducing downstream generation length by ~50% on VerilogEval-v2.
+- **Relation:** Demonstrates the value of verifier-guided search and intermediate plan preservation for VerilogEval-v2 correctness and token efficiency.
+
+#### 7.1.3 GI-RTL-Fuzz: Grammar-Informed RTL Generation with LLMs for End-to-End Differential Simulator Fuzzing
+- **arXiv:** 2610.38489 [cs.AR]
+- **What it claims:** Grammar-informed fuzzing framework that leverages LLMs to generate high-quality RTL test cases, guided by BNF grammar coverage.
+- **Reported numbers:** 15 previously unreported bugs and inconsistencies in Verilator, Icarus Verilog and ModelSim from 1,000 generated test cases. Grammar coverage with k=3 nodes reaches 51.92% with GPT-4, vs 35.12% baseline and 11.08% for Verismith. Behavioral mismatches 41 vs 23 baseline.
+- **Relation:** Not an RTL generation competitor per se, but a method for stressing RTL simulators using LLM-generated Verilog, orthogonal to IGLA CODER's spec-to-RTL direction.
+
+### 7.2 Physics formal verification / certified computation
+
+#### 7.2.1 Rigorously Certified Neural-Network Computation of Nonlinear Water Waves
+- **arXiv:** 2611.07395 [math.AP]
+- **What it claims:** Physics-informed neural networks discover near-machine-precision solutions to strongly nonlinear PDEs, with rigorous interval-arithmetic certification and Lean formalisation.
+- **Reported numbers:** Near-machine-precision residuals achieved for high-amplitude Stokes waves, Crapper waves, Wilton ripples.
+- **Relation:** Illustrates a certified-neural + formal-verification pipeline for physics PDEs, analogous in spirit to t27's Coq proofs + seals, but in the PDE certification domain.
+
+### 7.3 Numeric formats / ternary AI
+
+#### 7.3.1 NativeTernary and related ternary format work
+Recent preprints continue active development of ternary and low-bit numeric formats:
+- **arXiv:** 2610.22621, 2610.12251, 2609.35352 Fiona, 2604.03336 NativeTernary — cited in the 2026-10/11 sweep as active competitor work in ternary numeric formats and hardware-efficient AI number representations.
+- **Relation:** These papers explore ternary / native ternary representations for inference and training. t27's GoldenFloat family and GF-T ternary formats are positioned as spec-driven, sealed formats with conformance vectors; the competitor papers focus on algorithmic and hardware novelty rather than open spec-to-silicon reproducibility.
+
+### 7.4 FPGA open-source flows
+
+The 2026-10/11 period continues the open-source FPGA toolchain trend:
+- **SpecLens** arXiv:2609.16729 and **LLM-based Hardware Development** arXiv:2608.30659 are representative of LLM-assisted hardware design flows that target open-source toolchains.
+- **Relation:** These flows emphasize LLM-assisted RTL generation and HLS repair within open-source EDA contexts, overlapping with IGLA CODER's spec-driven generation but without the .t27 spec-to-RTL seal chain.
+
+---
+
+*These entries are added 2026-11-09. Pass@K and benchmark numbers are reported as given in the preprints; independent reproduction has not been performed here.*
