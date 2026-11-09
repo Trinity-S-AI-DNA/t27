@@ -7,8 +7,7 @@
 
 use crate::wasm_law as w; // the wasm32 byte law (specs/tri/t27b/wasm.t27), mounted in lib.rs
 
-/// Integer, boolean and float types of the supported subset. `usize` lowers
-/// to `U64`, `isize` to `I64`.
+/// The types of the supported subset; the table law is specs/tri/t27b/ir_types.t27 (`law`'s kind code below).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Ty {
     Bool,
@@ -20,43 +19,17 @@ pub enum Ty {
     I16,
     I32,
     I64,
-    /// A 64-bit address into a frame slot or the read-only data image (memory
-    /// lane). Never a value of the language: lowering makes it for aggregates,
-    /// passes it as a hidden parameter, and only ever offsets and loads it.
     Ptr,
-    /// IEEE-754 binary64. A value is carried as its 64-bit pattern (a
-    /// non-negative `i128` below 2^64 in the IR and the interpreter, the whole
-    /// X register in generated code); arithmetic happens in D registers, and
-    /// AAPCS64 passes and returns it in d0-d7.
     F64,
-    /// IEEE-754 binary32: its 32-bit pattern, canonical like a u32 (zero-
-    /// extended in the X register); arithmetic happens in S registers, and
-    /// AAPCS64 passes and returns it in s0-s7.
     F32,
-    /// `uN` for an N in 1..=31 other than 8 and 16 (`u1`, `u4`, `u21`).
-    /// Canonical like u8/u16: zero-extended in its W register. Stored in the
-    /// bytes Zig gives it (`@sizeOf(u21) == 4`).
+    /// `uN`/`iN` for an N in 1..=31 other than 8 and 16.
     UN(u8),
-    /// `iN` for an N in 1..=31 other than 8 and 16: sign-extended in its W
-    /// register, like i8/i16.
     IN(u8),
-    /// `i128`: a pair of X registers in generated code, the low word first (x0:x1 for a result, the next even
-    /// pair for a parameter), and 16 bytes in memory (specs/tri/t27b/i128_plan.t27, `ip` below).
     I128,
 }
 
 #[path = "../../../gen/rust/tri/t27b/i128_plan.rs"] #[allow(dead_code, unused_parens)]
 pub(crate) mod ip; // t27c gen-rust of specs/tri/t27b/i128_plan.t27: a run-time i128 as a pair of X registers
-
-/// Names of the odd widths, so `Ty::name` stays a `&'static str`.
-const UN_NAMES: [&str; 32] = [
-    "u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7", "u8", "u9", "u10", "u11", "u12", "u13", "u14", "u15",
-    "u16", "u17", "u18", "u19", "u20", "u21", "u22", "u23", "u24", "u25", "u26", "u27", "u28", "u29", "u30", "u31",
-];
-const IN_NAMES: [&str; 32] = [
-    "i0", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9", "i10", "i11", "i12", "i13", "i14", "i15",
-    "i16", "i17", "i18", "i19", "i20", "i21", "i22", "i23", "i24", "i25", "i26", "i27", "i28", "i29", "i30", "i31",
-];
 
 impl Ty {
     pub const INTS: [Ty; 8] = [
@@ -69,6 +42,17 @@ impl Ty {
         Ty::I32,
         Ty::I64,
     ];
+
+    /// The kind code of specs/tri/t27b/ir_types.t27 (bool=0, u8=1, u16=2, u32=3, u64=4, i8=5, i16=6, i32=7,
+    /// i64=8, ptr=9, f32=10, f64=11, i128=12, odd unsigned 100+n, odd signed 200+n) with its odd width.
+    fn law(self) -> (u32, u32) {
+        match self {
+            Ty::Bool => (0, 0), Ty::U8 => (1, 0), Ty::U16 => (2, 0), Ty::U32 => (3, 0),
+            Ty::U64 => (4, 0), Ty::I8 => (5, 0), Ty::I16 => (6, 0), Ty::I32 => (7, 0),
+            Ty::I64 => (8, 0), Ty::Ptr => (9, 0), Ty::F32 => (10, 0), Ty::F64 => (11, 0),
+            Ty::I128 => (12, 0), Ty::UN(n) => (100 + u32::from(n), u32::from(n)), Ty::IN(n) => (200 + u32::from(n), u32::from(n)),
+        }
+    }
 
     pub fn from_name(s: &str) -> Option<Ty> {
         Some(match s {
@@ -107,65 +91,26 @@ impl Ty {
         Some(if signed { Ty::IN(n) } else { Ty::UN(n) })
     }
 
-    /// An odd width (`Ty::UN` / `Ty::IN`): no 8/16-bit load or extend
-    /// instruction is exactly its canonical form.
-    pub fn is_odd(self) -> bool {
-        matches!(self, Ty::UN(_) | Ty::IN(_))
-    }
+    pub fn is_odd(self) -> bool { crate::ir_types::ty_is_odd(self.law().0) }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Ty::Bool => "bool",
-            Ty::U8 => "u8",
-            Ty::U16 => "u16",
-            Ty::U32 => "u32",
-            Ty::U64 => "u64",
-            Ty::I8 => "i8",
-            Ty::I16 => "i16",
-            Ty::I32 => "i32",
-            Ty::I64 => "i64",
-            Ty::Ptr => "ptr",
-            Ty::F64 => "f64",
-            Ty::F32 => "f32",
-            Ty::UN(n) => UN_NAMES[n as usize],
-            Ty::IN(n) => IN_NAMES[n as usize],
-            Ty::I128 => "i128",
-        }
-    }
+    pub fn name(self) -> &'static str { let (k, n) = self.law(); crate::ir_types::ty_name(k, n) }
 
-    pub fn is_int(self) -> bool {
-        !matches!(self, Ty::Bool | Ty::Ptr | Ty::F64 | Ty::F32)
-    }
+    pub fn is_int(self) -> bool { crate::ir_types::ty_is_int(self.law().0) }
 
-    pub fn is_float(self) -> bool {
-        matches!(self, Ty::F64 | Ty::F32)
-    }
+    pub fn is_float(self) -> bool { crate::ir_types::ty_is_float(self.law().0) }
 
     /// Size in memory: a load or store of this type moves this many bytes, Zig's ABI size (specs/tri/t27b/builtin_plan.t27).
     pub fn bytes(self) -> u32 {
         crate::lower::bp::abi_bytes(self.bits())
     }
 
-    /// Width in bits. `Bool` reports 8 (it is stored as a 0/1 byte value).
-    pub fn bits(self) -> u32 {
-        match self {
-            Ty::Bool | Ty::U8 | Ty::I8 => 8,
-            Ty::U16 | Ty::I16 => 16,
-            Ty::U32 | Ty::I32 | Ty::F32 => 32,
-            Ty::U64 | Ty::I64 | Ty::Ptr | Ty::F64 => 64,
-            Ty::UN(n) | Ty::IN(n) => n as u32,
-            Ty::I128 => 128,
-        }
-    }
+    /// Width in bits (ir_types.t27 `ty_bits`): a bool reports 8 (a 0/1 byte).
+    pub fn bits(self) -> u32 { let (k, n) = self.law(); crate::ir_types::ty_bits(k, n) }
 
-    pub fn signed(self) -> bool {
-        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_) | Ty::I128)
-    }
+    pub fn signed(self) -> bool { crate::ir_types::ty_signed(self.law().0) }
 
     /// True when the value occupies a full 64-bit X register.
-    pub fn is64(self) -> bool {
-        self.bits() == 64
-    }
+    pub fn is64(self) -> bool { crate::ir_types::ty_is64(self.law().0) }
 
     /// The bounds, as specs/tri/t27b/eval_arith.t27 has them (`ty_min`, `ty_max`, `fits`), an i128's too.
     pub fn min(self) -> i128 { crate::eval::spec::ty_min(self.bits(), self.signed()) }

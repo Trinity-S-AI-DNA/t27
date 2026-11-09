@@ -4680,10 +4680,7 @@ fn gen_resolved(input_path: &str, compile: fn(&str) -> Result<String, String>) -
                 // The splice is discarded here and the unresolved source used
                 // instead. Without this line that is invisible: the command
                 // succeeds, and every import it resolved is silently gone.
-                eprintln!(
-                    "note: spliced source did not compile, falling back to the \
-            unresolved original -- imported declarations are NOT in this output"
-                );
+                eprintln!("note: spliced source did not compile ({spliced_err}), falling back to the unresolved original -- imported declarations are NOT in this output");
                 code
             }
             Err(_) => anyhow::bail!("Compile error: {}", spliced_err),

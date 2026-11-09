@@ -142,12 +142,14 @@ its date, and re-measure a `NOTE` before you repeat it.
 
 Gaps that are open until a PR closes them. Do not assume otherwise:
 
-- **The owner's Mac has no `HOST`.** The vocabulary is `github-actions`,
-  `inngest`, `railway-cron`, `timer`. launchd jobs, crontab lines and Claude
-  Code scheduled tasks therefore have no card, and neither the page nor the
-  Queen sees them. A new host is a schema change in `specs/crons/README.md`
-  first, then in the trinity generator (`apps/website/scripts/agents-from-specs.mjs`),
-  then in the Queen's `src/inngest/plan.ts`.
+- **Claude Code scheduled tasks have no `HOST`.** The vocabulary since
+  0930ccde91 (2026-10-04) is `github-actions`, `inngest`, `railway-cron`,
+  `timer`, `launchd`: launchd jobs and crontab lines card under `launchd`
+  (`specs/crons/README.md`, "HOST launchd"), the page renders them with
+  controls disabled, and the Queen serves them `tick-only`. A new host is
+  still a schema change in `specs/crons/README.md` first, then in the trinity
+  generator (`apps/website/scripts/agents-from-specs.mjs`), then in the
+  Queen's `src/inngest/plan.ts`.
 - **Dispatched workflows fire twice.** A `github-actions` card the Queen
   dispatches still has its `schedule:` block until a PR removes it, in the
   order fixed by
@@ -473,6 +475,19 @@ Every spec is a running cost: a seal, a ledger row, CI minutes on every pull req
 - **Extend before creating.** Prefer extending an existing plan or conformance spec over a new file. Keep one conformance spec per area, not one per feature.
 - **t27o (the converter) reuses.** It reuses an existing t27 function with the same input/output contract instead of emitting a new body, and reports how many it reused.
 - **Duplicates only go down.** `tools/duplicate_bodies_baseline.txt` only moves down. A pull request that adds a duplicate body is wrong even where the check is not required (#8963).
+
+## Choosing work: the Pareto roadmap rule (owner, 2026-11-08)
+
+Hard gates (safety, end-to-end flow, unblocking, repeated failure) beat the score; a high score never makes a task P0.
+The score is impact x confidence / effort, each 1 to 5. The rule and its checks live in `specs/queen/roadmap.t27`,
+with `specs/queen/priority.t27` (levels) and `specs/queen/claim_msg.t27` (claims). Read them; do not restate them.
+
+## Cost optimization: savings never beat correctness or privacy (owner, 2026-11-08)
+
+A cheaper route is taken only when correctness, privacy and review stay intact. Architecture, security, critical
+fixes and final review never go to a small model; an output that fails validation escalates and is never returned.
+The rule (cost score, prompt and response caching, routing, budget, anomalies, the T27L cost event) lives in
+`specs/claw/cost_policy.t27`; Claude tiers stay `specs/claw/model_route.t27`. A Cursor session follows `specs/claw/cursor_route.t27`. Read them; do not restate them.
 
 ## trigit is the standard: our own git (owner rules, 2026-10-20; standard 2026-10-22)
 
