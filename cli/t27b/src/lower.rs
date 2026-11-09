@@ -7808,7 +7808,7 @@ fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
             { let ExprKind::Cmp { op: o2, lhs: l2, rhs: r2 } = &cond.kind else { unreachable!() }; // countdown: specs/tri/t27b/countdown_plan.t27 Refs #13421
               let (op2, iv_ty, rhs2) = (*o2 as u8, l2.ty, r2.clone());
               if op2 == 2 && k == 1 && n == 1 && fixed && writes(body, iv) == 0 && init0(before, iv) == Some(0) {
-                for s in before.iter_mut().rev() { match s { Stmt::Assign { var, value } if *var == iv => { *value = rhs2; break; } Stmt::Assign { .. } => {} _ => break } }
+                for s in before.iter_mut().rev() { match s { Stmt::Assign { var, value } if *var == iv => { *value = *rhs2; break; } Stmt::Assign { .. } => {} _ => break } }
                 for l in [&mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { if let ExprKind::Arith { op: ref mut ao, .. } = e.kind { if matches!(ao, ArithOp::Add | ArithOp::AddW) { *ao = ArithOp::SubW; } } }); }
                 cond.kind = ExprKind::Var(iv); cond.ty = iv_ty; } }
         }
