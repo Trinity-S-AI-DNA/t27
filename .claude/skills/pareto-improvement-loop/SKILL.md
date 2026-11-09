@@ -88,7 +88,7 @@ Three variants live in `specs/acceleration/`:
 - Before editing for a red check, use `pareto_fix_may_start` in `specs/crons/t27-pareto-improvement-loop.t27` (wraps `gate_patch_allowed` + `fix_may_start`); if it is false, stop and wait for the owning lane.
 - At STEP AUDIT, `inherited_repo_gate_red(duplicate_bodies_red, seal_coverage_red)` names the two master-debt checks this lane does not patch; pass flags from `gh pr checks`, not from memory.
 - Mass "required check pending" on PRs is a gate class, not per-PR whack-a-mole. Law: `specs/ci/pr_ready_aggregate.t27` (aggregate `pr-ready`, always terminal on latest SHA). Host: `.github/workflows/pr-ready.yml` after owner labels foreign workflow work; until then fix master debt (#13505 dupes, #13506 queen_dash) per sibling lanes.
-- Before `git push`, call `batch_push_may_run(skill_only_tick, inherited_repo_gate_red, own_task_path, required_checks_pending)` in the same spec; when it is false, verify locally and update the PR body only.
+- Before `git push`, call `batch_push_may_run(skill_only_tick, inherited_repo_gate_red, own_task_path, required_checks_pending)` in the same spec; when it is false, verify locally (`t27c seal --verify` on the lane specs) and record the tick under `/opt/cursor/artifacts/pareto-tick-*.txt`. While `required_checks_pending` and rollup `pass=0`, do **not** edit the PR body every tick — repeated edits cancel/requeue `check-linked-issue` and `fix-carries-source` on Actions; one consolidated PR footer after `pass>0` is enough.
 - Before a second `git merge origin/master` in the same CI window, call `merge_master_may_run(required_checks_pending, master_ahead)`; when required checks are still pending after the last push, wait.
 
 ## No foreign edits
