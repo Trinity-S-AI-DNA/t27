@@ -16,6 +16,7 @@
 //! * Calls inside the module are `bl` with the offset filled in by `link`.
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
+use crate::lower::me;
 use std::collections::HashMap;
 
 // t27b-generated inline decision source of truth: specs/tri/t27b/inline.t27.
@@ -163,6 +164,8 @@ struct Gen<'a> {
     /// Some parameter arrives on the stack (read from x29, so a frame).
     stack_params: bool,
     data_refs: Vec<(usize, u32)>,
+    /// middle_end.t27 LICM_CONST: constants built once in the prologue (canonical value, sf, register).
+    hoist: Vec<(u64, bool, Reg)>,
 }
 /// Compile every function of `prog` (tests too when `with_tests`).
 pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec<FuncCode>, CodegenError> {
@@ -205,6 +208,7 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
         uses_lr: false,
         stack_params: false,
         data_refs: Vec::new(),
+        hoist: Vec::new(),
     };
     let mut top = 0u32;
     for sl in &f.slots {
@@ -386,6 +390,19 @@ impl<'a> Gen<'a> {
         self.nvar_slots = slots;
         if !frame_layout::slot_ok(8 * slots) {
             self.fail(format!("more than {} variables spill to the frame", MAX_SLOT_BYTES / 8));
+        }
+        let mut lim = Vec::new(); // middle_end.t27 licm_hoist_const: the pools are the homes', after the homes
+        loop_limits(&f.body, &mut lim);
+        let framed = frame_layout::needs_frame(frame_layout::FrameFacts { has_call, saves_callee: taken_callee > 0, has_var_slots: slots > 0, has_temp_slots: false, has_agg: self.agg_bytes > 0, uses_lr: false, has_stack_params: self.stack_params });
+        for (c, sf) in lim {
+            let (v, mut words) = (a64::canon(c as u64, sf), Vec::new());
+            a64::mov_imm(sf, X16, v, &mut words);
+            if self.hoist.iter().any(|h| (h.0, h.1) == (v, sf)) { continue; }
+            match me::licm_hoist_const(words.len() as u32, !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64), home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64), framed, self.hoist.len() as u32) {
+                me::LICM_CALLER => { self.hoist.push((v, sf, (nint + taken_caller) as Reg)); taken_caller += 1; }
+                me::LICM_CALLEE => { let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.hoist.push((v, sf, r)); }
+                _ => {}
+            }
         }
         self.temp_base = frame_layout::temp_base_of(slots, self.used_callee.len() as u32);
     }
@@ -584,6 +601,7 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        for &(v, sf, r) in &self.hoist { a64::mov_imm(sf, r, v, &mut pro); } // LICM_CONST: once per call
         let shift = pro.len();
         let mut code = pro;
         code.extend_from_slice(&self.code);
@@ -1430,7 +1448,8 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 let rx = self.use_(x, X16, ty);
-                let ry = self.use_(y, X17, ty);
+                let h = if let V::Const(c) = y { self.hoist.iter().find(|h| (h.0, h.1) == (a64::canon(c as u64, s), s)).map(|h| h.2) } else { None };
+                let ry = match h { Some(r) => r, None => self.use_(y, X17, ty) };
                 self.emit(a64::cmp(s, rx, ry));
             }
         }
@@ -1943,6 +1962,23 @@ fn may_fall_through(ss: &[Stmt]) -> bool {
 
 fn ends_in_jump(ss: &[Stmt]) -> bool {
     matches!(ss.last(), Some(Stmt::Return(_)) | Some(Stmt::Break) | Some(Stmt::Continue))
+}
+
+/// middle_end.t27 LICM_CONST: the constant side of each `while` condition's integer compare, as `compare` sees it.
+fn loop_limits(ss: &[Stmt], out: &mut Vec<(i128, bool)>) {
+    for s in ss {
+        match s {
+            Stmt::While { cond, body, step } => {
+                if let ExprKind::Cmp { lhs, rhs, .. } = &cond.kind {
+                    let c = match (&lhs.kind, &rhs.kind) { (ExprKind::Const(_), ExprKind::Const(_)) => None, (ExprKind::Const(c), _) | (_, ExprKind::Const(c)) => Some(*c), _ => None };
+                    if let Some(c) = c.filter(|_| !lhs.ty.is_float() && lhs.ty != Ty::I128) { out.push((c, lhs.ty.is64())); }
+                }
+                for b in [body, step] { loop_limits(b, out); }
+            }
+            Stmt::If { then, els, .. } => { loop_limits(then, out); loop_limits(els, out); }
+            _ => {}
+        }
+    }
 }
 
 fn weigh_stmts(ss: &[Stmt], depth: u32, w: &mut [u64], wr: &mut [u64], has_call: &mut bool) {

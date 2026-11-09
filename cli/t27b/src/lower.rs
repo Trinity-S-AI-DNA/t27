@@ -125,6 +125,8 @@ mod oc; // t27c gen-rust of specs/tri/t27b/optional_compare_plan.t27: `?T == v`,
 mod dv; // t27c gen-rust of specs/tri/t27b/const_div_plan.t27: `/` and `%` of two integer constants, folded
 #[path = "../../../gen/rust/tri/t27b/bit_cast_plan.rs"] #[allow(dead_code, unused_parens)]
 mod bc; // t27c gen-rust of specs/tri/t27b/bit_cast_plan.t27: `@bitCast` of a scalar, `@intFromBool`
+#[path = "../../../gen/rust/tri/t27b/middle_end.rs"] #[allow(dead_code, unused_parens)]
+pub(crate) mod me; // t27c gen-rust of specs/tri/t27b/middle_end.t27: identities, strength reduction, LICM_CONST
 #[path = "../../../gen/rust/tri/t27b/literal_plan.rs"] #[allow(dead_code, unused_parens)]
 mod lp; // t27c gen-rust of specs/tri/t27b/literal_plan.t27: a literal's text as the t27c parser keeps it
 #[path = "../../../gen/rust/tri/t27b/ref_var_plan.rs"] #[allow(dead_code, unused_parens)]
@@ -4100,6 +4102,20 @@ impl<'a> Lower<'a> {
             let b = op.as_bytes();
             // `/` and `%` fold where specs/tri/t27b/const_div_plan.t27 says so, as Zig folds them at compile time.
             if let Some(r) = r.filter(|r| cp::folds(b[0], b.get(1).copied().unwrap_or(0), b.len(), ty.fits(*r)) || dv::div_folds(b[0], b.len(), ty.signed(), *q == 0, ty.fits(*r))) { return Ok(Val::E(Expr { ty, kind: ExprKind::Const(ty.wrap(r)) })); }
+        }
+        // Identities and strength reduction by a constant right operand (specs/tri/t27b/middle_end.t27).
+        if let (true, ExprKind::Const(k)) = (ty.is_int(), &y.kind) {
+            let k = *k;
+            if k >= 0 && k <= u64::MAX as i128 {
+                let id = me::identity(aop as u8, k as u64, ty.bits());
+                if id == me::ID_LHS { return Ok(Val::E(x)); }
+                if id == me::ID_ZERO && matches!(x.kind, ExprKind::Var(_) | ExprKind::Const(_)) { return Ok(Val::E(Expr { ty, kind: ExprKind::Const(0) })); }
+                let sr = me::strength(aop as u8, k as u64, ty.signed());
+                let sh = me::log2_exact(k as u64);
+                if sr == me::SR_SHL && sh < ty.bits() { return self.shift(ArithOp::ShlW, Val::E(x), Val::Ct(sh as i128)); }
+                if sr == me::SR_LSR && sh < ty.bits() { return self.shift(ArithOp::ShrW, Val::E(x), Val::Ct(sh as i128)); }
+                if sr == me::SR_AND { return Ok(Val::E(Expr { ty, kind: ExprKind::Arith { op: ArithOp::And, lhs: Box::new(x), rhs: Box::new(Expr { ty, kind: ExprKind::Const(k - 1) }), site: 0 } })); }
+            }
         }
         let site = match aop {
             ArithOp::Add | ArithOp::Sub | ArithOp::Mul => {
