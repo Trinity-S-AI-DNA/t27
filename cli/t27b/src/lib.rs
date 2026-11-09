@@ -39,6 +39,16 @@ pub mod timing;
 #[allow(dead_code)]
 mod wasm_law;
 
+/// The verdict-reuse law of the differential suite (specs/tri/t27b/diff_cache.t27).
+#[path = "../../../gen/rust/tri/t27b/diff_cache.rs"]
+#[allow(dead_code, unused_parens)]
+pub mod diff_cache;
+
+/// The IR type table (specs/tri/t27b/ir_types.t27): bits/signed/is64/float/int/odd/name as kind laws.
+#[path = "../../../gen/rust/tri/t27b/ir_types.rs"]
+#[allow(dead_code, unused_parens)]
+pub mod ir_types;
+
 /// The wasm32 emit adapter (the emitter file deleted, owner rule 2026-10-24,
 /// PR thread #11983): the IR half of the flatten is ir::wasm_facts; this
 /// takes walk_refusal's verdict and composes the module through walk_prog +

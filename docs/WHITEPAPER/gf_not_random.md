@@ -528,15 +528,19 @@ cargo build --release --features gmp
 
 ```bash
 # Full competitive report
+### Not built (planned surface only): tri math compete
 ./scripts/tri math compete --full
 
 # Specific test categorie
+### Not built (planned surface only): tri math compete
 ./scripts/tri math compete --sacred --roundtrip
 
 # Cross-language test
+### Not built (planned surface only): tri math compete
 ./scripts/tri math compete --language
 
 # Output to file
+### Not built (planned surface only): tri math compete
 ./scripts/tri math compete --full --output results/gf_competitive_report.md
 ```
 

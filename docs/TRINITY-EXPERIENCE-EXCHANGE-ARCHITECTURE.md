@@ -112,9 +112,11 @@ Replace tag-only lines with objects: `trigger`, `context`, `response`, `rule_gen
 | 1 | JSON Schema for episode v2 + CI validation |
 | 2 | Queen `wisdom.jsonl` + aggregator + briefing generator |
 | 3 | IPC spec (PUSH/PULL/BROADCAST) + conformance tests |
+> `tri insight` and `tri episode` are not built yet; they are listed as intended surface only.
 | 4 | `insights_voting.jsonl` + lifecycle + `tri insight …` commands |
 | 5 | Reflexion pipeline + amygdala v2 + auto rule promotion |
 | 6 | SIGMA/OMEGA/PHI templates + doc lint |
+### Not built (planned surface only): tri episode
 | 7 | Issue-close → episode automation + `tri episode create --issue N` |
 
 ## Evaluation metrics (when implemented)
