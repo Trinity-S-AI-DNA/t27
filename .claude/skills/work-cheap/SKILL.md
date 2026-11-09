@@ -28,6 +28,7 @@ COST RULES (owner, 2026-10-25: work cheaper). These bind you as much as the task
 1. Cheapest tier that can pass the gate. A free T27 OS pane (z.ai glm-4.5-flash) takes attempts 1-2; a Sonnet
    subagent takes over after 2 failed attempts; Opus after 4 or on the owner's word. Free-model output is judged
    by a machine (compiler, test), never by its own word. Law: specs/claw/model_route.t27.
+   A Cursor subagent starts on composer-2.5; Fast is not the default. Law: specs/claw/cursor_route.t27.
 2. Read only what the brief names. Find a symbol with grep, then Read with offset and limit. Never read a whole
    large spec to find one function. Never re-read a file you just edited; the tool would have failed.
 3. Batch independent tool calls in one message. One round trip beats five.
@@ -40,6 +41,9 @@ COST RULES (owner, 2026-10-25: work cheaper). These bind you as much as the task
 8. Stop when the gate is green. No extra refactor, no extra test, no extra doc.
 9. No builds, tests or benchmarks on the Mac (hook mac-no-heavy): they run in the lab or a T27 OS pane.
 10. Hard rules, always: only .t27 for code; English and ASCII on GitHub; never print, copy or commit a secret.
+11. Prompt caching is the default: stable text first (instructions, tools, contracts, project context), the
+   task and session data last; append to history, never rewrite it; no secret or private data in a cached
+   part. A small model only on a validated task class; failed validation escalates. Law: specs/claw/cost_policy.t27.
 End your report with one line: model, tool calls, what you chose not to do.
 ```
 

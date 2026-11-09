@@ -793,9 +793,8 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
         let ren: String = scoped.iter().filter(|((c, x), o)| *c == d.origin || (*x == d.name && **o == d.origin)).map(|((_, x), o)| format!("{x}\t{o}\n")).collect();
         d.text = sized(|b, n| use_splice::rewrite(d.text.as_bytes(), imports.get(&d.origin).map_or("", String::as_str).as_bytes(), names.as_bytes(), ren.as_bytes(), b, n));
     }
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
+    let tail = out.split_off(use_splice::tail_start(out.as_bytes())); // #13366: before a trailing `endmodule`
+    if !out.ends_with('\n') { out.push('\n'); }
     out.push_str("\n// ---- resolved from `use` (t27c) ----\n");
     for (name, origins) in &ambiguous {
         out.push_str(&format!(
@@ -813,7 +812,7 @@ pub fn resolve(input_path: &Path, source: &str) -> String {
         out.push_str(&d.text);
         out.push('\n');
     }
-    out
+    out + &tail
 }
 
 /// The enums declared by the specs this one imports, as
