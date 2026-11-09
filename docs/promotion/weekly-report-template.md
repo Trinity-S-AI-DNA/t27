@@ -1,0 +1,32 @@
+# Weekly promotion report (blank)
+
+Part of #13473. Issue #13480. Do not fill a number that has no command. Write `not measured` instead. Do not send this form.
+
+```text
+WEEK_ENDING_UTC:
+EPIC_CREATED:
+ISSUES_CREATED:
+BASELINE_CAPTURED:
+COURSE_MAP_CREATED:
+WIDGET_INVENTORY_CREATED:
+CONTENT_CALENDAR_CREATED:
+CONTENT_BANK_CREATED:
+FUNNEL_LIVE:
+METRICS_TRACKED:
+CONTRIBUTOR_PATH_LIVE:
+MONETIZATION_LIVE:
+SELF_IMPROVING_LOOP_LIVE:
+REGRESSION_STATUS:
+ANOMALIES_FOUND:
+BLOCKERS:
+NEXT_ACTION:
+GITHUB_STARS:
+GITHUB_FORKS:
+GITHUB_OPEN_ISSUES:
+GITHUB_CONTRIBUTORS:
+X_FOLLOWERS:
+X_IMPRESSIONS:
+DRAFTS_SENT:
+```
+
+`DRAFTS_SENT` stays 0 until the owner approves a named draft and a later run records the send. This template does not approve one.
