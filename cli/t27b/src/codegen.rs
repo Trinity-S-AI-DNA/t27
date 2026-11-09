@@ -288,7 +288,7 @@ impl<'a> Gen<'a> {
         let vals: Vec<V> = args.iter().map(|x| self.eval(x)).collect();
         let (mut x, mut y, mut op2) = (if l.0 == inline_decision::SK_PARAM { vals[l.1 as usize] } else { V::Const(l.1 as i128) }, if r.0 == inline_decision::SK_PARAM { vals[r.1 as usize] } else { V::Const(r.1 as i128) }, *op);
         if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) { (x, y, op2) = (y, x, op2.swap()); }
-        let rx = self.use_(x, X16, lhs.ty);
+        let rx = self.use_nz(x, X16, lhs.ty); // not ZR: reg 31 in cmp_imm is SP
         match y { V::Const(c) if (0..4096).contains(&c) => self.emit(a64::cmp_imm(true, rx, c as u32)), _ => { let ry = self.use_(y, X17, lhs.ty); self.emit(a64::cmp(true, rx, ry)) } }
         for v in vals.into_iter().rev() { self.release(v); }
         let (c, (d, t)) = (cond_for(op2, lhs.ty), self.dest(dst));
