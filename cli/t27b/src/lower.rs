@@ -860,7 +860,8 @@ fn lower_mode<'a>(
         return Err(l.errors);
     }
     l.synthesized(&mut funcs);
-    for f in &mut funcs { elide_checks(&mut f.body); } // specs/tri/t27b/check_elide_plan.t27
+    let rets: Vec<_> = funcs.iter().map(|f| if f.is_test || f.ret.is_none() { None } else { ret_max(&f.body) }).collect();
+    for f in &mut funcs { elide_checks(&mut f.body, &rets); } // specs/tri/t27b/check_elide_plan.t27
     // More than 8 parameters of a class: the rest are passed on the stack
     // in t27b's own convention (`Program::stack_args`), never exported.
     for (id, f) in funcs.iter().enumerate() {
@@ -7766,6 +7767,19 @@ fn konst(op: ArithOp, x: VarId, e: &Expr) -> Option<u64> { // `x op c`, trapping
     match &e.kind { ExprKind::Arith { op: o, lhs, rhs: r, site } if *o == op && *site != 0 && matches!(lhs.kind, ExprKind::Var(v) if v == x) => match r.kind { ExprKind::Const(c) => u64::try_from(c).ok(), _ => None }, _ => None }
 }
 fn relax(e: &mut Expr, w: ArithOp) { if let ExprKind::Arith { op, site, .. } = &mut e.kind { *op = w; *site = 0; } }
+fn has_cont(ss: &[Stmt]) -> bool { ss.iter().any(|s| match s { Stmt::Continue => true, Stmt::If { then, els, .. } => has_cont(then) || has_cont(els), Stmt::While { body, step, .. } => has_cont(body) || has_cont(step), _ => false }) }
+fn max_of(e: &Expr, rets: &[Option<u64>]) -> Option<u64> { // the largest value e can take, when it is a constant, a call returning constants or a select of those
+    match &e.kind { ExprKind::Const(c) => u64::try_from(*c).ok(), ExprKind::Call { func, .. } => rets[*func as usize], ExprKind::Select { then, els, .. } => Some(max_of(then, rets)?.max(max_of(els, rets)?)), _ => None }
+}
+fn ret_max(ss: &[Stmt]) -> Option<u64> { // the largest value a fn can return, when every `return` yields a constant
+    let mut m = Some(0);
+    for s in ss { let r = match s { Stmt::Return(Some(Expr { kind: ExprKind::Const(c), .. })) => u64::try_from(*c).ok(), Stmt::Return(Some(_)) => None, Stmt::If { then, els, .. } => ret_max(then).zip(ret_max(els)).map(|(a, b)| a.max(b)), Stmt::While { body, step, .. } => ret_max(body).zip(ret_max(step)).map(|(a, b)| a.max(b)), _ => Some(0) }; m = m.zip(r).map(|(a, b)| a.max(b)); }
+    m
+}
+fn init0(before: &[Stmt], x: VarId) -> Option<u64> { // the constant x holds when the loop starts: the last write in the run of assigns just before it
+    for s in before.iter().rev() { match s { Stmt::Assign { var, value } if *var == x => return match value.kind { ExprKind::Const(c) => u64::try_from(c).ok(), _ => None }, Stmt::Assign { .. } => {} _ => return None } }
+    None
+}
 fn after_inc(rest: &mut [Stmt], x: VarId, c: u64, pos: u8) { // (b) uses of x after `x = x + c`, until a statement that could assign x
     for (j, s) in rest.iter_mut().enumerate() { match s {
         Stmt::Assign { var, value } => { if konst(ArithOp::Sub, x, value).map_or(false, |k| ce::decrement_elides(c, k, pos, false)) { relax(value, ArithOp::SubW); } if *var == x { return; } }
@@ -7773,19 +7787,29 @@ fn after_inc(rest: &mut [Stmt], x: VarId, c: u64, pos: u8) { // (b) uses of x af
         Stmt::While { .. } => return,
         _ => if writes(std::slice::from_mut(s), x) > 0 { return; } } }
 }
-fn elide_checks(ss: &mut [Stmt]) {
-    for i in 0..ss.len() { let (head, rest) = ss.split_at_mut(i + 1); match &mut head[i] {
+fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
+    for i in 0..ss.len() { let (before, tail) = ss.split_at_mut(i); let (cur, rest) = tail.split_first_mut().unwrap(); match cur {
         Stmt::Assign { var, value } => if let Some(c) = konst(ArithOp::Add, *var, value) { after_inc(rest, *var, c, ce::POS_SAME_LIST); },
-        Stmt::If { then, els, .. } => { elide_checks(then); elide_checks(els); }
+        Stmt::If { then, els, .. } => { elide_checks(then, rets); elide_checks(els, rets); }
         Stmt::While { cond, body, step } => { // (a) `while (i < n)` with the single `i = i + 1`
-            elide_checks(body); elide_checks(step);
+            elide_checks(body, rets); elide_checks(step, rets);
             let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { continue };
             let ExprKind::Var(iv) = lhs.kind else { continue };
             let fixed = match rhs.kind { ExprKind::Const(_) => true, ExprKind::Var(n) => n != iv && writes(body, n) + writes(step, n) == 0, _ => false };
             let (mut k, mut n, mut inner) = (0, 0, false);
             for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, nest| if v == iv { n += 1; inner |= nest; k = konst(ArithOp::Add, iv, e).unwrap_or(0); }); }
             if ce::induction_elides(*op as u8, lhs.ty == rhs.ty, fixed, n, k, false, inner) { // a VarId is never addressed: address-taken locals live in slots
-                for l in [body, step] { stmt_each(l, false, &mut |v, e, _| if v == iv { relax(e, ArithOp::AddW); }); }
+                let top = |l: &[Stmt]| l.iter().any(|s| matches!(s, Stmt::Assign { var, .. } if *var == iv));
+                let every = top(step) || (top(body) && !has_cont(body));
+                let mut accs = vec![]; // (c) `a = a + e` writes in the loop
+                for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { relax(e, ArithOp::AddW); } else if matches!(&e.kind, ExprKind::Arith { op: ArithOp::Add, lhs, site, .. } if *site != 0 && matches!(lhs.kind, ExprKind::Var(a) if a == v)) { accs.push(v); }); }
+                accs.dedup();
+                for a in accs {
+                    let (mut n, mut m, mut inner, mut same) = (0, u64::MAX, false, true);
+                    for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, nest| if v == a { n += 1; inner |= nest; same &= e.ty == lhs.ty; m = match &e.kind { ExprKind::Arith { rhs, .. } => max_of(rhs, rets).unwrap_or(u64::MAX), _ => u64::MAX }; }); }
+                    let le = matches!((init0(before, a), init0(before, iv)), (Some(a0), Some(i0)) if a0 <= i0);
+                    if ce::accumulator_elides(true, every, le, n, m, k, same, false, inner) { for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == a { relax(e, ArithOp::AddW); }); } }
+                }
             }
         }
         _ => {} } }
