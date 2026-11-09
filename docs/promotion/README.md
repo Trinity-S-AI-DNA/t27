@@ -8,3 +8,4 @@ here disagrees with that spec, the spec wins.
 - `docs/promotion/content-calendar.md` -- 10-day cycle and weekly cadence.
 - `docs/promotion/content-bank.md` -- two drafts, fitting claims only.
 - `docs/promotion/publish-gate.md` -- widget, screenshot, test, human yes.
+- `docs/promotion/baseline.md` -- GitHub counts, cited X impressions, course not ready.
