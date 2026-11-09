@@ -91,6 +91,21 @@ this repo.
   TRI-NET chip repos (`tt-trinity-phi`, `tt-trinity-euler`,
   `tt-trinity-gamma`). It is part of our pipeline, not a competitor.
 
+
+### 1.8 Baud (baudlabs.ai)
+
+- **Vendor page:** https://baudlabs.ai/
+- **What they sell:** an ASIC architecture and an arithmetic representation that losslessly eliminates multiplications and compresses neural networks during forward and backward passes; a compiler that converts PyTorch-exportable models to their format "with bit exact results in most cases"; early access to a first cluster supporting pretraining, fine-tuning, RL post-training, and inference. They claim a multiplier-free design packs "an order of magnitude more compute and memory into the same die area" (comparison made at the same process node and memory bandwidth).
+- **What TRI-NET is not:** we do not sell a multiplier-free ASIC, a cluster for pretraining/fine-tuning, or a PyTorch-to-ASIC compiler. We do not claim TOPS, mW/TOPS, or any die-area or compute-density figure.
+- **What TRI-NET differs in:** TRI-NET's orthogonal value is an inspectable open-shuttle silicon line (Tiny Tapeout) with spec-to-RTL reproducibility, Coq proofs, and seal-based integrity -- research-tier and auditable, not a substitute for a multiplier-free ASIC cluster.
+
+### 1.9 XPU Grasshopper (Zettascale / zscc.ai)
+
+- **Vendor page:** https://zscc.ai/ (product page: https://zscc.ai/grasshopper)
+- **What they sell:** XPU Grasshopper (VU47P), described as "an AI chip co-designed with AI for the era of recursive self-improvement"; end-to-end inference live on FPGA today with a serving API coming soon; XPU frontends for PyTorch, tinygrad, and JAX; Monolith, a hosted cluster of XPUs "that behaves as one chip"; libxpu, a C ABI over the machine "planned to be fully open source". Their announcement states Grasshopper went "from 0.06 to 51 tokens per second, 816x faster" in 13 weeks, and the devkit is open for pre-order. Backed by Y Combinator.
+- **What TRI-NET is not:** we do not ship an FPGA inference prototype, a hosted XPU cluster, or a PyTorch/tinygrad/JAX frontend. We do not claim tokens-per-second, energy per token, or any speedup figure.
+- **What TRI-NET differs in:** TRI-NET's orthogonal value is open, spec-sealed, Tiny Tapeout-targeted silicon with formal proofs -- research-tier and auditable, not a hosted FPGA/silicon inference service.
+
 ---
 
 ## 2. What we do not claim
@@ -528,3 +543,57 @@ same list:
   after re-evolving against clean benchmarks. Any system that edits its own
   toolchain, including this one, owes that finding an answer it does not yet
   have.
+
+---
+
+## 7. 2026-10/11 recent competitor research
+
+This section records arXiv preprints from 2026-10 to 2026-11 in the five
+adjacent fields tracked by IGLA CODER / IGLA RACE / t27. Numbers are taken
+from the papers' abstracts and reported tables; they are given as reported
+without independent reproduction.
+
+### 7.1 RTL generation — LLMs that emit Verilog
+
+#### 7.1.1 EvolVE: Evolutionary Search for LLM-based Verilog Generation
+- **arXiv:** 2601.18067 [cs.AI]
+- **What it claims:** MCTS excels at maximizing functional correctness; Idea-Guided Refinement is superior for optimisation. Structured Testbench Generation accelerates evolution.
+- **Reported numbers:** 98.1% on VerilogEval v2, 92% on RTLLM v2. On the industry-scale IC-RTL suite, Power-Performance-Area product reduced by up to 66% in Huffman Coding and 17% geometric mean across all problems.
+- **Relation to IGLA CODER:** Direct competitor in the LLM-for-RTL generation field. Pass rates are reported on the same VerilogEval / RTLLM benchmarks against which IGLA CODER has no published score.
+
+#### 7.1.2 Search-Guided Reasoning Trace Curation for Verilog Generation
+- **arXiv:** 2610.37706 [cs.AR]
+- **What it claims:** MCTS-SFT curates reasoning traces for supervised fine-tuning of Verilog generation models. Plan-MCTS searches over compact hardware-design plans.
+- **Reported numbers:** Plan-MCTS functional trace yield 84.2% vs 81.9% one-shot structured planning and 82.0% unguided tree exploration. For identical Plan-MCTS trajectories, retaining explicit plan raises pass@10 from 52.56% to 57.7%. In a 6,000-trace study, MCTS-curated supervision improves pass@10 over full-response chain-of-thought distillation by up to 3.7 points while reducing downstream generation length by ~50% on VerilogEval-v2.
+- **Relation:** Demonstrates the value of verifier-guided search and intermediate plan preservation for VerilogEval-v2 correctness and token efficiency.
+
+#### 7.1.3 GI-RTL-Fuzz: Grammar-Informed RTL Generation with LLMs for End-to-End Differential Simulator Fuzzing
+- **arXiv:** 2610.38489 [cs.AR]
+- **What it claims:** Grammar-informed fuzzing framework that leverages LLMs to generate high-quality RTL test cases, guided by BNF grammar coverage.
+- **Reported numbers:** 15 previously unreported bugs and inconsistencies in Verilator, Icarus Verilog and ModelSim from 1,000 generated test cases. Grammar coverage with k=3 nodes reaches 51.92% with GPT-4, vs 35.12% baseline and 11.08% for Verismith. Behavioral mismatches 41 vs 23 baseline.
+- **Relation:** Not an RTL generation competitor per se, but a method for stressing RTL simulators using LLM-generated Verilog, orthogonal to IGLA CODER's spec-to-RTL direction.
+
+### 7.2 Physics formal verification / certified computation
+
+#### 7.2.1 Rigorously Certified Neural-Network Computation of Nonlinear Water Waves
+- **arXiv:** 2611.07395 [math.AP]
+- **What it claims:** Physics-informed neural networks discover near-machine-precision solutions to strongly nonlinear PDEs, with rigorous interval-arithmetic certification and Lean formalisation.
+- **Reported numbers:** Near-machine-precision residuals achieved for high-amplitude Stokes waves, Crapper waves, Wilton ripples.
+- **Relation:** Illustrates a certified-neural + formal-verification pipeline for physics PDEs, analogous in spirit to t27's Coq proofs + seals, but in the PDE certification domain.
+
+### 7.3 Numeric formats / ternary AI
+
+#### 7.3.1 NativeTernary and related ternary format work
+Recent preprints continue active development of ternary and low-bit numeric formats:
+- **arXiv:** 2610.22621, 2610.12251, 2609.35352 Fiona, 2604.03336 NativeTernary — cited in the 2026-10/11 sweep as active competitor work in ternary numeric formats and hardware-efficient AI number representations.
+- **Relation:** These papers explore ternary / native ternary representations for inference and training. t27's GoldenFloat family and GF-T ternary formats are positioned as spec-driven, sealed formats with conformance vectors; the competitor papers focus on algorithmic and hardware novelty rather than open spec-to-silicon reproducibility.
+
+### 7.4 FPGA open-source flows
+
+The 2026-10/11 period continues the open-source FPGA toolchain trend:
+- **SpecLens** arXiv:2609.16729 and **LLM-based Hardware Development** arXiv:2608.30659 are representative of LLM-assisted hardware design flows that target open-source toolchains.
+- **Relation:** These flows emphasize LLM-assisted RTL generation and HLS repair within open-source EDA contexts, overlapping with IGLA CODER's spec-driven generation but without the .t27 spec-to-RTL seal chain.
+
+---
+
+*These entries are added 2026-11-09. Pass@K and benchmark numbers are reported as given in the preprints; independent reproduction has not been performed here.*

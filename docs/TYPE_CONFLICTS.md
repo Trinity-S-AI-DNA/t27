@@ -183,6 +183,7 @@ whether to rename.
 | `Outputs` | 3 | 3 files | No defect. Prefix per module if names must resolve across specs. |
 | `ParseError` | 2 | 2 files | Delete specs/tri/pipeline/codegen.t27 or give it a real body; nothing consumes its ParseError. |
 | `Parser` | 2 | 2 files | None needed; if flattened, PinsParser is the natural rename for the pins one (it is already t... |
+| `ParsedCommand` | 2 | 2 files | DISTINCT: tri collections' CLI argument classifier (tag: namespaced/flat/help) vs the RUST-04 clade-improve port's verb dispatch (kind: Help/Improve/ShadowMode/Approve + description). No shared field or reader; if flattened, the port's copy renames to CliArgs. |
 | `PipelineConfig` | 3 | 3 files | Delete specs/igla/coder/_tmp_pipeline_import.t27 — it is a temp import artifact that duplicat... |
 | `PipelineResult` | 5 | 5 files | Rename per subsystem (FusionResult / CompilePipelineResult / GenerationResult / BatchEntryRes... |
 | `Point` | 2 | 2 files | None. The basics lesson's Point is quoted by its course page; TriBezier's could become BezierP... |

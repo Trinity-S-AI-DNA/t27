@@ -1,0 +1,624 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{tabularx}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\title{t27b: A Fast Baseline AArch64 Compiler for a Specification-First Language\\[2pt]
+\large Corpus-Scale Differential Measurement against Zig, GCC and Clang Pipelines}
+\author{Dmitrii Vasilev\\ \small Trinity S3AI}
+\date{2026-11-07}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+t27b is the native backend of t27, a specification-first language whose source files carry their own tests. It lowers t27's internal intermediate representation to AArch64 machine code, runs a specification's tests in-process through a JIT, and emits relocatable objects and assembly listings. We measure it against the t27c reference pipeline (t27c gen, then Zig 0.16 Debug) and against t27c's C emitter compiled with GCC 12.2 and Clang 21.1, over the 1,819-specification corpus at one pinned revision. t27b passes 1,296 of the 1,311 files the reference passes (98.9\%) and agrees with the reference on all 8,344 tests both ran. Its test-compile latency, which ends with code in memory and does not link, is 4.8~ms per specification (geometric mean over 18), 8.8$\times$ below GCC -O0 compiling the generated C to an object and 640$\times$ below one Zig Debug invocation, which builds and links a test binary; when 20 specifications share one Zig invocation the gap is 8.6$\times$. The compiler is a 3.08~MB executable with one crate dependency and a median peak compile memory of 5.3~MiB. Its generated code is at the level of an unoptimising compiler: on the 20 specifications with the most GCC -O0 instructions among the 567 that every pipeline, t27b included, passes, it executes 0.91$\times$ the instructions of GCC -O0 and 3.4$\times$ those of GCC -O2, runs 4.1$\times$ slower than GCC -O2 under qemu-aarch64 emulation (3.7$\times$ slower than Clang -O2 on the 9 specifications Clang did not fold), and is 1.8$\times$ larger than GCC -O2 code; on four crypto specifications it executes 10.1$\times$ the instructions of Zig ReleaseFast. Agreement is self-consistency behind one shared front end, not independent proof: a random-program fuzzer at a nearby commit found 7 disagreements in 1,000 programs. All run times are emulated. The report and its raw JSON are committed with the repository.
+\end{abstract}
+
+\section{Introduction}
+
+t27 is a specification-first language: a \texttt{.t27} file declares
+functions and data together with the \texttt{test} and \texttt{invariant}
+blocks that state what they must do. Its reference compiler, t27c, checks
+a specification and emits it as Zig, C, Rust or Verilog source; the
+reference way to run a specification's tests is \texttt{t27c gen} followed
+by the Zig compiler. t27b is a second, native path: it mounts the same
+front end and lowers the resulting internal representation directly to
+AArch64 machine code, without LLVM, an assembler or a linker.
+
+This paper asks what such a small native backend costs and what it buys
+when measured over a whole corpus rather than on a chosen example. The
+answer, on the evidence below, is the profile of a fast baseline compiler:
+low test-compile latency and a small footprint, with generated code at the
+level of an unoptimising compiler.
+
+\paragraph{Contributions.}
+(1) A corpus-scale, test-by-test differential comparison of t27b with the
+reference pipeline and with C pipelines over the 1,819-specification
+corpus at one revision, each pair compared on the files both ran
+(Section~\ref{sec:agree}).
+(2) Compile-latency, memory and footprint measurements against Zig, GCC,
+Clang and rustc on the same host, including the case where Zig amortises
+its fixed cost over many specifications (Sections~\ref{sec:compile}
+and~\ref{sec:resources}).
+(3) A code-quality measurement by executed guest instructions on
+specifications ranked by GCC -O0 instruction count, a rule that uses no
+t27b measurement (Section~\ref{sec:code}).
+(4) An explicit list of threats to validity, including the ways in which
+the agreement result is not independent (Section~\ref{sec:threats}).
+
+\paragraph{Scope: what t27b is not.}
+t27b is not an optimising compiler and not a replacement for LLVM. It is
+not a multi-language backend: it does not parse C, Rust, Zig, Go or
+Python, and no front end for those languages lowers to its internal
+representation. In this paper ``t27 IR'' means that in-memory
+representation; it is not an external interchange format, and t27b reads
+no serialised IR. At the measured revision t27b did not produce a linked
+executable on Linux (Section~\ref{sec:sut}).
+
+\paragraph{Artifacts.}
+Every number in this paper outside Section~\ref{sec:after} comes from
+one measurement report committed to the public t27 repository,
+\path{docs/reports/t27b-bench-2026-10.md}, and its raw data,
+\path{docs/reports/t27b-bench-2026-10.json}
+(\url{https://github.com/Trinity-S-AI-DNA/t27}). The measurements were
+taken at commit \texttt{9a0f4c394} (2026-10-10; full hash in
+Table~\ref{tab:env}), except two trust results that the report quotes
+from the t27b lab at other commits; Section~\ref{sec:threats} names
+their commits. The harness itself is lab scratch and is not committed; the
+report spells out every command it ran (Section~\ref{sec:threats}). The
+repository's acceptance matrix for t27b, the t27 specification
+\path{specs/tri/shootout/acceptance_matrix.t27}, records the headline
+ratios as cells tagged with the same commit; it is a ledger of this
+report, not a second measurement.
+
+\section{System under test}
+\label{sec:sut}
+
+\paragraph{t27c.}
+Version 0.5.2, built at the measured commit. \texttt{t27c gen} emits Zig,
+\texttt{gen-c} emits C and \texttt{gen-rust} emits Rust. gen-rust lowers
+function bodies but no tests, so it appears only in compile-time, size and
+determinism results.
+
+\paragraph{t27b.}
+t27b mounts t27c's front end (\texttt{bootstrap/src/compiler.rs}) and adds
+its own AArch64 code generator. \texttt{t27b test} compiles a specification
+and runs each test in an in-process JIT; with \texttt{--check} it also runs
+each test in t27b's own IR interpreter and compares the two.
+\texttt{--overflow trap}, the default, keeps integer-overflow and bounds
+checks; \texttt{wrap} drops the overflow checks. \texttt{t27b build} writes
+a relocatable object and \texttt{t27b asm} an assembly listing;
+\texttt{t27b corpus} walks a directory and, with \texttt{--reference t27c},
+compares every test with the reference. t27b is written in Rust. 36\% of
+its backend source is generated from \texttt{.t27} specifications;
+counting the front end it mounts, the generated share is 12\%. Its only
+crate dependency is \texttt{serde}, used by the shared front end.
+
+\paragraph{Limits at the measured revision.}
+\texttt{t27b build} wrote Mach-O objects only, did not link, and refused
+module-level variables in an object file (2 of the 20 code-quality
+specifications). On aarch64-linux t27b was therefore a JIT test runner,
+not a compiler that ships binaries; every t27b run time below is a JIT run.
+Section~\ref{sec:after} reports what changed after the snapshot.
+
+\section{Environment and method}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}lY@{}}
+\toprule
+Host & Shared x86\_64 cloud container: Intel Xeon 6975P-C, 48 host threads, cgroup quota 24 CPUs, 24 GB memory limit, Linux 6.18.5, Debian 12.15. Host 1-minute load 27--103 during the run, recorded with every sample. \\
+Commit & \texttt{9a0f4c394a1474bb75103f141cc0b405d9de51b9} \\
+Zig & 0.16.0; its aarch64 output goes through LLVM (LLD 21.1.0) \\
+GCC & aarch64-linux-gnu-gcc 12.2.0, binutils 2.40, glibc 2.36, \texttt{-static} \\
+Clang & 21.1.0 as bundled in Zig 0.16.0 (\texttt{zig cc -target aarch64-linux-musl}, \texttt{-static}) \\
+rustc & 1.99.0 (LLVM 23.1.1), aarch64-unknown-linux-gnu \\
+qemu & qemu-aarch64 7.2.22, user mode \\
+\bottomrule
+\end{tabularx}
+\caption{Measurement environment.}
+\label{tab:env}
+\end{table}
+
+\paragraph{Pipelines.}
+t27b runs tests in its JIT under qemu-aarch64. The Zig pipelines (Debug,
+ReleaseSafe, ReleaseFast) and the C pipelines (GCC and Clang at -O0 and
+-O2) build static aarch64 test binaries and run each test in its own
+qemu-aarch64 process, the same one-test-per-process protocol as
+\texttt{t27c test-report}. Safety checks differ: t27b (trap) and Zig
+Debug/ReleaseSafe check overflow and bounds at run time; Zig ReleaseFast,
+GCC and Clang do not, and in C signed overflow is undefined behaviour. The
+like-for-like comparison for t27b's default output is Zig ReleaseSafe.
+
+\paragraph{Corpus and classes.}
+The denominator is every \texttt{.t27} file under \texttt{specs/}: 1,819
+files, none left out for being slow or broken. Each file falls into one
+class per pipeline: pass (compiled, at least one test, all passed),
+vacuous pass (t27b only: no runtime assert executed), compiled with no
+tests, a test fails, timeout, or blocked (did not generate, did not
+compile, or t27b refused a construct). Where two pipelines both ran a
+file, verdicts are compared test by test, by name.
+
+\paragraph{Compile latency.}
+The host is x86\_64, so t27b was also built for the host. On x86\_64
+\texttt{t27b test} runs the front end and code generation, tests included,
+then stops with exit code 74 when it tries to map the JIT; the wall time of
+that process is t27b's test-compile time. It therefore covers code
+generation into memory, with no loading, assembling or linking, while
+the Zig figures include building and linking a test binary and the C
+figures stop at an object; the steps are not the same work. All other
+compilers also run natively. One sample is the wall time of one process from spawn to exit,
+one compile at a time, round-robin over specifications and pipelines for
+6 rounds; rounds 1--5 are warm and their median is reported. Process start
+(about 1~ms for t27b and t27c) is included.
+
+\paragraph{Code-quality selection.}
+Tier 1 starts from the 567 files that every pipeline, t27b included,
+passes, builds each with GCC -O0, counts the guest instructions its tests
+execute, and takes the 20 with the most. The ranking uses no t27b
+measurement, but the pool is conditioned on t27b passing, and the rule
+favours compute-heavy specifications. It selects six
+benchmark kernels, three FPGA-synthesis simulations, an ISA model and ten
+other specifications. gen-c output does not compile for the crypto
+specifications, so they are not in tier 1; four of them are measured
+against Zig only.
+
+\paragraph{Instructions, time and size.}
+A qemu TCG plugin adds each translated block's instruction count at block
+entry. For Zig and C it counts between two \texttt{getppid()} markers
+around each test call; for t27b it counts blocks in memory the process
+made executable, which is the JIT image. The count is deterministic and
+includes t27b's run-time invariants (under 6\% of its test time). Run time
+is the sum over tests of \texttt{CLOCK\_MONOTONIC} brackets inside the
+guest, median of 5 repetitions; these are emulated times. Code size is the
+bytes of machine code for the specification's functions and tests.
+Pipeline ratios are geometric means over specifications of t27b divided by
+the other pipeline.
+
+\section{Coverage and agreement}
+\label{sec:agree}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+Pipeline & passes, of the 1,311 files the reference passes \\
+\midrule
+t27b (JIT, trap) & 1,296 (98.9\%) \\
+Zig Debug, aarch64 & 1,311 (100.0\%) \\
+Zig ReleaseFast, aarch64 & 1,306 (99.6\%) \\
+gen-c + GCC -O0 / -O2 & 581 (44.3\%) / 578 (44.1\%) \\
+gen-c + Clang -O0 / -O2 & 571 (43.6\%) / 622 (47.4\%) \\
+\bottomrule
+\end{tabular}
+\caption{Coverage relative to the reference (t27c gen + Zig Debug, x86\_64).}
+\label{tab:coverage}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Pair & files both ran & files that differ & tests compared & tests that differ \\
+\midrule
+t27b / reference & 1,315 & 0 & 8,344 & 0 \\
+t27b / Zig ReleaseFast & 1,315 & 5 & 8,344 & 8 \\
+Zig Debug / Zig ReleaseFast & 1,337 & 7 & 8,531 & 11 \\
+GCC -O0 / GCC -O2 & 644 & 4 & 4,906 & 4 \\
+Clang -O0 / Clang -O2 & 635 & 39 & 4,798 & 107 \\
+GCC -O2 / Clang -O2 & 635 & 35 & 4,798 & 95 \\
+t27b / GCC -O2 & 610 & 24 & 3,790 & 48 \\
+t27b / Clang -O2 & 634 & 12 & 3,901 & 28 \\
+\bottomrule
+\end{tabular}
+\caption{Test-by-test disagreements.}
+\label{tab:agree}
+\end{table}
+
+t27b agrees with the reference on every test both ran: 0 of 8,344
+(Table~\ref{tab:agree}). The reference itself is unchanged by moving from
+x86\_64 to aarch64 (0 of 8,513 tests differ). Zig ReleaseFast is not the
+reference: it flips 7 files against Zig Debug; t27b runs 5 of them and
+agrees with Debug on all 5. The C pipelines disagree with themselves
+across optimisation levels, because gen-c output contains undefined
+behaviour; GCC -O2 and Clang -O2 differ from each other on 35 files. So
+t27b's differences with the optimised C pipelines (24 files against GCC
+-O2, 12 against Clang -O2) do not by themselves locate a t27b fault. The
+C rows cover only the files gen-c compiles, about a third of the corpus.
+
+Of the 15 files the reference passes and t27b does not, 14 are blocked
+(i128 three times, an escaping frame address three times, an empty typed
+array literal twice, \texttt{@cos}, \texttt{anytype}, \texttt{std.*}, an
+assignment form, a type mismatch, and a 1~MiB frame-size limit) and 1
+passes vacuously. t27b passes 3 files the reference cannot compile.
+A native arm64 CI run at the same commit printed the same t27b tally as
+the emulated run.
+
+\section{Compile latency}
+\label{sec:compile}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Pipeline (18 tier-1 specifications) & geomean warm median (ms) & $\times$ t27b test-compile \\
+\midrule
+t27b test-compile (tests included) & 4.75 & 1.00 \\
+t27b build (object, no tests) & 5.11 & 1.08 \\
+gen-c + GCC -O0, object & 42.0 & 8.84 \\
+gen-c + GCC -O2, object & 100 & 21.0 \\
+gen-c + Clang -O0, object & 71.1 & 15.0 \\
+gen-c + Clang -O2, object & 105 & 22.1 \\
+gen + Zig Debug, test binary & 3,050 & 642 \\
+gen + Zig ReleaseFast, test binary & 13,808 & 2,906 \\
+\bottomrule
+\end{tabular}
+\caption{Compile latency per specification, native x86\_64. The 18
+specifications are the tier-1 set minus the two \texttt{t27b build}
+refuses; generator time is included where there is a generator.}
+\label{tab:compile}
+\end{table}
+
+Most of Zig's time per specification is fixed cost (test runner, standard
+library machinery and the LLVM link), which a project amortises by
+compiling many specifications at once. With all 20 tier-1 specifications
+in one \texttt{zig test} invocation, Zig takes 6.21~s in Debug and 32.9~s
+in ReleaseFast, against 0.72~s for 20 separate t27b test-compile
+processes: the gap falls from about 640$\times$ to 8.6$\times$ (Debug) and
+from about 2,900$\times$ to 46$\times$ (ReleaseFast). t27b has no
+multi-file mode. Over the 567 files every pipeline passes, t27b
+test-compiles 183 files per second (3.10~s in all), against 28 files per
+second for gen-c + GCC -O0 to objects (6.4$\times$ slower). The first Zig
+build after an empty global cache costs more again (6.2~s in Debug on one
+kernel); t27b, GCC and rustc have no such step.
+
+\section{Generated code}
+\label{sec:code}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+t27b (trap) / pipeline & $n$ & executed instructions & emulated run time & code size \\
+\midrule
+Zig Debug & 20 & 0.54 & 0.69 & 0.66 \\
+Zig ReleaseSafe & 20 & 3.17 & 3.41 & 1.89 \\
+Zig ReleaseFast & 20 & 4.47 & 4.14 & 2.03 \\
+GCC -O0 & 20 & 0.91 & 1.11 & 1.34 \\
+GCC -O2 & 20 & 3.43 & 4.05 & 1.82 \\
+Clang -O0 & 20 & 0.41 & 0.62 & 0.65 \\
+Clang -O2 & 9 & 3.50 & 3.72 & 1.69 \\
+\bottomrule
+\end{tabular}
+\caption{Geometric-mean ratios over tier 1. Below 1, t27b is better.
+Clang -O2 evaluated the test at compile time on 11 of the 20
+specifications (it executed under 1\% of GCC -O0's instructions); those
+are left out of its row.}
+\label{tab:code}
+\end{table}
+
+t27b's code is at the level of an unoptimising compiler
+(Table~\ref{tab:code}). It executes about as many instructions as GCC -O0
+and beats only unoptimised LLVM output (Zig Debug, Clang -O0). On tier 1,
+every optimising pipeline is 3 to 5 times better by geometric mean
+(individual specifications vary more): against the like-for-like
+checked build, Zig ReleaseSafe, t27b executes 3.2$\times$ the instructions
+and takes 3.4$\times$ the emulated time; against GCC -O2, 3.4$\times$ and
+4.1$\times$; against Clang -O2 where it did not fold the test,
+3.5$\times$ and 3.7$\times$. Its code is larger than every optimising
+build. The gap is larger outside tier 1: on the four crypto
+specifications measured against Zig only, t27b executes 7.0$\times$ the
+instructions of Zig ReleaseSafe and 10.1$\times$ those of Zig ReleaseFast.
+
+Overflow checks add about 12\% to the instructions of t27b's unchecked
+build (trap/wrap 1.12$\times$) and 24\% to its emulated time. One case is pathological: before every test the JIT copies
+the whole module-variable image so each test starts from fresh state, and
+a specification with large module arrays (\texttt{compiler/core/t27core},
+95 tests) runs 8.3$\times$ slower than Zig Debug although t27b executes
+fewer instructions. Instruction counts are the better measure here:
+emulation cost varies by instruction mix, and on one kernel Zig
+ReleaseFast executes 43\% fewer instructions than t27b yet takes 25\%
+longer under qemu.
+
+\section{Compiler resources}
+\label{sec:resources}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Compiler step & $n$ & median peak RSS (MiB) & max (MiB) \\
+\midrule
+t27b test-compile & 24 & 5.26 & 48.4 \\
+t27b build & 22 & 5.12 & 14.1 \\
+Zig Debug / ReleaseFast & 24 & 354 / 500 & 412 / 670 \\
+GCC -O0 / -O2, object & 20 & 27.1 / 31.6 & 59.4 / 173 \\
+Clang -O0 / -O2, object & 20 & 68.0 / 75.5 & 118 / 243 \\
+rustc -O0 / -O3, object & 18 & 112 / 120 & 138 / 134 \\
+\bottomrule
+\end{tabular}
+\caption{Peak resident memory of each compiler's whole process tree, from
+\texttt{wait4}. $n$ is the number of code-quality specifications (tier 1
+plus tier 2, up to 24) that step compiled; failed compiles are left out,
+so the rows are not over the same set. Compile steps only: running the
+tests, aarch64 t27b under qemu peaks at a median of 26.1~MiB (max 119~MiB,
+qemu's own memory included).}
+\label{tab:mem}
+\end{table}
+
+t27b is one executable: 3.08~MB for x86\_64 and 2.79~MB for aarch64,
+unstripped, with Rust's standard library linked statically and no
+assembler or linker. For comparison, the t27c executable is 11.9~MB, Zig
+0.16.0 (which also provides the Clang used here) is 363~MB installed, GCC
+12 for aarch64 is about 145~MB, and rustc 1.99 is 790~MB. The comparison
+is not like for like: those toolchains produce linked executables, which
+t27b did not at the measured revision.
+
+\section{Determinism}
+\label{sec:determinism}
+
+Each tier-1 specification was built by every pipeline three times, twice
+in one directory and once from a different absolute path, where the
+pipeline could build it: \texttt{t27b build} and \texttt{t27b asm} built 18
+of the 20 (they refuse the two with module-level variables) and rustc 15.
+All outputs that were built were bit-identical within one directory. t27b's objects and assembly
+listings, t27c's generators, GCC (without \texttt{-g}) and rustc were also
+identical across directories; Zig and \texttt{zig cc} record the build
+directory in DWARF and were not.
+
+\section{Threats to validity}
+\label{sec:threats}
+
+\paragraph{Self-consistency, not independence.}
+The reference t27b agrees with is produced by the same t27c front end
+that t27b mounts, and the JIT/interpreter check reads one IR. A
+diverse-double-compiling receipt over three routes (lab, commit
+\texttt{0e8564505}) ends in backend agreement, not independence, for the
+same reason~\cite{wheeler}. A source-level random-program fuzzer against
+the reference reaches beyond the corpus and, in the lab run the report
+quotes (commit \texttt{8e2e44b7e}, 1,000 programs, 1,975 tests), found 7
+disagreements; the corpus result of Table~\ref{tab:agree} therefore does
+not mean t27b agrees with the reference on every program. No check here compares t27b with an independently written
+t27 front end.
+
+\paragraph{Emulation and a shared host.}
+All run times are qemu-aarch64 on x86\_64; they rank pipelines on this
+host and are not arm64 speed. The host was shared with other jobs (load
+27--103 on 48 threads); medians are reported, but millisecond-scale
+compile samples are noisy (over 5 runs, the median max/min spread was
+34\% for t27b and 36\% for GCC -O0).
+
+\paragraph{Different contracts.}
+t27b re-initialises module variables before each test and runs invariants
+at run time; the Zig and C runners do neither. Undefined behaviour in
+gen-c output changes C verdicts with the optimisation level, and an
+optimiser may exploit it. Clang is Zig's bundled Clang with musl, not a
+distribution Clang with glibc.
+
+\paragraph{Which Zig backend.}
+Zig 0.15 made its self-hosted x86-64 backend the default for Debug builds,
+and its release notes describe Debug compilation as five times faster with
+it~\cite{zig015}. The aarch64 target measured here goes through LLVM
+(Table~\ref{tab:env}), so the 640$\times$ figure is against Zig Debug
+through LLVM and does not carry over to Zig's self-hosted backends.
+
+\paragraph{Selection and repetition.}
+Tier 1 excludes everything gen-c cannot compile. Coverage numbers come
+from one corpus run per pipeline. The 4.8~ms figure is a geometric mean
+over 18 specifications, not over the corpus.
+
+\paragraph{Reproducibility.}
+The harness (about 1,650 lines of lab scratch) is not committed; the
+report lists every command it ran and the tool hashes, and the JSON holds
+every sample with its host load. An earlier single-specification
+demonstration on an arm64 workstation is not used here, because its
+specification is not on the main branch and no raw runs were retained.
+
+\section{State after the snapshot}
+\label{sec:after}
+
+The results above refer to commit \texttt{9a0f4c394}. The following
+changes are on the main branch, are reported in the repository's issues,
+and were not re-measured for this paper. \texttt{t27b build --elf} writes
+ELF64 relocatable objects for aarch64-linux, which supersedes the
+Mach-O-only limit of Section~\ref{sec:sut}; \texttt{t27b run} executes a
+named entry point; \texttt{t27b verilog} emits RTL; scalar exports follow
+the AAPCS64 C calling convention. The corpus has also grown. Later lab
+runs at other commits are not used here: the revisions are not
+interchangeable, and no post-snapshot figure enters this paper.
+
+\section{Claims and evidence}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}YlY@{}}
+\toprule
+Claim & Report section & Status \\
+\midrule
+Coverage 1,296 / 1,311; 0 of 8,344 tests disagree & A & measured; self-consistency \\
+Test-compile 4.8~ms; 8.8$\times$ GCC -O0; 640$\times$, batched 8.6$\times$, Zig Debug & B & measured; shared host \\
+0.91$\times$ GCC -O0 and 3.4$\times$ GCC -O2 instructions; 4.1$\times$ / 3.7$\times$ emulated time vs GCC / Clang -O2 & C & measured; emulated time \\
+5.3~MiB median peak memory; 3.08~MB executable & D & measured \\
+Bit-identical, path-independent t27b outputs & E & measured \\
+Native run time comparable to Clang -O2 & -- & not claimed; contradicted by C \\
+External IR input; C, Rust, Zig, Go or Python front ends & -- & not implemented \\
+\bottomrule
+\end{tabularx}
+\caption{Claims and their evidence in \texttt{docs/reports/t27b-bench-2026-10.md}.}
+\label{tab:claims}
+\end{table}
+
+\section{Related work}
+
+LLVM established the pattern of shared front ends, a common IR and
+retargetable optimising backends~\cite{lattner2004}; t27b is the opposite
+trade, a single-target baseline backend with no optimiser. Cranelift,
+offered as an alternative code generator for rustc, makes a similar
+compile-time versus code-quality trade within an existing
+compiler~\cite{rustcCodegenSsa,craneliftTradeoff}.
+
+\paragraph{Baseline compilers.}
+Fast non-optimising compilers are an established design point. TinyCC
+reports compiling, assembling and linking C several times faster than
+GCC~\cite{tcc}; QBE aims at 70\% of the performance of industrial
+optimising compilers in 10\% of the code~\cite{qbe}. In WebAssembly
+engines, V8's Liftoff makes a single pass over a function's
+bytes~\cite{liftoff}, and Wasmtime's Winch names compilation performance
+as its primary goal, with a single pass and no intermediate
+representation~\cite{winch}. Titzer compares six baseline compilers and
+the tradeoff between compilation speed and code
+quality~\cite{titzer2023}. Copy-and-patch compilation reports generating
+code 4.9--6.5$\times$ faster than Liftoff~\cite{copypatch}; TPDE, a
+back-end framework for LLVM IR, reports compiling 8--24$\times$ faster
+than LLVM -O0 with on-par run time on SPECint 2017~\cite{tpde}; Umbra's
+Flying Start back end targets low query latency~\cite{umbra}. t27b differs from
+these in what it compiles and checks: it lowers one specification
+language's own IR and runs that language's embedded tests in process. None
+of these systems was measured here, and the ratios in this paper are
+against the same specifications' C and Zig outputs only.
+
+\paragraph{Testing compilers.}
+Csmith and EMI find
+compiler bugs by random programs and equivalence modulo
+inputs~\cite{csmith,emi}; this paper runs neither, and its differential
+method compares two backends behind one front end. The corpus also
+contains specifications of number formats described
+elsewhere~\cite{goldenfloat,goldenruler}; two of them (GF16 and OCP MX)
+are among the measured specifications.
+
+\section{Future work}
+
+The measured gaps name the next steps: middle-end optimisation passes to
+close the 3--5$\times$ tier-1 instruction gap (10$\times$ on the crypto
+specifications); a multi-file build mode to keep
+the latency lead when Zig amortises; per-test state isolation without
+copying the whole module image; a differential fuzzing gate with zero
+disagreements; and native arm64 timings in place of emulated ones.
+Lowering restricted subsets of other languages through a versioned IR
+contract to t27b is an architectural goal; no such front end exists.
+
+\section{Conclusion}
+
+Over the full 1,819-specification corpus at one revision, t27b passes
+98.9\% of what its reference passes and agrees with it on all 8,344 tests
+both ran. It test-compiles a specification in about 5~ms with about
+5~MiB of memory from a 3~MB executable without LLVM, though without
+linking; its code executes 3--5$\times$ the instructions of optimising
+compilers on tier 1 by geometric mean, and 10$\times$ on the crypto
+specifications. That is the profile
+of a fast baseline compiler; its agreement with the reference is
+self-consistency behind a shared front end, not independent verification.
+
+\raggedright
+\begin{thebibliography}{99}
+
+\bibitem{goldenfloat}
+D.~Vasilev,
+\emph{GoldenFloat: A Phi-Derived Static-Split Floating-Point Family from GF4 to GF1024 with a Lucas-Exact Integer Identity},
+2026.
+\href{https://arxiv.org/abs/2606.05017}{arXiv:2606.05017}.
+
+\bibitem{goldenruler}
+D.~Vasilev,
+\emph{Golden Ruler: A Numeric Format Catalog with Bit-Exact Conformance Vectors for FP8, BF16, MXFP4, and Microscaling Formats},
+2026.
+\href{https://arxiv.org/abs/2606.09686}{arXiv:2606.09686}.
+
+\bibitem{lattner2004}
+C.~Lattner and V.~Adve,
+\emph{LLVM: A Compilation Framework for Lifelong Program Analysis \& Transformation},
+CGO 2004.
+DOI 10.1109/CGO.2004.1281665.
+
+\bibitem{rustcCodegenSsa}
+Rust Compiler Development Guide,
+\emph{Backend-agnostic code generation}.
+\url{https://rustc-dev-guide.rust-lang.org/backend/backend-agnostic.html}.
+
+\bibitem{craneliftTradeoff}
+\emph{Using rustc\_codegen\_cranelift},
+Inside Rust blog, 2020-11-15.
+\url{https://blog.rust-lang.org/inside-rust/2020/11/15/Using-rustc_codegen_cranelift/}.
+
+\bibitem{csmith}
+X.~Yang, Y.~Chen, E.~Eide, and J.~Regehr,
+\emph{Finding and Understanding Bugs in C Compilers},
+PLDI 2011.
+DOI 10.1145/1993498.1993532.
+
+\bibitem{emi}
+V.~Le, M.~Afshari, and Z.~Su,
+\emph{Compiler Validation via Equivalence Modulo Inputs},
+PLDI 2014.
+DOI 10.1145/2594291.2594334.
+
+\bibitem{wheeler}
+D.~A.~Wheeler,
+\emph{Fully Countering Trusting Trust through Diverse Double-Compiling},
+PhD dissertation, George Mason University, 2009.
+\href{https://arxiv.org/abs/1004.5534}{arXiv:1004.5534}.
+
+\bibitem{tcc}
+F.~Bellard,
+\emph{Tiny C Compiler}.
+\url{https://bellard.org/tcc/}.
+
+\bibitem{qbe}
+\emph{QBE: compiler backend}.
+\url{https://c9x.me/compile/}.
+
+\bibitem{liftoff}
+C.~Backes,
+\emph{Liftoff: a new baseline compiler for WebAssembly in V8},
+V8 blog, 2018-08-20.
+\url{https://v8.dev/blog/liftoff}.
+
+\bibitem{winch}
+Bytecode Alliance,
+\emph{Winch: WebAssembly Intentionally Non-optimizing Compiler and Host},
+Wasmtime repository.
+\url{https://github.com/bytecodealliance/wasmtime/tree/main/winch}.
+
+\bibitem{titzer2023}
+B.~L.~Titzer,
+\emph{Whose baseline compiler is it anyway?},
+2023.
+\href{https://arxiv.org/abs/2305.13241}{arXiv:2305.13241}.
+
+\bibitem{copypatch}
+H.~Xu and F.~Kjolstad,
+\emph{Copy-and-Patch Compilation: A fast compilation algorithm for high-level languages and bytecode},
+2021.
+DOI 10.1145/3485513;
+\href{https://arxiv.org/abs/2011.13127}{arXiv:2011.13127}.
+
+\bibitem{tpde}
+T.~Schwarz, T.~Kamm, and A.~Engelke,
+\emph{TPDE: A Fast Adaptable Compiler Back-End Framework},
+2025.
+\href{https://arxiv.org/abs/2505.22610}{arXiv:2505.22610}.
+
+\bibitem{umbra}
+T.~Kersten, V.~Leis, et al.,
+\emph{Tidy Tuples and Flying Start: fast compilation and fast execution of relational queries in Umbra},
+The VLDB Journal 30:883--905, 2021.
+DOI 10.1007/s00778-020-00643-4.
+
+\bibitem{zig015}
+\emph{Zig 0.15.1 Release Notes}, section ``x86 Backend''.
+\url{https://ziglang.org/download/0.15.1/release-notes.html}.
+
+\end{thebibliography}
+
+\end{document}
