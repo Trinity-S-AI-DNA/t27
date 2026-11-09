@@ -44,6 +44,10 @@ pub(crate) mod trap_plan;
 #[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"] // specs/tri/t27b/ifconv_plan.t27
 #[allow(dead_code, unused_parens)]
 mod ifc;
+// cinc peephole: cset + add -> cinc (specs/tri/t27b/cinc_peephole_plan.t27).
+#[path = "../../../gen/rust/tri/t27b/cinc_peephole_plan.rs"]
+#[allow(dead_code, unused_parens)]
+mod cp;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -650,14 +654,12 @@ impl<'a> Gen<'a> {
         match v {
             V::Reg(r) => r,
             V::Temp(i) if i < TEMP_REGS => 9 + i as Reg,
-            V::Temp(i) => {
-                let off = self.slot_of_temp(i);
-                self.ldr_slot(scratch, off);
-                scratch
-            }
+            V::Temp(i) => { let off = self.slot_of_temp(i); self.ldr_slot(scratch, off); scratch }
             V::Const(0) => ZR,
             V::Const(c) => {
-                self.mov_imm(ty.is64(), scratch, a64::canon(c as u64, ty.is64()));
+                let can = a64::canon(c as u64, ty.is64());
+                if let Some(r) = self.hoist.iter().find(|h| h.0 == can && h.1 == ty.is64()).map(|h| h.2) { return r; }
+                self.mov_imm(ty.is64(), scratch, can);
                 scratch
             }
         }
@@ -1819,6 +1821,23 @@ impl<'a> Gen<'a> {
                     let l = self.stub_site(site);
                     self.bcond(overflow_cond(ty, sub), l);
                 } else {
+                    if !sub && !checked && d == rx && (ry as u32) != (d as u32) && ry < 31 {
+                        if let Some(&last) = self.code.last() {
+                            if (last & 0xFFFF_0FE0) == 0x9A9F_07E0 && (last & 31) == ry as u32 {
+                                let (si, csf) = ((last >> 12) & 0xf, (last >> 31) != 0);
+                                if cp::cinc_ok(s, true, true, true, csf, true) {
+                                    let ol = self.code.len();
+                                    self.code.pop();
+                                    for xl in self.labels.iter_mut() {
+                                        if *xl == Some(ol) { *xl = Some(ol - 1); }
+                                    }
+                                    self.emit(a64::csinc(true, d, rx, rx,
+                                        Cond::from_bits(si)));
+                                    return self.done(d, t);
+                                }
+                            }
+                        }
+                    }
                     self.emit(a64::addsub_reg(s, sub, false, d, rx, ry, Shift::Lsl, 0));
                     if narrow {
                         if checked {
@@ -1981,6 +2000,7 @@ fn loop_limits(ss: &[Stmt], out: &mut Vec<(i128, bool)>) {
                 }
                 for b in [body, step] { loop_limits(b, out); }
             }
+            Stmt::Assign { value, .. } => { if let ExprKind::Const(c) = &value.kind { if !value.ty.is_float() && value.ty != Ty::I128 { out.push((*c, value.ty.is64())); } } }
             Stmt::If { then, els, .. } => { loop_limits(then, out); loop_limits(els, out); }
             _ => {}
         }
