@@ -37,8 +37,7 @@ pub(crate) mod frame_layout;
 #[path = "../../../gen/rust/tri/t27b/trap_plan.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod trap_plan;
-// t27b-generated if-conversion decision: specs/tri/t27b/ifconv_plan.t27.
-#[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"]
+#[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"] // specs/tri/t27b/ifconv_plan.t27
 #[allow(dead_code, unused_parens)]
 mod ifc;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1350,8 +1349,7 @@ impl<'a> Gen<'a> {
         let mut vars: Vec<VarId> = t.iter().chain(&e).map(|a| a.0).collect();
         vars.sort(); vars.dedup();
         if vars.len() > 2 || [&t, &e].iter().any(|a| a.iter().enumerate().any(|(i, x)| a[..i].iter().any(|y| y.0 == x.0))) { return false; }
-        let (mut regs, mut srcs) = (vec![], vec![]);
-        for &v in &vars {
+        let (mut regs, mut srcs) = (vec![], vec![]); for &v in &vars {
             let Home::Reg(h) = self.homes[v as usize] else { return false };
             let mut side = [(0, 0, h); 2];
             for (n, a) in [&t, &e].iter().enumerate() {
