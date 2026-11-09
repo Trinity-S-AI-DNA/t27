@@ -1,0 +1,1114 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/claw/cost_policy.t27 -- the owner's COST_OPTIMIZATION policy (2026-11-08), in one place.
+; Cost-awareness is a policy with guardrails: routing depends on correctness risk, privacy and criticality, not only on
+; savings. This spec is PURE (no host I/O, no clock, no network). It scores, checks, routes, budgets and writes events.
+; One home for this rule: nothing else restates it; other files point here.
+; Boundaries:
+;   1. Claude tier choice (Opus / Sonnet / pane) INSIDE the Claude route stays specs/claw/model_route.t27 route().
+;      This spec never picks a Claude tier; cp_stronger(claude) is claude, and model_route escalates the tier from there.
+;   2. Usage normalization and the per-request prompt-cache hit proof stay specs/t27os/router_cache.t27.
+;      cp_hit_permille here is the arithmetic on numbers a caller already proved; it proves nothing itself.
+;   3. The event envelope (schema t27l/v1, validation, redaction) is specs/t27os/t27l.t27. A cost event is surface
+;      "cost", action llm_call (25) or route_decision (26); this spec only builds the payload and calls tl_event_line.
+;   4. Money savings are never claimed without a measured tariff. Counters here are tokens and integer micro-USD that the
+;      caller measured; no float, no list-price guess, no "saved N percent" function.
+;   5. The cost score is a candidate rank only: no routing or merge function in this spec takes the score.
+; Deviations from the owner's field list (stated plainly):
+;   a. The policy names input_tokens / cached_tokens / output_tokens. Those names contain TOKEN, so share::redact (R_ENV,
+;      NAME=value with KEY, TOKEN or SECRET in NAME) would replace their values with [REDACTED]. The payload keys are
+;      tok_in / tok_cached / tok_out.
+;   b. cost_usd is integer micro-USD (cost_usd_micro), never a float. The key `agent` is added so Menu L can show spend
+;      by agent.
+; Payload (ONE flat text string, keys in this order, space-separated key=value):
+;   agent model route task_type tok_in tok_cached tok_out cost_usd_micro cache_hit routing_reason budget_status
+; Routing fallback (owner micro-amendment): if SLM output fails validation (correctness, format, confidence threshold),
+; automatically escalate to a stronger model; log the escalation in T27L; do not return unvalidated output to the user.
+; The escalation stays inside the same approval mask as the first route (cp_next): a failed local answer on private
+; content never moves to a provider that content is not approved for.
+; CLI: the proposed commands `tri cost report | breakdown | cache | route | budget | optimize | anomaly` are NOT BUILT.
+; The functions below are the checks they would call (cp_help names each command, cp_arg_ok guards their arguments).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+module ClawCostPolicy;
+
+use t27os::t27l::tl_event_line;
+use t27os::t27l::tl_arg_ok;
+use t27os::t27l::tl_validate_line;
+use t27os::t27l::TL_OK;
+use t27os::t27l::tl_put_hex16;
+use t27os::t27l::tl_t_fill;
+use t27os::share::redact;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use std::mem::bytes_eq;
+
+// ---- A. cost score (a candidate rank only) ----
+
+pub const CP_U64_MAX : u64 = 18446744073709551615;
+
+fn cp_sat_add(a: u64, b: u64) -> u64 {
+    if (a > CP_U64_MAX - b) { return CP_U64_MAX; }
+    return a + b;
+}
+
+fn cp_sat_mul(a: u64, b: u64) -> u64 {
+    if (a == 0 or b == 0) { return 0; }
+    if (a > CP_U64_MAX / b) { return CP_U64_MAX; }
+    return a * b;
+}
+
+/// (tokens + compute_ms + latency_ms) * per_day, saturating at the u64 maximum. A rank, never a price.
+pub fn cost_score(tokens: u64, compute_ms: u64, latency_ms: u64, per_day: u64) -> u64 {
+    return cp_sat_mul(cp_sat_add(cp_sat_add(tokens, compute_ms), latency_ms), per_day);
+}
+
+/// Is this candidate worth a look? A candidate rank only: no routing or merge function in this spec takes the score.
+pub fn optimize_candidate(score: u64, threshold: u64) -> bool {
+    return score >= threshold;
+}
+
+// ---- shared text helpers (every private name carries the cp_ prefix) ----
+
+fn cp_fold(c: u8) -> u8 {
+    if (c >= 65 and c <= 90) { return c + 32; }
+    return c;
+}
+
+/// `needle` (lower case) occurs in `hay`, compared case-insensitively.
+fn cp_has(hay: []const u8, needle: []const u8) -> bool {
+    if (needle.len == 0 or hay.len < needle.len) { return false; }
+    var s : usize = 0;
+    while (s + needle.len <= hay.len) {
+        var k : usize = 0;
+        while (k < needle.len and cp_fold(hay[s + k]) == needle[k]) { k = k + 1; }
+        if (k == needle.len) { return true; }
+        s = s + 1;
+    }
+    return false;
+}
+
+/// Words that mark a secret-bearing text: never cached, never logged.
+fn cp_forbidden(s: []const u8) -> bool {
+    return cp_has(s, "password") or cp_has(s, "passwd") or cp_has(s, "cookie")
+        or cp_has(s, "authorization:") or cp_has(s, "bearer ")
+        or cp_has(s, "-----begin") or cp_has(s, "private key");
+}
+
+/// 1..48 bytes of [a-z0-9._-]: a model, agent or reason word that is safe in a key or a payload.
+fn cp_word_ok(w: []const u8) -> bool {
+    if (w.len == 0 or w.len > 48) { return false; }
+    var i : usize = 0;
+    while (i < w.len) {
+        const c : u8 = w[i];
+        const ok : bool = (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 46 or c == 95 or c == 45;
+        if (!ok) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Copy the first n bytes of tmp to out; 0 when n is 0 or out is too small.
+fn cp_emit(out: []u8, tmp: []const u8, n: usize) -> usize {
+    if (n == 0 or n > out.len) { return 0; }
+    return put_bytes(out, 0, tmp[0..n]);
+}
+
+// ---- B. L1 prompt caching ----
+
+pub const SEG_SYSTEM : u8 = 1;
+pub const SEG_TOOLS : u8 = 2;
+pub const SEG_SCHEMA : u8 = 3;
+pub const SEG_PROJECT : u8 = 4;
+pub const SEG_USER : u8 = 5;
+pub const SEG_SESSION : u8 = 6;
+
+/// Stable prefix first, dynamic last: every kind in 1..6 and the kinds never go down.
+pub fn cp_prefix_order_ok(kinds: []const u8) -> bool {
+    var prev : u8 = 1;
+    var i : usize = 0;
+    while (i < kinds.len) {
+        const k : u8 = kinds[i];
+        if (k < SEG_SYSTEM or k > SEG_SESSION or k < prev) { return false; }
+        prev = k;
+        i = i + 1;
+    }
+    return true;
+}
+
+/// History is append-only: `old` is a byte prefix of `new` (append, never rewrite).
+pub fn cp_history_append_only(old: []const u8, new: []const u8) -> bool {
+    if (old.len > new.len) { return false; }
+    var i : usize = 0;
+    while (i < old.len) {
+        if (old[i] != new[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub const CP_SEG_MAX : usize = 8192;
+
+/// A segment may enter a shared prefix only when redact() finds no key, no NAME=value secret, no home path (it names a
+/// person) and no e-mail in it and it holds no forbidden word. A segment longer than CP_SEG_MAX bytes is refused (fail
+/// closed).
+pub fn cp_segment_cacheable(text: []const u8) -> bool {
+    if (text.len > CP_SEG_MAX) { return false; }
+    if (cp_forbidden(text)) { return false; }
+    var buf : [8192]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const n : usize = redact(text, buf[0..8192], cn[0..5]);
+    if (n == 0 and text.len > 0) { return false; }
+    return cn[0] == 0 and cn[1] == 0 and cn[2] == 0 and cn[3] == 0 and cn[4] == 0;
+}
+
+/// cached * 1000 / total_in, 0 when total_in is 0, capped at 1000. Arithmetic on numbers already proved elsewhere.
+pub fn cp_hit_permille(cached: u64, total_in: u64) -> u32 {
+    if (total_in == 0) { return 0; }
+    if (cached >= total_in) { return 1000; }
+    var c : u64 = cached;
+    var t : u64 = total_in;
+    while (t > 18446744073709551) {
+        c = c / 2;
+        t = t / 2;
+    }
+    if (t == 0) { return 0; }
+    const r : u64 = c * 1000 / t;
+    if (r > 1000) { return 1000; }
+    return @intCast(r);
+}
+
+// ---- tasks and routes (names are the T27L payload words) ----
+
+pub const TK_FORMAT : u8 = 1;
+pub const TK_EXTRACT : u8 = 2;
+pub const TK_SIMPLE_QA : u8 = 3;
+pub const TK_SUMMARY : u8 = 4;
+pub const TK_DRAFT_DOC : u8 = 5;
+pub const TK_REPO_SCAN : u8 = 6;
+pub const TK_REVIEW_FIRST : u8 = 7;
+pub const TK_ARCH : u8 = 8;
+pub const TK_CRITICAL_FIX : u8 = 9;
+pub const TK_FINAL_REVIEW : u8 = 10;
+pub const TK_SECURITY : u8 = 11;
+
+pub const RT_CLAUDE : u8 = 1;
+pub const RT_DEEPSEEK : u8 = 2;
+pub const RT_ZAI : u8 = 3;
+pub const RT_LOCAL : u8 = 4;
+pub const RT_OWNER : u8 = 5;
+
+pub fn cp_task_name(t: u8) -> []const u8 {
+    if (t == 1) { return "format"; }
+    if (t == 2) { return "extract"; }
+    if (t == 3) { return "simple_qa"; }
+    if (t == 4) { return "summary"; }
+    if (t == 5) { return "draft_doc"; }
+    if (t == 6) { return "repo_scan"; }
+    if (t == 7) { return "review_first"; }
+    if (t == 8) { return "architecture"; }
+    if (t == 9) { return "critical_fix"; }
+    if (t == 10) { return "final_review"; }
+    if (t == 11) { return "security"; }
+    return "";
+}
+
+/// The id of a task name, 0 when unknown.
+pub fn cp_task_id(name: []const u8) -> u8 {
+    var t : u8 = 1;
+    while (t <= 11) {
+        if (bytes_eq(cp_task_name(t), name)) { return t; }
+        t = t + 1;
+    }
+    return 0;
+}
+
+pub fn cp_route_name(r: u8) -> []const u8 {
+    if (r == 1) { return "claude"; }
+    if (r == 2) { return "deepseek"; }
+    if (r == 3) { return "zai"; }
+    if (r == 4) { return "local"; }
+    if (r == 5) { return "owner"; }
+    return "";
+}
+
+/// The id of a route name, 0 when unknown.
+pub fn cp_route_id(name: []const u8) -> u8 {
+    var r : u8 = 1;
+    while (r <= 5) {
+        if (bytes_eq(cp_route_name(r), name)) { return r; }
+        r = r + 1;
+    }
+    return 0;
+}
+
+// ---- C. L2 response caching ----
+
+/// A response may be cached only when it is deterministic, not private, not security work, and has a validation step.
+pub fn cp_response_cacheable(deterministic: bool, private: bool, security: bool, has_validation: bool) -> bool {
+    return deterministic and !private and !security and has_validation;
+}
+
+/// Writes `<task name>|<model>|<16 lower hex>|<16 lower hex>|s<schema_v>|t<tool_v>`. 0 when the task is unknown, the
+/// model fails cp_word_ok, or out is too small.
+pub fn cp_cache_key(out: []u8, task: u8, model: []const u8, prompt_hash: u64, input_hash: u64, schema_v: u32, tool_v: u32) -> usize {
+    const tn : []const u8 = cp_task_name(task);
+    if (tn.len == 0 or !cp_word_ok(model)) { return 0; }
+    var tmp : [256]u8 = undefined;
+    var p : usize = put_bytes(tmp[0..256], 0, tn);
+    tmp[p] = 124;
+    p = put_bytes(tmp[0..256], p + 1, model);
+    tmp[p] = 124;
+    p = tl_put_hex16(tmp[0..256], p + 1, prompt_hash);
+    tmp[p] = 124;
+    p = tl_put_hex16(tmp[0..256], p + 1, input_hash);
+    p = put_bytes(tmp[0..256], p, "|s");
+    p = put_dec(tmp[0..256], p, @as(u64, schema_v));
+    p = put_bytes(tmp[0..256], p, "|t");
+    p = put_dec(tmp[0..256], p, @as(u64, tool_v));
+    return cp_emit(out, tmp[0..256], p);
+}
+
+// ---- D. L3 routing ----
+
+/// Only bounded, checkable work may leave Claude. Architecture, critical fixes, final review, security and any unknown id
+/// never downgrade (fail closed).
+pub fn cp_downgrade_allowed(task: u8) -> bool {
+    return task >= TK_FORMAT and task <= TK_REVIEW_FIRST;
+}
+
+fn cp_bit(r: u8) -> u32 {
+    if (r == 1) { return 1; }
+    if (r == 2) { return 2; }
+    if (r == 3) { return 4; }
+    if (r == 4) { return 8; }
+    if (r == 5) { return 16; }
+    return 0;
+}
+
+fn cp_approved(mask: u32, r: u8) -> bool {
+    return (mask & cp_bit(r)) != 0;
+}
+
+fn cp_claude_or_owner(mask: u32) -> u8 {
+    if (cp_approved(mask, RT_CLAUDE)) { return RT_CLAUDE; }
+    return RT_OWNER;
+}
+
+/// An SLM route that is approved, local first; 0 when none.
+fn cp_slm_pick(mask: u32) -> u8 {
+    if (cp_approved(mask, RT_LOCAL)) { return RT_LOCAL; }
+    if (cp_approved(mask, RT_ZAI)) { return RT_ZAI; }
+    return 0;
+}
+
+/// Where a task goes. approved_mask bit (1 << (route - 1)) says that provider is approved for THIS content's privacy class
+/// (a caller with private content passes the mask for private content). Rules, in order: security is the owner's always;
+/// a task that may not downgrade stays on Claude (owner when Claude is not approved); format, extract and simple_qa use an
+/// approved SLM when its output is validated, else Claude; summary and draft_doc use the SLM when validated, else DeepSeek,
+/// else Claude; repo_scan and review_first use DeepSeek, else Claude. Nothing approved is the owner. An SLM route (zai,
+/// local) is NEVER returned when slm_validated is false.
+pub fn cp_route(task: u8, slm_validated: bool, approved_mask: u32) -> u8 {
+    if (task == TK_SECURITY) { return RT_OWNER; }
+    if (!cp_downgrade_allowed(task)) { return cp_claude_or_owner(approved_mask); }
+    if (task <= TK_SIMPLE_QA) {
+        if (slm_validated) {
+            const s : u8 = cp_slm_pick(approved_mask);
+            if (s != 0) { return s; }
+        }
+        return cp_claude_or_owner(approved_mask);
+    }
+    if (task <= TK_DRAFT_DOC) {
+        if (slm_validated) {
+            const s2 : u8 = cp_slm_pick(approved_mask);
+            if (s2 != 0) { return s2; }
+        }
+        if (cp_approved(approved_mask, RT_DEEPSEEK)) { return RT_DEEPSEEK; }
+        return cp_claude_or_owner(approved_mask);
+    }
+    if (cp_approved(approved_mask, RT_DEEPSEEK)) { return RT_DEEPSEEK; }
+    return cp_claude_or_owner(approved_mask);
+}
+
+// ---- E. routing fallback ----
+
+/// SLM output passes only when it is correct, in format, and at or above the confidence threshold.
+pub fn cp_output_ok(correct: bool, format_ok: bool, confidence_permille: u32, threshold_permille: u32) -> bool {
+    return correct and format_ok and confidence_permille >= threshold_permille;
+}
+
+/// One step up, inside the same approval mask as cp_route (privacy gate: escalation never reaches a provider the mask does
+/// not approve for this content). zai and local go to deepseek when approved, else claude when approved, else the owner;
+/// deepseek and claude go to claude when approved, else the owner (model_route escalates the Claude tier from there);
+/// owner stays owner; an unknown id goes to the owner (fail closed).
+pub fn cp_stronger(route: u8, approved_mask: u32) -> u8 {
+    if (route == RT_ZAI or route == RT_LOCAL) {
+        if (cp_approved(approved_mask, RT_DEEPSEEK)) { return RT_DEEPSEEK; }
+        return cp_claude_or_owner(approved_mask);
+    }
+    if (route == RT_DEEPSEEK or route == RT_CLAUDE) { return cp_claude_or_owner(approved_mask); }
+    return RT_OWNER;
+}
+
+/// 0 = return the output to the user, and only when ok. Otherwise the route to escalate to (never 0, never zai or local,
+/// never outside approved_mask except the owner): unvalidated output is never returned.
+pub fn cp_next(route: u8, ok: bool, approved_mask: u32) -> u8 {
+    if (ok) { return 0; }
+    return cp_stronger(route, approved_mask);
+}
+
+/// `from=<r> to=<r> task_type=<t> reason=<word>`; 0 on an unknown id or a reason failing cp_word_ok.
+pub fn cp_route_payload(out: []u8, from: u8, to: u8, task: u8, reason: []const u8) -> usize {
+    const fnm : []const u8 = cp_route_name(from);
+    const tnm : []const u8 = cp_route_name(to);
+    const kn : []const u8 = cp_task_name(task);
+    if (fnm.len == 0 or tnm.len == 0 or kn.len == 0 or !cp_word_ok(reason)) { return 0; }
+    var tmp : [256]u8 = undefined;
+    var p : usize = put_bytes(tmp[0..256], 0, "from=");
+    p = put_bytes(tmp[0..256], p, fnm);
+    p = put_bytes(tmp[0..256], p, " to=");
+    p = put_bytes(tmp[0..256], p, tnm);
+    p = put_bytes(tmp[0..256], p, " task_type=");
+    p = put_bytes(tmp[0..256], p, kn);
+    p = put_bytes(tmp[0..256], p, " reason=");
+    p = put_bytes(tmp[0..256], p, reason);
+    return cp_emit(out, tmp[0..256], p);
+}
+
+// ---- F. budget ----
+
+pub const BS_OK : u8 = 0;
+pub const BS_WARN : u8 = 1;
+pub const BS_OVER : u8 = 2;
+pub const BS_UNSET : u8 = 3;
+
+pub fn cp_budget_name(b: u8) -> []const u8 {
+    if (b == 0) { return "ok"; }
+    if (b == 1) { return "warn"; }
+    if (b == 2) { return "over"; }
+    if (b == 3) { return "unset"; }
+    return "";
+}
+
+/// Unset when there is no daily budget; over at or above it; warn at or above 80 percent; else ok. No overflow: the 80
+/// percent line is the ceiling of daily * 4 / 5, computed with division.
+pub fn cp_budget_status(spent_micro: u64, daily_micro: u64) -> u8 {
+    if (daily_micro == 0) { return BS_UNSET; }
+    if (spent_micro >= daily_micro) { return BS_OVER; }
+    const warn_at : u64 = (daily_micro / 5) * 4 + ((daily_micro % 5) * 4 + 4) / 5;
+    if (spent_micro >= warn_at) { return BS_WARN; }
+    return BS_OK;
+}
+
+/// Decimal USD ("5", "5.25", "0.000001") to micro-USD in out[0]. Refuses empty, a sign, an exponent, two dots, a dot with
+/// no digit on either side, more than 6 fraction digits, any non-digit and overflow.
+pub fn cp_parse_usd_micro(s: []const u8, out: []u64) -> bool {
+    if (s.len == 0 or out.len == 0) { return false; }
+    var acc : u64 = 0;
+    var i : usize = 0;
+    var dot : bool = false;
+    var fd : usize = 0;
+    var digits : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (c == 46) {
+            if (dot or digits == 0) { return false; }
+            dot = true;
+        } else {
+            if (c < 48 or c > 57) { return false; }
+            const d : u64 = @as(u64, c) - 48;
+            if (acc > (CP_U64_MAX - d) / 10) { return false; }
+            acc = acc * 10 + d;
+            digits = digits + 1;
+            if (dot) { fd = fd + 1; }
+        }
+        i = i + 1;
+    }
+    if (digits == 0 or fd > 6) { return false; }
+    if (dot and fd == 0) { return false; }
+    while (fd < 6) {
+        if (acc > CP_U64_MAX / 10) { return false; }
+        acc = acc * 10;
+        fd = fd + 1;
+    }
+    out[0] = acc;
+    return true;
+}
+
+// ---- G. anomaly ----
+
+pub const ANOM_FACTOR : u64 = 3;
+pub const ANOM_MIN_DAYS : u32 = 3;
+pub const AN_NONE : u8 = 0;
+pub const AN_SPIKE : u8 = 1;
+pub const AN_NO_BASELINE : u8 = 2;
+pub const AN_NEW_SPEND : u8 = 3;
+
+/// Fewer than ANOM_MIN_DAYS days of history is no baseline; spend against a zero baseline is new spend; more than
+/// ANOM_FACTOR times the baseline is a spike.
+pub fn cp_anomaly(today_micro: u64, baseline_micro: u64, days: u32) -> u8 {
+    if (days < ANOM_MIN_DAYS) { return AN_NO_BASELINE; }
+    if (baseline_micro == 0 and today_micro > 0) { return AN_NEW_SPEND; }
+    if (today_micro > cp_sat_mul(baseline_micro, ANOM_FACTOR)) { return AN_SPIKE; }
+    return AN_NONE;
+}
+
+// ---- H. T27L cost event ----
+
+/// The payload of one llm_call event, keys in the fixed order (see the header). 0 when agent, model or reason fail
+/// cp_word_ok, a route, task or budget id is unknown, tok_cached exceeds tok_in, or out is too small.
+pub fn cp_llm_payload(out: []u8, agent: []const u8, model: []const u8, route: u8, task: u8, tok_in: u64, tok_cached: u64,
+                      tok_out: u64, usd_micro: u64, cache_hit: bool, reason: []const u8, budget: u8) -> usize {
+    const rn : []const u8 = cp_route_name(route);
+    const kn : []const u8 = cp_task_name(task);
+    const bn : []const u8 = cp_budget_name(budget);
+    if (rn.len == 0 or kn.len == 0 or bn.len == 0) { return 0; }
+    if (!cp_word_ok(agent) or !cp_word_ok(model) or !cp_word_ok(reason)) { return 0; }
+    if (tok_cached > tok_in) { return 0; }
+    var tmp : [640]u8 = undefined;
+    var p : usize = put_bytes(tmp[0..640], 0, "agent=");
+    p = put_bytes(tmp[0..640], p, agent);
+    p = put_bytes(tmp[0..640], p, " model=");
+    p = put_bytes(tmp[0..640], p, model);
+    p = put_bytes(tmp[0..640], p, " route=");
+    p = put_bytes(tmp[0..640], p, rn);
+    p = put_bytes(tmp[0..640], p, " task_type=");
+    p = put_bytes(tmp[0..640], p, kn);
+    p = put_bytes(tmp[0..640], p, " tok_in=");
+    p = put_dec(tmp[0..640], p, tok_in);
+    p = put_bytes(tmp[0..640], p, " tok_cached=");
+    p = put_dec(tmp[0..640], p, tok_cached);
+    p = put_bytes(tmp[0..640], p, " tok_out=");
+    p = put_dec(tmp[0..640], p, tok_out);
+    p = put_bytes(tmp[0..640], p, " cost_usd_micro=");
+    p = put_dec(tmp[0..640], p, usd_micro);
+    if (cache_hit) { p = put_bytes(tmp[0..640], p, " cache_hit=1"); } else { p = put_bytes(tmp[0..640], p, " cache_hit=0"); }
+    p = put_bytes(tmp[0..640], p, " routing_reason=");
+    p = put_bytes(tmp[0..640], p, reason);
+    p = put_bytes(tmp[0..640], p, " budget_status=");
+    p = put_bytes(tmp[0..640], p, bn);
+    return cp_emit(out, tmp[0..640], p);
+}
+
+/// One canonical T27L line for an llm_call: actor agent (2), surface cost (9), action llm_call (25), level warn (3) or
+/// info (2). The payload is redacted by tl_event_line; 0 when the envelope refuses it.
+pub fn cp_llm_event(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                    trace_id: []const u8, span_id: []const u8, parent_span_id: []const u8, payload: []const u8, warn: bool) -> usize {
+    var lvl : u8 = 2;
+    if (warn) { lvl = 3; }
+    return tl_event_line(out, event_id, ts, device_id, session_id, 2, 9, 25, lvl, trace_id, span_id, parent_span_id, payload, "");
+}
+
+/// One canonical T27L line for a route_decision (action 26): level warn (3) when it is an escalation, else info (2).
+pub fn cp_route_event(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                      trace_id: []const u8, span_id: []const u8, parent_span_id: []const u8, payload: []const u8, escalation: bool) -> usize {
+    var lvl : u8 = 2;
+    if (escalation) { lvl = 3; }
+    return tl_event_line(out, event_id, ts, device_id, session_id, 2, 9, 26, lvl, trace_id, span_id, parent_span_id, payload, "");
+}
+
+/// Index just after `key=` when `key` starts the text or follows a space; len + 1 when absent.
+fn cp_val_at(s: []const u8, key: []const u8) -> usize {
+    if (key.len == 0) { return s.len + 1; }
+    var p : usize = 0;
+    while (p + key.len + 1 <= s.len) {
+        if (p == 0 or s[p - 1] == 32) {
+            var k : usize = 0;
+            while (k < key.len and s[p + k] == key[k]) { k = k + 1; }
+            if (k == key.len and s[p + key.len] == 61) { return p + key.len + 1; }
+        }
+        p = p + 1;
+    }
+    return s.len + 1;
+}
+
+/// The word value of `key=` (up to a space or the end); an empty slice when the key is absent.
+fn cp_word_at(s: []const u8, key: []const u8) -> []const u8 {
+    const v : usize = cp_val_at(s, key);
+    if (v > s.len) { return s[0..0]; }
+    var e : usize = v;
+    while (e < s.len and s[e] != 32) { e = e + 1; }
+    return s[v..e];
+}
+
+/// Read the number of `key=` into out[0]; false when the key is absent, the value is empty, has a non-digit or overflows.
+pub fn cp_field(payload: []const u8, key: []const u8, out: []u64) -> bool {
+    if (out.len == 0) { return false; }
+    const v : usize = cp_val_at(payload, key);
+    if (v > payload.len) { return false; }
+    var acc : u64 = 0;
+    var i : usize = v;
+    while (i < payload.len and payload[i] != 32) {
+        const c : u8 = payload[i];
+        if (c < 48 or c > 57) { return false; }
+        const d : u64 = @as(u64, c) - 48;
+        if (acc > (CP_U64_MAX - d) / 10) { return false; }
+        acc = acc * 10 + d;
+        i = i + 1;
+    }
+    if (i == v) { return false; }
+    out[0] = acc;
+    return true;
+}
+
+/// Over newline-separated payloads, the saturating sum of `key` on the lines whose word field by_key equals by_val
+/// (by_key empty = all lines). Lines without a readable `key` add nothing. This backs report, breakdown --by
+/// model|task_type|agent, and cache stats.
+pub fn cp_sum(lines: []const u8, key: []const u8, by_key: []const u8, by_val: []const u8) -> u64 {
+    var total : u64 = 0;
+    var s : usize = 0;
+    while (s < lines.len) {
+        var e : usize = s;
+        while (e < lines.len and lines[e] != 10) { e = e + 1; }
+        const line : []const u8 = lines[s..e];
+        var take : bool = true;
+        if (by_key.len > 0) {
+            if (cp_val_at(line, by_key) > line.len) { take = false; }
+            else if (!bytes_eq(cp_word_at(line, by_key), by_val)) { take = false; }
+        }
+        if (take) {
+            var v : [1]u64 = undefined;
+            if (cp_field(line, key, v[0..1])) { total = cp_sat_add(total, v[0]); }
+        }
+        s = e + 1;
+    }
+    return total;
+}
+
+// ---- I. tri cost (NOT BUILT) ----
+
+/// report 1, breakdown 2, cache 3, route 4, budget 5, optimize 6, anomaly 7; 0 when unknown.
+pub fn cp_cmd_id(name: []const u8) -> u8 {
+    if (bytes_eq(name, "report")) { return 1; }
+    if (bytes_eq(name, "breakdown")) { return 2; }
+    if (bytes_eq(name, "cache")) { return 3; }
+    if (bytes_eq(name, "route")) { return 4; }
+    if (bytes_eq(name, "budget")) { return 5; }
+    if (bytes_eq(name, "optimize")) { return 6; }
+    if (bytes_eq(name, "anomaly")) { return 7; }
+    return 0;
+}
+
+/// One ASCII usage line per command; empty for an unknown id. NOT BUILT: these commands do not exist yet.
+pub fn cp_help(cmd: u8) -> []const u8 {
+    if (cmd == 1) { return "tri cost report --since <YYYY-MM-DD>  prints JSON"; }
+    if (cmd == 2) { return "tri cost breakdown --by model|task_type|agent  prints a table"; }
+    if (cmd == 3) { return "tri cost cache stats  prints cached and total input tokens and the hit permille"; }
+    if (cmd == 4) { return "tri cost route <task_type>  prints the route and its reason"; }
+    if (cmd == 5) { return "tri cost budget status  prints spent, daily budget and ok|warn|over|unset"; }
+    if (cmd == 6) { return "tri cost optimize --top <N>  prints candidates by cost score, a rank only"; }
+    if (cmd == 7) { return "tri cost anomaly --since <YYYY-MM-DD>  prints none|spike|no_baseline|new_spend"; }
+    return "";
+}
+
+/// No secret values as arguments: the same check as tl_arg_ok.
+pub fn cp_arg_ok(arg: []const u8) -> bool {
+    return tl_arg_ok(arg);
+}
+
+/// Exactly {"schema":"t27l-cost/v1","spent_usd_micro":N,"calls":N,"cache_hit_permille":N,"budget_status":"ok"}; 0 on an
+/// unknown budget id or a small out.
+pub fn cp_report_json(out: []u8, spent_micro: u64, calls: u64, hit_permille: u32, budget: u8) -> usize {
+    const bn : []const u8 = cp_budget_name(budget);
+    if (bn.len == 0) { return 0; }
+    var tmp : [256]u8 = undefined;
+    var p : usize = put_bytes(tmp[0..256], 0, "{\"schema\":\"t27l-cost/v1\",\"spent_usd_micro\":");
+    p = put_dec(tmp[0..256], p, spent_micro);
+    p = put_bytes(tmp[0..256], p, ",\"calls\":");
+    p = put_dec(tmp[0..256], p, calls);
+    p = put_bytes(tmp[0..256], p, ",\"cache_hit_permille\":");
+    p = put_dec(tmp[0..256], p, @as(u64, hit_permille));
+    p = put_bytes(tmp[0..256], p, ",\"budget_status\":\"");
+    p = put_bytes(tmp[0..256], p, bn);
+    p = put_bytes(tmp[0..256], p, "\"}");
+    return cp_emit(out, tmp[0..256], p);
+}
+
+// ---- test fixtures ----
+
+pub const CP_T_EV : str = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+pub const CP_T_TS : str = "2026-11-08T12:34:56Z";
+
+
+/// A payload with the fields the sum tests vary. tok_cached 5 stays at or under every tok_in the tests pass (7 is the
+/// smallest); a larger value makes cp_llm_payload refuse the line and return 0.
+fn cp_t_pay(out: []u8, agent: []const u8, model: []const u8, task: u8, tok_in: u64) -> usize {
+    return cp_llm_payload(out, agent, model, RT_CLAUDE, task, tok_in, 5, 5, 100, true, "policy", BS_OK);
+}
+
+// ---- tests ----
+
+test cost_score_saturates {
+    assert cost_score(100, 20, 30, 2) == 300;
+    assert cost_score(0, 0, 0, 5) == 0;
+    assert cost_score(100, 20, 30, 0) == 0;
+    assert cost_score(CP_U64_MAX, 1, 1, 1) == CP_U64_MAX;
+    assert cost_score(CP_U64_MAX / 2, 0, 0, 3) == CP_U64_MAX;
+    assert optimize_candidate(300, 300);
+    assert optimize_candidate(301, 300);
+    assert !optimize_candidate(299, 300);
+}
+
+test prefix_order_stable_first {
+    var k : [4]u8 = undefined;
+    k[0] = 1; k[1] = 2; k[2] = 4; k[3] = 6;
+    assert cp_prefix_order_ok(k[0..4]);
+    k[1] = 2; k[2] = 2; k[3] = 2;
+    assert cp_prefix_order_ok(k[0..4]);
+    k[0] = 1; k[1] = 5; k[2] = 4; k[3] = 6;
+    assert !cp_prefix_order_ok(k[0..4]);
+    k[0] = 0; k[1] = 2; k[2] = 3; k[3] = 4;
+    assert !cp_prefix_order_ok(k[0..4]);
+    k[0] = 1; k[1] = 2; k[2] = 3; k[3] = 7;
+    assert !cp_prefix_order_ok(k[0..4]);
+    assert cp_prefix_order_ok(k[0..0]);
+}
+
+test history_is_append_only {
+    assert cp_history_append_only("abc", "abcdef");
+    assert cp_history_append_only("", "abc");
+    assert cp_history_append_only("abc", "abc");
+    assert !cp_history_append_only("abc", "abXdef");
+    assert !cp_history_append_only("abcdef", "abc");
+    assert !cp_history_append_only("abc", "xabc");
+}
+
+test segment_cacheable_refuses_secrets {
+    assert cp_segment_cacheable("You are a careful reviewer. Follow the spec.");
+    var b : [128]u8 = undefined;
+    var s : usize = put_bytes(b[0..128], 0, "use ");
+    s = put_bytes(b[0..128], s, "sk-");
+    s = tl_t_fill(b[0..128], s, 97, 24);
+    assert !cp_segment_cacheable(b[0..s]);
+    var e : [64]u8 = undefined;
+    var n : usize = put_bytes(e[0..64], 0, "MY_API_");
+    n = put_bytes(e[0..64], n, "KEY=value");
+    assert !cp_segment_cacheable(e[0..n]);
+    assert !cp_segment_cacheable("mail someone@example.org please");
+    assert !cp_segment_cacheable("a cookie jar");
+    assert !cp_segment_cacheable("x -----begin y");
+    assert !cp_segment_cacheable("my Private Key is here");
+    assert !cp_segment_cacheable("Authorization: x");
+    var h : [64]u8 = undefined;
+    var hn : usize = put_bytes(h[0..64], 0, "notes in /ho");
+    hn = put_bytes(h[0..64], hn, "me/someone/x");
+    assert !cp_segment_cacheable(h[0..hn]);
+    assert cp_segment_cacheable("notes in specs/claw");
+}
+
+test hit_permille_arithmetic {
+    assert cp_hit_permille(60000, 80000) == 750;
+    assert cp_hit_permille(0, 100) == 0;
+    assert cp_hit_permille(5, 0) == 0;
+    assert cp_hit_permille(100, 100) == 1000;
+    assert cp_hit_permille(200, 100) == 1000;
+    assert cp_hit_permille(1, 3) == 333;
+    // both halve 10 times to (2^53 - 1) / (2^54 - 1), just under one half: the floor is 499
+    assert cp_hit_permille(CP_U64_MAX / 2, CP_U64_MAX) == 499;
+    // 2^63 halves to 2^53 against 2^54 - 1, just over one half: 500
+    assert cp_hit_permille(9223372036854775808, CP_U64_MAX) == 500;
+}
+
+test response_cacheable_needs_all_four {
+    assert cp_response_cacheable(true, false, false, true);
+    assert !cp_response_cacheable(false, false, false, true);
+    assert !cp_response_cacheable(true, true, false, true);
+    assert !cp_response_cacheable(true, false, true, true);
+    assert !cp_response_cacheable(true, false, false, false);
+}
+
+test cache_key_exact_and_sensitive {
+    var a : [200]u8 = undefined;
+    const n : usize = cp_cache_key(a[0..200], TK_EXTRACT, "glm-4.7-flash", 255, 4096, 2, 7);
+    const exp : str = "extract|glm-4.7-flash|00000000000000ff|0000000000001000|s2|t7";
+    assert n == exp.len;
+    assert bytes_eq(a[0..n], exp);
+    var b : [200]u8 = undefined;
+    var m : usize = cp_cache_key(b[0..200], TK_SUMMARY, "glm-4.7-flash", 255, 4096, 2, 7);
+    assert !bytes_eq(a[0..n], b[0..m]);
+    m = cp_cache_key(b[0..200], TK_EXTRACT, "glm-4.7", 255, 4096, 2, 7);
+    assert !bytes_eq(a[0..n], b[0..m]);
+    m = cp_cache_key(b[0..200], TK_EXTRACT, "glm-4.7-flash", 256, 4096, 2, 7);
+    assert !bytes_eq(a[0..n], b[0..m]);
+    m = cp_cache_key(b[0..200], TK_EXTRACT, "glm-4.7-flash", 255, 4097, 2, 7);
+    assert !bytes_eq(a[0..n], b[0..m]);
+    m = cp_cache_key(b[0..200], TK_EXTRACT, "glm-4.7-flash", 255, 4096, 3, 7);
+    assert !bytes_eq(a[0..n], b[0..m]);
+    m = cp_cache_key(b[0..200], TK_EXTRACT, "glm-4.7-flash", 255, 4096, 2, 8);
+    assert !bytes_eq(a[0..n], b[0..m]);
+    assert cp_cache_key(b[0..200], 0, "glm", 1, 1, 1, 1) == 0;
+    assert cp_cache_key(b[0..200], 12, "glm", 1, 1, 1, 1) == 0;
+    assert cp_cache_key(b[0..200], TK_EXTRACT, "GLM", 1, 1, 1, 1) == 0;
+    assert cp_cache_key(b[0..200], TK_EXTRACT, "", 1, 1, 1, 1) == 0;
+    assert cp_cache_key(b[0..10], TK_EXTRACT, "glm", 1, 1, 1, 1) == 0;
+}
+
+test names_and_ids_round_trip {
+    var t : u8 = 1;
+    while (t <= 11) {
+        assert cp_task_id(cp_task_name(t)) == t;
+        t = t + 1;
+    }
+    var r : u8 = 1;
+    while (r <= 5) {
+        assert cp_route_id(cp_route_name(r)) == r;
+        r = r + 1;
+    }
+    assert cp_task_name(0).len == 0;
+    assert cp_task_name(12).len == 0;
+    assert cp_route_name(0).len == 0;
+    assert cp_route_name(6).len == 0;
+    assert cp_task_id("nope") == 0;
+    assert cp_route_id("nope") == 0;
+    assert bytes_eq(cp_task_name(TK_ARCH), "architecture");
+    assert bytes_eq(cp_route_name(RT_ZAI), "zai");
+}
+
+test downgrade_only_bounded_work {
+    assert cp_downgrade_allowed(TK_FORMAT);
+    assert cp_downgrade_allowed(TK_EXTRACT);
+    assert cp_downgrade_allowed(TK_SIMPLE_QA);
+    assert cp_downgrade_allowed(TK_SUMMARY);
+    assert cp_downgrade_allowed(TK_DRAFT_DOC);
+    assert cp_downgrade_allowed(TK_REPO_SCAN);
+    assert cp_downgrade_allowed(TK_REVIEW_FIRST);
+    assert !cp_downgrade_allowed(TK_ARCH);
+    assert !cp_downgrade_allowed(TK_CRITICAL_FIX);
+    assert !cp_downgrade_allowed(TK_FINAL_REVIEW);
+    assert !cp_downgrade_allowed(TK_SECURITY);
+    assert !cp_downgrade_allowed(0);
+    assert !cp_downgrade_allowed(12);
+    assert !cp_downgrade_allowed(255);
+}
+
+test routing_table_rows {
+    // bits claude 1, deepseek 2, zai 4, local 8, owner 16. 31 = all; 23 = no local; 19 = no zai and no local;
+    // 29 = no deepseek; 30 = no claude; 4 = zai only; 2 = deepseek only; 1 = claude only
+    assert cp_route(TK_FORMAT, true, 31) == RT_LOCAL;
+    assert cp_route(TK_FORMAT, true, 23) == RT_ZAI;
+    assert cp_route(TK_FORMAT, true, 19) == RT_CLAUDE;
+    assert cp_route(TK_FORMAT, false, 31) == RT_CLAUDE;
+    assert cp_route(TK_EXTRACT, true, 31) == RT_LOCAL;
+    assert cp_route(TK_EXTRACT, false, 31) == RT_CLAUDE;
+    assert cp_route(TK_SIMPLE_QA, true, 4) == RT_ZAI;
+    assert cp_route(TK_SIMPLE_QA, true, 2) == RT_OWNER;
+    assert cp_route(TK_SIMPLE_QA, false, 31) == RT_CLAUDE;
+    assert cp_route(TK_SUMMARY, true, 31) == RT_LOCAL;
+    assert cp_route(TK_SUMMARY, false, 31) == RT_DEEPSEEK;
+    assert cp_route(TK_SUMMARY, false, 29) == RT_CLAUDE;
+    assert cp_route(TK_SUMMARY, true, 2) == RT_DEEPSEEK;
+    assert cp_route(TK_DRAFT_DOC, true, 31) == RT_LOCAL;
+    assert cp_route(TK_DRAFT_DOC, false, 31) == RT_DEEPSEEK;
+    assert cp_route(TK_DRAFT_DOC, false, 1) == RT_CLAUDE;
+    assert cp_route(TK_REPO_SCAN, true, 31) == RT_DEEPSEEK;
+    assert cp_route(TK_REPO_SCAN, false, 31) == RT_DEEPSEEK;
+    assert cp_route(TK_REPO_SCAN, false, 1) == RT_CLAUDE;
+    assert cp_route(TK_REVIEW_FIRST, true, 31) == RT_DEEPSEEK;
+    assert cp_route(TK_REVIEW_FIRST, false, 29) == RT_CLAUDE;
+    assert cp_route(TK_ARCH, true, 31) == RT_CLAUDE;
+    assert cp_route(TK_CRITICAL_FIX, true, 31) == RT_CLAUDE;
+    assert cp_route(TK_FINAL_REVIEW, true, 31) == RT_CLAUDE;
+    assert cp_route(TK_ARCH, true, 30) == RT_OWNER;
+    assert cp_route(TK_SECURITY, true, 31) == RT_OWNER;
+    assert cp_route(TK_SECURITY, false, 1) == RT_OWNER;
+    assert cp_route(0, true, 31) == RT_CLAUDE;
+    assert cp_route(200, true, 30) == RT_OWNER;
+}
+
+test routing_mask_sweep_guardrails {
+    var m : u32 = 0;
+    while (m < 32) {
+        var t : u8 = 0;
+        while (t < 16) {
+            var vi : u32 = 0;
+            while (vi < 2) {
+                const v : bool = vi == 1;
+                const r : u8 = cp_route(t, v, m);
+                assert r >= RT_CLAUDE and r <= RT_OWNER;
+                assert r == RT_OWNER or cp_approved(m, r);
+                if (!v) { assert r != RT_ZAI and r != RT_LOCAL; }
+                if (!cp_downgrade_allowed(t)) { assert r == RT_CLAUDE or r == RT_OWNER; }
+                if (t == TK_SECURITY) { assert r == RT_OWNER; }
+                if (!cp_approved(m, RT_CLAUDE) and !cp_downgrade_allowed(t)) { assert r == RT_OWNER; }
+                if (m == 0) { assert r == RT_OWNER; }
+                vi = vi + 1;
+            }
+            t = t + 1;
+        }
+        m = m + 1;
+    }
+}
+
+test output_ok_and_escalation_chain {
+    assert cp_output_ok(true, true, 900, 800);
+    assert cp_output_ok(true, true, 800, 800);
+    assert !cp_output_ok(false, true, 900, 800);
+    assert !cp_output_ok(true, false, 900, 800);
+    assert !cp_output_ok(true, true, 799, 800);
+    assert cp_stronger(RT_ZAI, 31) == RT_DEEPSEEK;
+    assert cp_stronger(RT_LOCAL, 31) == RT_DEEPSEEK;
+    assert cp_stronger(RT_DEEPSEEK, 31) == RT_CLAUDE;
+    assert cp_stronger(RT_CLAUDE, 31) == RT_CLAUDE;
+    assert cp_stronger(RT_OWNER, 31) == RT_OWNER;
+    assert cp_stronger(0, 31) == RT_OWNER;
+    // private content approved for claude and local only (mask 9): a failed local answer skips deepseek
+    assert cp_stronger(RT_LOCAL, 9) == RT_CLAUDE;
+    // local only (mask 8): nothing stronger is approved, so the owner
+    assert cp_stronger(RT_LOCAL, 8) == RT_OWNER;
+    assert cp_stronger(RT_DEEPSEEK, 2) == RT_OWNER;
+    assert cp_next(RT_ZAI, false, 31) == RT_DEEPSEEK;
+    assert cp_next(cp_next(RT_ZAI, false, 31), false, 31) == RT_CLAUDE;
+    assert cp_next(RT_LOCAL, true, 31) == 0;
+}
+
+// ESCALATION_PRIVACY_INVARIANT (owner, 2026-11-08): kept as a test, not an `invariant` block, because a
+// 256-step loop in an invariant runs at comptime and blocks the whole spec. CI runs every spec test through
+// test-report, so a regression in any of the 32 masks x 8 routes fails this test by name.
+test escalation_privacy_invariant {
+    var m : u32 = 0;
+    while (m < 32) {
+        var r : u8 = 0;
+        while (r < 8) {
+            const x : u8 = cp_next(r, false, m);
+            assert x != 0;
+            assert x != RT_ZAI and x != RT_LOCAL;
+            assert x == RT_OWNER or cp_approved(m, x);
+            assert cp_next(r, true, m) == 0;
+            r = r + 1;
+        }
+        m = m + 1;
+    }
+}
+
+test route_payload_exact_and_refusals {
+    var o : [128]u8 = undefined;
+    const n : usize = cp_route_payload(o[0..128], RT_ZAI, RT_DEEPSEEK, TK_SUMMARY, "validation_failed");
+    const exp : str = "from=zai to=deepseek task_type=summary reason=validation_failed";
+    assert n == exp.len;
+    assert bytes_eq(o[0..n], exp);
+    assert cp_route_payload(o[0..128], 0, RT_DEEPSEEK, TK_SUMMARY, "x") == 0;
+    assert cp_route_payload(o[0..128], RT_ZAI, 9, TK_SUMMARY, "x") == 0;
+    assert cp_route_payload(o[0..128], RT_ZAI, RT_DEEPSEEK, 0, "x") == 0;
+    assert cp_route_payload(o[0..128], RT_ZAI, RT_DEEPSEEK, TK_SUMMARY, "Bad Word") == 0;
+    assert cp_route_payload(o[0..128], RT_ZAI, RT_DEEPSEEK, TK_SUMMARY, "") == 0;
+    assert cp_route_payload(o[0..20], RT_ZAI, RT_DEEPSEEK, TK_SUMMARY, "x") == 0;
+}
+
+test budget_boundaries {
+    assert cp_budget_status(0, 0) == BS_UNSET;
+    assert cp_budget_status(5, 0) == BS_UNSET;
+    assert cp_budget_status(0, 100) == BS_OK;
+    assert cp_budget_status(79, 100) == BS_OK;
+    assert cp_budget_status(80, 100) == BS_WARN;
+    assert cp_budget_status(99, 100) == BS_WARN;
+    assert cp_budget_status(100, 100) == BS_OVER;
+    assert cp_budget_status(101, 100) == BS_OVER;
+    // 80 percent of 4 is 3.2, so 3 (75 percent) is still ok; 80 percent of 5 is exactly 4
+    assert cp_budget_status(3, 4) == BS_OK;
+    assert cp_budget_status(2, 4) == BS_OK;
+    assert cp_budget_status(4, 5) == BS_WARN;
+    assert cp_budget_status(3, 5) == BS_OK;
+    assert cp_budget_status(CP_U64_MAX, CP_U64_MAX) == BS_OVER;
+    assert cp_budget_status(CP_U64_MAX - 1, CP_U64_MAX) == BS_WARN;
+    assert cp_budget_status(CP_U64_MAX / 2, CP_U64_MAX) == BS_OK;
+    assert bytes_eq(cp_budget_name(BS_WARN), "warn");
+    assert cp_budget_name(4).len == 0;
+}
+
+test parse_usd_micro {
+    var v : [1]u64 = undefined;
+    assert cp_parse_usd_micro("5", v[0..1]);
+    assert v[0] == 5000000;
+    assert cp_parse_usd_micro("5.25", v[0..1]);
+    assert v[0] == 5250000;
+    assert cp_parse_usd_micro("0.000001", v[0..1]);
+    assert v[0] == 1;
+    assert cp_parse_usd_micro("0", v[0..1]);
+    assert v[0] == 0;
+    assert !cp_parse_usd_micro("", v[0..1]);
+    assert !cp_parse_usd_micro("-5", v[0..1]);
+    assert !cp_parse_usd_micro("+5", v[0..1]);
+    assert !cp_parse_usd_micro("1e3", v[0..1]);
+    assert !cp_parse_usd_micro("1.2.3", v[0..1]);
+    assert !cp_parse_usd_micro("0.0000001", v[0..1]);
+    assert !cp_parse_usd_micro("5.", v[0..1]);
+    assert !cp_parse_usd_micro(".5", v[0..1]);
+    assert !cp_parse_usd_micro("$5", v[0..1]);
+    assert !cp_parse_usd_micro("5 ", v[0..1]);
+    assert !cp_parse_usd_micro("99999999999999999999", v[0..1]);
+    assert !cp_parse_usd_micro("18446744073710", v[0..1]);
+    assert cp_parse_usd_micro("18446744073709", v[0..1]);
+}
+
+test anomaly_cases {
+    assert cp_anomaly(100, 100, 2) == AN_NO_BASELINE;
+    assert cp_anomaly(0, 0, 0) == AN_NO_BASELINE;
+    assert cp_anomaly(5, 0, 3) == AN_NEW_SPEND;
+    assert cp_anomaly(0, 0, 3) == AN_NONE;
+    assert cp_anomaly(301, 100, 3) == AN_SPIKE;
+    assert cp_anomaly(300, 100, 3) == AN_NONE;
+    assert cp_anomaly(50, 100, 10) == AN_NONE;
+    assert cp_anomaly(CP_U64_MAX, CP_U64_MAX, 5) == AN_NONE;
+    // 3 * (MAX - 1) saturates to MAX, and MAX is not more than MAX
+    assert cp_anomaly(CP_U64_MAX, CP_U64_MAX - 1, 5) == AN_NONE;
+    assert cp_anomaly(CP_U64_MAX, CP_U64_MAX / 4, 5) == AN_SPIKE;
+}
+
+test llm_payload_exact_and_refusals {
+    var o : [512]u8 = undefined;
+    const n : usize = cp_llm_payload(o[0..512], "queen", "glm-4.7-flash", RT_ZAI, TK_FORMAT, 1000, 0, 50, 0, false, "slm_validated", BS_OK);
+    const exp : str = "agent=queen model=glm-4.7-flash route=zai task_type=format tok_in=1000 tok_cached=0 tok_out=50 cost_usd_micro=0 cache_hit=0 routing_reason=slm_validated budget_status=ok";
+    assert n == exp.len;
+    assert bytes_eq(o[0..n], exp);
+    const m : usize = cp_llm_payload(o[0..512], "queen", "m1", RT_CLAUDE, TK_ARCH, 80, 60, 7, 1234, true, "no_downgrade", BS_WARN);
+    const exp2 : str = "agent=queen model=m1 route=claude task_type=architecture tok_in=80 tok_cached=60 tok_out=7 cost_usd_micro=1234 cache_hit=1 routing_reason=no_downgrade budget_status=warn";
+    assert m == exp2.len;
+    assert bytes_eq(o[0..m], exp2);
+    assert cp_llm_payload(o[0..512], "Queen", "m1", RT_CLAUDE, TK_ARCH, 80, 60, 7, 1, true, "r", BS_OK) == 0;
+    assert cp_llm_payload(o[0..512], "queen", "", RT_CLAUDE, TK_ARCH, 80, 60, 7, 1, true, "r", BS_OK) == 0;
+    assert cp_llm_payload(o[0..512], "queen", "m1", RT_CLAUDE, TK_ARCH, 80, 60, 7, 1, true, "a b", BS_OK) == 0;
+    assert cp_llm_payload(o[0..512], "queen", "m1", 0, TK_ARCH, 80, 60, 7, 1, true, "r", BS_OK) == 0;
+    assert cp_llm_payload(o[0..512], "queen", "m1", RT_CLAUDE, 0, 80, 60, 7, 1, true, "r", BS_OK) == 0;
+    assert cp_llm_payload(o[0..512], "queen", "m1", RT_CLAUDE, TK_ARCH, 80, 60, 7, 1, true, "r", 9) == 0;
+    assert cp_llm_payload(o[0..512], "queen", "m1", RT_CLAUDE, TK_ARCH, 80, 81, 7, 1, true, "r", BS_OK) == 0;
+    assert cp_llm_payload(o[0..40], "queen", "m1", RT_CLAUDE, TK_ARCH, 80, 60, 7, 1, true, "r", BS_OK) == 0;
+}
+
+test built_payload_survives_redact {
+    var o : [512]u8 = undefined;
+    const n : usize = cp_llm_payload(o[0..512], "queen", "claude-sonnet-5-5", RT_CLAUDE, TK_REVIEW_FIRST, 141000, 60000, 900, 41234, true, "cheapest_tier", BS_WARN);
+    assert n > 0;
+    var r : [640]u8 = undefined;
+    var cn : [5]u32 = undefined;
+    const rn : usize = redact(o[0..n], r[0..640], cn[0..5]);
+    assert rn == n;
+    assert bytes_eq(r[0..rn], o[0..n]);
+    assert cn[0] == 0 and cn[1] == 0 and cn[2] == 0 and cn[3] == 0 and cn[4] == 0;
+    assert cp_segment_cacheable(o[0..n]);
+}
+
+test cost_events_pass_the_t27l_validator {
+    var p : [512]u8 = undefined;
+    const pn : usize = cp_llm_payload(p[0..512], "queen", "glm-4.7-flash", RT_ZAI, TK_FORMAT, 1000, 0, 50, 0, false, "slm_validated", BS_OK);
+    assert pn > 0;
+    var ln : [2048]u8 = undefined;
+    const n : usize = cp_llm_event(ln[0..2048], CP_T_EV, CP_T_TS, "mac-1", "sess-1", "", "", "", p[0..pn], false);
+    assert n > 0;
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    assert cp_has(ln[0..n], "\"surface\":\"cost\"");
+    assert cp_has(ln[0..n], "\"action\":\"llm_call\"");
+    assert cp_has(ln[0..n], "\"level\":\"info\"");
+    const w : usize = cp_llm_event(ln[0..2048], CP_T_EV, CP_T_TS, "mac-1", "sess-1", "", "", "", p[0..pn], true);
+    assert tl_validate_line(ln[0..w]) == TL_OK;
+    assert cp_has(ln[0..w], "\"level\":\"warn\"");
+    var rp : [128]u8 = undefined;
+    const rn : usize = cp_route_payload(rp[0..128], RT_ZAI, RT_DEEPSEEK, TK_FORMAT, "validation_failed");
+    const e : usize = cp_route_event(ln[0..2048], CP_T_EV, CP_T_TS, "mac-1", "sess-1", "", "", "", rp[0..rn], true);
+    assert e > 0;
+    assert tl_validate_line(ln[0..e]) == TL_OK;
+    assert cp_has(ln[0..e], "\"action\":\"route_decision\"");
+    assert cp_has(ln[0..e], "\"level\":\"warn\"");
+    assert cp_has(ln[0..e], "\"surface\":\"cost\"");
+    const i : usize = cp_route_event(ln[0..2048], CP_T_EV, CP_T_TS, "mac-1", "sess-1", "", "", "", rp[0..rn], false);
+    assert cp_has(ln[0..i], "\"level\":\"info\"");
+    assert cp_llm_event(ln[0..2048], "bad-id", CP_T_TS, "mac-1", "sess-1", "", "", "", p[0..pn], false) == 0;
+}
+
+test secret_in_event_payload_is_redacted {
+    var k : [64]u8 = undefined;
+    var s : usize = put_bytes(k[0..64], 0, "key ");
+    s = put_bytes(k[0..64], s, "sk-");
+    s = tl_t_fill(k[0..64], s, 97, 24);
+    var ln : [2048]u8 = undefined;
+    const n : usize = cp_llm_event(ln[0..2048], CP_T_EV, CP_T_TS, "mac-1", "sess-1", "", "", "", k[0..s], false);
+    assert n > 0;
+    assert !cp_has(ln[0..n], "sk-");
+    // cp_has folds only the haystack, so the needle is the lower-case form of share's "[REDACTED]" mark
+    assert cp_has(ln[0..n], "[redacted]");
+}
+
+test field_and_sum_read_back {
+    var o : [512]u8 = undefined;
+    const n : usize = cp_llm_payload(o[0..512], "queen", "m1", RT_CLAUDE, TK_SUMMARY, 80, 60, 7, 1234, true, "r", BS_OK);
+    var v : [1]u64 = undefined;
+    assert cp_field(o[0..n], "tok_in", v[0..1]);
+    assert v[0] == 80;
+    assert cp_field(o[0..n], "tok_cached", v[0..1]);
+    assert v[0] == 60;
+    assert cp_field(o[0..n], "cost_usd_micro", v[0..1]);
+    assert v[0] == 1234;
+    assert cp_field(o[0..n], "cache_hit", v[0..1]);
+    assert v[0] == 1;
+    assert !cp_field(o[0..n], "model", v[0..1]);
+    assert !cp_field(o[0..n], "missing", v[0..1]);
+    assert !cp_field(o[0..n], "in", v[0..1]);
+    assert !cp_field(o[0..n], "", v[0..1]);
+    assert !cp_field("a=12x", "a", v[0..1]);
+    assert !cp_field("a= b=2", "a", v[0..1]);
+    assert cp_field("a=12 b=3", "b", v[0..1]);
+    assert v[0] == 3;
+    var buf : [1500]u8 = undefined;
+    var at : usize = cp_t_pay(buf[0..1500], "queen", "m1", TK_SUMMARY, 100);
+    assert at > 0;
+    buf[at] = 10;
+    at = at + 1;
+    var q : [512]u8 = undefined;
+    var l : usize = cp_t_pay(q[0..512], "bee", "m2", TK_FORMAT, 50);
+    assert l > 0;
+    at = put_bytes(buf[0..1500], at, q[0..l]);
+    buf[at] = 10;
+    at = at + 1;
+    l = cp_t_pay(q[0..512], "queen", "m1", TK_FORMAT, 7);
+    assert l > 0;
+    at = put_bytes(buf[0..1500], at, q[0..l]);
+    buf[at] = 10;
+    at = at + 1;
+    assert cp_sum(buf[0..at], "tok_in", "", "") == 157;
+    assert cp_sum(buf[0..at], "tok_in", "model", "m1") == 107;
+    assert cp_sum(buf[0..at], "tok_in", "model", "m2") == 50;
+    assert cp_sum(buf[0..at], "tok_in", "model", "m3") == 0;
+    assert cp_sum(buf[0..at], "tok_in", "agent", "queen") == 107;
+    assert cp_sum(buf[0..at], "tok_in", "task_type", "format") == 57;
+    assert cp_sum(buf[0..at], "cost_usd_micro", "", "") == 300;
+    assert cp_sum(buf[0..at], "tok_cached", "model", "m1") == 10;
+    assert cp_sum(buf[0..at], "nokey", "", "") == 0;
+    assert cp_sum(buf[0..at], "tok_in", "nokey", "m1") == 0;
+    assert cp_sum(buf[0..0], "tok_in", "", "") == 0;
+}
+
+test tri_cost_commands_not_built_but_checked {
+    assert cp_cmd_id("report") == 1;
+    assert cp_cmd_id("breakdown") == 2;
+    assert cp_cmd_id("cache") == 3;
+    assert cp_cmd_id("route") == 4;
+    assert cp_cmd_id("budget") == 5;
+    assert cp_cmd_id("optimize") == 6;
+    assert cp_cmd_id("anomaly") == 7;
+    assert cp_cmd_id("reports") == 0;
+    assert cp_cmd_id("") == 0;
+    assert bytes_eq(cp_help(1), "tri cost report --since <YYYY-MM-DD>  prints JSON");
+    var c : u8 = 1;
+    while (c <= 7) {
+        assert cp_help(c).len > 0;
+        c = c + 1;
+    }
+    assert cp_help(0).len == 0;
+    assert cp_help(8).len == 0;
+    assert cp_arg_ok("2026-11-08");
+    assert cp_arg_ok("model");
+    var k : [64]u8 = undefined;
+    var s : usize = put_bytes(k[0..64], 0, "sk-");
+    s = tl_t_fill(k[0..64], s, 97, 24);
+    assert !cp_arg_ok(k[0..s]);
+    assert !cp_arg_ok("a cookie");
+}
+
+test report_json_exact {
+    var o : [256]u8 = undefined;
+    const n : usize = cp_report_json(o[0..256], 5250000, 12, 750, BS_OK);
+    const exp : str = "{\"schema\":\"t27l-cost/v1\",\"spent_usd_micro\":5250000,\"calls\":12,\"cache_hit_permille\":750,\"budget_status\":\"ok\"}";
+    assert n == exp.len;
+    assert bytes_eq(o[0..n], exp);
+    assert cp_report_json(o[0..256], 1, 1, 1, 7) == 0;
+    assert cp_report_json(o[0..20], 1, 1, 1, BS_OK) == 0;
+    const w : usize = cp_report_json(o[0..256], 0, 0, 0, BS_UNSET);
+    assert cp_has(o[0..w], "\"budget_status\":\"unset\"");
+}
