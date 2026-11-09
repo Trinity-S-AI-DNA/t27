@@ -487,7 +487,7 @@ with `specs/queen/priority.t27` (levels) and `specs/queen/claim_msg.t27` (claims
 A cheaper route is taken only when correctness, privacy and review stay intact. Architecture, security, critical
 fixes and final review never go to a small model; an output that fails validation escalates and is never returned.
 The rule (cost score, prompt and response caching, routing, budget, anomalies, the T27L cost event) lives in
-`specs/claw/cost_policy.t27`; Claude tiers stay `specs/claw/model_route.t27`. Read them; do not restate them.
+`specs/claw/cost_policy.t27`; Claude tiers stay `specs/claw/model_route.t27`. A Cursor session follows `specs/claw/cursor_route.t27`. Read them; do not restate them.
 
 ## trigit is the standard: our own git (owner rules, 2026-10-20; standard 2026-10-22)
 

@@ -1,0 +1,429 @@
+// SPDX-License-Identifier: Apache-2.0
+; The bounded run of the next-step law: one event, one call of decide, one executor (Refs #12884).
+; Pure half: the fixture of three tasks, the attempt states, the deferred owner rules (an expired
+; deadline is not an approval; a failed attempt never changes the acceptance criterion), the
+; wait-status decode and the two report checks the verifier runs on the executor's artifact.
+; The host half is specs/t27os/next_step_main.t27: one-shot, no daemon, no conductor, no cron.
+; The contract describes deduplication, fences, replay and the effect journal; the runtime
+; behaviour is not measured by this file.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenNextStepRun;
+
+use queen::next_step::NS_OK;
+use queen::next_step::NS_NO_PERMISSION;
+use queen::next_step::NS_PARKED;
+use queen::next_step::NS_BLOCKED;
+use queen::next_step::NS_NO_BUDGET;
+use queen::next_step::NS_NOT_ISOLATED;
+use queen::next_step::NS_NONE;
+use queen::next_step::ST_DONE;
+use queen::next_step::ST_VERIFIED;
+use queen::next_step::ST_NOTIFIED;
+use queen::next_step::ST_READ;
+use queen::next_step::NO_PICK;
+use queen::next_step::D_STALE;
+use queen::next_step::MAX_CANDIDATES;
+use queen::next_step::unavailable_reason;
+use queen::next_step::budget_after;
+use queen::next_step::blockers_from;
+use queen::next_step::has;
+use queen::next_step::decide;
+use queen::control::EV_WORKER_IDLE;
+use queen::control::EV_REVIEW;
+use t27os::pty_proto::get_u64;
+use t27os::pty_proto::put_u64;
+
+/// A outranks B and waits for the owner's approval; it has no executor in this run.
+pub const TASK_A : u8 = 0;
+/// B is the safe test task: t27c test-report of specs/queen/next_step.t27 into a scratch artifact.
+pub const TASK_B : u8 = 1;
+/// C depends on B: its blockers are blockers_from(B's status).
+pub const TASK_C : u8 = 2;
+pub const RUN_TASKS : u32 = 3;
+/// Executor launches one bounded run may make.
+pub const RUN_CAP : u32 = 1;
+/// B's criterion, recorded when the attempt is created: 14 tests, 14 pass, 0 FAIL, 0 vacuous.
+pub const RUN_WANT : u64 = 14;
+/// A task that already has an attempt is never offered again (not one of next_step's reasons).
+pub const NR_ATTEMPTED : u8 = 7;
+
+pub const AT_NONE : u8 = 0;
+pub const AT_JOURNALED : u8 = 1;
+pub const AT_EXECUTED : u8 = 2;
+pub const AT_VERIFIED : u8 = 3;
+pub const AT_REFUSED : u8 = 4;
+pub const AT_LAUNCH_FAILED : u8 = 5;
+
+pub const AP_WAITING : u8 = 0;
+pub const AP_GRANTED : u8 = 1;
+pub const AP_EXPIRED : u8 = 2;
+
+/// exit_of's answer for a child that did not exit normally (signal or stop).
+pub const EXIT_SIGNALED : u32 = 256;
+pub const NOT_FOUND : usize = 4294967295;
+pub const NO_NUMBER : u64 = 4294967296;
+
+/// The run state record: little-endian u64 fields, then one byte per field.
+pub const SR_LEN : usize = 32;
+pub const SR_LAST : usize = 0;
+pub const SR_DEADLINE : usize = 8;
+pub const SR_LAUNCHES : usize = 16;
+pub const SR_ATTEMPT : usize = 17;
+pub const SR_TASK : usize = 18;
+pub const SR_STATE : usize = 19;
+pub const SR_B_STATUS : usize = 20;
+pub const SR_WANT : usize = 21;
+pub const SR_CODE : usize = 22;
+pub const SR_APPROVAL : usize = 23;
+pub const SR_MAGIC : usize = 24;
+pub const SR_MAGIC_VALUE : u8 = 27;
+
+/// The Queen order inputs of the fixture: A has eff 0, B and C eff 2; level 0; index = position.
+pub fn eff_of(task: u8) -> u8 {
+    var e : u8 = 2;
+    if (task == TASK_A) { e = 0; }
+    return e;
+}
+
+/// An owner word grants; a granted approval stays granted; otherwise a passed deadline, or an
+/// approval already expired, is AP_EXPIRED; else AP_WAITING. Nothing but owner_word reaches GRANTED.
+pub fn approval_after(state: u8, deadline_passed: bool, owner_word: bool) -> u8 {
+    if (owner_word == true) { return AP_GRANTED; }
+    if (state == AP_GRANTED) { return AP_GRANTED; }
+    if (deadline_passed == true) { return AP_EXPIRED; }
+    if (state == AP_EXPIRED) { return AP_EXPIRED; }
+    return AP_WAITING;
+}
+
+/// The acceptance criterion after a proposal to change it: only the owner's proposal is taken.
+/// A failed attempt has no argument here, so it cannot lower or raise the bar.
+pub fn criterion_after(old: u64, proposed: u64, by_owner: bool) -> u64 {
+    var c : u64 = old;
+    if (by_owner == true) { c = proposed; }
+    return c;
+}
+
+/// The stage-1 reason of one fixture task. A: permitted unless its approval expired, parked while
+/// it waits. B: NR_ATTEMPTED once it has an attempt. C: blocked by B's status. All share budget_left.
+pub fn reason_of(task: u8, approval: u8, attempted_b: bool, b_status: u8, budget_left: u32) -> u8 {
+    if (task == TASK_A) {
+        return unavailable_reason(approval != AP_EXPIRED, approval == AP_WAITING, 0, 1, budget_left, true);
+    }
+    if (task == TASK_B) {
+        if (attempted_b == true) { return NR_ATTEMPTED; }
+        return unavailable_reason(true, false, 0, 1, budget_left, true);
+    }
+    if (task == TASK_C) {
+        return unavailable_reason(true, false, blockers_from(b_status), 1, budget_left, true);
+    }
+    return NS_NONE;
+}
+
+/// decide over the fixture (n = 3, no manual assignment pending, level 0, index = position).
+pub fn run_decide(kind: u8, last: u64, seq: u64, ra: u8, rb: u8, rc: u8) -> u32 {
+    var reason : [4]u8 = [ra, rb, rc, NS_NONE];
+    var eff : [4]u8 = [eff_of(TASK_A), eff_of(TASK_B), eff_of(TASK_C), 0];
+    return decide(kind, last, seq, false, reason, eff, [0, 0, 0, 0], [0, 1, 2, 3], RUN_TASKS);
+}
+
+/// Only the safe test task has an executor here; a pick of another task is refused, not run.
+pub fn has_executor(pick: u32) -> bool {
+    return pick == @as(u32, TASK_B);
+}
+
+/// The attempt state after the independent check: verified only when the executor exited 0 and
+/// both reports meet the criterion recorded at creation.
+pub fn attempt_after_verify(exec_code: u32, exec_ok: bool, verify_ok: bool) -> u8 {
+    var s : u8 = AT_REFUSED;
+    if (exec_code == 0) {
+        if (exec_ok == true) {
+            if (verify_ok == true) { s = AT_VERIFIED; }
+        }
+    }
+    return s;
+}
+
+/// B's status after a verified attempt: done, verified, the report written; READ stays unset.
+pub fn verified_status() -> u8 {
+    return ST_DONE | ST_VERIFIED | ST_NOTIFIED;
+}
+
+/// The exit code in a waitpid status word, or EXIT_SIGNALED when the low 7 bits are not 0.
+pub fn exit_of(ws: u32) -> u32 {
+    var low : u32 = ws & 127;
+    var code : u32 = EXIT_SIGNALED;
+    if (low == 0) { code = (ws / 256) & 255; }
+    return code;
+}
+
+/// The first p >= at with text[p .. p + needle.len] == needle inside text[0..n], or NOT_FOUND.
+pub fn find_from(text: []const u8, n: usize, at: usize, needle: []const u8) -> usize {
+    var p : usize = at;
+    while (p + needle.len <= n) {
+        var k : usize = 0;
+        var same : bool = true;
+        while (same and k < needle.len) {
+            if (text[p + k] != needle[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same) { return p; }
+        p = p + 1;
+    }
+    return NOT_FOUND;
+}
+
+/// The decimal number at text[at..n] after any spaces; NO_NUMBER when no digit follows or the
+/// number has more than 9 digits.
+pub fn number_at(text: []const u8, n: usize, at: usize) -> u64 {
+    var p : usize = at;
+    var blank : bool = p < n;
+    while (blank) {
+        if (text[p] == 32) {
+            p = p + 1;
+            blank = p < n;
+        } else {
+            blank = false;
+        }
+    }
+    var v : u64 = 0;
+    var digits : u32 = 0;
+    var digit : bool = p < n;
+    while (digit) {
+        const ch : u8 = text[p];
+        if (ch >= 48 and ch <= 57) {
+            v = v * 10 + @as(u64, ch - 48);
+            digits = digits + 1;
+            p = p + 1;
+            digit = p < n;
+        } else {
+            digit = false;
+        }
+        if (digits > 9) { digit = false; }
+    }
+    if (digits == 0 or digits > 9) { return NO_NUMBER; }
+    return v;
+}
+
+/// The number after the first `label` at or after `from`, or NO_NUMBER.
+pub fn number_after(text: []const u8, n: usize, from: usize, label: []const u8) -> u64 {
+    const at : usize = find_from(text, n, from, label);
+    if (at == NOT_FOUND) { return NO_NUMBER; }
+    return number_at(text, n, at + label.len);
+}
+
+/// A t27c test-report: tests == want, pass == want, FAIL 0, vacuous passes 0.
+pub fn report_ok_t27c(text: []const u8, n: usize, want: u64) -> bool {
+    if (number_after(text, n, 0, "  tests ") != want) { return false; }
+    if (number_after(text, n, 0, "  pass ") != want) { return false; }
+    if (number_after(text, n, 0, "  FAIL ") != 0) { return false; }
+    if (number_after(text, n, 0, "vacuous passes ") != 0) { return false; }
+    return true;
+}
+
+/// A t27b test run of QueenNextStep: "<want> passed, 0 failed, <want> total" and "0 broken"
+/// invariants. The count line is the first "QueenNextStep: " followed by a number.
+pub fn report_ok_t27b(text: []const u8, n: usize, want: u64) -> bool {
+    var at : usize = find_from(text, n, 0, "QueenNextStep: ");
+    var passed : u64 = NO_NUMBER;
+    var tries : u32 = 0;
+    while (at != NOT_FOUND and passed == NO_NUMBER and tries < 4) {
+        passed = number_at(text, n, at + 15);
+        if (passed == NO_NUMBER) { at = find_from(text, n, at + 1, "QueenNextStep: "); }
+        tries = tries + 1;
+    }
+    if (passed != want) { return false; }
+    if (number_after(text, n, at, " passed, ") != 0) { return false; }
+    if (number_after(text, n, at, " failed, ") != want) { return false; }
+    if (number_after(text, n, 0, " held, ") != 0) { return false; }
+    return true;
+}
+
+/// A fresh run record: nothing applied, A waiting until `deadline`, no attempt, B's criterion.
+pub fn record_init(rec: []u8, deadline: u64) -> usize {
+    var i : usize = 0;
+    while (i < SR_LEN) {
+        rec[i] = 0;
+        i = i + 1;
+    }
+    put_u64(rec, SR_LAST, 0);
+    put_u64(rec, SR_DEADLINE, deadline);
+    rec[SR_TASK] = NS_NONE;
+    rec[SR_WANT] = @as(u8, @intCast(RUN_WANT));
+    rec[SR_APPROVAL] = AP_WAITING;
+    rec[SR_MAGIC] = SR_MAGIC_VALUE;
+    return SR_LEN;
+}
+
+/// B has an attempt in this record.
+pub fn record_attempted_b(rec: []const u8) -> bool {
+    if (rec[SR_ATTEMPT] == 0) { return false; }
+    return rec[SR_TASK] == TASK_B;
+}
+
+test a_waits_b_is_picked_at_once {
+    // first event: nothing applied, A waits for approval, B is ready, C waits on B
+    const left : u32 = budget_after(RUN_CAP, 0);
+    const ra : u8 = reason_of(TASK_A, AP_WAITING, false, 0, left);
+    const rb : u8 = reason_of(TASK_B, AP_WAITING, false, 0, left);
+    const rc : u8 = reason_of(TASK_C, AP_WAITING, false, 0, left);
+    assert ra == NS_PARKED;
+    assert rb == NS_OK;
+    assert rc == NS_BLOCKED;
+    const d : u32 = run_decide(EV_WORKER_IDLE, 0, 1, ra, rb, rc);
+    assert d == 1;
+    assert has_executor(d) == true;
+    assert has_executor(0) == false;
+    assert has_executor(2) == false;
+}
+
+test replay_launches_nothing {
+    // the attempt was journaled with last = 1 before the effect; seq 1 again is stale
+    var launches : u32 = 1;
+    const left : u32 = budget_after(RUN_CAP, launches);
+    const ra : u8 = reason_of(TASK_A, AP_WAITING, true, ST_DONE, left);
+    const rb : u8 = reason_of(TASK_B, AP_WAITING, true, ST_DONE, left);
+    const rc : u8 = reason_of(TASK_C, AP_WAITING, true, ST_DONE, left);
+    const d : u32 = run_decide(EV_WORKER_IDLE, 1, 1, ra, rb, rc);
+    assert d == D_STALE;
+    if (d < MAX_CANDIDATES) { launches = launches + 1; }
+    assert launches == 1;
+    // an older event is stale too
+    const d0 : u32 = run_decide(EV_WORKER_IDLE, 1, 0, ra, rb, rc);
+    assert d0 == D_STALE;
+}
+
+test attempted_task_is_not_offered_again {
+    // even with budget left, B with an attempt is not picked a second time
+    const rb : u8 = reason_of(TASK_B, AP_WAITING, true, ST_DONE, 5);
+    assert rb == NR_ATTEMPTED;
+    assert rb != NS_OK;
+    const ra : u8 = reason_of(TASK_A, AP_WAITING, true, ST_DONE, 5);
+    const rc : u8 = reason_of(TASK_C, AP_WAITING, true, ST_DONE, 5);
+    const d : u32 = run_decide(EV_WORKER_IDLE, 1, 2, ra, rb, rc);
+    assert d == NO_PICK;
+    assert rc == NS_BLOCKED;
+}
+
+test after_check_next_decision_is_wait_on_budget {
+    // verified, report written and unread; the one launch is spent; A's deadline passed
+    const st : u8 = verified_status();
+    assert has(st, ST_READ) == false;
+    const ap : u8 = approval_after(AP_WAITING, true, false);
+    const left : u32 = budget_after(RUN_CAP, 1);
+    const ra : u8 = reason_of(TASK_A, ap, true, st, left);
+    const rb : u8 = reason_of(TASK_B, ap, true, st, left);
+    const rc : u8 = reason_of(TASK_C, ap, true, st, left);
+    assert ra == NS_NO_PERMISSION;
+    assert rb == NR_ATTEMPTED;
+    assert rc == NS_NO_BUDGET;
+    const d : u32 = run_decide(EV_REVIEW, 1, 2, ra, rb, rc);
+    assert d == NO_PICK;
+}
+
+test unread_report_does_not_block_the_next_task {
+    // with one more launch in the budget, C is picked while B's report is still unread
+    const unread : u8 = verified_status();
+    const read : u8 = unread | ST_READ;
+    const rc_unread : u8 = reason_of(TASK_C, AP_WAITING, true, unread, 1);
+    const rc_read : u8 = reason_of(TASK_C, AP_WAITING, true, read, 1);
+    assert rc_unread == NS_OK;
+    assert rc_read == NS_OK;
+    const ra : u8 = reason_of(TASK_A, AP_WAITING, true, unread, 1);
+    const rb : u8 = reason_of(TASK_B, AP_WAITING, true, unread, 1);
+    const d_unread : u32 = run_decide(EV_REVIEW, 1, 2, ra, rb, rc_unread);
+    const d_read : u32 = run_decide(EV_REVIEW, 1, 2, ra, rb, rc_read);
+    assert d_unread == 2;
+    assert d_read == d_unread;
+    // done but not verified still blocks C
+    const rc_done : u8 = reason_of(TASK_C, AP_WAITING, true, ST_DONE, 1);
+    assert rc_done == NS_BLOCKED;
+}
+
+test expired_deadline_is_not_approval {
+    assert approval_after(AP_WAITING, false, false) == AP_WAITING;
+    assert approval_after(AP_WAITING, true, false) == AP_EXPIRED;
+    assert approval_after(AP_EXPIRED, false, false) == AP_EXPIRED;
+    assert approval_after(AP_EXPIRED, true, false) == AP_EXPIRED;
+    assert approval_after(AP_WAITING, false, true) == AP_GRANTED;
+    assert approval_after(AP_GRANTED, true, false) == AP_GRANTED;
+    // A whose deadline passed is refused for permission, never admitted
+    const ra : u8 = reason_of(TASK_A, AP_EXPIRED, false, 0, 1);
+    assert ra == NS_NO_PERMISSION;
+    assert ra != NS_OK;
+}
+
+test failed_attempt_keeps_criterion {
+    assert criterion_after(RUN_WANT, 10, false) == RUN_WANT;
+    assert criterion_after(RUN_WANT, 0, false) == RUN_WANT;
+    assert criterion_after(RUN_WANT, 20, true) == 20;
+    assert attempt_after_verify(1, true, true) == AT_REFUSED;
+    assert attempt_after_verify(0, false, true) == AT_REFUSED;
+    assert attempt_after_verify(0, true, false) == AT_REFUSED;
+    assert attempt_after_verify(EXIT_SIGNALED, true, true) == AT_REFUSED;
+    assert attempt_after_verify(0, true, true) == AT_VERIFIED;
+}
+
+test wait_status_decode {
+    assert exit_of(0) == 0;
+    assert exit_of(256) == 1;
+    assert exit_of(768) == 3;
+    assert exit_of(65280) == 255;
+    assert exit_of(9) == EXIT_SIGNALED;
+    assert exit_of(15) == EXIT_SIGNALED;
+    assert exit_of(4991) == EXIT_SIGNALED;
+}
+
+test t27c_report_check {
+    const good : []const u8 = "--- test report: x ---\n\n  tests       14\n  pass        14\n  FAIL        0\n  vacuous passes  0 of 14  (0 comptime-verified)\n";
+    assert report_ok_t27c(good, good.len, 14) == true;
+    assert report_ok_t27c(good, good.len, 13) == false;
+    const fail : []const u8 = "  tests       14\n  pass        13\n  FAIL        1\n  vacuous passes  0 of 14\n";
+    assert report_ok_t27c(fail, fail.len, 14) == false;
+    const vac : []const u8 = "  tests       14\n  pass        14\n  FAIL        0\n  vacuous passes  1 of 14\n";
+    assert report_ok_t27c(vac, vac.len, 14) == false;
+    const cut : []const u8 = "  tests       14\n  pass        14\n";
+    assert report_ok_t27c(cut, cut.len, 14) == false;
+    const empty : []const u8 = "";
+    assert report_ok_t27c(empty, 0, 14) == false;
+}
+
+test t27b_report_check {
+    const good : []const u8 = "PASS a\nQueenNextStep: invariants 1 held, 0 broken, 0 not checked\nQueenNextStep: 14 passed, 0 failed, 14 total\n";
+    assert report_ok_t27b(good, good.len, 14) == true;
+    assert report_ok_t27b(good, good.len, 15) == false;
+    const failed : []const u8 = "QueenNextStep: invariants 1 held, 0 broken, 0 not checked\nQueenNextStep: 13 passed, 1 failed, 14 total\n";
+    assert report_ok_t27b(failed, failed.len, 14) == false;
+    const broken : []const u8 = "QueenNextStep: invariants 0 held, 1 broken, 0 not checked\nQueenNextStep: 14 passed, 0 failed, 14 total\n";
+    assert report_ok_t27b(broken, broken.len, 14) == false;
+    const none : []const u8 = "QueenNextStep: invariants 1 held, 0 broken, 0 not checked\n";
+    assert report_ok_t27b(none, none.len, 14) == false;
+}
+
+test record_layout {
+    var rec : [32]u8 = undefined;
+    const n : usize = record_init(rec[0..32], 1762070400);
+    assert n == SR_LEN;
+    assert get_u64(rec[0..32], SR_LAST) == 0;
+    assert get_u64(rec[0..32], SR_DEADLINE) == 1762070400;
+    assert rec[SR_TASK] == NS_NONE;
+    assert rec[SR_WANT] == 14;
+    assert rec[SR_MAGIC] == SR_MAGIC_VALUE;
+    assert record_attempted_b(rec[0..32]) == false;
+    rec[SR_ATTEMPT] = 1;
+    rec[SR_TASK] = TASK_B;
+    assert record_attempted_b(rec[0..32]) == true;
+    put_u64(rec[0..32], SR_LAST, 2);
+    assert get_u64(rec[0..32], SR_LAST) == 2;
+    assert get_u64(rec[0..32], SR_DEADLINE) == 1762070400;
+}
+
+invariant next_step_run_constants {
+    assert NR_ATTEMPTED != NS_OK;
+    assert NR_ATTEMPTED != NS_NOT_ISOLATED;
+    assert NR_ATTEMPTED < NS_NONE;
+    assert RUN_TASKS <= MAX_CANDIDATES;
+    assert SR_MAGIC < SR_LEN;
+    assert AP_GRANTED != AP_WAITING;
+    assert AP_GRANTED != AP_EXPIRED;
+}
