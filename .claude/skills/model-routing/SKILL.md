@@ -1,7 +1,7 @@
 ---
 id: model-routing
 name: model-routing
-description: Which model does which job -- a sub-task starts in a T27 OS pane on the free key tier, the orchestrator runs on Sonnet 5.5, Sonnet is the first escalation of a sub-task, and Opus 5.5 is reached only after failed attempts or on the owner's word. Load before spawning any subagent or pane, writing a workflow, or picking a model in TRI CLAW or the Queen.
+description: Which model does which job -- a sub-task starts in a T27 OS pane on the free key tier, the orchestrator runs on Sonnet 5.5, Sonnet is the first escalation of a sub-task, and Opus 5.5 is reached only after failed attempts or on the owner's word. A Cursor session follows specs/claw/cursor_route.t27. Load before spawning any subagent or pane, writing a workflow, or picking a model in TRI CLAW or the Queen.
 argument-hint: "[role: orchestrate|plan|review-final|implement|port|search|test|docs|fix]"
 ---
 
@@ -19,6 +19,8 @@ argument-hint: "[role: orchestrate|plan|review-final|implement|port|search|test|
 Owner directive 2026-10-20 (#11317, summarised): run lanes through T27 OS instead of paid subagents -- cheaper, and the owner watches every lane live in the window. It adds the pane tier below Sonnet for sub-tasks. It builds on the directive of 2026-10-19 (translated): "set Sonnet as the default model for all agents -- it is cheaper with the same result" (#10921), which keeps the orchestrator on Sonnet 5.5; that one replaced the 2026-10-18 rule (orchestration on Opus 5.5, #10493). The rule is part of TRI CLAW so development stays economical.
 
 **The law is `specs/claw/model_route.t27`.** This skill is how to follow it in a Claude Code session. If the two disagree, the spec wins; fix the skill.
+
+A Cursor session is a different host. It follows `specs/claw/cursor_route.t27`: a cheap task starts on `composer-2.5`, and `grok-4.7` is the escalation and the start for architecture, a conflict, or a multi-file refactor. Fast and a window above 256k are not defaults. If this skill and that spec disagree, the spec wins.
 
 ## The rule
 
