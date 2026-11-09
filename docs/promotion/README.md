@@ -9,3 +9,4 @@ here disagrees with that spec, the spec wins.
 - `docs/promotion/content-bank.md` -- two drafts, fitting claims only.
 - `docs/promotion/publish-gate.md` -- widget, screenshot, test, human yes.
 - `docs/promotion/baseline.md` -- GitHub counts, cited X impressions, course not ready.
+- `docs/promotion/metrics.md` -- tracked metrics and the weekly report.
