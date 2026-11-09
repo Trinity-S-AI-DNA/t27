@@ -1,5 +1,13 @@
-# Promotion
+# Promotion planning
 
-Index for epic #13473. M0 files land here. A publishable asset still needs one checked claim, one artifact, one path, one visual, one CTA, and one metric. This directory does not post or send mail.
+Part of #13473. These cards do not publish, send mail, or spend a paid token.
 
-- [baseline.md](baseline.md) — measured reach on 2026-11-10 (Asia/Bangkok).
+The executable law is `specs/automation/promotion_kernel.t27`. If a number
+here disagrees with that spec, the spec wins.
+
+- `docs/promotion/content-calendar.md` -- 10-day cycle and weekly cadence.
+- `docs/promotion/content-bank.md` -- two drafts, fitting claims only.
+- `docs/promotion/publish-gate.md` -- widget, screenshot, test, human yes.
+- `docs/promotion/baseline.md` -- GitHub counts, cited X impressions, course not ready.
+- `docs/promotion/metrics.md` -- tracked metrics and the weekly report.
+- `docs/promotion/funnel.md` -- one CTA per step, paid checkout off.
