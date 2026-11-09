@@ -7755,6 +7755,10 @@ impl<'a> Lower<'a> {
 }
 #[path = "../../../gen/rust/tri/t27b/check_elide_plan.rs"] #[allow(dead_code, unused_parens)]
 mod ce; // t27c gen-rust of specs/tri/t27b/check_elide_plan.t27
+#[path = "../../../gen/rust/tri/t27b/if_convert_plan.rs"] #[allow(dead_code, unused_parens)]
+mod ic; // t27c gen-rust of specs/tri/t27b/if_convert_plan.t27 -- stub, always false until CFG pass
+#[path = "../../../gen/rust/tri/t27b/countdown_plan.rs"] #[allow(dead_code, unused_parens)]
+mod cd; // t27c gen-rust of specs/tri/t27b/countdown_plan.t27 -- stub, always false until loop-rotation pass
 fn stmt_each(ss: &mut [Stmt], nest: bool, f: &mut dyn FnMut(VarId, &mut Expr, bool)) { // nest: the write sits in an inner while
     for s in ss { match s {
         Stmt::Assign { var, value } => f(*var, value, nest),
@@ -7790,7 +7794,10 @@ fn after_inc(rest: &mut [Stmt], x: VarId, c: u64, pos: u8) { // (b) uses of x af
 fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
     for i in 0..ss.len() { let (before, tail) = ss.split_at_mut(i); let (cur, rest) = tail.split_first_mut().unwrap(); match cur {
         Stmt::Assign { var, value } => if let Some(c) = konst(ArithOp::Add, *var, value) { after_inc(rest, *var, c, ce::POS_SAME_LIST); },
-        Stmt::If { then, els, .. } => { elide_checks(then, rets); elide_checks(els, rets); }
+        Stmt::If { then, els, .. } => { elide_checks(then, rets); elide_checks(els, rets);
+            // if-conversion stub -- specs/tri/t27b/if_convert_plan.t27; returns false until CFG pass wired
+            let _ = ic::if_convert_ok(false, false, false, false, false);
+        }
         Stmt::While { cond, body, step } => { // (a) `while (i < n)` with the single `i = i + 1`
             elide_checks(body, rets); elide_checks(step, rets);
             let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { continue };
@@ -7798,6 +7805,8 @@ fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
             let fixed = match rhs.kind { ExprKind::Const(_) => true, ExprKind::Var(n) => n != iv && writes(body, n) + writes(step, n) == 0, _ => false };
             let (mut k, mut n, mut inner) = (0, 0, false);
             for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, nest| if v == iv { n += 1; inner |= nest; k = konst(ArithOp::Add, iv, e).unwrap_or(0); }); }
+            // countdown stub -- specs/tri/t27b/countdown_plan.t27; returns false until loop-rotation pass wired
+            let _ = cd::countdown_ok(false, false, false, false, false);
             if ce::induction_elides(*op as u8, lhs.ty == rhs.ty, fixed, n, k, false, inner) { // a VarId is never addressed: address-taken locals live in slots
                 let top = |l: &[Stmt]| l.iter().any(|s| matches!(s, Stmt::Assign { var, .. } if *var == iv));
                 let every = top(step) || (top(body) && !has_cont(body));
