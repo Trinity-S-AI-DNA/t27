@@ -6690,6 +6690,7 @@ Last updated: 2026-07-10
 
 - `cli/tri/src/fpga.rs`
   - Added `--synthetic-operating-point` to `tri fpga cold-por` and `tri fpga cclk-sweep`.
+### Not built (planned surface only): tri fpga verify-lean
   - Added `tri fpga verify-lean` subcommand to validate `.lean` theorem blocks
     against JSON summaries and count theorem declarations.
   - Promoted `resolve_pvt_context_for_boot` to a public helper returning
@@ -6753,6 +6754,7 @@ Last updated: 2026-07-10
     missing source comment, and mismatched expected source.
 
 - `fpga/HARDWARE_SSOT.md` §3.6.23
+### Not built (planned surface only): tri fpga verify-lean
   - Documented the machine-readable `tri fpga verify-lean --json` schema.
 
 - `docs/reports/T27_VS_FORMAL_HDL_2026.md`

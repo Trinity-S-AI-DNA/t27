@@ -162,8 +162,11 @@ The generated JSON includes:
 
 ### For Existing Specs
 
+> `tri spec` is not built yet; the commands below are the intended surface.
+
 1. **Check your spec** for test/invariant blocks:
    ```bash
+### Not built (planned surface only): tri spec
    tri spec validate specs/my_spec.t27
    ```
 
@@ -186,9 +189,11 @@ The generated JSON includes:
 
 ### For New Specs
 
+### Not built (planned surface only): tri spec
 Use `tri spec create` to generate a template with TDD blocks:
 
 ```bash
+### Not built (planned surface only): tri spec
 tri spec create my_feature
 
 # Creates: specs/my_feature.t27 with template .test/.invariant sections
@@ -236,9 +241,11 @@ tri gen specs/my_spec.t27 --emit-conformance
 
 ```bash
 # Check single spec
+### Not built (planned surface only): tri spec
 tri spec validate specs/my_spec.t27
 
 # Check all specs
+### Not built (planned surface only): tri spec
 tri spec list
 
 # Show TDD status for all specs
