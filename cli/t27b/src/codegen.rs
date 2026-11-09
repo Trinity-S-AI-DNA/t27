@@ -275,7 +275,7 @@ impl<'a> Gen<'a> {
             has_assert: f.body.iter().any(|s| matches!(s, Stmt::Assert { .. } | Stmt::AssertEq { .. })),
         };
         let sf = inline_decision::CallSiteFacts {
-            inside_loop: self.loops.last().is_some(),
+            hot_loop: self.loops.last().is_some(),
             constant_args: args.iter().all(|a| matches!(a.kind, ExprKind::Const(_))),
             call_depth: self.loops.len() as u8,
             caller_size: self.code.len() as u32,
