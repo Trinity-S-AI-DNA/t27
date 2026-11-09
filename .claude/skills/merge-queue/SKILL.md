@@ -60,6 +60,8 @@ In Cursor Cloud:
 
 Forbidden: `sleep` loops scanning `gh pr checks` every few seconds; spawning agents only to poll.
 
+**Sweep batches:** when judging many open PRs in one wake, load `.claude/skills/cron-batch/SKILL.md` (**CRON_BATCH_V1**): debounce 500 ms, max **100** actions/cycle, overflow → dead letter + T27L action 72.
+
 ## Machine-readable verdict line
 
 Emit one line per judged PR (spec `mv_line`):
