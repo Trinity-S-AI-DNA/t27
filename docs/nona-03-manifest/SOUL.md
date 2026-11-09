@@ -189,7 +189,7 @@ tri skill begin --issue N
 # ... work on spec (with tests!) ...
 
 # Seal skill
-tri skill seal
+tri cell seal
 
 # Commit (adds issue:N to message automatically)
 tri git commit --all -m "description"

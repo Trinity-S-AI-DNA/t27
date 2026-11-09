@@ -479,10 +479,11 @@ Any major operation (NUMERIC-STANDARD-001, SACRED-PHYSICS-001, De-Zig, GoldenFlo
 ## EXECUTION OF ENGINEERING LAYER
 
 ### AGENT T AS ACTIVE COMMANDS
-
+> Not built yet: `tri queen`, `tri agent` and their verbs are not built yet (intended surface only).
 ```bash
 # Run 6-phase cycle
 tri queen lotus --phase plan --task "NUMERIC-STANDARD-001"
+### Not built (planned surface only): tri queen / tri agent
 tri queen lotus --phase assign
 tri queen lotus --phase run
 tri queen lotus --phase test
@@ -490,14 +491,21 @@ tri queen lotus --phase verdict
 tri queen lotus --phase evolve
 
 # Delegating to agents
+### Not built (planned surface only): tri agent
 tri agent assign <task> --agent A  # Architecture
+### Not built (planned surface only): tri agent
 tri agent assign <task> --agent N  # Numeric
+### Not built (planned surface only): tri agent
 tri agent assign <task> --agent P  # Physics
+### Not built (planned surface only): tri agent
 tri agent assign <task> --agent F  # Conformance
 
 # Get status
+### Not built (planned surface only): tri queen
 tri queen lotus --status
+### Not built (planned surface only): tri queen
 tri queen lotus --agents  # Show all agents status
+### Not built (planned surface only): tri queen
 tri queen lotus --graph    # Show graph_v2.json impact
 ```
 
