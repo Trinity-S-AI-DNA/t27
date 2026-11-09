@@ -1,6 +1,6 @@
 ---
 name: pareto-improvement-loop
-description: Fifteen-minute continuous improvement tick: audit swarm state, Pareto-rank weak points, fix the top one in .t27, verify with receipts, land green, beat the hive feed, never break past work. Auto-fix on, self-heal reverts red changes.
+description: Fifteen-minute continuous improvement tick: audit swarm state, Pareto-rank weak points, fix the top one in .t27, verify with receipts, land green, beat the hive feed, never break past work. A red typecheck rolls that lane back to its pre-tick HEAD and leaves older commits in place. Where this page and the cron spec disagree, the spec wins.
 ---
 
 <!-- only-t27-rule -->
@@ -38,12 +38,20 @@ The cron card `specs/crons/t27-pareto-improvement-loop.t27` runs every 15 minute
 
 ## Rules that keep past work intact
 
-- **Never break a past merge.** `fix_may_start` requires the PR gate ran and no own PR is red.
-- **Self-heal:** `should_rollback` reverts a change that red-checks past the 3-tick window.
+The law is `self_recovery_action` and `prior_commits_untouched` in `specs/crons/t27-pareto-improvement-loop.t27`. Where this skill and that spec disagree, the spec wins.
+
+- **Own files only.** A tick commits only the task files it named. `tick_commit_allowed` calls `oc_commit_ok`; the body is not copied.
+- **Red typecheck.** Roll this lane back to the HEAD recorded before the tick wrote (`SR_ROLLBACK_LANE`). If that HEAD was not recorded, move no ref (`SR_REFUSE`). Do not guess an older commit.
+- **Prior commits stay.** The rollback target is that pre-tick HEAD. Commits older than it stay. This is not a reset of master and not a force-push.
+- **Window.** `oc_window_open` stays false. A tick that asks to open the window is refused.
+- **Never break a past merge.** `fix_may_start` calls `pick_may_run`: the PR gate ran and no own PR is red.
+- **Later window.** `should_rollback` in `specs/acceleration/auto_fix_self_heal.t27` still reverts a landed change that red-checks past `ROLLBACK_WINDOW` (3 ticks). That is a second gate. It does not replace the pre-tick rollback above.
 - **Lane hygiene:** only own released lanes are removed, at most 8 per tick (reuses `specs/tri/worktrees/reap.t27`).
 - **L1 traceability:** every commit body carries a local `Closes|Fixes|Resolves|Refs|Updates #N`.
 - **Foreign-edits budget:** net-negative (added ≤ deleted), ≤40 lines/file, ≤80/PR; no `--no-verify`/`LEFTHOOK=0`.
 - **ASCII only** (L3): `bootstrap/build.rs` fails the build on any Cyrillic under `specs/`.
+
+Lesson, 2026-11-10: a failed tick that resets the lane to an ancestor older than the pre-tick HEAD, or that resets master, drops green commits the tick did not make. Record the lane HEAD before writing. On a red typecheck, `git reset --hard` that recorded commit on this lane only. Do not force-push. Do not open the window.
 
 ## New `tri` commands (proposed, not built yet)
 

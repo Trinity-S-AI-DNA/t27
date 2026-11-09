@@ -1,0 +1,476 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/model_log.t27 -- THE GATEWAY LOG AS TRACE ROWS: what the ladder's own log can prove,
+; and what it cannot (epic #13172, owner 2026-11-04).
+; --
+; The deployed ladder writes ONE line per request:
+;     [ladder] 2026-11-04T04:34:49.402Z rung=2 status=402 238398ms
+; and nothing else. This spec turns such a line into a model_trace record and is explicit about the
+; fields the line does not carry:
+;   KNOWN from the line: started_at, duration, the rung that ended the request, the rung's status,
+;                        and the gateway status the client saw (the ladder's own rule: non-200 -> 503).
+;   DERIVED from the ladder's source, not from the line: the route is fallback when the request did
+;                        not end on rung 0; rung 2's fixed model is deepseek-chat, rung 1's is
+;                        gemma4:31b-cloud; rung 0's model is UNKNOWN because the head rotates among
+;                        three zai models and the line does not say which one answered.
+;   UNKNOWN and recorded as unknown: requested model, credential, tokens, cost, attempt ids, policy.
+; A row from this log can therefore never claim a price. That is the point: the epic exists because
+; the gateway recorded a refusal five times over and could price none of it.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27OsModelLog;
+
+use t27os::model_trace::TR_CELLS;
+use t27os::model_trace::TR_REQUESTED_MODEL;
+use t27os::model_trace::TR_RESOLVED_PROVIDER;
+use t27os::model_trace::TR_RESOLVED_MODEL;
+use t27os::model_trace::TR_ROUTE_REASON;
+use t27os::model_trace::TR_FALLBACK_RUNG;
+use t27os::model_trace::TR_POLICY;
+use t27os::model_trace::TR_CRED_KIND;
+use t27os::model_trace::TR_CRED_SLOT;
+use t27os::model_trace::TR_STARTED_MS;
+use t27os::model_trace::TR_DURATION_MS;
+use t27os::model_trace::TR_UPSTREAM;
+use t27os::model_trace::TR_GATEWAY;
+use t27os::model_trace::TR_BODY_CLASS;
+use t27os::model_trace::TR_RETRY_REASON;
+use t27os::model_trace::TR_USAGE_KNOWN;
+use t27os::model_trace::TR_COST_KIND;
+use t27os::model_trace::TR_COST_MICRO;
+use t27os::model_trace::TR_ATTEMPT;
+use t27os::model_trace::TR_PARENT;
+use t27os::model_trace::MT_OK;
+use t27os::model_trace::MT_UNFUNDED;
+use t27os::model_trace::MT_UNKNOWN;
+use t27os::model_trace::CK_UNKNOWN;
+use t27os::model_trace::RR_DIRECT;
+use t27os::model_trace::RR_FALLBACK;
+use t27os::model_trace::CS_UNKNOWN;
+use t27os::model_trace::MODEL_UNKNOWN;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::editors::same_bytes;
+
+// ---- 1. The timestamp: ISO-8601 UTC to epoch milliseconds ----
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's days_from_civil, the branchless form).
+/// Only years >= 1970 are used here, so the negative-era branches are not carried.
+pub fn days_from_civil(y : i64, m : i64, d : i64) -> i64 {
+    var yy : i64 = y;
+    if (m <= 2) { yy = yy - 1; }
+    const era : i64 = yy / 400;
+    const yoe : i64 = yy - era * 400;
+    var mp : i64 = m + 9;
+    if (m > 2) { mp = m - 3; }
+    const doy : i64 = (153 * mp + 2) / 5 + d - 1;
+    const doe : i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn dec_at(s : []const u8, at : usize, n : usize, out : []u64) -> bool {
+    if (at + n > s.len) { return false; }
+    var v : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        if (s[at + i] < 48 or s[at + i] > 57) { return false; }
+        v = v * 10 + @as(u64, s[at + i] - 48);
+        i = i + 1;
+    }
+    out[0] = v;
+    return true;
+}
+
+/// "2026-11-04T04:34:49.402Z" at `at` -> epoch ms. Returns the index after "Z", or 0 when the text is
+/// not that shape (a missing fraction is accepted as 0 ms).
+pub fn parse_iso_ms(s : []const u8, at : usize, out : []u64) -> usize {
+    var f : [1]u64 = undefined;
+    if (at + 19 > s.len) { return 0; }
+    if (s[at + 4] != 45 or s[at + 7] != 45 or s[at + 10] != 84 or s[at + 13] != 58 or s[at + 16] != 58) { return 0; }
+    if (dec_at(s, at, 4, f[0..1]) == false) { return 0; }
+    const y : i64 = @intCast(f[0]);
+    if (dec_at(s, at + 5, 2, f[0..1]) == false) { return 0; }
+    const mo : i64 = @intCast(f[0]);
+    if (dec_at(s, at + 8, 2, f[0..1]) == false) { return 0; }
+    const d : i64 = @intCast(f[0]);
+    if (dec_at(s, at + 11, 2, f[0..1]) == false) { return 0; }
+    const h : u64 = f[0];
+    if (dec_at(s, at + 14, 2, f[0..1]) == false) { return 0; }
+    const mi : u64 = f[0];
+    if (dec_at(s, at + 17, 2, f[0..1]) == false) { return 0; }
+    const se : u64 = f[0];
+    if (mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or se > 60) { return 0; }
+    var e : usize = at + 19;
+    var ms : u64 = 0;
+    if (e + 1 < s.len and s[e] == 46) {
+        if (dec_at(s, e + 1, 3, f[0..1]) == false) { return 0; }
+        ms = f[0];
+        e = e + 4;
+    }
+    if (e >= s.len or s[e] != 90) { return 0; }
+    const days : i64 = days_from_civil(y, mo, d);
+    const secs : i64 = days * 86400 + @as(i64, @intCast(h * 3600 + mi * 60 + se));
+    out[0] = @as(u64, @intCast(secs)) * 1000 + ms;
+    return e + 1;
+}
+
+// ---- 2. One ladder line is one request ----
+
+pub const LOG_PREFIX : str = "[ladder] ";
+pub const RUNG_ZAI : u64 = 0;
+pub const RUNG_OLLAMA : u64 = 1;
+pub const RUNG_DEEPSEEK : u64 = 2;
+/// The policy cell for a line written before the log carried one. Out of range on purpose: policy_word
+/// prints "unknown", and a record must never point at the current policy it did not run under.
+pub const POLICY_NOT_LOGGED : u64 = 999;
+
+fn find_after(s : []const u8, at : usize, word : []const u8) -> usize {
+    if (at + word.len > s.len) { return 0; }
+    if (same_bytes(s[at .. at + word.len], word) == false) { return 0; }
+    return at + word.len;
+}
+
+fn dec_run(s : []const u8, at : usize, out : []u64) -> usize {
+    var i : usize = at;
+    var v : u64 = 0;
+    while (i < s.len and s[i] >= 48 and s[i] <= 57 and i - at < 18) {
+        v = v * 10 + @as(u64, s[i] - 48);
+        i = i + 1;
+    }
+    if (i == at) { return 0; }
+    out[0] = v;
+    return i;
+}
+
+/// Parse "[ladder] <iso> rung=N status=S <dur>ms" into a trace record. False for any other line
+/// (startup banners, health prints, blank lines), so a whole log can be scanned without a filter.
+pub fn parse_ladder_line(line : []const u8, c : []u64) -> bool {
+    var f : [1]u64 = undefined;
+    var e : usize = find_after(line, 0, LOG_PREFIX);
+    if (e == 0) { return false; }
+    e = parse_iso_ms(line, e, f[0..1]);
+    if (e == 0) { return false; }
+    const started : u64 = f[0];
+    e = find_after(line, e, " rung=");
+    if (e == 0) { return false; }
+    e = dec_run(line, e, f[0..1]);
+    if (e == 0) { return false; }
+    const rung : u64 = f[0];
+    if (rung > RUNG_DEEPSEEK) { return false; }
+    e = find_after(line, e, " status=");
+    if (e == 0) { return false; }
+    e = dec_run(line, e, f[0..1]);
+    if (e == 0) { return false; }
+    const status : u64 = f[0];
+    e = find_after(line, e, " ");
+    if (e == 0) { return false; }
+    e = dec_run(line, e, f[0..1]);
+    if (e == 0) { return false; }
+    const dur : u64 = f[0];
+    if (find_after(line, e, "ms") == 0) { return false; }
+
+    var i : usize = 0;
+    while (i < TR_CELLS) { c[i] = 0; i = i + 1; }
+    c[TR_STARTED_MS] = started;
+    c[TR_DURATION_MS] = dur;
+    c[TR_RESOLVED_PROVIDER] = rung;
+    c[TR_FALLBACK_RUNG] = rung;
+    c[TR_ROUTE_REASON] = RR_DIRECT;
+    if (rung != RUNG_ZAI) { c[TR_ROUTE_REASON] = RR_FALLBACK; }
+    // the line names the rung's model only where the ladder has exactly one for that rung
+    c[TR_RESOLVED_MODEL] = MODEL_UNKNOWN;
+    if (rung == RUNG_OLLAMA) { c[TR_RESOLVED_MODEL] = 3; }
+    if (rung == RUNG_DEEPSEEK) { c[TR_RESOLVED_MODEL] = 4; }
+    // the rung's own status, and the envelope the client saw (the ladder rewrites every non-200 to 503)
+    c[TR_UPSTREAM] = status;
+    c[TR_GATEWAY] = 200;
+    if (status != 200) { c[TR_GATEWAY] = 503; }
+    c[TR_BODY_CLASS] = MT_UNKNOWN;
+    if (status == 402) { c[TR_BODY_CLASS] = MT_UNFUNDED; }
+    if (status == 200) { c[TR_BODY_CLASS] = MT_OK; }
+    // nothing below is in the line; each cell says so rather than defaulting to a happy value
+    c[TR_REQUESTED_MODEL] = MODEL_UNKNOWN;
+    c[TR_POLICY] = POLICY_NOT_LOGGED;
+    c[TR_CRED_KIND] = CS_UNKNOWN;
+    c[TR_CRED_SLOT] = 255;
+    c[TR_RETRY_REASON] = 0;
+    c[TR_USAGE_KNOWN] = 0;
+    c[TR_COST_KIND] = CK_UNKNOWN;
+    c[TR_COST_MICRO] = 0;
+    c[TR_ATTEMPT] = 0;
+    c[TR_PARENT] = 0;
+    return true;
+}
+
+// ---- 3. Rows as text, so a tool can hand them to the window ----
+
+/// 23 decimal cells, comma separated, no spaces: the file the panel reads.
+pub fn put_cells(c : []const u64, out : []u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < TR_CELLS) {
+        if (i > 0) { n = put_bytes(out, n, ","); }
+        n = put_dec(out, n, c[i]);
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The inverse. False when a cell is missing, non-numeric or overflows past `end`.
+pub fn get_cells(s : []const u8, end : usize, c : []u64) -> bool {
+    var at : usize = 0;
+    var k : usize = 0;
+    while (k < TR_CELLS) {
+        if (at >= end) { return false; }
+        var v : u64 = 0;
+        var digits : usize = 0;
+        while (at < end and s[at] != 44) {
+            if (s[at] < 48 or s[at] > 57) { return false; }
+            v = v * 10 + @as(u64, s[at] - 48);
+            at = at + 1;
+            digits = digits + 1;
+            if (digits > 20) { return false; }
+        }
+        if (digits == 0) { return false; }
+        c[k] = v;
+        k = k + 1;
+        if (at < end and s[at] == 44) { at = at + 1; }
+        else if (k < TR_CELLS) { return false; }
+    }
+    return at == end;
+}
+
+// ---- 4. Totals the log can support ----
+
+pub const ML_T_TOTAL : usize = 0;
+pub const ML_T_OK : usize = 1;
+pub const ML_T_UNFUNDED : usize = 2;
+pub const ML_T_OTHER : usize = 3;
+pub const ML_T_WASTED_MS : usize = 4;
+pub const ML_T_ROWS : usize = 5;
+pub const ML_T_START : usize = 6;
+pub const ML_T_CELLS : usize = 7;
+
+/// Scan a whole log buffer and keep the LAST `cap` requests, in order, in `rows` (cap * TR_CELLS cells).
+/// Totals cover the whole log, not the kept tail: a panel that showed only its window would understate
+/// the damage. `t[ML_T_START]` is the index of the oldest kept row.
+pub fn scan_log(buf : []const u8, n : usize, rows : []u64, cap : u32, t : []u64) -> void {
+    acc_init(t);
+    var c : [TR_CELLS]u64 = undefined;
+    var at : usize = 0;
+    while (at < n) {
+        var e : usize = at;
+        while (e < n and buf[e] != 10) { e = e + 1; }
+        if (parse_ladder_line(buf[at..e], c[0..TR_CELLS])) { acc_line(c[0..TR_CELLS], rows, cap, t); }
+        at = e + 1;
+    }
+    acc_finish(cap, t);
+}
+
+/// Zero the accumulator. Kept apart from scan_log so a caller that reads the log in chunks (the
+/// recorder) can hold the same totals with a 64 KB buffer instead of a whole-file one.
+pub fn acc_init(t : []u64) -> void {
+    var i : usize = 0;
+    while (i < ML_T_CELLS) { t[i] = 0; i = i + 1; }
+}
+
+/// One parsed request into the totals and the ring of kept rows. ML_T_START doubles as the running
+/// write counter while lines are arriving; acc_finish turns it into the oldest kept row.
+pub fn acc_line(c : []const u64, rows : []u64, cap : u32, t : []u64) -> void {
+    t[ML_T_TOTAL] = t[ML_T_TOTAL] + 1;
+    if (c[TR_UPSTREAM] == 200) {
+        t[ML_T_OK] = t[ML_T_OK] + 1;
+    } else {
+        t[ML_T_WASTED_MS] = t[ML_T_WASTED_MS] + c[TR_DURATION_MS];
+        if (c[TR_UPSTREAM] == 402) { t[ML_T_UNFUNDED] = t[ML_T_UNFUNDED] + 1; }
+        else { t[ML_T_OTHER] = t[ML_T_OTHER] + 1; }
+    }
+    if (cap == 0) { return; }
+    const pos : usize = @as(usize, t[ML_T_START] % cap);
+    var k : usize = 0;
+    while (k < TR_CELLS) {
+        rows[pos * TR_CELLS + k] = c[k];
+        k = k + 1;
+    }
+    t[ML_T_START] = t[ML_T_START] + 1;
+    if (t[ML_T_ROWS] < cap) { t[ML_T_ROWS] = t[ML_T_ROWS] + 1; }
+}
+
+/// The ring's oldest kept row, once every line has been seen.
+pub fn acc_finish(cap : u32, t : []u64) -> void {
+    const written : u64 = t[ML_T_START];
+    t[ML_T_START] = 0;
+    if (cap > 0 and written >= @as(u64, cap)) { t[ML_T_START] = written % @as(u64, cap); }
+}
+
+/// "ladder: 590 unfunded of 13069 requests, 899.7 min burned" -- minutes with one decimal from
+/// integer arithmetic, so no float decides a number the owner reads.
+pub fn q_log(t : []const u64, out : []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "ladder: ");
+    n = put_dec(out, n, t[ML_T_UNFUNDED]);
+    n = put_bytes(out, n, " unfunded of ");
+    n = put_dec(out, n, t[ML_T_TOTAL]);
+    n = put_bytes(out, n, " requests, ");
+    const mins : u64 = t[ML_T_WASTED_MS] / 60000;
+    const tenth : u64 = (t[ML_T_WASTED_MS] % 60000) / 6000;
+    n = put_dec(out, n, mins);
+    n = put_bytes(out, n, ".");
+    n = put_dec(out, n, tenth);
+    n = put_bytes(out, n, " min burned");
+    return n;
+}
+
+// ---- 5. Tests, on the real incident lines ----
+
+test the_timestamp_of_the_incident_decodes_to_its_epoch {
+    var o : [1]u64 = undefined;
+    const e : usize = parse_iso_ms("2026-11-04T04:34:49.402Z", 0, o[0..1]);
+    assert e == 24;
+    assert o[0] == 1793766889402;
+    // a leap day, and a date that is not one
+    assert parse_iso_ms("2024-02-29T00:00:00.000Z", 0, o[0..1]) == 24;
+    assert o[0] == 1709164800000;
+    assert parse_iso_ms("2026-02-29T00:00:00.000Z", 0, o[0..1]) == 24;
+    assert o[0] == 1772323200000;
+    // not a timestamp
+    assert parse_iso_ms("2026-11-04 04:34:49.402Z", 0, o[0..1]) == 0;
+    assert parse_iso_ms("2026-13-04T04:34:49.402Z", 0, o[0..1]) == 0;
+}
+
+test the_three_incident_lines_parse_to_the_same_shape {
+    var c : [TR_CELLS]u64 = undefined;
+    assert parse_ladder_line("[ladder] 2026-11-04T04:34:49.402Z rung=2 status=402 238398ms", c[0..TR_CELLS]);
+    assert c[TR_STARTED_MS] == 1793766889402;
+    assert c[TR_DURATION_MS] == 238398;
+    assert c[TR_RESOLVED_PROVIDER] == 2;
+    assert c[TR_ROUTE_REASON] == RR_FALLBACK;
+    assert c[TR_FALLBACK_RUNG] == 2;
+    assert c[TR_UPSTREAM] == 402;
+    assert c[TR_GATEWAY] == 503;
+    assert c[TR_BODY_CLASS] == MT_UNFUNDED;
+    // the fields the line does not carry
+    assert c[TR_REQUESTED_MODEL] == MODEL_UNKNOWN;
+    assert c[TR_CRED_KIND] == CS_UNKNOWN;
+    assert c[TR_USAGE_KNOWN] == 0;
+    assert c[TR_COST_KIND] == CK_UNKNOWN;
+    assert c[TR_POLICY] == POLICY_NOT_LOGGED;
+    // the other two attempts of the same turn
+    assert parse_ladder_line("[ladder] 2026-11-04T04:35:12.875Z rung=2 status=402 91823ms", c[0..TR_CELLS]);
+    assert c[TR_DURATION_MS] == 91823;
+    assert parse_ladder_line("[ladder] 2026-11-04T04:35:26.011Z rung=2 status=402 90011ms", c[0..TR_CELLS]);
+    assert c[TR_STARTED_MS] == 1793766926011;
+}
+
+test a_served_request_is_direct_and_a_banner_is_not_a_request {
+    var c : [TR_CELLS]u64 = undefined;
+    assert parse_ladder_line("[ladder] 2026-11-04T04:30:15.716Z rung=0 status=200 20982ms", c[0..TR_CELLS]);
+    assert c[TR_ROUTE_REASON] == RR_DIRECT;
+    assert c[TR_GATEWAY] == 200;
+    assert c[TR_BODY_CLASS] == MT_OK;
+    assert c[TR_RESOLVED_MODEL] == MODEL_UNKNOWN;
+    // rung 1 and rung 2 have exactly one model each, so the line does pin it
+    assert parse_ladder_line("[ladder] 2026-11-04T04:30:15.716Z rung=1 status=200 1200ms", c[0..TR_CELLS]);
+    assert c[TR_RESOLVED_MODEL] == 3;
+    assert parse_ladder_line("[ladder] 2026-11-04T04:30:15.716Z rung=2 status=200 900ms", c[0..TR_CELLS]);
+    assert c[TR_RESOLVED_MODEL] == 4;
+    // anything else is not a request
+    assert parse_ladder_line("[ladder] listening on 127.0.0.1:3131, zai keys: 5, head: glm-4.5-flash, V1+V2+V3", c[0..TR_CELLS]) == false;
+    assert parse_ladder_line("", c[0..TR_CELLS]) == false;
+    assert parse_ladder_line("[ladder] 2026-11-04T04:30:15.716Z rung=7 status=200 1ms", c[0..TR_CELLS]) == false;
+    assert parse_ladder_line("[ladder] 2026-11-04T04:30:15.716Z rung=0 status=200", c[0..TR_CELLS]) == false;
+}
+
+test cells_round_trip_through_the_text_the_panel_reads {
+    var c : [TR_CELLS]u64 = undefined;
+    assert parse_ladder_line("[ladder] 2026-11-04T04:34:49.402Z rung=2 status=402 238398ms", c[0..TR_CELLS]);
+    var buf : [512]u8 = undefined;
+    const n : usize = put_cells(c[0..TR_CELLS], buf[0..512]);
+    assert n > 0;
+    var d : [TR_CELLS]u64 = undefined;
+    assert get_cells(buf[0..512], n, d[0..TR_CELLS]);
+    var i : usize = 0;
+    while (i < TR_CELLS) {
+        assert d[i] == c[i];
+        i = i + 1;
+    }
+    // a truncated or padded line is refused, not zero-filled
+    assert get_cells(buf[0..512], n - 2, d[0..TR_CELLS]) == false;
+    var bad : [32]u8 = undefined;
+    const bn : usize = put_bytes(bad[0..32], 0, "1,2,3,4,5,6,7,8,9");
+    assert get_cells(bad[0..32], bn, d[0..TR_CELLS]) == false;
+}
+
+test the_scan_keeps_the_tail_and_counts_the_whole_log {
+    var log : [1024]u8 = undefined;
+    var w : usize = 0;
+    w = put_bytes(log[0..1024], w, "[ladder] 2026-11-04T04:30:15.716Z rung=0 status=200 20982ms\n");
+    w = put_bytes(log[0..1024], w, "[ladder] listening on 127.0.0.1:3131\n");
+    w = put_bytes(log[0..1024], w, "[ladder] 2026-11-04T04:34:49.402Z rung=2 status=402 238398ms\n");
+    w = put_bytes(log[0..1024], w, "[ladder] 2026-11-04T04:35:12.875Z rung=2 status=402 91823ms\n");
+    w = put_bytes(log[0..1024], w, "[ladder] 2026-11-04T04:35:26.011Z rung=2 status=402 90011ms\n");
+    var rows : [2 * TR_CELLS]u64 = undefined;
+    var t : [ML_T_CELLS]u64 = undefined;
+    scan_log(log[0..1024], w, rows[0..2 * TR_CELLS], 2, t[0..ML_T_CELLS]);
+    assert t[ML_T_TOTAL] == 4;
+    assert t[ML_T_OK] == 1;
+    assert t[ML_T_UNFUNDED] == 3;
+    assert t[ML_T_OTHER] == 0;
+    assert t[ML_T_WASTED_MS] == 238398 + 91823 + 90011;
+    assert t[ML_T_ROWS] == 2;
+    // the tail, oldest first: 04:35:12 then 04:35:26
+    const s : usize = @as(usize, t[ML_T_START]);
+    assert rows[s * TR_CELLS + TR_DURATION_MS] == 91823;
+    const s2 : usize = (s + 1) % 2;
+    assert rows[s2 * TR_CELLS + TR_DURATION_MS] == 90011;
+    var out : [96]u8 = undefined;
+    const qn : usize = q_log(t[0..ML_T_CELLS], out[0..96]);
+    assert same_bytes(out[0..qn], "ladder: 3 unfunded of 4 requests, 7.0 min burned");
+}
+
+test feeding_the_lines_in_two_chunks_gives_the_same_totals_and_ring {
+    // the recorder reads 64 KB at a time; a line cut by the chunk edge must not be counted twice or
+    // dropped, so the accumulator is fed whole lines only and this test proves the totals agree
+    var a : [256]u8 = undefined;
+    var w : usize = put_bytes(a[0..256], 0, "[ladder] 2026-11-04T04:30:15.716Z rung=0 status=200 20982ms\n");
+    w = put_bytes(a[0..256], w, "[ladder] 2026-11-04T04:34:49.402Z rung=2 status=402 238398ms\n");
+    w = put_bytes(a[0..256], w, "[ladder] 2026-11-04T04:35:12.875Z rung=2 status=402 91823ms\n");
+    var rows_a : [2 * TR_CELLS]u64 = undefined;
+    var ta : [ML_T_CELLS]u64 = undefined;
+    scan_log(a[0..256], w, rows_a[0..2 * TR_CELLS], 2, ta[0..ML_T_CELLS]);
+    // the same text split at byte 40, then fed line by line
+    var rows_b : [2 * TR_CELLS]u64 = undefined;
+    var tb : [ML_T_CELLS]u64 = undefined;
+    acc_init(tb[0..ML_T_CELLS]);
+    var c : [TR_CELLS]u64 = undefined;
+    var at : usize = 0;
+    while (at < w) {
+        var e : usize = at;
+        while (e < w and a[e] != 10) { e = e + 1; }
+        if (parse_ladder_line(a[at..e], c[0..TR_CELLS])) { acc_line(c[0..TR_CELLS], rows_b[0..2 * TR_CELLS], 2, tb[0..ML_T_CELLS]); }
+        at = e + 1;
+    }
+    acc_finish(2, tb[0..ML_T_CELLS]);
+    var i : usize = 0;
+    while (i < ML_T_CELLS) {
+        assert ta[i] == tb[i];
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < 2 * TR_CELLS) {
+        assert rows_a[j] == rows_b[j];
+        j = j + 1;
+    }
+    assert tb[ML_T_START] == 1;
+}
+
+test a_cap_of_one_still_reports_the_last_request {
+    var log : [256]u8 = undefined;
+    var w : usize = 0;
+    w = put_bytes(log[0..256], w, "[ladder] 2026-11-04T04:34:49.402Z rung=2 status=402 238398ms\n");
+    w = put_bytes(log[0..256], w, "[ladder] 2026-11-04T05:04:52.158Z rung=2 status=402 95213ms\n");
+    var rows : [TR_CELLS]u64 = undefined;
+    var t : [ML_T_CELLS]u64 = undefined;
+    scan_log(log[0..256], w, rows[0..TR_CELLS], 1, t[0..ML_T_CELLS]);
+    assert t[ML_T_ROWS] == 1;
+    assert t[ML_T_START] == 0;
+    assert rows[TR_DURATION_MS] == 95213;
+}
