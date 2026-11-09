@@ -1,0 +1,872 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/tri/trigit/roadmap_dashboard_sync.t27 -- the roadmap, the board and the owner dashboard as PROJECTIONS of
+// the one canonical work graph (owner order T27V_ROADMAP_DASHBOARD_SYNC V3, 2026-11-08, Wave A: the contract).
+//
+// WHY. The graph is the source of truth. Roadmap membership, the P0..P3 priority, the board column and the GitHub
+// labels are computed from it; none of them is ever read back as a fact about the work. A label that disagrees
+// with the graph is a sync action, never a correction of the graph.
+//
+// PIECES (each is a pure function; the host that talks to GitHub is Wave B):
+//   1 projection   RdLife (what the graph cannot hold: owner decisions, open/closed, clock-held times) and RdItem
+//                  (member, level, column, labels) -- rd_project(g, n, life, src)
+//   2 membership   rd_member_bits reads the graph (parent epic, SUPERSEDES in, DEPENDS_ON from a RELEASE) and adds
+//                  the life bits; rd_member applies one written precedence
+//   3 priority     rd_target_level (P0 triggers > critical path > polish > normal); P0 only through the hard gates
+//                  of queen/roadmap.t27 (p0_justified); rd_level_step holds a change 30 s up, 60 s down, and only
+//                  with a reason and evidence (priority_change_ok)
+//   4 board        rd_column: Done needs a verified artifact (wx_issue_has_verified_artifact) and no open
+//                  dependency; a missing or fixture feed for a live-feed item is Blocked, honestly
+//   5 labels       one bit each; rd_labels_ok: at most one priority, at most one column label, live-feed and
+//                  replay-only exclusive, fixture-only never with live-feed
+//   6 sync         rd_add / rd_remove are a diff over the schema mask only (foreign labels untouched), so a replay
+//                  plans nothing; rd_cycle_now / rd_cycle_overflow bound one cycle at 100 actions and send the rest
+//                  to the durable dead letter (t27m TM_DL_OVERFLOW); rd_debounce_fire batches events (500 ms quiet)
+//   7 write policy rd_write_policy: read allow; add/remove label, move card policy-gated; create issue, close issue
+//                  (with evidence), delete label owner-gated; delete issue and repository settings forbidden
+//   8 dashboard    one dashboard, twelve filters as pure queries (rd_filter_match); a filter change is the event
+//                  dashboard_view_changed, there is no view switch
+//   9 events       every name is looked up in t27os/t27l.t27 (surface "roadmap", actions 157..174, 72)
+//
+// REUSED, NOT COPIED: queen/roadmap.t27 (ST_* columns, p0_justified, priority_change_ok); queen/priority.t27
+// (LEVEL_*); t27f/work_graph.t27 + work_graph_ext.t27 (the one graph, the extension kinds, verified artifacts);
+// t27f/lukomorye_graph_terminal.t27 (LK_SRC_* sources, lk_empty_state); t27os/t27m.t27 (dead-letter reason and
+// class); t27os/t27l.t27 (event ids). Times are monotonic-clock inputs (t27os/t27t.t27), never a wall clock.
+//
+// NOT CLAIMED: no GitHub call, no host, no renderer and no t27b build exist yet (Waves B..D). The tests below were
+// checked by hand, not run: the swap gate was BLOCKED when this was written, so no test ran. The order's actor
+// 0xPlanner@product.t27 is an agent; t27l's actor field holds user/agent/system, so the name goes in the payload.
+// Choices of this file, not numbers of the order: the debounce max wait (RD_DEBOUNCE_MAX_MS) and the membership
+// precedence; both are written below so the owner can change them in one place.
+
+module TriTrigitRoadmapDashboardSync;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::nodes;
+use t27f::work_graph::edges;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::edge_kind_at;
+use t27f::work_graph::edge_from_at;
+use t27f::work_graph::edge_to_at;
+use t27f::work_graph::NK_ARTIFACT;
+use t27f::work_graph::EK_VERIFIES;
+use t27f::work_graph::EK_BLOCKS;
+use t27f::work_graph::WG_OK;
+use t27f::work_graph::NODE_CAP;
+use t27f::spec_graph::LABEL_EXACT;
+use t27f::work_graph_ext::NX_ROOT;
+use t27f::work_graph_ext::NX_TRUNK;
+use t27f::work_graph_ext::NX_EPIC;
+use t27f::work_graph_ext::NX_ISSUE;
+use t27f::work_graph_ext::NX_RELEASE;
+use t27f::work_graph_ext::EX_BELONGS_TO;
+use t27f::work_graph_ext::EX_DEPENDS_ON;
+use t27f::work_graph_ext::EX_SUPERSEDES;
+use t27f::work_graph_ext::wx_ensure_node;
+use t27f::work_graph_ext::wx_add_edge;
+use t27f::work_graph_ext::wx_parent;
+use t27f::work_graph_ext::wx_has_in;
+use t27f::work_graph_ext::wx_issue_has_verified_artifact;
+use t27f::lukomorye_graph_terminal::LK_SRC_NONE;
+use t27f::lukomorye_graph_terminal::LK_SRC_FIXTURE;
+use t27f::lukomorye_graph_terminal::LK_SRC_REPLAY;
+use t27f::lukomorye_graph_terminal::LK_SRC_LIVE;
+use t27f::lukomorye_graph_terminal::lk_empty_state;
+use queen::priority::LEVEL_CRITICAL;
+use queen::priority::LEVEL_HIGH;
+use queen::priority::LEVEL_NORMAL;
+use queen::priority::LEVEL_LOW;
+use queen::roadmap::ST_BACKLOG;
+use queen::roadmap::ST_IN_PROGRESS;
+use queen::roadmap::ST_BLOCKED;
+use queen::roadmap::ST_DONE;
+use queen::roadmap::G_SAFETY;
+use queen::roadmap::G_E2E;
+use queen::roadmap::G_UNBLOCKS;
+use queen::roadmap::p0_justified;
+use queen::roadmap::priority_change_ok;
+use t27os::t27m::TM_DL_OVERFLOW;
+use t27os::t27m::TM_FC_TRANSIENT;
+use t27os::t27l::tl_action_id;
+use t27os::t27l::tl_surface_id;
+
+// ---- 1. projection ----
+
+/// What the graph cannot hold, for one item: owner decisions, open/closed state of neighbours, and the inputs of
+/// the priority and board rules. Every field is an input; nothing here is computed from labels.
+pub struct RdLife {
+    owner_added: bool,
+    owner_removed: bool,
+    epic_archived: bool,
+    blocks_critical: bool,
+    done_not_required: bool,
+    triggers: u32,
+    critical_path: bool,
+    polish: bool,
+    started: bool,
+    open_blockers: u32,
+    open_deps: u32,
+    needs_live: bool,
+    hygiene: u32,
+}
+
+/// The projection of one item: what the roadmap, the board and the labels must say about it.
+pub struct RdItem {
+    member: bool,
+    level: u8,
+    column: u8,
+    labels: u32,
+}
+
+/// A life record with nothing set: an ordinary open issue with no owner decision, no trigger and no feed need.
+pub fn rd_life_none() -> RdLife {
+    return RdLife { owner_added: false, owner_removed: false, epic_archived: false, blocks_critical: false,
+        done_not_required: false, triggers: 0, critical_path: false, polish: false, started: false,
+        open_blockers: 0, open_deps: 0, needs_live: false, hygiene: 0 };
+}
+
+// ---- 2. membership ----
+
+/// Enter reasons.
+pub const M_ACTIVE_EPIC : u32 = 1;
+pub const M_BLOCKS_CRITICAL : u32 = 2;
+pub const M_RELEASE_REQUIRED : u32 = 4;
+pub const M_OWNER_ADDED : u32 = 8;
+/// Leave reasons.
+pub const M_EPIC_ARCHIVED : u32 = 16;
+pub const M_SUPERSEDED : u32 = 32;
+pub const M_OWNER_REMOVED : u32 = 64;
+pub const M_DONE_NOT_REQUIRED : u32 = 128;
+pub const M_ENTER : u32 = 15;
+
+/// Does a RELEASE node DEPEND_ON n?
+pub fn rd_release_requires(g: *WorkGraph, n: u32) -> bool {
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == EX_DEPENDS_ON && edge_to_at(g, e) == n) {
+            if (node_kind_at_pub(g, edge_from_at(g, e)) == NX_RELEASE) { return true; }
+        }
+        e = e + 1;
+    }
+    return false;
+}
+
+/// The membership bits: the graph decides the epic parent, the supersession and the release need; the life record
+/// adds only what the graph cannot hold. An archived epic counts only when the item really has an epic parent.
+pub fn rd_member_bits(g: *WorkGraph, n: u32, life: RdLife) -> u32 {
+    var b : u32 = 0;
+    if (n >= nodes(g)) { return 0; }
+    const p : u32 = wx_parent(g, n);
+    if (p != NODE_CAP) {
+        if (node_kind_at_pub(g, p) == NX_EPIC) {
+            if (life.epic_archived) { b = b | M_EPIC_ARCHIVED; } else { b = b | M_ACTIVE_EPIC; }
+        }
+    }
+    if (wx_has_in(g, n, EX_SUPERSEDES)) { b = b | M_SUPERSEDED; }
+    if (rd_release_requires(g, n)) { b = b | M_RELEASE_REQUIRED; }
+    if (life.blocks_critical) { b = b | M_BLOCKS_CRITICAL; }
+    if (life.owner_added) { b = b | M_OWNER_ADDED; }
+    if (life.owner_removed) { b = b | M_OWNER_REMOVED; }
+    if (life.done_not_required) { b = b | M_DONE_NOT_REQUIRED; }
+    return b;
+}
+
+/// The precedence (a choice of this file): owner removed -> out; superseded -> out (the superseding item carries
+/// the work); owner added -> in; epic archived or done and no longer required -> out; any enter reason -> in.
+pub fn rd_member(bits: u32) -> bool {
+    if ((bits & M_OWNER_REMOVED) != 0) { return false; }
+    if ((bits & M_SUPERSEDED) != 0) { return false; }
+    if ((bits & M_OWNER_ADDED) != 0) { return true; }
+    if ((bits & (M_EPIC_ARCHIVED | M_DONE_NOT_REQUIRED)) != 0) { return false; }
+    return (bits & M_ENTER) != 0;
+}
+
+// ---- 3. priority with hysteresis ----
+
+/// P0 triggers. Each maps onto a hard gate of queen/roadmap.t27, so P0 has one law.
+pub const T_SWAP_GATE : u32 = 1;
+pub const T_BILLING_BLOCK : u32 = 2;
+pub const T_COMPILE_ERROR : u32 = 4;
+pub const T_FEED_MISSING : u32 = 8;
+pub const T_SECURITY : u32 = 16;
+
+/// Triggers as hard gates: swap gate and security are safety, compile error and a missing live feed break the end
+/// to end path, a billing block blocks everything behind it.
+pub fn rd_gate_flags(triggers: u32) -> u32 {
+    var f : u32 = 0;
+    if ((triggers & (T_SWAP_GATE | T_SECURITY)) != 0) { f = f | G_SAFETY; }
+    if ((triggers & (T_COMPILE_ERROR | T_FEED_MISSING)) != 0) { f = f | G_E2E; }
+    if ((triggers & T_BILLING_BLOCK) != 0) { f = f | G_UNBLOCKS; }
+    return f;
+}
+
+/// The level the graph state asks for: a higher level overrides a lower one.
+pub fn rd_target_level(triggers: u32, critical_path: bool, polish: bool) -> u8 {
+    if (rd_gate_flags(triggers) != 0) { return LEVEL_CRITICAL; }
+    if (critical_path) { return LEVEL_HIGH; }
+    if (polish) { return LEVEL_LOW; }
+    return LEVEL_NORMAL;
+}
+
+pub const RD_ESCALATE_MS : u64 = 30000;
+pub const RD_DEESCALATE_MS : u64 = 60000;
+
+/// One hysteresis step. held_ms is how long the target has differed from the current level without a break
+/// (monotonic clock). A change needs a reason and evidence; up waits 30 s, down waits 60 s.
+pub fn rd_level_step(current: u8, target: u8, held_ms: u64, has_reason: bool, evidence: u32) -> u8 {
+    if (target == current) { return current; }
+    if (!priority_change_ok(current, target, has_reason, evidence)) { return current; }
+    if (target < current) {
+        if (held_ms >= RD_ESCALATE_MS) { return target; }
+        return current;
+    }
+    if (held_ms >= RD_DEESCALATE_MS) { return target; }
+    return current;
+}
+
+// ---- 4. board ----
+
+/// Is the item waiting on a live feed it does not have? A fixture never passes as live; a replay is offline mode.
+pub fn rd_feed_blocked(needs_live: bool, src: u8) -> bool {
+    if (!needs_live) { return false; }
+    return src == LK_SRC_NONE || src == LK_SRC_FIXTURE;
+}
+
+/// The column: Done (verified artifact, no open dependency) > Blocked (an open blocker or a missing feed)
+/// > In Progress (started) > Backlog.
+pub fn rd_column(verified: bool, open_deps: u32, open_blockers: u32, feed_blocked: bool, started: bool) -> u8 {
+    if (verified && open_deps == 0) { return ST_DONE; }
+    if (open_blockers > 0 || feed_blocked) { return ST_BLOCKED; }
+    if (started) { return ST_IN_PROGRESS; }
+    return ST_BACKLOG;
+}
+
+/// Does any BLOCKS edge enter n? The life record says how many of those blockers are still open.
+pub fn rd_has_blocker(g: *WorkGraph, n: u32) -> bool {
+    return wx_has_in(g, n, EK_BLOCKS);
+}
+
+// ---- 5. labels ----
+
+pub const L_ROADMAP : u32 = 1;
+pub const L_P0 : u32 = 2;
+pub const L_P1 : u32 = 4;
+pub const L_P2 : u32 = 8;
+pub const L_P3 : u32 = 16;
+pub const L_BLOCKED : u32 = 32;
+pub const L_IN_PROGRESS : u32 = 64;
+pub const L_DONE : u32 = 128;
+pub const L_LIVE_FEED : u32 = 256;
+pub const L_REPLAY_ONLY : u32 = 512;
+pub const L_FIXTURE_ONLY : u32 = 1024;
+pub const L_DUPLICATE : u32 = 2048;
+pub const L_STALE : u32 = 4096;
+pub const L_RESOLVED_ELSEWHERE : u32 = 8192;
+pub const L_HYGIENE_REVIEW : u32 = 16384;
+pub const L_COUNT : u32 = 15;
+/// Every label of the schema; a label outside this mask belongs to someone else and sync never touches it.
+pub const L_MASK : u32 = 32767;
+pub const L_PRIORITY : u32 = 30;
+pub const L_COLUMN : u32 = 224;
+pub const L_HYGIENE : u32 = 30720;
+
+/// The GitHub name of label bit k (0..14); "" past the last.
+pub fn rd_label_name(k: u32) -> []const u8 {
+    if (k == 0) { return "roadmap"; }
+    if (k == 1) { return "P0"; }
+    if (k == 2) { return "P1"; }
+    if (k == 3) { return "P2"; }
+    if (k == 4) { return "P3"; }
+    if (k == 5) { return "blocked"; }
+    if (k == 6) { return "in-progress"; }
+    if (k == 7) { return "done"; }
+    if (k == 8) { return "live-feed"; }
+    if (k == 9) { return "replay-only"; }
+    if (k == 10) { return "fixture-only"; }
+    if (k == 11) { return "duplicate"; }
+    if (k == 12) { return "stale"; }
+    if (k == 13) { return "resolved-elsewhere"; }
+    if (k == 14) { return "hygiene-review"; }
+    return "";
+}
+
+pub fn rd_popcount(x: u32) -> u32 {
+    var c : u32 = 0;
+    var v : u32 = x;
+    while (v != 0) {
+        c = c + (v & 1);
+        v = v >> 1;
+    }
+    return c;
+}
+
+/// The label rules: at most one priority, at most one column label, live-feed excludes replay-only and
+/// fixture-only (a fixture never passes as live).
+pub fn rd_labels_ok(set: u32) -> bool {
+    if (rd_popcount(set & L_PRIORITY) > 1) { return false; }
+    if (rd_popcount(set & L_COLUMN) > 1) { return false; }
+    if ((set & L_LIVE_FEED) != 0 && (set & (L_REPLAY_ONLY | L_FIXTURE_ONLY)) != 0) { return false; }
+    return true;
+}
+
+pub fn rd_level_label(level: u8) -> u32 {
+    if (level == LEVEL_CRITICAL) { return L_P0; }
+    if (level == LEVEL_HIGH) { return L_P1; }
+    if (level == LEVEL_NORMAL) { return L_P2; }
+    return L_P3;
+}
+
+pub fn rd_column_label(column: u8) -> u32 {
+    if (column == ST_BLOCKED) { return L_BLOCKED; }
+    if (column == ST_IN_PROGRESS) { return L_IN_PROGRESS; }
+    if (column == ST_DONE) { return L_DONE; }
+    return 0;
+}
+
+/// The feed label of an item that needs a live feed; none without a feed (the item is Blocked instead).
+pub fn rd_feed_label(needs_live: bool, src: u8) -> u32 {
+    if (!needs_live) { return 0; }
+    if (src == LK_SRC_LIVE) { return L_LIVE_FEED; }
+    if (src == LK_SRC_REPLAY) { return L_REPLAY_ONLY; }
+    if (src == LK_SRC_FIXTURE) { return L_FIXTURE_ONLY; }
+    return 0;
+}
+
+/// The labels the projection asks for. Roadmap, priority and column labels only on a member; the feed label and
+/// the hygiene labels (from issue_hygiene_engine.t27) on any item.
+pub fn rd_labels(member: bool, level: u8, column: u8, needs_live: bool, src: u8, hygiene: u32) -> u32 {
+    var s : u32 = rd_feed_label(needs_live, src) | (hygiene & L_HYGIENE);
+    if (member) { s = s | L_ROADMAP | rd_level_label(level) | rd_column_label(column); }
+    return s;
+}
+
+/// The whole projection of item n. level is the level after hysteresis, which the caller holds.
+pub fn rd_project(g: *WorkGraph, n: u32, life: RdLife, level: u8, src: u8) -> RdItem {
+    const member : bool = rd_member(rd_member_bits(g, n, life));
+    const verified : bool = wx_issue_has_verified_artifact(g, n);
+    const fb : bool = rd_feed_blocked(life.needs_live, src);
+    const col : u8 = rd_column(verified, life.open_deps, life.open_blockers, fb, life.started);
+    return RdItem { member: member, level: level, column: col,
+        labels: rd_labels(member, level, col, life.needs_live, src, life.hygiene) };
+}
+
+// ---- 6. sync: idempotent diff, bounded cycle, debounce ----
+
+/// Labels to add and to remove so that the item shows `want`; labels outside the schema are never named.
+pub fn rd_add(want: u32, have: u32) -> u32 {
+    return (want & L_MASK) & ~have;
+}
+
+pub fn rd_remove(want: u32, have: u32) -> u32 {
+    return (have & L_MASK) & ~want;
+}
+
+/// What the item carries after the plan ran: the schema part is `want`, the foreign part is untouched.
+pub fn rd_after(want: u32, have: u32) -> u32 {
+    return (have & ~rd_add(want, have) & ~rd_remove(want, have)) | rd_add(want, have);
+}
+
+/// Actions of one item: one per label added or removed, plus one card move when the column differs.
+pub fn rd_plan_count(want: RdItem, have: RdItem) -> u32 {
+    var c : u32 = rd_popcount(rd_add(want.labels, have.labels)) + rd_popcount(rd_remove(want.labels, have.labels));
+    if (want.column != have.column) { c = c + 1; }
+    return c;
+}
+
+pub const RD_CYCLE_MAX : u32 = 100;
+
+/// Actions run this cycle; the rest go to the durable dead letter, none is dropped.
+pub fn rd_cycle_now(planned: u32) -> u32 {
+    if (planned > RD_CYCLE_MAX) { return RD_CYCLE_MAX; }
+    return planned;
+}
+
+pub fn rd_cycle_overflow(planned: u32) -> u32 {
+    return planned - rd_cycle_now(planned);
+}
+
+/// The dead-letter reason and class of an overflowed action: overflow, transient (the next cycle replans it).
+pub fn rd_overflow_reason() -> u8 {
+    return TM_DL_OVERFLOW;
+}
+
+pub fn rd_overflow_class() -> u8 {
+    return TM_FC_TRANSIENT;
+}
+
+pub const RD_DEBOUNCE_MS : u64 = 500;
+/// A choice of this file: a stream with no 500 ms gap still syncs after ten debounce periods.
+pub const RD_DEBOUNCE_MAX_MS : u64 = 5000;
+
+/// Fire one batched sync: something is pending and the stream was quiet for 500 ms, or the oldest pending event
+/// has waited the max.
+pub fn rd_debounce_fire(pending: u32, quiet_ms: u64, oldest_ms: u64) -> bool {
+    if (pending == 0) { return false; }
+    if (quiet_ms >= RD_DEBOUNCE_MS) { return true; }
+    return oldest_ms >= RD_DEBOUNCE_MAX_MS;
+}
+
+/// The sync triggers of the order. Each one replans the same idempotent projection; the daily cron also runs the
+/// hygiene engine.
+pub const RT_TASK_CREATED : u8 = 0;
+pub const RT_TASK_STARTED : u8 = 1;
+pub const RT_TASK_COMPLETED : u8 = 2;
+pub const RT_TASK_FAILED : u8 = 3;
+pub const RT_ERROR_RAISED : u8 = 4;
+pub const RT_BLOCKER_ADDED : u8 = 5;
+pub const RT_BLOCKER_REMOVED : u8 = 6;
+pub const RT_ARTIFACT_VERIFIED : u8 = 7;
+pub const RT_LIVE_FEED_CHANGED : u8 = 8;
+pub const RT_EPIC_CREATED : u8 = 9;
+pub const RT_EPIC_ARCHIVED : u8 = 10;
+pub const RT_OWNER_DECISION : u8 = 11;
+pub const RT_ISSUE_OPENED : u8 = 12;
+pub const RT_ISSUE_CLOSED : u8 = 13;
+pub const RT_ISSUE_LABELED : u8 = 14;
+pub const RT_DAILY_HYGIENE : u8 = 15;
+pub const RT_COUNT : u8 = 16;
+
+pub fn rd_trigger_ok(t: u8) -> bool {
+    return t < RT_COUNT;
+}
+
+pub fn rd_trigger_runs_hygiene(t: u8) -> bool {
+    return t == RT_DAILY_HYGIENE;
+}
+
+// ---- 7. GitHub write policy ----
+
+pub const GA_READ : u8 = 0;
+pub const GA_ADD_LABEL : u8 = 1;
+pub const GA_REMOVE_LABEL : u8 = 2;
+pub const GA_MOVE_CARD : u8 = 3;
+pub const GA_CREATE_ISSUE : u8 = 4;
+pub const GA_CLOSE_ISSUE : u8 = 5;
+pub const GA_DELETE_LABEL : u8 = 6;
+pub const GA_MODIFY_SETTINGS : u8 = 7;
+pub const GA_DELETE_ISSUE : u8 = 8;
+pub const GA_COUNT : u8 = 9;
+
+pub const PW_ALLOW : u8 = 0;
+pub const PW_POLICY : u8 = 1;
+pub const PW_OWNER : u8 = 2;
+pub const PW_FORBIDDEN : u8 = 3;
+
+pub fn rd_write_policy(a: u8) -> u8 {
+    if (a == GA_READ) { return PW_ALLOW; }
+    if (a == GA_ADD_LABEL || a == GA_REMOVE_LABEL || a == GA_MOVE_CARD) { return PW_POLICY; }
+    if (a == GA_CREATE_ISSUE || a == GA_CLOSE_ISSUE || a == GA_DELETE_LABEL) { return PW_OWNER; }
+    return PW_FORBIDDEN;
+}
+
+/// May this write run now? A close also needs its evidence; an unknown action is forbidden.
+pub fn rd_write_allowed(a: u8, policy_ok: bool, owner_ok: bool, has_evidence: bool) -> bool {
+    const p : u8 = rd_write_policy(a);
+    if (p == PW_ALLOW) { return true; }
+    if (p == PW_POLICY) { return policy_ok; }
+    if (p == PW_OWNER) {
+        if (a == GA_CLOSE_ISSUE && !has_evidence) { return false; }
+        return owner_ok;
+    }
+    return false;
+}
+
+// ---- 8. the one dashboard and its filters ----
+
+pub const RF_ALL : u8 = 0;
+pub const RF_P0_BLOCKERS : u8 = 1;
+pub const RF_ACTIVE_EPICS : u8 = 2;
+pub const RF_BLOCKED : u8 = 3;
+pub const RF_IN_PROGRESS : u8 = 4;
+pub const RF_DONE_VERIFIED : u8 = 5;
+pub const RF_LIVE_FEED : u8 = 6;
+pub const RF_REPLAY_ONLY : u8 = 7;
+pub const RF_STALE : u8 = 8;
+pub const RF_DUPLICATES : u8 = 9;
+pub const RF_RESOLVED_OPEN : u8 = 10;
+pub const RF_HYGIENE_QUEUE : u8 = 11;
+pub const RF_COUNT : u8 = 12;
+
+pub fn rd_filter_ok(f: u8) -> bool {
+    return f < RF_COUNT;
+}
+
+/// Does a row pass filter f? A pure query over the projection; it changes nothing and shows no other view.
+/// is_epic says the row is an EPIC node. Roadmap filters show members; hygiene filters show any item.
+pub fn rd_filter_match(f: u8, it: RdItem, is_epic: bool) -> bool {
+    if (f == RF_ALL) { return it.member; }
+    if (f == RF_P0_BLOCKERS) { return it.member && it.level == LEVEL_CRITICAL; }
+    if (f == RF_ACTIVE_EPICS) { return it.member && is_epic; }
+    if (f == RF_BLOCKED) { return it.member && it.column == ST_BLOCKED; }
+    if (f == RF_IN_PROGRESS) { return it.member && it.column == ST_IN_PROGRESS; }
+    if (f == RF_DONE_VERIFIED) { return it.member && it.column == ST_DONE; }
+    if (f == RF_LIVE_FEED) { return (it.labels & L_LIVE_FEED) != 0; }
+    if (f == RF_REPLAY_ONLY) { return (it.labels & L_REPLAY_ONLY) != 0; }
+    if (f == RF_STALE) { return (it.labels & L_STALE) != 0; }
+    if (f == RF_DUPLICATES) { return (it.labels & L_DUPLICATE) != 0; }
+    if (f == RF_RESOLVED_OPEN) { return (it.labels & L_RESOLVED_ELSEWHERE) != 0; }
+    if (f == RF_HYGIENE_QUEUE) { return (it.labels & L_HYGIENE_REVIEW) != 0; }
+    return false;
+}
+
+/// The honest empty state of the dashboard: no feed, or nothing projected.
+pub fn rd_dashboard_empty(src: u8, rows: u32) -> bool {
+    return lk_empty_state(src, rows);
+}
+
+// ---- 9. T27L events ----
+
+pub fn rd_surface() -> u8 {
+    return tl_surface_id("roadmap");
+}
+
+/// Each event id is looked up by name in t27l, so a renamed or missing event fails the test below.
+pub fn rd_ev_membership() -> u8 { return tl_action_id("roadmap_membership_changed"); }
+pub fn rd_ev_priority() -> u8 { return tl_action_id("priority_changed"); }
+pub fn rd_ev_column() -> u8 { return tl_action_id("board_column_changed"); }
+pub fn rd_ev_label_added() -> u8 { return tl_action_id("label_added"); }
+pub fn rd_ev_label_removed() -> u8 { return tl_action_id("label_removed"); }
+pub fn rd_ev_label_failed() -> u8 { return tl_action_id("label_sync_failed"); }
+pub fn rd_ev_synced() -> u8 { return tl_action_id("roadmap_synced"); }
+pub fn rd_ev_overflow() -> u8 { return tl_action_id("sync_overflow"); }
+/// The order's deadletter_created is the existing message_deadlettered: one event keeps one name.
+pub fn rd_ev_deadletter() -> u8 { return tl_action_id("message_deadlettered"); }
+pub fn rd_ev_owner_approval() -> u8 { return tl_action_id("owner_approval_required"); }
+pub fn rd_ev_filter() -> u8 { return tl_action_id("dashboard_view_changed"); }
+
+/// The event a write that may not run now emits: owner approval for an owner-gated write, otherwise a failed sync.
+pub fn rd_refused_write_event(a: u8) -> u8 {
+    if (rd_write_policy(a) == PW_OWNER) { return rd_ev_owner_approval(); }
+    return rd_ev_label_failed();
+}
+
+// ---- fixture ----
+
+/// root <- trunk <- epic 12779 <- issues 1, 2; issue 3 has no epic; release 1 DEPENDS_ON issue 3; issue 2
+/// SUPERSEDES issue 4 (which belongs to the epic too); artifact 7 verifies issue 1 (EXACT); issue 3 BLOCKS issue 2.
+/// Node order: root 0, trunk 1, epic 2, i1 3, i2 4, i3 5, rel 6, i4 7, art 8.
+pub fn rd_fixture(g: *WorkGraph) -> u32 {
+    const root : u32 = wx_ensure_node(g, NX_ROOT, 1, LABEL_EXACT);
+    const trunk : u32 = wx_ensure_node(g, NX_TRUNK, 1, LABEL_EXACT);
+    const epic : u32 = wx_ensure_node(g, NX_EPIC, 12779, LABEL_EXACT);
+    const i1 : u32 = wx_ensure_node(g, NX_ISSUE, 1, LABEL_EXACT);
+    const i2 : u32 = wx_ensure_node(g, NX_ISSUE, 2, LABEL_EXACT);
+    const i3 : u32 = wx_ensure_node(g, NX_ISSUE, 3, LABEL_EXACT);
+    const rel : u32 = wx_ensure_node(g, NX_RELEASE, 1, LABEL_EXACT);
+    const i4 : u32 = wx_ensure_node(g, NX_ISSUE, 4, LABEL_EXACT);
+    const art : u32 = wx_ensure_node(g, NK_ARTIFACT, 7, LABEL_EXACT);
+    var bad : u32 = 0;
+    if (wx_add_edge(g, EX_BELONGS_TO, trunk, root, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, epic, trunk, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, i1, epic, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, i2, epic, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, i4, epic, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_DEPENDS_ON, rel, i3, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_SUPERSEDES, i2, i4, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, art, i1, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EK_VERIFIES, art, i1, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EK_BLOCKS, i3, i2, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    return bad;
+}
+
+// ---- tests ----
+
+test "the fixture builds the graph the projection reads" {
+    var g = new_graph();
+    assert(rd_fixture(&g) == 0);
+    assert(nodes(&g) == 9);
+    assert(edges(&g) == 10);
+}
+
+test "membership comes from the graph: epic, release, supersession" {
+    var g = new_graph();
+    assert(rd_fixture(&g) == 0);
+    const life : RdLife = rd_life_none();
+    // i1 and i2 belong to the active epic
+    assert(rd_member_bits(&g, 3, life) == M_ACTIVE_EPIC);
+    assert(rd_member(rd_member_bits(&g, 3, life)));
+    assert(rd_member(rd_member_bits(&g, 4, life)));
+    // i3 has no epic but a release depends on it
+    assert(rd_member_bits(&g, 5, life) == M_RELEASE_REQUIRED);
+    assert(rd_member(rd_member_bits(&g, 5, life)));
+    // i4 is in the epic but superseded by i2: out
+    assert(rd_member_bits(&g, 7, life) == (M_ACTIVE_EPIC | M_SUPERSEDED));
+    assert(!rd_member(rd_member_bits(&g, 7, life)));
+    // a node past the graph has no bits
+    assert(rd_member_bits(&g, 99, life) == 0);
+}
+
+test "membership precedence: owner removed, superseded, owner added, leave, enter" {
+    assert(!rd_member(0));
+    assert(rd_member(M_BLOCKS_CRITICAL));
+    assert(!rd_member(M_ACTIVE_EPIC | M_OWNER_REMOVED));
+    assert(!rd_member(M_OWNER_ADDED | M_OWNER_REMOVED));
+    assert(!rd_member(M_OWNER_ADDED | M_SUPERSEDED));
+    assert(rd_member(M_OWNER_ADDED | M_EPIC_ARCHIVED));
+    assert(!rd_member(M_EPIC_ARCHIVED));
+    assert(!rd_member(M_RELEASE_REQUIRED | M_DONE_NOT_REQUIRED));
+    assert(rd_member(M_OWNER_ADDED | M_DONE_NOT_REQUIRED));
+}
+
+test "an archived epic takes its issues off the roadmap unless the owner keeps them" {
+    var g = new_graph();
+    assert(rd_fixture(&g) == 0);
+    var life : RdLife = rd_life_none();
+    life.epic_archived = true;
+    assert(rd_member_bits(&g, 3, life) == M_EPIC_ARCHIVED);
+    assert(!rd_member(rd_member_bits(&g, 3, life)));
+    life.owner_added = true;
+    assert(rd_member(rd_member_bits(&g, 3, life)));
+    // i3 has no epic parent: an archived flag there means nothing
+    var l3 : RdLife = rd_life_none();
+    l3.epic_archived = true;
+    assert(rd_member_bits(&g, 5, l3) == M_RELEASE_REQUIRED);
+}
+
+test "priority: a P0 trigger beats the critical path beats polish; P0 stands on a hard gate" {
+    assert(rd_target_level(0, false, false) == LEVEL_NORMAL);
+    assert(rd_target_level(0, false, true) == LEVEL_LOW);
+    assert(rd_target_level(0, true, true) == LEVEL_HIGH);
+    assert(rd_target_level(T_SWAP_GATE, false, true) == LEVEL_CRITICAL);
+    assert(rd_target_level(T_BILLING_BLOCK, false, false) == LEVEL_CRITICAL);
+    assert(rd_target_level(T_COMPILE_ERROR, false, false) == LEVEL_CRITICAL);
+    assert(rd_target_level(T_FEED_MISSING, false, false) == LEVEL_CRITICAL);
+    assert(rd_target_level(T_SECURITY, false, false) == LEVEL_CRITICAL);
+    var t : u32 = 1;
+    while (t < 32) {
+        assert(p0_justified(rd_target_level(t, false, false), rd_gate_flags(t)));
+        t = t + 1;
+    }
+    assert(rd_gate_flags(T_SWAP_GATE) == G_SAFETY);
+    assert(rd_gate_flags(T_SECURITY) == G_SAFETY);
+    assert(rd_gate_flags(T_COMPILE_ERROR) == G_E2E);
+    assert(rd_gate_flags(T_FEED_MISSING) == G_E2E);
+    assert(rd_gate_flags(T_BILLING_BLOCK) == G_UNBLOCKS);
+}
+
+test "priority hysteresis: up after 30 s, down after 60 s, never without a reason and evidence" {
+    assert(rd_level_step(LEVEL_NORMAL, LEVEL_CRITICAL, 29999, true, 1) == LEVEL_NORMAL);
+    assert(rd_level_step(LEVEL_NORMAL, LEVEL_CRITICAL, 30000, true, 1) == LEVEL_CRITICAL);
+    assert(rd_level_step(LEVEL_CRITICAL, LEVEL_NORMAL, 30000, true, 1) == LEVEL_CRITICAL);
+    assert(rd_level_step(LEVEL_CRITICAL, LEVEL_NORMAL, 59999, true, 1) == LEVEL_CRITICAL);
+    assert(rd_level_step(LEVEL_CRITICAL, LEVEL_NORMAL, 60000, true, 1) == LEVEL_NORMAL);
+    assert(rd_level_step(LEVEL_NORMAL, LEVEL_CRITICAL, 90000, false, 1) == LEVEL_NORMAL);
+    assert(rd_level_step(LEVEL_NORMAL, LEVEL_CRITICAL, 90000, true, 0) == LEVEL_NORMAL);
+    assert(rd_level_step(LEVEL_HIGH, LEVEL_HIGH, 0, false, 0) == LEVEL_HIGH);
+}
+
+test "board: Done needs a verified artifact and no open dependency" {
+    var g = new_graph();
+    assert(rd_fixture(&g) == 0);
+    assert(wx_issue_has_verified_artifact(&g, 3));
+    assert(!wx_issue_has_verified_artifact(&g, 4));
+    assert(rd_column(true, 0, 0, false, false) == ST_DONE);
+    assert(rd_column(true, 1, 0, false, true) == ST_IN_PROGRESS);
+    assert(rd_column(false, 0, 0, false, true) == ST_IN_PROGRESS);
+    assert(rd_column(false, 0, 1, false, true) == ST_BLOCKED);
+    assert(rd_column(false, 0, 0, true, true) == ST_BLOCKED);
+    assert(rd_column(false, 0, 0, false, false) == ST_BACKLOG);
+    // the projection of i1 with nothing open is Done
+    var life : RdLife = rd_life_none();
+    life.started = true;
+    const it : RdItem = rd_project(&g, 3, life, LEVEL_HIGH, LK_SRC_LIVE);
+    assert(it.member);
+    assert(it.column == ST_DONE);
+    assert(it.labels == (L_ROADMAP | L_P1 | L_DONE));
+}
+
+test "board: a missing or fixture feed is Blocked, a replay is offline mode, live is live" {
+    assert(rd_feed_blocked(true, LK_SRC_NONE));
+    assert(rd_feed_blocked(true, LK_SRC_FIXTURE));
+    assert(!rd_feed_blocked(true, LK_SRC_REPLAY));
+    assert(!rd_feed_blocked(true, LK_SRC_LIVE));
+    assert(!rd_feed_blocked(false, LK_SRC_NONE));
+    var g = new_graph();
+    assert(rd_fixture(&g) == 0);
+    var life : RdLife = rd_life_none();
+    life.started = true;
+    life.needs_live = true;
+    const none : RdItem = rd_project(&g, 4, life, LEVEL_NORMAL, LK_SRC_NONE);
+    assert(none.column == ST_BLOCKED);
+    assert((none.labels & (L_LIVE_FEED | L_REPLAY_ONLY | L_FIXTURE_ONLY)) == 0);
+    const fix : RdItem = rd_project(&g, 4, life, LEVEL_NORMAL, LK_SRC_FIXTURE);
+    assert(fix.column == ST_BLOCKED);
+    assert((fix.labels & L_FIXTURE_ONLY) != 0);
+    assert((fix.labels & L_LIVE_FEED) == 0);
+    const rep : RdItem = rd_project(&g, 4, life, LEVEL_NORMAL, LK_SRC_REPLAY);
+    assert(rep.column == ST_IN_PROGRESS);
+    assert((rep.labels & L_REPLAY_ONLY) != 0);
+    const live : RdItem = rd_project(&g, 4, life, LEVEL_NORMAL, LK_SRC_LIVE);
+    assert((live.labels & L_LIVE_FEED) != 0);
+    assert(rd_has_blocker(&g, 4));
+    assert(!rd_has_blocker(&g, 3));
+}
+
+test "labels: names, exclusivity, and every projection obeys the rules" {
+    assert(rd_popcount(L_MASK) == L_COUNT);
+    assert(rd_popcount(L_PRIORITY) == 4);
+    assert(rd_popcount(L_COLUMN) == 3);
+    assert(rd_popcount(L_HYGIENE) == 4);
+    assert(rd_label_name(0).len == 7);
+    assert(rd_label_name(14).len == 14);
+    assert(rd_label_name(L_COUNT).len == 0);
+    assert(rd_labels_ok(L_ROADMAP | L_P0 | L_BLOCKED));
+    assert(!rd_labels_ok(L_P0 | L_P1));
+    assert(!rd_labels_ok(L_DONE | L_BLOCKED));
+    assert(!rd_labels_ok(L_LIVE_FEED | L_REPLAY_ONLY));
+    assert(!rd_labels_ok(L_LIVE_FEED | L_FIXTURE_ONLY));
+    var lv : u8 = 0;
+    while (lv <= 3) {
+        var col : u8 = 0;
+        while (col <= 3) {
+            var src : u8 = 0;
+            while (src <= 3) {
+                assert(rd_labels_ok(rd_labels(true, lv, col, true, src, L_HYGIENE)));
+                assert(rd_labels_ok(rd_labels(false, lv, col, true, src, 0)));
+                src = src + 1;
+            }
+            col = col + 1;
+        }
+        lv = lv + 1;
+    }
+    // a non-member carries no roadmap, priority or column label
+    assert((rd_labels(false, LEVEL_CRITICAL, ST_DONE, false, LK_SRC_LIVE, 0) & (L_ROADMAP | L_PRIORITY | L_COLUMN)) == 0);
+}
+
+test "sync is idempotent: a replay plans nothing and foreign labels are never touched" {
+    const foreign : u32 = 1 << 20;
+    const have : u32 = foreign | L_ROADMAP | L_P2 | L_STALE;
+    const want : u32 = L_ROADMAP | L_P0 | L_BLOCKED;
+    assert(rd_add(want, have) == (L_P0 | L_BLOCKED));
+    assert(rd_remove(want, have) == (L_P2 | L_STALE));
+    const after : u32 = rd_after(want, have);
+    assert(after == (want | foreign));
+    assert(rd_add(want, after) == 0);
+    assert(rd_remove(want, after) == 0);
+    assert(rd_after(want, after) == after);
+    const a : RdItem = RdItem { member: true, level: LEVEL_CRITICAL, column: ST_BLOCKED, labels: want };
+    const b : RdItem = RdItem { member: true, level: LEVEL_NORMAL, column: ST_BACKLOG, labels: have };
+    assert(rd_plan_count(a, b) == 5);
+    const c : RdItem = RdItem { member: true, level: LEVEL_CRITICAL, column: ST_BLOCKED, labels: after };
+    assert(rd_plan_count(a, c) == 0);
+}
+
+test "the projection is deterministic: two builds of one graph project the same item" {
+    var g1 = new_graph();
+    var g2 = new_graph();
+    assert(rd_fixture(&g1) == 0);
+    assert(rd_fixture(&g2) == 0);
+    var life : RdLife = rd_life_none();
+    life.started = true;
+    var n : u32 = 0;
+    while (n < 9) {
+        const x : RdItem = rd_project(&g1, n, life, LEVEL_NORMAL, LK_SRC_REPLAY);
+        const y : RdItem = rd_project(&g2, n, life, LEVEL_NORMAL, LK_SRC_REPLAY);
+        assert(x.member == y.member);
+        assert(x.column == y.column);
+        assert(x.labels == y.labels);
+        assert(rd_plan_count(x, y) == 0);
+        n = n + 1;
+    }
+}
+
+test "one cycle runs at most 100 actions and dead-letters the rest" {
+    assert(rd_cycle_now(0) == 0);
+    assert(rd_cycle_now(100) == 100);
+    assert(rd_cycle_overflow(100) == 0);
+    assert(rd_cycle_now(101) == 100);
+    assert(rd_cycle_overflow(101) == 1);
+    assert(rd_cycle_now(250) + rd_cycle_overflow(250) == 250);
+    assert(rd_cycle_overflow(250) == 150);
+    assert(rd_overflow_reason() == TM_DL_OVERFLOW);
+    assert(rd_overflow_class() == TM_FC_TRANSIENT);
+}
+
+test "debounce: nothing pending never fires, 500 ms quiet fires, a long stream fires at the max" {
+    assert(!rd_debounce_fire(0, 9999, 9999));
+    assert(!rd_debounce_fire(3, 499, 499));
+    assert(rd_debounce_fire(3, 500, 500));
+    assert(!rd_debounce_fire(3, 100, 4999));
+    assert(rd_debounce_fire(3, 100, 5000));
+    var t : u8 = 0;
+    while (t < RT_COUNT) {
+        assert(rd_trigger_ok(t));
+        t = t + 1;
+    }
+    assert(!rd_trigger_ok(RT_COUNT));
+    assert(rd_trigger_runs_hygiene(RT_DAILY_HYGIENE));
+    assert(!rd_trigger_runs_hygiene(RT_ISSUE_LABELED));
+}
+
+test "write policy: read free, labels policy, close owner and evidence, delete and settings never" {
+    assert(rd_write_policy(GA_READ) == PW_ALLOW);
+    assert(rd_write_policy(GA_ADD_LABEL) == PW_POLICY);
+    assert(rd_write_policy(GA_REMOVE_LABEL) == PW_POLICY);
+    assert(rd_write_policy(GA_MOVE_CARD) == PW_POLICY);
+    assert(rd_write_policy(GA_CREATE_ISSUE) == PW_OWNER);
+    assert(rd_write_policy(GA_CLOSE_ISSUE) == PW_OWNER);
+    assert(rd_write_policy(GA_DELETE_LABEL) == PW_OWNER);
+    assert(rd_write_policy(GA_MODIFY_SETTINGS) == PW_FORBIDDEN);
+    assert(rd_write_policy(GA_DELETE_ISSUE) == PW_FORBIDDEN);
+    assert(rd_write_policy(GA_COUNT) == PW_FORBIDDEN);
+    assert(rd_write_allowed(GA_READ, false, false, false));
+    assert(!rd_write_allowed(GA_ADD_LABEL, false, true, true));
+    assert(rd_write_allowed(GA_ADD_LABEL, true, false, false));
+    assert(!rd_write_allowed(GA_CLOSE_ISSUE, true, true, false));
+    assert(rd_write_allowed(GA_CLOSE_ISSUE, false, true, true));
+    assert(!rd_write_allowed(GA_DELETE_ISSUE, true, true, true));
+    assert(!rd_write_allowed(GA_MODIFY_SETTINGS, true, true, true));
+    assert(rd_refused_write_event(GA_CLOSE_ISSUE) == 165);
+    assert(rd_refused_write_event(GA_ADD_LABEL) == 162);
+}
+
+test "one dashboard: twelve filters are queries over the projection" {
+    const p0 : RdItem = RdItem { member: true, level: LEVEL_CRITICAL, column: ST_BLOCKED, labels: L_ROADMAP | L_P0 | L_BLOCKED | L_LIVE_FEED };
+    const done : RdItem = RdItem { member: true, level: LEVEL_NORMAL, column: ST_DONE, labels: L_ROADMAP | L_P2 | L_DONE | L_REPLAY_ONLY };
+    const dup : RdItem = RdItem { member: false, level: LEVEL_NORMAL, column: ST_BACKLOG, labels: L_DUPLICATE | L_STALE | L_RESOLVED_ELSEWHERE | L_HYGIENE_REVIEW };
+    assert(rd_filter_match(RF_ALL, p0, false));
+    assert(!rd_filter_match(RF_ALL, dup, false));
+    assert(rd_filter_match(RF_P0_BLOCKERS, p0, false));
+    assert(!rd_filter_match(RF_P0_BLOCKERS, done, false));
+    assert(rd_filter_match(RF_ACTIVE_EPICS, done, true));
+    assert(!rd_filter_match(RF_ACTIVE_EPICS, done, false));
+    assert(rd_filter_match(RF_BLOCKED, p0, false));
+    assert(!rd_filter_match(RF_IN_PROGRESS, p0, false));
+    assert(rd_filter_match(RF_DONE_VERIFIED, done, false));
+    assert(rd_filter_match(RF_LIVE_FEED, p0, false));
+    assert(rd_filter_match(RF_REPLAY_ONLY, done, false));
+    assert(rd_filter_match(RF_STALE, dup, false));
+    assert(rd_filter_match(RF_DUPLICATES, dup, false));
+    assert(rd_filter_match(RF_RESOLVED_OPEN, dup, false));
+    assert(rd_filter_match(RF_HYGIENE_QUEUE, dup, false));
+    assert(!rd_filter_match(RF_COUNT, p0, false));
+    assert(rd_filter_ok(RF_HYGIENE_QUEUE));
+    assert(!rd_filter_ok(RF_COUNT));
+    assert(rd_dashboard_empty(LK_SRC_NONE, 5));
+    assert(rd_dashboard_empty(LK_SRC_LIVE, 0));
+    assert(!rd_dashboard_empty(LK_SRC_REPLAY, 5));
+}
+
+test "every event name lives in t27l: surface roadmap, actions 157..166, dead letter 72" {
+    assert(rd_surface() == 19);
+    assert(rd_ev_membership() == 157);
+    assert(rd_ev_priority() == 158);
+    assert(rd_ev_column() == 159);
+    assert(rd_ev_label_added() == 160);
+    assert(rd_ev_label_removed() == 161);
+    assert(rd_ev_label_failed() == 162);
+    assert(rd_ev_synced() == 163);
+    assert(rd_ev_overflow() == 164);
+    assert(rd_ev_deadletter() == 72);
+    assert(rd_ev_owner_approval() == 165);
+    assert(rd_ev_filter() == 166);
+}
+
+invariant "the label schema is fifteen distinct bits and its groups do not overlap" {
+    assert(L_MASK == (1 << L_COUNT) - 1);
+    assert((L_PRIORITY & L_COLUMN) == 0);
+    assert((L_PRIORITY & L_HYGIENE) == 0);
+    assert((L_COLUMN & L_HYGIENE) == 0);
+    assert(RD_CYCLE_MAX == 100);
+    assert(RD_ESCALATE_MS < RD_DEESCALATE_MS);
+}
