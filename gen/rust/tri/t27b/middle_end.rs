@@ -117,7 +117,7 @@ pub fn pass_order(p: u32) -> u32 {
 }
 
 pub fn pass_status(p: u32) -> u32 {
-    if (((p == PASS_FOLD) || (p == PASS_IDENT)) || (p == PASS_STRENGTH)) {
+    if ((((p == PASS_FOLD) || (p == PASS_IDENT)) || (p == PASS_STRENGTH)) || (p == PASS_LICM_CONST)) {
         return STATUS_LIVE;
     }
     if ((p == PASS_REGALLOC) || (p == PASS_ISEL_PEEPHOLE)) {
@@ -284,14 +284,26 @@ pub fn strength(op: u8, k: u64, signed: bool) -> u32 {
 
 pub const LICM_MAX_HOIST: u32 = 2;
 
-pub fn licm_hoist_const(insns_to_build: u32, free_callee_regs: u32, hoisted: u32) -> bool {
+pub const LICM_NONE: u32 = 0;
+
+pub const LICM_CALLER: u32 = 1;
+
+pub const LICM_CALLEE: u32 = 2;
+
+pub fn licm_hoist_const(insns_to_build: u32, caller_free: bool, callee_free: bool, framed: bool, hoisted: u32) -> u32 {
     if (insns_to_build < 2) {
-        return false;
+        return LICM_NONE;
     }
-    if (free_callee_regs == 0) {
-        return false;
+    if (hoisted >= LICM_MAX_HOIST) {
+        return LICM_NONE;
     }
-    return (hoisted < LICM_MAX_HOIST);
+    if caller_free {
+        return LICM_CALLER;
+    }
+    if (callee_free && framed) {
+        return LICM_CALLEE;
+    }
+    return LICM_NONE;
 }
 
 pub fn fold_fits(value_is_in_range: bool, mode_wrap: bool) -> bool {
