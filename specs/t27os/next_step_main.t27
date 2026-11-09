@@ -1,0 +1,737 @@
+// SPDX-License-Identifier: Apache-2.0
+; The bounded run of the next-step law, host half (Refs #12884): one input event, one real call of
+; queen::next_step::decide (through queen::next_step_run::run_decide), a check of the decision, at
+; most one executor launch, an independent check of its artifact, then the next decision.
+; A one-shot program: no daemon, no conductor, no cron, no network, no credentials, no shared
+; service. Every file it writes is under target/next_step/ (gitignored scratch) in the cwd.
+; The contract describes deduplication, fences, replay and the effect journal; the runtime
+; behaviour is measured only by the journal of a run, not by this file.
+; From the repo root:
+;   NS_MODE=event NS_KIND=2 NS_SEQ=1 NS_EXEC=<absolute t27c> [NS_VERIFY=<absolute t27b>] next_step_main
+;   NS_MODE=verify NS_VERIFY=<absolute t27b> next_step_main
+;   NS_MODE=feed NS_FEED_DIR=target/next_step/<dir> [NS_LEASE=<pane>] next_step_main
+; With NS_VERIFY set, an executed attempt goes straight on to the verifier and the next decision.
+; NS_MODE=feed reads at most FEED_MAX_SNAPS pane-table snapshots <dir>/s1, s2, ... (t27os::pane_feed),
+; keeps its own cursor in <dir>/cursor and journals in <dir>/journal. It is an observation adapter: an
+; idle edge of the leased pane is journaled as one extra check asked, never as a decision; decide is
+; not called, nothing is launched, and target/next_step/run/ is neither read nor written.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osNextStepMain;
+
+use queen::next_step_run::TASK_A;
+use queen::next_step_run::TASK_B;
+use queen::next_step_run::TASK_C;
+use queen::next_step_run::RUN_CAP;
+use queen::next_step_run::RUN_WANT;
+use queen::next_step_run::NR_ATTEMPTED;
+use queen::next_step_run::AT_JOURNALED;
+use queen::next_step_run::AT_EXECUTED;
+use queen::next_step_run::AT_VERIFIED;
+use queen::next_step_run::AT_LAUNCH_FAILED;
+use queen::next_step_run::AP_WAITING;
+use queen::next_step_run::EXIT_SIGNALED;
+use queen::next_step_run::NO_NUMBER;
+use queen::next_step_run::NOT_FOUND;
+use queen::next_step_run::SR_LAST;
+use queen::next_step_run::SR_DEADLINE;
+use queen::next_step_run::SR_LAUNCHES;
+use queen::next_step_run::SR_ATTEMPT;
+use queen::next_step_run::SR_TASK;
+use queen::next_step_run::SR_STATE;
+use queen::next_step_run::SR_B_STATUS;
+use queen::next_step_run::SR_WANT;
+use queen::next_step_run::SR_CODE;
+use queen::next_step_run::SR_APPROVAL;
+use queen::next_step_run::SR_MAGIC;
+use queen::next_step_run::SR_MAGIC_VALUE;
+use queen::next_step_run::approval_after;
+use queen::next_step_run::reason_of;
+use queen::next_step_run::run_decide;
+use queen::next_step_run::has_executor;
+use queen::next_step_run::attempt_after_verify;
+use queen::next_step_run::verified_status;
+use queen::next_step_run::exit_of;
+use queen::next_step_run::find_from;
+use queen::next_step_run::number_at;
+use queen::next_step_run::report_ok_t27c;
+use queen::next_step_run::report_ok_t27b;
+use queen::next_step_run::record_init;
+use queen::next_step_run::record_attempted_b;
+use queen::next_step::D_STALE;
+use queen::next_step::NS_OK;
+use queen::next_step::NS_PARKED;
+use queen::next_step::NS_BLOCKED;
+use queen::next_step::ST_DONE;
+use queen::next_step::budget_after;
+use queen::control::EV_REVIEW;
+use t27os::pane_feed::AGENT_SHELL;
+use t27os::pane_feed::FC_LEN;
+use t27os::pane_feed::FC_TABLE;
+use t27os::pane_feed::FT_LEN;
+use t27os::pane_feed::FA_APPLY;
+use t27os::pane_feed::FEED_MAX_SNAPS;
+use t27os::pane_feed::FEED_NO_EVENT;
+use t27os::pane_feed::FEED_QUIET;
+use t27os::pane_feed::snap_time;
+use t27os::pane_feed::snap_parse;
+use t27os::pane_feed::feed_action;
+use t27os::pane_feed::cursor_after;
+use t27os::pane_feed::cursor_clear;
+use t27os::pane_feed::cursor_ok;
+use t27os::pane_feed::lease_edge;
+use t27os::pane_feed::foreign_changes;
+use t27os::pane_feed::feed_signal;
+use t27os::pane_feed::autonomy_allowed;
+use t27os::pty_proto::get_u64;
+use t27os::pty_proto::put_u64;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_waitpid;
+use t27os::pty_sys::sys_gettimeofday;
+use t27os::pty_sys::sys_environ;
+
+/// O_WRONLY | O_APPEND (macOS).
+pub const OPEN_APPEND : i32 = 9;
+/// O_WRONLY | O_CREAT | O_EXCL (macOS): an artifact that already exists refuses the launch.
+pub const OPEN_NEW : i32 = 2561;
+pub const FILE_MODE : u32 = 420;
+pub const DIR_MODE : u32 = 493;
+/// run_child's answer when the program did not start (above every exit_of answer).
+pub const LAUNCH_FAILED : u32 = 512;
+/// Seconds task A waits for an approval in one run; then approval_after says AP_EXPIRED.
+pub const APPROVAL_WINDOW : u64 = 2;
+pub const ART_CAP : usize = 8192;
+pub const LINE_CAP : usize = 256;
+/// Bytes of one snapshot a feed run reads; a file that fills it is refused as cut (SN_OVERFLOW).
+pub const FEED_BUF : usize = 2048;
+/// The longest NS_FEED_DIR, so that "<dir>/cursor.tmp" and its 0 fit a 128-byte path.
+pub const FEED_DIR_CAP : usize = 96;
+
+/// posix_spawn(3) with three argument words and a 0; the file actions are the 8-byte object.
+fn ns_spawn(pid: [2]u32, path: []const u8, actions: []u8, attr: u64, argv: [4]u64, envp: u64) -> i32 { return @extern("posix_spawn"); }
+fn ns_fa_init(fa: []u8) -> i32 { return @extern("posix_spawn_file_actions_init"); }
+fn ns_fa_destroy(fa: []u8) -> i32 { return @extern("posix_spawn_file_actions_destroy"); }
+fn ns_fa_dup2(fa: []u8, fd: i32, to: i32) -> i32 { return @extern("posix_spawn_file_actions_adddup2"); }
+fn ns_fa_open(fa: []u8, fd: i32, path: []const u8, flags: i32, mode: u32) -> i32 { return @extern("posix_spawn_file_actions_addopen"); }
+
+/// "target/next_step/run/a<id>.out" (the executor's artifact) or ".ver" (the verifier's), then a 0.
+/// Returns the length without the 0.
+pub fn artifact_path(p: []u8, id: u64, verifier: bool) -> usize {
+    var at : usize = put_bytes(p, 0, "target/next_step/run/a");
+    at = put_dec(p, at, id);
+    if (verifier == true) {
+        at = put_bytes(p, at, ".ver");
+    } else {
+        at = put_bytes(p, at, ".out");
+    }
+    p[at] = 0;
+    return at;
+}
+
+/// The executor's artifact is the t27c report of the spec the attempt named: its first line says so.
+/// A report of any other spec, or a file that only contains the right totals, is not the artifact.
+pub fn report_names_spec(text: []const u8, n: usize) -> bool {
+    return find_from(text, n, 0, "--- test report: specs/queen/next_step.t27 ---\n") == 0;
+}
+
+/// The report line, built from the record: the task and the attempt the verifier checked.
+pub fn put_report(out: []u8, rec: []const u8) -> usize {
+    var k : usize = put_bytes(out, 0, "report task_id=");
+    out[k] = 65 + rec[SR_TASK];
+    k = put_bytes(out, k + 1, " attempt_id=");
+    k = put_dec(out, k, @as(u64, rec[SR_ATTEMPT]));
+    k = put_bytes(out, k, " verified: notified, read=no");
+    return k;
+}
+
+/// A feed directory is scratch under target/next_step/, not the bridge's run/, with no "..".
+pub fn feed_dir_ok(dir: []const u8, dn: usize) -> bool {
+    if (dn <= 17 or dn > FEED_DIR_CAP) { return false; }
+    if (find_from(dir, dn, 0, "target/next_step/") != 0) { return false; }
+    if (find_from(dir, dn, 0, "..") != NOT_FOUND) { return false; }
+    return find_from(dir, dn, 0, "target/next_step/run") != 0;
+}
+
+/// "<dir>/<name>" and a 0; the length without the 0.
+pub fn feed_path(p: []u8, dir: []const u8, dn: usize, name: []const u8) -> usize {
+    var at : usize = put_bytes(p, 0, dir[0..dn]);
+    p[at] = 47;
+    at = put_bytes(p, at + 1, name);
+    p[at] = 0;
+    return at;
+}
+
+/// "<dir>/s<i>" and a 0: the i-th snapshot of a feed run.
+pub fn snap_path(p: []u8, dir: []const u8, dn: usize, i: u64) -> usize {
+    var at : usize = put_bytes(p, 0, dir[0..dn]);
+    at = put_bytes(p, at, "/s");
+    at = put_dec(p, at, i);
+    p[at] = 0;
+    return at;
+}
+
+/// The stage-1 reason of one task, read from the run record and the approval state of A.
+pub fn reason_now(rec: []const u8, ap: u8, task: u8) -> u8 {
+    const budget : u32 = budget_after(RUN_CAP, @as(u32, rec[SR_LAUNCHES]));
+    return reason_of(task, ap, record_attempted_b(rec), rec[SR_B_STATUS], budget);
+}
+
+pub fn put_flag(out: []u8, at: usize, b: bool) -> usize {
+    var k : usize = at;
+    if (b == true) {
+        k = put_bytes(out, k, "yes");
+    } else {
+        k = put_bytes(out, k, "no");
+    }
+    return k;
+}
+
+/// One journal line for a decision: the event, the three reasons, A's approval state, the answer.
+pub fn put_decision(out: []u8, seq: u64, kind: u8, last: u64, ap: u8, rec: []const u8, d: u32) -> usize {
+    var k : usize = put_bytes(out, 0, "decide seq=");
+    k = put_dec(out, k, seq);
+    k = put_bytes(out, k, " kind=");
+    k = put_dec(out, k, @as(u64, kind));
+    k = put_bytes(out, k, " last=");
+    k = put_dec(out, k, last);
+    k = put_bytes(out, k, " approval_a=");
+    k = put_dec(out, k, @as(u64, ap));
+    k = put_bytes(out, k, " reasons=");
+    k = put_dec(out, k, @as(u64, reason_now(rec, ap, TASK_A)));
+    out[k] = 44;
+    k = put_dec(out, k + 1, @as(u64, reason_now(rec, ap, TASK_B)));
+    out[k] = 44;
+    k = put_dec(out, k + 1, @as(u64, reason_now(rec, ap, TASK_C)));
+    k = put_bytes(out, k, " decision=");
+    k = put_dec(out, k, @as(u64, d));
+    return k;
+}
+
+fn now_secs() -> u64 {
+    var tv : [16]u8 = undefined;
+    var i : usize = 0;
+    while (i < 16) {
+        tv[i] = 0;
+        i = i + 1;
+    }
+    sys_gettimeofday(tv[0..16], 0);
+    return get_u64(tv[0..16], 0);
+}
+
+/// Writes line[0..n] and a newline to stdout and appends it to the journal at path.
+fn say_in(path: []const u8, line: []u8, n: usize) -> void {
+    line[n] = 10;
+    const len : u64 = @as(u64, n + 1);
+    sys_write(1, line, len);
+    var fd : i32 = sys_open_ro(path, OPEN_APPEND);
+    if (fd < 0) { fd = sys_creat(path, FILE_MODE); }
+    if (fd >= 0) {
+        sys_write(fd, line, len);
+        sys_close(fd);
+    }
+}
+
+fn say(line: []u8, n: usize) -> void {
+    say_in("target/next_step/run/journal", line, n);
+}
+
+fn load_record(rec: []u8) -> bool {
+    const fd : i32 = sys_open_ro("target/next_step/run/state", 0);
+    if (fd < 0) { return false; }
+    const got : i64 = sys_read(fd, rec, 32);
+    sys_close(fd);
+    if (got != 32) { return false; }
+    return rec[SR_MAGIC] == SR_MAGIC_VALUE;
+}
+
+/// state.tmp, then rename(2) over state: a reader sees the old record or the new one, never half.
+fn save_record(rec: []const u8) -> bool {
+    const fd : i32 = sys_creat("target/next_step/run/state.tmp", FILE_MODE);
+    if (fd < 0) { return false; }
+    const put : i64 = sys_write(fd, rec, 32);
+    sys_close(fd);
+    if (put != 32) { return false; }
+    return sys_rename("target/next_step/run/state.tmp", "target/next_step/run/state") == 0;
+}
+
+fn env_into(name: []const u8, buf: []u8, cap: usize) -> usize {
+    const p : u64 = sys_getenv(name);
+    if (p == 0) { return 0; }
+    const n : u64 = sys_strlen(p);
+    if (n == 0 or n >= @as(u64, cap)) { return 0; }
+    sys_peek(buf, p, n);
+    const k : usize = @as(usize, @intCast(n));
+    buf[k] = 0;
+    return k;
+}
+
+fn read_into(path: []const u8, buf: []u8, cap: usize) -> usize {
+    const fd : i32 = sys_open_ro(path, 0);
+    if (fd < 0) { return 0; }
+    var total : usize = 0;
+    var live : bool = true;
+    while (live and total < cap) {
+        const got : i64 = sys_read(fd, buf[total .. cap], @as(u64, cap - total));
+        if (got <= 0) {
+            live = false;
+        } else {
+            total = total + @as(usize, @intCast(got));
+        }
+    }
+    sys_close(fd);
+    return total;
+}
+
+/// Starts tool with the words [tool, w1, w2]; its stdout and stderr go to the new file out_path
+/// (O_EXCL), its stdin is /dev/null. Waits, then returns exit_of(status), or LAUNCH_FAILED.
+fn run_child(tool: []const u8, tn: usize, w1: []const u8, w2: []const u8, out_path: []const u8) -> u32 {
+    var words : [512]u8 = undefined;
+    var at : usize = put_bytes(words[0..512], 0, tool[0..tn]);
+    words[at] = 0;
+    const o1 : usize = at + 1;
+    at = put_bytes(words[0..512], o1, w1);
+    words[at] = 0;
+    const o2 : usize = at + 1;
+    at = put_bytes(words[0..512], o2, w2);
+    words[at] = 0;
+    const base : u64 = sys_addr(words[0..512], words[0..512], 0);
+    var argv : [4]u64 = undefined;
+    argv[0] = base;
+    argv[1] = base + @as(u64, o1);
+    argv[2] = base + @as(u64, o2);
+    argv[3] = 0;
+    var ev : [8]u8 = undefined;
+    var z : usize = 0;
+    while (z < 8) {
+        ev[z] = 0;
+        z = z + 1;
+    }
+    sys_peek(ev[0..8], sys_environ(), 8);
+    const envp : u64 = get_u64(ev[0..8], 0);
+    var dn : [16]u8 = undefined;
+    const dl : usize = put_bytes(dn[0..16], 0, "/dev/null");
+    dn[dl] = 0;
+    var fa : [8]u8 = undefined;
+    z = 0;
+    while (z < 8) {
+        fa[z] = 0;
+        z = z + 1;
+    }
+    if (ns_fa_init(fa[0..8]) != 0) { return LAUNCH_FAILED; }
+    var bad : bool = false;
+    if (ns_fa_open(fa[0..8], 1, out_path, OPEN_NEW, FILE_MODE) != 0) { bad = true; }
+    if (ns_fa_dup2(fa[0..8], 1, 2) != 0) { bad = true; }
+    if (ns_fa_open(fa[0..8], 0, dn[0..16], 0, 0) != 0) { bad = true; }
+    var pid : [2]u32 = undefined;
+    pid[0] = 0;
+    pid[1] = 0;
+    var rc : i32 = 1;
+    if (bad == false) { rc = ns_spawn(pid, words[0..512], fa[0..8], 0, argv, envp); }
+    ns_fa_destroy(fa[0..8]);
+    if (rc != 0) { return LAUNCH_FAILED; }
+    const pidv : i32 = @as(i32, @intCast(pid[0]));
+    var ws : [2]u32 = undefined;
+    ws[0] = 0;
+    ws[1] = 0;
+    var wp : i32 = sys_waitpid(pidv, ws, 0);
+    var tries : u32 = 0;
+    while (wp != pidv and tries < 4) {
+        wp = sys_waitpid(pidv, ws, 0);
+        tries = tries + 1;
+    }
+    if (wp != pidv) { return EXIT_SIGNALED; }
+    return exit_of(ws[0]);
+}
+
+/// NS_MODE=event: decide on the input event; a replay changes nothing and launches nothing; a pick
+/// with an executor is journaled and saved BEFORE the one launch.
+fn on_event() -> u32 {
+    var line : [256]u8 = undefined;
+    var k : usize = 0;
+    var nb : [16]u8 = undefined;
+    var n : usize = env_into("NS_KIND", nb[0..16], 16);
+    const kind64 : u64 = number_at(nb[0..16], n, 0);
+    n = env_into("NS_SEQ", nb[0..16], 16);
+    const seq : u64 = number_at(nb[0..16], n, 0);
+    var tool : [256]u8 = undefined;
+    const tn : usize = env_into("NS_EXEC", tool[0..256], 256);
+    if (kind64 >= 256 or seq == NO_NUMBER or tn == 0) {
+        k = put_bytes(line[0..256], 0, "refused: NS_KIND, NS_SEQ and NS_EXEC are required");
+        say(line[0..256], k);
+        return 2;
+    }
+    const kind : u8 = @as(u8, @intCast(kind64));
+    var rec : [32]u8 = undefined;
+    const now : u64 = now_secs();
+    if (load_record(rec[0..32]) == false) {
+        record_init(rec[0..32], now + APPROVAL_WINDOW);
+        k = put_bytes(line[0..256], 0, "init run record: A waits for an approval for 2 s");
+        say(line[0..256], k);
+    }
+    const last : u64 = get_u64(rec[0..32], SR_LAST);
+    const ap : u8 = approval_after(rec[SR_APPROVAL], now >= get_u64(rec[0..32], SR_DEADLINE), false);
+    const d : u32 = run_decide(kind, last, seq, reason_now(rec[0..32], ap, TASK_A), reason_now(rec[0..32], ap, TASK_B), reason_now(rec[0..32], ap, TASK_C));
+    k = put_decision(line[0..256], seq, kind, last, ap, rec[0..32], d);
+    say(line[0..256], k);
+    if (d == D_STALE) {
+        k = put_bytes(line[0..256], 0, "replay: no state change, no launch");
+        say(line[0..256], k);
+        return 0;
+    }
+    put_u64(rec[0..32], SR_LAST, seq);
+    rec[SR_APPROVAL] = ap;
+    if (has_executor(d) == false) {
+        save_record(rec[0..32]);
+        k = put_bytes(line[0..256], 0, "no executor for this answer: WAIT, nothing launched");
+        say(line[0..256], k);
+        return 0;
+    }
+    const id : u8 = rec[SR_LAUNCHES] + 1;
+    rec[SR_LAUNCHES] = id;
+    rec[SR_ATTEMPT] = id;
+    rec[SR_TASK] = TASK_B;
+    rec[SR_STATE] = AT_JOURNALED;
+    rec[SR_WANT] = @as(u8, @intCast(RUN_WANT));
+    if (save_record(rec[0..32]) == false) {
+        k = put_bytes(line[0..256], 0, "refused: run record not saved, nothing launched");
+        say(line[0..256], k);
+        return 3;
+    }
+    k = put_bytes(line[0..256], 0, "attempt task_id=B attempt_id=");
+    k = put_dec(line[0..256], k, @as(u64, id));
+    k = put_bytes(line[0..256], k, " state=journaled, saved before the launch");
+    say(line[0..256], k);
+    var art : [64]u8 = undefined;
+    const an : usize = artifact_path(art[0..64], @as(u64, id), false);
+    const code : u32 = run_child(tool[0..256], tn, "test-report", "specs/queen/next_step.t27", art[0..64]);
+    if (code == LAUNCH_FAILED) {
+        rec[SR_STATE] = AT_LAUNCH_FAILED;
+    } else {
+        rec[SR_STATE] = AT_EXECUTED;
+    }
+    if (code == 0) { rec[SR_B_STATUS] = ST_DONE; }
+    var cb : u32 = code;
+    if (cb > 255) { cb = 255; }
+    rec[SR_CODE] = @as(u8, @intCast(cb));
+    save_record(rec[0..32]);
+    k = put_bytes(line[0..256], 0, "executed attempt_id=");
+    k = put_dec(line[0..256], k, @as(u64, id));
+    k = put_bytes(line[0..256], k, " exit=");
+    k = put_dec(line[0..256], k, @as(u64, code));
+    k = put_bytes(line[0..256], k, " state=");
+    k = put_dec(line[0..256], k, @as(u64, rec[SR_STATE]));
+    k = put_bytes(line[0..256], k, " artifact=");
+    k = put_bytes(line[0..256], k, art[0..an]);
+    say(line[0..256], k);
+    if (sys_getenv("NS_VERIFY") == 0) { return 0; }
+    if (rec[SR_STATE] != AT_EXECUTED) { return 0; }
+    return on_verify();
+}
+
+/// NS_MODE=verify: an independent tool reruns the criterion; both artifacts are checked against the
+/// criterion recorded at creation (never against the artifact); then the next decision is made.
+fn on_verify() -> u32 {
+    var line : [256]u8 = undefined;
+    var k : usize = 0;
+    var rec : [32]u8 = undefined;
+    if (load_record(rec[0..32]) == false) {
+        k = put_bytes(line[0..256], 0, "verify refused: no run record");
+        say(line[0..256], k);
+        return 3;
+    }
+    if (rec[SR_STATE] != AT_EXECUTED) {
+        k = put_bytes(line[0..256], 0, "verify refused: attempt state=");
+        k = put_dec(line[0..256], k, @as(u64, rec[SR_STATE]));
+        say(line[0..256], k);
+        return 3;
+    }
+    if (rec[SR_TASK] != TASK_B) {
+        k = put_bytes(line[0..256], 0, "verify refused: the attempt's task has no criterion, task=");
+        k = put_dec(line[0..256], k, @as(u64, rec[SR_TASK]));
+        say(line[0..256], k);
+        return 3;
+    }
+    var tool : [256]u8 = undefined;
+    const tn : usize = env_into("NS_VERIFY", tool[0..256], 256);
+    if (tn == 0) {
+        k = put_bytes(line[0..256], 0, "verify refused: NS_VERIFY is required");
+        say(line[0..256], k);
+        return 2;
+    }
+    const id : u64 = @as(u64, rec[SR_ATTEMPT]);
+    var art : [64]u8 = undefined;
+    artifact_path(art[0..64], id, false);
+    var ver : [64]u8 = undefined;
+    artifact_path(ver[0..64], id, true);
+    const vcode : u32 = run_child(tool[0..256], tn, "test", "specs/queen/next_step.t27", ver[0..64]);
+    var abuf : [8192]u8 = undefined;
+    const na : usize = read_into(art[0..64], abuf[0..8192], ART_CAP);
+    var vbuf : [8192]u8 = undefined;
+    const nv : usize = read_into(ver[0..64], vbuf[0..8192], ART_CAP);
+    const want : u64 = @as(u64, rec[SR_WANT]);
+    const names_ok : bool = report_names_spec(abuf[0..8192], na);
+    var exec_ok : bool = report_ok_t27c(abuf[0..8192], na, want);
+    if (names_ok == false) { exec_ok = false; }
+    var verify_ok : bool = report_ok_t27b(vbuf[0..8192], nv, want);
+    if (vcode != 0) { verify_ok = false; }
+    const st : u8 = attempt_after_verify(@as(u32, rec[SR_CODE]), exec_ok, verify_ok);
+    rec[SR_STATE] = st;
+    if (st == AT_VERIFIED) { rec[SR_B_STATUS] = verified_status(); }
+    k = put_bytes(line[0..256], 0, "verify attempt_id=");
+    k = put_dec(line[0..256], k, id);
+    k = put_bytes(line[0..256], k, " want=");
+    k = put_dec(line[0..256], k, want);
+    k = put_bytes(line[0..256], k, " artifact_bytes=");
+    k = put_dec(line[0..256], k, @as(u64, na));
+    k = put_bytes(line[0..256], k, " names_spec=");
+    k = put_flag(line[0..256], k, names_ok);
+    k = put_bytes(line[0..256], k, " exec_ok=");
+    k = put_flag(line[0..256], k, exec_ok);
+    k = put_bytes(line[0..256], k, " verifier_exit=");
+    k = put_dec(line[0..256], k, @as(u64, vcode));
+    k = put_bytes(line[0..256], k, " verifier_bytes=");
+    k = put_dec(line[0..256], k, @as(u64, nv));
+    k = put_bytes(line[0..256], k, " verify_ok=");
+    k = put_flag(line[0..256], k, verify_ok);
+    k = put_bytes(line[0..256], k, " state=");
+    k = put_dec(line[0..256], k, @as(u64, st));
+    say(line[0..256], k);
+    if (st == AT_VERIFIED) {
+        k = put_report(line[0..256], rec[0..32]);
+        say(line[0..256], k);
+    }
+    const now : u64 = now_secs();
+    const ap : u8 = approval_after(rec[SR_APPROVAL], now >= get_u64(rec[0..32], SR_DEADLINE), false);
+    rec[SR_APPROVAL] = ap;
+    const last : u64 = get_u64(rec[0..32], SR_LAST);
+    const seq : u64 = last + 1;
+    const d : u32 = run_decide(EV_REVIEW, last, seq, reason_now(rec[0..32], ap, TASK_A), reason_now(rec[0..32], ap, TASK_B), reason_now(rec[0..32], ap, TASK_C));
+    put_u64(rec[0..32], SR_LAST, seq);
+    save_record(rec[0..32]);
+    k = put_decision(line[0..256], seq, EV_REVIEW, last, ap, rec[0..32], d);
+    say(line[0..256], k);
+    if (has_executor(d) == false) {
+        k = put_bytes(line[0..256], 0, "next: no launch (WAIT unless the decision names a task)");
+        say(line[0..256], k);
+    }
+    var r : u32 = 4;
+    if (st == AT_VERIFIED) { r = 0; }
+    return r;
+}
+
+/// cursor.tmp, then rename(2) over cursor, like save_record.
+fn save_cursor(c: []const u8, tmp: []const u8, path: []const u8) -> bool {
+    const fd : i32 = sys_creat(tmp, FILE_MODE);
+    if (fd < 0) { return false; }
+    const put : i64 = sys_write(fd, c, @as(u64, FC_LEN));
+    sys_close(fd);
+    if (put != @as(i64, FC_LEN)) { return false; }
+    return sys_rename(tmp, path) == 0;
+}
+
+/// NS_MODE=feed: each snapshot is parsed and checked against the cursor (t27os::pane_feed); an idle
+/// edge of the leased pane (FEED_QUIET) is journaled as one extra check asked. LIST is a snapshot of
+/// observed state, not an end of an attempt, so nothing is decided and nothing is assigned here.
+fn on_feed() -> u32 {
+    var line : [256]u8 = undefined;
+    var k : usize = 0;
+    var dir : [128]u8 = undefined;
+    const dn : usize = env_into("NS_FEED_DIR", dir[0..128], 128);
+    if (feed_dir_ok(dir[0..128], dn) == false) {
+        k = put_bytes(line[0..256], 0, "feed refused: NS_FEED_DIR must be target/next_step/<dir>, not run/\n");
+        sys_write(1, line[0..256], @as(u64, k));
+        return 2;
+    }
+    var jp : [128]u8 = undefined;
+    feed_path(jp[0..128], dir[0..128], dn, "journal");
+    var cp : [128]u8 = undefined;
+    feed_path(cp[0..128], dir[0..128], dn, "cursor");
+    var tp : [128]u8 = undefined;
+    feed_path(tp[0..128], dir[0..128], dn, "cursor.tmp");
+    var nb : [16]u8 = undefined;
+    const ln : usize = env_into("NS_LEASE", nb[0..16], 16);
+    var pane64 : u64 = 15;
+    if (ln > 0) { pane64 = number_at(nb[0..16], ln, 0); }
+    if (pane64 >= 16) {
+        k = put_bytes(line[0..256], 0, "feed refused: NS_LEASE is not a pane");
+        say_in(jp[0..128], line[0..256], k);
+        return 2;
+    }
+    const pane : u32 = @as(u32, @intCast(pane64));
+    var c : [80]u8 = undefined;
+    cursor_clear(c[0..80]);
+    if (read_into(cp[0..128], c[0..80], FC_LEN) != FC_LEN) { cursor_clear(c[0..80]); }
+    k = put_bytes(line[0..256], 0, "feed start lease_pane=");
+    k = put_dec(line[0..256], k, pane64);
+    k = put_bytes(line[0..256], k, " agent=");
+    k = put_dec(line[0..256], k, @as(u64, AGENT_SHELL));
+    k = put_bytes(line[0..256], k, " cursor_kept=");
+    k = put_flag(line[0..256], k, cursor_ok(c[0..80]));
+    k = put_bytes(line[0..256], k, " autonomy_allowed=");
+    k = put_flag(line[0..256], k, autonomy_allowed(true, true));
+    say_in(jp[0..128], line[0..256], k);
+    var sp : [128]u8 = undefined;
+    var buf : [2048]u8 = undefined;
+    var tab : [64]u8 = undefined;
+    var i : u32 = 1;
+    var asked : u64 = 0;
+    var more : bool = true;
+    while (more and i <= FEED_MAX_SNAPS) {
+        snap_path(sp[0..128], dir[0..128], dn, @as(u64, i));
+        const nr : usize = read_into(sp[0..128], buf[0..2048], FEED_BUF);
+        if (nr == 0) {
+            more = false;
+        } else {
+            const t : u64 = snap_time(buf[0..2048], nr);
+            const s : u32 = snap_parse(buf[0..2048], nr, FEED_BUF, tab[0..64]);
+            const a : u32 = feed_action(c[0..80], s, t, tab[0..64], pane, AGENT_SHELL);
+            var edge : u32 = 0;
+            var foreign : u32 = 0;
+            if (a == FA_APPLY) {
+                edge = lease_edge(c[FC_TABLE .. FC_TABLE + FT_LEN], tab[0..64], pane);
+                foreign = foreign_changes(c[FC_TABLE .. FC_TABLE + FT_LEN], tab[0..64], pane);
+            }
+            const ev : u8 = feed_signal(a, edge);
+            k = put_bytes(line[0..256], 0, "feed snap=");
+            k = put_dec(line[0..256], k, @as(u64, i));
+            k = put_bytes(line[0..256], k, " time=");
+            k = put_dec(line[0..256], k, t);
+            k = put_bytes(line[0..256], k, " parse=");
+            k = put_dec(line[0..256], k, @as(u64, s));
+            k = put_bytes(line[0..256], k, " action=");
+            k = put_dec(line[0..256], k, @as(u64, a));
+            k = put_bytes(line[0..256], k, " edge=");
+            k = put_dec(line[0..256], k, @as(u64, edge));
+            k = put_bytes(line[0..256], k, " foreign=");
+            k = put_dec(line[0..256], k, @as(u64, foreign));
+            k = put_bytes(line[0..256], k, " event=");
+            k = put_dec(line[0..256], k, @as(u64, ev));
+            say_in(jp[0..128], line[0..256], k);
+            if (ev == FEED_QUIET) {
+                k = put_bytes(line[0..256], 0, "quiet: one extra check asked, not run; IDLE is output silence, not an end; nothing decided, nothing assigned");
+                say_in(jp[0..128], line[0..256], k);
+                asked = asked + 1;
+            }
+            if (cursor_after(c[0..80], a, t, tab[0..64], pane, AGENT_SHELL)) {
+                if (save_cursor(c[0..80], tp[0..128], cp[0..128]) == false) {
+                    k = put_bytes(line[0..256], 0, "feed stopped: cursor not saved");
+                    say_in(jp[0..128], line[0..256], k);
+                    return 3;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    k = put_bytes(line[0..256], 0, "feed end snapshots=");
+    k = put_dec(line[0..256], k, @as(u64, i - 1));
+    k = put_bytes(line[0..256], k, " checks_asked=");
+    k = put_dec(line[0..256], k, asked);
+    k = put_bytes(line[0..256], k, " decisions=0 launches=0");
+    say_in(jp[0..128], line[0..256], k);
+    return 0;
+}
+
+pub fn main() -> void {
+    sys_mkdir("target/next_step", DIR_MODE);
+    var mode : [16]u8 = undefined;
+    const mn : usize = env_into("NS_MODE", mode[0..16], 16);
+    var r : u32 = 2;
+    if (mn > 0) {
+        if (mode[0] == 102) {
+            r = on_feed();
+        } else {
+            sys_mkdir("target/next_step/run", DIR_MODE);
+            if (mode[0] == 101) { r = on_event(); }
+            if (mode[0] == 118) { r = on_verify(); }
+        }
+    }
+    sys_exit(@as(i32, @intCast(r)));
+}
+
+test the_artifact_must_name_the_spec {
+    const good : []const u8 = "--- test report: specs/queen/next_step.t27 ---\n\n  tests       14\n";
+    const other : []const u8 = "--- test report: specs/t27os/pane_feed.t27 ---\n\n  tests       14\n";
+    assert report_names_spec(good, good.len);
+    assert report_names_spec(other, other.len) == false;
+    assert report_names_spec("  tests       14\n", 17) == false;
+    assert report_names_spec(good, 20) == false;
+}
+
+test the_report_line_comes_from_the_record {
+    var rec : [32]u8 = undefined;
+    record_init(rec[0..32], 100);
+    rec[SR_TASK] = TASK_B;
+    rec[SR_ATTEMPT] = 2;
+    var out : [256]u8 = undefined;
+    const n : usize = put_report(out[0..256], rec[0..32]);
+    assert find_from(out[0..256], n, 0, "report task_id=B attempt_id=2 verified") == 0;
+    rec[SR_TASK] = TASK_A;
+    rec[SR_ATTEMPT] = 1;
+    const m : usize = put_report(out[0..256], rec[0..32]);
+    assert find_from(out[0..256], m, 0, "report task_id=A attempt_id=1 ") == 0;
+}
+
+test feed_files_stay_in_scratch {
+    assert feed_dir_ok("target/next_step/feed1", 22);
+    assert feed_dir_ok("target/next_step/run", 20) == false;
+    assert feed_dir_ok("target/next_step/run2", 21) == false;
+    assert feed_dir_ok("target/next_step/", 17) == false;
+    assert feed_dir_ok("target/next_step/../x", 21) == false;
+    assert feed_dir_ok("/tmp/target/next_step/x", 23) == false;
+    var p : [128]u8 = undefined;
+    const n : usize = snap_path(p[0..128], "target/next_step/feed1", 22, 3);
+    assert n == 25;
+    assert p[n] == 0;
+    assert find_from(p[0..128], n, 0, "feed1/s3") == 17;
+    const m : usize = feed_path(p[0..128], "target/next_step/feed1", 22, "cursor.tmp");
+    assert m == 33;
+    assert find_from(p[0..128], m, 0, "/cursor.tmp") == 22;
+}
+
+test artifact_paths_name_the_attempt {
+    var p : [64]u8 = undefined;
+    const n : usize = artifact_path(p[0..64], 1, false);
+    assert n == 27;
+    assert p[n] == 0;
+    assert find_from(p[0..64], n, 0, "run/a1.out") == 17;
+    const m : usize = artifact_path(p[0..64], 12, true);
+    assert m == 28;
+    assert find_from(p[0..64], m, 0, "a12.ver") != NOT_FOUND;
+}
+
+test reasons_follow_the_record {
+    var rec : [32]u8 = undefined;
+    record_init(rec[0..32], 100);
+    assert reason_now(rec[0..32], AP_WAITING, TASK_A) == NS_PARKED;
+    assert reason_now(rec[0..32], AP_WAITING, TASK_B) == NS_OK;
+    assert reason_now(rec[0..32], AP_WAITING, TASK_C) == NS_BLOCKED;
+    rec[SR_ATTEMPT] = 1;
+    rec[SR_TASK] = TASK_B;
+    rec[SR_LAUNCHES] = 1;
+    assert reason_now(rec[0..32], AP_WAITING, TASK_B) == NR_ATTEMPTED;
+}
+
+test decision_line_carries_event_reasons_and_answer {
+    var rec : [32]u8 = undefined;
+    record_init(rec[0..32], 100);
+    var out : [256]u8 = undefined;
+    const n : usize = put_decision(out[0..256], 1, 2, 0, AP_WAITING, rec[0..32], 1);
+    assert find_from(out[0..256], n, 0, "decide seq=1 kind=2 last=0") == 0;
+    assert find_from(out[0..256], n, 0, " reasons=2,0,3 decision=1") != NOT_FOUND;
+    var f : [8]u8 = undefined;
+    assert put_flag(f[0..8], 0, true) == 3;
+    assert put_flag(f[0..8], 0, false) == 2;
+}

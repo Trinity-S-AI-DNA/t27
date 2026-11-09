@@ -1,0 +1,705 @@
+// SPDX-License-Identifier: Apache-2.0
+; Closes #11275
+; specs/t27os/godmode_policy.t27 -- GODMODE v1 policy: which paths a task may touch and which commands it may run.
+; GODMODE v1 is one green path: task -> isolated worktree -> supervised PTY -> allowlisted command -> validated report.
+; T27 OS owns the contract, the policy, the journal, the validation and the recovery; the executor is swappable.
+; This module is the policy half. It is PURE (no @extern): the host feeds it facts (a path, a command line, the text of
+; `git status --porcelain` after the run) and acts on the verdict number. Verdict numbers are stable and never renumbered.
+; Lists are newline-separated text, one entry per line (the shape of `changes` in specs/tri/land/land.t27). An empty
+; text is an empty list. An empty line inside a list is a bad entry, and an empty entry never covers anything.
+; Paths: repo-relative, no absolute path, no `~`, no `..`, no `.` component, no empty component, no backslash, printable
+; ASCII without space. Matching is by whole component (`build` covers `build/x`, never `buildx`) and ASCII-case-insensitive,
+; because the Mac volume is case-insensitive and `.GIT/config` is `.git/config` there.
+; v1 has no write sandbox. Writes are detected AFTER the run from `git status --porcelain`; a violating run is refused and
+; rolled back by the host. That post-run check (gm_changes_verdict) is the real enforcement in v1.
+; Commands: a small allowlist plus a fixed dangerous list. There is no human approval path in v1, so a dangerous word is
+; denied in AM_DENY_DANGEROUS even when it is allowlisted (the host journals approval.requested, then approval.denied).
+; Redirection targets of an allowed command are not checked here; they surface in the changes check after the run.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osGodmodePolicy;
+
+; --- 1. path operations and verdicts -------------------------------------------------------------------------
+
+pub const OP_READ : u8 = 1;
+pub const OP_WRITE : u8 = 2;
+pub const OP_CREATE : u8 = 3;
+pub const OP_DELETE : u8 = 4;
+
+/// Path verdicts. Stable, never renumber.
+pub const PV_ALLOW : u8 = 0;
+pub const PV_BAD_PATH : u8 = 1;
+pub const PV_FORBIDDEN : u8 = 2;
+pub const PV_NOT_DECLARED : u8 = 3;
+
+/// Always forbidden, applied before the task's own list, for every op including read. The owner forbade touching DSH,
+/// LM Studio and NVIDIA configuration; those live outside the repo, and an absolute path is already PV_BAD_PATH. `.git`
+/// covers the base branch and the hooks.
+pub const GM_BUILTIN_FORBIDDEN : []const u8 = ".git\n.env\n.claude\n.trinity/seals\n.dsh\n.lmstudio";
+
+; --- 2. byte helpers (private) ---------------------------------------------------------------------------------
+
+/// ASCII lower case of one byte.
+fn gm_lc(c: u8) -> u8 {
+    if (c >= 65 and c <= 90) { return c + 32; }
+    return c;
+}
+
+/// Are s[a..b] and t[c..d] the same bytes? ci folds ASCII case. A different length is false, never "almost equal".
+fn gm_spans_eq(s: []const u8, a: usize, b: usize, t: []const u8, c: usize, d: usize, ci: bool) -> bool {
+    if (b < a or d < c or b - a != d - c) { return false; }
+    var i : usize = 0;
+    while (i < b - a) {
+        var x : u8 = s[a + i];
+        var y : u8 = t[c + i];
+        if (ci) { x = gm_lc(x); y = gm_lc(y); }
+        if (x != y) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Index of the next newline at or after `from`, or s.len.
+fn gm_eol(s: []const u8, from: usize) -> usize {
+    var i : usize = from;
+    while (i < s.len and s[i] != 10) { i = i + 1; }
+    return i;
+}
+
+/// Is the span w[a..b] one whole line of `list`? Empty lines never match.
+fn gm_list_has(list: []const u8, w: []const u8, a: usize, b: usize, ci: bool) -> bool {
+    var pos : usize = 0;
+    while (pos < list.len) {
+        const e : usize = gm_eol(list, pos);
+        if (e > pos and gm_spans_eq(list, pos, e, w, a, b, ci)) { return true; }
+        pos = e + 1;
+    }
+    return false;
+}
+
+; --- 3. path syntax and component-prefix match ---------------------------------------------------------------
+
+/// A path component that may not appear: empty (`a//b`, trailing slash), `.` or `..`. A `.` component is refused too,
+/// because `./.git/x` would slip past a component-prefix match on `.git`.
+fn gm_bad_component(p: []const u8, a: usize, b: usize) -> bool {
+    if (b == a) { return true; }
+    if (b - a == 1 and p[a] == 46) { return true; }
+    if (b - a == 2 and p[a] == 46 and p[a + 1] == 46) { return true; }
+    return false;
+}
+
+fn gm_syntax_span(p: []const u8, a: usize, b: usize) -> bool {
+    if (b <= a) { return false; }
+    if (p[a] == 47 or p[a] == 126) { return false; }
+    var cs : usize = a;
+    var i : usize = a;
+    while (i < b) {
+        const c : u8 = p[i];
+        if (c <= 32 or c >= 127 or c == 92) { return false; }
+        if (c == 47) {
+            if (gm_bad_component(p, cs, i)) { return false; }
+            cs = i + 1;
+        }
+        i = i + 1;
+    }
+    return gm_bad_component(p, cs, b) == false;
+}
+
+/// Is p a safe repo-relative path? Non-empty; not starting with `/` or `~`; no `..`, `.` or empty component; no `\`;
+/// printable ASCII without space (a space breaks the porcelain rename form and hides arguments).
+pub fn gm_path_syntax_ok(p: []const u8) -> bool {
+    return gm_syntax_span(p, 0, p.len);
+}
+
+/// Does the list line l[ea..eb] cover p[a..b]? Entry `.` covers every path; otherwise path == entry, or the path starts
+/// with the entry followed by `/`.
+fn gm_entry_covers(p: []const u8, a: usize, b: usize, l: []const u8, ea: usize, eb: usize) -> bool {
+    const n : usize = eb - ea;
+    if (n == 1 and l[ea] == 46) { return true; }
+    if (n == 0 or b - a < n) { return false; }
+    if (gm_spans_eq(p, a, a + n, l, ea, eb, true) == false) { return false; }
+    return b - a == n or p[a + n] == 47;
+}
+
+fn gm_covers_span(list: []const u8, p: []const u8, a: usize, b: usize) -> bool {
+    var pos : usize = 0;
+    while (pos < list.len) {
+        const e : usize = gm_eol(list, pos);
+        if (gm_entry_covers(p, a, b, list, pos, e)) { return true; }
+        pos = e + 1;
+    }
+    return false;
+}
+
+/// True when path == entry or path starts with entry followed by `/`. Entry `.` matches every path.
+pub fn gm_path_under(path: []const u8, entry: []const u8) -> bool {
+    return gm_entry_covers(path, 0, path.len, entry, 0, entry.len);
+}
+
+/// True when some line of the newline list covers the path.
+pub fn gm_list_covers(list: []const u8, path: []const u8) -> bool {
+    return gm_covers_span(list, path, 0, path.len);
+}
+
+/// Is every line of the list a usable entry? An empty list is fine; an empty line is not. With allow_dot the entry `.`
+/// (the whole tree) is accepted, which only a read list should use.
+pub fn gm_list_entries_ok(list: []const u8, allow_dot: bool) -> bool {
+    var pos : usize = 0;
+    while (pos < list.len) {
+        const e : usize = gm_eol(list, pos);
+        const dot : bool = allow_dot and e - pos == 1 and list[pos] == 46;
+        if (dot == false and gm_syntax_span(list, pos, e) == false) { return false; }
+        pos = e + 1;
+    }
+    return true;
+}
+
+/// Is some entry of the list covered by the builtin forbidden list or by the task's own? (An entry that is a parent of a
+/// forbidden path is not a hit here: the path verdict lets the forbidden child win.)
+pub fn gm_list_hits_forbidden(list: []const u8, forbidden_paths: []const u8) -> bool {
+    var pos : usize = 0;
+    while (pos < list.len) {
+        const e : usize = gm_eol(list, pos);
+        if (gm_covers_span(GM_BUILTIN_FORBIDDEN, list, pos, e) or gm_covers_span(forbidden_paths, list, pos, e)) { return true; }
+        pos = e + 1;
+    }
+    return false;
+}
+
+/// Is every line of the list a path the task may write or create (declared, not forbidden)? An empty list is true.
+pub fn gm_list_all_writable(list: []const u8, write_paths: []const u8, create_paths: []const u8, forbidden_paths: []const u8) -> bool {
+    var pos : usize = 0;
+    while (pos < list.len) {
+        const e : usize = gm_eol(list, pos);
+        const w : u8 = gm_verdict_span(OP_WRITE, list, pos, e, "", write_paths, create_paths, "", forbidden_paths);
+        const c : u8 = gm_verdict_span(OP_CREATE, list, pos, e, "", write_paths, create_paths, "", forbidden_paths);
+        if (w != PV_ALLOW and c != PV_ALLOW) { return false; }
+        pos = e + 1;
+    }
+    return true;
+}
+
+; --- 4. the path verdict -----------------------------------------------------------------------------------------
+
+fn gm_verdict_span(op: u8, p: []const u8, a: usize, b: usize, rd: []const u8, wr: []const u8, cr: []const u8, de: []const u8, fb: []const u8) -> u8 {
+    if (gm_syntax_span(p, a, b) == false) { return PV_BAD_PATH; }
+    if (gm_covers_span(GM_BUILTIN_FORBIDDEN, p, a, b) or gm_covers_span(fb, p, a, b)) { return PV_FORBIDDEN; }
+    if (op == OP_READ and (gm_covers_span(rd, p, a, b) or gm_covers_span(wr, p, a, b))) { return PV_ALLOW; }
+    if (op == OP_WRITE and gm_covers_span(wr, p, a, b)) { return PV_ALLOW; }
+    if (op == OP_CREATE and gm_covers_span(cr, p, a, b)) { return PV_ALLOW; }
+    if (op == OP_DELETE and gm_covers_span(de, p, a, b)) { return PV_ALLOW; }
+    return PV_NOT_DECLARED;
+}
+
+/// The verdict for one op on one path: bad syntax, then forbidden (builtin or the task's own; it wins for every op,
+/// read included), then the declared lists, else not declared. A read is also allowed where a write is. An unknown op
+/// is never declared.
+pub fn gm_path_verdict(op: u8, path: []const u8, read_paths: []const u8, write_paths: []const u8, create_paths: []const u8, delete_paths: []const u8, forbidden_paths: []const u8) -> u8 {
+    return gm_verdict_span(op, path, 0, path.len, read_paths, write_paths, create_paths, delete_paths, forbidden_paths);
+}
+
+; --- 5. the post-run change check --------------------------------------------------------------------------------
+
+/// Index of the first " -> " in ch[a..e], or e when there is none.
+fn gm_find_arrow(ch: []const u8, a: usize, e: usize) -> usize {
+    var k : usize = a;
+    while (k + 4 <= e) {
+        if (ch[k] == 32 and ch[k + 1] == 45 and ch[k + 2] == 62 and ch[k + 3] == 32) { return k; }
+        k = k + 1;
+    }
+    return e;
+}
+
+/// The verdict of one porcelain line ch[s..e): two status chars, a space, the path. `??` and `A` create, `D` deletes,
+/// `M` writes (either column; D beats M, so `MD` is a delete). `R  old -> new` is a delete of old plus a create of
+/// new. Any other status, a short line, an empty line, a missing space or a rename without an arrow is malformed.
+fn gm_line_verdict(ch: []const u8, s: usize, e: usize, wr: []const u8, cr: []const u8, de: []const u8, fb: []const u8) -> u8 {
+    if (e < s + 4 or ch[s + 2] != 32) { return PV_BAD_PATH; }
+    const x : u8 = ch[s];
+    const y : u8 = ch[s + 1];
+    if (x == 82) {
+        const k : usize = gm_find_arrow(ch, s + 3, e);
+        if (k >= e) { return PV_BAD_PATH; }
+        const v : u8 = gm_verdict_span(OP_DELETE, ch, s + 3, k, "", wr, cr, de, fb);
+        if (v != PV_ALLOW) { return v; }
+        return gm_verdict_span(OP_CREATE, ch, k + 4, e, "", wr, cr, de, fb);
+    }
+    var op : u8 = 0;
+    if (x == 63 and y == 63) { op = OP_CREATE; }
+    else if (x == 65 or y == 65) { op = OP_CREATE; }
+    else if (x == 68 or y == 68) { op = OP_DELETE; }
+    else if (x == 77 or y == 77) { op = OP_WRITE; }
+    else { return PV_BAD_PATH; }
+    return gm_verdict_span(op, ch, s + 3, e, "", wr, cr, de, fb);
+}
+
+/// How many lines of `git status --porcelain` text break the declared paths (any verdict but PV_ALLOW).
+pub fn gm_changes_violations(changes: []const u8, write_paths: []const u8, create_paths: []const u8, delete_paths: []const u8, forbidden_paths: []const u8) -> u32 {
+    var n : u32 = 0;
+    var pos : usize = 0;
+    while (pos < changes.len) {
+        const e : usize = gm_eol(changes, pos);
+        if (gm_line_verdict(changes, pos, e, write_paths, create_paths, delete_paths, forbidden_paths) != PV_ALLOW) { n = n + 1; }
+        pos = e + 1;
+    }
+    return n;
+}
+
+/// PV_ALLOW when every line is fine, else the verdict of the first violating line (a malformed line is PV_BAD_PATH).
+pub fn gm_changes_verdict(changes: []const u8, write_paths: []const u8, create_paths: []const u8, delete_paths: []const u8, forbidden_paths: []const u8) -> u8 {
+    var pos : usize = 0;
+    while (pos < changes.len) {
+        const e : usize = gm_eol(changes, pos);
+        const v : u8 = gm_line_verdict(changes, pos, e, write_paths, create_paths, delete_paths, forbidden_paths);
+        if (v != PV_ALLOW) { return v; }
+        pos = e + 1;
+    }
+    return PV_ALLOW;
+}
+
+; --- 6. command verdicts --------------------------------------------------------------------------------------------
+
+pub const AM_UNSET : u8 = 0;
+pub const AM_DENY_DANGEROUS : u8 = 1;
+
+/// Command verdicts. Stable, never renumber.
+pub const CV_ALLOW : u8 = 0;
+pub const CV_EMPTY : u8 = 1;
+pub const CV_NOT_ALLOWLISTED : u8 = 2;
+pub const CV_DANGEROUS : u8 = 3;
+pub const CV_BACKGROUND : u8 = 4;
+pub const CV_SUBSTITUTION : u8 = 5;
+pub const CV_ENV_ASSIGN : u8 = 6;
+pub const CV_BAD_MODE : u8 = 7;
+pub const CV_UNBALANCED_QUOTE : u8 = 8;
+
+/// Words that never run in v1: deletion, privilege, network, process control, package managers, interpreters,
+/// eval-like builtins, anything that detaches or reaches the desktop. Matched on the basename, ASCII-case-insensitive.
+pub const GM_DANGEROUS : []const u8 = "rm\nrmdir\nsudo\nsu\ndoas\ncurl\nwget\nssh\nscp\nrsync\nnc\nncat\ntelnet\ndd\nmkfs\ndiskutil\nchmod\nchown\nkill\npkill\nkillall\nlaunchctl\nsystemctl\ngit\ngh\neval\nexec\nsource\nnohup\ndisown\nsetsid\nosascript\nopen\ndefaults\nsecurity\ncrontab\nat\ndocker\npip\nnpm\ncargo\nbrew\npython\npython3\nnode\nperl\nruby";
+
+/// An unset approval mode (0) means deny-dangerous. Any other value stays as it is, so the contract can refuse it.
+pub fn gm_effective_approval(m: u8) -> u8 {
+    if (m == AM_UNSET) { return AM_DENY_DANGEROUS; }
+    return m;
+}
+
+/// Does this verdict need an approval the host would ask for? Only CV_DANGEROUS. v1 has no approver: the host journals
+/// approval.requested and then approval.denied.
+pub fn gm_approval_needed(cv: u8) -> bool {
+    return cv == CV_DANGEROUS;
+}
+
+/// Is the span a shell (bash, sh, zsh)?
+fn gm_is_shell(t: []const u8, a: usize, b: usize) -> bool {
+    return gm_spans_eq(t, a, b, "bash", 0, 4, true) or gm_spans_eq(t, a, b, "sh", 0, 2, true) or gm_spans_eq(t, a, b, "zsh", 0, 3, true);
+}
+
+/// Verdict for one command word t[ws..we): `=` anywhere is an env assignment; the basename (after the last `/`) is
+/// then checked against the dangerous list, then refused if it is a shell (no nested shells inside a script, where
+/// quoting would hide a second script from this lexer), then must be on the allowlist (exact case).
+fn gm_word_verdict(t: []const u8, ws: usize, we: usize, allowed: []const u8) -> u8 {
+    var k : usize = ws;
+    var bs : usize = ws;
+    while (k < we) {
+        if (t[k] == 61) { return CV_ENV_ASSIGN; }
+        if (t[k] == 47) { bs = k + 1; }
+        k = k + 1;
+    }
+    if (gm_list_has(GM_DANGEROUS, t, bs, we, true)) { return CV_DANGEROUS; }
+    if (gm_is_shell(t, bs, we)) { return CV_NOT_ALLOWLISTED; }
+    if (gm_list_has(allowed, t, bs, we, false) == false) { return CV_NOT_ALLOWLISTED; }
+    return CV_ALLOW;
+}
+
+/// The lexer over t[a..b). A while loop over bytes with a small state; no recursion.
+///   single quotes: literal to the next `'`; double quotes: end at an unescaped `"`, and `$(` or a backtick inside is
+///   a substitution; outside quotes `$(`, a backtick, `<(` and `>(` are substitutions; a backslash outside quotes
+///   escapes the next byte. Segments end at `;`, newline, `&&`, `||`, `|`. A lone `&` (not `&&`, `>&`, `&>`) is a
+///   background process. A segment starts with its command word; a segment that starts with a redirection is refused.
+fn gm_script_span(t: []const u8, a: usize, b: usize, allowed: []const u8) -> u8 {
+    var i : usize = a;
+    var in_s : bool = false;
+    var in_d : bool = false;
+    var expect : bool = true;
+    var in_cw : bool = false;
+    var ws : usize = a;
+    var words : u32 = 0;
+    while (i < b) {
+        const c : u8 = t[i];
+        if (in_s) {
+            if (c == 39) { in_s = false; }
+            i = i + 1;
+            continue;
+        }
+        if (in_d) {
+            if (c == 92) { i = i + 2; continue; }
+            if (c == 34) { in_d = false; i = i + 1; continue; }
+            if (c == 96) { return CV_SUBSTITUTION; }
+            if (c == 36 and i + 1 < b and t[i + 1] == 40) { return CV_SUBSTITUTION; }
+            i = i + 1;
+            continue;
+        }
+        if (c == 96) { return CV_SUBSTITUTION; }
+        if (c == 36 and i + 1 < b and t[i + 1] == 40) { return CV_SUBSTITUTION; }
+        const sep : bool = c == 59 or c == 10 or c == 124 or c == 38;
+        const redir : bool = c == 60 or c == 62;
+        if (c == 32 or c == 9 or sep or redir) {
+            if (in_cw) {
+                const wv : u8 = gm_word_verdict(t, ws, i, allowed);
+                if (wv != CV_ALLOW) { return wv; }
+                in_cw = false;
+            }
+        }
+        if (redir) {
+            if (expect) { return CV_NOT_ALLOWLISTED; }
+            if (i + 1 < b and t[i + 1] == 40) { return CV_SUBSTITUTION; }
+            i = i + 1;
+            continue;
+        }
+        if (c == 38) {
+            if (i + 1 < b and t[i + 1] == 38) { expect = true; i = i + 2; continue; }
+            if (i > a and t[i - 1] == 62) { i = i + 1; continue; }
+            if (i + 1 < b and t[i + 1] == 62) { i = i + 1; continue; }
+            return CV_BACKGROUND;
+        }
+        if (c == 124) {
+            expect = true;
+            i = i + 1;
+            if (i < b and (t[i] == 124 or t[i] == 38)) { i = i + 1; }
+            continue;
+        }
+        if (c == 59 or c == 10) { expect = true; i = i + 1; continue; }
+        if (c == 32 or c == 9) { i = i + 1; continue; }
+        if (expect) {
+            expect = false;
+            in_cw = true;
+            ws = i;
+            words = words + 1;
+        }
+        if (c == 92) { i = i + 2; continue; }
+        if (c == 39) { in_s = true; }
+        if (c == 34) { in_d = true; }
+        i = i + 1;
+    }
+    if (in_s or in_d) { return CV_UNBALANCED_QUOTE; }
+    if (in_cw) {
+        const lv : u8 = gm_word_verdict(t, ws, b, allowed);
+        if (lv != CV_ALLOW) { return lv; }
+    }
+    if (words == 0) { return CV_EMPTY; }
+    return CV_ALLOW;
+}
+
+/// The verdict for a shell script text. First failing verdict in script order, else CV_ALLOW; a script with no command
+/// word at all is CV_EMPTY. Redirections are allowed here; their targets are judged after the run.
+pub fn gm_script_verdict(script: []const u8, allowed_tools: []const u8, approval_mode: u8) -> u8 {
+    if (gm_effective_approval(approval_mode) != AM_DENY_DANGEROUS) { return CV_BAD_MODE; }
+    return gm_script_span(script, 0, script.len, allowed_tools);
+}
+
+/// The first failing script verdict over a newline list of shell lines (each line is one script), else CV_ALLOW. An
+/// empty line is CV_EMPTY, so it fails; an empty list is CV_ALLOW (the caller decides whether a list may be empty).
+pub fn gm_script_lines_verdict(lines: []const u8, allowed_tools: []const u8, approval_mode: u8) -> u8 {
+    if (gm_effective_approval(approval_mode) != AM_DENY_DANGEROUS) { return CV_BAD_MODE; }
+    var pos : usize = 0;
+    while (pos < lines.len) {
+        const e : usize = gm_eol(lines, pos);
+        const v : u8 = gm_script_span(lines, pos, e, allowed_tools);
+        if (v != CV_ALLOW) { return v; }
+        pos = e + 1;
+    }
+    return CV_ALLOW;
+}
+
+/// Is the line args[s..e) exactly the literal?
+fn gm_arg_is(args: []const u8, s: usize, e: usize, lit: []const u8) -> bool {
+    return gm_spans_eq(args, s, e, lit, 0, lit.len, false);
+}
+
+/// The verdict for the executor command and its newline-separated argv. Mode first, then empty, then the command word
+/// (basename): dangerous, then allowlisted. A shell (bash, sh, zsh) runs only as `-c` or `-lc` plus a script, and the
+/// script goes through gm_script_verdict; a script file or a bare shell is refused. Any other command may not carry the
+/// single token `&` as an argument.
+pub fn gm_command_verdict(command: []const u8, args: []const u8, allowed_tools: []const u8, approval_mode: u8) -> u8 {
+    if (gm_effective_approval(approval_mode) != AM_DENY_DANGEROUS) { return CV_BAD_MODE; }
+    if (command.len == 0) { return CV_EMPTY; }
+    var bs : usize = 0;
+    var k : usize = 0;
+    while (k < command.len) {
+        if (command[k] == 47) { bs = k + 1; }
+        k = k + 1;
+    }
+    if (gm_list_has(GM_DANGEROUS, command, bs, command.len, true)) { return CV_DANGEROUS; }
+    if (gm_list_has(allowed_tools, command, bs, command.len, false) == false) { return CV_NOT_ALLOWLISTED; }
+    if (gm_is_shell(command, bs, command.len)) {
+        const e0 : usize = gm_eol(args, 0);
+        if (gm_arg_is(args, 0, e0, "-c") == false and gm_arg_is(args, 0, e0, "-lc") == false) { return CV_NOT_ALLOWLISTED; }
+        if (e0 >= args.len) { return CV_NOT_ALLOWLISTED; }
+        const s1 : usize = e0 + 1;
+        return gm_script_span(args, s1, gm_eol(args, s1), allowed_tools);
+    }
+    var pos : usize = 0;
+    while (pos < args.len) {
+        const e : usize = gm_eol(args, pos);
+        if (gm_arg_is(args, pos, e, "&")) { return CV_BACKGROUND; }
+        pos = e + 1;
+    }
+    return CV_ALLOW;
+}
+
+; --- 7. tests -----------------------------------------------------------------------------------------------------
+
+test path_under_matches_whole_components {
+    assert gm_path_under("build", "build");
+    assert gm_path_under("build/report.json", "build");
+    assert gm_path_under("a/b/c", "a/b");
+    assert gm_path_under("BUILD/x", "build");
+    assert gm_path_under("buildx", "build") == false;
+    assert gm_path_under("build", "build/report.json") == false;
+    assert gm_path_under("x/build", "build") == false;
+}
+
+test dot_entry_covers_every_path {
+    assert gm_path_under("a", ".");
+    assert gm_path_under("deep/er/path.txt", ".");
+    assert gm_list_covers("specs\n.", "anything/at/all");
+}
+
+test list_covers_by_line {
+    assert gm_list_covers("specs\ngen\nbuild", "gen/c/x.c");
+    assert gm_list_covers("specs\ngen\nbuild", "genx/c") == false;
+    assert gm_list_covers("", "build") == false;
+    assert gm_list_covers("\n\n", "build") == false;
+}
+
+test syntax_accepts_plain_relative_paths {
+    assert gm_path_syntax_ok("build/report.json");
+    assert gm_path_syntax_ok("a");
+    assert gm_path_syntax_ok(".claude/worktrees/godmode-001");
+    assert gm_path_syntax_ok("dir/.hidden/file");
+}
+
+test syntax_refuses_bad_paths {
+    assert gm_path_syntax_ok("") == false;
+    assert gm_path_syntax_ok("/etc/x") == false;
+    assert gm_path_syntax_ok("~/x") == false;
+    assert gm_path_syntax_ok("a/../b") == false;
+    assert gm_path_syntax_ok("..") == false;
+    assert gm_path_syntax_ok("a//b") == false;
+    assert gm_path_syntax_ok("a/") == false;
+    assert gm_path_syntax_ok("a\\b") == false;
+    assert gm_path_syntax_ok("a b") == false;
+    assert gm_path_syntax_ok(".") == false;
+    assert gm_path_syntax_ok("./.git/x") == false;
+}
+
+test forbidden_beats_write {
+    assert gm_path_verdict(OP_WRITE, "build/x", "", "build", "", "", "build") == PV_FORBIDDEN;
+    assert gm_path_verdict(OP_WRITE, "build/x", "", "build", "", "", "specs") == PV_ALLOW;
+    assert gm_path_verdict(OP_READ, "specs/a.t27", ".", "", "", "", "specs") == PV_FORBIDDEN;
+}
+
+test builtin_forbidden_covers_git_and_friends {
+    assert gm_path_verdict(OP_WRITE, ".git/config", "", ".", "", "", "") == PV_FORBIDDEN;
+    assert gm_path_verdict(OP_READ, ".git/HEAD", ".", "", "", "", "") == PV_FORBIDDEN;
+    assert gm_path_verdict(OP_WRITE, ".GIT/config", "", ".", "", "", "") == PV_FORBIDDEN;
+    assert gm_path_verdict(OP_CREATE, ".env", "", "", ".", "", "") == PV_FORBIDDEN;
+    assert gm_path_verdict(OP_WRITE, ".trinity/seals/a", "", ".", "", "", "") == PV_FORBIDDEN;
+    assert gm_path_verdict(OP_WRITE, ".trinity/other", "", ".trinity", "", "", "") == PV_ALLOW;
+    assert gm_path_verdict(OP_WRITE, ".gitignore", "", ".gitignore", "", "", "") == PV_ALLOW;
+}
+
+test bad_path_beats_everything {
+    assert gm_path_verdict(OP_WRITE, "/etc/passwd", "", ".", "", "", "") == PV_BAD_PATH;
+    assert gm_path_verdict(OP_READ, "a/../.git/x", ".", "", "", "", "") == PV_BAD_PATH;
+}
+
+test read_is_allowed_through_the_write_list {
+    assert gm_path_verdict(OP_READ, "build/a", "", "build", "", "", "") == PV_ALLOW;
+    assert gm_path_verdict(OP_READ, "src/a", "src", "", "", "", "") == PV_ALLOW;
+    assert gm_path_verdict(OP_READ, "src/a", "docs", "", "", "", "") == PV_NOT_DECLARED;
+}
+
+test create_and_delete_need_their_own_lists {
+    assert gm_path_verdict(OP_CREATE, "build/new", "", "build", "", "", "") == PV_NOT_DECLARED;
+    assert gm_path_verdict(OP_CREATE, "build/new", "", "", "build", "", "") == PV_ALLOW;
+    assert gm_path_verdict(OP_DELETE, "build/old", "", "build", "build", "", "") == PV_NOT_DECLARED;
+    assert gm_path_verdict(OP_DELETE, "build/old", "", "", "", "build", "") == PV_ALLOW;
+    assert gm_path_verdict(OP_WRITE, "build/new", "", "", "build", "", "") == PV_NOT_DECLARED;
+}
+
+test unknown_op_is_not_declared {
+    assert gm_path_verdict(0, "build/a", ".", ".", ".", ".", "") == PV_NOT_DECLARED;
+    assert gm_path_verdict(9, "build/a", ".", ".", ".", ".", "") == PV_NOT_DECLARED;
+}
+
+test changes_allow_declared_create {
+    assert gm_changes_verdict("?? build/report.json", "", "build", "", "") == PV_ALLOW;
+    assert gm_changes_violations("?? build/report.json", "", "build", "", "") == 0;
+    assert gm_changes_verdict("", "", "", "", "") == PV_ALLOW;
+    assert gm_changes_verdict("A  build/a\n?? build/b\n", "", "build", "", "") == PV_ALLOW;
+}
+
+test changes_refuse_forbidden_modify {
+    assert gm_changes_verdict(" M .git/HEAD", ".", ".", ".", "") == PV_FORBIDDEN;
+    assert gm_changes_verdict("M  a\n M .git/HEAD", "a", "", "", "") == PV_FORBIDDEN;
+    assert gm_changes_violations(" M .git/HEAD\n M specs/x", ".", ".", ".", "specs") == 2;
+}
+
+test changes_refuse_undeclared_delete_and_write {
+    assert gm_changes_verdict(" D build/x", "build", "build", "", "") == PV_NOT_DECLARED;
+    assert gm_changes_verdict("D  build/x", "build", "build", "build", "") == PV_ALLOW;
+    assert gm_changes_verdict(" M other/x", "build", "build", "", "") == PV_NOT_DECLARED;
+    assert gm_changes_verdict("MD build/x", "build", "", "", "") == PV_NOT_DECLARED;
+}
+
+test changes_rename_is_delete_plus_create {
+    assert gm_changes_verdict("R  build/a -> build/b", "", "build", "build", "") == PV_ALLOW;
+    assert gm_changes_verdict("R  build/a -> build/b", "", "build", "", "") == PV_NOT_DECLARED;
+    assert gm_changes_verdict("R  build/a -> build/b", "", "", "build", "") == PV_NOT_DECLARED;
+    assert gm_changes_verdict("R  build/a -> .git/b", "", ".", ".", "") == PV_FORBIDDEN;
+    assert gm_changes_verdict("R  build/a", "", "build", "build", "") == PV_BAD_PATH;
+}
+
+test changes_malformed_lines_are_bad_path {
+    assert gm_changes_verdict("?? ", "", ".", "", "") == PV_BAD_PATH;
+    assert gm_changes_verdict("x", "", ".", "", "") == PV_BAD_PATH;
+    assert gm_changes_verdict("?? build/a\n\n?? build/b", "", "build", "", "") == PV_BAD_PATH;
+    assert gm_changes_verdict("XX build/a", "build", "build", "build", "") == PV_BAD_PATH;
+    assert gm_changes_verdict("??build/a", "", "build", "", "") == PV_BAD_PATH;
+    assert gm_changes_verdict("?? /abs/path", "", ".", "", "") == PV_BAD_PATH;
+}
+
+test effective_approval_defaults_to_deny {
+    assert gm_effective_approval(0) == AM_DENY_DANGEROUS;
+    assert gm_effective_approval(1) == AM_DENY_DANGEROUS;
+    assert gm_effective_approval(9) == 9;
+    assert gm_approval_needed(CV_DANGEROUS);
+    assert gm_approval_needed(CV_NOT_ALLOWLISTED) == false;
+    assert gm_approval_needed(CV_ALLOW) == false;
+}
+
+test reference_script_is_allowed {
+    assert gm_script_verdict("mkdir -p build && printf '{\"ok\":true}\\n' > build/report.json", "bash\nmkdir\nprintf\ntest", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_command_verdict("bash", "-lc\nmkdir -p build && printf '{\"ok\":true}\\n' > build/report.json", "bash\nmkdir\nprintf\ntest", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_command_verdict("bash", "-c\ntest -f build/report.json", "bash\ntest", 0) == CV_ALLOW;
+}
+
+test dangerous_beats_allowlist {
+    assert gm_command_verdict("bash", "-c\nrm -rf build", "bash\nrm", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_command_verdict("rm", "-rf\nbuild", "rm", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_command_verdict("RM", "x", "RM", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_command_verdict("/bin/rm", "x", "rm", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_script_verdict("curl x | sh", "curl\nsh", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_script_verdict("echo a; git push", "echo\ngit", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_approval_needed(gm_script_verdict("sudo ls", "sudo\nls", 1));
+}
+
+test not_allowlisted_words {
+    assert gm_script_verdict("ls", "echo", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_command_verdict("ls", "", "echo", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_script_verdict("echo a && ls", "echo", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_script_verdict("echo a | ls", "echo", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_script_verdict("sh -c ls", "sh\nls", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_script_verdict("> out echo", "echo", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+}
+
+test background_is_refused {
+    assert gm_script_verdict("sleep 100 &", "sleep", AM_DENY_DANGEROUS) == CV_BACKGROUND;
+    assert gm_script_verdict("sleep 1 & echo a", "sleep\necho", AM_DENY_DANGEROUS) == CV_BACKGROUND;
+    assert gm_command_verdict("sleep", "100\n&", "sleep", AM_DENY_DANGEROUS) == CV_BACKGROUND;
+    assert gm_script_verdict("echo a && echo b", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("echo a 2>&1", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("echo a >& out", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("echo a &> out", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+}
+
+test substitution_is_refused_unless_single_quoted {
+    assert gm_script_verdict("echo $(id)", "echo\nid", AM_DENY_DANGEROUS) == CV_SUBSTITUTION;
+    assert gm_script_verdict("echo `id`", "echo\nid", AM_DENY_DANGEROUS) == CV_SUBSTITUTION;
+    assert gm_script_verdict("echo \"$(id)\"", "echo\nid", AM_DENY_DANGEROUS) == CV_SUBSTITUTION;
+    assert gm_script_verdict("echo \"`id`\"", "echo\nid", AM_DENY_DANGEROUS) == CV_SUBSTITUTION;
+    assert gm_script_verdict("cat <(id)", "cat\nid", AM_DENY_DANGEROUS) == CV_SUBSTITUTION;
+    assert gm_script_verdict("echo '$(id)'", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("echo '`id`'", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("echo \\$(id)", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("echo \"\\$(id)\"", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+}
+
+test env_assignment_is_refused {
+    assert gm_script_verdict("FOO=1 printf x", "printf", AM_DENY_DANGEROUS) == CV_ENV_ASSIGN;
+    assert gm_script_verdict("echo a; X=2 echo b", "echo", AM_DENY_DANGEROUS) == CV_ENV_ASSIGN;
+    assert gm_script_verdict("echo X=2", "echo", AM_DENY_DANGEROUS) == CV_ALLOW;
+}
+
+test quotes_hide_separators_and_unbalanced_quotes_fail {
+    assert gm_script_verdict("printf 'a;b'", "printf", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("printf \"a;rm b\"", "printf", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("printf 'a'; rm b", "printf\nrm", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_script_verdict("printf 'abc", "printf", AM_DENY_DANGEROUS) == CV_UNBALANCED_QUOTE;
+    assert gm_script_verdict("printf \"abc", "printf", AM_DENY_DANGEROUS) == CV_UNBALANCED_QUOTE;
+    assert gm_script_verdict("printf \"a\\\"b\"", "printf", AM_DENY_DANGEROUS) == CV_ALLOW;
+}
+
+test newline_and_pipe_separators {
+    assert gm_script_verdict("echo a\nrm b", "echo\nrm", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_script_verdict("echo a || rm b", "echo\nrm", AM_DENY_DANGEROUS) == CV_DANGEROUS;
+    assert gm_script_verdict("echo a |& cat", "echo\ncat", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_script_verdict("", "echo", AM_DENY_DANGEROUS) == CV_EMPTY;
+    assert gm_script_verdict("  ; ;", "echo", AM_DENY_DANGEROUS) == CV_EMPTY;
+}
+
+test shell_forms {
+    assert gm_command_verdict("bash", "script.sh", "bash", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_command_verdict("bash", "", "bash", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_command_verdict("bash", "-c", "bash", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_command_verdict("bash", "-x\necho a", "bash\necho", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_command_verdict("zsh", "-c\necho a", "zsh\necho", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_command_verdict("sh", "-c\necho a", "echo", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+}
+
+test command_basename_and_empty {
+    assert gm_command_verdict("/usr/bin/printf", "x", "printf", AM_DENY_DANGEROUS) == CV_ALLOW;
+    assert gm_command_verdict("", "", "printf", AM_DENY_DANGEROUS) == CV_EMPTY;
+    assert gm_command_verdict("printf", "x", "", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+    assert gm_command_verdict("printf/", "x", "printf", AM_DENY_DANGEROUS) == CV_NOT_ALLOWLISTED;
+}
+
+test approval_mode_is_checked_first {
+    assert gm_command_verdict("printf", "x", "printf", 9) == CV_BAD_MODE;
+    assert gm_script_verdict("echo a", "echo", 9) == CV_BAD_MODE;
+    assert gm_command_verdict("", "", "", 9) == CV_BAD_MODE;
+    assert gm_command_verdict("printf", "x", "printf", 0) == CV_ALLOW;
+    assert gm_command_verdict("rm", "x", "rm", 0) == CV_DANGEROUS;
+}
+
+test stable_codes {
+    assert PV_ALLOW == 0 and PV_BAD_PATH == 1 and PV_FORBIDDEN == 2 and PV_NOT_DECLARED == 3;
+    assert CV_ALLOW == 0 and CV_EMPTY == 1 and CV_NOT_ALLOWLISTED == 2 and CV_DANGEROUS == 3;
+    assert CV_BACKGROUND == 4 and CV_SUBSTITUTION == 5 and CV_ENV_ASSIGN == 6;
+    assert CV_BAD_MODE == 7 and CV_UNBALANCED_QUOTE == 8;
+    assert OP_READ == 1 and OP_WRITE == 2 and OP_CREATE == 3 and OP_DELETE == 4;
+}
+
+test list_helpers_for_the_contract {
+    assert gm_list_entries_ok("", false);
+    assert gm_list_entries_ok("build\nout/x", false);
+    assert gm_list_entries_ok("a\n\nb", false) == false;
+    assert gm_list_entries_ok(".", false) == false;
+    assert gm_list_entries_ok(".", true);
+    assert gm_list_hits_forbidden("build\n.git/hooks", "") ;
+    assert gm_list_hits_forbidden("build\nspecs/a", "specs");
+    assert gm_list_hits_forbidden("build\nout", "specs") == false;
+    assert gm_list_all_writable("build/a.json", "build", "", "");
+    assert gm_list_all_writable("build/a.json", "", "build", "");
+    assert gm_list_all_writable("other/a.json", "build", "build", "") == false;
+    assert gm_list_all_writable("build/a.json", "build", "build", "build/a.json") == false;
+    assert gm_list_all_writable("", "", "", "");
+}
+
+test script_lines_first_failure {
+    assert gm_script_lines_verdict("test -f a\ntest -d b", "test", 1) == CV_ALLOW;
+    assert gm_script_lines_verdict("test -f a\nrm b", "test\nrm", 1) == CV_DANGEROUS;
+    assert gm_script_lines_verdict("test -f a\n\ntest -d b", "test", 1) == CV_EMPTY;
+    assert gm_script_lines_verdict("test -f a", "test", 9) == CV_BAD_MODE;
+}
