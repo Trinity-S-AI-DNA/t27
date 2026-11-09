@@ -65,7 +65,7 @@ Lesson, 2026-11-10 (Asia/Bangkok): resealing `crons_CronParetoImprovementLoop.js
 
 ## CRON_BATCH_V1 (cloud ticks)
 
-Load `.claude/skills/cron-batch/SKILL.md` at tick start. Law is `roadmap_dashboard_sync.t27` (500 ms debounce, 100 actions/cycle, overflow dead-letter); predicates on this cron card: `cron_tick_may_run`, `cron_actions_this_cycle`. One timer/subscription wake = **one** job: seal + at most one CI read when the batch includes a CI event. **No** `gh pr checks` on empty or duplicate wakes.
+Load `.claude/skills/cron-batch/SKILL.md` at tick start (includes **T27L_AUTOMATION_CONTROL_V1**). Law: `roadmap_dashboard_sync.t27`, `specs/t27os/t27l.t27`, predicates `cron_tick_may_run`, `automation_empty_tick`, `t27l_action_*` on this cron card. Wake only when actionable; empty tick = zero model calls. **No** `gh pr checks` on empty or duplicate wakes.
 
 ## New `tri` commands (proposed, not built yet)
 
