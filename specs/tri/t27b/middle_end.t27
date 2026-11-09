@@ -1,0 +1,415 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/middle_end.t27 -- the golden law of the t27b middle-end (umbrella gHashTag/t27#12871).
+; t27b lowers the tree IR straight to AArch64 with almost no optimisation; the measured cost is the instruction
+; deficit of docs/reports/t27b-bench-2026-10.json axis_C (3.43x gcc -O2, 4.47x zig ReleaseFast, geomean over 20
+; tier-1 specs). This spec holds three things: the catalogue of passes with their TRUE status on master, the
+; legality laws a pass must obey (pure functions, mounted through `t27c gen-rust`), and the golden targets.
+; --
+; The one rule behind every law: a rewrite must keep every trap. Checked ops (arith_op.t27: ADD 0, SUB 1,
+; MUL 2, DIV 6, REM 8, SHL 12, SHR 13) trap on overflow or a bad operand; a rewrite may remove a trap only when
+; the trap cannot happen, and must never invent a value the original would not produce.
+; --
+; Caller: cli/t27b/src/lower.rs (binary-op lowering) runs identity() and strength() on a constant right operand;
+; the other laws below are not called yet. Existing pass decisions are pointed
+; at, never copied: ifconv_plan.t27 (if-conversion to csel), inline.t27 (inline decision), const_div_plan.t27
+; (const `/` and `%` fold), narrow_law.t27 (canonical narrow extension), arith_op.t27 (op codes).
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27bMiddleEnd;
+
+// ----------------------------------------------------------------------------------------------------------
+// Op codes, as arith_op.t27 (the numbers are that spec's; they are repeated here only as facts to compare).
+// ----------------------------------------------------------------------------------------------------------
+
+pub const OP_ADD : u8 = 0;
+pub const OP_SUB : u8 = 1;
+pub const OP_MUL : u8 = 2;
+pub const OP_ADD_W : u8 = 3;
+pub const OP_SUB_W : u8 = 4;
+pub const OP_MUL_W : u8 = 5;
+pub const OP_DIV : u8 = 6;
+pub const OP_DIV_W : u8 = 7;
+pub const OP_REM : u8 = 8;
+pub const OP_AND : u8 = 9;
+pub const OP_OR : u8 = 10;
+pub const OP_XOR : u8 = 11;
+pub const OP_SHL : u8 = 12;
+pub const OP_SHR : u8 = 13;
+pub const OP_SHL_W : u8 = 14;
+pub const OP_SHR_W : u8 = 15;
+
+pub const U64_MAX : u64 = 18446744073709551615;
+
+// ----------------------------------------------------------------------------------------------------------
+// The pass catalogue. One code per pass; the order is the pipeline rank; the status is what is TRUE of master.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const PASS_FOLD : u32 = 1;
+pub const PASS_IDENT : u32 = 2;
+pub const PASS_DCE : u32 = 3;
+pub const PASS_SSA : u32 = 4;
+pub const PASS_CSE : u32 = 5;
+pub const PASS_LICM_CONST : u32 = 6;
+pub const PASS_LICM : u32 = 7;
+pub const PASS_STRENGTH : u32 = 8;
+pub const PASS_IFCONV : u32 = 9;
+pub const PASS_INLINE : u32 = 10;
+pub const PASS_REGALLOC : u32 = 11;
+pub const PASS_ISEL_PEEPHOLE : u32 = 12;
+
+pub const STATUS_LIVE : u32 = 1;           // code in cli/t27b executes it
+pub const STATUS_DECISION_ONLY : u32 = 2;  // a spec exists, nothing executes it
+pub const STATUS_MISSING : u32 = 3;        // neither
+
+pub const DISP_FIXED : u32 = 1;         // landed and measured
+pub const DISP_FIX_PROPOSED : u32 = 2;  // a law or plan exists, the executor is the open slice
+pub const DISP_ACCEPTED : u32 = 3;      // the deficit is accepted for now: no measured payoff on tier-1
+pub const DISP_BLOCKER : u32 = 4;       // cannot start until another pass lands
+
+; PASS_FOLD: partial. lower.rs (fn fold, const_div_plan.t27) evaluates MODULE consts only, Zig-compat; there is
+; no value propagation through locals. Status LIVE covers that part only. Lowering already picks immediates
+; (codegen.rs add/sub imm12, logical bitmask imm, const shift amounts), so little more is expected on tier-1.
+; PASS_IDENT: LIVE in lower.rs (x+0, x*1, x&ones ...; x*0 and x%1 only when x is a Var or Const). Law: identity() below.
+; PASS_DCE: none. A never-read local only gets no home (codegen.rs assign_homes), a side effect of register
+; assignment; no dead statement or unreachable tail is removed.
+; PASS_SSA: none. ir.rs Func is vars plus a tree body with mutable Assign; there is no CFG. CSE and the general
+; LICM need it, which makes it the blocker of both.
+; PASS_CSE: none. Little expected on tier-1 because lowering already folds; accepted until measured.
+; PASS_LICM_CONST: LIVE in codegen.rs. A `while` compare's constant that takes 2+ words (codegen_audit.t27: movz
+; + movk per iteration) is built once in the prologue into a free home register. Law: licm_hoist_const().
+; PASS_LICM: none; needs the SSA/CFG of PASS_SSA.
+; PASS_STRENGTH: LIVE in lower.rs for wrapping mul, unsigned div and rem by 2^k; checked Mul and signed div stay. Law: strength().
+; PASS_IFCONV: LIVE in codegen.rs (fn ifconv, from Stmt::If): a U64 home vs an imm12 const, arms of at most 2
+; register-homed U64 assigns (const, var, var +/- imm12) become csel. Law: ifconv_plan.t27 may_if_convert().
+; PASS_INLINE: DECISION ONLY. inline.t27 decides, try_inline in codegen.rs discards the decision and returns false.
+; PASS_REGALLOC: live, partial. Usage-weighted homes (home_plan.t27: x19-x28, then frame slots); expression temps
+; are LIFO x9-x15. No live-range analysis. Accepted until SSA gives live ranges.
+; PASS_ISEL_PEEPHOLE: live, one rule. bcond fuses a compare-with-zero and the branch (a64::zero_test).
+
+/// The pipeline rank of a pass (1 runs first); 0 for a code that is not a pass.
+pub fn pass_order(p: u32) -> u32 {
+    if (p == PASS_INLINE) { return 1; }
+    if (p == PASS_FOLD) { return 2; }
+    if (p == PASS_IDENT) { return 3; }
+    if (p == PASS_STRENGTH) { return 4; }
+    if (p == PASS_IFCONV) { return 5; }
+    if (p == PASS_DCE) { return 6; }
+    if (p == PASS_SSA) { return 7; }
+    if (p == PASS_CSE) { return 8; }
+    if (p == PASS_LICM_CONST) { return 9; }
+    if (p == PASS_LICM) { return 10; }
+    if (p == PASS_REGALLOC) { return 11; }
+    if (p == PASS_ISEL_PEEPHOLE) { return 12; }
+    return 0;
+}
+
+/// What is true of master 1c20844156 plus the ifconv slice (#13383), inventory of 2026-11-09. 0 for a code that is not a pass.
+pub fn pass_status(p: u32) -> u32 {
+    if (p == PASS_FOLD or p == PASS_IDENT or p == PASS_STRENGTH or p == PASS_LICM_CONST) { return STATUS_LIVE; }
+    if (p == PASS_REGALLOC or p == PASS_ISEL_PEEPHOLE or p == PASS_IFCONV) { return STATUS_LIVE; }
+    if (p == PASS_INLINE) { return STATUS_DECISION_ONLY; }
+    if (p >= PASS_DCE and p <= PASS_LICM) { return STATUS_MISSING; }
+    return 0;
+}
+
+/// What the umbrella does about a pass. 0 for a code that is not a pass.
+pub fn pass_disposition(p: u32) -> u32 {
+    if (p == PASS_SSA or p == PASS_LICM) { return DISP_BLOCKER; }
+    if (p == PASS_CSE or p == PASS_REGALLOC or p == PASS_ISEL_PEEPHOLE) { return DISP_ACCEPTED; }
+    if (p >= PASS_FOLD and p <= PASS_INLINE) { return DISP_FIX_PROPOSED; }
+    return 0;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Powers of two.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Whether k is 1, 2, 4, 8 ... (zero is not a power of two).
+pub fn is_pow2(k: u64) -> bool {
+    if (k == 0) { return false; }
+    return (k & (k - 1)) == 0;
+}
+
+/// The floor of log2 k; exact when is_pow2(k). 0 for k == 0 and k == 1.
+pub fn log2_exact(k: u64) -> u32 {
+    var v: u64 = k;
+    var r: u32 = 0;
+    if ((v >> 32) != 0) { v = v >> 32; r = r + 32; }
+    if ((v >> 16) != 0) { v = v >> 16; r = r + 16; }
+    if ((v >> 8) != 0) { v = v >> 8; r = r + 8; }
+    if ((v >> 4) != 0) { v = v >> 4; r = r + 4; }
+    if ((v >> 2) != 0) { v = v >> 2; r = r + 2; }
+    if ((v >> 1) != 0) { r = r + 1; }
+    return r;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Algebraic identities. The right operand is a constant; the answer says what the result is.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const ID_NONE : u32 = 0;  // no identity applies
+pub const ID_LHS : u32 = 1;   // the result is the left operand
+pub const ID_ZERO : u32 = 2;  // the result is zero
+
+; ID_ZERO drops the left operand, so it is legal only when the left side is pure (no call, no trap, no store);
+; the CALLER checks that, this function sees only the op and the constant. No identity here drops a trap of the
+; operation itself: x/1 cannot trap, so it is ID_LHS; x%1 is ID_ZERO; x/0 and x%0 are never an identity.
+; x*0 cannot overflow, so a checked MUL by 0 loses no trap either.
+
+/// The all-ones value of a width, for the widths a register holds; 0 for any other width.
+pub fn ones_of(bits: u32) -> u64 {
+    if (bits == 8) { return 255; }
+    if (bits == 16) { return 65535; }
+    if (bits == 32) { return 4294967295; }
+    if (bits == 64) { return U64_MAX; }
+    return 0;
+}
+
+/// What `x OP rhs_const` is, when it is x or zero. `bits` is the width of the operation.
+pub fn identity(op: u8, rhs_const: u64, bits: u32) -> u32 {
+    if (op == OP_ADD or op == OP_SUB or op == OP_ADD_W or op == OP_SUB_W) {
+        if (rhs_const == 0) { return ID_LHS; }
+        return ID_NONE;
+    }
+    if (op == OP_MUL or op == OP_MUL_W) {
+        if (rhs_const == 1) { return ID_LHS; }
+        if (rhs_const == 0) { return ID_ZERO; }
+        return ID_NONE;
+    }
+    if (op == OP_DIV or op == OP_DIV_W) {
+        if (rhs_const == 1) { return ID_LHS; }
+        return ID_NONE;
+    }
+    if (op == OP_REM) {
+        if (rhs_const == 1) { return ID_ZERO; }
+        return ID_NONE;
+    }
+    if (op == OP_AND) {
+        if (rhs_const == 0) { return ID_ZERO; }
+        if (ones_of(bits) != 0 and rhs_const == ones_of(bits)) { return ID_LHS; }
+        return ID_NONE;
+    }
+    if (op == OP_OR or op == OP_XOR) {
+        if (rhs_const == 0) { return ID_LHS; }
+        return ID_NONE;
+    }
+    if (op == OP_SHL or op == OP_SHR or op == OP_SHL_W or op == OP_SHR_W) {
+        if (rhs_const == 0) { return ID_LHS; }
+        return ID_NONE;
+    }
+    return ID_NONE;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Strength reduction by a constant power of two.
+// ----------------------------------------------------------------------------------------------------------
+
+pub const SR_NONE : u32 = 0;
+pub const SR_SHL : u32 = 1;  // x * 2^k  ==> x << k
+pub const SR_LSR : u32 = 2;  // x / 2^k  ==> x >> k   (logical, unsigned)
+pub const SR_AND : u32 = 3;  // x % 2^k  ==> x & (2^k - 1)   (unsigned)
+
+; Why the refusals. Checked MUL stays SR_NONE: a shift does not trap on overflow, the multiply's overflow check
+; does, and removing the trap would change the exit code. Signed DIV and REM stay SR_NONE: rounding toward zero
+; of a negative dividend needs a bias fix-up (add, shift, arithmetic shift) that costs as many instructions as
+; sdiv itself, so there is nothing to win. Unsigned DIV by 2^k cannot trap (k is a non-zero constant).
+
+/// The rewrite of `x OP k` for a constant k; SR_NONE when none is sound and worth it.
+pub fn strength(op: u8, k: u64, signed: bool) -> u32 {
+    if (is_pow2(k) == false) { return SR_NONE; }
+    if (op == OP_MUL_W) { return SR_SHL; }
+    if (signed) { return SR_NONE; }
+    if (op == OP_DIV or op == OP_DIV_W) { return SR_LSR; }
+    if (op == OP_REM) { return SR_AND; }
+    return SR_NONE;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Loop-invariant constants.
+// ----------------------------------------------------------------------------------------------------------
+
+; A hoisted constant lives for the whole fn, as a home does (home_plan.t27), so it takes a register from the
+; same pools once every home is placed and never takes one from a local. A leaf's free argument register comes
+; first: it costs nothing per call. A callee-saved register is taken only when the fn has a frame anyway; in a
+; frameless leaf it would buy a frame (4 words or more per call) to save 2 words per iteration, and t27b knows
+; no trip counts. LICM_MAX_HOIST is a CHOSEN bound, not a measured one: two constants per fn is what the audited
+; hot loop needs, and each callee-saved one adds a save and a restore.
+pub const LICM_MAX_HOIST : u32 = 2;
+pub const LICM_NONE : u32 = 0;
+pub const LICM_CALLER : u32 = 1;
+pub const LICM_CALLEE : u32 = 2;
+
+/// The pool a `while` condition's constant is hoisted into: LICM_NONE when rebuilding it costs one instruction,
+/// the fn has used up its hoists, or the only free register would cost a frame.
+pub fn licm_hoist_const(insns_to_build: u32, caller_free: bool, callee_free: bool, framed: bool, hoisted: u32) -> u32 {
+    if (insns_to_build < 2) { return LICM_NONE; }
+    if (hoisted >= LICM_MAX_HOIST) { return LICM_NONE; }
+    if (caller_free) { return LICM_CALLER; }
+    if (callee_free and framed) { return LICM_CALLEE; }
+    return LICM_NONE;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Constant folding.
+// ----------------------------------------------------------------------------------------------------------
+
+/// `Const op Const` folds under Wrap always; under Trap only when the exact result fits, otherwise the trap
+/// must stay in the program and fire at run time.
+pub fn fold_fits(value_is_in_range: bool, mode_wrap: bool) -> bool {
+    if (mode_wrap) { return true; }
+    return value_is_in_range;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Golden targets. Ratios are instruction counts of t27b over the reference, times 100 (343 = 3.43x).
+// ----------------------------------------------------------------------------------------------------------
+
+pub const BASELINE_GCC_O2_X100 : u32 = 343;        // docs/reports/t27b-bench-2026-10.json axis_C, geomean vs gcc -O2
+pub const BASELINE_ZIG_FAST_X100 : u32 = 447;      // docs/reports/t27b-bench-2026-10.json axis_C, vs zig ReleaseFast
+pub const TARGET_GCC_O2_X100 : u32 = 200;          // gHashTag/t27#12871 Success Criteria: 2.0x or below
+pub const TARGET_ZIG_FAST_X100 : u32 = 250;        // gHashTag/t27#12871 Success Criteria: 2.5x or below
+
+/// Whether a measured ratio meets a target (at or below it).
+pub fn target_met(ratio_x100: u32, target_x100: u32) -> bool {
+    return ratio_x100 <= target_x100;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Tests.
+// ----------------------------------------------------------------------------------------------------------
+
+test pass_orders_are_distinct_and_cover_one_to_twelve {
+    assert pass_order(PASS_FOLD) != pass_order(PASS_IDENT);
+    assert pass_order(PASS_DCE) != pass_order(PASS_SSA);
+    assert pass_order(PASS_CSE) != pass_order(PASS_LICM);
+    assert pass_order(PASS_STRENGTH) != pass_order(PASS_IFCONV);
+    assert pass_order(PASS_INLINE) == 1;
+    assert pass_order(PASS_ISEL_PEEPHOLE) == 12;
+    assert pass_order(PASS_SSA) < pass_order(PASS_CSE);
+    assert pass_order(PASS_SSA) < pass_order(PASS_LICM);
+    assert pass_order(99) == 0;
+}
+test statuses_are_true_of_master {
+    assert pass_status(PASS_FOLD) == STATUS_LIVE;
+    assert pass_status(PASS_IFCONV) == STATUS_LIVE;
+    assert pass_status(PASS_INLINE) == STATUS_DECISION_ONLY;
+    assert pass_status(PASS_SSA) == STATUS_MISSING;
+    assert pass_status(PASS_CSE) == STATUS_MISSING;
+    assert pass_status(PASS_LICM) == STATUS_MISSING;
+    assert pass_status(PASS_LICM_CONST) == STATUS_LIVE;
+    assert pass_status(PASS_STRENGTH) == STATUS_LIVE;
+    assert pass_status(PASS_IDENT) == STATUS_LIVE;
+    assert pass_status(PASS_REGALLOC) == STATUS_LIVE;
+    assert pass_status(99) == 0;
+}
+test every_pass_has_a_disposition_and_a_decision_only_pass_is_never_fixed {
+    assert pass_disposition(PASS_FOLD) != 0;
+    assert pass_disposition(PASS_IDENT) != 0;
+    assert pass_disposition(PASS_DCE) != 0;
+    assert pass_disposition(PASS_SSA) == DISP_BLOCKER;
+    assert pass_disposition(PASS_CSE) != 0;
+    assert pass_disposition(PASS_LICM_CONST) != 0;
+    assert pass_disposition(PASS_LICM) == DISP_BLOCKER;
+    assert pass_disposition(PASS_STRENGTH) != 0;
+    assert pass_disposition(PASS_IFCONV) != DISP_FIXED;
+    assert pass_disposition(PASS_INLINE) != DISP_FIXED;
+    assert pass_disposition(PASS_REGALLOC) != 0;
+    assert pass_disposition(PASS_ISEL_PEEPHOLE) != 0;
+    assert pass_disposition(99) == 0;
+}
+test pow2_law {
+    assert is_pow2(1);
+    assert is_pow2(2);
+    assert is_pow2(4096);
+    assert is_pow2(9223372036854775808);
+    assert is_pow2(0) == false;
+    assert is_pow2(3) == false;
+    assert is_pow2(6) == false;
+    assert is_pow2(U64_MAX) == false;
+}
+test log2_law {
+    assert log2_exact(1) == 0;
+    assert log2_exact(2) == 1;
+    assert log2_exact(8) == 3;
+    assert log2_exact(4096) == 12;
+    assert log2_exact(4294967296) == 32;
+    assert log2_exact(9223372036854775808) == 63;
+    assert log2_exact(0) == 0;
+}
+test identities_that_return_the_left_operand {
+    assert identity(OP_ADD, 0, 64) == ID_LHS;
+    assert identity(OP_SUB, 0, 64) == ID_LHS;
+    assert identity(OP_ADD_W, 0, 32) == ID_LHS;
+    assert identity(OP_SUB_W, 0, 32) == ID_LHS;
+    assert identity(OP_MUL, 1, 64) == ID_LHS;
+    assert identity(OP_MUL_W, 1, 64) == ID_LHS;
+    assert identity(OP_DIV, 1, 64) == ID_LHS;
+    assert identity(OP_OR, 0, 64) == ID_LHS;
+    assert identity(OP_XOR, 0, 64) == ID_LHS;
+    assert identity(OP_SHL, 0, 64) == ID_LHS;
+    assert identity(OP_SHR_W, 0, 64) == ID_LHS;
+    assert identity(OP_AND, 255, 8) == ID_LHS;
+    assert identity(OP_AND, U64_MAX, 64) == ID_LHS;
+}
+test identities_that_return_zero {
+    assert identity(OP_MUL, 0, 64) == ID_ZERO;
+    assert identity(OP_MUL_W, 0, 64) == ID_ZERO;
+    assert identity(OP_AND, 0, 64) == ID_ZERO;
+    assert identity(OP_REM, 1, 64) == ID_ZERO;
+}
+test no_identity_drops_a_trap_or_invents_a_value {
+    assert identity(OP_DIV, 0, 64) == ID_NONE;
+    assert identity(OP_REM, 0, 64) == ID_NONE;
+    assert identity(OP_DIV_W, 0, 32) == ID_NONE;
+    assert identity(OP_ADD, 1, 64) == ID_NONE;
+    assert identity(OP_MUL, 2, 64) == ID_NONE;
+    assert identity(OP_AND, 255, 16) == ID_NONE;
+    assert identity(OP_AND, 5, 0) == ID_NONE;
+    assert identity(OP_SHL, 1, 64) == ID_NONE;
+    assert identity(OP_REM, 2, 64) == ID_NONE;
+    assert identity(200, 0, 64) == ID_NONE;
+}
+test strength_rewrites_unsigned_powers_of_two {
+    assert strength(OP_MUL_W, 8, false) == SR_SHL;
+    assert strength(OP_MUL_W, 8, true) == SR_SHL;
+    assert strength(OP_DIV, 16, false) == SR_LSR;
+    assert strength(OP_DIV_W, 2, false) == SR_LSR;
+    assert strength(OP_REM, 64, false) == SR_AND;
+}
+test strength_refuses_what_would_drop_a_trap_or_cost_as_much {
+    assert strength(OP_MUL, 8, false) == SR_NONE;
+    assert strength(OP_DIV, 16, true) == SR_NONE;
+    assert strength(OP_REM, 64, true) == SR_NONE;
+    assert strength(OP_MUL_W, 6, false) == SR_NONE;
+    assert strength(OP_DIV, 0, false) == SR_NONE;
+    assert strength(OP_REM, 3, false) == SR_NONE;
+    assert strength(OP_ADD, 8, false) == SR_NONE;
+}
+test licm_hoists_only_when_it_pays_and_fits {
+    assert licm_hoist_const(2, true, false, false, 0) == LICM_CALLER;
+    assert licm_hoist_const(2, true, true, true, 0) == LICM_CALLER;
+    assert licm_hoist_const(4, false, true, true, 1) == LICM_CALLEE;
+    assert licm_hoist_const(2, false, true, false, 0) == LICM_NONE;
+    assert licm_hoist_const(1, true, true, true, 0) == LICM_NONE;
+    assert licm_hoist_const(2, false, false, true, 0) == LICM_NONE;
+    assert licm_hoist_const(2, true, true, true, LICM_MAX_HOIST) == LICM_NONE;
+    assert LICM_MAX_HOIST == 2;
+}
+test fold_fits_law {
+    assert fold_fits(true, true);
+    assert fold_fits(false, true);
+    assert fold_fits(true, false);
+    assert fold_fits(false, false) == false;
+}
+test golden_targets_and_the_baselines_are_behind_them {
+    assert BASELINE_GCC_O2_X100 == 343;
+    assert BASELINE_ZIG_FAST_X100 == 447;
+    assert TARGET_GCC_O2_X100 == 200;
+    assert TARGET_ZIG_FAST_X100 == 250;
+    assert target_met(BASELINE_GCC_O2_X100, TARGET_GCC_O2_X100) == false;
+    assert target_met(BASELINE_ZIG_FAST_X100, TARGET_ZIG_FAST_X100) == false;
+    assert target_met(200, TARGET_GCC_O2_X100);
+    assert target_met(199, TARGET_GCC_O2_X100);
+    assert target_met(251, TARGET_ZIG_FAST_X100) == false;
+}

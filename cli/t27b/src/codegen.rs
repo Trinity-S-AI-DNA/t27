@@ -16,6 +16,7 @@
 //! * Calls inside the module are `bl` with the offset filled in by `link`.
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
+use crate::lower::me;
 use std::collections::HashMap;
 
 // t27b-generated inline decision source of truth: specs/tri/t27b/inline.t27.
@@ -33,10 +34,16 @@ pub(crate) mod home_plan;
 #[path = "../../../gen/rust/tri/t27b/frame_layout.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod frame_layout;
+#[path = "../../../gen/rust/tri/t27b/flow_plan.rs"] #[allow(dead_code, unused_parens)] // specs/tri/t27b/flow_plan.t27
+pub(crate) mod flow_plan;
+use flow_plan as fp;
 // t27b-generated trap stub law: specs/tri/t27b/trap_plan.t27.
 #[path = "../../../gen/rust/tri/t27b/trap_plan.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod trap_plan;
+#[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"] // specs/tri/t27b/ifconv_plan.t27
+#[allow(dead_code, unused_parens)]
+mod ifc;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -160,6 +167,8 @@ struct Gen<'a> {
     /// Some parameter arrives on the stack (read from x29, so a frame).
     stack_params: bool,
     data_refs: Vec<(usize, u32)>,
+    /// middle_end.t27 LICM_CONST: constants built once in the prologue (canonical value, sf, register).
+    hoist: Vec<(u64, bool, Reg)>,
 }
 /// Compile every function of `prog` (tests too when `with_tests`).
 pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec<FuncCode>, CodegenError> {
@@ -202,6 +211,7 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
         uses_lr: false,
         stack_params: false,
         data_refs: Vec::new(),
+        hoist: Vec::new(),
     };
     let mut top = 0u32;
     for sl in &f.slots {
@@ -253,10 +263,13 @@ impl<'a> Gen<'a> {
         self.code.push(w);
     }
 
-    /// Decision boundary only; no hand-written executor.
-    /// Returns the spec's inline/reject verdict; execution stays with `call`.
-    fn try_inline(&mut self, func: FuncId, args: &[Expr]) -> bool {
+    /// A select-shaped callee (inline.t27 `select_shape_ok`): each argument once, then cmp + cset/csel, no `bl`.
+    fn try_inline(&mut self, func: FuncId, args: &[Expr], dst: Option<Reg>) -> Option<V> {
         let f = &self.prog.funcs[func as usize];
+        let [Stmt::If { cond, then, els }, Stmt::Return(Some(Expr { kind: ExprKind::Const(b), .. }))] = f.body.as_slice() else { return None };
+        let ([Stmt::Return(Some(Expr { kind: ExprKind::Const(a), .. }))], true, ExprKind::Cmp { op, lhs, rhs }) = (then.as_slice(), els.is_empty(), &cond.kind) else { return None };
+        let k = |e: &Expr| match e.kind { ExprKind::Var(i) => (inline_decision::SK_PARAM, i as u64), ExprKind::Const(c) => (inline_decision::SK_IMM, c as u64), _ => (inline_decision::SK_OTHER, 0) };
+        let (l, r, w64) = (k(lhs), k(rhs), |t: Option<Ty>| matches!(t, Some(Ty::I64 | Ty::U64)));
         let cf = inline_decision::CalleeFacts {
             is_test: f.is_test,
             is_invariant: f.is_invariant,
@@ -268,14 +281,26 @@ impl<'a> Gen<'a> {
             has_assert: f.body.iter().any(|s| matches!(s, Stmt::Assert { .. } | Stmt::AssertEq { .. })),
         };
         let sf = inline_decision::CallSiteFacts {
-            inside_loop: self.loops.last().is_some(),
+            hot_loop: self.loops.last().is_some(),
             constant_args: args.iter().all(|a| matches!(a.kind, ExprKind::Const(_))),
             call_depth: self.loops.len() as u8,
             caller_size: self.code.len() as u32,
             result_used: true,
         };
-        let _decision = inline_decision::should_inline_call(cf, sf);
-        false
+        if !(inline_decision::should_inline_call(cf, sf) && inline_decision::select_shape_ok(true, l.0, l.1, r.0, r.1, f.nparams as u32, f.vars[..f.nparams].iter().all(|v| w64(Some(v.ty))), w64(f.ret), w64(Some(lhs.ty)))) { return None; }
+        let vals: Vec<V> = args.iter().map(|x| self.eval(x)).collect();
+        let (mut x, mut y, mut op2) = (if l.0 == inline_decision::SK_PARAM { vals[l.1 as usize] } else { V::Const(l.1 as i128) }, if r.0 == inline_decision::SK_PARAM { vals[r.1 as usize] } else { V::Const(r.1 as i128) }, *op);
+        if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) { (x, y, op2) = (y, x, op2.swap()); }
+        let rx = self.use_nz(x, X16, lhs.ty); // not ZR: reg 31 in cmp_imm is SP
+        match y { V::Const(c) if (0..4096).contains(&c) => self.emit(a64::cmp_imm(true, rx, c as u32)), _ => { let ry = self.use_(y, X17, lhs.ty); self.emit(a64::cmp(true, rx, ry)) } }
+        for v in vals.into_iter().rev() { self.release(v); }
+        let (c, (d, t)) = (cond_for(op2, lhs.ty), self.dest(dst));
+        match inline_decision::select_form(*a as u64, *b as u64) {
+            inline_decision::SF_CSET => self.emit(a64::cset(true, d, c)),
+            inline_decision::SF_CSET_INV => self.emit(a64::cset(true, d, Cond::from_bits(a64::invert_bits(c as u32)))),
+            _ => { let (p, q) = (self.use_(V::Const(*a), X16, Ty::U64), self.use_(V::Const(*b), X17, Ty::U64)); self.emit(a64::csel(true, d, p, q, c)) }
+        }
+        Some(self.done(d, t))
     }
     fn new_label(&mut self) -> Label {
         self.labels.push(None);
@@ -383,6 +408,19 @@ impl<'a> Gen<'a> {
         self.nvar_slots = slots;
         if !frame_layout::slot_ok(8 * slots) {
             self.fail(format!("more than {} variables spill to the frame", MAX_SLOT_BYTES / 8));
+        }
+        let mut lim = Vec::new(); // middle_end.t27 licm_hoist_const: the pools are the homes', after the homes
+        loop_limits(&f.body, &mut lim);
+        let framed = frame_layout::needs_frame(frame_layout::FrameFacts { has_call, saves_callee: taken_callee > 0, has_var_slots: slots > 0, has_temp_slots: false, has_agg: self.agg_bytes > 0, uses_lr: false, has_stack_params: self.stack_params });
+        for (c, sf) in lim {
+            let (v, mut words) = (a64::canon(c as u64, sf), Vec::new());
+            a64::mov_imm(sf, X16, v, &mut words);
+            if self.hoist.iter().any(|h| (h.0, h.1) == (v, sf)) { continue; }
+            match me::licm_hoist_const(words.len() as u32, !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64), home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64), framed, self.hoist.len() as u32) {
+                me::LICM_CALLER => { self.hoist.push((v, sf, (nint + taken_caller) as Reg)); taken_caller += 1; }
+                me::LICM_CALLEE => { let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.hoist.push((v, sf, r)); }
+                _ => {}
+            }
         }
         self.temp_base = frame_layout::temp_base_of(slots, self.used_callee.len() as u32);
     }
@@ -581,6 +619,7 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        for &(v, sf, r) in &self.hoist { a64::mov_imm(sf, r, v, &mut pro); } // LICM_CONST: once per call
         let shift = pro.len();
         let mut code = pro;
         code.extend_from_slice(&self.code);
@@ -686,6 +725,7 @@ impl<'a> Gen<'a> {
                     self.release(v);
                 }
             },
+            Stmt::If { cond, then, els } if self.ifconv(cond, then, els) => {}
             Stmt::If { cond, then, els } => {
                 let l_else = self.new_label();
                 self.branch(cond, l_else, false);
@@ -742,7 +782,6 @@ impl<'a> Gen<'a> {
             }
             Stmt::Eval(e) => {
                 if let ExprKind::Call { func, args } = &e.kind {
-                    self.try_inline(*func, args);
                     self.call(*func, args, None, false);
                 } else {
                     let v = self.eval(e);
@@ -994,7 +1033,7 @@ impl<'a> Gen<'a> {
                 self.done(d, t)
             }
             ExprKind::Call { func, args } => {
-                self.try_inline(*func, args);
+                if let Some(v) = self.try_inline(*func, args, dst) { return v; }
                 self.call(*func, args, dst, true)
             }
             ExprKind::FArith { op, lhs, rhs } => {
@@ -1336,6 +1375,42 @@ impl<'a> Gen<'a> {
         }
     }
 
+    fn ifconv(&mut self, cond: &Expr, then: &[Stmt], els: &[Stmt]) -> bool {
+        let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { return false };
+        let (ExprKind::Var(g), ExprKind::Const(c)) = (&lhs.kind, &rhs.kind) else { return false };
+        if lhs.ty != Ty::U64 || !(0..4096).contains(c) || !matches!(self.homes[*g as usize], Home::Reg(_)) { return false; }
+        fn asg(ss: &[Stmt]) -> Option<Vec<(VarId, &Expr)>> { ss.iter().map(|s| if let Stmt::Assign { var, value } = s { Some((*var, value)) } else { None }).collect() }
+        let (Some(t), Some(e)) = (asg(then), asg(els)) else { return false };
+        let mut vars: Vec<VarId> = t.iter().chain(&e).map(|a| a.0).collect();
+        vars.sort(); vars.dedup();
+        if vars.len() > 2 || [&t, &e].iter().any(|a| a.iter().enumerate().any(|(i, x)| a[..i].iter().any(|y| y.0 == x.0))) { return false; }
+        let (mut regs, mut srcs) = (vec![], vec![]); for &v in &vars {
+            let Home::Reg(h) = self.homes[v as usize] else { return false };
+            let mut side = [(0, 0, h); 2];
+            for (n, a) in [&t, &e].iter().enumerate() {
+                let p = a.iter().position(|x| x.0 == v);
+                let own: Vec<VarId> = a[..p.unwrap_or(0)].iter().map(|x| x.0).collect();
+                let reg = |y: &Expr| match (y.ty, &y.kind) { (Ty::U64, ExprKind::Var(w)) if !own.contains(w) => match self.homes[*w as usize] { Home::Reg(r) => Some(r), _ => None }, _ => None };
+                side[n] = match p.map(|i| a[i].1).map(|y| (y, &y.kind)) {
+                    None => (ifc::AK_NONE, 0, h),
+                    Some((y, _)) if y.ty != Ty::U64 => return false,
+                    Some((_, ExprKind::Const(0))) => (ifc::AK_CONST, 0, ZR),
+                    Some((y, ExprKind::Const(k))) if *k > 0 => { srcs.push((X17, y)); (ifc::AK_CONST, *k as u64, X17) }
+                    Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => return false },
+                    Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::Sub), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
+                        (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
+                        _ => return false, },
+                    _ => return false, };
+            }
+            if !ifc::may_if_convert(ifc::guard_of_cmp(*op as u8), *c as u64, side[0].0, side[0].1, side[1].0, side[1].1, vars.len() as u32, srcs.iter().filter(|s| s.0 == X16).count() as u32, true, true) { return false; } regs.push((h, side[0].2, side[1].2));
+        }
+        srcs.sort_by_key(|s| s.0);
+        if srcs.windows(2).any(|w| w[0].0 == w[1].0) { return false; }
+        for (r, y) in srcs { self.eval_into(y, r); } let cc = self.compare(*op, lhs, rhs);
+        for (h, tr, er) in regs { self.emit(a64::csel(true, h, tr, er, cc)); }
+        true
+    }
+
     /// One arm of a `Select`, evaluated and moved into `d`.
     fn select_arm(&mut self, e: &Expr, d: Reg, ty: Ty) {
         let v = self.eval(e);
@@ -1390,7 +1465,8 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 let rx = self.use_(x, X16, ty);
-                let ry = self.use_(y, X17, ty);
+                let h = if let V::Const(c) = y { self.hoist.iter().find(|h| (h.0, h.1) == (a64::canon(c as u64, s), s)).map(|h| h.2) } else { None };
+                let ry = match h { Some(r) => r, None => self.use_(y, X17, ty) };
                 self.emit(a64::cmp(s, rx, ry));
             }
         }
@@ -1880,29 +1956,35 @@ impl<'a> Gen<'a> {
 /// to 32 bits and zero-extend u8/u16/bool, which is the canonical form.
 fn ldst_op(ty: Ty, load: bool) -> (u32, u32) {
     let size = a64::size_log2(ty.bytes());
-    let opc = if !load {
-        a64::ST
-    } else if ty.signed() && size < 2 {
-        a64::LDS32
-    } else {
-        a64::LD
-    };
-    (size, opc)
+    (size, a64::ldst_opc(load, ty.signed(), size)) // a64.t27 ldst_opc
 }
 
 fn overflow_cond(ty: Ty, sub: bool) -> Cond { Cond::from_bits(ip::overflow_cond(ty.signed(), sub)) }
 
-/// Conservative: false only when control certainly cannot reach the end.
+fn last_kind(ss: &[Stmt]) -> u8 { match ss.last() { Some(Stmt::Return(_)) => fp::SK_RETURN, Some(Stmt::Break) => fp::SK_BREAK,
+    Some(Stmt::Continue) => fp::SK_CONTINUE, Some(Stmt::If { .. }) => fp::SK_IF, Some(_) => fp::SK_OTHER, None => fp::SK_NONE } }
+/// flow_plan.t27 falls_through; the walk only recurses into the arms of a trailing `if`.
 fn may_fall_through(ss: &[Stmt]) -> bool {
-    match ss.last() {
-        Some(Stmt::Return(_)) => false,
-        Some(Stmt::If { then, els, .. }) => may_fall_through(then) || els.is_empty() || may_fall_through(els),
-        _ => true,
-    }
+    let (tf, ee, ef) = match ss.last() { Some(Stmt::If { then, els, .. }) => (may_fall_through(then), els.is_empty(), may_fall_through(els)), _ => (false, false, false) };
+    fp::falls_through(last_kind(ss), tf, ee, ef)
 }
+fn ends_in_jump(ss: &[Stmt]) -> bool { fp::ends_in_jump_kind(last_kind(ss)) }
 
-fn ends_in_jump(ss: &[Stmt]) -> bool {
-    matches!(ss.last(), Some(Stmt::Return(_)) | Some(Stmt::Break) | Some(Stmt::Continue))
+/// middle_end.t27 LICM_CONST: the constant side of each `while` condition's integer compare, as `compare` sees it.
+fn loop_limits(ss: &[Stmt], out: &mut Vec<(i128, bool)>) {
+    for s in ss {
+        match s {
+            Stmt::While { cond, body, step } => {
+                if let ExprKind::Cmp { lhs, rhs, .. } = &cond.kind {
+                    let c = match (&lhs.kind, &rhs.kind) { (ExprKind::Const(_), ExprKind::Const(_)) => None, (ExprKind::Const(c), _) | (_, ExprKind::Const(c)) => Some(*c), _ => None };
+                    if let Some(c) = c.filter(|_| !lhs.ty.is_float() && lhs.ty != Ty::I128) { out.push((c, lhs.ty.is64())); }
+                }
+                for b in [body, step] { loop_limits(b, out); }
+            }
+            Stmt::If { then, els, .. } => { loop_limits(then, out); loop_limits(els, out); }
+            _ => {}
+        }
+    }
 }
 
 fn weigh_stmts(ss: &[Stmt], depth: u32, w: &mut [u64], wr: &mut [u64], has_call: &mut bool) {
@@ -2055,7 +2137,7 @@ pub fn data_layout(data: &[Vec<u8>]) -> (Vec<usize>, usize) {
     let mut offs = Vec::with_capacity(data.len());
     let mut at = 0usize;
     for b in data {
-        at = (at + 7) & !7;
+        at = frame_layout::data_blob_at(at as u64) as usize;
         offs.push(at);
         at += b.len();
     }
