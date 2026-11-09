@@ -1,0 +1,1248 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27F-007 task card in the t27.ai style: vf_card paints the merged vf_layout rectangles with a theme and real Outfit type
+; Refs gHashTag/t27#13214, epic #13214
+; Pipeline the owner ordered: object graph -> meaning -> layout -> theme -> render. This is the render step: tokens from vf_theme, glyphs from vf_type
+; Reads VfGraph, VfLayout, vf_pixel, vf_theme and vf_type, edits none of them
+; Result codes: 0 ok, 1 scale outside 50..400 percent, 2 theme is not TH_T27 or TH_PAPER, 3 bad raster (w or h 0 or over 4096, or w * h * 3 over the buffer),
+;   4 bad metrics (vc_render_s with a content width, heading size or body size of 0)
+; vc_render_s takes the text inset, the content width, the heading and body sizes, the outline width and the text pad as design pixels in a VcStyle
+;   (T27F-007: vf_card_tok resolves them from the vf_tokens manifest); vc_render_m takes only the inset and the width, the rest from the theme;
+;   vc_render_state and vc_render are vc_render_m at the theme defaults TH_CARD_INSET and TH_CARD_MAX_W
+; A refusal paints nothing: the raster stays as it was
+; Painter order: clear to the theme ground, then nodes by index, each as box, outline, text, so a later node covers an earlier one
+; Readings of the kinds, chosen here and not stated by the contract:
+;   card, input, badge, button and unknown kinds are boxes filled with th_kind_color
+;   container, stack and list are layout only and paint no box: their token is the ground colour, and a ground-coloured box inside a card would cut a hole in it
+;   text paints no box either: its kind token is the ink colour itself
+;   card, input and every button that is not PRIMARY get a 1 px outline in TH_CARD_BORDER, scaled with pct
+;   a button that is not PRIMARY is filled TH_BORDER, the card colour: the secondary action is outlined, only the PRIMARY one is accent
+;   heading = the first text node under its parent: Outfit 800 at type step 5, TH_TEXT. Any other text node: Outfit 400 at step 3, TH_MUTED
+;   badge and button text: Outfit 400 at step 3 in whichever of TH_TEXT and TH_BG has the larger luma gap to the fill, so ink reads on gold and on accent in both themes
+;   pen starts one space step (sp-1, 6 px) right of the node edge, but never closer than TH_CARD_INSET to the card's left edge
+;   baseline: the cap height (TH_CAP_MILLI per mille of the type size) is centred in the node box, but never so high that the cap top
+;     is nearer than TH_CARD_INSET to the card's top edge. The layout is not moved: a 26 px title in a 20 px node at y 8 gets a baseline
+;     below its node bottom (31, node bottom 28), which is why the old rule "two thirds of the node height" (cap top 3 px from the edge) is gone
+;   a button label is centred in its drawn box, horizontally by vt_text_width_q8 and vertically on the cap height
+;   a text node that an input names through label_ref is its caption: Outfit 400 in TH_MUTED, and TH_TEXT while that input has the focus
+;   an input with empty text paints VC_PLACEHOLDER_TEXT in TH_MUTED, centred on the cap height, in the same text column as its caption
+;   the focus: vc_render_state takes a node index. A focused input or button gets a TH_FOCUS_W ring in TH_ACCENT in place of its 1 px
+;     outline. VC_NO_FOCUS means none, and vc_render is vc_render_state with none. On a PRIMARY button the ring is accent on accent: invisible
+;   content width: a root card wider than TH_CARD_MAX_W is drawn that wide and centred, every node moves right by the same offset, the raster
+;     outside the card is the theme ground, and no control is stretched. A root card not wider than that fills its width as before
+; Sizes: design pixels times pct / 100, rounded. Box edges are rounded to whole pixels, the pen keeps its Q8 fraction
+; Limits: no wrapping, no hover state, no corner radius, no clipping of text to its node box (the layout measures no text, so a heading can be wider than its node)
+; Limits: the error and disabled states of an input are NOT drawn: vf_theme has no error colour and inventing one would not be a site token, so those
+;   stories in vf_storybook check structure and widths only. The state field of the graph is not read; only the focus argument is
+; Limits: the placeholder string is a vf_card constant because the contract carries no placeholder text for an empty input; the 16 px inset, the 560 px
+;   width (equal to the tokens space.card.padding and layout.card.max_inline since the reconciliation), the cap ratio and the focus width are layout choices of this review (vf_theme card_layout_tokens), not site CSS values
+; Limits: no contrast check for text over a parent fill, no gamma, the type size is clamped to the 6..80 px of vf_type
+; It is NOT a human-eye proof: tests pin pixel bytes and measure ink, and nobody has opened the frame yet
+; All arithmetic is u32 and non-negative: compare before subtracting
+
+module t27f_vf_card;
+use t27f::visual_factory_contract::VfGraph;
+use t27f::visual_factory_contract::VF_CONTAINER;
+use t27f::visual_factory_contract::VF_STACK;
+use t27f::visual_factory_contract::VF_LIST;
+use t27f::visual_factory_contract::VF_TEXT;
+use t27f::visual_factory_contract::VF_BUTTON;
+use t27f::visual_factory_contract::VF_INPUT;
+use t27f::visual_factory_contract::VF_CARD;
+use t27f::visual_factory_contract::VF_BADGE;
+use t27f::visual_factory_contract::PRIMARY;
+use t27f::vf_layout::VfLayout;
+use t27f::vf_layout::vf_layout;
+use t27f::vf_pixel::vf_px_card;
+use t27f::vf_theme::TH_T27;
+use t27f::vf_theme::TH_PAPER;
+use t27f::vf_theme::TH_BG;
+use t27f::vf_theme::TH_TEXT;
+use t27f::vf_theme::TH_MUTED;
+use t27f::vf_theme::TH_ACCENT;
+use t27f::vf_theme::TH_BORDER;
+use t27f::vf_theme::TH_CARD_BORDER;
+use t27f::vf_theme::th_color;
+use t27f::vf_theme::th_kind_color;
+use t27f::vf_theme::th_font_px;
+use t27f::vf_theme::th_luma;
+use t27f::vf_theme::th_luma_gap;
+use t27f::vf_theme::TH_CARD_INSET;
+use t27f::vf_theme::TH_CARD_MAX_W;
+use t27f::vf_theme::TH_CONTROL_INSET;
+use t27f::vf_theme::TH_FOCUS_W;
+use t27f::vf_theme::TH_CAP_MILLI;
+use t27f::vf_type::vt_draw_text;
+use t27f::vf_type::vt_text_width_q8;
+use t27f::vf_type::VT_REGULAR;
+use t27f::vf_type::VT_BOLD;
+use t27f::vf_type::VT_MIN_PX;
+use t27f::vf_type::VT_MAX_PX;
+use t27f::vf_type::VT_OK;
+
+; results of vc_render
+pub const VC_OK : u32 = 0;
+pub const VC_BAD_SCALE : u32 = 1;
+pub const VC_BAD_THEME : u32 = 2;
+pub const VC_BAD_RASTER : u32 = 3;
+pub const VC_BAD_METRICS : u32 = 4;
+
+; the scale limits, in percent of the design size
+pub const VC_PCT_MIN : u32 = 50;
+pub const VC_PCT_MAX : u32 = 400;
+
+; vf_theme steps: type step 5 is f2 (26 px), type step 3 is f0 (16 px). VC_PAD_MAX: the largest text pad a style may ask for, design px (the pen product stays far from 2^32)
+pub const VC_HEAD_STEP : u32 = 5;
+pub const VC_BODY_STEP : u32 = 3;
+pub const VC_PAD_MAX : u32 = 64;
+
+; SUPERSEDED rule, kept only as the negative control of the inset test: the baseline sat BASE_NUM / BASE_DEN of the node height below its top
+pub const VC_BASE_NUM : u32 = 2;
+pub const VC_BASE_DEN : u32 = 3;
+
+; no node has the focus
+pub const VC_NO_FOCUS : u32 = 0xFFFFFFFF;
+
+; what an input with empty text shows (the contract has no placeholder text of its own)
+pub const VC_PLACEHOLDER_TEXT : str = "Type here";
+
+; the test raster: 750 x 384 x 3 = 864000 bytes holds the 375 card at 200 percent
+pub var VC_A : [864000]u8 = [0] ** 864000;
+
+; the six design-pixel numbers the renderer takes from its caller (T27F-007): the text inset, the content width, the heading and body type
+; sizes, the outline width and the text pad (pad_x, the pen offset from a node edge). vc_style_theme is the theme's own set; vf_card_tok builds the same record from the vf_tokens manifest
+pub struct VcStyle {
+    inset: u32,
+    max_w: u32,
+    head_px: u32,
+    body_px: u32,
+    border: u32,
+    pad_x: u32,
+}
+
+; the theme defaults: TH_CARD_INSET, TH_CARD_MAX_W, th_font_px at the heading and body steps, a 1 px outline
+pub fn vc_style_theme() -> VcStyle {
+    var st : VcStyle = VcStyle {
+        inset: TH_CARD_INSET,
+        max_w: TH_CARD_MAX_W,
+        head_px: th_font_px(VC_HEAD_STEP),
+        body_px: th_font_px(VC_BODY_STEP),
+        border: 1,
+        pad_x: TH_CONTROL_INSET,
+    };
+    return st;
+}
+
+; design pixels to output pixels at pct percent, rounded to the nearest
+fn vc_sc(v: u32, pct: u32) -> u32 {
+    return (pct * v + 50) / 100;
+}
+
+; design pixels to Q8 output pixels (256 to the pixel) at pct percent, exact
+fn vc_q8(v: u32, pct: u32) -> u32 {
+    return (v * pct * 256) / 100;
+}
+
+; flat rectangle [x0, x1) x [y0, y1) in colour col, clipped to a w x h raster
+fn vc_fill(rgb: []u8, w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32, col: u32) -> void {
+    var xe : u32 = x1;
+    if xe > w {
+        xe = w;
+    }
+    var ye : u32 = y1;
+    if ye > h {
+        ye = h;
+    }
+    var cr : u8 = ((col >> 16) & 255) as u8;
+    var cg : u8 = ((col >> 8) & 255) as u8;
+    var cb : u8 = (col & 255) as u8;
+    var yy : u32 = y0;
+    while yy < ye {
+        var xx : u32 = x0;
+        while xx < xe {
+            var at : usize = ((yy * w + xx) * 3) as usize;
+            rgb[at] = cr;
+            rgb[at + 1] = cg;
+            rgb[at + 2] = cb;
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+}
+
+; ink for a fill: TH_TEXT or TH_BG, whichever is farther from the fill in luma, the text role wins a tie
+fn vc_ink_on(theme: u32, fill: u32) -> u32 {
+    var ink_a : u32 = th_color(theme, TH_TEXT);
+    var ink_b : u32 = th_color(theme, TH_BG);
+    if th_luma_gap(ink_a, fill) >= th_luma_gap(ink_b, fill) {
+        return ink_a;
+    }
+    return ink_b;
+}
+
+; true when text node i is the caption of an input: that input's label_ref names i
+fn vc_is_caption(g: VfGraph, i: u32) -> bool {
+    if g.kind[i] != VF_TEXT {
+        return false;
+    }
+    var j : u32 = 0;
+    while j < 16 {
+        if g.kind[j] == VF_INPUT and (g.label_ref[j] as u32) == i {
+            return true;
+        }
+        j = j + 1;
+    }
+    return false;
+}
+
+; true when text node i is the caption of the input that has the focus
+fn vc_caption_focused(g: VfGraph, i: u32, focus: u32) -> bool {
+    if focus >= 16 {
+        return false;
+    }
+    if g.kind[focus] != VF_INPUT {
+        return false;
+    }
+    if g.kind[i] != VF_TEXT {
+        return false;
+    }
+    return (g.label_ref[focus] as u32) == i;
+}
+
+; the text node i shows: its own text, or VC_PLACEHOLDER_TEXT when it is an input with empty text
+fn vc_shown(g: VfGraph, i: u32) -> str {
+    let s : str = g.text[i];
+    if s == "" {
+        if g.kind[i] == VF_INPUT {
+            return VC_PLACEHOLDER_TEXT;
+        }
+    }
+    return s;
+}
+
+; centring offset in design pixels at a content width max_w: a root card wider than max_w is centred, a card not wider fills its width
+fn vc_off_m(l: VfLayout, max_w: u32) -> u32 {
+    if l.w[0] > max_w {
+        return (l.w[0] - max_w) / 2;
+    }
+    return 0;
+}
+
+; centring offset at the theme default content width TH_CARD_MAX_W
+fn vc_off(l: VfLayout) -> u32 {
+    return vc_off_m(l, TH_CARD_MAX_W);
+}
+
+; design width of node i: the root card is capped at max_w, every other node keeps its layout width (controls are not stretched)
+fn vc_node_w(l: VfLayout, i: u32, max_w: u32) -> u32 {
+    if i == 0 {
+        if l.w[0] > max_w {
+            return max_w;
+        }
+    }
+    return l.w[i];
+}
+
+; baseline row (the edge under the glyph feet) for text of px output pixels in the box rows y0..y1. The cap height is centred in the box,
+; and the baseline is never above card_y + inset_px + the cap height rounded up, so the cap top is at least inset_px below the card top.
+; capm is the cap height in thousandths of a pixel
+fn vc_baseline(y0: u32, y1: u32, px: u32, card_y: u32, inset_px: u32) -> u32 {
+    var span : u32 = 0;
+    if y1 > y0 {
+        span = y1 - y0;
+    }
+    var capm : u32 = px * TH_CAP_MILLI;
+    var base : u32 = y0 + (span * 1000 + capm + 1000) / 2000;
+    var lowest : u32 = card_y + inset_px + (capm + 999) / 1000;
+    if base < lowest {
+        base = lowest;
+    }
+    return base;
+}
+
+; true for the first text node under its parent that is not an input caption: the heading of the card
+pub fn vc_is_heading(g: VfGraph, i: u32) -> bool {
+    if g.kind[i] != VF_TEXT {
+        return false;
+    }
+    if vc_is_caption(g, i) {
+        return false;
+    }
+    var j : u32 = 0;
+    while j < i {
+        if g.kind[j] == VF_TEXT and g.parent[j] == g.parent[i] {
+            if vc_is_caption(g, j) == false {
+                return false;
+            }
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+; paint node i: box, outline (or focus ring), then its text. off is the centring offset in design pixels, focus the focused node or VC_NO_FOCUS,
+; st.inset the design-pixel distance text keeps from the card's top and left edges, st.max_w the design-pixel content width of the root card,
+; st.head_px and st.body_px the heading and body type sizes, st.border the outline width, st.pad_x the text pen offset from a node edge. Returns VC_OK
+fn vc_node(g: VfGraph, l: VfLayout, i: u32, rgb: []u8, w: u32, h: u32, pct: u32, theme: u32, off: u32, focus: u32, st: VcStyle) -> u32 {
+    let inset : u32 = st.inset;
+    let max_w : u32 = st.max_w;
+    var k : u8 = g.kind[i];
+    var x0 : u32 = vc_sc(l.x[i] + off, pct);
+    var y0 : u32 = vc_sc(l.y[i], pct);
+    var x1 : u32 = vc_sc(l.x[i] + off + vc_node_w(l, i, max_w), pct);
+    var y1 : u32 = vc_sc(l.y[i] + l.h[i], pct);
+    var fill : u32 = th_kind_color(theme, k as u32);
+    var boxed : bool = true;
+    var outlined : bool = false;
+    var ring : bool = false;
+    if i == focus {
+        if k == VF_INPUT or k == VF_BUTTON {
+            ring = true;
+        }
+    }
+    if k == VF_CONTAINER or k == VF_STACK or k == VF_LIST or k == VF_TEXT {
+        boxed = false;
+    }
+    if k == VF_CARD or k == VF_INPUT {
+        outlined = true;
+    }
+    if k == VF_BUTTON and g.variant[i] != PRIMARY {
+        fill = th_color(theme, TH_BORDER);
+        outlined = true;
+    }
+    if boxed {
+        if outlined or ring {
+            var t : u32 = vc_sc(st.border, pct);
+            var edge : u32 = th_color(theme, TH_CARD_BORDER);
+            if ring {
+                t = vc_sc(TH_FOCUS_W, pct);
+                edge = th_color(theme, TH_ACCENT);
+            }
+            vc_fill(rgb, w, h, x0, y0, x1, y1, edge);
+            if x1 > x0 + 2 * t and y1 > y0 + 2 * t {
+                vc_fill(rgb, w, h, x0 + t, y0 + t, x1 - t, y1 - t, fill);
+            }
+        } else {
+            vc_fill(rgb, w, h, x0, y0, x1, y1, fill);
+        }
+    }
+
+    let raw : str = g.text[i];
+    var is_ph : bool = false;
+    if raw == "" {
+        if k == VF_INPUT {
+            is_ph = true;
+        }
+    }
+    let s : str = vc_shown(g, i);
+    if s == "" {
+        return VC_OK;
+    }
+    var dpx : u32 = st.body_px;
+    var weight : u32 = VT_REGULAR;
+    var ink : u32 = vc_ink_on(theme, fill);
+    if is_ph {
+        ink = th_color(theme, TH_MUTED);
+    }
+    if k == VF_TEXT {
+        ink = th_color(theme, TH_MUTED);
+        if vc_is_heading(g, i) {
+            dpx = st.head_px;
+            weight = VT_BOLD;
+            ink = th_color(theme, TH_TEXT);
+        }
+        if vc_caption_focused(g, i, focus) {
+            ink = th_color(theme, TH_TEXT);
+        }
+    }
+    var px : u32 = (dpx * pct + 50) / 100;
+    if px < VT_MIN_PX {
+        px = VT_MIN_PX;
+    }
+    if px > VT_MAX_PX {
+        px = VT_MAX_PX;
+    }
+    var base : u32 = vc_baseline(y0, y1, px, vc_sc(l.y[0], pct), vc_sc(inset, pct));
+    var pen : u32 = vc_q8(l.x[i] + off, pct) + st.pad_x * pct * 256 / 100;
+    if k == VF_BUTTON {
+        var tw : u32 = vt_text_width_q8(s, px, weight);
+        var bw : u32 = 0;
+        if x1 > x0 {
+            bw = (x1 - x0) * 256;
+        }
+        if tw < bw {
+            pen = x0 * 256 + (bw - tw) / 2;
+        }
+    }
+    var pen_min : u32 = vc_q8(l.x[0] + off + inset, pct);
+    if pen < pen_min {
+        pen = pen_min;
+    }
+    var tr : u32 = vt_draw_text(rgb, w, h, pen, base, s, px, weight, ink);
+    if tr != VT_OK {
+        return VC_BAD_RASTER;
+    }
+    return VC_OK;
+}
+
+; paint the graph into rgb (w * h * 3 bytes, top row first) at pct percent in a theme, node focus_node drawn with the focus ring
+; (VC_NO_FOCUS = none; a node that is not an input or a button gets no ring), with the text inset, the card content width, the heading and body
+; type sizes and the outline width given as design pixels in st instead of the theme defaults (T27F-007: the caller resolves them from vf_tokens).
+; A max_w, head_px or body_px of 0, or a pad_x above VC_PAD_MAX, is VC_BAD_METRICS. Refusals paint nothing
+pub fn vc_render_s(g: VfGraph, l: VfLayout, rgb: []u8, w: u32, h: u32, pct: u32, theme: u32, focus_node: u32, st: VcStyle) -> u32 {
+    if pct < VC_PCT_MIN or pct > VC_PCT_MAX {
+        return VC_BAD_SCALE;
+    }
+    if theme != TH_T27 and theme != TH_PAPER {
+        return VC_BAD_THEME;
+    }
+    if w == 0 or h == 0 or w > 4096 or h > 4096 {
+        return VC_BAD_RASTER;
+    }
+    if st.max_w == 0 or st.head_px == 0 or st.body_px == 0 or st.pad_x > VC_PAD_MAX {
+        return VC_BAD_METRICS;
+    }
+    var need : u32 = w * h * 3;
+    if need > (rgb.len as u32) {
+        return VC_BAD_RASTER;
+    }
+    vc_fill(rgb, w, h, 0, 0, w, h, th_color(theme, TH_BG));
+    var n : u32 = l.node_count;
+    if n > 16 {
+        n = 16;
+    }
+    var off : u32 = vc_off_m(l, st.max_w);
+    var i : u32 = 0;
+    while i < n {
+        var nr : u32 = vc_node(g, l, i, rgb, w, h, pct, theme, off, focus_node, st);
+        if nr != VC_OK {
+            return nr;
+        }
+        i = i + 1;
+    }
+    return VC_OK;
+}
+
+; vc_render_s with the theme's type sizes and outline and the given text inset and content width: the caller that resolves only those two
+pub fn vc_render_m(g: VfGraph, l: VfLayout, rgb: []u8, w: u32, h: u32, pct: u32, theme: u32, focus_node: u32, inset: u32, max_w: u32) -> u32 {
+    var st : VcStyle = vc_style_theme();
+    st.inset = inset;
+    st.max_w = max_w;
+    return vc_render_s(g, l, rgb, w, h, pct, theme, focus_node, st);
+}
+
+; paint the graph into rgb at pct percent in a theme, node focus_node drawn with the focus ring: vc_render_m at the theme defaults
+; TH_CARD_INSET and TH_CARD_MAX_W (16 and 560 since the reconciliation, the token values)
+pub fn vc_render_state(g: VfGraph, l: VfLayout, rgb: []u8, w: u32, h: u32, pct: u32, theme: u32, focus_node: u32) -> u32 {
+    return vc_render_m(g, l, rgb, w, h, pct, theme, focus_node, TH_CARD_INSET, TH_CARD_MAX_W);
+}
+
+; paint the graph with no focus: vc_render_state with VC_NO_FOCUS. Signature and result as before the focus state existed
+pub fn vc_render(g: VfGraph, l: VfLayout, rgb: []u8, w: u32, h: u32, pct: u32, theme: u32) -> u32 {
+    return vc_render_state(g, l, rgb, w, h, pct, theme, VC_NO_FOCUS);
+}
+
+; ---- helpers for the tests below ----
+
+; colour 0xRRGGBB of the test-raster pixel (x, y) in a raster w wide
+fn vc_px(w: u32, x: u32, y: u32) -> u32 {
+    var at : usize = ((y * w + x) * 3) as usize;
+    var pr : u32 = VC_A[at] as u32;
+    var pg : u32 = VC_A[at + 1] as u32;
+    var pb : u32 = VC_A[at + 2] as u32;
+    return pr * 65536 + pg * 256 + pb;
+}
+
+; set one byte of a buffer
+fn vc_poke(buf: []u8, at: u32, v: u8) -> void {
+    buf[at as usize] = v;
+}
+
+; how many pixels in x0 <= x < x1, y0 <= y < y1 differ from colour col
+fn vc_count_not(w: u32, x0: u32, x1: u32, y0: u32, y1: u32, col: u32) -> u32 {
+    var cnt : u32 = 0;
+    var y : u32 = y0;
+    while y < y1 {
+        var x : u32 = x0;
+        while x < x1 {
+            if vc_px(w, x, y) != col {
+                cnt = cnt + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return cnt;
+}
+
+; the smallest luma in the box
+fn vc_min_luma(w: u32, x0: u32, x1: u32, y0: u32, y1: u32) -> u32 {
+    var best : u32 = 255;
+    var y : u32 = y0;
+    while y < y1 {
+        var x : u32 = x0;
+        while x < x1 {
+            var lu : u32 = th_luma(vc_px(w, x, y));
+            if lu < best {
+                best = lu;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return best;
+}
+
+; the largest red byte in the box
+fn vc_max_red(w: u32, x0: u32, x1: u32, y0: u32, y1: u32) -> u32 {
+    var best : u32 = 0;
+    var y : u32 = y0;
+    while y < y1 {
+        var x : u32 = x0;
+        while x < x1 {
+            var rd : u32 = vc_px(w, x, y) / 65536;
+            if rd > best {
+                best = rd;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return best;
+}
+
+; first column in x0 <= x < x1 with a pixel in rows y0..y1 that is not bg, or 4096 when there is none
+fn vc_ink_left(w: u32, x0: u32, x1: u32, y0: u32, y1: u32, bg: u32) -> u32 {
+    var x : u32 = x0;
+    while x < x1 {
+        var y : u32 = y0;
+        while y < y1 {
+            if vc_px(w, x, y) != bg {
+                return x;
+            }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    return 4096;
+}
+
+; last column in x0 <= x < x1 with a pixel in rows y0..y1 that is not bg, or 0 when there is none
+fn vc_ink_right(w: u32, x0: u32, x1: u32, y0: u32, y1: u32, bg: u32) -> u32 {
+    var x : u32 = x1;
+    while x > x0 {
+        x = x - 1;
+        var y : u32 = y0;
+        while y < y1 {
+            if vc_px(w, x, y) != bg {
+                return x;
+            }
+            y = y + 1;
+        }
+    }
+    return 0;
+}
+
+; first row in y0 <= y < y1 with a pixel in columns x0..x1 that is not bg, or 4096 when there is none
+fn vc_ink_top(w: u32, x0: u32, x1: u32, y0: u32, y1: u32, bg: u32) -> u32 {
+    var y : u32 = y0;
+    while y < y1 {
+        var x : u32 = x0;
+        while x < x1 {
+            if vc_px(w, x, y) != bg {
+                return y;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 4096;
+}
+
+; last row in y0 <= y < y1 with a pixel in columns x0..x1 that is not bg, or 0 when there is none
+fn vc_ink_bottom(w: u32, x0: u32, x1: u32, y0: u32, y1: u32, bg: u32) -> u32 {
+    var y : u32 = y1;
+    while y > y0 {
+        y = y - 1;
+        var x : u32 = x0;
+        while x < x1 {
+            if vc_px(w, x, y) != bg {
+                return y;
+            }
+            x = x + 1;
+        }
+    }
+    return 0;
+}
+
+; how many pixels in x0 <= x < x1, y0 <= y < y1 are exactly colour col
+fn vc_count_is(w: u32, x0: u32, x1: u32, y0: u32, y1: u32, col: u32) -> u32 {
+    var cnt : u32 = 0;
+    var y : u32 = y0;
+    while y < y1 {
+        var x : u32 = x0;
+        while x < x1 {
+            if vc_px(w, x, y) == col {
+                cnt = cnt + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return cnt;
+}
+
+; width of the ink bounding box of the title (rows above the badge, inside the card outline, columns left of xmax) at pct percent
+fn vc_title_span(xmax: u32, pct: u32, bg: u32, w: u32) -> u32 {
+    var t : u32 = vc_sc(1, pct);
+    var yb : u32 = vc_sc(36, pct);
+    var lo : u32 = vc_ink_left(w, t, xmax - t, t, yb, bg);
+    var hi : u32 = vc_ink_right(w, t, xmax - t, t, yb, bg);
+    if lo >= 4096 {
+        return 0;
+    }
+    if hi < lo {
+        return 0;
+    }
+    return hi - lo + 1;
+}
+
+; ---- tests ----
+
+test ok_and_three_refusals {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert VC_OK == 0;
+    assert VC_BAD_SCALE == 1;
+    assert VC_BAD_THEME == 2;
+    assert VC_BAD_RASTER == 3;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_PAPER) == VC_OK;
+    assert vc_render(g, l, &VC_A, 188, 96, 50, TH_T27) == VC_OK;
+    assert vc_render(g, l, &VC_A, 100, 50, 400, TH_T27) == VC_OK;
+    assert vc_render(g, l, &VC_A, 375, 192, 49, TH_T27) == VC_BAD_SCALE;
+    assert vc_render(g, l, &VC_A, 375, 192, 401, TH_T27) == VC_BAD_SCALE;
+    assert vc_render(g, l, &VC_A, 375, 192, 0, TH_T27) == VC_BAD_SCALE;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, 2) == VC_BAD_THEME;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, 99) == VC_BAD_THEME;
+    assert vc_render(g, l, &VC_A, 0, 192, 100, TH_T27) == VC_BAD_RASTER;
+    assert vc_render(g, l, &VC_A, 375, 0, 100, TH_T27) == VC_BAD_RASTER;
+    assert vc_render(g, l, &VC_A, 4097, 1, 100, TH_T27) == VC_BAD_RASTER;
+    assert vc_render(g, l, &VC_A, 1, 4097, 100, TH_T27) == VC_BAD_RASTER;
+    assert vc_render(g, l, &VC_A, 1500, 768, 100, TH_T27) == VC_BAD_RASTER;
+    var small : [10]u8 = [0; 10];
+    assert vc_render(g, l, &small, 375, 192, 100, TH_T27) == VC_BAD_RASTER;
+    vc_poke(&VC_A, 0, 77);
+    assert vc_render(g, l, &VC_A, 375, 192, 49, TH_T27) == VC_BAD_SCALE;
+    assert VC_A[0] == 77;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, 2) == VC_BAD_THEME;
+    assert VC_A[0] == 77;
+    assert vc_render(g, l, &VC_A, 4097, 1, 100, TH_T27) == VC_BAD_RASTER;
+    assert VC_A[0] == 77;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert VC_A[0] == 51;
+}
+
+test corner_is_the_background {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vc_render(g, l, &VC_A, 400, 220, 100, TH_T27) == VC_OK;
+    assert vc_px(400, 399, 219) == th_color(TH_T27, TH_BG);
+    assert vc_px(400, 399, 219) == 0x000000;
+    assert vc_px(400, 380, 100) == 0x000000;
+    assert vc_px(400, 0, 219) == 0x000000;
+    assert vc_px(400, 0, 0) != th_color(TH_T27, TH_BG);
+    assert vc_px(400, 0, 0) == th_color(TH_T27, TH_CARD_BORDER);
+    assert vc_render(g, l, &VC_A, 400, 220, 100, TH_PAPER) == VC_OK;
+    assert vc_px(400, 399, 219) == th_color(TH_PAPER, TH_BG);
+    assert vc_px(400, 399, 219) == 0xFFFFFF;
+    assert vc_px(400, 0, 0) == 0xCCCCCC;
+}
+
+test fills_at_centres {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_px(375, 150, 116) == th_kind_color(TH_T27, VF_INPUT as u32);
+    assert vc_px(375, 150, 116) == 0x333333;
+    assert vc_px(375, 300, 100) == th_kind_color(TH_T27, VF_CARD as u32);
+    assert vc_px(375, 300, 100) == 0x141414;
+    assert vc_px(375, 10, 38) == th_kind_color(TH_T27, VF_BADGE as u32);
+    assert vc_px(375, 10, 38) == 0xFFD700;
+    assert vc_px(375, 150, 116) != vc_px(375, 300, 100);
+    l.w[4] = 0;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_px(375, 150, 116) == 0x141414;
+    l = vf_layout(g);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_PAPER) == VC_OK;
+    assert vc_px(375, 150, 116) == th_kind_color(TH_PAPER, VF_INPUT as u32);
+    assert vc_px(375, 150, 116) == 0xCCCCCC;
+    assert vc_px(375, 300, 100) == 0xEBEBEB;
+}
+
+test title_carries_ink {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_count_not(375, 8, 88, 8, 28, card) >= 40;
+    g.text[1] = "";
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_count_not(375, 8, 88, 8, 28, card) == 0;
+}
+
+test text_follows_the_layout_not_the_width {
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    var ga : VfGraph = vf_px_card(375);
+    var la : VfLayout = vf_layout(ga);
+    assert vc_render(ga, la, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    var left375 : u32 = vc_ink_left(375, 1, 374, 1, 36, card);
+    var gb : VfGraph = vf_px_card(768);
+    var lb : VfLayout = vf_layout(gb);
+    assert vc_render(gb, lb, &VC_A, 768, 192, 100, TH_T27) == VC_OK;
+    // at 768 the card is 560 wide and centred, offset 104: the search starts inside its outline (column 105) and the text sits the offset to the right
+    var left768 : u32 = vc_ink_left(768, 105, 663, 1, 36, card);
+    assert left375 < 4096;
+    assert left375 >= TH_CARD_INSET;
+    assert left375 <= TH_CARD_INSET + 6;
+    assert left768 == left375 + 104;
+    lb.x[1] = 28;
+    assert vc_render(gb, lb, &VC_A, 768, 192, 100, TH_T27) == VC_OK;
+    var shifted : u32 = vc_ink_left(768, 105, 663, 1, 36, card);
+    // the pen is the larger of (node x + pad_x, the control inset token 6) and the inset: at x 8 the inset 16 wins (pen 16), at x 28 the node does (pen 34), so the ink moves 18
+    assert shifted == left768 + 18;
+    assert shifted != left768;
+}
+
+test scale_doubles_the_title {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    var s100 : u32 = vc_title_span(375, 100, card, 375);
+    assert vc_render(g, l, &VC_A, 563, 288, 150, TH_T27) == VC_OK;
+    var s150 : u32 = vc_title_span(563, 150, card, 563);
+    assert vc_render(g, l, &VC_A, 750, 384, 200, TH_T27) == VC_OK;
+    var s200 : u32 = vc_title_span(750, 200, card, 750);
+    assert s100 >= 100;
+    assert s200 * 100 >= s100 * 190;
+    assert s200 * 100 <= s100 * 210;
+    assert s150 * 100 >= s100 * 140;
+    assert s150 * 100 <= s100 * 160;
+    assert s200 > s150;
+    assert s150 > s100;
+    assert vc_render(g, l, &VC_A, 750, 384, 100, TH_T27) == VC_OK;
+    assert vc_title_span(375, 100, card, 750) == s100;
+}
+
+test paper_theme_changes_the_ground_not_the_geometry {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vc_render(g, l, &VC_A, 400, 220, 100, TH_T27) == VC_OK;
+    var bg_site : u32 = vc_px(400, 399, 219);
+    var left_site : u32 = vc_ink_left(400, 1, 374, 1, 36, th_kind_color(TH_T27, VF_CARD as u32));
+    assert vc_render(g, l, &VC_A, 400, 220, 100, TH_PAPER) == VC_OK;
+    var bg_paper : u32 = vc_px(400, 399, 219);
+    var left_paper : u32 = vc_ink_left(400, 1, 374, 1, 36, th_kind_color(TH_PAPER, VF_CARD as u32));
+    assert bg_site != bg_paper;
+    assert bg_site == 0x000000;
+    assert bg_paper == 0xFFFFFF;
+    assert left_site < 4096;
+    assert left_paper == left_site;
+    assert vc_render(g, l, &VC_A, 400, 220, 100, TH_T27) == VC_OK;
+    assert vc_px(400, 399, 219) == bg_site;
+}
+
+test primary_is_accent_and_secondary_is_outlined {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_px(375, 10, 146) == th_color(TH_T27, TH_ACCENT);
+    assert vc_px(375, 10, 146) == 0x00FF88;
+    assert vc_px(375, 114, 146) == th_color(TH_T27, TH_BORDER);
+    assert vc_px(375, 112, 146) == th_color(TH_T27, TH_CARD_BORDER);
+    assert vc_px(375, 114, 146) != vc_px(375, 10, 146);
+    assert vc_px(375, 108, 164) == 0x141414;
+    assert vc_px(375, 108, 164) != th_kind_color(TH_T27, VF_STACK as u32);
+    g.variant[7] = PRIMARY;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_px(375, 114, 146) == th_color(TH_T27, TH_ACCENT);
+    assert vc_px(375, 112, 146) == th_color(TH_T27, TH_ACCENT);
+}
+
+test button_and_badge_ink_contrast_with_the_fill {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_min_luma(375, 8, 104, 144, 184) <= 140;
+    assert vc_min_luma(375, 8, 56, 36, 60) <= 140;
+    g.text[6] = "";
+    g.text[2] = "";
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_min_luma(375, 8, 104, 144, 184) == th_luma(0x00FF88);
+    assert vc_min_luma(375, 8, 56, 36, 60) == th_luma(0xFFD700);
+    assert vc_min_luma(375, 8, 104, 144, 184) > 140;
+    assert vc_min_luma(375, 8, 56, 36, 60) > 140;
+}
+
+test heading_is_bright_and_label_is_muted {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    var title_max : u32 = vc_max_red(375, 1, 374, 1, 36);
+    var label_max : u32 = vc_max_red(375, 1, 374, 62, 92);
+    assert title_max >= 240;
+    assert label_max >= 60;
+    assert label_max <= 136;
+    assert title_max > label_max;
+    g.text[3] = "";
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_max_red(375, 1, 374, 62, 92) == 20;
+}
+
+; item 1 of the owner review: the title keeps TH_CARD_INSET from the card's top and left edges
+test title_clears_the_card_top_by_the_inset {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    assert TH_CARD_INSET == 16;
+    // the layout is not moved: title node rows 8..28, so the baseline has to leave the node
+    assert l.y[1] == 8;
+    assert l.h[1] == 20;
+    var base : u32 = vc_baseline(8, 28, 26, 0, TH_CARD_INSET);
+    var cap_up : u32 = (26 * TH_CAP_MILLI + 999) / 1000;
+    assert cap_up == 19;
+    assert base == 35;
+    assert base > 28;
+    assert base >= TH_CARD_INSET + cap_up;
+    // negative controls: the superseded two-thirds rule puts the baseline at 21 and the cap top about 3 px from the edge, inside the inset, and the
+    // inset of 12 that the theme had before the reconciliation leaves the baseline at 31, a cap top 12 px from the edge
+    var old_base : u32 = 8 + 20 * VC_BASE_NUM / VC_BASE_DEN;
+    assert old_base == 21;
+    assert old_base < TH_CARD_INSET + cap_up;
+    assert vc_baseline(8, 28, 26, 0, 12) == 31;
+    assert vc_baseline(8, 28, 26, 0, 12) < TH_CARD_INSET + cap_up;
+    // the rule is the card inset, not a blanket shift: a node well inside a card is still centred on its cap height
+    assert vc_baseline(100, 120, 16, 80, TH_CARD_INSET) == 116;
+    // 200 percent: 52 px type, node rows 16..56, inset 32, cap 36.4 rounded up to 37
+    var base200 : u32 = vc_baseline(16, 56, 52, 0, 2 * TH_CARD_INSET);
+    assert base200 == 69;
+    assert base200 >= 32 + 37;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    var left : u32 = vc_ink_left(375, 1, 374, 1, 36, card);
+    assert left >= TH_CARD_INSET;
+    // the first ink row of the W (the first 14 columns of the title lie inside that glyph): one row of antialias fringe is allowed
+    var top : u32 = vc_ink_top(375, left, left + 14, 1, 36, card);
+    assert top + 1 >= TH_CARD_INSET;
+    assert top <= TH_CARD_INSET + 2;
+}
+
+; item 2: a card wider than TH_CARD_MAX_W is centred at that width, the raster outside it is the ground, and a narrower card fills its width
+test wide_cards_are_centred_at_the_max_width {
+    var bg : u32 = th_color(TH_T27, TH_BG);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    var edge : u32 = th_color(TH_T27, TH_CARD_BORDER);
+    var accent : u32 = th_color(TH_T27, TH_ACCENT);
+    assert TH_CARD_MAX_W == 560;
+    var g8 : VfGraph = vf_px_card(768);
+    var l8 : VfLayout = vf_layout(g8);
+    assert l8.w[0] == 768;
+    assert vc_off(l8) == 104;
+    assert vc_render(g8, l8, &VC_A, 768, 192, 100, TH_T27) == VC_OK;
+    assert vc_count_not(768, 0, 104, 0, 192, bg) == 0;
+    assert vc_count_not(768, 664, 768, 0, 192, bg) == 0;
+    assert vc_count_not(768, 104, 664, 0, 192, bg) > 0;
+    assert vc_px(768, 104, 96) == edge;
+    assert vc_px(768, 663, 96) == edge;
+    assert vc_px(768, 444, 100) == card;
+    // controls are not stretched: the Save button is still 96 wide and the gap to Cancel is still 8
+    assert vc_px(768, 207, 146) == accent;
+    assert vc_px(768, 208, 146) == card;
+    assert vc_px(768, 215, 164) == card;
+    assert vc_px(768, 216, 164) == edge;
+    assert vc_render(g8, l8, &VC_A, 768, 192, 100, TH_PAPER) == VC_OK;
+    assert vc_count_not(768, 0, 104, 0, 192, 0xFFFFFF) == 0;
+    assert vc_count_not(768, 664, 768, 0, 192, 0xFFFFFF) == 0;
+    var g12 : VfGraph = vf_px_card(1280);
+    var l12 : VfLayout = vf_layout(g12);
+    assert vc_off(l12) == 360;
+    assert vc_render(g12, l12, &VC_A, 1280, 192, 100, TH_T27) == VC_OK;
+    assert vc_count_not(1280, 0, 360, 0, 192, bg) == 0;
+    assert vc_count_not(1280, 920, 1280, 0, 192, bg) == 0;
+    assert vc_count_not(1280, 360, 920, 0, 192, bg) > 0;
+    assert vc_px(1280, 360, 96) == edge;
+    assert vc_px(1280, 919, 96) == edge;
+    // negative controls: 375 and exactly 560 fill their width, 561 is the first width that is cut (offset 0, the card stays 560), and the 480 that
+    // the theme had before the reconciliation is no longer the default: the same 768 card would start at 144
+    assert vc_off_m(l8, 480) == 144;
+    assert vc_off(l8) != vc_off_m(l8, 480);
+    var g3 : VfGraph = vf_px_card(375);
+    var l3 : VfLayout = vf_layout(g3);
+    assert vc_off(l3) == 0;
+    assert vc_render(g3, l3, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_px(375, 0, 96) == edge;
+    assert vc_px(375, 374, 96) == edge;
+    l3.w[0] = 560;
+    assert vc_off(l3) == 0;
+    assert vc_render(g3, l3, &VC_A, 560, 192, 100, TH_T27) == VC_OK;
+    assert vc_px(560, 0, 96) == edge;
+    assert vc_px(560, 559, 96) == edge;
+    l3.w[0] = 561;
+    assert vc_off(l3) == 0;
+    assert vc_render(g3, l3, &VC_A, 561, 192, 100, TH_T27) == VC_OK;
+    assert vc_px(561, 559, 96) == edge;
+    assert vc_px(561, 560, 96) == bg;
+}
+
+; T27F-007, vc_render_m (i): the text inset is a parameter. Inset 16 keeps the title's cap top and left ink 16 design px inside the card at 100 and
+; 200 percent; one pixel of antialias fringe is allowed, as in title_clears_the_card_top_by_the_inset. The first 14 (28) columns of the title lie
+; inside its first glyph, a flat-topped W, so the top row is the cap top, not an ascender
+test render_m_takes_the_inset_as_a_parameter {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    assert vc_render_m(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, 16, TH_CARD_MAX_W) == VC_OK;
+    var left16 : u32 = vc_ink_left(375, 1, 374, 1, 36, card);
+    var top16 : u32 = vc_ink_top(375, left16, left16 + 14, 1, 36, card);
+    assert left16 + 1 >= 16;
+    assert top16 + 1 >= 16;
+    assert vc_render_m(g, l, &VC_A, 750, 384, 200, TH_T27, VC_NO_FOCUS, 16, TH_CARD_MAX_W) == VC_OK;
+    var left32 : u32 = vc_ink_left(750, 2, 748, 2, 72, card);
+    var top32 : u32 = vc_ink_top(750, left32, left32 + 28, 2, 72, card);
+    assert left32 + 1 >= 32;
+    assert top32 + 1 >= 32;
+    // negative controls: an explicit inset 12 (the theme default before the reconciliation) leaves the cap top nearer than 16 (32 at 200 percent)
+    // and the title further left
+    assert vc_render_m(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, 12, TH_CARD_MAX_W) == VC_OK;
+    var left12 : u32 = vc_ink_left(375, 1, 374, 1, 36, card);
+    var top12 : u32 = vc_ink_top(375, left12, left12 + 14, 1, 36, card);
+    assert top12 < 16;
+    assert top12 < top16;
+    assert left12 < left16;
+    assert vc_render_m(g, l, &VC_A, 750, 384, 200, TH_T27, VC_NO_FOCUS, 12, TH_CARD_MAX_W) == VC_OK;
+    var left24 : u32 = vc_ink_left(750, 2, 748, 2, 72, card);
+    var top24 : u32 = vc_ink_top(750, left24, left24 + 28, 2, 72, card);
+    assert top24 < 32;
+    assert top24 < top32;
+    assert left24 < left32;
+    // vc_render_state is vc_render_m at the theme defaults: the default path draws the same ink as an explicit TH_CARD_INSET (16), which is
+    // the inset 16 measured above
+    assert TH_CARD_INSET == 16;
+    assert vc_render(g, l, &VC_A, 750, 384, 200, TH_T27) == VC_OK;
+    assert vc_ink_left(750, 2, 748, 2, 72, card) == left32;
+    assert vc_ink_top(750, left32, left32 + 28, 2, 72, card) == top32;
+    assert vc_render_m(g, l, &VC_A, 750, 384, 200, TH_T27, VC_NO_FOCUS, TH_CARD_INSET, TH_CARD_MAX_W) == VC_OK;
+    assert vc_ink_left(750, 2, 748, 2, 72, card) == left32;
+    assert vc_ink_top(750, left32, left32 + 28, 2, 72, card) == top32;
+}
+
+; T27F-007, vc_render_m (ii): the content width is a parameter. At max_w 560 a 768 card is centred at offset 104 and a 1280 card at offset 360,
+; the raster outside it is the ground, and the card is not wider than 560 (a 520 card fills its width). Negative control: at the former theme default 480
+; the same 768 card starts at 144, so column 104 is still the ground. A max_w of 0 is refused and paints nothing
+test render_m_takes_the_content_width_as_a_parameter {
+    var bg : u32 = th_color(TH_T27, TH_BG);
+    var edge : u32 = th_color(TH_T27, TH_CARD_BORDER);
+    var g8 : VfGraph = vf_px_card(768);
+    var l8 : VfLayout = vf_layout(g8);
+    assert vc_off_m(l8, 560) == 104;
+    assert vc_off_m(l8, TH_CARD_MAX_W) == 104;
+    assert vc_off_m(l8, 480) == 144;
+    assert vc_render_m(g8, l8, &VC_A, 768, 192, 100, TH_T27, VC_NO_FOCUS, TH_CARD_INSET, 560) == VC_OK;
+    assert vc_count_not(768, 0, 104, 0, 192, bg) == 0;
+    assert vc_count_not(768, 664, 768, 0, 192, bg) == 0;
+    assert vc_count_not(768, 104, 664, 0, 192, bg) > 0;
+    assert vc_px(768, 104, 96) == edge;
+    assert vc_px(768, 663, 96) == edge;
+    assert vc_px(768, 103, 96) == bg;
+    assert vc_px(768, 664, 96) == bg;
+    // controls are not stretched: the Save button is still 96 wide (design x 8..104), shifted by the offset 104 only
+    assert vc_px(768, 207, 146) == th_color(TH_T27, TH_ACCENT);
+    assert vc_px(768, 208, 146) == th_kind_color(TH_T27, VF_CARD as u32);
+    assert vc_render_m(g8, l8, &VC_A, 768, 192, 100, TH_T27, VC_NO_FOCUS, TH_CARD_INSET, 480) == VC_OK;
+    assert vc_px(768, 104, 96) == bg;
+    assert vc_px(768, 144, 96) == edge;
+    var g12 : VfGraph = vf_px_card(1280);
+    var l12 : VfLayout = vf_layout(g12);
+    assert vc_off_m(l12, 560) == 360;
+    assert vc_render_m(g12, l12, &VC_A, 1280, 192, 100, TH_T27, VC_NO_FOCUS, TH_CARD_INSET, 560) == VC_OK;
+    assert vc_count_not(1280, 0, 360, 0, 192, bg) == 0;
+    assert vc_count_not(1280, 920, 1280, 0, 192, bg) == 0;
+    assert vc_count_not(1280, 360, 920, 0, 192, bg) > 0;
+    assert vc_px(1280, 360, 96) == edge;
+    assert vc_px(1280, 919, 96) == edge;
+    // a card not wider than max_w fills its width: 520 is centred at 480 (offset 20) and fills 560 (offset 0)
+    var l5 : VfLayout = vf_layout(vf_px_card(375));
+    l5.w[0] = 520;
+    assert vc_off_m(l5, 480) == 20;
+    assert vc_off_m(l5, 560) == 0;
+    assert vc_off_m(l5, 520) == 0;
+    // a zero content width is refused, and the raster is left as it was
+    assert vc_render_m(g12, l12, &VC_A, 1280, 192, 100, TH_T27, VC_NO_FOCUS, TH_CARD_INSET, 0) == VC_BAD_METRICS;
+    assert vc_px(1280, 360, 96) == edge;
+    assert VC_BAD_METRICS != VC_BAD_RASTER;
+}
+
+; T27F-007, vc_render_s (i): the type sizes are parameters. The theme style is the 26 px heading and the 16 px body, and the default path draws the
+; same pixels as vc_render_s with it. The ink of the title band grows with head_px (20 < 26 < 33), the ink of the Save label grows with body_px
+; (12 < 16 < 24). Nothing else is claimed: the numbers are pixel counts of a band, not a measured glyph size
+test render_s_takes_the_type_sizes_from_the_style {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    var accent : u32 = th_color(TH_T27, TH_ACCENT);
+    var st : VcStyle = vc_style_theme();
+    assert st.head_px == 26;
+    assert st.body_px == 16;
+    assert st.border == 1;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    var title26 : u32 = vc_count_not(375, 1, 374, 1, 36, card);
+    var label16 : u32 = vc_count_not(375, 10, 102, 147, 181, accent);
+    assert title26 > 0;
+    assert label16 > 0;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_count_not(375, 1, 374, 1, 36, card) == title26;
+    assert vc_count_not(375, 10, 102, 147, 181, accent) == label16;
+    st.head_px = 20;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    var title20 : u32 = vc_count_not(375, 1, 374, 1, 36, card);
+    assert title20 < title26;
+    assert vc_count_not(375, 10, 102, 147, 181, accent) == label16;
+    st.head_px = 33;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    assert vc_count_not(375, 1, 374, 1, 36, card) > title26;
+    st.head_px = 26;
+    st.body_px = 12;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    assert vc_count_not(375, 10, 102, 147, 181, accent) < label16;
+    assert vc_count_not(375, 1, 374, 1, 36, card) == title26;
+    st.body_px = 24;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    assert vc_count_not(375, 10, 102, 147, 181, accent) > label16;
+}
+
+; T27F-007, vc_render_s (ii): the outline width is a parameter. Width 1 is the theme's, 2 doubles the card edge, 0 paints no outline. A heading or
+; body size of 0 is refused and paints nothing; the raster stays as the last good render left it
+test render_s_takes_the_outline_width_and_refuses_zero_sizes {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    var edge : u32 = th_color(TH_T27, TH_CARD_BORDER);
+    var st : VcStyle = vc_style_theme();
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    assert vc_px(375, 0, 96) == edge;
+    assert vc_px(375, 1, 96) == card;
+    st.border = 2;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    assert vc_px(375, 0, 96) == edge;
+    assert vc_px(375, 1, 96) == edge;
+    assert vc_px(375, 2, 96) == card;
+    st.border = 0;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    assert vc_px(375, 0, 96) == card;
+    st.border = 2;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    st.head_px = 0;
+    st.border = 1;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_BAD_METRICS;
+    assert vc_px(375, 1, 96) == edge;
+    st.head_px = 26;
+    st.body_px = 0;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_BAD_METRICS;
+    assert vc_px(375, 1, 96) == edge;
+    st.body_px = 16;
+    st.max_w = 0;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_BAD_METRICS;
+    assert vc_px(375, 1, 96) == edge;
+    st.max_w = TH_CARD_MAX_W;
+    st.pad_x = VC_PAD_MAX + 1;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_BAD_METRICS;
+    assert vc_px(375, 1, 96) == edge;
+    st.pad_x = VC_PAD_MAX;
+    assert vc_render_s(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+}
+
+; the text pen offset is the style's pad_x: a node at x 28 inks 6 design pixels further right with pad_x 12 than with the theme pad 6
+test the_text_pen_follows_the_style_pad {
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    var g : VfGraph = vf_px_card(768);
+    var l : VfLayout = vf_layout(g);
+    l.x[1] = 28;
+    var st : VcStyle = vc_style_theme();
+    assert st.pad_x == 6;
+    assert vc_render_s(g, l, &VC_A, 768, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    var a : u32 = vc_ink_left(768, 105, 663, 1, 36, card);
+    st.pad_x = 12;
+    assert vc_render_s(g, l, &VC_A, 768, 192, 100, TH_T27, VC_NO_FOCUS, st) == VC_OK;
+    var b : u32 = vc_ink_left(768, 105, 663, 1, 36, card);
+    assert b == a + 6;
+    assert b != a;
+}
+
+; item 3, placeholder: an input with empty text paints a muted placeholder inside its box, a node that is not an input paints nothing
+test an_empty_input_shows_a_muted_placeholder {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var infill : u32 = th_kind_color(TH_T27, VF_INPUT as u32);
+    var card : u32 = th_kind_color(TH_T27, VF_CARD as u32);
+    let t4 : str = g.text[4];
+    assert t4 == "";
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    // ink inside the interior of the input (10..166 x 98..134), in the muted role: brighter than the fill, never brighter than TH_MUTED
+    assert vc_count_not(375, 10, 166, 98, 134, infill) >= 30;
+    var pmax : u32 = vc_max_red(375, 10, 166, 98, 134);
+    assert pmax >= 60;
+    assert pmax <= 136;
+    // it starts in the text column of the caption above it (pen at 14, one column of antialias fringe allowed)
+    var pl : u32 = vc_ink_left(375, 10, 166, 98, 134, infill);
+    var cl : u32 = vc_ink_left(375, 9, 166, 68, 88, card);
+    assert pl + 1 >= 14;
+    assert pl <= 20;
+    assert pl <= cl + 2;
+    assert cl <= pl + 2;
+    // vertically centred: clear of the box edges, and its ink centre (descenders pull it down a little) near the box centre 116
+    var ptop : u32 = vc_ink_top(375, 10, 166, 98, 134, infill);
+    var pbot : u32 = vc_ink_bottom(375, 10, 166, 98, 134, infill);
+    assert ptop >= 104;
+    assert pbot <= 128;
+    var c2 : u32 = ptop + pbot + 1;
+    assert c2 + 8 >= 232;
+    assert c2 <= 232 + 8;
+    // negative control: the same node as text (not an input) paints no box and no placeholder
+    var g2 : VfGraph = vf_px_card(375);
+    g2.kind[4] = VF_TEXT;
+    assert vc_render(g2, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_count_not(375, 8, 168, 96, 136, card) == 0;
+    // negative control: an input with a value paints the value in the text role, brighter than any placeholder can be (TH_MUTED red is 136)
+    var g3 : VfGraph = vf_px_card(375);
+    g3.text[4] = "Ada";
+    assert vc_render(g3, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_max_red(375, 10, 166, 98, 134) >= 160;
+}
+
+; item 3, focus: vc_render_state draws a TH_FOCUS_W ring in the accent on the focused input or button and on no other node
+test the_focus_ring_is_accent_and_only_on_the_focused_node {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var accent : u32 = th_color(TH_T27, TH_ACCENT);
+    var infill : u32 = th_kind_color(TH_T27, VF_INPUT as u32);
+    var edge : u32 = th_color(TH_T27, TH_CARD_BORDER);
+    assert TH_FOCUS_W == 2;
+    assert VC_NO_FOCUS == 0xFFFFFFFF;
+    // no focus: vc_render and vc_render_state with VC_NO_FOCUS give an input without any accent pixel and with a muted caption
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_count_is(375, 8, 168, 96, 136, accent) == 0;
+    assert vc_px(375, 8, 96) == edge;
+    assert vc_max_red(375, 1, 374, 62, 92) <= 136;
+    assert vc_render_state(g, l, &VC_A, 375, 192, 100, TH_T27, VC_NO_FOCUS) == VC_OK;
+    assert vc_count_is(375, 8, 168, 96, 136, accent) == 0;
+    assert vc_px(375, 8, 96) == edge;
+    assert vc_max_red(375, 1, 374, 62, 92) <= 136;
+    // focus on the input, node 4: a 2 px ring, 160 x 40 minus 156 x 36 = 784 accent pixels, and nowhere else in the input or on Cancel
+    assert vc_render_state(g, l, &VC_A, 375, 192, 100, TH_T27, 4) == VC_OK;
+    assert vc_count_is(375, 8, 168, 96, 136, accent) == 784;
+    assert vc_px(375, 8, 96) == accent;
+    assert vc_px(375, 9, 97) == accent;
+    assert vc_px(375, 167, 135) == accent;
+    assert vc_px(375, 10, 98) == infill;
+    assert vc_px(375, 150, 116) == infill;
+    assert vc_count_is(375, 112, 208, 144, 184, accent) == 0;
+    assert vc_px(375, 0, 0) == edge;
+    // the link: the caption of the focused input turns bright, above the TH_MUTED red of 136
+    assert vc_max_red(375, 1, 374, 62, 92) >= 160;
+    // focus on the Cancel button, node 7: 96 x 40 minus 92 x 36 = 528 accent pixels on it, none on the input, the caption muted again
+    assert vc_render_state(g, l, &VC_A, 375, 192, 100, TH_T27, 7) == VC_OK;
+    assert vc_count_is(375, 112, 208, 144, 184, accent) == 528;
+    assert vc_px(375, 112, 144) == accent;
+    assert vc_px(375, 114, 146) == th_color(TH_T27, TH_BORDER);
+    assert vc_count_is(375, 8, 168, 96, 136, accent) == 0;
+    assert vc_max_red(375, 1, 374, 62, 92) <= 136;
+    // negative controls: a node that is neither an input nor a button, and an index past the graph, get no ring
+    assert vc_render_state(g, l, &VC_A, 375, 192, 100, TH_T27, 1) == VC_OK;
+    assert vc_count_is(375, 8, 168, 96, 136, accent) == 0;
+    assert vc_count_is(375, 112, 208, 144, 184, accent) == 0;
+    assert vc_render_state(g, l, &VC_A, 375, 192, 100, TH_T27, 0) == VC_OK;
+    assert vc_px(375, 0, 0) == edge;
+    assert vc_render_state(g, l, &VC_A, 375, 192, 100, TH_T27, 99) == VC_OK;
+    assert vc_count_is(375, 8, 168, 96, 136, accent) == 0;
+    // the refusals are the same as vc_render's
+    assert vc_render_state(g, l, &VC_A, 375, 192, 49, TH_T27, 4) == VC_BAD_SCALE;
+    assert vc_render_state(g, l, &VC_A, 375, 192, 100, 2, 4) == VC_BAD_THEME;
+    assert vc_render_state(g, l, &VC_A, 0, 192, 100, TH_T27, 4) == VC_BAD_RASTER;
+}
+
+; item 4: a button label is centred in its drawn box, horizontally by its width and vertically on the cap height
+test button_labels_are_centred_in_their_boxes {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    var accent : u32 = th_color(TH_T27, TH_ACCENT);
+    var secondary : u32 = th_color(TH_T27, TH_BORDER);
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    // Save, box 8..104 x 144..184 filled accent, interior 9..103 x 145..183. Doubled centres are compared, a difference of 2 is one pixel;
+    // horizontally 2 px are allowed for the side bearings of the first and last glyph, vertically 1 px
+    var sl : u32 = vc_ink_left(375, 9, 103, 145, 183, accent);
+    var sr : u32 = vc_ink_right(375, 9, 103, 145, 183, accent);
+    var st : u32 = vc_ink_top(375, 9, 103, 145, 183, accent);
+    var sb : u32 = vc_ink_bottom(375, 9, 103, 145, 183, accent);
+    assert sl < 4096;
+    assert sr > sl;
+    assert st < 4096;
+    assert sb > st;
+    var sx2 : u32 = sl + sr + 1;
+    var sy2 : u32 = st + sb + 1;
+    assert sx2 + 4 >= 112;
+    assert sx2 <= 112 + 4;
+    assert sy2 + 2 >= 328;
+    assert sy2 <= 328 + 2;
+    // the label is no longer left-aligned: the old pen left the ink at about x 15
+    assert sl >= 22;
+    // Cancel, box 112..208 x 144..184 filled TH_BORDER, interior 113..207 x 145..183
+    var cl : u32 = vc_ink_left(375, 113, 207, 145, 183, secondary);
+    var cr : u32 = vc_ink_right(375, 113, 207, 145, 183, secondary);
+    var ct : u32 = vc_ink_top(375, 113, 207, 145, 183, secondary);
+    var cb : u32 = vc_ink_bottom(375, 113, 207, 145, 183, secondary);
+    assert cl < 4096;
+    assert cr > cl;
+    assert ct < 4096;
+    assert cb > ct;
+    var cx2 : u32 = cl + cr + 1;
+    var cy2 : u32 = ct + cb + 1;
+    assert cx2 + 4 >= 320;
+    assert cx2 <= 320 + 4;
+    assert cy2 + 2 >= 328;
+    assert cy2 <= 328 + 2;
+    assert cl >= 126;
+    // negative control: without the label the interior has no ink, so the measures above are the label's and nothing else
+    g.text[6] = "";
+    g.text[7] = "";
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    assert vc_ink_left(375, 9, 103, 145, 183, accent) == 4096;
+    assert vc_ink_left(375, 113, 207, 145, 183, secondary) == 4096;
+}
+
+; item 5: the text an input names through label_ref is its caption, muted and unlike the title; focusing the input brightens it
+test an_input_caption_is_muted_and_linked_to_its_field {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vc_is_caption(g, 3);
+    assert vc_is_caption(g, 1) == false;
+    assert vc_is_caption(g, 4) == false;
+    assert vc_is_heading(g, 1);
+    assert vc_is_heading(g, 3) == false;
+    assert vc_caption_focused(g, 3, 4);
+    assert vc_caption_focused(g, 3, 7) == false;
+    assert vc_caption_focused(g, 1, 4) == false;
+    assert vc_caption_focused(g, 3, VC_NO_FOCUS) == false;
+    assert vc_render(g, l, &VC_A, 375, 192, 100, TH_T27) == VC_OK;
+    var title_max : u32 = vc_max_red(375, 1, 374, 1, 36);
+    var label_max : u32 = vc_max_red(375, 1, 374, 62, 92);
+    assert label_max >= 60;
+    assert label_max <= 136;
+    assert title_max >= 240;
+    assert label_max < title_max;
+    // negative control: an input that names no label makes no caption, and its focus brightens nothing
+    var g2 : VfGraph = vf_px_card(375);
+    g2.label_ref[4] = 255;
+    assert vc_is_caption(g2, 3) == false;
+    assert vc_caption_focused(g2, 3, 4) == false;
+    assert vc_render_state(g2, l, &VC_A, 375, 192, 100, TH_T27, 4) == VC_OK;
+    assert vc_max_red(375, 1, 374, 62, 92) <= 136;
+}
