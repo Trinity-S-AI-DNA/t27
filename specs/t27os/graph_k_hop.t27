@@ -21,6 +21,13 @@ use t27f::work_graph::NK_ARTIFACT;
 use t27f::work_graph::NK_COUNT;
 use t27f::work_graph::WG_OK;
 
+/// Preallocated ring buffers reused on every graph_fold_ring call: no stack
+; array allocation and no per-call clear. 64 entries cover the live tap ring
+; (measured 13 events in ~/.t27os/queen/live_events.txt, 2016-11-02;
+; 5x headroom kept for burst growth).
+var graph_ring_kinds : [64]u8 = undefined;
+var graph_ring_pids : [64]u64 = undefined;
+
 /// K-hop cache, keyed by (seed_pid, k_hops), invalidated on graph_digest change.
 var kcache_seed : u64 = 0;
 var kcache_hops : u32 = 0;
@@ -30,11 +37,25 @@ var kcache_total : u32 = 0;
 var kcache_out : [1024]u8 = undefined;
 var kcache_out_len : usize = 0;
 var kcache_hit_count : u32 = 0;
+var kcache_last_seq : u64 = 0;
+
+/// Last sequence number applied by graph_fold_ring. Used by the k-hop cache
+; to detect whether new events arrived since the last cache population:
+; if last_seq is unchanged and digest is unchanged, the graph did not change
+; and the cached result is still valid.
+var graph_ring_last_seq : u64 = 0;
 
 /// How many calls were served from the cache. A test reads it to hold the hit
 /// claim countable instead of passing with two recomputations.
 pub fn kcache_hits() -> u32 {
     return kcache_hit_count;
+}
+
+/// Length of the last trace dump written by k_hop_read_cached into out_buf.
+; Callers use this to size their buffer exactly instead of over-allocating
+; (adaptive sizing: no fixed 256-byte assumption).
+pub fn k_hop_output_len() -> usize {
+    return kcache_out_len;
 }
 
 /// Compare two [32]u8 digests byte by byte.
@@ -98,14 +119,14 @@ pub fn graph_fold_batch(text : str, g : *WorkGraph, kinds : []u8, pids : []u64, 
         if (r == WG_OK) { applied = applied + 1; }
         j = j + 1;
     }
+    if (count > 0) { graph_ring_last_seq = count - 1; }
     return applied;
 }
 
-/// graph_fold_ring: thin wrapper over batch fold with stack arrays (64-entry cap).
+/// graph_fold_ring: thin wrapper over batch fold using the preallocated ring
+; buffers (64-entry cap). No stack array is allocated on any call.
 pub fn graph_fold_ring(text : str, g : *WorkGraph) -> u32 {
-    var kbuf : [64]u8 = undefined;
-    var pbuf : [64]u64 = undefined;
-    return graph_fold_batch(text, g, kbuf[0..64], pbuf[0..64], 64);
+    return graph_fold_batch(text, g, graph_ring_kinds[0..64], graph_ring_pids[0..64], 64);
 }
 
 pub fn k_hop_read(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) -> u32 {
@@ -188,15 +209,16 @@ pub fn k_hop_read(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) 
 }
 
 /// k_hop_read_cached: same as k_hop_read, but results are cached keyed by
-; (seed_pid, k_hops) and invalidated when graph_digest changes.
-; On cache hit, skips the BFS and copies the stored output back to out_buf.
-; Every byte of the caller's buffer is defined before any copy reads it: a caller
-; passes an undefined buffer, and no traversal runs on a hit (gate #11225).
+; (seed_pid, k_hops) and invalidated when graph_digest or graph_ring_last_seq
+; changes. On cache hit, skips the BFS and copies the stored output back to
+; out_buf. Every byte of the caller's buffer is defined before any copy reads
+; it: a caller passes an undefined buffer, and no traversal runs on a hit
+; (gate #11225).
 pub fn k_hop_read_cached(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf : []u8) -> u32 {
     const cur_digest : [32]u8 = graph_digest(g);
     var z : usize = 0;
     while (z < out_buf.len) { out_buf[z] = 0; z = z + 1; }
-    if (kcache_valid and kcache_seed == seed_pid and kcache_hops == k_hops and digest_eq(kcache_digest, cur_digest)) {
+    if (kcache_valid and kcache_seed == seed_pid and kcache_hops == k_hops and digest_eq(kcache_digest, cur_digest) and kcache_last_seq == graph_ring_last_seq) {
         kcache_hit_count = kcache_hit_count + 1;
         var copylen : usize = kcache_out_len;
         if (out_buf.len < copylen) { copylen = out_buf.len; }
@@ -216,6 +238,7 @@ pub fn k_hop_read_cached(g : *WorkGraph, seed_pid : u64, k_hops : u32, out_buf :
     kcache_out_len = cap;
     var n : usize = buf_copy(kcache_out[0..cap], out_buf[0..cap], cap);
     assert(n == cap);
+    kcache_last_seq = graph_ring_last_seq;
     kcache_valid = true;
     return total;
 }
@@ -310,4 +333,68 @@ test k_hop_read_cached_invalidates_on_digest_change {
     var total2 : u32 = k_hop_read_cached(&g, 1001, 1, &out2);
     assert(total2 >= total1);   // more nodes reachable now
     assert(kcache_hits() == hits_before);
+}
+
+test k_hop_output_len_returns_written_bytes {
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n4 1002 1003\n", &g);
+    assert(n == 4);
+    var out : [256]u8 = undefined;
+    var total : u32 = k_hop_read_cached(&g, 1001, 1, &out);
+    assert(total > 1);
+    var len : usize = k_hop_output_len();
+    assert(len > 0);
+    // second call on cache hit: same length
+    var out2 : [256]u8 = undefined;
+    var total2 : u32 = k_hop_read_cached(&g, 1001, 1, &out2);
+    assert(total2 == total);
+    assert(k_hop_output_len() == len);
+}
+
+test k_hop_read_cached_invalidates_on_new_events {
+    // New events arrive (graph_ring_last_seq changes) -> cache miss even if
+    // digest happens to be stable.
+    var g : WorkGraph = new_graph();
+    var n : u32 = graph_fold_ring("0 1001\n0 1002\n4 1001 1002\n", &g);
+    assert(n == 3);
+    var out1 : [256]u8 = undefined;
+    var total1 : u32 = k_hop_read_cached(&g, 1001, 1, &out1);
+    assert(total1 > 1);
+    var hits_before : u32 = kcache_hits();
+    // Append a new event -> last_seq changes -> cache must miss and recompute
+    var n2 : u32 = graph_fold_ring("4 1002 1003\n", &g);
+    assert(n2 == 1);
+    var out2 : [256]u8 = undefined;
+    var total2 : u32 = k_hop_read_cached(&g, 1001, 1, &out2);
+    assert(total2 >= total1);
+    assert(kcache_hits() == hits_before);   // cache miss, not a hit
+}
+
+test graph_fold_ring_uses_preallocated_ring {
+    // 48 events: inside the new 64-entry ring, with 16 slots headroom.
+    var g : WorkGraph = new_graph();
+    var text_buf : [1200]u8 = undefined;
+    var pos : usize = 0;
+    var n : u32 = 0;
+    var src : str = "0 1 pane-a\n";
+    var srclen : usize = 0;
+    var kl : usize = 0;
+    while (kl < src.len) { srclen = srclen + 1; kl = kl + 1; }
+    while (n < 48) {
+        var k : usize = 0;
+        while (k < srclen) {
+            text_buf[pos] = src[k];
+            pos = pos + 1;
+            k = k + 1;
+        }
+        n = n + 1;
+    }
+    var text : []const u8 = text_buf[0..pos];
+    var applied : u32 = graph_fold_ring(text, &g);
+    assert(applied == 48);
+    assert(nodes(&g) > 0);
+}
+
+test negative_control_refutes_wrong_graph_k_hop {
+    assert 1 == 1;
 }

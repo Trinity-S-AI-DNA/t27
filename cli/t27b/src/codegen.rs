@@ -1,38 +1,53 @@
-//! AArch64 code generation from the t27b IR.
-//!
-//! One pass per function, directly to machine words (no assembler text):
-//!
-//! * Canonical register form. A value of a type of 32 bits or less lives in
-//!   the low 32 bits of its register: u8/u16/bool zero-extended to 32 bits,
-//!   i8/i16 sign-extended to 32 bits, the upper 32 bits undefined. A 64-bit
-//!   value uses the whole X register. All arithmetic on narrow types is done in
-//!   W registers and re-normalised (or overflow-checked) afterwards.
-//! * Registers. x0-x7 arguments and result (and variable homes in leaf
-//!   functions); x8 operation scratch; x9-x15 the expression temp stack (temp
-//!   7 and deeper spill to the frame); x16/x17 scratch for spilled temps and
-//!   materialised constants; x18 never touched (Apple platform register);
-//!   x19-x28 variable homes, assigned by loop-weighted use count; x29/x30
-//!   frame pointer and link register.
-//! * Frame. `stp x29, x30, [sp, #-16]!; mov x29, sp; sub sp, sp, #N`, then
-//!   from sp upward: variable slots, saved callee-saved registers, temp slots
-//!   (spilled temps and temps saved across calls); and, directly below x29,
-//!   the aggregate area holding `Func::slots`, addressed from x29 so its
-//!   offsets do not depend on how many temps the body needs. Leaf functions
-//!   that need none of this get no frame at all.
+//! AArch64 code generation from the t27b IR: one pass per function, directly
+//! to machine words; the laws live in specs (tested there, L4), this is their emitter:
+//! * Canonical register form, register classes, frame layout and stack
+//!   probing: specs/tri/t27b/frame_layout.t27 (x0-x7 args, x8 scratch,
+//!   x9-x15 temps, x16/x17 spill scratch, x18 untouched, x19-x28 homes,
+//!   x29/x30 fp/lr; slots, saved callee-saved, temp slots, aggregate area
+//!   below x29; big frames probed one page at a time, #7367), narrow-type
+//!   normalisation by specs/tri/t27b/narrow_law.t27.
 //! * Memory. Loads and stores take the narrowest instruction for the type
 //!   (`ldrsb w` for i8, `ldrh` for u16, ...), so a loaded value is already in
 //!   canonical form. A slot access close to x29 is one `ldur`/`stur`; read-only
 //!   data is reached with `adrp` + `add`, resolved by the JIT loader or by
 //!   PAGE21/PAGEOFF12 relocations in the object file. Large copies loop with
 //!   x30 as the end pointer, which forces a frame.
-//! * Traps. Every check branches to an out-of-line stub at the end of the
-//!   function. JIT stubs load the site number (and the assert_eq operands) and
-//!   jump to the shared `trap_common` routine of the JIT image; object-file
-//!   stubs are `brk #kind`.
+//! * Traps: the stub law (site-recording vs `brk`, the assert_eq ABI, the reach) is specs/tri/t27b/trap_plan.t27.
 //! * Calls inside the module are `bl` with the offset filled in by `link`.
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
+use crate::lower::me;
 use std::collections::HashMap;
+
+// t27b-generated inline decision source of truth: specs/tri/t27b/inline.t27.
+#[path = "../../../gen/rust/tri/t27b/inline.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod inline_decision;
+#[path = "../../../gen/rust/tri/t27b/narrow_law.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod narrow_law;
+// t27b-generated home-plan source of truth: specs/tri/t27b/home_plan.t27.
+#[path = "../../../gen/rust/tri/t27b/home_plan.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod home_plan;
+// t27b-generated frame-layout source of truth: specs/tri/t27b/frame_layout.t27.
+#[path = "../../../gen/rust/tri/t27b/frame_layout.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod frame_layout;
+#[path = "../../../gen/rust/tri/t27b/flow_plan.rs"] #[allow(dead_code, unused_parens)] // specs/tri/t27b/flow_plan.t27
+pub(crate) mod flow_plan;
+use flow_plan as fp;
+// t27b-generated trap stub law: specs/tri/t27b/trap_plan.t27.
+#[path = "../../../gen/rust/tri/t27b/trap_plan.rs"]
+#[allow(dead_code, unused_parens)]
+pub(crate) mod trap_plan;
+#[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"] // specs/tri/t27b/ifconv_plan.t27
+#[allow(dead_code, unused_parens)]
+mod ifc;
+// cinc peephole: cset + add -> cinc (specs/tri/t27b/cinc_peephole_plan.t27).
+#[path = "../../../gen/rust/tri/t27b/cinc_peephole_plan.rs"]
+#[allow(dead_code, unused_parens)]
+mod cp;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -63,24 +78,20 @@ pub struct CodegenError {
     pub construct: &'static str,
     pub detail: String,
 }
-const X0: Reg = 0;
-const X8: Reg = 8;
-const X16: Reg = 16;
-const X17: Reg = 17;
-const TEMP_REGS: usize = 7; // x9..x15
-const CALLEE_SAVED: [Reg; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
-const MAX_SLOT_BYTES: u32 = 32760;
+// Register classes and frame constants: specs/tri/t27b/frame_layout.t27 (mounted below), tested there (L4).
+const X0: Reg = frame_layout::X0 as Reg;
+const X8: Reg = frame_layout::SCRATCH as Reg;
+const X16: Reg = frame_layout::SPILL_A as Reg;
+const X17: Reg = frame_layout::SPILL_B as Reg;
+const TEMP_REGS: usize = frame_layout::TEMP_COUNT as usize; // x9..x15
+const MAX_SLOT_BYTES: u32 = frame_layout::MAX_SLOT_BYTES;
 /// Largest aggregate area of one frame: each slot is then at most two SUB words below x29 (a64::sub_const).
 pub const MAX_AGG_BYTES: u32 = (a64::SUB_CONST_REACH - 16) as u32;
-/// Largest frame the prologue allocates in one step. It is kept below the
-/// stack guard size, so such a frame never reaches past the guard page
-/// without touching it. A larger frame is allocated in `PROBE_STEP` steps,
-/// each one stored to before the next (#7367).
-const MAX_UNPROBED_FRAME: usize = 16384;
+/// Largest frame allocated in one step; the probe law lives in frame_layout.t27 (#7367).
+const MAX_UNPROBED_FRAME: usize = frame_layout::MAX_UNPROBED_FRAME as usize;
 /// One step of a probed frame: the smallest page size t27b runs on.
-const PROBE_STEP: usize = 4096;
-const LR: Reg = 30;
-const FP: Reg = 29;
+const PROBE_STEP: usize = frame_layout::PROBE_STEP as usize;
+const LR: Reg = frame_layout::LR as Reg; const FP: Reg = frame_layout::FP as Reg; // x29/x30
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Home {
     None,
@@ -111,11 +122,11 @@ fn fp_in(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_in(ty == Ty::F32, rd, rn) 
 fn fp_out(ty: Ty, rd: Reg, rn: Reg) -> u32 { a64::fmov_out(ty == Ty::F32, rd, rn) }
 fn fp_op(ty: Ty, w: u32) -> u32 { a64::fp_prec(ty == Ty::F32, w) }
 fn narrow_ext(ty: Ty) -> Option<Ext> {
-    match ty {
-        Ty::U8 | Ty::Bool => Some(Ext::Uxtb),
-        Ty::U16 => Some(Ext::Uxth),
-        Ty::I8 => Some(Ext::Sxtb),
-        Ty::I16 => Some(Ext::Sxth),
+    match narrow_law::narrow_ext(ty.bits(), ty.signed(), ty == Ty::Bool) {
+        0 => Some(Ext::Uxtb),
+        1 => Some(Ext::Uxth),
+        4 => Some(Ext::Sxtb),
+        5 => Some(Ext::Sxth),
         _ => None,
     }
 }
@@ -160,6 +171,8 @@ struct Gen<'a> {
     /// Some parameter arrives on the stack (read from x29, so a frame).
     stack_params: bool,
     data_refs: Vec<(usize, u32)>,
+    /// middle_end.t27 LICM_CONST: constants built once in the prologue (canonical value, sf, register).
+    hoist: Vec<(u64, bool, Reg)>,
 }
 /// Compile every function of `prog` (tests too when `with_tests`).
 pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec<FuncCode>, CodegenError> {
@@ -202,6 +215,7 @@ pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<Func
         uses_lr: false,
         stack_params: false,
         data_refs: Vec::new(),
+        hoist: Vec::new(),
     };
     let mut top = 0u32;
     for sl in &f.slots {
@@ -252,6 +266,46 @@ impl<'a> Gen<'a> {
     fn emit(&mut self, w: u32) {
         self.code.push(w);
     }
+
+    /// A select-shaped callee (inline.t27 `select_shape_ok`): each argument once, then cmp + cset/csel, no `bl`.
+    fn try_inline(&mut self, func: FuncId, args: &[Expr], dst: Option<Reg>) -> Option<V> {
+        let f = &self.prog.funcs[func as usize];
+        let [Stmt::If { cond, then, els }, Stmt::Return(Some(Expr { kind: ExprKind::Const(b), .. }))] = f.body.as_slice() else { return None };
+        let ([Stmt::Return(Some(Expr { kind: ExprKind::Const(a), .. }))], true, ExprKind::Cmp { op, lhs, rhs }) = (then.as_slice(), els.is_empty(), &cond.kind) else { return None };
+        let k = |e: &Expr| match e.kind { ExprKind::Var(i) => (inline_decision::SK_PARAM, i as u64), ExprKind::Const(c) => (inline_decision::SK_IMM, c as u64), _ => (inline_decision::SK_OTHER, 0) };
+        let (l, r, w64) = (k(lhs), k(rhs), |t: Option<Ty>| matches!(t, Some(Ty::I64 | Ty::U64)));
+        let cf = inline_decision::CalleeFacts {
+            is_test: f.is_test,
+            is_invariant: f.is_invariant,
+            ret_is_none: f.ret.is_none(),
+            body_stmts: f.body.len() as u32,
+            has_nested_call: f.body.iter().any(|s| matches!(s, Stmt::Eval(e) if matches!(e.kind, ExprKind::Call { .. }))),
+            has_store: f.body.iter().any(|s| matches!(s, Stmt::Store { .. })),
+            has_copy: f.body.iter().any(|s| matches!(s, Stmt::Copy { .. })),
+            has_assert: f.body.iter().any(|s| matches!(s, Stmt::Assert { .. } | Stmt::AssertEq { .. })),
+        };
+        let sf = inline_decision::CallSiteFacts {
+            hot_loop: self.loops.last().is_some(),
+            constant_args: args.iter().all(|a| matches!(a.kind, ExprKind::Const(_))),
+            call_depth: self.loops.len() as u8,
+            caller_size: self.code.len() as u32,
+            result_used: true,
+        };
+        if !(inline_decision::should_inline_call(cf, sf) && inline_decision::select_shape_ok(true, l.0, l.1, r.0, r.1, f.nparams as u32, f.vars[..f.nparams].iter().all(|v| w64(Some(v.ty))), w64(f.ret), w64(Some(lhs.ty)))) { return None; }
+        let vals: Vec<V> = args.iter().map(|x| self.eval(x)).collect();
+        let (mut x, mut y, mut op2) = (if l.0 == inline_decision::SK_PARAM { vals[l.1 as usize] } else { V::Const(l.1 as i128) }, if r.0 == inline_decision::SK_PARAM { vals[r.1 as usize] } else { V::Const(r.1 as i128) }, *op);
+        if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) { (x, y, op2) = (y, x, op2.swap()); }
+        let rx = self.use_nz(x, X16, lhs.ty); // not ZR: reg 31 in cmp_imm is SP
+        match y { V::Const(c) if (0..4096).contains(&c) => self.emit(a64::cmp_imm(true, rx, c as u32)), _ => { let ry = self.use_(y, X17, lhs.ty); self.emit(a64::cmp(true, rx, ry)) } }
+        for v in vals.into_iter().rev() { self.release(v); }
+        let (c, (d, t)) = (cond_for(op2, lhs.ty), self.dest(dst));
+        match inline_decision::select_form(*a as u64, *b as u64) {
+            inline_decision::SF_CSET => self.emit(a64::cset(true, d, c)),
+            inline_decision::SF_CSET_INV => self.emit(a64::cset(true, d, Cond::from_bits(a64::invert_bits(c as u32)))),
+            _ => { let (p, q) = (self.use_(V::Const(*a), X16, Ty::U64), self.use_(V::Const(*b), X17, Ty::U64)); self.emit(a64::csel(true, d, p, q, c)) }
+        }
+        Some(self.done(d, t))
+    }
     fn new_label(&mut self) -> Label {
         self.labels.push(None);
         self.labels.len() - 1
@@ -286,21 +340,16 @@ impl<'a> Gen<'a> {
     }
     // ------------------------------------------------------- trap stubs
     fn stub_site(&mut self, site: SiteId) -> Label {
-        match self.style {
-            TrapStyle::Jit => {
-                if let Some(&l) = self.stub_by_site.get(&site) {
-                    return l;
-                }
-                let l = self.new_label();
-                self.stubs.push((l, Stub::Site(site)));
-                self.stub_by_site.insert(site, l);
-                l
-            }
-            TrapStyle::Brk | TrapStyle::Elf => {
-                let kind = self.prog.sites[site as usize].kind;
-                self.stub_brk(kind)
-            }
+        if !trap_plan::stub_records_site(self.style == TrapStyle::Jit) {
+            return self.stub_brk(self.prog.sites[site as usize].kind);
         }
+        if let Some(&l) = self.stub_by_site.get(&site) {
+            return l;
+        }
+        let l = self.new_label();
+        self.stubs.push((l, Stub::Site(site)));
+        self.stub_by_site.insert(site, l);
+        l
     }
     fn stub_brk(&mut self, kind: TrapKind) -> Label {
         let k = kind as u32;
@@ -327,68 +376,64 @@ impl<'a> Gen<'a> {
             }
         }
         self.has_call = has_call;
-        self.stack_params = Program::stack_args(&Program::arg_regs(f)).1 > 0;
+        let regs = Program::arg_regs(f);
+        self.stack_params = Program::stack_args(&regs).1 > 0;
         let mut order: Vec<usize> = (0..f.vars.len()).collect();
         order.sort_by(|&a, &b| w[b].cmp(&w[a]).then(a.cmp(&b)));
-        let mut callee = CALLEE_SAVED.iter().copied();
         let mut slots = 0u32;
         for &v in order.iter().filter(|&&v| f.vars[v].ty == Ty::I128) { // i128_plan.t27: 16 frame bytes, laid out first (16-aligned)
             if w[v] > 0 { (self.homes[v], w[v], slots) = (Home::Slot(8 * slots), 0, slots + ip::HOME_WORDS); }
         }
-        if !has_call {
-            // Leaf: parameters stay in their argument registers; the free
-            // argument registers are homes too.
-            // An F64 parameter arrives in a d register; it gets a home like
-            // any other variable and the prologue moves it there.
-            let regs = Program::arg_regs(f);
-            let nint = regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0);
-            let mut caller: Vec<Reg> = ((nint as Reg)..8).collect();
-            caller.reverse();
-            for (p, &(fp, k)) in regs.iter().enumerate() {
-                if !fp && k < 8 && f.vars[p].ty != Ty::I128 { // a pair parameter is homed in the frame
-                    self.homes[p] = Home::Reg(k as Reg);
-                }
+        // The home pools are home_plan.t27's: a leaf's free argument registers
+        // (nint..8) first, then the callee-saved registers, then the slots.
+        let nint = if has_call { 8 } else { regs.iter().zip(&f.vars).filter(|(r, _)| !r.0).map(|(r, v)| ip::arg_next(r.1 as u32, v.ty == Ty::I128)).max().unwrap_or(0) };
+        let mut taken_caller = 0u32;
+        let mut taken_callee = 0usize;
+        for (p, &(fp, k)) in regs.iter().enumerate() {
+            if home_plan::param_keeps_arg_reg(fp, k as u64, f.vars[p].ty == Ty::I128) {
+                self.homes[p] = Home::Reg(k as Reg); // a pair parameter is homed in the frame
             }
-            for &v in &order {
-                if (v < f.nparams && !regs[v].0 && regs[v].1 < 8) || w[v] == 0 {
-                    continue;
-                }
-                self.homes[v] = if let Some(r) = caller.pop() {
-                    Home::Reg(r)
-                } else if let Some(r) = callee.next() {
-                    self.used_callee.push(r);
-                    Home::Reg(r)
-                } else {
-                    slots += 1;
-                    Home::Slot(8 * (slots - 1))
-                };
+        }
+        for &v in &order {
+            if w[v] == 0 || (!has_call && v < f.nparams && !regs[v].0 && regs[v].1 < 8) {
+                continue; // never read, or already homed in its argument register
             }
-        } else {
-            for &v in &order {
-                if w[v] == 0 {
-                    continue;
-                }
-                self.homes[v] = if let Some(r) = callee.next() {
-                    self.used_callee.push(r);
-                    Home::Reg(r)
-                } else {
-                    slots += 1;
-                    Home::Slot(8 * (slots - 1))
-                };
+            let home = home_plan::next_home(
+                !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64),
+                home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64),
+                slots as u64,
+            );
+            match home >> 32 {
+                home_plan::HOME_CALLER => { self.homes[v] = Home::Reg((nint + taken_caller) as Reg); taken_caller += 1; }
+                home_plan::HOME_CALLEE => { let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.homes[v] = Home::Reg(r); }
+                _ => { self.homes[v] = Home::Slot(8 * (home & 0xFFFFFFFF) as u32); slots += 1; }
             }
         }
         self.nvar_slots = slots;
-        if 8 * slots > MAX_SLOT_BYTES {
+        if !frame_layout::slot_ok(8 * slots) {
             self.fail(format!("more than {} variables spill to the frame", MAX_SLOT_BYTES / 8));
         }
-        self.temp_base = 8 * (slots + self.used_callee.len() as u32);
+        let mut lim = Vec::new(); // middle_end.t27 licm_hoist_const: the pools are the homes', after the homes
+        loop_limits(&f.body, &mut lim);
+        let framed = frame_layout::needs_frame(frame_layout::FrameFacts { has_call, saves_callee: taken_callee > 0, has_var_slots: slots > 0, has_temp_slots: false, has_agg: self.agg_bytes > 0, uses_lr: false, has_stack_params: self.stack_params });
+        for (c, sf) in lim {
+            let (v, mut words) = (a64::canon(c as u64, sf), Vec::new());
+            a64::mov_imm(sf, X16, v, &mut words);
+            if self.hoist.iter().any(|h| (h.0, h.1) == (v, sf)) { continue; }
+            match me::licm_hoist_const(words.len() as u32, !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64), home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64), framed, self.hoist.len() as u32) {
+                me::LICM_CALLER => { self.hoist.push((v, sf, (nint + taken_caller) as Reg)); taken_caller += 1; }
+                me::LICM_CALLEE => { let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.hoist.push((v, sf, r)); }
+                _ => {}
+            }
+        }
+        self.temp_base = frame_layout::temp_base_of(slots, self.used_callee.len() as u32);
     }
     fn slot_of_temp(&mut self, i: usize) -> u32 {
         if i + 1 > self.max_slot {
             self.max_slot = i + 1;
         }
-        let off = self.temp_base + 8 * i as u32;
-        if off > MAX_SLOT_BYTES {
+        let off = frame_layout::slot_of_temp(self.temp_base, i as u32);
+        if !frame_layout::slot_ok(off) {
             self.fail(format!("frame larger than {} bytes", MAX_SLOT_BYTES));
             return 0;
         }
@@ -403,13 +448,16 @@ impl<'a> Gen<'a> {
     /// Assemble prologue + body + epilogue + stubs, and resolve local branches.
     fn finish(&mut self, id: FuncId) -> FuncCode {
         let f = self.f;
-        let frame = self.has_call
-            || !self.used_callee.is_empty()
-            || self.nvar_slots > 0
-            || self.max_slot > 0
-            || self.agg_bytes > 0
-            || self.uses_lr
-            || self.stack_params;
+        // frame_layout.t27: a frame iff one of its facts holds; else `b ret` becomes `ret`.
+        let frame = frame_layout::needs_frame(frame_layout::FrameFacts {
+            has_call: self.has_call,
+            saves_callee: !self.used_callee.is_empty(),
+            has_var_slots: self.nvar_slots > 0,
+            has_temp_slots: self.max_slot > 0,
+            has_agg: self.agg_bytes > 0,
+            uses_lr: self.uses_lr,
+            has_stack_params: self.stack_params,
+        });
         // Drop a trailing `b ret` that would jump to the very next word.
         if let Some(&last) = self.ret_jumps.last() {
             if last + 1 == self.code.len() {
@@ -427,8 +475,8 @@ impl<'a> Gen<'a> {
         // Epilogue.
         self.bind(self.ret_label);
         let ncallee = self.used_callee.len();
-        let nbytes = 8 * (self.nvar_slots as usize + ncallee + self.max_slot);
-        let frame_bytes = ((nbytes + 15) & !15) + self.agg_bytes as usize;
+        let sizes = frame_layout::frame_bytes_of(self.nvar_slots, ncallee as u32, self.max_slot as u32, self.agg_bytes);
+        let frame_bytes = sizes.frame_bytes as usize;
         if frame {
             let (base, mut k) = (8 * self.nvar_slots, 0); // the callee-saved registers back: a64.t27's `save_word`
             while k < ncallee { let u = &self.used_callee; let w = a64::save_word(true, ncallee, base, k, u[k], u[(k + 1) % ncallee]); self.emit(w); k = a64::save_next(ncallee, base, k); }
@@ -448,22 +496,19 @@ impl<'a> Gen<'a> {
         let stubs = std::mem::take(&mut self.stubs);
         for (l, stub) in stubs {
             self.bind(l);
-            match stub {
-                Stub::Site(site) => {
-                    self.mov_imm(false, 1, site as u64);
-                    self.trap_jumps.push(self.code.len());
-                    self.emit(a64::b(0));
-                }
+            let site = match stub {
+                Stub::Site(site) => site,
                 Stub::AssertEq(site, ra, rb) => {
-                    self.emit(a64::mov(true, X8, rb));
-                    self.emit(a64::mov(true, 2, ra));
-                    self.emit(a64::mov(true, 3, X8));
-                    self.mov_imm(false, 1, site as u64);
-                    self.trap_jumps.push(self.code.len());
-                    self.emit(a64::b(0));
+                    for (i, src) in [rb, ra, X8].into_iter().enumerate() {
+                        self.emit(a64::mov(true, trap_plan::assert_eq_dst(i as u64) as Reg, src));
+                    }
+                    site
                 }
-                Stub::Brk(kind) => self.emit(a64::brk(kind as u32)),
-            }
+                Stub::Brk(kind) => { self.emit(a64::brk(kind as u32)); continue; }
+            };
+            self.mov_imm(false, 1, site as u64);
+            self.trap_jumps.push(self.code.len());
+            self.emit(a64::b(0));
         }
         // Resolve local branches.
         let fixes = std::mem::take(&mut self.fixes);
@@ -478,7 +523,7 @@ impl<'a> Gen<'a> {
             let off = target as i64 - pos as i64;
             let w = self.code[pos];
             if w & 0x7C00_0000 == 0x1400_0000 {
-                if !(-(1 << 25)..(1 << 25)).contains(&off) {
+                if !trap_plan::branch_reaches(off) {
                     self.fail("branch out of range".into());
                 }
                 self.code[pos] = a64::b(off as i32);
@@ -495,17 +540,9 @@ impl<'a> Gen<'a> {
             pro.push(a64::stp_x_pre(29, 30, SP, -16));
             pro.push(a64::mov_sp(29, SP));
             if frame_bytes > MAX_UNPROBED_FRAME {
-                // Stack probing: lower sp one page at a time and touch each
-                // new page, top down, so the guard page below the stack
-                // faults instead of being stepped over (#7367).
-                //   mov  x16, #pages*4096
-                // 1: sub  sp, sp, #1, lsl #12
-                //   str  xzr, [sp]
-                //   subs x16, x16, #1, lsl #12
-                //   b.ne 1b
-                //   sub  sp, sp, #rest ; str xzr, [sp]
-                let whole = frame_bytes / PROBE_STEP * PROBE_STEP;
-                let rest = frame_bytes - whole;
+                // Stack probing, frame_layout.t27 (#7367): touch each new page top down.
+                let whole = frame_layout::probe_pages(frame_bytes as u32) as usize * PROBE_STEP;
+                let rest = frame_layout::probe_rest(frame_bytes as u32) as usize;
                 a64::mov_imm(true, X16, whole as u64, &mut pro);
                 pro.push(a64::addsub_imm(true, true, false, SP, SP, (PROBE_STEP >> 12) as u32, true));
                 pro.push(a64::str_x(ZR, SP, 0));
@@ -586,6 +623,7 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        for &(v, sf, r) in &self.hoist { a64::mov_imm(sf, r, v, &mut pro); } // LICM_CONST: once per call
         let shift = pro.len();
         let mut code = pro;
         code.extend_from_slice(&self.code);
@@ -616,14 +654,12 @@ impl<'a> Gen<'a> {
         match v {
             V::Reg(r) => r,
             V::Temp(i) if i < TEMP_REGS => 9 + i as Reg,
-            V::Temp(i) => {
-                let off = self.slot_of_temp(i);
-                self.ldr_slot(scratch, off);
-                scratch
-            }
+            V::Temp(i) => { let off = self.slot_of_temp(i); self.ldr_slot(scratch, off); scratch }
             V::Const(0) => ZR,
             V::Const(c) => {
-                self.mov_imm(ty.is64(), scratch, a64::canon(c as u64, ty.is64()));
+                let can = a64::canon(c as u64, ty.is64());
+                if let Some(r) = self.hoist.iter().find(|h| h.0 == can && h.1 == ty.is64()).map(|h| h.2) { return r; }
+                self.mov_imm(ty.is64(), scratch, can);
                 scratch
             }
         }
@@ -691,6 +727,7 @@ impl<'a> Gen<'a> {
                     self.release(v);
                 }
             },
+            Stmt::If { cond, then, els } if self.ifconv(cond, then, els) => {}
             Stmt::If { cond, then, els } => {
                 let l_else = self.new_label();
                 self.branch(cond, l_else, false);
@@ -997,7 +1034,10 @@ impl<'a> Gen<'a> {
                 }
                 self.done(d, t)
             }
-            ExprKind::Call { func, args } => self.call(*func, args, dst, true),
+            ExprKind::Call { func, args } => {
+                if let Some(v) = self.try_inline(*func, args, dst) { return v; }
+                self.call(*func, args, dst, true)
+            }
             ExprKind::FArith { op, lhs, rhs } => {
                 let a = self.eval(lhs);
                 let b = self.eval(rhs);
@@ -1337,6 +1377,42 @@ impl<'a> Gen<'a> {
         }
     }
 
+    fn ifconv(&mut self, cond: &Expr, then: &[Stmt], els: &[Stmt]) -> bool {
+        let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { return false };
+        let (ExprKind::Var(g), ExprKind::Const(c)) = (&lhs.kind, &rhs.kind) else { return false };
+        if lhs.ty != Ty::U64 || !(0..4096).contains(c) || !matches!(self.homes[*g as usize], Home::Reg(_)) { return false; }
+        fn asg(ss: &[Stmt]) -> Option<Vec<(VarId, &Expr)>> { ss.iter().map(|s| if let Stmt::Assign { var, value } = s { Some((*var, value)) } else { None }).collect() }
+        let (Some(t), Some(e)) = (asg(then), asg(els)) else { return false };
+        let mut vars: Vec<VarId> = t.iter().chain(&e).map(|a| a.0).collect();
+        vars.sort(); vars.dedup();
+        if vars.len() > 2 || [&t, &e].iter().any(|a| a.iter().enumerate().any(|(i, x)| a[..i].iter().any(|y| y.0 == x.0))) { return false; }
+        let (mut regs, mut srcs) = (vec![], vec![]); for &v in &vars {
+            let Home::Reg(h) = self.homes[v as usize] else { return false };
+            let mut side = [(0, 0, h); 2];
+            for (n, a) in [&t, &e].iter().enumerate() {
+                let p = a.iter().position(|x| x.0 == v);
+                let own: Vec<VarId> = a[..p.unwrap_or(0)].iter().map(|x| x.0).collect();
+                let reg = |y: &Expr| match (y.ty, &y.kind) { (Ty::U64, ExprKind::Var(w)) if !own.contains(w) => match self.homes[*w as usize] { Home::Reg(r) => Some(r), _ => None }, _ => None };
+                side[n] = match p.map(|i| a[i].1).map(|y| (y, &y.kind)) {
+                    None => (ifc::AK_NONE, 0, h),
+                    Some((y, _)) if y.ty != Ty::U64 => { return false },
+                    Some((_, ExprKind::Const(0))) => (ifc::AK_CONST, 0, ZR),
+                    Some((y, ExprKind::Const(k))) if *k > 0 => { srcs.push((X17, y)); (ifc::AK_CONST, *k as u64, X17) }
+                    Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => { return false } },
+                    Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::AddW | ArithOp::Sub | ArithOp::SubW), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
+                        (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub | ArithOp::SubW) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
+                        _ => { return false } },
+                    _ => { return false } };
+            }
+            if !ifc::may_if_convert(ifc::guard_of_cmp(*op as u8), *c as u64, side[0].0, side[0].1, side[1].0, side[1].1, vars.len() as u32, srcs.iter().filter(|s| s.0 == X16).count() as u32, true, true) { return false; } regs.push((h, side[0].2, side[1].2));
+        }
+        srcs.sort_by_key(|s| s.0);
+        if srcs.windows(2).any(|w| w[0].0 == w[1].0) { return false; }
+        for (r, y) in srcs { self.eval_into(y, r); } let cc = self.compare(*op, lhs, rhs);
+        for (h, tr, er) in regs { self.emit(a64::csel(true, h, tr, er, cc)); }
+        true
+    }
+
     /// One arm of a `Select`, evaluated and moved into `d`.
     fn select_arm(&mut self, e: &Expr, d: Reg, ty: Ty) {
         let v = self.eval(e);
@@ -1391,7 +1467,8 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 let rx = self.use_(x, X16, ty);
-                let ry = self.use_(y, X17, ty);
+                let h = if let V::Const(c) = y { self.hoist.iter().find(|h| (h.0, h.1) == (a64::canon(c as u64, s), s)).map(|h| h.2) } else { None };
+                let ry = match h { Some(r) => r, None => self.use_(y, X17, ty) };
                 self.emit(a64::cmp(s, rx, ry));
             }
         }
@@ -1744,6 +1821,23 @@ impl<'a> Gen<'a> {
                     let l = self.stub_site(site);
                     self.bcond(overflow_cond(ty, sub), l);
                 } else {
+                    if !sub && !checked && d == rx && (ry as u32) != (d as u32) && ry < 31 {
+                        if let Some(&last) = self.code.last() {
+                            if (last & 0xFFFF_0FE0) == 0x9A9F_07E0 && (last & 31) == ry as u32 {
+                                let (si, csf) = ((last >> 12) & 0xf, (last >> 31) != 0);
+                                if cp::cinc_ok(s, true, true, true, csf, true) {
+                                    let ol = self.code.len();
+                                    self.code.pop();
+                                    for xl in self.labels.iter_mut() {
+                                        if *xl == Some(ol) { *xl = Some(ol - 1); }
+                                    }
+                                    self.emit(a64::csinc(true, d, rx, rx,
+                                        Cond::from_bits(si)));
+                                    return self.done(d, t);
+                                }
+                            }
+                        }
+                    }
                     self.emit(a64::addsub_reg(s, sub, false, d, rx, ry, Shift::Lsl, 0));
                     if narrow {
                         if checked {
@@ -1881,29 +1975,36 @@ impl<'a> Gen<'a> {
 /// to 32 bits and zero-extend u8/u16/bool, which is the canonical form.
 fn ldst_op(ty: Ty, load: bool) -> (u32, u32) {
     let size = a64::size_log2(ty.bytes());
-    let opc = if !load {
-        a64::ST
-    } else if ty.signed() && size < 2 {
-        a64::LDS32
-    } else {
-        a64::LD
-    };
-    (size, opc)
+    (size, a64::ldst_opc(load, ty.signed(), size)) // a64.t27 ldst_opc
 }
 
 fn overflow_cond(ty: Ty, sub: bool) -> Cond { Cond::from_bits(ip::overflow_cond(ty.signed(), sub)) }
 
-/// Conservative: false only when control certainly cannot reach the end.
+fn last_kind(ss: &[Stmt]) -> u8 { match ss.last() { Some(Stmt::Return(_)) => fp::SK_RETURN, Some(Stmt::Break) => fp::SK_BREAK,
+    Some(Stmt::Continue) => fp::SK_CONTINUE, Some(Stmt::If { .. }) => fp::SK_IF, Some(_) => fp::SK_OTHER, None => fp::SK_NONE } }
+/// flow_plan.t27 falls_through; the walk only recurses into the arms of a trailing `if`.
 fn may_fall_through(ss: &[Stmt]) -> bool {
-    match ss.last() {
-        Some(Stmt::Return(_)) => false,
-        Some(Stmt::If { then, els, .. }) => may_fall_through(then) || els.is_empty() || may_fall_through(els),
-        _ => true,
-    }
+    let (tf, ee, ef) = match ss.last() { Some(Stmt::If { then, els, .. }) => (may_fall_through(then), els.is_empty(), may_fall_through(els)), _ => (false, false, false) };
+    fp::falls_through(last_kind(ss), tf, ee, ef)
 }
+fn ends_in_jump(ss: &[Stmt]) -> bool { fp::ends_in_jump_kind(last_kind(ss)) }
 
-fn ends_in_jump(ss: &[Stmt]) -> bool {
-    matches!(ss.last(), Some(Stmt::Return(_)) | Some(Stmt::Break) | Some(Stmt::Continue))
+/// middle_end.t27 LICM_CONST: the constant side of each `while` condition's integer compare, as `compare` sees it.
+fn loop_limits(ss: &[Stmt], out: &mut Vec<(i128, bool)>) {
+    for s in ss {
+        match s {
+            Stmt::While { cond, body, step } => {
+                if let ExprKind::Cmp { lhs, rhs, .. } = &cond.kind {
+                    let c = match (&lhs.kind, &rhs.kind) { (ExprKind::Const(_), ExprKind::Const(_)) => None, (ExprKind::Const(c), _) | (_, ExprKind::Const(c)) => Some(*c), _ => None };
+                    if let Some(c) = c.filter(|_| !lhs.ty.is_float() && lhs.ty != Ty::I128) { out.push((c, lhs.ty.is64())); }
+                }
+                for b in [body, step] { loop_limits(b, out); }
+            }
+            Stmt::Assign { value, .. } => { if let ExprKind::Const(c) = &value.kind { if !value.ty.is_float() && value.ty != Ty::I128 { out.push((*c, value.ty.is64())); } } }
+            Stmt::If { then, els, .. } => { loop_limits(then, out); loop_limits(els, out); }
+            _ => {}
+        }
+    }
 }
 
 fn weigh_stmts(ss: &[Stmt], depth: u32, w: &mut [u64], wr: &mut [u64], has_call: &mut bool) {
@@ -2031,7 +2132,7 @@ pub fn link(prefix: Vec<u32>, trap_common: Option<usize>, funcs: &[FuncCode], nf
             let at = start + p;
             let target = offsets[callee as usize].ok_or_else(|| format!("call to function #{} that was not emitted", callee))?;
             let off = target as i64 - at as i64;
-            if !(-(1 << 25)..(1 << 25)).contains(&off) {
+            if !trap_plan::branch_reaches(off) {
                 return Err("bl out of range (module larger than 128 MiB)".into());
             }
             code[at] = a64::bl(off as i32);
@@ -2041,7 +2142,7 @@ pub fn link(prefix: Vec<u32>, trap_common: Option<usize>, funcs: &[FuncCode], nf
             let at = start + p;
             let tc = trap_common.ok_or("trap stub without trap_common")?;
             let off = tc as i64 - at as i64;
-            if !(-(1 << 25)..(1 << 25)).contains(&off) {
+            if !trap_plan::branch_reaches(off) {
                 return Err("trap branch out of range".into());
             }
             code[at] = a64::b(off as i32);
@@ -2056,7 +2157,7 @@ pub fn data_layout(data: &[Vec<u8>]) -> (Vec<usize>, usize) {
     let mut offs = Vec::with_capacity(data.len());
     let mut at = 0usize;
     for b in data {
-        at = (at + 7) & !7;
+        at = frame_layout::data_blob_at(at as u64) as usize;
         offs.push(at);
         at += b.len();
     }

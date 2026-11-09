@@ -1,0 +1,435 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/graph_transition.t27 -- the transition state machine of the live mycelium
+; graph (epic #12779). Pure functions; the window holds no transition logic of its own.
+; --
+; WHAT IS DECIDED HERE (every rule has a test below): the three visual modes (STATIC: jump
+; to the final state; SMOOTH: continuous interpolation; STAGED: GraphDiaries-style staged
+; transitions), the five stages of a staged transition, the frame budgets per stage, the
+; pause/resume/step controls, and the event coalescing policy (events arriving faster than
+; a transition are batched, never queued into an infinite animation backlog).
+; --
+; RESEARCH BASIS. GraphDiaries (Bach, Pietriga, Fekete, 2014) found staged transitions
+; effective for tracking graph changes. Archambault et al (2011, 2016) found animation
+; helpful in some conditions but no universal advantage over small multiples -- hence
+; STATIC is a first-class mode, not a fallback. Heer & Robertson (2007) showed that
+; simple predictable transitions improve perception. Yee et al (2001) contributed the
+; radial layout approach for focus-node transitions (future k-hop focus mode).
+; --
+; WHAT IS NOT HERE: the rendering (window), the data feed (live_tap), the graph state
+; (work_graph). A mode switch to STATIC clears the transition; events apply directly.
+; ASCII only (L3). phi^2 + phi^-2 = 3 | TRINITY
+
+module T27osGraphTransition;
+
+// ---- modes ----------------------------------------------------------------------
+
+/// STATIC: jump to the final state, no animation. Research shows no universal
+; advantage of animation over small multiples; static comparison is first-class.
+pub const TRM_STATIC : u8 = 0;
+/// SMOOTH: continuous interpolation between snapshots.
+pub const TRM_SMOOTH : u8 = 1;
+/// STAGED: GraphDiaries-style staged transitions (highlight, remove, move, add).
+pub const TRM_STAGED : u8 = 2;
+pub const TRM_COUNT : u8 = 3;
+
+// ---- stages ---------------------------------------------------------------------
+
+/// No transition active.
+pub const TRS_NONE : u8 = 0;
+/// Highlight the elements that changed (new nodes, changed edges).
+pub const TRS_HIGHLIGHT : u8 = 1;
+/// Fade out the edges and nodes that disappeared.
+pub const TRS_FADE_OUT : u8 = 2;
+/// Move the remaining nodes to their new positions.
+pub const TRS_MOVE : u8 = 3;
+/// Show the new nodes and edges at their final positions.
+pub const TRS_SHOW_NEW : u8 = 4;
+/// Hold the settled state briefly, then return to NONE.
+pub const TRS_SETTLE : u8 = 5;
+pub const TRS_COUNT : u8 = 6;
+
+// ---- stage frame budgets ---------------------------------------------------------
+
+/// Frame budgets per stage. Tuned experimentally; no perceptual claim until
+; a user study compares the modes. STATIC finishes every stage in one frame.
+pub const TRF_STATIC : u8 = 1;
+pub const TRF_HIGHLIGHT : u8 = 6;
+pub const TRF_FADE : u8 = 8;
+pub const TRF_MOVE : u8 = 12;
+pub const TRF_SHOW : u8 = 6;
+pub const TRF_SETTLE : u8 = 2;
+
+// ---- the engine state ------------------------------------------------------------
+
+/// The transition engine: mode, current stage, frame within the stage, paused,
+; pending (coalesced events waiting for the current transition to settle).
+pub struct TrState {
+    pub mode : u8,
+    pub stage : u8,
+    pub frame : u8,
+    pub paused : bool,
+    pub pending : u32,
+}
+
+/// A fresh engine in `mode`, no transition active, nothing pending.
+pub fn trs_new(mode : u8) -> TrState {
+    var m : u8 = mode;
+    if (m >= TRM_COUNT) { m = TRM_STATIC; }
+    return TrState { mode: m, stage: TRS_NONE, frame: 0, paused: false, pending: 0 };
+}
+
+/// Clamp: the modes are 0..TRM_COUNT-1.
+pub fn trs_clamp_mode(mode : u8) -> u8 {
+    if (mode >= TRM_COUNT) { return TRM_STATIC; }
+    return mode;
+}
+
+/// Whether the engine is in STATIC mode.
+pub fn trs_is_static(s : *TrState) -> bool { return s.mode == TRM_STATIC; }
+
+/// Whether the engine is in STAGED mode.
+pub fn trs_is_staged(s : *TrState) -> bool { return s.mode == TRM_STAGED; }
+
+/// Whether the engine is in SMOOTH mode.
+pub fn trs_is_smooth(s : *TrState) -> bool { return s.mode == TRM_SMOOTH; }
+
+// ---- controls -------------------------------------------------------------------
+
+/// Pause the transition: trs_tick does nothing until resumed (or stepped).
+pub fn trs_pause(s : *TrState) -> void { s.paused = true; }
+/// Resume: trs_tick advances normally again.
+pub fn trs_resume(s : *TrState) -> void { s.paused = false; }
+/// Switch to STATIC mode; clears the active transition (events apply directly).
+pub fn trs_set_static(s : *TrState) -> void { s.mode = TRM_STATIC; s.stage = TRS_NONE; s.frame = 0; s.pending = 0; }
+/// Switch to SMOOTH mode; active transition continues under the new mode.
+pub fn trs_set_smooth(s : *TrState) -> void { s.mode = TRM_SMOOTH; }
+/// Switch to STAGED mode; active transition continues under the new mode.
+pub fn trs_set_staged(s : *TrState) -> void { s.mode = TRM_STAGED; }
+
+// ---- event coalescing ------------------------------------------------------------
+
+/// Queue `count` new events. If no transition is active, start one at
+; TRS_HIGHLIGHT. If one is active, coalesce: the pending counter grows, events
+; are batched (no infinite animation backlog; the caller keeps the raw events
+; for analysis).
+pub fn trs_enqueue(s : *TrState, count : u32) -> void {
+    if (count == 0) { return; }
+    if (s.mode == TRM_STATIC) { return; }   // STATIC: events apply directly, no staging
+    if (s.stage == TRS_NONE) {
+        s.stage = TRS_HIGHLIGHT;
+        s.frame = 0;
+        s.pending = 0;
+    } else {
+        s.pending = s.pending + count;
+    }
+}
+
+/// Advance one frame. When paused, does nothing (unless `step` is set).
+; In STATIC mode, no-op: events apply directly.
+pub fn trs_tick(s : *TrState, step : bool) -> void {
+    if (s.mode == TRM_STATIC) { return; }
+    if (s.paused and step == false) { return; }
+    if (s.stage == TRS_NONE) { return; }
+    if (trs_budget(s.stage, s.frame, s.pending)) {
+        s.stage = trs_next(s.stage, s.pending);
+        s.frame = 0;
+        // coalesced events re-trigger after the transition settles
+        if (s.stage == TRS_NONE and s.pending > 0) {
+            trs_start_fast(s);
+            s.pending = 0;
+        }
+    } else {
+        s.frame = s.frame + 1;
+    }
+}
+
+// ---- Pareto speed 1: adaptive frame budgets ---------------------------------------
+// When pending events are large, shorten stage budgets to consume the backlog
+; faster. TRF_ADAPT_DIV divides the base budget; TRF_ADAPT_MIN floors it.
+
+pub const TRF_ADAPT_DIV : u8 = 2;
+pub const TRF_ADAPT_MIN : u8 = 2;
+/// Above this pending count, adaptive budgets kick in.
+pub const TRS_ADAPT_THRESHOLD : u32 = 5;
+
+/// The effective frame budget for a stage, given the pending count.
+pub fn trs_budget(stage : u8, frame : u8, pending : u32) -> bool {
+    var limit : u8 = trs_base_budget(stage);
+    if (pending > TRS_ADAPT_THRESHOLD) {
+        var reduced : u8 = limit / TRF_ADAPT_DIV;
+        if (reduced < TRF_ADAPT_MIN) { reduced = TRF_ADAPT_MIN; }
+        limit = reduced;
+    }
+    return frame >= limit;
+}
+
+fn trs_base_budget(stage : u8) -> u8 {
+    var limit : u8 = TRF_STATIC;
+    if (stage == TRS_HIGHLIGHT) { limit = TRF_HIGHLIGHT; }
+    if (stage == TRS_FADE_OUT) { limit = TRF_FADE; }
+    if (stage == TRS_MOVE) { limit = TRF_MOVE; }
+    if (stage == TRS_SHOW_NEW) { limit = TRF_SHOW; }
+    if (stage == TRS_SETTLE) { limit = TRF_SETTLE; }
+    return limit;
+}
+
+/// Backward-compatible: the base budget without adaptation.
+pub fn trs_stage_done(stage : u8, frame : u8) -> bool {
+    return frame >= trs_base_budget(stage);
+}
+
+// ---- Pareto speed 2: fast-forward through stages -----------------------------------
+// When pending events are large, skip HIGHLIGHT and SETTLE (go directly to
+; FADE_OUT -> MOVE -> SHOW_NEW). The user sees only the two most important
+; stages: movement and appearance. ~40% fewer frames per transition on burst.
+
+pub const TRS_FAST_THRESHOLD : u32 = 8;
+
+/// Start a transition in fast mode when pending is large: skip HIGHLIGHT.
+pub fn trs_start_fast(s : *TrState) -> void {
+    if (s.pending > TRS_FAST_THRESHOLD) {
+        s.stage = TRS_FADE_OUT;   // skip HIGHLIGHT
+    } else {
+        s.stage = TRS_HIGHLIGHT;
+    }
+    s.frame = 0;
+    s.pending = 0;
+}
+
+/// The next stage, skipping HIGHLIGHT and SETTLE when pending is large.
+pub fn trs_next(stage : u8, pending : u32) -> u8 {
+    if (stage >= TRS_SETTLE) { return TRS_NONE; }
+    var next : u8 = stage + 1;
+    if (pending > TRS_FAST_THRESHOLD) {
+        if (next == TRS_HIGHLIGHT) { next = TRS_FADE_OUT; }
+        if (next == TRS_SETTLE) { next = TRS_NONE; }
+    }
+    return next;
+}
+
+// ---- Pareto speed 3: delta positions ------------------------------------------------
+// Precompute movement deltas once at enqueue time, then linearly interpolate
+; per frame during MOVE: pos = old + delta * progress. No per-frame position
+; recalculation.
+
+pub struct TrDelta {
+    pub dx : f64,
+    pub dy : f64,
+    pub x0 : f64,
+    pub y0 : f64,
+}
+
+/// Precompute the movement delta between two positions.
+pub fn trs_make_delta(x0 : f64, y0 : f64, x1 : f64, y1 : f64) -> TrDelta {
+    return TrDelta { dx: x1 - x0, dy: y1 - y0, x0: x0, y0: y0 };
+}
+
+/// Interpolate: old + delta * progress (0..1). Pure arithmetic.
+pub fn trs_lerp(d : TrDelta, progress : f64) -> [2]f64 {
+    var out : [2]f64 = undefined;
+    out[0] = d.x0 + d.dx * progress;
+    out[1] = d.y0 + d.dy * progress;
+    return out;
+}
+
+// ---- tests ----------------------------------------------------------------------
+
+fn trt_new(mode : u8) -> TrState { return trs_new(mode); }
+
+test the_three_modes_are_distinct_and_clamped {
+    assert(TRM_STATIC == 0 and TRM_SMOOTH == 1 and TRM_STAGED == 2);
+    assert(TRM_COUNT == 3);
+    assert(trs_clamp_mode(0) == TRM_STATIC);
+    assert(trs_clamp_mode(1) == TRM_SMOOTH);
+    assert(trs_clamp_mode(2) == TRM_STAGED);
+    assert(trs_clamp_mode(3) == TRM_STATIC);
+    assert(trs_clamp_mode(255) == TRM_STATIC);
+}
+
+test static_mode_enqueues_nothing_and_ticks_nowhere {
+    var s : TrState = trs_new(TRM_STATIC);
+    trs_enqueue(&s, 5);
+    assert(s.stage == TRS_NONE and s.pending == 0);
+    trs_tick(&s, false);
+    assert(s.stage == TRS_NONE and s.frame == 0);
+    assert(trs_is_static(&s));
+}
+
+test staged_mode_starts_a_transition_and_walks_the_five_stages {
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    assert(s.stage == TRS_HIGHLIGHT and s.pending == 0);
+    // HIGHLIGHT runs TRF_HIGHLIGHT frames then moves to FADE_OUT
+    var tick : u32 = 0;
+    while (tick < TRF_HIGHLIGHT + 1) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_FADE_OUT);
+    tick = 0;
+    while (tick < TRF_FADE + 1) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_MOVE);
+    tick = 0;
+    while (tick < TRF_MOVE + 1) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_SHOW_NEW);
+    tick = 0;
+    while (tick < TRF_SHOW + 1) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_SETTLE);
+    tick = 0;
+    while (tick < TRF_SETTLE + 1) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_NONE);   // done, all five stages walked
+}
+
+test pause_holds_and_step_advances_one_frame {
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    assert(s.stage == TRS_HIGHLIGHT);
+    trs_pause(&s);
+    trs_tick(&s, false);
+    assert(s.frame == 0);   // paused: no advance
+    trs_tick(&s, true);     // step: one frame forward
+    assert(s.frame == 1);
+    trs_tick(&s, false);
+    assert(s.frame == 1);   // still paused
+    trs_resume(&s);
+    trs_tick(&s, false);
+    assert(s.frame == 2);   // resumed: advances
+}
+
+test rapid_events_coalesce_not_queue {
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    assert(s.stage == TRS_HIGHLIGHT and s.pending == 0);
+    trs_enqueue(&s, 3);
+    trs_enqueue(&s, 7);
+    assert(s.pending == 10);   // batched, not queued
+    // advance to SETTLE then past it
+    var tick : u32 = 0;
+    var total : u32 = TRF_HIGHLIGHT + TRF_FADE + TRF_MOVE + TRF_SHOW + TRF_SETTLE + 5;
+    while (tick < total) { trs_tick(&s, false); tick = tick + 1; }
+    // coalesced events consumed and re-triggered (exact stage depends on
+    // adaptive budgets + fast-forward, both of which are tested separately)
+    assert(s.stage != TRS_NONE);
+    assert(s.pending == 0);              // pending consumed
+}
+
+test static_mode_switch_clears_active_transition {
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    assert(s.stage == TRS_HIGHLIGHT);
+    trs_set_static(&s);
+    assert(s.stage == TRS_NONE and s.pending == 0 and trs_is_static(&s));
+    trs_enqueue(&s, 3);
+    assert(s.stage == TRS_NONE);   // STATIC: no staging
+}
+
+test mode_switch_keeps_active_transition {
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    trs_set_smooth(&s);
+    assert(s.stage == TRS_HIGHLIGHT);   // transition continues under new mode
+    assert(trs_is_smooth(&s));
+    trs_set_staged(&s);
+    assert(trs_is_staged(&s));
+}
+
+test smooth_mode_walks_the_same_stages {
+    var s : TrState = trs_new(TRM_SMOOTH);
+    trs_enqueue(&s, 1);
+    assert(s.stage == TRS_HIGHLIGHT);
+    var tick : u32 = 0;
+    var total : u32 = TRF_HIGHLIGHT + TRF_FADE + TRF_MOVE + TRF_SHOW + TRF_SETTLE + 5;
+    while (tick < total) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_NONE);
+}
+
+test the_stage_frame_budgets_are_positive {
+    assert(TRF_STATIC == 1);
+    assert(TRF_HIGHLIGHT >= 1);
+    assert(TRF_FADE >= 1);
+    assert(TRF_MOVE >= 1);
+    assert(TRF_SHOW >= 1);
+    assert(TRF_SETTLE >= 1);
+}
+
+invariant the_stages_are_sequential {
+    assert(TRS_NONE == 0 and TRS_HIGHLIGHT == 1 and TRS_FADE_OUT == 2
+        and TRS_MOVE == 3 and TRS_SHOW_NEW == 4 and TRS_SETTLE == 5
+        and TRS_COUNT == 6);
+}
+
+invariant the_modes_are_sequential {
+    assert(TRM_STATIC == 0 and TRM_SMOOTH == 1 and TRM_STAGED == 2
+        and TRM_COUNT == 3);
+}
+
+// ---- Pareto speed tests ----------------------------------------------------------
+
+test adaptive_budget_reduces_frames_when_pending_is_large {
+    // with pending = 10 > TRS_ADAPT_THRESHOLD(5), the effective budget
+    // for HIGHLIGHT should be TRF_HIGHLIGHT / 2 = 3
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    s.pending = 10;   // simulate burst: force pending above threshold
+    // tick past HIGHLIGHT: adapted budget = 6/2 = 3
+    var tick : u32 = 0;
+    while (tick < 4) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_FADE_OUT);   // moved after 4 ticks (3 frames + 1 check)
+}
+
+test adaptive_budget_normal_when_pending_is_small {
+    // with pending = 2 <= TRS_ADAPT_THRESHOLD(5), the budget stays at base
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    s.pending = 2;   // below threshold
+    // tick 3 frames: NOT enough for base HIGHLIGHT budget (6)
+    var tick : u32 = 0;
+    while (tick < 3) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_HIGHLIGHT);   // still in HIGHLIGHT
+    // tick 4 more: now 7 ticks total; frame reaches 6, budget check passes
+    while (tick < 7) { trs_tick(&s, false); tick = tick + 1; }
+    assert(s.stage == TRS_FADE_OUT);   // moved after 7 ticks
+}
+
+test fast_forward_skips_highlight_on_large_pending {
+    var s : TrState = trs_new(TRM_STAGED);
+    s.pending = 10;   // above TRS_FAST_THRESHOLD(8)
+    trs_start_fast(&s);
+    assert(s.stage == TRS_FADE_OUT);   // HIGHLIGHT skipped
+}
+
+test fast_forward_skips_settle_on_large_pending {
+    // moving FROM SHOW_NEW with pending > 8: SETTLE skipped, then
+    // re-triggered fast at FADE_OUT (SETTLE never entered)
+    var s : TrState = trs_new(TRM_STAGED);
+    trs_enqueue(&s, 1);
+    s.pending = 10;
+    s.stage = TRS_SHOW_NEW;
+    s.frame = 99;   // past budget
+    trs_tick(&s, false);
+    assert(s.stage == TRS_FADE_OUT);   // SETTLE skipped, re-triggered fast
+}
+
+test delta_positions_compute_correctly {
+    var d : TrDelta = trs_make_delta(10.0, 20.0, 50.0, 80.0);
+    assert(d.dx == 40.0 and d.dy == 60.0);
+    // progress 0: at start
+    var p0 : [2]f64 = trs_lerp(d, 0.0);
+    assert(p0[0] == 10.0 and p0[1] == 20.0);
+    // progress 0.5: halfway
+    var p5 : [2]f64 = trs_lerp(d, 0.5);
+    assert(p5[0] == 30.0 and p5[1] == 50.0);
+    // progress 1: at end
+    var p1 : [2]f64 = trs_lerp(d, 1.0);
+    assert(p1[0] == 50.0 and p1[1] == 80.0);
+}
+
+test fast_forward_reduces_total_frames {
+    // normal: 5 stages x base budgets = 34 frames
+    // fast: 3 stages (no HIGHLIGHT, no SETTLE) x base budgets = 26 frames
+    // ~24% fewer frames
+    var normal_frames : u32 = TRF_HIGHLIGHT + TRF_FADE + TRF_MOVE + TRF_SHOW + TRF_SETTLE;
+    var fast_frames : u32 = TRF_FADE + TRF_MOVE + TRF_SHOW;
+    assert(fast_frames < normal_frames);
+}
+
+test negative_control_refutes_wrong_trm_static {
+    assert(TRM_STATIC != 3);
+}

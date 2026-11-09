@@ -1255,6 +1255,8 @@ pub const LIVE_DIR: &'static str = "/.t27os/live/";
 
 pub const F_LIVE: &'static str = "live.t27";
 
+pub const F_LIVE_DEV: &'static str = "live-dev.t27";
+
 pub fn rl_fetch(out: &mut [u8], cap: usize, w: usize, url: &'static str, dst: &'static str) -> usize {
     let mut k: usize = rl_put(out, cap, w, "[ -s ");
     k = rl_put(out, cap, k, dst);
