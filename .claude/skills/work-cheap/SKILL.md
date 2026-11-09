@@ -60,7 +60,7 @@ End your report with one line: model, tool calls, what you chose not to do.
 ## Using it
 
 1. Starting a task yourself: apply the ten rules, do not paste them to yourself.
-1b. A Pareto cron tick loads this skill first (see `.claude/skills/pareto-improvement-loop/SKILL.md`, "Free-first routing").
+1b. A Pareto cron tick loads this skill first (see `.claude/skills/pareto-improvement-loop/SKILL.md`, "Free-first routing"). Before editing for a red CI check, `pareto_fix_may_start` in the Pareto cron spec must be true.
 2. Briefing a pane, subagent or side session: the brief starts with the prompt block above, then the issue
    link, the files the agent may touch and the command that proves it done (step 6 of `worktree-lane`).
 3. A pane's command line cuts `T27OS_KEYS` at 200 bytes: put the brief in a file and type a one-line pointer to it.
