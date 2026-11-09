@@ -588,6 +588,24 @@ Recent preprints continue active development of ternary and low-bit numeric form
 - **arXiv:** 2610.22621, 2610.12251, 2609.35352 Fiona, 2604.03336 NativeTernary — cited in the 2026-10/11 sweep as active competitor work in ternary numeric formats and hardware-efficient AI number representations.
 - **Relation:** These papers explore ternary / native ternary representations for inference and training. t27's GoldenFloat family and GF-T ternary formats are positioned as spec-driven, sealed formats with conformance vectors; the competitor papers focus on algorithmic and hardware novelty rather than open spec-to-silicon reproducibility.
 
+#### 7.3.2 Bio-Inspired Auditory Processing with Spiking Ternary GRU
+- **arXiv:** 2610.29720 [cs.SD]
+- **What it claims:** Spiking Ternary GRU (stGRU) couples ternary-weight gated recurrent units with Resonate-and-Fire neurons for matrix-MAC-free ASR; binary event transmission is a native training constraint.
+- **Reported numbers:** Trained end-to-end on LibriSpeech-960, Small/Medium/Large stGRUs reach 8.09%, 7.04%, and 6.44±0.17% WER on test-clean without external LM; 10.88% test CER on Aishell-1 (9.28% dev).
+- **Relation to t27 / GoldenFloat:** Demonstrates ternary-weight recurrent networks achieving single-digit WER without MACs. t27's value is spec-driven, sealed ternary formats with conformance vectors and formal proofs, not task-specific ASR architectures.
+
+#### 7.3.3 Noise-shaped Sampling and Annealing for Scalable On-the-edge Training of Binary and Ternary AI Models
+- **arXiv:** 2610.22621 [cs.LG]
+- **What it claims:** ΣΔ-Sampler embeds stochastic sampling-and-annealing as noisy quantizer inside first-order ΣΔ noise-shaping loop to reconcile Ising solvers with generalization; reduces training memory >50%, order-of-magnitude speed-up, four orders magnitude less weight-update memory traffic.
+- **Reported numbers:** 13M-parameter ternary model within 1% of full-precision accuracy on CIFAR-10; ternary ResNet-18 within 0.4% Top-5 accuracy of a ternary baseline on ImageNet-1k; MatMul-free language models up to 2.7B parameters outperform STE baseline under matched continued pre-training.
+- **Relation to t27 / GoldenFloat:** Active competitor in ternary training algorithms and hardware-efficient representations. t27 positions GoldenFloat/GF-T as open, spec-sealed formats with conformance vectors; this work focuses on training efficiency for binary/ternary models rather than open spec-to-silicon reproducibility.
+
+#### 7.3.4 Embeddings Are Overpriced? A Frozen 16 MB Vocabulary for Small and Ternary Language Models
+- **arXiv:** 2610.22428 [cs.CL]
+- **What it claims:** Replace trainable embedding table with frozen 16 MB 512-bit code table derived by PCA + sign binarisation; with ternary BitNet b1.58 body, full model is 46 MB file.
+- **Reported numbers:** Frozen table ties float model on LAMBADA and PIQA; ternary BitNet b1.58 body with frozen embeddings generates 615-740 tokens/s on laptop CPU in 62 MB RAM, 5-6× speed of float 8-bit GGUF with ~1/7 memory; frozen table wins 1.7-2.3 nats on rare words vs learned table, accepts 10k new words after training with 3% cost vs 43% collapse for learned table.
+- **Relation to t27 / GoldenFloat:** Shows practical gains from ternary BitNet bodies plus aggressive embedding compression. t27's differentiation remains spec-driven numeric formats, sealed conformance and formal assurance, not deployment-focused embedding tricks.
+
 ### 7.4 FPGA open-source flows
 
 The 2026-10/11 period continues the open-source FPGA toolchain trend:
