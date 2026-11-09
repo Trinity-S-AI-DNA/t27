@@ -1379,9 +1379,9 @@ impl<'a> Gen<'a> {
                     Some((y, _)) if y.ty != Ty::U64 => return false,
                     Some((_, ExprKind::Const(0))) => (ifc::AK_CONST, 0, ZR),
                     Some((y, ExprKind::Const(k))) if *k > 0 => { srcs.push((X17, y)); (ifc::AK_CONST, *k as u64, X17) }
-                    Some((y, ExprKind::Var(_))) => match reg(y) { Some(r) => (ifc::AK_VAR, 0, r), None => return false },
+                    Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => return false },
                     Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::Sub), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
-                        (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
+                        (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
                         _ => return false, },
                     _ => return false, };
             }
