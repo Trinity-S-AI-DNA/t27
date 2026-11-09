@@ -55,6 +55,10 @@ Parallelism: about 3 working lanes (panes or subagents together) at once on this
 
 `is_waste(role, tier, failed_attempts, owner_flag)` in the spec answers whether a run spent a stronger tier than `route` names. Use it when TRI CLAW or the Queen records which model ran a job.
 
+## Cursor cloud agents
+
+`route()` is the Claude Code table. A Cursor cloud subagent reads `cursor_pick(kind, failures)` in the same spec. A named cheap class (parse, test, a small `.t27` edit, screenshots, visual regression, the live work graph, UI kit) starts at `composer-2.5`. Architecture, a CRM contract, a wide refactor, a repeated failure, and any class the table does not name start at `grok-4.7-medium`. Two failures of a cheap class move that task to Grok. Fast and the long window are never the pick. At most 3 parallel subagents and 8 files in the brief. The cited list prices live next to `cursor_micro()`; they are not a measured saving.
+
 ## Not covered yet
 
 - TRI CLAW's own chat agent (gHashTag/999-multibots-telegraf) and the Queen (gHashTag/trios) still pick models in their own code; they should read this table. Follow-up issues in those repos.
