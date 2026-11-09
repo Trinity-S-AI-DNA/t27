@@ -55,6 +55,16 @@ TDD, bootstrap/testing plans, math/physics test framework charter, PHI loop, tec
 | [`nona-03-manifest/VIZ-PETAL-GUIDE.md`](nona-03-manifest/VIZ-PETAL-GUIDE.md) | Contributor guide: add the visualization for one more petal (start, write, test, check, land) through `viz_contract` and `petal_viz_plan` (#12173) |
 | [`nona-03-manifest/ELECTRONICS-101-TEARDOWN.md`](nona-03-manifest/ELECTRONICS-101-TEARDOWN.md) | Teardown of electronics-101-six.vercel.app: lesson-as-data architecture, `/closed-loop` vertical slice, 48-lesson content tree, learning model and a course-27 mapping |
 
+## [`promotion/`](promotion/) - social and media planning
+
+Planning cards for the promotion kernel. The executable law is
+[`specs/automation/promotion_kernel.t27`](../specs/automation/promotion_kernel.t27).
+A number in the markdown that disagrees with that spec is wrong.
+
+| Path | Role |
+|------|------|
+| [`promotion/README.md`](promotion/README.md) | Index of the planning cards. |
+
 ## External Projects
 
 | Project | Description | Link |
