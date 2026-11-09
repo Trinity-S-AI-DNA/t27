@@ -41,7 +41,7 @@ GCC -O2 produces 10 words (gap = 11). This is a **regression vs the design** —
 
 1. **To merge:** owner clicks Approve on Trinity-S-AI-DNA/t27#13498. Auto-merge fires immediately.
 2. **Follow-up:** file a Trinity-S-AI-DNA/t27 issue: "Why do check_elide/cinc/ifconv/countdown not fire on bench_audit after all 8 PRs merged?" Evidence: `verdict_fn` not inlined (called via `bl`); hot loop = naive form.
-3. **Worktree:** `/Users/playra/t27/.claude/worktrees/arxiv-t27b-backend-shootout` (or clone from the branch).
+3. **Worktree:** branch `lane/golden-spec-derived` (clone from Trinity-S-AI-DNA/t27 and check it out).
 4. **Key file:** `specs/tri/t27b/golden_spec.t27` lines 96-102 (measurement comment) and 163-187 (functions + tests).
 5. **Tests pass:** `./target/release/t27b test specs/tri/t27b/golden_spec.t27` → PASS 3/3 (run from worktree root or with full path from main clone).
 
