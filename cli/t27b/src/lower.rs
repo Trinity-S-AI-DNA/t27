@@ -71,7 +71,6 @@
 //! named struct literal is an empty slice. `[*]T` and the map `[K:V]` are
 //! refused by name.
 //! `for (s) |x|` reads the slice's address and length once, before the loop.
-
 mod arraylit;
 mod floatas;
 mod formulti;
@@ -81,7 +80,6 @@ mod formulti;
 mod lencall;
 mod stdmem;
 mod unanalyzed;
-
 use crate::codegen;
 use crate::compiler::{Node, NodeKind};
 use crate::ir::*;
@@ -7774,6 +7772,8 @@ fn init0(before: &[Stmt], x: VarId) -> Option<u64> { // the constant x holds whe
     for s in before.iter().rev() { match s { Stmt::Assign { var, value } if *var == x => return match value.kind { ExprKind::Const(c) => u64::try_from(c).ok(), _ => None }, Stmt::Assign { .. } => {} _ => return None } }
     None
 }
+fn expr_has_var(e: &Expr, x: VarId) -> bool { match &e.kind { ExprKind::Var(v) => *v == x, ExprKind::Arith { lhs, rhs, .. } | ExprKind::FArith { lhs, rhs, .. } | ExprKind::Cmp { lhs, rhs, .. } => expr_has_var(lhs, x) || expr_has_var(rhs, x), ExprKind::And(a, b) | ExprKind::Or(a, b) => expr_has_var(a, x) || expr_has_var(b, x), ExprKind::Not(a) | ExprKind::BitNot(a) | ExprKind::FNeg(a) | ExprKind::FSqrt(a) | ExprKind::IntToFloat(a) | ExprKind::FloatCast(a) | ExprKind::Widen(a) => expr_has_var(a, x), ExprKind::FloatToInt { arg, .. } | ExprKind::Cast { arg, .. } => expr_has_var(arg, x), ExprKind::Call { args, .. } => args.iter().any(|a| expr_has_var(a, x)), ExprKind::Load { addr, .. } => expr_has_var(addr, x), ExprKind::Offset { base, idx, .. } => expr_has_var(base, x) || expr_has_var(idx, x), ExprKind::Bounds { idx, len, .. } => expr_has_var(idx, x) || expr_has_var(len, x), ExprKind::Select { cond, then, els } => expr_has_var(cond, x) || expr_has_var(then, x) || expr_has_var(els, x), ExprKind::Seq { stmts, value } => stmts_has_var(stmts, x) || expr_has_var(value, x), _ => false } }
+fn stmts_has_var(ss: &[Stmt], x: VarId) -> bool { ss.iter().any(|s| match s { Stmt::Assign { value, .. } => expr_has_var(value, x), Stmt::If { cond, then, els } => expr_has_var(cond, x) || stmts_has_var(then, x) || stmts_has_var(els, x), Stmt::While { cond, body, step } => expr_has_var(cond, x) || stmts_has_var(body, x) || stmts_has_var(step, x), Stmt::Return(Some(e)) => expr_has_var(e, x), Stmt::Eval(e) => expr_has_var(e, x), Stmt::Assert { cond, .. } => expr_has_var(cond, x), Stmt::AssertEq { lhs, rhs, .. } => expr_has_var(lhs, x) || expr_has_var(rhs, x), Stmt::Store { addr, value, .. } => expr_has_var(addr, x) || expr_has_var(value, x), Stmt::Copy { dst, src, .. } => expr_has_var(dst, x) || expr_has_var(src, x), _ => false }) }
 fn after_inc(rest: &mut [Stmt], x: VarId, c: u64, pos: u8) { // (b) uses of x after `x = x + c`, until a statement that could assign x
     for (j, s) in rest.iter_mut().enumerate() { match s {
         Stmt::Assign { var, value } => { if konst(ArithOp::Sub, x, value).map_or(false, |k| ce::decrement_elides(c, k, pos, false)) { relax(value, ArithOp::SubW); } if *var == x { return; } }
@@ -7807,7 +7807,7 @@ fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
             }
             { let ExprKind::Cmp { op: o2, lhs: l2, rhs: r2 } = &cond.kind else { unreachable!() }; // countdown: specs/tri/t27b/countdown_plan.t27 Refs #13421
               let (op2, iv_ty, rhs2) = (*o2 as u8, l2.ty, r2.clone());
-              if op2 == 2 && k == 1 && n == 1 && fixed && writes(body, iv) == 0 && init0(before, iv) == Some(0) {
+              if op2 == 2 && k == 1 && n == 1 && fixed && writes(body, iv) == 0 && init0(before, iv) == Some(0) && !stmts_has_var(body, iv) {
                 for s in before.iter_mut().rev() { match s { Stmt::Assign { var, value } if *var == iv => { *value = *rhs2; break; } Stmt::Assign { .. } => {} _ => break } }
                 for l in [&mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { if let ExprKind::Arith { op: ref mut ao, .. } = e.kind { if matches!(ao, ArithOp::Add | ArithOp::AddW) { *ao = ArithOp::SubW; } } }); }
                 cond.kind = ExprKind::Var(iv); cond.ty = iv_ty; } }
