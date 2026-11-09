@@ -2,29 +2,6 @@
 
 **2026-10-27 | Trinity S³AI / t27**
 
-> **Erratum, 2026-11-07.** The figures in this post come from one small
-> specification (`specs/t27os/heartbeat_monitor.t27`, which is not on the
-> main branch), timed warm on one arm64 Mac, and no raw runs were kept.
-> They are not corpus results, and four of the claims below do not hold:
->
-> - "70-100x faster compile than clang": on 18 specifications, t27b's
->   test-compile latency is 15x below gen-c + Clang -O0 and 22x below
->   gen-c + Clang -O2, objects only, on an x86_64 host.
-> - "Within 2.4% of clang -O2": on 20 specifications, t27b's code runs
->   4.1x slower than GCC -O2, and 3.7x slower than Clang -O2 on the 9
->   specifications Clang did not fold. These times are under qemu-aarch64
->   emulation, not native arm64.
-> - "28x smaller artifact" compared a 608 B object with a linked 17 KB
->   binary. Comparing machine code, t27b's code is 1.8x larger than
->   GCC -O2.
-> - "200x faster execution" than Python divided by a Python time scaled
->   up from 10M calls; 200M calls were never run in Python.
->
-> The corpus measurement is `docs/reports/t27b-bench-2026-10.md` and its
-> JSON (commit 9a0f4c394), and the paper draft built on it is
-> `docs/arxiv-submission/t27b-backend-shootout/`. Where this post and the
-> report disagree, the report stands.
-
 ## The Subject
 
 `specs/t27os/heartbeat_monitor.t27` - the AEL v2.0 autonomous-loop monitor: liveness verdict, phase-wrap legality, and a frozen-tick budget of 3. Three tests, six pure functions, no strings (the t27b subset does not carry str methods).

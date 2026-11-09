@@ -12,7 +12,7 @@ quoted above its proof:
   these IDs were NOT re-verified in this session (the web survey subagent hung
   and web_search returned no durable result), so they are marked UNVERIFIED
 ### Not built (planned surface only): tri papers
-  until `tri papers` or a fresh fetch confirms them.
+  until `tri papers` (not built yet) or a fresh fetch confirms them.
 
 ---
 
@@ -32,7 +32,7 @@ CUTLASS 3.5.1, sm_89, CUDA 12.4, 2026-10-18). All ratios stored in hundredths
 | Generated kernel ships only above CUTLASS s8 by | **10%** (`GEN_CUDA_BAR_E2`) | law |
 
 ### Not built (planned surface only): tri papers
-Audit discipline: `specs/numeric/paper_claims.t27` (`tri papers`) — of 45
+Audit discipline: `specs/numeric/paper_claims.t27` (`tri papers`, not built yet) — of 45
 numbers printed in the three format papers, **34 recompute exactly, 8 misfit,
 3 cannot be checked**. A paper number that misfits is reported, never smoothed.
 
@@ -69,7 +69,7 @@ across the project's own docs (BitNet b1.58, llm.int8, SmoothQuant, AWQ, GPTQ,
 TWN, TTQ, DeepSeek-V3 FP8). Their IDs below are **from general knowledge and
 were not re-verified in this session** — do not cite them as confirmed until
 ### Not built (planned surface only): tri papers
-`tri papers` or a fresh web fetch closes the loop:
+`tri papers` (not built yet) or a fresh web fetch closes the loop:
 
 | Paper | ID (UNVERIFIED) | Relevance to the shelf |
 |---|---|---|
