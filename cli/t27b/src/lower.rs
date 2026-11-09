@@ -126,7 +126,7 @@ mod dv; // t27c gen-rust of specs/tri/t27b/const_div_plan.t27: `/` and `%` of tw
 #[path = "../../../gen/rust/tri/t27b/bit_cast_plan.rs"] #[allow(dead_code, unused_parens)]
 mod bc; // t27c gen-rust of specs/tri/t27b/bit_cast_plan.t27: `@bitCast` of a scalar, `@intFromBool`
 #[path = "../../../gen/rust/tri/t27b/middle_end.rs"] #[allow(dead_code, unused_parens)]
-mod me; // t27c gen-rust of specs/tri/t27b/middle_end.t27: identities and strength reduction by a constant
+pub(crate) mod me; // t27c gen-rust of specs/tri/t27b/middle_end.t27: identities, strength reduction, LICM_CONST
 #[path = "../../../gen/rust/tri/t27b/literal_plan.rs"] #[allow(dead_code, unused_parens)]
 mod lp; // t27c gen-rust of specs/tri/t27b/literal_plan.t27: a literal's text as the t27c parser keeps it
 #[path = "../../../gen/rust/tri/t27b/ref_var_plan.rs"] #[allow(dead_code, unused_parens)]
