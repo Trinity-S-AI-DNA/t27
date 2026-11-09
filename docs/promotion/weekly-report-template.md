@@ -1,9 +1,12 @@
-# Weekly promotion report (blank)
+# Weekly campaign report
 
-Part of #13473. Issue #13480. Do not fill a number that has no command. Write `not measured` instead. Do not send this form.
+Part of #13473. Copy this block, fill a field only from a named source,
+and leave an unknown field blank. Do not write 0 for a metric that was
+not measured.
 
-```text
-WEEK_ENDING_UTC:
+The field list is `WEEKLY_FIELD` in `specs/automation/promotion_kernel.t27`.
+
+```
 EPIC_CREATED:
 ISSUES_CREATED:
 BASELINE_CAPTURED:
@@ -20,13 +23,7 @@ REGRESSION_STATUS:
 ANOMALIES_FOUND:
 BLOCKERS:
 NEXT_ACTION:
-GITHUB_STARS:
-GITHUB_FORKS:
-GITHUB_OPEN_ISSUES:
-GITHUB_CONTRIBUTORS:
-X_FOLLOWERS:
-X_IMPRESSIONS:
-DRAFTS_SENT:
 ```
 
-`DRAFTS_SENT` stays 0 until the owner approves a named draft and a later run records the send. This template does not approve one.
+Known this week, if the baseline card is still current: impressions 809
+(citation, not a new X read). Clicks, course starts and payments: blank.

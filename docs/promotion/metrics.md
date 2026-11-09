@@ -1,32 +1,23 @@
 # Metrics
 
-Part of #13473. Issue #13480. Status: DRAFT_UNSENT. This file does not post a report.
+Part of #13473. This card does not publish.
 
-The weekly blank is `docs/promotion/weekly-report-template.md`. Its field names are the final-report template in #13473. Values stay blank until a later run fills them from a named command.
+The executable check is `specs/automation/promotion_kernel.t27`
+(`metric_known`, `WEEKLY_FIELD`).
 
-Numbers already measured once, on 2026-11-09T18:23:02Z, live in `docs/promotion/baseline.md`. They are a baseline, not a weekly delta.
+The weekly report template is `docs/promotion/weekly-report-template.md`.
+Its fields are the sixteen names of the epic final-report template, in
+the same order as `WEEKLY_FIELD`.
 
-Tracked names, and whether this run has a value:
+## What is tracked
 
-| name | value in this run | where |
-| --- | --- | --- |
-| GitHub stars | 5 | baseline.md |
-| GitHub forks | 4 | baseline.md |
-| open issues | 2041 | baseline.md |
-| open pull requests | 68 | baseline.md |
-| contributors | 31 | baseline.md |
-| X followers | unavailable | baseline.md |
-| X impressions | unavailable | baseline.md |
-| course lesson count | 27 | course-map.md |
-| content-bank drafts sent | 0 | content-bank.json `sent: false` on every row |
+| Metric | State |
+|--------|-------|
+| impressions, 7-day | known, 809, cited from #13465 on 2026-11-09 |
+| clicks | not measured |
+| course starts | not measured |
+| payments | not measured |
+| paid checkout | off |
 
-## Asset fields
-
-| Field | Value |
-| --- | --- |
-| claim | N/A |
-| artifact | `docs/promotion/weekly-report-template.md` |
-| reproducible path | baseline.md commands |
-| visual | N/A |
-| CTA | N/A -- not sent |
-| metric | the table above |
+`metric_known` is true only for impressions. An unknown metric is left
+blank in the weekly report. It is not written as 0.

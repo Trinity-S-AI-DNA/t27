@@ -25,6 +25,7 @@ First-party docs follow the **27-agent trinity alphabet** grouping: **three nona
 | [`coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md`](coordination/ROLLING-INTEGRATION-PLAN-SEED-TO-QUEEN.md) | Phased plan: seed → tests → Queen brain (`tri`/`t27c`, conformance, codegen gap). |
 | [`coordination/inter-agent-handoff/`](coordination/inter-agent-handoff/) | Portable handoff bundle. |
 | [`coordination/HANDOFF.md`](coordination/HANDOFF.md) | The ledger `tri trigit handoff` reads and appends (#12286). |
+| [`coordination/dsh-to-t27os-migration-2026-11-01.md`](coordination/dsh-to-t27os-migration-2026-11-01.md) | DSH to T27 OS migration package: audit scope, module map, behaviour table, backlog, blocker (#12884); data in [`dsh-to-t27os-audit/`](coordination/dsh-to-t27os-audit/). |
 
 ## [`system/`](system/) — system documentation bodies (rendered at `t27.ai/#/docs`)
 
@@ -54,11 +55,15 @@ TDD, bootstrap/testing plans, math/physics test framework charter, PHI loop, tec
 | [`nona-03-manifest/VIZ-PETAL-GUIDE.md`](nona-03-manifest/VIZ-PETAL-GUIDE.md) | Contributor guide: add the visualization for one more petal (start, write, test, check, land) through `viz_contract` and `petal_viz_plan` (#12173) |
 | [`nona-03-manifest/ELECTRONICS-101-TEARDOWN.md`](nona-03-manifest/ELECTRONICS-101-TEARDOWN.md) | Teardown of electronics-101-six.vercel.app: lesson-as-data architecture, `/closed-loop` vertical slice, 48-lesson content tree, learning model and a course-27 mapping |
 
-## Promotion kernel (M0 planning, not published)
+## [`promotion/`](promotion/) - social and media planning
+
+Planning cards for the promotion kernel. The executable law is
+[`specs/automation/promotion_kernel.t27`](../specs/automation/promotion_kernel.t27).
+A number in the markdown that disagrees with that spec is wrong.
 
 | Path | Role |
 |------|------|
-| [`promotion/README.md`](promotion/README.md) | Index of the #13473 planning pack. Drafts stay unsent until a named owner approval. |
+| [`promotion/README.md`](promotion/README.md) | Index of the planning cards. |
 
 ## External Projects
 
