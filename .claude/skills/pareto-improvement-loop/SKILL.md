@@ -90,6 +90,7 @@ Three variants live in `specs/acceleration/`:
 - Mass "required check pending" on PRs is a gate class, not per-PR whack-a-mole. Law: `specs/ci/pr_ready_aggregate.t27` (aggregate `pr-ready`, always terminal on latest SHA). Host: `.github/workflows/pr-ready.yml` after owner labels foreign workflow work; until then fix master debt (#13505 dupes, #13506 queen_dash) per sibling lanes.
 - Before `git push`, call `batch_push_may_run(skill_only_tick, inherited_repo_gate_red, own_task_path, required_checks_pending)` in the same spec; when it is false, verify locally (`t27c seal --verify` on the lane specs) and record the tick under `/opt/cursor/artifacts/pareto-tick-*.txt`. While `required_checks_pending` and rollup `pass=0`, do **not** edit the PR body every tick — repeated edits cancel/requeue `check-linked-issue` and `fix-carries-source` on Actions; one consolidated PR footer after `pass>0` is enough.
 - Before a second `git merge origin/master` in the same CI window, call `merge_master_may_run(required_checks_pending, master_ahead)`; when required checks are still pending after the last push, wait.
+- Squash-merge of this lane's PR is **not** a pareto tick action: load `.claude/skills/merge-verdict/SKILL.md` and evaluate `specs/claw/merge_verdict.t27` on a CI/PR subscription wake; emit one `M\t` line before any merge.
 
 ## No foreign edits
 
