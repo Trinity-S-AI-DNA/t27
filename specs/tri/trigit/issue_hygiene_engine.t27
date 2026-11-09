@@ -1,0 +1,480 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/tri/trigit/issue_hygiene_engine.t27 -- issue hygiene over the one canonical work graph: duplicates, stale
+// issues, issues resolved elsewhere but still open, and the evidence a close or an archive needs (owner order
+// T27V_ROADMAP_DASHBOARD_SYNC V3, 2026-11-08, Wave A: the contract).
+//
+// WHY. The board is honest only if the issue list is: a duplicate, a stale issue or an issue whose work already
+// landed elsewhere makes the roadmap lie. This engine finds them from the graph and from recorded facts, never from
+// text similarity, and it only RECOMMENDS a close: the close itself is owner-gated and needs evidence. Nothing is
+// ever deleted -- an issue is closed, then archived (closed with the hygiene-review label removed).
+//
+// RULES:
+//   duplicate         only through an outgoing DUPLICATES edge of the graph; a pair pointing at each other is a
+//                     conflict for the owner, not a close
+//   stale             no event, commit, PR or comment for 7 days (idle_ms, monotonic, t27os/t27t.t27); stale and
+//                     no owner action for 14 days escalates: the hygiene-review label and owner_approval_required,
+//                     never a priority change (priority is roadmap_dashboard_sync.t27's alone)
+//   resolved-but-open a verified artifact or a SUPERSEDES edge (graph), a merged PR, passing tests
+//   close evidence    an owner decision, or graph evidence (verified artifact or superseded) AND a merged PR AND
+//                     passing tests; a duplicate's evidence is its DUPLICATES edge; every close is owner-gated
+//   archive           an issue closed with evidence that still carries hygiene-review: the label sync removes it
+//   run               daily (cron) or on demand, at most RD_CYCLE_MAX actions, the rest to the dead letter
+//
+// The engine writes nothing itself: it yields hygiene label bits (fed to rd_labels as RdLife.hygiene), events and
+// recommendations; GitHub writes go through rd_write_allowed. This file imports roadmap_dashboard_sync.t27; that
+// file never imports this one.
+//
+// NOT CLAIMED: no host, no cron and no GitHub call exist yet (Waves B..D); the tests were checked by hand, not run,
+// because the swap gate was BLOCKED when this was written.
+
+module TriTrigitIssueHygieneEngine;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::nodes;
+use t27f::work_graph::edges;
+use t27f::work_graph::edge_kind_at;
+use t27f::work_graph::edge_from_at;
+use t27f::work_graph::edge_to_at;
+use t27f::work_graph::NK_ARTIFACT;
+use t27f::work_graph::EK_VERIFIES;
+use t27f::work_graph::WG_OK;
+use t27f::work_graph::NODE_CAP;
+use t27f::spec_graph::LABEL_EXACT;
+use t27f::work_graph_ext::NX_ROOT;
+use t27f::work_graph_ext::NX_TRUNK;
+use t27f::work_graph_ext::NX_EPIC;
+use t27f::work_graph_ext::NX_ISSUE;
+use t27f::work_graph_ext::EX_BELONGS_TO;
+use t27f::work_graph_ext::EX_DUPLICATES;
+use t27f::work_graph_ext::EX_SUPERSEDES;
+use t27f::work_graph_ext::wx_ensure_node;
+use t27f::work_graph_ext::wx_add_edge;
+use t27f::work_graph_ext::wx_has_in;
+use t27f::work_graph_ext::wx_issue_has_verified_artifact;
+use t27f::lukomorye_graph_terminal::LK_SRC_LIVE;
+use queen::priority::LEVEL_NORMAL;
+use queen::roadmap::ST_IN_PROGRESS;
+use tri::trigit::roadmap_dashboard_sync::L_DUPLICATE;
+use tri::trigit::roadmap_dashboard_sync::L_STALE;
+use tri::trigit::roadmap_dashboard_sync::L_RESOLVED_ELSEWHERE;
+use tri::trigit::roadmap_dashboard_sync::L_HYGIENE_REVIEW;
+use tri::trigit::roadmap_dashboard_sync::L_HYGIENE;
+use tri::trigit::roadmap_dashboard_sync::L_ROADMAP;
+use tri::trigit::roadmap_dashboard_sync::RD_CYCLE_MAX;
+use tri::trigit::roadmap_dashboard_sync::rd_cycle_now;
+use tri::trigit::roadmap_dashboard_sync::rd_cycle_overflow;
+use tri::trigit::roadmap_dashboard_sync::rd_overflow_reason;
+use tri::trigit::roadmap_dashboard_sync::rd_write_policy;
+use tri::trigit::roadmap_dashboard_sync::rd_write_allowed;
+use tri::trigit::roadmap_dashboard_sync::rd_labels;
+use tri::trigit::roadmap_dashboard_sync::rd_labels_ok;
+use tri::trigit::roadmap_dashboard_sync::rd_add;
+use tri::trigit::roadmap_dashboard_sync::rd_remove;
+use tri::trigit::roadmap_dashboard_sync::GA_READ;
+use tri::trigit::roadmap_dashboard_sync::GA_ADD_LABEL;
+use tri::trigit::roadmap_dashboard_sync::GA_REMOVE_LABEL;
+use tri::trigit::roadmap_dashboard_sync::GA_CLOSE_ISSUE;
+use tri::trigit::roadmap_dashboard_sync::GA_DELETE_ISSUE;
+use tri::trigit::roadmap_dashboard_sync::PW_OWNER;
+use tri::trigit::roadmap_dashboard_sync::PW_FORBIDDEN;
+use t27os::t27m::TM_DL_OVERFLOW;
+use t27os::t27l::tl_action_id;
+
+// ---- 1. duplicates: only a DUPLICATES edge ----
+
+/// The issue n duplicates (the first outgoing DUPLICATES target), else NODE_CAP.
+pub fn ih_duplicate_of(g: *WorkGraph, n: u32) -> u32 {
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == EX_DUPLICATES && edge_from_at(g, e) == n) { return edge_to_at(g, e); }
+        e = e + 1;
+    }
+    return NODE_CAP;
+}
+
+/// Two issues that each say the other is the duplicate: the owner picks the survivor; no close is recommended.
+pub fn ih_dup_conflict(g: *WorkGraph, n: u32) -> bool {
+    const m : u32 = ih_duplicate_of(g, n);
+    if (m == NODE_CAP) { return false; }
+    return ih_duplicate_of(g, m) == n;
+}
+
+// ---- 2. stale ----
+
+pub const IH_DAY_MS : u64 = 86400000;
+pub const IH_STALE_MS : u64 = 604800000;
+pub const IH_ESCALATE_MS : u64 = 1209600000;
+
+/// idle_ms: time since the last event, commit, PR or comment on the issue.
+pub fn ih_stale(idle_ms: u64) -> bool {
+    return idle_ms >= IH_STALE_MS;
+}
+
+/// owner_idle_ms: time since the owner last acted on the issue. Escalation is a review request, not a priority.
+pub fn ih_escalate(idle_ms: u64, owner_idle_ms: u64) -> bool {
+    if (!ih_stale(idle_ms)) { return false; }
+    return owner_idle_ms >= IH_ESCALATE_MS;
+}
+
+// ---- 3. resolved elsewhere and close evidence ----
+
+pub const RE_VERIFIED_ARTIFACT : u32 = 1;
+pub const RE_MERGED_PR : u32 = 2;
+pub const RE_TESTS_PASS : u32 = 4;
+pub const RE_SUPERSEDED : u32 = 8;
+pub const RE_OWNER_DECISION : u32 = 16;
+/// The bits that make an open issue a resolved-elsewhere candidate (an owner decision is not "elsewhere").
+pub const RE_CANDIDATE : u32 = 15;
+pub const RE_GRAPH : u32 = 9;
+
+/// What the graph proves (verified artifact, superseded) plus the recorded facts (merged PR, tests, owner).
+pub fn ih_resolved_bits(g: *WorkGraph, n: u32, merged_pr: bool, tests_pass: bool, owner_decision: bool) -> u32 {
+    var b : u32 = 0;
+    if (n >= nodes(g)) { return 0; }
+    if (wx_issue_has_verified_artifact(g, n)) { b = b | RE_VERIFIED_ARTIFACT; }
+    if (wx_has_in(g, n, EX_SUPERSEDES)) { b = b | RE_SUPERSEDED; }
+    if (merged_pr) { b = b | RE_MERGED_PR; }
+    if (tests_pass) { b = b | RE_TESTS_PASS; }
+    if (owner_decision) { b = b | RE_OWNER_DECISION; }
+    return b;
+}
+
+pub fn ih_resolved_candidate(bits: u32) -> bool {
+    return (bits & RE_CANDIDATE) != 0;
+}
+
+/// Evidence for a close: the owner decided, or the graph AND a merged PR AND passing tests agree.
+pub fn ih_close_evidence(bits: u32) -> bool {
+    if ((bits & RE_OWNER_DECISION) != 0) { return true; }
+    if ((bits & RE_GRAPH) == 0) { return false; }
+    if ((bits & RE_MERGED_PR) == 0) { return false; }
+    return (bits & RE_TESTS_PASS) != 0;
+}
+
+// ---- 4. the verdict of one issue ----
+
+/// Facts the graph cannot hold, all recorded by the host from the monotonic clock and GitHub reads.
+pub struct IhFacts {
+    idle_ms: u64,
+    owner_idle_ms: u64,
+    merged_pr: bool,
+    tests_pass: bool,
+    owner_decision: bool,
+    closed: bool,
+}
+
+pub struct IhVerdict {
+    duplicate_of: u32,
+    conflict: bool,
+    stale: bool,
+    escalate: bool,
+    resolved: u32,
+    recommend_close: bool,
+    has_evidence: bool,
+    labels: u32,
+}
+
+pub fn ih_facts_none() -> IhFacts {
+    return IhFacts { idle_ms: 0, owner_idle_ms: 0, merged_pr: false, tests_pass: false, owner_decision: false,
+        closed: false };
+}
+
+/// The hygiene labels of an open issue; a closed issue carries none (that is the archive).
+pub fn ih_labels(closed: bool, dup: bool, stale: bool, resolved: bool, review: bool) -> u32 {
+    if (closed) { return 0; }
+    var s : u32 = 0;
+    if (dup) { s = s | L_DUPLICATE; }
+    if (stale) { s = s | L_STALE; }
+    if (resolved) { s = s | L_RESOLVED_ELSEWHERE; }
+    if (review) { s = s | L_HYGIENE_REVIEW; }
+    return s;
+}
+
+pub fn ih_judge(g: *WorkGraph, n: u32, f: IhFacts) -> IhVerdict {
+    const d : u32 = ih_duplicate_of(g, n);
+    const conflict : bool = ih_dup_conflict(g, n);
+    const dup_ok : bool = d != NODE_CAP && !conflict;
+    const st : bool = ih_stale(f.idle_ms);
+    const esc : bool = ih_escalate(f.idle_ms, f.owner_idle_ms);
+    const rb : u32 = ih_resolved_bits(g, n, f.merged_pr, f.tests_pass, f.owner_decision);
+    const ev : bool = dup_ok || ih_close_evidence(rb);
+    const rec : bool = !f.closed && ev;
+    const review : bool = rec || esc || conflict;
+    return IhVerdict { duplicate_of: d, conflict: conflict, stale: st, escalate: esc, resolved: rb,
+        recommend_close: rec, has_evidence: ev,
+        labels: ih_labels(f.closed, d != NODE_CAP, st, ih_resolved_candidate(rb), review) };
+}
+
+/// May the close run now? Owner-gated, and only with its evidence.
+pub fn ih_close_allowed(v: IhVerdict, owner_ok: bool) -> bool {
+    return rd_write_allowed(GA_CLOSE_ISSUE, false, owner_ok, v.has_evidence);
+}
+
+/// An issue closed with evidence that still carries hygiene-review is due for archive.
+pub fn ih_archive_due(closed_with_evidence: bool, have: u32) -> bool {
+    if (!closed_with_evidence) { return false; }
+    return (have & L_HYGIENE_REVIEW) != 0;
+}
+
+pub fn ih_archived(closed_with_evidence: bool, have: u32) -> bool {
+    if (!closed_with_evidence) { return false; }
+    return (have & L_HYGIENE_REVIEW) == 0;
+}
+
+// ---- 5. verbs: detect, label, recommend, close, archive -- no delete ----
+
+pub const IV_DETECT : u8 = 0;
+pub const IV_LABEL : u8 = 1;
+pub const IV_RECOMMEND_CLOSE : u8 = 2;
+pub const IV_CLOSE : u8 = 3;
+pub const IV_RECOMMEND_ARCHIVE : u8 = 4;
+pub const IV_ARCHIVE : u8 = 5;
+pub const IV_COUNT : u8 = 6;
+
+/// The GitHub action behind a verb. A recommendation writes only the hygiene-review label or nothing.
+pub fn ih_verb_action(v: u8) -> u8 {
+    if (v == IV_LABEL || v == IV_RECOMMEND_CLOSE) { return GA_ADD_LABEL; }
+    if (v == IV_CLOSE) { return GA_CLOSE_ISSUE; }
+    if (v == IV_ARCHIVE) { return GA_REMOVE_LABEL; }
+    return GA_READ;
+}
+
+// ---- 6. runs: daily or on demand, bounded ----
+
+pub fn ih_run_due(on_demand: bool, since_last_ms: u64) -> bool {
+    if (on_demand) { return true; }
+    return since_last_ms >= IH_DAY_MS;
+}
+
+pub fn ih_run_now(planned: u32) -> u32 {
+    return rd_cycle_now(planned);
+}
+
+pub fn ih_run_overflow(planned: u32) -> u32 {
+    return rd_cycle_overflow(planned);
+}
+
+// ---- 7. T27L events ----
+
+pub fn ih_ev_duplicate() -> u8 { return tl_action_id("issue_duplicate_detected"); }
+pub fn ih_ev_stale() -> u8 { return tl_action_id("issue_stale_detected"); }
+pub fn ih_ev_resolved() -> u8 { return tl_action_id("issue_resolved_elsewhere_detected"); }
+pub fn ih_ev_close_recommended() -> u8 { return tl_action_id("issue_close_recommended"); }
+pub fn ih_ev_closed() -> u8 { return tl_action_id("issue_closed_with_evidence"); }
+pub fn ih_ev_archive_recommended() -> u8 { return tl_action_id("issue_archive_recommended"); }
+pub fn ih_ev_cron() -> u8 { return tl_action_id("hygiene_cron_run"); }
+pub fn ih_ev_overflow() -> u8 { return tl_action_id("hygiene_overflow"); }
+pub fn ih_ev_owner_approval() -> u8 { return tl_action_id("owner_approval_required"); }
+
+// ---- fixture ----
+
+/// root <- trunk <- epic <- issues 1..4; artifact 7 verifies issue 1 (EXACT); issue 2 DUPLICATES issue 1; issue 4
+/// SUPERSEDES issue 3. Node order: root 0, trunk 1, epic 2, i1 3, i2 4, i3 5, i4 6, art 7.
+pub fn ih_fixture(g: *WorkGraph) -> u32 {
+    const root : u32 = wx_ensure_node(g, NX_ROOT, 1, LABEL_EXACT);
+    const trunk : u32 = wx_ensure_node(g, NX_TRUNK, 1, LABEL_EXACT);
+    const epic : u32 = wx_ensure_node(g, NX_EPIC, 1, LABEL_EXACT);
+    const i1 : u32 = wx_ensure_node(g, NX_ISSUE, 1, LABEL_EXACT);
+    const i2 : u32 = wx_ensure_node(g, NX_ISSUE, 2, LABEL_EXACT);
+    const i3 : u32 = wx_ensure_node(g, NX_ISSUE, 3, LABEL_EXACT);
+    const i4 : u32 = wx_ensure_node(g, NX_ISSUE, 4, LABEL_EXACT);
+    const art : u32 = wx_ensure_node(g, NK_ARTIFACT, 7, LABEL_EXACT);
+    var bad : u32 = 0;
+    if (wx_add_edge(g, EX_BELONGS_TO, trunk, root, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, epic, trunk, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, i1, epic, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, i2, epic, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, i3, epic, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, i4, epic, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_BELONGS_TO, art, i1, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EK_VERIFIES, art, i1, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_DUPLICATES, i2, i1, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    if (wx_add_edge(g, EX_SUPERSEDES, i4, i3, LABEL_EXACT) != WG_OK) { bad = bad + 1; }
+    return bad;
+}
+
+// ---- tests ----
+
+test "the fixture builds the graph the engine reads" {
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    assert(nodes(&g) == 8);
+    assert(edges(&g) == 10);
+}
+
+test "a duplicate exists only as a DUPLICATES edge" {
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    assert(ih_duplicate_of(&g, 4) == 3);
+    assert(ih_duplicate_of(&g, 3) == NODE_CAP);
+    assert(ih_duplicate_of(&g, 5) == NODE_CAP);
+    assert(ih_duplicate_of(&g, 99) == NODE_CAP);
+    assert(!ih_dup_conflict(&g, 4));
+    const v : IhVerdict = ih_judge(&g, 4, ih_facts_none());
+    assert(v.recommend_close);
+    assert(v.has_evidence);
+    assert((v.labels & L_DUPLICATE) != 0);
+    assert((v.labels & L_HYGIENE_REVIEW) != 0);
+    // the canonical issue is not a duplicate of anything
+    const c : IhVerdict = ih_judge(&g, 3, ih_facts_none());
+    assert((c.labels & L_DUPLICATE) == 0);
+}
+
+test "two issues naming each other as the duplicate go to the owner, not to a close" {
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    assert(wx_add_edge(&g, EX_DUPLICATES, 3, 4, LABEL_EXACT) == WG_OK);
+    assert(ih_dup_conflict(&g, 3));
+    assert(ih_dup_conflict(&g, 4));
+    const v : IhVerdict = ih_judge(&g, 4, ih_facts_none());
+    assert(v.conflict);
+    assert(!v.recommend_close);
+    assert((v.labels & L_HYGIENE_REVIEW) != 0);
+}
+
+test "stale at 7 days, escalation at 14 days without the owner, never before stale" {
+    assert(!ih_stale(IH_STALE_MS - 1));
+    assert(ih_stale(IH_STALE_MS));
+    assert(!ih_escalate(IH_STALE_MS, IH_ESCALATE_MS - 1));
+    assert(ih_escalate(IH_STALE_MS, IH_ESCALATE_MS));
+    assert(!ih_escalate(IH_STALE_MS - 1, IH_ESCALATE_MS * 2));
+    assert(IH_STALE_MS == 7 * IH_DAY_MS);
+    assert(IH_ESCALATE_MS == 14 * IH_DAY_MS);
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    var f : IhFacts = ih_facts_none();
+    f.idle_ms = IH_STALE_MS;
+    f.owner_idle_ms = IH_STALE_MS;
+    const s : IhVerdict = ih_judge(&g, 6, f);
+    assert(s.stale);
+    assert(!s.escalate);
+    assert(s.labels == L_STALE);
+    f.owner_idle_ms = IH_ESCALATE_MS;
+    const e : IhVerdict = ih_judge(&g, 6, f);
+    assert(e.escalate);
+    assert(e.labels == (L_STALE | L_HYGIENE_REVIEW));
+    assert(!e.recommend_close);
+}
+
+test "resolved elsewhere: the graph proves a verified artifact or a supersession" {
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    assert(ih_resolved_bits(&g, 3, false, false, false) == RE_VERIFIED_ARTIFACT);
+    assert(ih_resolved_bits(&g, 5, false, false, false) == RE_SUPERSEDED);
+    assert(ih_resolved_bits(&g, 6, false, false, false) == 0);
+    assert(ih_resolved_bits(&g, 6, true, true, true) == (RE_MERGED_PR | RE_TESTS_PASS | RE_OWNER_DECISION));
+    assert(ih_resolved_bits(&g, 99, true, true, true) == 0);
+    assert(ih_resolved_candidate(RE_MERGED_PR));
+    assert(!ih_resolved_candidate(RE_OWNER_DECISION));
+    assert(!ih_resolved_candidate(0));
+}
+
+test "close evidence: graph and merged PR and tests, or the owner's decision" {
+    assert(!ih_close_evidence(0));
+    assert(!ih_close_evidence(RE_VERIFIED_ARTIFACT));
+    assert(!ih_close_evidence(RE_VERIFIED_ARTIFACT | RE_MERGED_PR));
+    assert(!ih_close_evidence(RE_MERGED_PR | RE_TESTS_PASS));
+    assert(ih_close_evidence(RE_VERIFIED_ARTIFACT | RE_MERGED_PR | RE_TESTS_PASS));
+    assert(ih_close_evidence(RE_SUPERSEDED | RE_MERGED_PR | RE_TESTS_PASS));
+    assert(ih_close_evidence(RE_OWNER_DECISION));
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    var f : IhFacts = ih_facts_none();
+    const weak : IhVerdict = ih_judge(&g, 3, f);
+    assert(!weak.recommend_close);
+    assert(weak.labels == L_RESOLVED_ELSEWHERE);
+    f.merged_pr = true;
+    f.tests_pass = true;
+    const strong : IhVerdict = ih_judge(&g, 3, f);
+    assert(strong.recommend_close);
+    assert(strong.labels == (L_RESOLVED_ELSEWHERE | L_HYGIENE_REVIEW));
+}
+
+test "a close is owner-gated and needs evidence; no verb deletes" {
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    const dup : IhVerdict = ih_judge(&g, 4, ih_facts_none());
+    assert(!ih_close_allowed(dup, false));
+    assert(ih_close_allowed(dup, true));
+    const none : IhVerdict = ih_judge(&g, 6, ih_facts_none());
+    assert(!none.has_evidence);
+    assert(!ih_close_allowed(none, true));
+    assert(rd_write_policy(ih_verb_action(IV_CLOSE)) == PW_OWNER);
+    var v : u8 = 0;
+    while (v < IV_COUNT) {
+        assert(ih_verb_action(v) != GA_DELETE_ISSUE);
+        assert(rd_write_policy(ih_verb_action(v)) != PW_FORBIDDEN);
+        v = v + 1;
+    }
+    assert(ih_verb_action(IV_DETECT) == GA_READ);
+    assert(ih_verb_action(IV_RECOMMEND_ARCHIVE) == GA_READ);
+    assert(ih_verb_action(IV_ARCHIVE) == GA_REMOVE_LABEL);
+}
+
+test "archive: closed with evidence, then the hygiene-review label goes" {
+    assert(ih_archive_due(true, L_HYGIENE_REVIEW | L_DUPLICATE));
+    assert(!ih_archive_due(false, L_HYGIENE_REVIEW));
+    assert(!ih_archive_due(true, L_DUPLICATE));
+    assert(ih_archived(true, 0));
+    assert(!ih_archived(false, 0));
+    assert(!ih_archived(true, L_HYGIENE_REVIEW));
+    // a closed issue wants no hygiene label, so one sync removes hygiene-review and adds nothing
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    var f : IhFacts = ih_facts_none();
+    f.closed = true;
+    const v : IhVerdict = ih_judge(&g, 4, f);
+    assert(v.labels == 0);
+    assert(!v.recommend_close);
+    const have : u32 = L_DUPLICATE | L_HYGIENE_REVIEW;
+    assert(rd_remove(v.labels, have) == have);
+    assert(rd_add(v.labels, have) == 0);
+}
+
+test "hygiene labels feed the roadmap projection and keep its label rules" {
+    var g = new_graph();
+    assert(ih_fixture(&g) == 0);
+    var f : IhFacts = ih_facts_none();
+    f.idle_ms = IH_ESCALATE_MS;
+    f.owner_idle_ms = IH_ESCALATE_MS;
+    var n : u32 = 0;
+    while (n < 8) {
+        const v : IhVerdict = ih_judge(&g, n, f);
+        assert((v.labels & ~L_HYGIENE) == 0);
+        const s : u32 = rd_labels(true, LEVEL_NORMAL, ST_IN_PROGRESS, true, LK_SRC_LIVE, v.labels);
+        assert(rd_labels_ok(s));
+        assert((s & L_ROADMAP) != 0);
+        assert((s & L_HYGIENE) == v.labels);
+        n = n + 1;
+    }
+}
+
+test "a run is daily or on demand and bounded at 100 actions" {
+    assert(ih_run_due(true, 0));
+    assert(!ih_run_due(false, IH_DAY_MS - 1));
+    assert(ih_run_due(false, IH_DAY_MS));
+    assert(ih_run_now(250) == RD_CYCLE_MAX);
+    assert(ih_run_overflow(250) == 150);
+    assert(ih_run_overflow(40) == 0);
+    assert(rd_overflow_reason() == TM_DL_OVERFLOW);
+}
+
+test "every event name lives in t27l: actions 167..174 and 165" {
+    assert(ih_ev_duplicate() == 167);
+    assert(ih_ev_stale() == 168);
+    assert(ih_ev_resolved() == 169);
+    assert(ih_ev_close_recommended() == 170);
+    assert(ih_ev_closed() == 171);
+    assert(ih_ev_archive_recommended() == 172);
+    assert(ih_ev_cron() == 173);
+    assert(ih_ev_overflow() == 174);
+    assert(ih_ev_owner_approval() == 165);
+}
+
+invariant "the evidence bits are distinct and the windows are ordered" {
+    assert((RE_CANDIDATE & RE_OWNER_DECISION) == 0);
+    assert(RE_GRAPH == (RE_VERIFIED_ARTIFACT | RE_SUPERSEDED));
+    assert(IH_DAY_MS < IH_STALE_MS);
+    assert(IH_STALE_MS < IH_ESCALATE_MS);
+}

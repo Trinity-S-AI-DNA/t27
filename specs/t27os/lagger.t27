@@ -1,0 +1,705 @@
+// SPDX-License-Identifier: Apache-2.0
+; Closes #11275
+; specs/t27os/lagger.t27 -- the T27LAGGER: the COST-ORDERED ladder of every path this node can reach.
+; Owner, 2026-11-05 (translated): "set the work through every possible path through the agents that give free
+; access; make the T27Lagger so that when a T27 model is installed the ladder picks the free ones first and the
+; paid ones after -- otherwise it is very expensive."
+; This spec is the decision half of that ladder. The serving half is specs/t27os/lagger_serve.t27 (next lane);
+; the T27 Ladder it grows out of is specs/t27os/ladder.t27, whose probe, refusal and fail-closed laws this file
+; imports instead of copying them. Nothing here reads a key, opens a socket or spends money.
+; --
+; WHAT THE OWNER'S WORDS MEASURED (this Mac, 2026-11-05, one probe per path, the command in the comment of the
+; path it measured):
+;   - z.ai coding pool (5 keys): key 1 answered 429/1310 "Weekly/Monthly Limit Exhausted, reset 2026-11-08
+;     14:35:31"; keys 2..5 answered 429/1113 "Insufficient balance or no resource package. Please recharge.".
+;     The free coding tier is therefore DEAD today, and the ladder must say so instead of walking past it.
+;   - ollama cloud (gemma4:31b-cloud through 127.0.0.1:11434): 402 "usage credits auto reload payment failed".
+;     The other cloud ids in the local list are retired (410): qwen3.5, kimi-k2.5, kimi-k2.6, deepseek-v3.2,
+;     glm-5. DEAD.
+;   - openrouter, free model id z-ai/glm-4.5-air:free with the Keychain key (ai.t27.os/openrouter): 401 "User
+;     not found." -- a STALE KEY, not a quota. DEAD.
+;   - nvidia (Keychain key ai.t27.os/nvidia): the catalogue /v1/models answered 200, the chat endpoint answered
+;     404 for the id used here, so this path is NOT MEASURED. It is a free-credit path, so it stays in the free
+;     tier and is probed, but no claim is made about it.
+;   - LM Studio on 127.0.0.1:1234, model qwen/qwen3-4b-2507: 200 in 9.4 s with 0 reasoning tokens and real
+;     content, no key, no quota, no account. ALIVE, and the only path measured alive today.
+;   - ollama on-device (qwen3:4b): pulling on 2026-11-05, so NOT MEASURED yet.
+;   - teamo: answered 200 on 2026-11-04 (provider-inventory, three model ids). PAID.
+; The consequence the owner complained about is visible in the table: every free path but the local one is dead
+; or unmeasured, so a ladder that walks to the tail lands on a PAID path and spends. The laws below make that
+; impossible without an explicit grant.
+; --
+; THE LAWS:
+;   1. COST FIRST: the walk visits every FREE path before any PAID path, whatever the order inside a tier.
+;      A paid path is never called while a free path is untried.
+;   2. NO FREE FAILURE AUTHORIZES MONEY: a refused, dead, unwired or unknown free path does NOT permit a paid
+;      call. Only an explicit owner grant (GRANT_PAID) does. This is the repository policy in AGENTS.md
+;      ("Failure of a local provider does not authorize switching to a paid provider") written as code.
+;   3. UNKNOWN IS THE MOST EXPENSIVE: a path whose cost was not measured is treated as PAID. An unknown path
+;      is never called before a known free one and never without a grant.
+;   4. PROBE EVIDENCE: a path is called only while it holds a key (unless it is keyless) and its turn-sized
+;      probe state is PROBE_OK (ladder.t27 law 8). A path that refused is skipped with NO network call until
+;      its probe is stale (LG_REPROBE_MS), so the dead paths above cost one probe each, not one call each.
+;   5. THE REQUEST SHAPE IS PER PATH AND PER MODEL: the thinking field of a request is a property of the
+;      (path, model) pair, not of the provider. Measured 2026-11-05: z.ai glm-5.3-flash answers 400/1210
+;      ("this model always engages in thinking and cannot be disabled") for thinking disabled AND for thinking
+;      low, while the request WITHOUT the field reaches the quota layer (429/1113) -- so the field must be
+;      OMITTED for that model, and the older law 6 of ladder.t27 (thinking off on the GLM head) no longer holds
+;      for it. z.ai glm-4.7-flash accepted thinking disabled (it answered 429/1305, a service overload, so the
+;      shape was accepted). A shape refusal is NOT a quota refusal: it never demotes a path and never marks a
+;      key bad (ladder.t27 demotes_rung is true only for 429 and 402).
+;   6. FAIL CLOSED: when no path can serve, the answer is 503 and its body names every path that was tried, in
+;      walk order, with its cost class -- so a tail path cannot mask an earlier failure (ladder.t27 law 3).
+;   7. THE COST ORDER IS THE TABLE ORDER: the table below is the walk order inside the free tier (best free
+;      coding tier first, the always-there local floor last) and the paid tier follows it. Nothing keeps a
+;      second copy of the table: the serve loop reads names, urls, models, cost classes and shapes from here.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osLagger;
+
+use t27os::ladder::{refusal, transient, demotes_rung, probe_after, rung_wired, PROBE_NONE, PROBE_OK, PROBE_REFUSED, STATUS_UNWIRED};
+use t27os::provider_router::pr_has;
+
+// ---- 1. the path table: the walk order, the free tier then the paid tier ----
+
+pub const PATH_COUNT : usize = 9;
+
+// -- the free tier (indices 0..5) --
+// PATH 0: z.ai coding pool -- the free coding tier, 5 rotating keys. DEAD on 2026-11-05 (429/1310 once,
+//         429/1113 four times); its quota window returns on 2026-11-08 14:35:31, so it is re-probed.
+// PATH 1: openrouter free model ids -- needs the Keychain key; STALE KEY on 2026-11-05 (401).
+// PATH 2: nvidia free-credit ids -- NOT MEASURED on 2026-11-05 (catalogue 200, chat 404 for the id used).
+// PATH 3: ollama cloud free plan (gemma4:31b-cloud) -- DEAD on 2026-11-05 (402, credits auto reload failed).
+// PATH 4: LM Studio on this Mac -- ALIVE on 2026-11-05, 200 in 9.4 s, no key. The floor.
+// PATH 5: ollama on-device -- NOT MEASURED on 2026-11-05 (qwen3:4b pulling). The second floor.
+// -- the paid tier (indices 6..8) --
+pub const PATH_ZAI : usize = 0;
+pub const PATH_OPENROUTER_FREE : usize = 1;
+pub const PATH_NVIDIA_FREE : usize = 2;
+pub const PATH_OLLAMA_CLOUD : usize = 3;
+pub const PATH_LMS_LOCAL : usize = 4;
+pub const PATH_OLLAMA_LOCAL : usize = 5;
+pub const PATH_TEAMO : usize = 6;
+pub const PATH_OPENROUTER_PAID : usize = 7;
+pub const PATH_DEEPSEEK : usize = 8;
+
+/// The first paid path index; every index below it belongs to the free tier.
+pub const FIRST_PAID_PATH : usize = 6;
+
+// ---- 2. the cost classes ----
+
+/// No money at all: an on-device model on this Mac.
+pub const COST_FREE : u32 = 0;
+/// The provider's own free allowance or free credits (a free tier with a quota).
+pub const COST_FREE_CREDIT : u32 = 1;
+/// The owner's money.
+pub const COST_PAID : u32 = 2;
+/// Not measured: treated as the most expensive class (law 3).
+pub const COST_UNKNOWN : u32 = 3;
+
+/// The cost class of a path. The two local paths cost nothing; the nvidia path spends free build credits; the
+/// three tail paths spend money; openrouter's free ids and the z.ai pool spend a free tier.
+pub fn lg_path_cost(p : usize) -> u32 {
+    if (p == PATH_ZAI) { return COST_FREE_CREDIT; }
+    if (p == PATH_OPENROUTER_FREE) { return COST_FREE_CREDIT; }
+    if (p == PATH_NVIDIA_FREE) { return COST_FREE_CREDIT; }
+    if (p == PATH_OLLAMA_CLOUD) { return COST_FREE_CREDIT; }
+    if (p == PATH_LMS_LOCAL) { return COST_FREE; }
+    if (p == PATH_OLLAMA_LOCAL) { return COST_FREE; }
+    if (p == PATH_TEAMO) { return COST_PAID; }
+    if (p == PATH_OPENROUTER_PAID) { return COST_PAID; }
+    if (p == PATH_DEEPSEEK) { return COST_PAID; }
+    return COST_UNKNOWN;
+}
+
+/// True when the class spends no owner money (a free tier and a free-credit tier both do not).
+pub fn lg_is_free(cost : u32) -> bool {
+    if (cost == COST_FREE) { return true; }
+    if (cost == COST_FREE_CREDIT) { return true; }
+    return false;
+}
+
+/// True when the class may spend the owner's money, or when it is unknown and therefore assumed to.
+pub fn lg_is_money(cost : u32) -> bool {
+    if (cost == COST_PAID) { return true; }
+    if (cost == COST_UNKNOWN) { return true; }
+    return false;
+}
+
+// ---- 3. the grant: the only thing that opens the paid tier ----
+
+/// No grant: the default. A free path that refuses is never answered with money.
+pub const GRANT_NONE : u32 = 0;
+/// The owner granted paid calls for this run.
+pub const GRANT_PAID : u32 = 1;
+
+/// True when the owner granted paid calls.
+pub fn lg_paid_granted(grant : u32) -> bool {
+    return grant == GRANT_PAID;
+}
+
+/// True when a path of this class may be called at all (law 2): a money class needs the grant, a free class
+/// never does.
+pub fn lg_class_callable(cost : u32, grant : u32) -> bool {
+    if (lg_is_money(cost)) { return lg_paid_granted(grant); }
+    return true;
+}
+
+/// True when this path may be called, given the class of the path and the grant.
+pub fn lg_path_callable(p : usize, grant : u32) -> bool {
+    return lg_class_callable(lg_path_cost(p), grant);
+}
+
+// ---- 4. the measured state of each path (dated; the live state is the probe state) ----
+
+/// The path answered a turn-sized request with 200 on the day it was measured.
+pub const MS_ALIVE : u32 = 0;
+/// The free tier's quota window is exhausted (429/1310).
+pub const MS_QUOTA : u32 = 1;
+/// The account has no package or balance (429/1113).
+pub const MS_BALANCE : u32 = 2;
+/// The account is unfunded (402).
+pub const MS_UNFUNDED : u32 = 3;
+/// The credential is stale or rejected (401/403).
+pub const MS_STALE_KEY : u32 = 4;
+/// Not measured yet.
+pub const MS_NOT_MEASURED : u32 = 5;
+
+/// The last MEASURED state of a path, as of 2026-11-05 on this Mac. It is a dated reading, never a live claim:
+/// the live state of a path is its probe state, which the serve loop keeps.
+pub fn lg_path_measured(p : usize) -> u32 {
+    if (p == PATH_ZAI) { return MS_QUOTA; }
+    if (p == PATH_OPENROUTER_FREE) { return MS_STALE_KEY; }
+    if (p == PATH_NVIDIA_FREE) { return MS_NOT_MEASURED; }
+    if (p == PATH_OLLAMA_CLOUD) { return MS_UNFUNDED; }
+    if (p == PATH_LMS_LOCAL) { return MS_ALIVE; }
+    if (p == PATH_OLLAMA_LOCAL) { return MS_NOT_MEASURED; }
+    if (p == PATH_TEAMO) { return MS_ALIVE; }
+    return MS_NOT_MEASURED;
+}
+
+/// The day the readings above were taken, as a fixed text (the lagger's own date field).
+pub const MEASURED_ON : str = "2026-11-05";
+
+// ---- 5. the request shape law (law 5) ----
+
+/// Send no thinking field at all.
+pub const SHAPE_NONE : u32 = 0;
+/// Send thinking disabled.
+pub const SHAPE_DISABLED : u32 = 1;
+/// Send thinking low.
+pub const SHAPE_LOW : u32 = 2;
+
+/// The thinking shape of one (path, model) pair. Measured 2026-11-05: z.ai glm-5.3-flash refuses the field in
+/// every form (400/1210) and accepts the request without it, so its shape is SHAPE_NONE; z.ai glm-4.7-flash
+/// accepted thinking disabled; every other path takes the OpenAI-compatible body with no thinking field.
+pub fn lg_path_shape(p : usize, m : usize) -> u32 {
+    if (p == PATH_ZAI) {
+        if (m == 0) { return SHAPE_NONE; }
+        if (m == 1) { return SHAPE_DISABLED; }
+        if (m == 2) { return SHAPE_DISABLED; }
+    }
+    return SHAPE_NONE;
+}
+
+/// True when the answer is a shape refusal: a 400 whose body names the thinking field. z.ai codes it 1210.
+pub fn lg_is_shape_refusal(status : u32, body : []const u8) -> bool {
+    if (status != 400) { return false; }
+    if (pr_has(body, "1210")) { return true; }
+    return pr_has(body, "thinking");
+}
+
+// ---- 6. the walk (laws 1, 2, 4) ----
+
+/// The sentinel for "no path".
+pub const PATH_NONE : u32 = 255;
+/// A path table of up to 16 paths fits one u32 tried mask.
+pub const PATH_MASK_MAX : u32 = 16;
+/// A refused path is probed again after this long (the same window the T27 Ladder uses).
+pub const LG_REPROBE_MS : u64 = 300000;
+/// The lagger serves the loopback port the T27 Ladder serves; it replaces that service, it does not add one.
+pub const LAGGER_PORT : u32 = 3131;
+
+/// The bit of a path in the tried mask.
+pub fn lg_mask_bit(p : u32) -> u32 {
+    if (p >= PATH_MASK_MAX) { return 0; }
+    return 1 << p;
+}
+
+/// True when the path was already tried in this turn.
+pub fn lg_was_tried(tried : u32, p : u32) -> bool {
+    if (p >= PATH_MASK_MAX) { return false; }
+    return (tried >> p) % 2 == 1;
+}
+
+/// True when every free path was tried or skipped (law 1: only then may a paid path be considered).
+pub fn lg_free_exhausted(tried : u32) -> bool {
+    var p : u32 = 0;
+    while (p < FIRST_PAID_PATH) {
+        if ((tried >> p) % 2 == 0) { return false; }
+        p = p + 1;
+    }
+    return true;
+}
+
+/// The next path to call, walking the table in order from `from`. A path is skipped when it was already tried,
+/// when its class may not be called (law 2), and when it is a money path while a free path is still untried
+/// (law 1). PATH_NONE when the walk is over.
+pub fn lg_next_path(from : u32, tried : u32, grant : u32) -> u32 {
+    var p : u32 = from;
+    while (p < PATH_COUNT) {
+        if (lg_was_tried(tried, p) == false) {
+            if (lg_path_callable(p, grant)) {
+                if (lg_is_money(lg_path_cost(p))) {
+                    if (lg_free_exhausted(tried)) { return p; }
+                } else {
+                    return p;
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return PATH_NONE;
+}
+
+/// The walk order as a mask: every path the walk may call with this grant, free tier first.
+pub fn lg_callable_mask(grant : u32) -> u32 {
+    var mask : u32 = 0;
+    var p : u32 = 0;
+    while (p < PATH_COUNT) {
+        if (lg_path_callable(p, grant)) { mask = mask | lg_mask_bit(p); }
+        p = p + 1;
+    }
+    return mask;
+}
+
+// ---- 7. the model resolution (law: free first, then paid) ----
+
+/// True when the path serves that model id.
+pub fn lg_serves_model(p : usize, model : []const u8) -> bool {
+    var m : usize = 0;
+    while (m < lg_path_model_count(p)) {
+        if (pr_has(model, lg_path_model(p, m))) { return true; }
+        m = m + 1;
+    }
+    return false;
+}
+
+/// The path that serves the requested model at the cheapest class; among equal classes the earliest path in
+/// the table. A money path is eligible only with the grant. PATH_NONE when no path serves that model.
+pub fn lg_resolve(model : []const u8, grant : u32) -> u32 {
+    var best : u32 = PATH_NONE;
+    var best_cost : u32 = 255;
+    var p : u32 = 0;
+    while (p < PATH_COUNT) {
+        if (lg_serves_model(p, model)) {
+            if (lg_class_callable(lg_path_cost(p), grant)) {
+                const cost : u32 = lg_path_cost(p);
+                if (cost < best_cost) {
+                    best = p;
+                    best_cost = cost;
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return best;
+}
+
+/// The head path: the first free path in the table. The head is never a money path -- the walk, not the head,
+/// decides when money may be spent.
+pub fn lg_head_path() -> u32 {
+    var p : u32 = 0;
+    while (p < FIRST_PAID_PATH) {
+        if (lg_is_free(lg_path_cost(p))) { return p; }
+        p = p + 1;
+    }
+    return PATH_NONE;
+}
+
+/// The model the head serves.
+pub fn lg_head_model() -> []const u8 {
+    return lg_path_model(lg_head_path(), 0);
+}
+
+// ---- 8. the fail-closed body (law 6) ----
+
+/// True when the 503 body carries an entry for this path.
+pub fn lg_names(tried : u32, p : u32) -> bool {
+    return lg_was_tried(tried, p);
+}
+
+/// The next path named in the 503 body at or after `from`, in walk order; PATH_NONE when none is left.
+pub fn lg_next_named(tried : u32, from : u32) -> u32 {
+    var p : u32 = from;
+    while (p < PATH_COUNT) {
+        if (lg_was_tried(tried, p)) { return p; }
+        p = p + 1;
+    }
+    return PATH_NONE;
+}
+
+/// How many entries the 503 body carries.
+pub fn lg_named_count(tried : u32) -> u32 {
+    var n : u32 = 0;
+    var p : u32 = 0;
+    while (p < PATH_COUNT) {
+        if (lg_was_tried(tried, p)) { n = n + 1; }
+        p = p + 1;
+    }
+    return n;
+}
+
+// ---- 9. the path table itself (the one home of names, urls and models) ----
+
+/// The path's name, as /health and the 503 body spell it; "" past the table.
+pub fn lg_path_name(p : usize) -> []const u8 {
+    if (p == PATH_ZAI) { return "zai-pool"; }
+    if (p == PATH_OPENROUTER_FREE) { return "openrouter-free"; }
+    if (p == PATH_NVIDIA_FREE) { return "nvidia-free"; }
+    if (p == PATH_OLLAMA_CLOUD) { return "ollama-cloud"; }
+    if (p == PATH_LMS_LOCAL) { return "lms-local"; }
+    if (p == PATH_OLLAMA_LOCAL) { return "ollama-local"; }
+    if (p == PATH_TEAMO) { return "teamo"; }
+    if (p == PATH_OPENROUTER_PAID) { return "openrouter-paid"; }
+    if (p == PATH_DEEPSEEK) { return "deepseek"; }
+    return "";
+}
+
+/// The chat-completions endpoint of the path; "" past the table.
+pub fn lg_path_url(p : usize) -> []const u8 {
+    if (p == PATH_ZAI) { return "https://api.z.ai/api/coding/paas/v4/chat/completions"; }
+    if (p == PATH_OPENROUTER_FREE) { return "https://openrouter.ai/api/v1/chat/completions"; }
+    if (p == PATH_NVIDIA_FREE) { return "https://integrate.api.nvidia.com/v1/chat/completions"; }
+    if (p == PATH_OLLAMA_CLOUD) { return "http://127.0.0.1:11434/v1/chat/completions"; }
+    if (p == PATH_LMS_LOCAL) { return "http://127.0.0.1:1234/v1/chat/completions"; }
+    if (p == PATH_OLLAMA_LOCAL) { return "http://127.0.0.1:11434/v1/chat/completions"; }
+    if (p == PATH_TEAMO) { return "https://api.teamorouter.com/v1/chat/completions"; }
+    if (p == PATH_OPENROUTER_PAID) { return "https://openrouter.ai/api/v1/chat/completions"; }
+    if (p == PATH_DEEPSEEK) { return "https://api.deepseek.com/chat/completions"; }
+    return "";
+}
+
+/// True when the path needs no key: the two paths on this Mac.
+pub fn lg_path_keyless(p : usize) -> bool {
+    if (p == PATH_LMS_LOCAL) { return true; }
+    if (p == PATH_OLLAMA_LOCAL) { return true; }
+    return false;
+}
+
+/// How many models the path tries, in order, before it counts as refused.
+pub fn lg_path_model_count(p : usize) -> usize {
+    if (p == PATH_ZAI) { return 3; }
+    if (p == PATH_OPENROUTER_FREE) { return 2; }
+    if (p == PATH_NVIDIA_FREE) { return 2; }
+    if (p == PATH_OLLAMA_CLOUD) { return 1; }
+    if (p == PATH_LMS_LOCAL) { return 2; }
+    if (p == PATH_OLLAMA_LOCAL) { return 1; }
+    if (p == PATH_TEAMO) { return 1; }
+    if (p == PATH_OPENROUTER_PAID) { return 1; }
+    if (p == PATH_DEEPSEEK) { return 1; }
+    return 0;
+}
+
+/// Model m of the path (0-based, in try order); "" past the table.
+pub fn lg_path_model(p : usize, m : usize) -> []const u8 {
+    if (p == PATH_ZAI and m == 0) { return "glm-5.3-flash"; }
+    if (p == PATH_ZAI and m == 1) { return "glm-4.7-flash"; }
+    if (p == PATH_ZAI and m == 2) { return "glm-4.5-flash"; }
+    if (p == PATH_OPENROUTER_FREE and m == 0) { return "z-ai/glm-4.5-air:free"; }
+    if (p == PATH_OPENROUTER_FREE and m == 1) { return "minimax/minimax-m3.1-flash:free"; }
+    if (p == PATH_NVIDIA_FREE and m == 0) { return "nvidia/nemotron-3.5-super-vl:free"; }
+    if (p == PATH_NVIDIA_FREE and m == 1) { return "meta/llama-3.3-70b-instruct"; }
+    if (p == PATH_OLLAMA_CLOUD and m == 0) { return "gemma4:31b-cloud"; }
+    if (p == PATH_LMS_LOCAL and m == 0) { return "qwen/qwen3-4b-2507"; }
+    if (p == PATH_LMS_LOCAL and m == 1) { return "qwen/qwen3-4b-thinking-2507"; }
+    if (p == PATH_OLLAMA_LOCAL and m == 0) { return "qwen3:4b"; }
+    if (p == PATH_TEAMO and m == 0) { return "deepseek-v4-pro"; }
+    if (p == PATH_OPENROUTER_PAID and m == 0) { return "deepseek/deepseek-chat"; }
+    if (p == PATH_DEEPSEEK and m == 0) { return "deepseek-chat"; }
+    return "";
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Run budget guard (GODMODE Phase 4b gap d). A run has four caps: calls, tokens, milliseconds, micro-dollars.
+// A cap of 0 means no cap on that axis. NEAR at 80 percent of a cap, HIT at the cap. HIT stops the run and the
+// owner is notified; NEAR only warns.
+// ---------------------------------------------------------------------------------------------------------------
+
+pub const BUDGET_OK : u32 = 0;
+pub const BUDGET_NEAR : u32 = 1;
+pub const BUDGET_HIT : u32 = 2;
+
+pub const CAP_CALLS : u32 = 0;
+pub const CAP_TOKENS : u32 = 1;
+pub const CAP_MS : u32 = 2;
+pub const CAP_MICRO_USD : u32 = 3;
+pub const CAP_AXIS_NONE : u32 = 255;
+
+/// The status of one axis: OK without a cap, HIT at or past the cap, NEAR from 80 percent of it.
+pub fn lg_axis_status(used : u64, cap : u64) -> u32 {
+    if (cap == 0) { return BUDGET_OK; }
+    if (used >= cap) { return BUDGET_HIT; }
+    if (used * 5 >= cap * 4) { return BUDGET_NEAR; }
+    return BUDGET_OK;
+}
+
+/// The run's status: the worst of its four axes.
+pub fn lg_budget_status(calls : u64, cap_calls : u64, tokens : u64, cap_tokens : u64,
+                        ms : u64, cap_ms : u64, micro_usd : u64, cap_micro_usd : u64) -> u32 {
+    var worst : u32 = lg_axis_status(calls, cap_calls);
+    var s : u32 = lg_axis_status(tokens, cap_tokens);
+    if (s > worst) { worst = s; }
+    s = lg_axis_status(ms, cap_ms);
+    if (s > worst) { worst = s; }
+    s = lg_axis_status(micro_usd, cap_micro_usd);
+    if (s > worst) { worst = s; }
+    return worst;
+}
+
+/// The first axis that is HIT, in the order calls, tokens, ms, micro-dollars; CAP_AXIS_NONE when none is.
+pub fn lg_budget_first_hit(calls : u64, cap_calls : u64, tokens : u64, cap_tokens : u64,
+                           ms : u64, cap_ms : u64, micro_usd : u64, cap_micro_usd : u64) -> u32 {
+    if (lg_axis_status(calls, cap_calls) == BUDGET_HIT) { return CAP_CALLS; }
+    if (lg_axis_status(tokens, cap_tokens) == BUDGET_HIT) { return CAP_TOKENS; }
+    if (lg_axis_status(ms, cap_ms) == BUDGET_HIT) { return CAP_MS; }
+    if (lg_axis_status(micro_usd, cap_micro_usd) == BUDGET_HIT) { return CAP_MICRO_USD; }
+    return CAP_AXIS_NONE;
+}
+
+/// True when the run must stop and notify the owner.
+pub fn lg_budget_stops(status : u32) -> bool {
+    return status == BUDGET_HIT;
+}
+
+// ---- 10. tests: the law is executable, not prose ----
+
+test the_table_is_free_tier_first_and_paid_tier_last {
+    var p : usize = 0;
+    while (p < PATH_COUNT) {
+        if (p < FIRST_PAID_PATH) {
+            assert lg_is_free(lg_path_cost(p));
+        } else {
+            assert lg_is_money(lg_path_cost(p));
+        }
+        p = p + 1;
+    }
+    assert PATH_COUNT == 9;
+    assert FIRST_PAID_PATH == 6;
+    assert lg_path_cost(PATH_LMS_LOCAL) == COST_FREE;
+    assert lg_path_cost(PATH_TEAMO) == COST_PAID;
+    assert lg_path_cost(99) == COST_UNKNOWN;
+}
+
+test the_free_tier_is_never_skipped_for_a_paid_path {
+    // Nothing tried: the walk starts at the z.ai pool, the free coding tier.
+    assert lg_next_path(0, 0, GRANT_NONE) == PATH_ZAI;
+    // The free tier is walked in table order.
+    assert lg_next_path(1, lg_mask_bit(0), GRANT_NONE) == PATH_OPENROUTER_FREE;
+    assert lg_next_path(2, lg_mask_bit(0) | lg_mask_bit(1), GRANT_NONE) == PATH_NVIDIA_FREE;
+    assert lg_next_path(3, lg_mask_bit(0) | lg_mask_bit(1) | lg_mask_bit(2), GRANT_NONE) == PATH_OLLAMA_CLOUD;
+    assert lg_next_path(4, lg_mask_bit(0) | lg_mask_bit(1) | lg_mask_bit(2) | lg_mask_bit(3), GRANT_NONE) == PATH_LMS_LOCAL;
+    assert lg_next_path(5, lg_mask_bit(0) | lg_mask_bit(1) | lg_mask_bit(2) | lg_mask_bit(3) | lg_mask_bit(4), GRANT_NONE) == PATH_OLLAMA_LOCAL;
+}
+
+test a_paid_path_is_not_called_while_a_free_path_is_untried {
+    // Only the paid tier is callable, and it is not reached because the free tier is not exhausted.
+    assert lg_free_exhausted(0) == false;
+    assert lg_next_path(FIRST_PAID_PATH, 0, GRANT_PAID) == PATH_NONE;
+    // When every free path was tried, the paid tier opens.
+    const free_all : u32 = 63;
+    assert lg_free_exhausted(free_all) == true;
+    assert lg_next_path(FIRST_PAID_PATH, free_all, GRANT_PAID) == PATH_TEAMO;
+}
+
+test no_free_failure_authorizes_money {
+    // Every free path tried, and no grant: the walk is over, the answer is the fail-closed 503.
+    const free_all : u32 = 63;
+    assert lg_next_path(FIRST_PAID_PATH, free_all, GRANT_NONE) == PATH_NONE;
+    // The class law: a money class needs the grant, a free class never does.
+    assert lg_class_callable(COST_FREE, GRANT_NONE) == true;
+    assert lg_class_callable(COST_FREE_CREDIT, GRANT_NONE) == true;
+    assert lg_class_callable(COST_PAID, GRANT_NONE) == false;
+    assert lg_class_callable(COST_PAID, GRANT_PAID) == true;
+    // An unknown path is the most expensive class (law 3).
+    assert lg_class_callable(COST_UNKNOWN, GRANT_NONE) == false;
+    assert lg_class_callable(COST_UNKNOWN, GRANT_PAID) == true;
+}
+
+test the_grant_is_the_only_thing_that_opens_the_paid_tier {
+    assert lg_paid_granted(GRANT_NONE) == false;
+    assert lg_paid_granted(GRANT_PAID) == true;
+    assert lg_paid_granted(7) == false;
+    // Without a grant the callable mask holds the free tier only.
+    const free_only : u32 = lg_callable_mask(GRANT_NONE);
+    assert free_only == 63;
+    // With the grant every path is callable.
+    assert lg_callable_mask(GRANT_PAID) == 511;
+}
+
+test the_walk_skips_a_path_that_was_already_tried {
+    const tried_one : u32 = lg_mask_bit(PATH_ZAI);
+    assert lg_next_path(0, tried_one, GRANT_NONE) == PATH_OPENROUTER_FREE;
+    assert lg_was_tried(tried_one, PATH_ZAI) == true;
+    assert lg_was_tried(tried_one, PATH_LMS_LOCAL) == false;
+    assert lg_mask_bit(0) == 1;
+    assert lg_mask_bit(4) == 16;
+    assert lg_mask_bit(99) == 0;
+}
+
+test a_requested_model_resolves_to_the_cheapest_path_that_serves_it {
+    // glm-5.3-flash: the z.ai pool serves it as a free tier.
+    assert lg_resolve("glm-5.3-flash", GRANT_NONE) == PATH_ZAI;
+    // A local model resolves to the local path, which costs nothing.
+    assert lg_resolve("qwen/qwen3-4b-2507", GRANT_NONE) == PATH_LMS_LOCAL;
+    assert lg_resolve("qwen3:4b", GRANT_NONE) == PATH_OLLAMA_LOCAL;
+    // deepseek-chat is served by a paid path only; without a grant it resolves to nothing.
+    assert lg_resolve("deepseek-chat", GRANT_NONE) == PATH_NONE;
+    assert lg_resolve("deepseek-chat", GRANT_PAID) == PATH_DEEPSEEK;
+    // A model nobody serves resolves to nothing, and the caller falls back to the head.
+    assert lg_resolve("gpt-6-astra", GRANT_NONE) == PATH_NONE;
+}
+
+test the_head_is_a_free_path_and_never_a_paid_one {
+    assert lg_head_path() == PATH_ZAI;
+    assert lg_is_free(lg_path_cost(lg_head_path()));
+    assert lg_head_model()[0] == 103;
+    // The head of the table is the free coding tier, never the paid tail.
+    var p : u32 = 0;
+    while (p < PATH_COUNT) {
+        if (lg_path_cost(p) == COST_PAID) { assert lg_path_cost(lg_head_path()) != COST_PAID; }
+        p = p + 1;
+    }
+}
+
+test the_request_shape_is_measured_per_model_not_per_provider {
+    // z.ai glm-5.3-flash: the field must be omitted (400/1210 otherwise).
+    assert lg_path_shape(PATH_ZAI, 0) == SHAPE_NONE;
+    // z.ai glm-4.7-flash accepted thinking disabled.
+    assert lg_path_shape(PATH_ZAI, 1) == SHAPE_DISABLED;
+    // Every other path takes the plain OpenAI-compatible body.
+    assert lg_path_shape(PATH_LMS_LOCAL, 0) == SHAPE_NONE;
+    assert lg_path_shape(PATH_TEAMO, 0) == SHAPE_NONE;
+}
+
+test a_shape_refusal_is_not_a_quota_refusal {
+    // The body of the measured z.ai answer.
+    const body : []const u8 = "{\"error\":{\"code\":\"1210\",\"message\":\"This model always engages in thinking and cannot be disabled; please use low, high, or max\"}}";
+    assert lg_is_shape_refusal(400, body) == true;
+    assert lg_is_shape_refusal(429, body) == false;
+    assert lg_is_shape_refusal(400, "{\"error\":{\"code\":\"1310\"}}") == false;
+    // A shape refusal never demotes a path and never marks a key bad (ladder.t27 law 7).
+    assert demotes_rung(400) == false;
+    assert demotes_rung(429) == true;
+    assert demotes_rung(402) == true;
+    // And it is not service noise either.
+    assert transient(400) == false;
+}
+
+test the_probe_law_still_comes_from_the_ladder {
+    // A path without a key, or without a turn-sized 200, makes no network call.
+    assert rung_wired(true, PROBE_OK) == true;
+    assert rung_wired(false, PROBE_OK) == false;
+    assert rung_wired(true, PROBE_REFUSED) == false;
+    // A one-token answer is not evidence.
+    assert probe_after(200, 1) == PROBE_NONE;
+    assert probe_after(200, 100) == PROBE_OK;
+    assert probe_after(429, 0) == PROBE_REFUSED;
+    assert STATUS_UNWIRED < 100;
+}
+
+test the_503_names_every_tried_path_in_walk_order {
+    // z.ai, openrouter-free and lms-local were tried and refused.
+    const tried : u32 = lg_mask_bit(0) | lg_mask_bit(1) | lg_mask_bit(4);
+    assert lg_names(tried, PATH_ZAI) == true;
+    assert lg_names(tried, PATH_NVIDIA_FREE) == false;
+    assert lg_next_named(tried, 0) == PATH_ZAI;
+    assert lg_next_named(tried, 2) == PATH_LMS_LOCAL;
+    assert lg_next_named(tried, 5) == PATH_NONE;
+    assert lg_named_count(tried) == 3;
+}
+
+test the_table_has_no_empty_row_and_no_deepseek_in_the_free_tier {
+    var p : usize = 0;
+    while (p < PATH_COUNT) {
+        assert lg_path_name(p).len > 0;
+        assert lg_path_url(p).len > 0;
+        assert lg_path_model_count(p) > 0;
+        assert lg_path_model(p, 0).len > 0;
+        assert lg_path_model(p, lg_path_model_count(p)).len == 0;
+        p = p + 1;
+    }
+    assert lg_path_name(PATH_COUNT).len == 0;
+    assert lg_path_model_count(PATH_COUNT) == 0;
+    // The free tier holds no paid name.
+    assert lg_path_cost(PATH_DEEPSEEK) == COST_PAID;
+    assert lg_path_cost(PATH_OPENROUTER_PAID) == COST_PAID;
+    assert lg_path_cost(PATH_TEAMO) == COST_PAID;
+    // The two paths on this Mac need no key.
+    assert lg_path_keyless(PATH_LMS_LOCAL) == true;
+    assert lg_path_keyless(PATH_OLLAMA_LOCAL) == true;
+    assert lg_path_keyless(PATH_ZAI) == false;
+    assert LAGGER_PORT == 3131;
+}
+
+test the_measured_states_are_readings_not_claims {
+    // On 2026-11-05 the local path was the only free path measured alive.
+    assert lg_path_measured(PATH_LMS_LOCAL) == MS_ALIVE;
+    assert lg_path_measured(PATH_ZAI) == MS_QUOTA;
+    assert lg_path_measured(PATH_OLLAMA_CLOUD) == MS_UNFUNDED;
+    assert lg_path_measured(PATH_OPENROUTER_FREE) == MS_STALE_KEY;
+    assert lg_path_measured(PATH_NVIDIA_FREE) == MS_NOT_MEASURED;
+    assert MEASURED_ON[0] == 50;
+    assert MEASURED_ON[3] == 54;
+    assert MEASURED_ON[8] == 48;
+    assert MEASURED_ON[9] == 53;
+}
+
+invariant a_paid_path_is_never_before_a_free_path
+    assert lg_path_cost(PATH_TEAMO) == COST_PAID
+    assert lg_path_cost(PATH_LMS_LOCAL) == COST_FREE
+    assert FIRST_PAID_PATH == 6
+    assert PATH_ZAI == 0
+
+invariant no_free_path_costs_money
+    assert lg_is_free(lg_path_cost(PATH_ZAI))
+    assert lg_is_free(lg_path_cost(PATH_OPENROUTER_FREE))
+    assert lg_is_free(lg_path_cost(PATH_NVIDIA_FREE))
+    assert lg_is_free(lg_path_cost(PATH_OLLAMA_CLOUD))
+    assert lg_is_free(lg_path_cost(PATH_LMS_LOCAL))
+    assert lg_is_free(lg_path_cost(PATH_OLLAMA_LOCAL))
+
+test a_run_without_caps_never_stops {
+    assert lg_budget_status(1000000, 0, 1000000, 0, 1000000, 0, 1000000, 0) == BUDGET_OK;
+    assert lg_budget_first_hit(1000000, 0, 1000000, 0, 1000000, 0, 1000000, 0) == CAP_AXIS_NONE;
+    assert !lg_budget_stops(BUDGET_OK);
+}
+
+test an_axis_is_near_from_eighty_percent_and_hit_at_its_cap {
+    assert lg_axis_status(79, 100) == BUDGET_OK;
+    assert lg_axis_status(80, 100) == BUDGET_NEAR;
+    assert lg_axis_status(99, 100) == BUDGET_NEAR;
+    assert lg_axis_status(100, 100) == BUDGET_HIT;
+    assert lg_axis_status(101, 100) == BUDGET_HIT;
+    assert lg_axis_status(5, 0) == BUDGET_OK;
+}
+
+test one_hit_axis_stops_the_run_and_is_named {
+    const st : u32 = lg_budget_status(10, 100, 50000, 50000, 1000, 600000, 0, 2000000);
+    assert st == BUDGET_HIT;
+    assert lg_budget_stops(st);
+    assert lg_budget_first_hit(10, 100, 50000, 50000, 1000, 600000, 0, 2000000) == CAP_TOKENS;
+}
+
+test the_first_hit_axis_wins_in_table_order {
+    assert lg_budget_first_hit(5, 5, 0, 0, 9, 9, 3, 3) == CAP_CALLS;
+    assert lg_budget_first_hit(1, 5, 0, 0, 9, 9, 3, 3) == CAP_MS;
+    assert lg_budget_first_hit(1, 5, 0, 0, 1, 9, 3, 3) == CAP_MICRO_USD;
+}
+
+test near_warns_but_does_not_stop {
+    const st : u32 = lg_budget_status(90, 100, 0, 0, 0, 0, 0, 0);
+    assert st == BUDGET_NEAR;
+    assert !lg_budget_stops(st);
+    assert lg_budget_first_hit(90, 100, 0, 0, 0, 0, 0, 0) == CAP_AXIS_NONE;
+}
