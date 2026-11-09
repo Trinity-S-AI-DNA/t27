@@ -7754,14 +7754,14 @@ impl<'a> Lower<'a> {
 }
 #[path = "../../../gen/rust/tri/t27b/check_elide_plan.rs"] #[allow(dead_code, unused_parens)]
 mod ce; // t27c gen-rust of specs/tri/t27b/check_elide_plan.t27
-fn each(ss: &mut [Stmt], f: &mut dyn FnMut(VarId, &mut Expr)) {
+fn stmt_each(ss: &mut [Stmt], f: &mut dyn FnMut(VarId, &mut Expr)) {
     for s in ss { match s {
         Stmt::Assign { var, value } => f(*var, value),
-        Stmt::If { then, els, .. } => { each(then, f); each(els, f); }
-        Stmt::While { body, step, .. } => { each(body, f); each(step, f); }
+        Stmt::If { then, els, .. } => { stmt_each(then, f); stmt_each(els, f); }
+        Stmt::While { body, step, .. } => { stmt_each(body, f); stmt_each(step, f); }
         _ => {} } }
 }
-fn writes(ss: &mut [Stmt], x: VarId) -> u32 { let mut n = 0; each(ss, &mut |v, _| n += (v == x) as u32); n }
+fn writes(ss: &mut [Stmt], x: VarId) -> u32 { let mut n = 0; stmt_each(ss, &mut |v, _| n += (v == x) as u32); n }
 fn konst(op: ArithOp, x: VarId, e: &Expr) -> Option<u64> { // `x op c`, trapping, c as the law reads it
     match &e.kind { ExprKind::Arith { op: o, lhs, rhs: r, site } if *o == op && *site != 0 && matches!(lhs.kind, ExprKind::Var(v) if v == x) => match r.kind { ExprKind::Const(c) => u64::try_from(c).ok(), _ => None }, _ => None }
 }
@@ -7783,9 +7783,9 @@ fn elide_checks(ss: &mut [Stmt]) {
             let ExprKind::Var(iv) = lhs.kind else { continue };
             let fixed = match rhs.kind { ExprKind::Const(_) => true, ExprKind::Var(n) => n != iv && writes(body, n) + writes(step, n) == 0, _ => false };
             let (mut k, mut n) = (0, 0);
-            for l in [&mut *body, &mut *step] { each(l, &mut |v, e| if v == iv { n += 1; k = konst(ArithOp::Add, iv, e).unwrap_or(0); }); }
+            for l in [&mut *body, &mut *step] { stmt_each(l, &mut |v, e| if v == iv { n += 1; k = konst(ArithOp::Add, iv, e).unwrap_or(0); }); }
             if ce::induction_elides(*op as u8, lhs.ty == rhs.ty, fixed, n, k, false) { // a VarId is never addressed: address-taken locals live in slots
-                for l in [body, step] { each(l, &mut |v, e| if v == iv { relax(e, ArithOp::AddW); }); }
+                for l in [body, step] { stmt_each(l, &mut |v, e| if v == iv { relax(e, ArithOp::AddW); }); }
             }
         }
         _ => {} } }
