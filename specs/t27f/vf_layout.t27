@@ -1,0 +1,948 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27F-003: vf_layout resolves a valid visual-factory graph plus its viewport to one integer rectangle per node
+; Refs gHashTag/t27#13217, epic #13214
+; Reads VfGraph from specs/t27f/visual_factory_contract.t27 and never edits it
+; Limits: no Yoga, no CSS parity, no nested grids; every kind has one fixed intrinsic size, except as below
+; Text (Refs Trinity-S-AI-DNA/t27#13251): a text node is as tall as vf_text_height of its text at its FINAL width, and a
+; button or badge is one line, at least its label width (vf_label_width) wide; both come from specs/t27f/vf_text_measure.t27
+; Route: vf_layout runs vf_layout_pass twice. The first run measures nothing; the second measures every text node at the
+; width the first run gave it. No width and no x reads a height here (row widths, column cross widths and grid cells come
+; from the parent content width, basis and intrinsic widths only), so the second run keeps every width and x of the first
+; Measured leaves (T27F-007): a caller that measured a leaf passes its size through vf_layout_m, and that size replaces both the
+;   kind's own and the text measure above. A child is held to the inner cross extent of its parent
+; All arithmetic is u32 and non-negative: compare before subtracting
+
+module t27f_vf_layout;
+use t27f::visual_factory_contract::VfGraph;
+use t27f::visual_factory_contract::VF_BASE;
+use t27f::visual_factory_contract::VF_UNKNOWN;
+use t27f::visual_factory_contract::VF_CONTAINER;
+use t27f::visual_factory_contract::VF_STACK;
+use t27f::visual_factory_contract::VF_TEXT;
+use t27f::visual_factory_contract::VF_BUTTON;
+use t27f::visual_factory_contract::VF_BADGE;
+use t27f::visual_factory_contract::VF_LIST;
+use t27f::visual_factory_contract::VF_NO_PARENT;
+use t27f::visual_factory_contract::DISPLAY_GRID;
+use t27f::visual_factory_contract::DIR_ROW;
+use t27f::visual_factory_contract::DIR_COLUMN;
+use t27f::visual_factory_contract::DIR_INHERIT;
+use t27f::visual_factory_contract::ALIGN_CENTER;
+use t27f::visual_factory_contract::ALIGN_END;
+use t27f::visual_factory_contract::ALIGN_STRETCH;
+use t27f::visual_factory_contract::JUSTIFY_CENTER;
+use t27f::visual_factory_contract::JUSTIFY_END;
+use t27f::visual_factory_contract::JUSTIFY_SPACE_BETWEEN;
+use t27f::visual_factory_contract::BP_MD;
+use t27f::visual_factory_contract::vf_blank_graph;
+use t27f::visual_factory_contract::vf_add;
+use t27f::visual_factory_contract::vf_validate;
+use t27f::visual_factory_contract::vf_breakpoint;
+use t27f::visual_factory_contract::vf_child_count;
+use t27f::visual_factory_contract::vf_sample_graph;
+use t27f::vf_text_measure::vf_text_height;
+use t27f::vf_text_measure::vf_label_width;
+
+; intrinsic border-box width and height by kind id; box kinds derive theirs from children
+pub const VF_INTR_W : [9]u32 = [0, 0, 0, 80, 96, 160, 0, 48, 0];
+pub const VF_INTR_H : [9]u32 = [0, 0, 0, 20, 40, 40, 0, 24, 0];
+
+; VF_KINDS is 9: any kind id at or above it resolves to VF_UNKNOWN
+
+pub struct VfLayout {
+    node_count: u32,
+    bp: u8,
+    x: [16]u32,
+    y: [16]u32,
+    w: [16]u32,
+    h: [16]u32,
+}
+
+pub fn vf_resolve(kind: u8) -> u8 {
+    if kind >= 9 {
+        return VF_UNKNOWN;
+    }
+    return VF_BASE[kind as u32];
+}
+
+pub fn vf_is_box(kind: u8) -> bool {
+    var base : u8 = vf_resolve(kind);
+    if base == VF_CONTAINER {
+        return true;
+    }
+    if base == VF_STACK {
+        return true;
+    }
+    if base == VF_LIST {
+        return true;
+    }
+    return false;
+}
+
+pub fn vf_clamp(v: u32, lo: u32, hi: u32) -> u32 {
+    var r : u32 = v;
+    if hi != 0 and r > hi {
+        r = hi;
+    }
+    if r < lo {
+        r = lo;
+    }
+    return r;
+}
+
+pub fn vf_eff_direction(g: VfGraph, i: u32, bp: u8) -> u8 {
+    if bp >= BP_MD and g.direction_md[i] != DIR_INHERIT {
+        return g.direction_md[i];
+    }
+    return g.direction[i];
+}
+
+pub fn vf_blank_layout() -> VfLayout {
+    var l : VfLayout = VfLayout {
+        node_count: 0,
+        bp: 0,
+        x: [0; 16],
+        y: [0; 16],
+        w: [0; 16],
+        h: [0; 16],
+    };
+    return l;
+}
+
+; one layout run; when measure is set, every text node is as tall as its text at the width first gave it
+;   mw[i] and mh[i], when above 0, replace the intrinsic width and height of leaf node i, text measure included (a box derives its
+;   own from its children as before). Cross-axis narrowing: a child never exceeds the inner cross extent of its parent (minus its
+;   margins); an explicit min_w or min_h still wins
+pub fn vf_layout_pass(g: VfGraph, first: VfLayout, measure: bool, mw: [16]u32, mh: [16]u32) -> VfLayout {
+    var l : VfLayout = vf_blank_layout();
+    if vf_validate(g) != 0 {
+        return l;
+    }
+    if g.node_count == 0 {
+        return l;
+    }
+
+    var bp : u8 = vf_breakpoint(g.viewport_w);
+    l.bp = bp;
+    l.node_count = g.node_count;
+
+    var iw : [16]u32 = [0; 16];
+    var ih : [16]u32 = [0; 16];
+
+    // pass 1: intrinsic border-box size, bottom-up (parents have smaller indexes)
+    var pi : u32 = g.node_count;
+    while pi > 0 {
+        pi = pi - 1;
+        var pk : u8 = g.kind[pi];
+        if vf_is_box(pk) {
+            var ppad : u32 = g.padding[pi];
+            var pgp : u32 = g.gap[pi];
+            var pk2 : u32 = vf_child_count(g, pi);
+            if g.display[pi] == DISPLAY_GRID {
+                var pc : u32 = g.columns[pi] as u32;
+                if pc == 0 {
+                    pc = 1;
+                }
+                var pcw : u32 = 0;
+                var pch : u32 = 0;
+                var pj : u32 = 0;
+                while pj < g.node_count {
+                    if g.parent[pj] == pi as u8 {
+                        var pw : u32 = iw[pj] + g.margin[pj] + g.margin[pj];
+                        var ph : u32 = ih[pj] + g.margin[pj] + g.margin[pj];
+                        if pw > pcw {
+                            pcw = pw;
+                        }
+                        if ph > pch {
+                            pch = ph;
+                        }
+                    }
+                    pj = pj + 1;
+                }
+                var prows : u32 = 0;
+                if pk2 > 0 {
+                    prows = (pk2 + pc - 1) / pc;
+                }
+                var pww : u32 = ppad + ppad + pc * pcw;
+                if pc >= 2 {
+                    pww = pww + pgp * (pc - 1);
+                }
+                var phh : u32 = ppad + ppad + prows * pch;
+                if prows >= 2 {
+                    phh = phh + pgp * (prows - 1);
+                }
+                iw[pi] = vf_clamp(pww, g.min_w[pi], g.max_w[pi]);
+                ih[pi] = vf_clamp(phh, g.min_h[pi], g.max_h[pi]);
+            } else {
+                var pdir : u8 = vf_eff_direction(g, pi, bp);
+                var psum : u32 = 0;
+                var pmax : u32 = 0;
+                var pj2 : u32 = 0;
+                while pj2 < g.node_count {
+                    if g.parent[pj2] == pi as u8 {
+                        if pdir == DIR_COLUMN {
+                            var ph2 : u32 = ih[pj2] + g.margin[pj2] + g.margin[pj2];
+                            psum = psum + ph2;
+                            var pw2 : u32 = iw[pj2] + g.margin[pj2] + g.margin[pj2];
+                            if pw2 > pmax {
+                                pmax = pw2;
+                            }
+                        } else {
+                            var pw3 : u32 = iw[pj2] + g.margin[pj2] + g.margin[pj2];
+                            psum = psum + pw3;
+                            var ph3 : u32 = ih[pj2] + g.margin[pj2] + g.margin[pj2];
+                            if ph3 > pmax {
+                                pmax = ph3;
+                            }
+                        }
+                    }
+                    pj2 = pj2 + 1;
+                }
+                if pk2 > 0 {
+                    psum = psum + pgp * (pk2 - 1);
+                }
+                if pdir == DIR_COLUMN {
+                    iw[pi] = vf_clamp(ppad + ppad + pmax, g.min_w[pi], g.max_w[pi]);
+                    ih[pi] = vf_clamp(ppad + ppad + psum, g.min_h[pi], g.max_h[pi]);
+                } else {
+                    iw[pi] = vf_clamp(ppad + ppad + psum, g.min_w[pi], g.max_w[pi]);
+                    ih[pi] = vf_clamp(ppad + ppad + pmax, g.min_h[pi], g.max_h[pi]);
+                }
+            }
+        } else {
+            var pkk : u32 = pk as u32;
+            if pkk >= 9 {
+                pkk = 0;
+            }
+            iw[pi] = VF_INTR_W[pkk];
+            ih[pi] = VF_INTR_H[pkk];
+            if pk == VF_TEXT and measure {
+                ih[pi] = vf_text_height(g.text[pi], first.w[pi]);
+            }
+            if pk == VF_BUTTON or pk == VF_BADGE {
+                var lw : u32 = vf_label_width(g.text[pi]);
+                if lw > iw[pi] {
+                    iw[pi] = lw;
+                }
+            }
+            // a size the caller measured (vf_layout_m, T27F-007) replaces the kind's own and the text measure
+            if mw[pi] > 0 {
+                iw[pi] = mw[pi];
+            }
+            if mh[pi] > 0 {
+                ih[pi] = mh[pi];
+            }
+            // a leaf's own bounds hold here too, so a parent sums the size pass 2 will draw (a row of 44 px buttons is
+            // 44 high, not the 40 of their kind); without it the children overflow their stack
+            iw[pi] = vf_clamp(iw[pi], g.min_w[pi], g.max_w[pi]);
+            ih[pi] = vf_clamp(ih[pi], g.min_h[pi], g.max_h[pi]);
+        }
+    }
+
+    // pass 2: rectangles, top-down
+    l.x[0] = 0;
+    l.y[0] = 0;
+    l.w[0] = vf_clamp(g.viewport_w, g.min_w[0], g.max_w[0]);
+    l.h[0] = vf_clamp(ih[0], g.min_h[0], g.max_h[0]);
+
+    var i : u32 = 0;
+    while i < l.node_count {
+        if vf_is_box(g.kind[i]) {
+            var pad2 : u32 = g.padding[i];
+            var gp2 : u32 = g.gap[i];
+            var ix2 : u32 = l.x[i] + pad2;
+            var iy2 : u32 = l.y[i] + pad2;
+            var inw2 : u32 = 0;
+            var inh2 : u32 = 0;
+            if l.w[i] > pad2 + pad2 {
+                inw2 = l.w[i] - pad2 - pad2;
+            }
+            if l.h[i] > pad2 + pad2 {
+                inh2 = l.h[i] - pad2 - pad2;
+            }
+            if g.display[i] == DISPLAY_GRID {
+                var gc : u32 = g.columns[i] as u32;
+                if gc == 0 {
+                    gc = 1;
+                }
+                var gk : u32 = vf_child_count(g, i);
+                if gk > 0 {
+                    var rowh : u32 = 0;
+                    var jj : u32 = 0;
+                    while jj < g.node_count {
+                        if g.parent[jj] == i as u8 {
+                            var oh : u32 = ih[jj] + g.margin[jj] + g.margin[jj];
+                            if oh > rowh {
+                                rowh = oh;
+                            }
+                        }
+                        jj = jj + 1;
+                    }
+                    var gapw : u32 = gp2 * (gc - 1);
+                    var cellw : u32 = 0;
+                    if inw2 > gapw {
+                        cellw = (inw2 - gapw) / gc;
+                    }
+                    var col2 : u32 = 0;
+                    var row2 : u32 = 0;
+                    var n3 : u32 = 0;
+                    while n3 < g.node_count {
+                        if g.parent[n3] == i as u8 {
+                            var mg3 : u32 = g.margin[n3];
+                            var cx : u32 = ix2 + col2 * (cellw + gp2) + mg3;
+                            var cy : u32 = iy2 + row2 * (rowh + gp2) + mg3;
+                            var cw3 : u32 = 0;
+                            if cellw > mg3 + mg3 {
+                                cw3 = cellw - mg3 - mg3;
+                            }
+                            cw3 = vf_clamp(cw3, g.min_w[n3], g.max_w[n3]);
+                            var ch3 : u32 = ih[n3];
+                            if g.align[i] == ALIGN_STRETCH {
+                                ch3 = 0;
+                                if rowh > mg3 + mg3 {
+                                    ch3 = rowh - mg3 - mg3;
+                                }
+                            }
+                            ch3 = vf_clamp(ch3, g.min_h[n3], g.max_h[n3]);
+                            l.x[n3] = cx;
+                            l.y[n3] = cy;
+                            l.w[n3] = cw3;
+                            l.h[n3] = ch3;
+                            col2 = col2 + 1;
+                            if col2 >= gc {
+                                col2 = 0;
+                                row2 = row2 + 1;
+                            }
+                        }
+                        n3 = n3 + 1;
+                    }
+                }
+            } else {
+                var kk : u32 = vf_child_count(g, i);
+                if kk > 0 {
+                    var dir2 : u8 = vf_eff_direction(g, i, bp);
+                    var is_row2 : bool = dir2 != DIR_COLUMN;
+                    var main_len2 : u32 = inh2;
+                    var cross_len2 : u32 = inw2;
+                    var main_start2 : u32 = iy2;
+                    var cross_start2 : u32 = ix2;
+                    if is_row2 {
+                        main_len2 = inw2;
+                        cross_len2 = inh2;
+                        main_start2 = ix2;
+                        cross_start2 = iy2;
+                    }
+
+                    var total2 : u32 = 0;
+                    var sum_grow2 : u32 = 0;
+                    var sum_shrink2 : u32 = 0;
+                    var j : u32 = 0;
+                    while j < g.node_count {
+                        if g.parent[j] == i as u8 {
+                            var bs1 : u32 = g.basis[j];
+                            if bs1 == 0 {
+                                if is_row2 {
+                                    bs1 = iw[j];
+                                } else {
+                                    bs1 = ih[j];
+                                }
+                            }
+                            total2 = total2 + bs1 + g.margin[j] + g.margin[j];
+                            sum_grow2 = sum_grow2 + g.grow[j];
+                            sum_shrink2 = sum_shrink2 + g.shrink[j];
+                        }
+                        j = j + 1;
+                    }
+                    if kk > 1 {
+                        total2 = total2 + gp2 * (kk - 1);
+                    }
+
+                    var free2 : u32 = 0;
+                    var deficit2 : u32 = 0;
+                    if total2 <= main_len2 {
+                        free2 = main_len2 - total2;
+                    } else {
+                        deficit2 = total2 - main_len2;
+                    }
+                    var grew2 : bool = false;
+                    if free2 > 0 and sum_grow2 > 0 {
+                        grew2 = true;
+                    }
+                    var shrank2 : bool = false;
+                    if deficit2 > 0 and sum_shrink2 > 0 {
+                        shrank2 = true;
+                    }
+
+                    var last_g : u32 = 0;
+                    var last_s : u32 = 0;
+                    var jx : u32 = 0;
+                    while jx < g.node_count {
+                        if g.parent[jx] == i as u8 {
+                            if g.grow[jx] > 0 {
+                                last_g = jx;
+                            }
+                            if g.shrink[jx] > 0 {
+                                last_s = jx;
+                            }
+                        }
+                        jx = jx + 1;
+                    }
+
+                    var leftover2 : u32 = 0;
+                    if grew2 == false {
+                        leftover2 = free2;
+                    }
+                    var offset2 : u32 = 0;
+                    var extra2 : u32 = 0;
+                    var jt : u8 = g.justify[i];
+                    if jt == JUSTIFY_CENTER {
+                        offset2 = leftover2 / 2;
+                    } else if jt == JUSTIFY_END {
+                        offset2 = leftover2;
+                    } else if jt == JUSTIFY_SPACE_BETWEEN {
+                        if kk >= 2 {
+                            extra2 = leftover2 / (kk - 1);
+                        }
+                    }
+
+                    var cursor2 : u32 = main_start2 + offset2;
+                    var given_g : u32 = 0;
+                    var given_s : u32 = 0;
+                    var n : u32 = 0;
+                    while n < g.node_count {
+                        if g.parent[n] == i as u8 {
+                            var bas2 : u32 = g.basis[n];
+                            if bas2 == 0 {
+                                if is_row2 {
+                                    bas2 = iw[n];
+                                } else {
+                                    bas2 = ih[n];
+                                }
+                            }
+                            var mg2 : u32 = g.margin[n];
+                            var sz2 : u32 = bas2;
+                            if grew2 and g.grow[n] > 0 {
+                                if n == last_g {
+                                    sz2 = bas2 + (free2 - given_g);
+                                } else {
+                                    var sh_g : u32 = free2 * g.grow[n] / sum_grow2;
+                                    sz2 = bas2 + sh_g;
+                                    given_g = given_g + sh_g;
+                                }
+                            } else if shrank2 and g.shrink[n] > 0 {
+                                var sh_s : u32 = 0;
+                                if n == last_s {
+                                    sh_s = deficit2 - given_s;
+                                } else {
+                                    sh_s = deficit2 * g.shrink[n] / sum_shrink2;
+                                    given_s = given_s + sh_s;
+                                }
+                                if sh_s > bas2 {
+                                    sz2 = 0;
+                                } else {
+                                    sz2 = bas2 - sh_s;
+                                }
+                            }
+                            if is_row2 {
+                                sz2 = vf_clamp(sz2, g.min_w[n], g.max_w[n]);
+                            } else {
+                                sz2 = vf_clamp(sz2, g.min_h[n], g.max_h[n]);
+                            }
+
+                            var mpos2 : u32 = cursor2 + mg2;
+                            if is_row2 {
+                                l.x[n] = mpos2;
+                            } else {
+                                l.y[n] = mpos2;
+                            }
+
+                            var csz2 : u32 = 0;
+                            if g.align[i] == ALIGN_STRETCH {
+                                if cross_len2 > mg2 + mg2 {
+                                    csz2 = cross_len2 - mg2 - mg2;
+                                }
+                            } else {
+                                if is_row2 {
+                                    csz2 = ih[n];
+                                } else {
+                                    csz2 = iw[n];
+                                }
+                                var room2 : u32 = 0;
+                                if cross_len2 > mg2 + mg2 {
+                                    room2 = cross_len2 - mg2 - mg2;
+                                }
+                                if csz2 > room2 {
+                                    csz2 = room2;
+                                }
+                            }
+                            if is_row2 {
+                                csz2 = vf_clamp(csz2, g.min_h[n], g.max_h[n]);
+                            } else {
+                                csz2 = vf_clamp(csz2, g.min_w[n], g.max_w[n]);
+                            }
+
+                            var cpos2 : u32 = cross_start2 + mg2;
+                            if g.align[i] == ALIGN_CENTER {
+                                if cross_len2 > csz2 + mg2 + mg2 {
+                                    cpos2 = cross_start2 + (cross_len2 - csz2 - mg2 - mg2) / 2 + mg2;
+                                }
+                            } else if g.align[i] == ALIGN_END {
+                                if cross_len2 > csz2 + mg2 {
+                                    cpos2 = cross_start2 + cross_len2 - csz2 - mg2;
+                                } else {
+                                    cpos2 = cross_start2;
+                                }
+                            }
+
+                            if is_row2 {
+                                l.y[n] = cpos2;
+                                l.w[n] = sz2;
+                                l.h[n] = csz2;
+                            } else {
+                                l.x[n] = cpos2;
+                                l.h[n] = sz2;
+                                l.w[n] = csz2;
+                            }
+
+                            cursor2 = cursor2 + mg2 + sz2 + mg2 + gp2 + extra2;
+                        }
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    return l;
+}
+
+; the layout: a first run for the widths, then a run that measures every text node at its final width
+pub fn vf_layout(g: VfGraph) -> VfLayout {
+    var none : [16]u32 = [0; 16];
+    return vf_layout_m(g, none, none);
+}
+
+; vf_layout with measured leaf sizes (T27F-007): the same two runs, mw and mh in both; all-zero overrides are vf_layout
+pub fn vf_layout_m(g: VfGraph, mw: [16]u32, mh: [16]u32) -> VfLayout {
+    let a : VfLayout = vf_layout_pass(g, vf_blank_layout(), false, mw, mh);
+    return vf_layout_pass(g, a, true, mw, mh);
+}
+
+pub fn vf_layout_equal(a: VfLayout, b: VfLayout) -> bool {
+    if a.node_count != b.node_count {
+        return false;
+    }
+    if a.bp != b.bp {
+        return false;
+    }
+    var i : u32 = 0;
+    while i < 16 {
+        if a.x[i] != b.x[i] {
+            return false;
+        }
+        if a.y[i] != b.y[i] {
+            return false;
+        }
+        if a.w[i] != b.w[i] {
+            return false;
+        }
+        if a.h[i] != b.h[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn vf_rect_is(l: VfLayout, i: u32, x: u32, y: u32, w: u32, h: u32) -> bool {
+    if i >= l.node_count {
+        return false;
+    }
+    if l.x[i] != x {
+        return false;
+    }
+    if l.y[i] != y {
+        return false;
+    }
+    if l.w[i] != w {
+        return false;
+    }
+    if l.h[i] != h {
+        return false;
+    }
+    return true;
+}
+
+; fixtures: container with two text children, props 32 = test id, 33 = test id + text
+fn vf_fix_pair(width: u32, dir: u8) -> VfGraph {
+    var g : VfGraph = vf_blank_graph();
+    g.viewport_w = width;
+    g = vf_add(g, VF_CONTAINER, VF_NO_PARENT, 32, "root");
+    g = vf_add(g, VF_TEXT, 0, 33, "a");
+    g = vf_add(g, VF_TEXT, 0, 33, "b");
+    g.text[1] = "A";
+    g.text[2] = "B";
+    g.direction[0] = dir;
+    return g;
+}
+
+fn vf_fix_trio(width: u32) -> VfGraph {
+    var g : VfGraph = vf_fix_pair(width, DIR_COLUMN);
+    g = vf_add(g, VF_TEXT, 0, 33, "c");
+    g.text[3] = "C";
+    return g;
+}
+
+test resolve_is_base_primitive {
+    assert vf_resolve(6) == 1;
+    assert vf_resolve(2) == 2;
+    assert vf_resolve(3) == 3;
+    assert vf_resolve(8) == 8;
+    assert vf_resolve(200) == 255;
+    assert vf_is_box(1) == true;
+    assert vf_is_box(2) == true;
+    assert vf_is_box(6) == true;
+    assert vf_is_box(8) == true;
+    assert vf_is_box(3) == false;
+    assert vf_is_box(4) == false;
+    assert vf_is_box(5) == false;
+    assert vf_is_box(7) == false;
+}
+
+test sample_at_sm {
+    let g : VfGraph = vf_sample_graph();
+    assert vf_validate(g) == 0;
+    let l : VfLayout = vf_layout(g);
+    assert l.node_count == 5;
+    assert l.bp == 0;
+    assert vf_rect_is(l, 0, 0, 0, 375, 100);
+    assert vf_rect_is(l, 1, 0, 0, 160, 100);
+    assert vf_rect_is(l, 2, 0, 0, 80, 20);
+    assert vf_rect_is(l, 3, 0, 20, 160, 40);
+    assert vf_rect_is(l, 4, 0, 60, 96, 40);
+}
+
+test sample_at_lg {
+    var g : VfGraph = vf_sample_graph();
+    assert vf_validate(g) == 0;
+    g.viewport_w = 1280;
+    let l : VfLayout = vf_layout(g);
+    assert l.bp == 2;
+    assert vf_rect_is(l, 0, 0, 0, 1280, 100);
+    assert vf_rect_is(l, 1, 0, 0, 160, 100);
+    assert vf_rect_is(l, 2, 0, 0, 80, 20);
+    assert vf_rect_is(l, 3, 0, 20, 160, 40);
+    assert vf_rect_is(l, 4, 0, 60, 96, 40);
+}
+
+test determinism_and_invalid {
+    let g : VfGraph = vf_sample_graph();
+    assert vf_layout_equal(vf_layout(g), vf_layout(g)) == true;
+    let b : VfGraph = vf_blank_graph();
+    let l : VfLayout = vf_layout(b);
+    assert l.node_count == 0;
+}
+
+test breakpoint_override {
+    var g : VfGraph = vf_fix_pair(375, DIR_COLUMN);
+    assert vf_validate(g) == 0;
+    g.direction_md[0] = DIR_ROW;
+    g.gap[0] = 8;
+    let a : VfLayout = vf_layout(g);
+    assert vf_rect_is(a, 0, 0, 0, 375, 48);
+    assert vf_rect_is(a, 1, 0, 0, 80, 20);
+    assert vf_rect_is(a, 2, 0, 28, 80, 20);
+    g.viewport_w = 639;
+    let b : VfLayout = vf_layout(g);
+    assert vf_rect_is(b, 0, 0, 0, 639, 48);
+    assert vf_rect_is(b, 1, 0, 0, 80, 20);
+    assert vf_rect_is(b, 2, 0, 28, 80, 20);
+    g.viewport_w = 640;
+    let c : VfLayout = vf_layout(g);
+    assert vf_rect_is(c, 0, 0, 0, 640, 20);
+    assert vf_rect_is(c, 1, 0, 0, 80, 20);
+    assert vf_rect_is(c, 2, 88, 0, 80, 20);
+    g.viewport_w = 1280;
+    let d : VfLayout = vf_layout(g);
+    assert vf_rect_is(d, 0, 0, 0, 1280, 20);
+    assert vf_rect_is(d, 1, 0, 0, 80, 20);
+    assert vf_rect_is(d, 2, 88, 0, 80, 20);
+}
+
+test padding_and_gap {
+    var g : VfGraph = vf_fix_pair(375, DIR_COLUMN);
+    assert vf_validate(g) == 0;
+    g.padding[0] = 10;
+    g.gap[0] = 4;
+    let l : VfLayout = vf_layout(g);
+    assert vf_rect_is(l, 0, 0, 0, 375, 64);
+    assert vf_rect_is(l, 1, 10, 10, 80, 20);
+    assert vf_rect_is(l, 2, 10, 34, 80, 20);
+}
+
+test margin_offsets {
+    var g : VfGraph = vf_fix_pair(375, DIR_COLUMN);
+    assert vf_validate(g) == 0;
+    g.margin[1] = 5;
+    let l : VfLayout = vf_layout(g);
+    assert vf_rect_is(l, 0, 0, 0, 375, 50);
+    assert vf_rect_is(l, 1, 5, 5, 80, 20);
+    assert vf_rect_is(l, 2, 0, 30, 80, 20);
+}
+
+test shrink_distributes_deficit {
+    var g : VfGraph = vf_fix_pair(300, DIR_ROW);
+    assert vf_validate(g) == 0;
+    g.basis[1] = 200;
+    g.basis[2] = 200;
+    let a : VfLayout = vf_layout(g);
+    assert vf_rect_is(a, 0, 0, 0, 300, 20);
+    assert vf_rect_is(a, 1, 0, 0, 150, 20);
+    assert vf_rect_is(a, 2, 150, 0, 150, 20);
+    g.shrink[2] = 3;
+    let b : VfLayout = vf_layout(g);
+    assert vf_rect_is(b, 1, 0, 0, 175, 20);
+    assert vf_rect_is(b, 2, 175, 0, 125, 20);
+}
+
+test grow_distributes_free {
+    var g : VfGraph = vf_fix_pair(300, DIR_ROW);
+    assert vf_validate(g) == 0;
+    g.basis[1] = 100;
+    g.basis[2] = 100;
+    g.grow[1] = 1;
+    g.grow[2] = 2;
+    let l : VfLayout = vf_layout(g);
+    assert vf_rect_is(l, 0, 0, 0, 300, 20);
+    assert vf_rect_is(l, 1, 0, 0, 133, 20);
+    assert vf_rect_is(l, 2, 133, 0, 167, 20);
+}
+
+test clamps_bound_size {
+    var g : VfGraph = vf_fix_pair(300, DIR_ROW);
+    assert vf_validate(g) == 0;
+    g.basis[1] = 200;
+    g.basis[2] = 100;
+    g.max_w[1] = 120;
+    let a : VfLayout = vf_layout(g);
+    assert vf_rect_is(a, 1, 0, 0, 120, 20);
+    assert vf_rect_is(a, 2, 120, 0, 100, 20);
+    g.basis[1] = 50;
+    g.max_w[1] = 0;
+    g.min_w[1] = 80;
+    let b : VfLayout = vf_layout(g);
+    assert vf_rect_is(b, 1, 0, 0, 80, 20);
+    assert vf_rect_is(b, 2, 80, 0, 100, 20);
+}
+
+test leaf_min_h_reaches_the_parent {
+    // a row whose first leaf must be 44 high is 44 high, so that leaf stays inside it
+    var g : VfGraph = vf_fix_pair(300, DIR_ROW);
+    assert vf_validate(g) == 0;
+    g.min_h[1] = 44;
+    let a : VfLayout = vf_layout(g);
+    assert a.h[1] == 44;
+    assert a.h[0] == 44;
+    assert a.y[1] + a.h[1] <= a.y[0] + a.h[0];
+    // control: without the bound the row is the 20 of its text leaves
+    g.min_h[1] = 0;
+    let b : VfLayout = vf_layout(g);
+    assert b.h[0] == 20;
+    assert b.h[1] == 20;
+}
+
+test align_positions_cross_axis {
+    var g : VfGraph = vf_fix_pair(375, DIR_COLUMN);
+    assert vf_validate(g) == 0;
+    g.align[0] = ALIGN_CENTER;
+    let a : VfLayout = vf_layout(g);
+    assert vf_rect_is(a, 0, 0, 0, 375, 40);
+    assert vf_rect_is(a, 1, 147, 0, 80, 20);
+    assert vf_rect_is(a, 2, 147, 20, 80, 20);
+    g.align[0] = ALIGN_END;
+    let b : VfLayout = vf_layout(g);
+    assert vf_rect_is(b, 1, 295, 0, 80, 20);
+    assert vf_rect_is(b, 2, 295, 20, 80, 20);
+    g.align[0] = ALIGN_STRETCH;
+    let c : VfLayout = vf_layout(g);
+    assert vf_rect_is(c, 1, 0, 0, 375, 20);
+    assert vf_rect_is(c, 2, 0, 20, 375, 20);
+}
+
+test justify_distributes_leftover {
+    var g : VfGraph = vf_fix_pair(300, DIR_ROW);
+    assert vf_validate(g) == 0;
+    g.justify[0] = JUSTIFY_CENTER;
+    let a : VfLayout = vf_layout(g);
+    assert vf_rect_is(a, 1, 70, 0, 80, 20);
+    assert vf_rect_is(a, 2, 150, 0, 80, 20);
+    g.justify[0] = JUSTIFY_END;
+    let b : VfLayout = vf_layout(g);
+    assert vf_rect_is(b, 1, 140, 0, 80, 20);
+    assert vf_rect_is(b, 2, 220, 0, 80, 20);
+    g.justify[0] = JUSTIFY_SPACE_BETWEEN;
+    let c : VfLayout = vf_layout(g);
+    assert vf_rect_is(c, 1, 0, 0, 80, 20);
+    assert vf_rect_is(c, 2, 220, 0, 80, 20);
+}
+
+test grid_cells {
+    var g : VfGraph = vf_fix_trio(300);
+    assert vf_validate(g) == 0;
+    g.display[0] = DISPLAY_GRID;
+    g.columns[0] = 2;
+    g.gap[0] = 4;
+    let l : VfLayout = vf_layout(g);
+    assert vf_rect_is(l, 0, 0, 0, 300, 44);
+    assert vf_rect_is(l, 1, 0, 0, 148, 20);
+    assert vf_rect_is(l, 2, 152, 0, 148, 20);
+    assert vf_rect_is(l, 3, 0, 24, 148, 20);
+}
+
+test narrowing_caps_a_child_at_the_inner_cross_extent {
+    var g : VfGraph = vf_fix_pair(60, DIR_COLUMN);
+    assert vf_validate(g) == 0;
+    g.padding[0] = 10;
+    let a : VfLayout = vf_layout(g);
+    assert vf_rect_is(a, 0, 0, 0, 60, 60);
+    assert vf_rect_is(a, 1, 10, 10, 40, 20);
+    assert vf_rect_is(a, 2, 10, 30, 40, 20);
+    // negative control: with room to spare the children keep their intrinsic 80
+    g.viewport_w = 200;
+    let b : VfLayout = vf_layout(g);
+    assert vf_rect_is(b, 1, 10, 10, 80, 20);
+    assert vf_rect_is(b, 2, 10, 30, 80, 20);
+    // an explicit min_w wins over the narrowing, for that child only
+    g.viewport_w = 60;
+    g.min_w[1] = 70;
+    let c : VfLayout = vf_layout(g);
+    assert vf_rect_is(c, 1, 10, 10, 70, 20);
+    assert vf_rect_is(c, 2, 10, 30, 40, 20);
+}
+
+test narrowing_reaches_the_cross_axis_of_a_row {
+    var g : VfGraph = vf_fix_pair(300, DIR_ROW);
+    assert vf_validate(g) == 0;
+    g.max_h[0] = 10;
+    let a : VfLayout = vf_layout(g);
+    assert vf_rect_is(a, 0, 0, 0, 300, 10);
+    assert vf_rect_is(a, 1, 0, 0, 80, 10);
+    assert vf_rect_is(a, 2, 80, 0, 80, 10);
+}
+
+test narrowing_runs_down_a_nested_box {
+    var g : VfGraph = vf_fix_pair(60, DIR_COLUMN);
+    g = vf_add(g, VF_STACK, 0, 32, "s");
+    g = vf_add(g, VF_TEXT, 3, 33, "p");
+    g = vf_add(g, VF_TEXT, 3, 33, "q");
+    g.text[4] = "P";
+    g.text[5] = "Q";
+    g.padding[0] = 10;
+    assert vf_validate(g) == 0;
+    let l : VfLayout = vf_layout(g);
+    // the stack is 160 wide on its own (two 80 children in a row); the root holds it to the 40 inside its padding
+    assert l.x[3] == 10;
+    assert l.w[3] == 40;
+    // its row children give back the deficit through the default shrink of 1: 80 + 80 into 40 is 20 + 20
+    assert vf_rect_is(l, 4, 10, l.y[3], 20, 20);
+    assert vf_rect_is(l, 5, 30, l.y[3], 20, 20);
+    assert l.x[5] + l.w[5] <= l.x[3] + l.w[3];
+}
+
+test measured_leaf_sizes_replace_the_intrinsic_ones {
+    var g : VfGraph = vf_fix_pair(375, DIR_COLUMN);
+    var none : [16]u32 = [0; 16];
+    var ow : [16]u32 = [0; 16];
+    var oh : [16]u32 = [0; 16];
+    ow[1] = 120;
+    oh[2] = 50;
+    let a : VfLayout = vf_layout_m(g, ow, oh);
+    assert vf_rect_is(a, 0, 0, 0, 375, 70);
+    assert vf_rect_is(a, 1, 0, 0, 120, 20);
+    assert vf_rect_is(a, 2, 0, 20, 80, 50);
+    // all-zero overrides are vf_layout
+    assert vf_layout_equal(vf_layout(g), vf_layout_m(g, none, none)) == true;
+    // the same override changes the layout, so the equality above is not vacuous
+    assert vf_layout_equal(vf_layout(g), a) == false;
+    // in a row the wider leaf pushes its neighbour along the main axis
+    var r : VfGraph = vf_fix_pair(375, DIR_ROW);
+    let b : VfLayout = vf_layout_m(r, ow, none);
+    assert vf_rect_is(b, 1, 0, 0, 120, 20);
+    assert vf_rect_is(b, 2, 120, 0, 80, 20);
+}
+
+test a_box_takes_its_size_from_measured_children {
+    var g : VfGraph = vf_fix_pair(375, DIR_COLUMN);
+    g = vf_add(g, VF_STACK, 0, 32, "s");
+    g = vf_add(g, VF_TEXT, 3, 33, "p");
+    g = vf_add(g, VF_TEXT, 3, 33, "q");
+    g.text[4] = "P";
+    g.text[5] = "Q";
+    assert vf_validate(g) == 0;
+    var none : [16]u32 = [0; 16];
+    var ow : [16]u32 = [0; 16];
+    let a : VfLayout = vf_layout_m(g, none, none);
+    assert a.w[3] == 160;
+    ow[5] = 120;
+    let b : VfLayout = vf_layout_m(g, ow, none);
+    assert b.w[3] == 200;
+    assert vf_rect_is(b, 4, 0, b.y[3], 80, 20);
+    assert vf_rect_is(b, 5, 80, b.y[3], 120, 20);
+}
+
+test fixtures_are_valid {
+    assert vf_validate(vf_fix_pair(375, DIR_COLUMN)) == 0;
+    assert vf_validate(vf_fix_pair(300, DIR_ROW)) == 0;
+    assert vf_validate(vf_fix_trio(300)) == 0;
+}
+
+test text_height_follows_the_final_width {
+    // column, align start: the 14-char title keeps its 80 px intrinsic width and wraps to 2 lines there
+    var g : VfGraph = vf_fix_pair(375, DIR_COLUMN);
+    g.text[1] = "Write the spec";
+    var none : [16]u32 = [0; 16];
+    let a : VfLayout = vf_layout_pass(g, vf_blank_layout(), false, none, none);
+    let b : VfLayout = vf_layout_pass(g, a, true, none, none);
+    var i : u32 = 0;
+    while i < 3 {
+        assert a.w[i] == b.w[i];
+        assert a.x[i] == b.x[i];
+        i = i + 1;
+    }
+    assert vf_rect_is(a, 1, 0, 0, 80, 20);
+    assert vf_rect_is(b, 0, 0, 0, 375, 50);
+    assert vf_rect_is(b, 1, 0, 0, 80, 30);
+    assert vf_rect_is(b, 2, 0, 30, 80, 20);
+    assert vf_layout_equal(b, vf_layout(g));
+    // row, basis 200 each, shrunk to 150: 26 chars are 3 lines at 80, 1 line at 200, and 2 lines at the final 150
+    var r : VfGraph = vf_fix_pair(300, DIR_ROW);
+    r.basis[1] = 200;
+    r.basis[2] = 200;
+    r.text[1] = "abcdefghijklmnopqrstuvwxyz";
+    let c : VfLayout = vf_layout(r);
+    assert vf_rect_is(c, 0, 0, 0, 300, 30);
+    assert vf_rect_is(c, 1, 0, 0, 150, 30);
+    assert vf_rect_is(c, 2, 150, 0, 150, 20);
+}
+
+test labels_widen_buttons_and_badges {
+    // a 20-char button label is 119 + 8 = 127 px, past the 96 px intrinsic width; a short label keeps 96
+    var g : VfGraph = vf_blank_graph();
+    g.viewport_w = 375;
+    g = vf_add(g, VF_CONTAINER, VF_NO_PARENT, 32, "root");
+    g = vf_add(g, VF_BUTTON, 0, 33, "go");
+    g = vf_add(g, VF_BADGE, 0, 33, "tag");
+    g.text[1] = "Save all the changes";
+    g.text[2] = "Open";
+    g.direction[0] = DIR_COLUMN;
+    assert vf_validate(g) == 0;
+    let l : VfLayout = vf_layout(g);
+    assert vf_rect_is(l, 1, 0, 0, 127, 40);
+    assert vf_rect_is(l, 2, 0, 40, 48, 24);
+    // negative control: the short label leaves the intrinsic width alone
+    g.text[1] = "Save";
+    let m : VfLayout = vf_layout(g);
+    assert vf_rect_is(m, 1, 0, 0, 96, 40);
+    assert l.w[1] != m.w[1];
+}

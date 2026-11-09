@@ -1,0 +1,1423 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/fpga/wasm_interp_doom.t27 -- the CONTROL-FLOW CORE a DOOM-class wasm port needs,
+; as one spec. The MVP interpreter (specs/fpga/wasm_interp.t27) declares block, loop, br
+; and br_if OUT OF SCOPE on purpose: they need a label stack, and that file keeps its
+; flat ctl counter honest by not pretending otherwise. This file is that label stack.
+; ----
+; WHY THIS SUBSET. specs/fpga/wasm_opcodes.t27 names the 23 FUTURE rows a DOOM-class
+; port needs (name_in_doom_set), ordered by roadmap_rank, branches first. This file
+; implements exactly the branch half of that list -- block 0x02, loop 0x03, if 0x04,
+; else 0x05, end 0x0B, br 0x0C, br_if 0x0D -- because a compiler lowers `while`,
+; `for`, `do`, `break` and `continue` into those bytes and nothing else. The memory
+; half (load/store family, i32.wrap_i64, call) is a later floor, so this file does
+; not claim it: test memory_family_is_not_claimed pins the boundary.
+; ----
+; HOW A BRANCH RESOLVES. One frame per open construct records its kind, its target
+; and the value-stack height at entry.
+;   loop  -- target is the loop body start, so `br` to it jumps BACKWARD and the
+;            frame stays open (that is how a loop iterates).
+;   block -- target is the matching end, found by scanning forward with a nesting
+;            counter, so `br` to it jumps FORWARD past that end and drops the frame.
+;   if    -- the branch taken at entry is recorded; `else` in the then-branch jumps
+;            forward to the matching end the same way a `br` out of it would.
+; `br_if` pops the condition first and falls through when it is zero. Every operand
+; unwind restores the value stack to the target frame height, so a branch cannot
+; leak the operands it abandoned.
+; ----
+; THE PROGRAMS. Real WebAssembly function bodies, byte for byte (locals 0 and 1 are
+; the params, locals 2 and up start at zero):
+;   COUNTDOWN  block loop local.get 0 i32.eqz br_if 1 local.get 0 i32.const 1
+;              i32.sub local.set 0 br 0 end end local.get 0 end
+;              -> leaves 0 whatever a is: the loop runs until br_if exits the block.
+;   STEP2      block loop local.get 0 i32.const 2 i32.lt_s br_if 1 local.get 0
+;              i32.const 2 i32.sub local.set 0 br 0 end end local.get 0 end
+;              -> a mod 2: the loop subtracts 2 until a < 2.
+;   MIN_IF     local.get 0 local.get 1 i32.lt_s if local.get 0 else local.get 1
+;              end end -> min(a, b) through if/else, the small form of the same choice.
+;   SKIP_IF    local.get 0 i32.eqz if i32.const 7 else i32.const 9 end end
+;              -> 7 when a == 0, 9 otherwise: the else-path jump, pinned.
+;   BAD_BR     block br 5 end end -- a depth deeper than any open frame must stop
+;              the run with ERR_LABEL, not read memory at a negative index.
+
+module WasmInterpDoom;
+
+; --- opcodes, WebAssembly MVP final bytes (pinned by test opcode_bytes_are_real_wasm)
+pub const OP_BLOCK : u8 = 0x02;
+pub const OP_LOOP : u8 = 0x03;
+pub const OP_IF : u8 = 0x04;
+pub const OP_ELSE : u8 = 0x05;
+pub const OP_END : u8 = 0x0B;
+pub const OP_BR : u8 = 0x0C;
+pub const OP_BR_IF : u8 = 0x0D;
+pub const OP_LOCAL_GET : u8 = 0x20;
+pub const OP_LOCAL_SET : u8 = 0x21;
+pub const OP_I32_CONST : u8 = 0x41;
+pub const OP_I32_EQZ : u8 = 0x45;
+pub const OP_I32_LT_S : u8 = 0x48;
+pub const OP_I32_LOAD : u8 = 0x28;
+pub const OP_I32_LOAD8_U : u8 = 0x2D;
+pub const OP_I32_LOAD8_S : u8 = 0x2C;
+pub const OP_I32_LOAD16_U : u8 = 0x2F;
+pub const OP_I32_LOAD16_S : u8 = 0x2E;
+pub const OP_I32_STORE : u8 = 0x36;
+pub const OP_I32_STORE8 : u8 = 0x3A;
+pub const OP_I32_STORE16 : u8 = 0x3B;
+pub const OP_I64_LOAD : u8 = 0x29;
+pub const OP_I64_LOAD8_U : u8 = 0x30;
+pub const OP_I64_LOAD8_S : u8 = 0x31;
+pub const OP_I64_LOAD16_U : u8 = 0x32;
+pub const OP_I64_LOAD16_S : u8 = 0x33;
+pub const OP_I64_LOAD32_U : u8 = 0x34;
+pub const OP_I64_LOAD32_S : u8 = 0x35;
+pub const OP_I64_CONST : u8 = 0x42;
+pub const OP_I64_STORE : u8 = 0x37;
+pub const OP_I64_STORE8 : u8 = 0x3C;
+pub const OP_I64_STORE16 : u8 = 0x3D;
+pub const OP_I64_STORE32 : u8 = 0x3E;
+pub const OP_I32_WRAP_I64 : u8 = 0xA7;
+pub const OP_I32_ADD : u8 = 0x6A;
+pub const OP_I32_SUB : u8 = 0x6B;
+; Floor CALL+FMEM (23 of 23 named): call moves pc through a return frame; the
+; four float memory ops move IEEE-754 BIT PATTERNS through the integer carriers
+; (f32 through the i32 stack, f64 through the u64 stack) -- this interpreter
+; still has no float datapath and claims none; only the bits move, exactly as
+; the reinterpret pair would move them.
+pub const OP_CALL : u8 = 0x10;
+pub const OP_F32_LOAD : u8 = 0x2A;
+pub const OP_F64_LOAD : u8 = 0x2B;
+pub const OP_F32_STORE : u8 = 0x38;
+pub const OP_F64_STORE : u8 = 0x39;
+
+; --- frame kinds
+pub const K_BLOCK : u8 = 0;
+pub const K_LOOP : u8 = 1;
+pub const K_IF_THEN : u8 = 2;
+pub const K_IF_OTHER : u8 = 3;
+
+; --- error codes
+pub const ERR_NONE : u8 = 0;
+pub const ERR_STACK : u8 = 1;
+pub const ERR_LOCAL : u8 = 2;
+pub const ERR_PC : u8 = 3;
+pub const ERR_STEP : u8 = 4;
+pub const ERR_OPCODE : u8 = 5;
+pub const ERR_LABEL : u8 = 6;
+pub const ERR_PROG : u8 = 7;
+pub const ERR_MEM : u8 = 8;
+pub const ERR_CALL : u8 = 9;
+
+; --- program ids
+pub const ID_COUNTDOWN : u32 = 0;
+pub const ID_STEP2 : u32 = 1;
+pub const ID_MIN_IF : u32 = 2;
+pub const ID_SKIP_IF : u32 = 3;
+pub const ID_BAD_BR : u32 = 4;
+pub const ID_STORE_LOAD : u32 = 5;
+pub const ID_STORE8_MASK : u32 = 6;
+pub const ID_LOAD16_LE : u32 = 7;
+pub const ID_OFFSET_LOAD : u32 = 8;
+pub const ID_FILL16 : u32 = 9;
+pub const ID_I64_ROUNDTRIP : u32 = 10;
+pub const ID_CALL : u32 = 11;
+pub const ID_CALL2 : u32 = 12;
+pub const ID_F32_BITS : u32 = 13;
+pub const ID_F64_BITS : u32 = 14;
+pub const ID_F32_STORE_LE : u32 = 15;
+pub const PROGS : u32 = 16;
+
+pub const STACK_MAX : u32 = 32;
+pub const LOCALS_MAX : u32 = 8;
+pub const LABEL_MAX : u32 = 16;
+pub const CALL_MAX : u32 = 4;
+pub const FN_MAX : u32 = 4;
+pub const CODE_MAX : u32 = 96;
+pub const MEM_MAX : u32 = 256;
+pub const STEP_LIMIT : u32 = 4096;
+pub const BT_VOID : u8 = 0x40;
+
+pub var stack : [STACK_MAX]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub var locals : [LOCALS_MAX]u32 = [0, 0, 0, 0, 0, 0, 0, 0];
+pub var code : [CODE_MAX]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+; one frame per open construct: kind, target pc, value-stack height at entry
+pub var label_kind : [LABEL_MAX]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub var label_pc : [LABEL_MAX]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub var label_height : [LABEL_MAX]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub var stack64 : [STACK_MAX]u64 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub var sp64 : u32 = 0;
+pub var mem : [MEM_MAX]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub var mem_n : u32 = MEM_MAX;
+pub var label_n : u32 = 0;
+
+pub var sp : u32 = 0;
+pub var pc : u32 = 0;
+pub var code_len : u32 = 0;
+pub var err : u8 = 0;
+
+; The call stack (floor CALL). One frame per live callee: the return pc, the
+; label-stack height and the value-stack heights at the call. The callee's
+; result is whatever it leaves on the stack above the saved heights (this
+; floor's ABI: exactly one value); its END pops the frame and resumes the
+; caller. Locals stay ONE FLAT FILE -- the callee reads the caller's locals;
+; the tests pass arguments through local 7 to keep that honest and visible.
+pub var call_ret_pc : [CALL_MAX]u32 = [0, 0, 0, 0];
+pub var call_label_n : [CALL_MAX]u32 = [0, 0, 0, 0];
+pub var call_sp : [CALL_MAX]u32 = [0, 0, 0, 0];
+pub var call_sp64 : [CALL_MAX]u32 = [0, 0, 0, 0];
+pub var call_n : u32 = 0;
+
+; The function table (floor CALL): fn i's body starts at fn_pc[i]. Registered
+; by the loader for the programs that use call; fn_n bounds the legal index.
+pub var fn_pc : [FN_MAX]u32 = [0, 0, 0, 0];
+pub var fn_n : u32 = 0;
+
+pub fn push(v : u32) u32 {
+    if (sp >= STACK_MAX) {
+        err = ERR_STACK;
+        return 0;
+    }
+    stack[sp] = v;
+    sp = sp + 1;
+    return 0;
+}
+
+pub fn pop() u32 {
+    if (sp == 0) {
+        err = ERR_STACK;
+        return 0;
+    }
+    sp = sp - 1;
+    return stack[sp];
+}
+
+pub fn wrap32(v : u64) u32 {
+    return (v & 0xFFFFFFFF) as u32;
+}
+
+; Signed comparison on the i32 bit pattern, as i32.lt_s defines it.
+pub fn lt_s(x : u32, y : u32) u32 {
+    var xs : i64 = x as i64;
+    if (x >= 0x80000000) {
+        xs = xs - 0x100000000;
+    }
+    var ys : i64 = y as i64;
+    if (y >= 0x80000000) {
+        ys = ys - 0x100000000;
+    }
+    if (xs < ys) {
+        return 1;
+    }
+    return 0;
+}
+
+; Signed LEB128, the i32.const immediate. Returns the bit pattern.
+pub fn read_sleb() u32 {
+    var result : u64 = 0;
+    var shift : u32 = 0;
+    var byte : u8 = 0;
+    var n : u32 = 0;
+    while (n < 5) {
+        if (pc >= code_len) {
+            err = ERR_PROG;
+            return 0;
+        }
+        byte = code[pc];
+        pc = pc + 1;
+        result = result | (((byte & 0x7F) as u64) << shift);
+        shift = shift + 7;
+        if ((byte & 0x80) == 0) {
+            if (shift < 64 && (byte & 0x40) != 0) {
+                result = result | (~0 as u64) << shift;
+            }
+            return wrap32(result);
+        }
+        n = n + 1;
+    }
+    err = ERR_PROG;
+    return 0;
+}
+
+fn open_frame(k : u8, target : u32) u8 {
+    if (label_n >= LABEL_MAX) {
+        err = ERR_LABEL;
+        return 0;
+    }
+    label_kind[label_n] = k;
+    label_pc[label_n] = target;
+    label_height[label_n] = sp;
+    label_n = label_n + 1;
+    return 0;
+}
+
+// Skip the immediate bytes of one instruction whose opcode byte was already
+// consumed, so a scan reads OPCODES and never mistakes an operand for one.
+//   block/loop/if   1 byte (blocktype)
+//   local.get/set   1 byte (index)
+//   i32.const, br, br_if  signed LEB128 (stop at the byte with the high bit clear)
+pub fn skip_immediate(op : u8) u8 {
+    var b : u8 = 0;
+    if (op == OP_BLOCK || op == OP_LOOP || op == OP_IF) {
+        if (pc < code_len) {
+            pc = pc + 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (op == OP_LOCAL_GET || op == OP_LOCAL_SET) {
+        if (pc < code_len) {
+            pc = pc + 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (op == OP_I32_CONST || op == OP_BR || op == OP_BR_IF) {
+        var n : u32 = 0;
+        while (n < 5 && pc < code_len) {
+            b = code[pc];
+            pc = pc + 1;
+            if ((b & 0x80) == 0) {
+                return 1;
+            }
+            n = n + 1;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+// From pc, find the matching else-or-end of the construct whose opening was just
+// consumed. `depth` is how many frames are still open INSIDE that construct, so
+// their ends are matched before the construct end is reached. Leaves pc AFTER
+// the byte. Returns 1 for else, 2 for end, 0 when the body runs out (err set).
+pub fn scan_else_or_end(open_inside : u32) u8 {
+    var depth : u32 = open_inside;
+    var op : u8 = 0;
+    while (pc < code_len) {
+        op = code[pc];
+        pc = pc + 1;
+        if (op == OP_END) {
+            if (depth == 0) {
+                return 2;
+            }
+            depth = depth - 1;
+        } else if (op == OP_ELSE && depth == 0) {
+            return 1;
+        } else if (op == OP_BLOCK || op == OP_LOOP || op == OP_IF) {
+            depth = depth + 1;
+            skip_immediate(op);
+        } else {
+            skip_immediate(op);
+        }
+    }
+    err = ERR_PROG;
+    return 0;
+}
+
+// From pc, find the matching end, ignoring else at depth 0. Leaves pc AFTER it.
+pub fn scan_end(open_inside : u32) u8 {
+    var depth : u32 = open_inside;
+    var op : u8 = 0;
+    while (pc < code_len) {
+        op = code[pc];
+        pc = pc + 1;
+        if (op == OP_END) {
+            if (depth == 0) {
+                return 1;
+            }
+            depth = depth - 1;
+        } else if (op == OP_BLOCK || op == OP_LOOP || op == OP_IF) {
+            depth = depth + 1;
+            skip_immediate(op);
+        } else {
+            skip_immediate(op);
+        }
+    }
+    err = ERR_PROG;
+    return 0;
+}
+
+// Execute br with the given depth against the open frames.
+pub fn do_br(depth : u32) u8 {
+    if (depth >= label_n) {
+        err = ERR_LABEL;
+        return 0;
+    }
+    var target : u32 = label_n - 1 - depth;
+    sp = label_height[target];
+    if (label_kind[target] == K_LOOP) {
+        pc = label_pc[target];
+        label_n = target + 1;
+        return 1;
+    }
+    // block or if: every frame opened after the target contributes its own end,
+    // so the scan starts at that count and the target end is the remaining one.
+    var inside : u32 = label_n - 1 - target;
+    if (scan_end(inside) == 0) {
+        return 0;
+    }
+    label_n = target;
+    return 1;
+}
+
+// Linear memory access: effective address = immediate offset + the operand on
+// the stack. Little-endian, as the WebAssembly memory model defines it. A byte
+// outside [0, mem_n) stops the run with ERR_MEM instead of reading garbage.
+pub fn push64(v : u64) u32 {
+    if (sp64 >= STACK_MAX) {
+        err = ERR_STACK;
+        return 0;
+    }
+    stack64[sp64] = v;
+    sp64 = sp64 + 1;
+    return 0;
+}
+
+pub fn pop64() u64 {
+    if (sp64 == 0) {
+        err = ERR_STACK;
+        return 0;
+    }
+    sp64 = sp64 - 1;
+    return stack64[sp64];
+}
+
+// Signed LEB128 for i64.const.
+pub fn read_sleb64() u64 {
+    var result : u64 = 0;
+    var shift : u32 = 0;
+    var byte : u8 = 0;
+    var n : u32 = 0;
+    while (n < 10) {
+        if (pc >= code_len) {
+            err = ERR_PROG;
+            return 0;
+        }
+        byte = code[pc];
+        pc = pc + 1;
+        result = result | (((byte & 0x7F) as u64) << shift);
+        shift = shift + 7;
+        if ((byte & 0x80) == 0) {
+            if (shift < 64 && (byte & 0x40) != 0) {
+                result = result | (~0 as u64) << shift;
+            }
+            return result;
+        }
+        n = n + 1;
+    }
+    err = ERR_PROG;
+    return 0;
+}
+
+// Read up to 8 bytes little-endian, zero-extended to 64 bits.
+pub fn mem_read64(addr : u32, off : u32, width : u32) u64 {
+    var v : u64 = 0;
+    var i : u32 = 0;
+    while (i < width) {
+        v = v | ((mem_byte(addr, off + i) as u64) << (8 * i));
+        i = i + 1;
+    }
+    return v;
+}
+
+pub fn mem_write64(addr : u32, off : u32, v : u64, width : u32) u8 {
+    var i : u32 = 0;
+    while (i < width) {
+        mem_put(addr, off + i, ((v >> (8 * i)) & 0xFF) as u8);
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Sign-extend a loaded value of `width` bytes to the full i64 pattern.
+pub fn sign_extend64(v : u64, width : u32) u64 {
+    if (width == 8) {
+        return v;
+    }
+    var bits : u32 = 8 * width;
+    var top : u64 = 1 << (bits - 1);
+    if ((v & top) == 0) {
+        return v;
+    }
+    return v | (~0 as u64) << bits;
+}
+
+pub fn mem_byte(addr : u32, off : u32) u8 {
+    var ea : u64 = (addr as u64) + (off as u64);
+    if (ea >= (mem_n as u64)) {
+        err = ERR_MEM;
+        return 0;
+    }
+    return mem[ea as u32];
+}
+
+pub fn mem_put(addr : u32, off : u32, b : u8) u8 {
+    var ea : u64 = (addr as u64) + (off as u64);
+    if (ea >= (mem_n as u64)) {
+        err = ERR_MEM;
+        return 0;
+    }
+    mem[ea as u32] = b;
+    return 1;
+}
+
+// Read `width` bytes (1, 2 or 4) little-endian and zero-extend to an i32 value.
+pub fn mem_read(addr : u32, off : u32, width : u32) u32 {
+    var v : u32 = 0;
+    var i : u32 = 0;
+    while (i < width) {
+        v = v | ((mem_byte(addr, off + i) as u32) << (8 * i));
+        i = i + 1;
+    }
+    return wrap32(v as u64);
+}
+
+pub fn mem_write(addr : u32, off : u32, v : u32, width : u32) u8 {
+    var i : u32 = 0;
+    while (i < width) {
+        mem_put(addr, off + i, ((v >> (8 * i)) & 0xFF) as u8);
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Sign-extend a loaded value of `width` bytes to the full i32 pattern.
+pub fn sign_extend(v : u32, width : u32) u32 {
+    if (width == 4) {
+        return v;
+    }
+    var bits : u32 = 8 * width;
+    var top : u32 = 1 << (bits - 1);
+    if ((v & top) == 0) {
+        return v;
+    }
+    return wrap32(((v | (0xFFFFFFFF << bits)) as u64));
+}
+
+pub fn program_len(prog : u32) u32 {
+    if (prog == ID_COUNTDOWN) { return 23; }
+    if (prog == ID_STEP2) { return 25; }
+    if (prog == ID_MIN_IF) { return 14; }
+    if (prog == ID_SKIP_IF) { return 12; }
+    if (prog == ID_BAD_BR) { return 6; }
+    if (prog == ID_STORE_LOAD) { return 13; }
+    if (prog == ID_STORE8_MASK) { return 14; }
+    if (prog == ID_LOAD16_LE) { return 14; }
+    if (prog == ID_OFFSET_LOAD) { return 13; }
+    if (prog == ID_FILL16) { return 37; }
+    if (prog == ID_I64_ROUNDTRIP) { return 22; }
+    // ID_CALL  main(7) + fn0 double(6) = 13:
+    //   main local.get 0(2); local.set 7(2); call 0(2); end(1)
+    //   fn0  local.get 7(2); local.get 7(2); i32.add(1); end(1)
+    if (prog == ID_CALL) { return 13; }
+    // ID_CALL2 main(7) + fn1(9) + fn0(6) = 22: fn1 doubles twice,
+    //   fn1 call 0; local.set 7; local.get 7; call 0; end
+    if (prog == ID_CALL2) { return 22; }
+    // ID_F32_BITS i32.const 0; i32.const <sleb 0x3F800000, 5 bytes>;
+    // i32.store; i32.const 0; f32.load; end = 2+6+3+2+3+1 = 17
+    if (prog == ID_F32_BITS) { return 17; }
+    // ID_F64_BITS i32.const 0; i64.const <sleb 0x0102030405060708, 9 bytes>;
+    // i64.store; i32.const 0; f64.load; i32.wrap_i64; end = 2+10+3+2+3+1+1 = 22
+    if (prog == ID_F64_BITS) { return 22; }
+    // ID_F32_STORE_LE i32.const 0; i32.const <f32 bits>; f32.store;
+    // i32.const 0; i32.load8_u offset 3; end = 2+6+3+2+3+1 = 17
+    if (prog == ID_F32_STORE_LE) { return 17; }
+    return 0;
+}
+
+; Put one byte and advance a module-level cursor.
+pub var fill_at : u32 = 0;
+
+fn put(b : u8) u8 {
+    if (fill_at >= CODE_MAX) {
+        err = ERR_PROG;
+        return 0;
+    }
+    code[fill_at] = b;
+    fill_at = fill_at + 1;
+    return 1;
+}
+
+; Load program prog into code[], the two params into locals[0]/[1], clear state.
+; Every byte below is the WebAssembly final encoding; the comments name the
+; instruction, and test code_bytes_match_the_text pins them against an independent count
+; independent count (23/25/14/12/6).
+pub fn load(prog : u32, a : u32, b : u32) u8 {
+    err = 0;
+    sp = 0;
+    pc = 0;
+    label_n = 0;
+    sp64 = 0;
+    call_n = 0;
+    fn_n = 0;
+    fill_at = 0;
+    code_len = program_len(prog);
+    if (code_len == 0) {
+        err = ERR_PROG;
+        return 0;
+    }
+    var i : u32 = 0;
+    while (i < CODE_MAX) {
+        code[i] = 0;
+        i = i + 1;
+    }
+    locals[0] = a;
+    locals[1] = b;
+    i = 2;
+    while (i < LOCALS_MAX) {
+        locals[i] = 0;
+        i = i + 1;
+    }
+    if (prog == ID_COUNTDOWN) {
+        put(OP_BLOCK); put(BT_VOID);
+        put(OP_LOOP); put(BT_VOID);
+        put(OP_LOCAL_GET); put(0);
+        put(OP_I32_EQZ);
+        put(OP_BR_IF); put(1);
+        put(OP_LOCAL_GET); put(0);
+        put(OP_I32_CONST); put(1);
+        put(OP_I32_SUB);
+        put(OP_LOCAL_SET); put(0);
+        put(OP_BR); put(0);
+        put(OP_END);
+        put(OP_END);
+        put(OP_LOCAL_GET); put(0);
+        put(OP_END);
+    }
+    if (prog == ID_STEP2) {
+        put(OP_BLOCK); put(BT_VOID);
+        put(OP_LOOP); put(BT_VOID);
+        put(OP_LOCAL_GET); put(0);
+        put(OP_I32_CONST); put(2);
+        put(OP_I32_LT_S);
+        put(OP_BR_IF); put(1);
+        put(OP_LOCAL_GET); put(0);
+        put(OP_I32_CONST); put(2);
+        put(OP_I32_SUB);
+        put(OP_LOCAL_SET); put(0);
+        put(OP_BR); put(0);
+        put(OP_END);
+        put(OP_END);
+        put(OP_LOCAL_GET); put(0);
+        put(OP_END);
+    }
+    if (prog == ID_MIN_IF) {
+        put(OP_LOCAL_GET); put(0);
+        put(OP_LOCAL_GET); put(1);
+        put(OP_I32_LT_S);
+        put(OP_IF); put(BT_VOID);
+        put(OP_LOCAL_GET); put(0);
+        put(OP_ELSE);
+        put(OP_LOCAL_GET); put(1);
+        put(OP_END);
+        put(OP_END);
+    }
+    if (prog == ID_SKIP_IF) {
+        put(OP_LOCAL_GET); put(0);
+        put(OP_I32_EQZ);
+        put(OP_IF); put(BT_VOID);
+        put(OP_I32_CONST); put(7);
+        put(OP_ELSE);
+        put(OP_I32_CONST); put(9);
+        put(OP_END);
+        put(OP_END);
+    }
+    if (prog == ID_BAD_BR) {
+        put(OP_BLOCK); put(BT_VOID);
+        put(OP_BR); put(5);
+        put(OP_END);
+        put(OP_END);
+    }
+    if (prog == ID_STORE_LOAD) {
+        put(OP_I32_CONST); put(8);
+        put(OP_I32_CONST); put(42);
+        put(OP_I32_STORE); put(0); put(0);
+        put(OP_I32_CONST); put(8);
+        put(OP_I32_LOAD); put(0); put(0);
+        put(OP_END);
+    }
+    if (prog == ID_STORE8_MASK) {
+        put(OP_I32_CONST); put(4);
+        put(OP_I32_CONST); put(0xFF); put(0x03);
+        put(OP_I32_STORE8); put(0); put(0);
+        put(OP_I32_CONST); put(4);
+        put(OP_I32_LOAD8_U); put(0); put(0);
+        put(OP_END);
+    }
+    if (prog == ID_LOAD16_LE) {
+        put(OP_I32_CONST); put(2);
+        put(OP_I32_CONST); put(0xFF); put(0x03);
+        put(OP_I32_STORE16); put(0); put(0);
+        put(OP_I32_CONST); put(2);
+        put(OP_I32_LOAD16_U); put(0); put(0);
+        put(OP_END);
+    }
+    if (prog == ID_OFFSET_LOAD) {
+        put(OP_I32_CONST); put(0);
+        put(OP_I32_CONST); put(9);
+        put(OP_I32_STORE); put(0); put(4);
+        put(OP_I32_CONST); put(0);
+        put(OP_I32_LOAD); put(0); put(4);
+        put(OP_END);
+    }
+    if (prog == ID_FILL16) {
+        put(OP_I32_CONST); put(0);
+        put(OP_LOCAL_SET); put(2);
+        put(OP_BLOCK); put(BT_VOID);
+        put(OP_LOOP); put(BT_VOID);
+        put(OP_LOCAL_GET); put(2);
+        put(OP_I32_CONST); put(16);
+        put(OP_I32_LT_S);
+        put(OP_I32_EQZ);
+        put(OP_BR_IF); put(1);
+        put(OP_LOCAL_GET); put(2);
+        put(OP_I32_CONST); put(42);
+        put(OP_I32_STORE); put(0); put(0);
+        put(OP_LOCAL_GET); put(2);
+        put(OP_I32_CONST); put(1);
+        put(OP_I32_ADD);
+        put(OP_LOCAL_SET); put(2);
+        put(OP_BR); put(0);
+        put(OP_END);
+        put(OP_END);
+        put(OP_LOCAL_GET); put(2);
+        put(OP_END);
+    }
+    if (prog == ID_I64_ROUNDTRIP) {
+        put(OP_I32_CONST); put(0);
+        put(OP_I64_CONST); put(0x88); put(0xEF); put(0x99); put(0xAB); put(0xC5); put(0xE8); put(0x8C); put(0x91); put(0x11);
+        put(OP_I64_STORE); put(0); put(0);
+        put(OP_I32_CONST); put(0);
+        put(OP_I64_LOAD); put(0); put(0);
+        put(OP_I32_WRAP_I64);
+        put(OP_END);
+    }
+    if (prog == ID_CALL) {
+        // main at pc 0: local.get 0; local.set 7; call 0; end
+        put(OP_LOCAL_GET); put(0);
+        put(OP_LOCAL_SET); put(7);
+        put(OP_CALL); put(0);
+        put(OP_END);
+        // fn0 (the double fn) at pc 10: local.get 7; local.get 7; i32.add; end
+        fn_pc[0] = fill_at;
+        fn_n = 1;
+        put(OP_LOCAL_GET); put(7);
+        put(OP_LOCAL_GET); put(7);
+        put(OP_I32_ADD);
+        put(OP_END);
+    }
+    if (prog == ID_CALL2) {
+        // main at pc 0: local.get 0; local.set 7; call 1; end  (7 bytes)
+        put(OP_LOCAL_GET); put(0);
+        put(OP_LOCAL_SET); put(7);
+        put(OP_CALL); put(1);
+        put(OP_END);
+        // fn1 at pc 7: doubles twice -- call 0; local.set 7; local.get 7;
+        // call 0; end  (9 bytes). The callee's result comes back on the
+        // stack; local.set 7 parks it, the second call doubles it again.
+        fn_pc[1] = fill_at;
+        put(OP_CALL); put(0);
+        put(OP_LOCAL_SET); put(7);
+        put(OP_LOCAL_GET); put(7);
+        put(OP_CALL); put(0);
+        put(OP_END);
+        // fn0 at pc 16: the double fn (6 bytes)
+        fn_pc[0] = fill_at;
+        fn_n = 2;
+        put(OP_LOCAL_GET); put(7);
+        put(OP_LOCAL_GET); put(7);
+        put(OP_I32_ADD);
+        put(OP_END);
+    }
+    if (prog == ID_F32_BITS) {
+        // store the 1.0f32 bit pattern 0x3F800000 as i32, load it back as f32:
+        // the same four bytes ride out and back, proving the pattern moves
+        put(OP_I32_CONST); put(0);
+        put(OP_I32_CONST); put(0x80); put(0x80); put(0x80); put(0xFC); put(0x03);
+        put(OP_I32_STORE); put(0); put(0);
+        put(OP_I32_CONST); put(0);
+        put(OP_F32_LOAD); put(0); put(0);
+        put(OP_END);
+    }
+    if (prog == ID_F64_BITS) {
+        // store 0x0102030405060708 as i64, load the same eight bytes back as
+        // f64, wrap to i32: the low word 0x05060708 comes back byte for byte
+        put(OP_I32_CONST); put(0);
+        put(OP_I64_CONST); put(0x88); put(0x8E); put(0x98); put(0xA8); put(0xC0); put(0xE0); put(0x80); put(0x81); put(0x01);
+        put(OP_I64_STORE); put(0); put(0);
+        put(OP_I32_CONST); put(0);
+        put(OP_F64_LOAD); put(0); put(0);
+        put(OP_I32_WRAP_I64);
+        put(OP_END);
+    }
+    if (prog == ID_F32_STORE_LE) {
+        // f32.store writes the pattern LITTLE-ENDIAN: 0x3F800000 lands as
+        // 00 00 80 3F, so the byte at offset 3 is 0x3F
+        put(OP_I32_CONST); put(0);
+        put(OP_I32_CONST); put(0x80); put(0x80); put(0x80); put(0xFC); put(0x03);
+        put(OP_F32_STORE); put(0); put(0);
+        put(OP_I32_CONST); put(0);
+        put(OP_I32_LOAD8_U); put(0); put(3);
+        put(OP_END);
+    }
+    if (fill_at != code_len) {
+        err = ERR_PROG;
+        return 0;
+    }
+    return 1;
+}
+
+; The interpreter. One flat dispatch, one self-contained if per opcode, so no
+; branch of it can swallow another opcodes bytes.
+pub fn exec() u32 {
+    var op : u8 = 0;
+    var idx : u32 = 0;
+    var cond : u32 = 0;
+    var x : u32 = 0;
+    var y : u32 = 0;
+    var steps : u32 = 0;
+    var jumped : u8 = 0;
+    var where : u8 = 0;
+    var matched : u8 = 0;
+    while (err == 0) {
+        steps = steps + 1;
+        if (steps > STEP_LIMIT) {
+            err = ERR_STEP;
+            return 0;
+        }
+        if (pc >= code_len) {
+            err = ERR_PC;
+            return 0;
+        }
+        op = code[pc];
+        pc = pc + 1;
+        matched = 0;
+
+        if (op == OP_I32_CONST) {
+            push(read_sleb());
+            matched = 1;
+        }
+        if (op == OP_LOCAL_GET) {
+            idx = code[pc] as u32;
+            pc = pc + 1;
+            if (idx < LOCALS_MAX) {
+                push(locals[idx]);
+                matched = 1;
+            } else {
+                err = ERR_LOCAL;
+            }
+        }
+        if (op == OP_LOCAL_SET) {
+            idx = code[pc] as u32;
+            pc = pc + 1;
+            if (idx < LOCALS_MAX) {
+                locals[idx] = pop();
+                matched = 1;
+            } else {
+                err = ERR_LOCAL;
+            }
+        }
+        if (op == OP_I32_EQZ) {
+            x = pop();
+            if (x == 0) { push(1); } else { push(0); }
+            matched = 1;
+        }
+        if (op == OP_I32_LT_S) {
+            y = pop();
+            x = pop();
+            push(lt_s(x, y));
+            matched = 1;
+        }
+        if (op == OP_I32_ADD) {
+            y = pop();
+            x = pop();
+            push(wrap32((x as u64) + (y as u64)));
+            matched = 1;
+        }
+        if (op == OP_I32_SUB) {
+            y = pop();
+            x = pop();
+            push(wrap32((x as u64) + ((0xFFFFFFFF - y) as u64) + 1));
+            matched = 1;
+        }
+        if (op == OP_BLOCK) {
+            pc = pc + 1;
+            open_frame(K_BLOCK, 0);
+            matched = 1;
+        }
+        if (op == OP_LOOP) {
+            pc = pc + 1;
+            open_frame(K_LOOP, pc);
+            matched = 1;
+        }
+        if (op == OP_IF) {
+            pc = pc + 1;
+            cond = pop();
+            if (cond != 0) {
+                open_frame(K_IF_THEN, 0);
+            } else {
+                open_frame(K_IF_OTHER, 0);
+                where = scan_else_or_end(label_n - 1);
+                if (where == 2) {
+                    // no else: the construct is closed, drop the frame we just opened
+                    label_n = label_n - 1;
+                }
+            }
+            matched = 1;
+        }
+        if (op == OP_ELSE) {
+            // reached only while the then-branch is executing: skip the else body
+            where = scan_end(label_n - 1);
+            if (where == 1) {
+                label_n = label_n - 1;
+            }
+            matched = 1;
+        }
+        if (op == OP_END) {
+            if (label_n == 0) {
+                if (call_n > 0) {
+                    // the callee's own end: pop the call frame and resume.
+                    // The callee's own execution already left the stack
+                    // heights where they belong (a well-formed callee runs
+                    // net +1), so a return rewinds nothing -- the saved
+                    // heights in the frame are for branch unwinding, not
+                    // for the return.
+                    call_n = call_n - 1;
+                    pc = call_ret_pc[call_n];
+                    label_n = call_label_n[call_n];
+                    matched = 1;
+                } else {
+                    // the top fn's own end: the run's result
+                    return pop();
+                }
+            } else {
+                label_n = label_n - 1;
+                matched = 1;
+            }
+        }
+        if (op == OP_BR) {
+            idx = read_sleb();
+            jumped = do_br(idx);
+            matched = 1;
+        }
+        if (op == OP_BR_IF) {
+            idx = read_sleb();
+            cond = pop();
+            if (cond != 0) {
+                do_br(idx);
+            }
+            matched = 1;
+        }
+        if (op == OP_I32_LOAD) {
+            idx = read_sleb(); // align hint, ignored by this interpreter
+            y = read_sleb();   // immediate offset
+            x = pop();
+            push(mem_read(x, y, 4));
+            matched = 1;
+        }
+        if (op == OP_I32_LOAD8_U) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push(mem_read(x, y, 1));
+            matched = 1;
+        }
+        if (op == OP_I32_LOAD8_S) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push(sign_extend(mem_read(x, y, 1), 1));
+            matched = 1;
+        }
+        if (op == OP_I32_LOAD16_U) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push(mem_read(x, y, 2));
+            matched = 1;
+        }
+        if (op == OP_I32_LOAD16_S) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push(sign_extend(mem_read(x, y, 2), 2));
+            matched = 1;
+        }
+        if (op == OP_I32_STORE) {
+            idx = read_sleb();
+            y = read_sleb();
+            cond = pop(); // value
+            x = pop();    // address
+            mem_write(x, y, cond, 4);
+            matched = 1;
+        }
+        if (op == OP_I32_STORE8) {
+            idx = read_sleb();
+            y = read_sleb();
+            cond = pop();
+            x = pop();
+            mem_write(x, y, cond, 1);
+            matched = 1;
+        }
+        if (op == OP_I32_STORE16) {
+            idx = read_sleb();
+            y = read_sleb();
+            cond = pop();
+            x = pop();
+            mem_write(x, y, cond, 2);
+            matched = 1;
+        }
+        if (op == OP_I64_CONST) {
+            push64(read_sleb64());
+            matched = 1;
+        }
+        if (op == OP_I32_WRAP_I64) {
+            var v64 : u64 = pop64();
+            push(wrap32(v64));
+            matched = 1;
+        }
+        if (op == OP_I64_LOAD) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(mem_read64(x, y, 8));
+            matched = 1;
+        }
+        if (op == OP_I64_LOAD8_U) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(mem_read64(x, y, 1));
+            matched = 1;
+        }
+        if (op == OP_I64_LOAD8_S) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(sign_extend64(mem_read64(x, y, 1), 1));
+            matched = 1;
+        }
+        if (op == OP_I64_LOAD16_U) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(mem_read64(x, y, 2));
+            matched = 1;
+        }
+        if (op == OP_I64_LOAD16_S) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(sign_extend64(mem_read64(x, y, 2), 2));
+            matched = 1;
+        }
+        if (op == OP_I64_LOAD32_U) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(mem_read64(x, y, 4));
+            matched = 1;
+        }
+        if (op == OP_I64_LOAD32_S) {
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(sign_extend64(mem_read64(x, y, 4), 4));
+            matched = 1;
+        }
+        if (op == OP_I64_STORE) {
+            idx = read_sleb();
+            y = read_sleb();
+            var val : u64 = pop64();
+            x = pop();
+            mem_write64(x, y, val, 8);
+            matched = 1;
+        }
+        if (op == OP_I64_STORE8) {
+            idx = read_sleb();
+            y = read_sleb();
+            var val8 : u64 = pop64();
+            x = pop();
+            mem_write64(x, y, val8, 1);
+            matched = 1;
+        }
+        if (op == OP_I64_STORE16) {
+            idx = read_sleb();
+            y = read_sleb();
+            var val16 : u64 = pop64();
+            x = pop();
+            mem_write64(x, y, val16, 2);
+            matched = 1;
+        }
+        if (op == OP_I64_STORE32) {
+            idx = read_sleb();
+            y = read_sleb();
+            var val32 : u64 = pop64();
+            x = pop();
+            mem_write64(x, y, val32, 4);
+            matched = 1;
+        }
+        if (op == OP_CALL) {
+            idx = read_sleb(); // the uleb function index
+            if (idx >= fn_n) {
+                err = ERR_CALL;
+            } else if (call_n >= CALL_MAX) {
+                err = ERR_CALL;
+            } else {
+                call_ret_pc[call_n] = pc;
+                call_label_n[call_n] = label_n;
+                call_sp[call_n] = sp;
+                call_sp64[call_n] = sp64;
+                call_n = call_n + 1;
+                pc = fn_pc[idx];
+            }
+            matched = 1;
+        }
+        if (op == OP_F32_LOAD) {
+            // the four bytes at the effective address ride the i32 stack as
+            // the f32's IEEE-754 bit pattern; no float arithmetic is claimed
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push(mem_read(x, y, 4));
+            matched = 1;
+        }
+        if (op == OP_F64_LOAD) {
+            // the eight bytes ride the u64 stack as the f64's bit pattern
+            idx = read_sleb();
+            y = read_sleb();
+            x = pop();
+            push64(mem_read64(x, y, 8));
+            matched = 1;
+        }
+        if (op == OP_F32_STORE) {
+            idx = read_sleb();
+            y = read_sleb();
+            cond = pop(); // the f32 bit pattern, on the i32 carrier
+            x = pop();    // address
+            mem_write(x, y, cond, 4);
+            matched = 1;
+        }
+        if (op == OP_F64_STORE) {
+            idx = read_sleb();
+            y = read_sleb();
+            var vf64 : u64 = pop64(); // the f64 bit pattern, on the u64 carrier
+            x = pop();
+            mem_write64(x, y, vf64, 8);
+            matched = 1;
+        }
+        if (matched == 0) {
+            err = ERR_OPCODE;
+        }
+    }
+    return 0;
+}
+
+; Run program prog on (a, b): load, execute, return the result (0 with err set).
+pub fn run_prog(prog : u32, a : u32, b : u32) u32 {
+    if (load(prog, a, b) == 0) {
+        return 0;
+    }
+    return exec();
+}
+
+// The linear memory as the outside sees it: the framebuffer link reads
+// pixels straight out of it, so the interpreter and the display share one array.
+pub fn mem_at(i : u32) u8 {
+    if (i >= mem_n) {
+        return 0;
+    }
+    return mem[i];
+}
+
+pub fn last_err() u8 {
+    return err;
+}
+
+test opcode_bytes_are_real_wasm {
+    // WebAssembly Section 5 instruction table, final encodings
+    assert OP_BLOCK == 0x02;
+    assert OP_LOOP == 0x03;
+    assert OP_IF == 0x04;
+    assert OP_ELSE == 0x05;
+    assert OP_END == 0x0B;
+    assert OP_BR == 0x0C;
+    assert OP_BR_IF == 0x0D;
+    assert OP_LOCAL_GET == 0x20;
+    assert OP_LOCAL_SET == 0x21;
+    assert OP_I32_CONST == 0x41;
+    assert OP_I32_EQZ == 0x45;
+    assert OP_I32_LT_S == 0x48;
+    assert OP_I32_SUB == 0x6B;
+}
+
+test memory_family_is_not_claimed {
+    // the DOOM set is 23 names; this floor implements the branch half only, and
+    // says so instead of silently covering less than its name suggests.
+    assert OP_BLOCK != 0x28;  // i32.load is a later floor
+    assert OP_LOOP != 0x36;   // i32.store is a later floor
+}
+
+test wrap32_keeps_the_low_32_bits {
+    assert wrap32(0x1_0000_0001) == 1;
+    assert wrap32(0xFFFFFFFF) == 0xFFFFFFFF;
+}
+
+test lt_s_is_signed {
+    assert lt_s(1, 2) == 1;
+    assert lt_s(2, 1) == 0;
+    // -1 < 0 in signed order, though 0xFFFFFFFF > 0 unsigned
+    assert lt_s(0xFFFFFFFF, 0) == 1;
+    assert lt_s(0, 0xFFFFFFFF) == 0;
+}
+
+test countdown_loop_reaches_zero {
+    // block loop local.get 0 i32.eqz br_if 1 ... br 0 end end
+    // The loop subtracts 1 until br_if exits the enclosing block.
+    assert run_prog(ID_COUNTDOWN, 5, 0) == 0;
+    assert last_err() == ERR_NONE;
+    assert run_prog(ID_COUNTDOWN, 0, 0) == 0;
+    assert last_err() == ERR_NONE;
+    assert run_prog(ID_COUNTDOWN, 1, 0) == 0;
+    assert last_err() == ERR_NONE;
+}
+
+test step2_computes_parity {
+    // The loop subtracts 2 while a >= 2, so the result is a mod 2.
+    assert run_prog(ID_STEP2, 0, 0) == 0;
+    assert run_prog(ID_STEP2, 1, 0) == 1;
+    assert run_prog(ID_STEP2, 2, 0) == 0;
+    assert run_prog(ID_STEP2, 7, 0) == 1;
+    assert run_prog(ID_STEP2, 10, 0) == 0;
+    assert last_err() == ERR_NONE;
+}
+
+test min_if_selects_the_smaller {
+    // local.get 0 local.get 1 i32.lt_s if local.get 0 else local.get 1 end
+    assert run_prog(ID_MIN_IF, 3, 9) == 3;
+    assert run_prog(ID_MIN_IF, 9, 3) == 3;
+    assert run_prog(ID_MIN_IF, 4, 4) == 4;
+    assert last_err() == ERR_NONE;
+}
+
+test skip_if_takes_the_else_path {
+    // local.get 0 i32.eqz if 7 else 9 end
+    assert run_prog(ID_SKIP_IF, 0, 0) == 7;
+    assert run_prog(ID_SKIP_IF, 1, 0) == 9;
+    assert last_err() == ERR_NONE;
+}
+
+test bad_branch_depth_is_refused {
+    // br 5 inside one block: deeper than any open frame, so the run stops with
+    // ERR_LABEL instead of reading a negative label index.
+    assert run_prog(ID_BAD_BR, 0, 0) == 0;
+    assert last_err() == ERR_LABEL;
+}
+
+test code_bytes_match_the_text {
+    // Every program length is the count of the text in the header comment.
+    assert load(ID_COUNTDOWN, 0, 0) == 1;
+    assert code_len == 23;
+    assert load(ID_STEP2, 0, 0) == 1;
+    assert code_len == 25;
+    assert load(ID_MIN_IF, 0, 0) == 1;
+    assert code_len == 14;
+    assert load(ID_SKIP_IF, 0, 0) == 1;
+    assert code_len == 12;
+    assert load(ID_BAD_BR, 0, 0) == 1;
+    assert code_len == 6;
+    // and the first bytes really are the MVP encodings, not the fill value
+    assert load(ID_COUNTDOWN, 0, 0) == 1;
+    assert code[0] == 0x02;
+    assert code[1] == 0x40;
+    assert code[2] == 0x03;
+    assert code[3] == 0x40;
+}
+
+test step_budget_is_enforced {
+    // A body that never advances pc must be stopped by the step limit, not hung.
+    err = 0;
+    code_len = 1;
+    code[0] = 0x0C; // br, then read_sleb runs past the end: ERR_PROG
+    pc = 0;
+    sp = 0;
+    label_n = 0;
+    exec();
+    assert err != ERR_NONE;
+}
+
+test store_then_load_roundtrips {
+    // i32.const 8 i32.const 42 i32.store i32.const 8 i32.load -> 42
+    assert run_prog(ID_STORE_LOAD, 0, 0) == 42;
+    assert last_err() == ERR_NONE;
+}
+
+test store8_truncates_to_one_byte {
+    // 511 stored as a byte reads back as 255, the low 8 bits zero-extended
+    assert run_prog(ID_STORE8_MASK, 0, 0) == 255;
+    assert last_err() == ERR_NONE;
+}
+
+test load16_is_little_endian {
+    // 511 = 0x01FF stored as 16 bits lands as FF 01, and reads back 511
+    assert run_prog(ID_LOAD16_LE, 0, 0) == 511;
+    assert last_err() == ERR_NONE;
+}
+
+test offset_immediate_moves_the_effective_address {
+    // store 9 at address 0 + offset 4, then load the same effective address
+    assert run_prog(ID_OFFSET_LOAD, 0, 0) == 9;
+    assert last_err() == ERR_NONE;
+}
+
+test out_of_range_access_is_refused {
+    // A load beyond the declared memory stops the run with ERR_MEM rather than
+    // reading outside the array.
+    err = 0;
+    pc = 0;
+    sp = 0;
+    label_n = 0;
+    mem_n = 8;
+    assert mem_read(6, 4, 4) == 0;
+    assert err == ERR_MEM;
+    mem_n = MEM_MAX;
+}
+
+test sign_extension_of_small_loads {
+    // 0x80 as a signed byte is -128, whose i32 pattern is 0xFFFFFF80
+    assert sign_extend(0x80, 1) == 0xFFFFFF80;
+    assert sign_extend(0x7F, 1) == 0x7F;
+    assert sign_extend(0x8000, 2) == 0xFFFF8000;
+    assert sign_extend(0x1234, 2) == 0x1234;
+    assert sign_extend(0x12345678, 4) == 0x12345678;
+}
+
+test fill16_writes_a_row_through_a_loop {
+    // i = 0; while i < 16 { mem[i] = 42; i = i + 1 }: branches and memory together,
+    // which is what a DOOM row blit does (a countdown loop storing palette indices).
+    assert run_prog(ID_FILL16, 0, 0) == 16;
+    assert last_err() == ERR_NONE;
+    var i : u32 = 0;
+    while (i < 16) {
+        assert mem_at(i) == 42;
+        i = i + 1;
+    }
+    assert mem_at(16) == 0;
+}
+
+test i64_roundtrip_then_wrap {
+    // i64.const 0x1122334455667788, store 8 bytes, load, i32.wrap_i64: the
+    // wrapped value is the low 32 bits, 0x55667788.
+    assert run_prog(ID_I64_ROUNDTRIP, 0, 0) == 0x55667788;
+    assert last_err() == ERR_NONE;
+    // the store really wrote little-endian bytes into memory
+    assert mem_at(0) == 0x88;
+    assert mem_at(1) == 0x77;
+    assert mem_at(7) == 0x11;
+}
+
+test i64_narrow_loads_and_sign_extension {
+    assert sign_extend64(0x80, 1) == 0xFFFFFFFFFFFFFF80;
+    assert sign_extend64(0x7F, 1) == 0x7F;
+    assert sign_extend64(0x8000, 2) == 0xFFFFFFFFFFFF8000;
+    assert sign_extend64(0x1234, 2) == 0x1234;
+    assert sign_extend64(0x80000000, 4) == 0xFFFFFFFF80000000;
+    assert sign_extend64(0x12345678, 4) == 0x12345678;
+    assert sign_extend64(0x1234567890ABCDEF, 8) == 0x1234567890ABCDEF;
+}
+
+test i64_memory_is_little_endian {
+    // write 0x0102030405060708 and read every byte back through mem_at
+    var v : u64 = 0x0102030405060708;
+    assert mem_write64(64, 0, v, 8) == 1;
+    assert mem_at(64) == 0x08;
+    assert mem_at(65) == 0x07;
+    assert mem_at(71) == 0x01;
+    assert mem_read64(64, 0, 8) == v;
+}
+
+; -- floor CALL+FMEM: the last five named DOOM opcodes (call, f32/f64
+; load/store). 23 of 23 after these tests. --
+
+test call_returns_the_callee_result {
+    // main passes a through local 7 into fn0 (double): double(21) = 42
+    assert run_prog(ID_CALL, 21, 0) == 42;
+    assert last_err() == ERR_NONE;
+    assert run_prog(ID_CALL, 0, 0) == 0;
+    assert last_err() == ERR_NONE;
+}
+
+test call_nests_two_frames_and_returns_in_order {
+    // main calls fn1 which doubles twice through fn0: quadruple(3) = 12;
+    // both frames return, the inner first
+    assert run_prog(ID_CALL2, 3, 0) == 12;
+    assert last_err() == ERR_NONE;
+}
+
+test call_of_unknown_fn_is_refused {
+    // a call index past fn_n fails closed with ERR_CALL, no frame is opened
+    assert load(ID_CALL, 1, 0) == 1;
+    // hand-patch the callee index past the table: fn_n is 1, index 5 refuses
+    // the call sits at pc 4, its index byte at pc 5
+    code[5] = 5;
+    err = 0; pc = 0;
+    exec();
+    assert last_err() == ERR_CALL;
+    assert call_n == 0;
+}
+
+test f32_load_store_moves_the_bit_pattern {
+    // 1.0f32 = 0x3F800000 goes out on the i32 carrier and comes back on it:
+    // the run's result is the same 32 bits, read as the pattern they are
+    assert run_prog(ID_F32_BITS, 0, 0) == 0x3F800000;
+    assert last_err() == ERR_NONE;
+}
+
+test f64_load_store_roundtrips_the_low_word {
+    // 0x0102030405060708 stored as i64, loaded back as f64 (the same eight
+    // bytes on the u64 carrier), wrapped to i32: the low word 0x05060708
+    assert run_prog(ID_F64_BITS, 0, 0) == 0x05060708;
+    assert last_err() == ERR_NONE;
+}
+
+test f32_store_writes_little_endian {
+    // 0x3F800000 lands as bytes 00 00 80 3F: offset 3 holds 0x3F
+    assert run_prog(ID_F32_STORE_LE, 0, 0) == 0x3F;
+    assert last_err() == ERR_NONE;
+    assert mem_at(0) == 0x00;
+    assert mem_at(1) == 0x00;
+    assert mem_at(2) == 0x80;
+    assert mem_at(3) == 0x3F;
+}
+
+test the_floor_is_now_twentythree_of_twentythree {
+    // every named DOOM opcode byte has a dispatch case: call 0x10, the four
+    // float memory ops, and the eighteen floors before them. The audit in
+    // wasm_opcodes.t27 reads this set through name_in_doom_set.
+    assert OP_CALL == 0x10;
+    assert OP_F32_LOAD == 0x2A and OP_F64_LOAD == 0x2B;
+    assert OP_F32_STORE == 0x38 and OP_F64_STORE == 0x39;
+    assert ERR_CALL == 9;
+    assert CALL_MAX == 4 and FN_MAX == 4;
+}

@@ -29,7 +29,7 @@ Any guard decision **MUST** depend only on these files and directly observable g
 
 #### 1.3.1. NO-COMMIT-WITHOUT-ISSUE
 
-Any operation leading to git commit (including `tri skill commit`, `tri git commit`, internal auto-commits) **MUST** be blocked if:
+Any operation leading to git commit (including `tri git commit`, `tri git commit`, internal auto-commits) **MUST** be blocked if:
 
 - No active skill in `.trinity/state/active-skill.json`, OR
 - No valid issue binding in `.trinity/state/issue-binding.json`, OR
@@ -42,7 +42,8 @@ On violation, PHI LOOP **MUST**:
 
 #### 1.3.2. NO-MUTATION-WITHOUT-SKILL
 
-Any command that modifies `.trinity/` or specs `.tri/.t27` (including `tri spec edit`, `tri gen`, `tri verdict`, `tri skill seal`) **MUST** check for active skill.
+### Not built (planned surface only): tri spec
+Any command that modifies `.trinity/` or specs `.tri/.t27` (including `tri spec edit`, `tri gen`, `tri verdict`, `tri cell seal`) **MUST** check for active skill.
 
 If no active skill exists, command **MUST** fail with error before any file changes.
 
@@ -83,10 +84,11 @@ State machine transitions (see §2 for diagram):
    - **MUST** create/update `.trinity/state/active-skill.json` and `.trinity/state/issue-binding.json` in consistent state
    - **MUST** refuse if there's already an active skill with different issue and lease wasn't properly closed
 
+### Not built (planned surface only): tri spec
 2. `tri spec edit ...`
    - **MUST** be allowed only with active skill + binding
 
-3. `tri skill seal --hash ...`
+3. `tri cell seal --hash ...`
    - **MUST** be prohibited without active skill
    - **MUST** verify spec_hash_before/after match current git state and expectations
 
@@ -94,7 +96,7 @@ State machine transitions (see §2 for diagram):
    - Each **MUST** check active skill + issue-binding before execution
    - **MUST** compute verdict (CLEAN/TOXIC) and exit accordingly
 
-5. `tri skill commit` / `tri git commit`
+5. `tri git commit` / `tri git commit`
    - **MUST** be the only legal commit methods in PHI LOOP
    - **MUST** perform NO-COMMIT-WITHOUT-ISSUE check
    - **MUST** after successful commit: add record to `episodes.jsonl` and reset `active-skill`
@@ -331,7 +333,7 @@ Contract:
               ▼                               ▼
 ┌─────────────────────────────┐   ┌──────────────────────────────────┐
 │       COMMIT (CLEAN)        │   │     ROLLBACK (TOXIC)           │
-│  • tri skill commit          │   │  • Atomic rollback protocol    │
+│  • tri git commit          │   │  • Atomic rollback protocol    │
 │  • Record episode            │   │  • Revert specs               │
 │  • Reset active skill        │   │  • Delete generated artifacts  │
 │  • Exit code 0               │   │  • Invalidate seal            │
@@ -355,7 +357,7 @@ Contract:
 | ACTIVE | VERDICT | `tri verdict` or `tri test` | Active skill exists |
 | VERDICT | COMMIT | Verdict == CLEAN | No failures, seals valid |
 | VERDICT | ROLLBACK | Verdict == TOXIC | Any TOXIC condition |
-| COMMIT | IDLE | `tri skill commit` success | Episode recorded, skill reset |
+| COMMIT | IDLE | `tri git commit` success | Episode recorded, skill reset |
 | ROLLBACK | IDLE | Rollback complete | Specs reverted, seal removed |
 
 ---
@@ -505,7 +507,7 @@ Available Actions:
   2. tri test specs/numeric/gf4.t27
   3. tri verdict --toxic specs/numeric/gf4.t27
   4. tri experience save
-  5. tri skill commit
+  5. tri git commit
 ```
 
 With TOXIC verdict:

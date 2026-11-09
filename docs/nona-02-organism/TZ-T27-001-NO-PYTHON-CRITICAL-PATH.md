@@ -35,6 +35,7 @@ Remove the documented split where “verdict” and assurance scenarios run thro
 |----|-------------|---------------------|
 | **R1** | Kepler/Newton formulas and tolerances live in canonical **`*.t27`** (or one aggregating spec module) | No duplicated logic in Python; Python removed or reduced to a thin `tri` wrapper marked deprecated |
 | **R2** | **Verdict** is invoked as **`tri verdict …`** (or equivalent `t27c`) | README and CI do not require `python conformance/kepler_newton_tests.py` for release |
+### Not built (planned surface only): tri scenario
 | **R3** | Bridge scenarios run via **`tri scenario …`** or merged CLI | `run_scenario.py` deprecated or thin-wrapper |
 | **R4** | Mandatory scenario steps write to **`.trinity/experience/`** under an agreed schema when possible | Documented example run with ≥2 steps |
 | **R5** | Precision: either GoldenFloat / `f64` in specs suffices, or **one** language/runtime extension (no new Python on path) | ADR or `docs/` section |
