@@ -57,7 +57,7 @@ program writes its frames relative to the working directory.
    would let `base/` overwrite the new frames:
    - `sips -s format png $H/*.ppm --out $H/png/` (new frames and `_diff` frames)
    - `sips -s format png $H/base/*.ppm --out $H/png/base/` (before frames)
-7. **Show.** In the Browser pane: `preview_start` name `course-hud` (`.claude/launch.json`, port 8127, serves
+7. **Show.** In the Browser pane: `preview_start` name `course-hud-png` (`.claude/launch.json`, port 8127, serves
    `$H/png`), then navigate to `http://localhost:8127/<frame>.png` and take a screenshot -- the changed frame, its
    `_diff`, and `base/<frame>.png` for the before. Never open a PNG with the Read tool. Without a Browser pane, give
    the paths as links. Skill `tri-dev` is the full bring-up around this step.

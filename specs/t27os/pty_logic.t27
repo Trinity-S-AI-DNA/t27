@@ -102,6 +102,8 @@ use t27os::keys::MAX_FAILOVERS;
 use t27os::keys::agent_uses;
 use t27os::keys::spawn_mask;
 use t27os::keys::P_ZAI;
+use t27os::keys::P_NVIDIA;
+use t27os::keys::PR_NVIDIA;
 use t27os::keys::P_ANTHROPIC;
 use t27os::keys::P_OPENROUTER;
 use t27os::keys::P_OPENAI;
@@ -109,6 +111,7 @@ use t27os::keys::FC_OTHER;
 use t27os::keys::FC_LOGIN_REJECTED;
 use t27os::keys::profile_agent;
 use t27os::keys::pick_profile;
+use t27os::keys::agent_first_profile;
 use t27os::keys::agent_profile_ok;
 use t27os::keys::agent_stored;
 use t27os::keys::light_of;
@@ -245,14 +248,19 @@ pub const GIVEUP_QUIET_MS : u64 = 60000;
 /// The stage-2 router's state sits above the pane table (issue 12797): the listen fd of the
 /// 127.0.0.1:47127 accept loop (fd+1 stored, 0 = not open), its faults in a row and backoff
 /// left (router_actor.t27 tick_decision), then the mailbox: RT_CONNS connection fds (fd+1,
-/// 0 = free) at G_RCFD and their read lengths at G_RCLEN. Word 515 is spare.
-pub const G_RTL : usize = 512;
-pub const G_RFAULTS : usize = 513;
-pub const G_RBACKOFF : usize = 514;
-pub const G_RCFD : usize = 516;
-pub const G_RCLEN : usize = 524;
-/// The table grew from 512 to 544 words for the router state (issue 12797); nothing existing moved.
-pub const ST_SIZE : usize = 544;
+/// 0 = free) at G_RCFD and their read lengths at G_RCLEN. Word 547 is spare. The block first sat
+/// at 512..531, inside the pane table once KEY_SLOTS grew to 88 (G_PANEK 432, 16 * PK ends at 544):
+/// pane 11's PK_DONE was G_RTL and panes 12..15 shared words with the mailbox.
+pub const G_RTL : usize = 544;
+pub const G_RFAULTS : usize = 545;
+pub const G_RBACKOFF : usize = 546;
+pub const G_RCFD : usize = 548;
+pub const G_RCLEN : usize = 556;
+/// The mailbox bound: the words at G_RCFD and at G_RCLEN (pty_server pins it to router_actor CONN_MAILBOX).
+pub const RT_CONNS : usize = 8;
+/// The table grew from 512 to 544 words for the router state (issue 12797), then to 564 when the
+/// router block moved above the pane table; nothing else moved.
+pub const ST_SIZE : usize = 564;
 pub const MAX_CONNS : usize = 8;
 
 pub const SID_CAP : usize = 64;
@@ -464,6 +472,50 @@ pub fn path_first(out: []u8, home: []const u8, path: []const u8) -> usize {
     if (same and (path.len == n or path[n] == 58)) { n = 0; i = 0; } else { n = put_bytes(out, n, ":"); }
     if (n == 0) { return put_bytes(out, 0, path); }
     return put_bytes(out, n, path);
+}
+
+fn append_pane_path_dir(out: []u8, n: usize, dir: []const u8) -> usize {
+    if (out.len - n <= dir.len) { return n; }
+    var start : usize = 0;
+    var end : usize = 0;
+    while (end <= n) {
+        if (end == n or out[end] == 58) {
+            if (same_bytes(out[start..end], dir)) { return n; }
+            start = end + 1;
+        }
+        end = end + 1;
+    }
+    out[n] = 58;
+    return put_bytes(out, n + 1, dir);
+}
+
+fn append_pane_home_dir(out: []u8, n: usize, home: []const u8, suffix: []const u8) -> usize {
+    var dir : [512]u8 = undefined;
+    if (home.len == 0 or home[0] != 47 or home.len > dir.len - suffix.len) { return n; }
+    const h : usize = put_bytes(dir[0..512], 0, home);
+    const d : usize = put_bytes(dir[0..512], h, suffix);
+    return append_pane_path_dir(out, n, dir[0..d]);
+}
+
+/// Preserve the caller's precedence, then find common GUI-missing client directories.
+/// Refs https://github.com/dmitrii-f-t27/t27/issues/19.
+pub fn pane_command_path(out: []u8, home: []const u8, path: []const u8) -> usize {
+    var n : usize = path_first(out, home, path);
+    n = append_pane_home_dir(out, n, home, "/.local/bin");
+    n = append_pane_home_dir(out, n, home, "/.npm-global/bin");
+    n = append_pane_home_dir(out, n, home, "/.opencode/bin");
+    n = append_pane_path_dir(out, n, "/opt/homebrew/bin");
+    return append_pane_path_dir(out, n, "/usr/local/bin");
+}
+
+test gui_pane_paths_find_user_clients_without_reordering_or_duplicating_paths {
+    var out : [256]u8 = undefined;
+    const n : usize = pane_command_path(out[0..256], "/Users/x", "/opt/homebrew/bin:/usr/bin");
+    assert(same_bytes(out[0..n], "/Users/x/.t27os/bin:/opt/homebrew/bin:/usr/bin:/Users/x/.local/bin:/Users/x/.npm-global/bin:/Users/x/.opencode/bin:/usr/local/bin"));
+    const m : usize = pane_command_path(out[0..256], "/Users/x", "");
+    assert(pl_count(out[0..m], "/usr/bin:/bin:/usr/sbin:/sbin:/Users/x/.local/bin") == 1);
+    const small : usize = pane_command_path(out[0..28], "/Users/x", "/usr/bin");
+    assert(same_bytes(out[0..small], "/Users/x/.t27os/bin:/usr/bin"));
 }
 
 /// The launchd agent plist that starts this binary at login and restarts it when it dies. launchd gives
@@ -742,7 +794,7 @@ pub fn plan_pane_keys(st: []u64, i: usize, a: u32, now_ms: u64) -> void {
         if (st[pk + PK_PROF] < @as(u64, PROFILE_COUNT) and agent_profile_ok(a, @as(u32, @intCast(st[pk + PK_PROF])))) {
             pr = @as(u32, @intCast(st[pk + PK_PROF]));
         } else {
-            pr = pick_profile(agent_stored(a, keys_stored(st)), @as(u32, @intCast(st[pk + PK_BAD])));
+            pr = agent_first_profile(a, keys_stored(st), @as(u32, @intCast(st[pk + PK_BAD])));
         }
         var skip : u32 = MAX_KEYS;
         if (st[pk + PK_SKIP] > 0) { skip = @as(u32, @intCast(st[pk + PK_SKIP])) - 1; }
@@ -1415,6 +1467,31 @@ test the_server_tables_and_the_arena_line_up_for_eight_keys_a_provider {
     assert CARRY_SLOT == CARRY_CAP + 4;
     assert SCAN_CAP >= CARRY_CAP + 4096 + 2;
     assert MAX_KEYS <= 8;
+}
+
+/// True when the router block (listen fd, faults, backoff, a spare word, then n connection fds and n read
+/// lengths) starts at or above the end of the 16-pane table and ends at or below the table size.
+fn router_block_clear(panek: usize, rtl: usize, rcfd: usize, rclen: usize, n: usize, size: usize) -> bool {
+    return panek + 16 * PK <= rtl and rtl + 4 <= rcfd and rcfd + n <= rclen and rclen + n <= size;
+}
+
+test the_router_block_sits_above_the_pane_table_and_inside_the_server_table {
+    assert G_PANEK + 16 * PK <= G_RTL;
+    assert G_RFAULTS == G_RTL + 1 and G_RBACKOFF == G_RTL + 2;
+    assert G_RCFD == G_RTL + 4 and G_RCLEN == G_RCFD + RT_CONNS;
+    assert G_RCLEN + RT_CONNS <= ST_SIZE;
+    assert router_block_clear(G_PANEK, G_RTL, G_RCFD, G_RCLEN, RT_CONNS, ST_SIZE);
+    // the last word of the last pane lies below the listen fd word
+    assert G_PANEK + 15 * PK + PK_WAIT < G_RTL;
+}
+
+test negative_control_the_old_router_words_fall_inside_the_pane_table {
+    // the layout before the move: G_RTL 512, G_RCFD 516, G_RCLEN 524, ST_SIZE 544
+    assert router_block_clear(G_PANEK, 512, 516, 524, RT_CONNS, 544) == false;
+    // there pane 11's failover counter was the listen fd word
+    assert G_PANEK + 11 * PK + PK_DONE == 512;
+    // a block that runs one word past the table end is refused too
+    assert router_block_clear(G_PANEK, G_RTL, G_RCFD, G_RCLEN, RT_CONNS, G_RCLEN + RT_CONNS - 1) == false;
 }
 
 test an_empty_table_holds_no_key_and_a_put_fills_one_slot {
@@ -2211,7 +2288,7 @@ test the_server_reads_the_providers_a_spawn_can_start_with {
     // every other agent reads the providers keys.t27 AGENT_PROVIDERS names
     assert load_mask_agent(1) == 2;
     assert load_mask_agent(2) == 4;
-    assert load_mask_agent(3) == 25;
+    assert load_mask_agent(3) == 537;
     assert load_mask_agent(4) == 1;
     assert load_mask_agent(5) == 25;
     assert load_mask_agent(6) == 128;
@@ -2301,7 +2378,7 @@ test an_opencode_pane_and_a_crush_pane_get_a_profile_and_their_own_variables_by_
     // a profile agent reads its error rows; a Codex pane (cell 1) still does not
     assert scan_applies(3) and scan_applies(5) and scan_applies(1) == false;
     assert has_key_for(st[0..ST_SIZE], 3) and has_key_for(st[0..ST_SIZE], 5);
-    assert load_mask_agent(3) == 25 and load_mask_agent(5) == 25;
+    assert load_mask_agent(3) == 537 and load_mask_agent(5) == 25;
     assert needs_key(3) and needs_key(5);
 }
 
@@ -2619,3 +2696,30 @@ test has_text_finds_a_substring {
     assert has_text("Missing openai API key", "log in") == false;
 }
 
+
+test an_opencode_pane_runs_on_nvidia_keys_in_turn_a_claude_pane_never_and_a_429_gives_up {
+    var st : [ST_SIZE]u64 = undefined;
+    var o : [64]u8 = undefined;
+    var why : [128]u8 = undefined;
+    var wl : [2]u64 = undefined;
+    t_zai3(st[0..ST_SIZE]);
+    // two NVIDIA keys beside the z.ai ones (fake slots: no key value is read or held here)
+    t_key(st[0..ST_SIZE], P_NVIDIA, 0);
+    t_key(st[0..ST_SIZE], P_NVIDIA, 1);
+    // OpenCode pane 0 starts on NVIDIA key 1, pane 1 on key 2
+    plan_pane_keys(st[0..ST_SIZE], 0, 3, 1000000);
+    assert t_prof(st[0..ST_SIZE], 0) == PR_NVIDIA;
+    assert pane_key_get(st[0..ST_SIZE], 0, P_NVIDIA) == 1;
+    plan_pane_keys(st[0..ST_SIZE], 1, 3, 1000100);
+    assert t_prof(st[0..ST_SIZE], 1) == PR_NVIDIA;
+    assert pane_key_get(st[0..ST_SIZE], 1, P_NVIDIA) == 2;
+    // a Claude Code pane never gets NVIDIA, it gets z.ai
+    plan_pane_keys(st[0..ST_SIZE], 2, 0, 1000200);
+    assert t_prof(st[0..ST_SIZE], 2) == PR_ZAI;
+    // the model is NVIDIA's ultra (nvidia/nemotron-3-ultra-550b-a55b is 33 bytes)
+    var n : usize = launch_model(st[0..ST_SIZE], 0, 3, false, "x", o[0..64]);
+    assert n == 33 and begins_with(o[0..n], "nvidia/nemotron-3-ultra");
+    // a 429 ends the pane's attempts: no other key, no other provider
+    assert plan_failover(st[0..ST_SIZE], 0, FC_RATE_LIMITED, 1001000, why[0..128], wl[0..2]) == FA_GIVE_UP;
+    assert t_prof(st[0..ST_SIZE], 0) == PR_NVIDIA;
+}
