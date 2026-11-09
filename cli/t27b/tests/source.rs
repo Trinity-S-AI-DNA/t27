@@ -3243,6 +3243,23 @@ fn opaque_pointers() {
     assert!(m.contains("ExprCall(@ptrFromInt)") && m.contains("not optional"), "{}", m);
 }
 
+/// middle_end.t27 LICM_CONST: a `while` limit that takes movz + movk is built once, in the prologue, into a home
+/// register (x0-x7 in a leaf, x19-x28 in a fn that has a frame anyway); no compare rebuilds it into x17.
+#[test]
+fn loop_limit_is_built_once() {
+    let body = |s: &str| format!("    var i: u64 = 199999990;\n    var s: u64 = n;\n    while (i < 200000000) {{\n        s = {};\n        i = i + 1;\n    }}\n    return s;\n", s);
+    let src = format!("module a;\n\nfn add(a: u64, b: u64) -> u64 {{\n    return a + b;\n}}\n\nfn leaf(n: u64) -> u64 {{\n{}}}\n\nfn framed(n: u64) -> u64 {{\n{}}}\n\ntest t {{\n    assert(leaf(3) == 1999999948);\n    assert(framed(3) == 1999999948);\n}}\n", body("s + i"), body("add(s, i)"));
+    let r = run(&src);
+    assert!(r.len() == 1 && names_ok(&r).iter().all(|(_, inv, ok)| !inv && *ok), "{:?}", names_ok(&r));
+    let prog = lower_src(&src).expect("lowers");
+    let code = codegen::compile(&prog, TrapStyle::Jit, true).expect("codegen");
+    for (name, pool) in [("leaf", 0..8), ("framed", 19..29)] {
+        let id = prog.funcs.iter().position(|f| f.name == name).unwrap() as u32;
+        let rms: Vec<u32> = code.iter().find(|c| c.func == id).unwrap().code.iter().filter(|&&w| w & 0x7FE0_001F == 0x6B00_001F).map(|w| (w >> 16) & 31).collect();
+        assert!(!rms.is_empty() && rms.iter().all(|r| pool.contains(r)), "{}: cmp reads {:?}", name, rms);
+    }
+}
+
 /// `t27b build --elf` (specs/tri/t27b/elf.t27, #8947): the conformance spec's object reads back; where the GNU
 /// aarch64 toolchain is installed it links with each `exit_*` fn standing in for `main`, and exits with its code.
 #[test]
