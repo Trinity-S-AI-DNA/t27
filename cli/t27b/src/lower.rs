@@ -860,6 +860,7 @@ fn lower_mode<'a>(
         return Err(l.errors);
     }
     l.synthesized(&mut funcs);
+    for f in &mut funcs { elide_checks(&mut f.body); } // specs/tri/t27b/check_elide_plan.t27
     // More than 8 parameters of a class: the rest are passed on the stack
     // in t27b's own convention (`Program::stack_args`), never exported.
     for (id, f) in funcs.iter().enumerate() {
@@ -7750,4 +7751,42 @@ impl<'a> Lower<'a> {
         let field = Node { kind: NodeKind::ExprFieldAccess, name: "len".into(), line: c.line, children: vec![recv], ..Node::default() };
         self.expr(&field).map(Some)
     }
+}
+#[path = "../../../gen/rust/tri/t27b/check_elide_plan.rs"] #[allow(dead_code, unused_parens)]
+mod ce; // t27c gen-rust of specs/tri/t27b/check_elide_plan.t27
+fn stmt_each(ss: &mut [Stmt], nest: bool, f: &mut dyn FnMut(VarId, &mut Expr, bool)) { // nest: the write sits in an inner while
+    for s in ss { match s {
+        Stmt::Assign { var, value } => f(*var, value, nest),
+        Stmt::If { then, els, .. } => { stmt_each(then, nest, f); stmt_each(els, nest, f); }
+        Stmt::While { body, step, .. } => { stmt_each(body, true, f); stmt_each(step, true, f); }
+        _ => {} } }
+}
+fn writes(ss: &mut [Stmt], x: VarId) -> u32 { let mut n = 0; stmt_each(ss, false, &mut |v, _, _| n += (v == x) as u32); n }
+fn konst(op: ArithOp, x: VarId, e: &Expr) -> Option<u64> { // `x op c`, trapping, c as the law reads it
+    match &e.kind { ExprKind::Arith { op: o, lhs, rhs: r, site } if *o == op && *site != 0 && matches!(lhs.kind, ExprKind::Var(v) if v == x) => match r.kind { ExprKind::Const(c) => u64::try_from(c).ok(), _ => None }, _ => None }
+}
+fn relax(e: &mut Expr, w: ArithOp) { if let ExprKind::Arith { op, site, .. } = &mut e.kind { *op = w; *site = 0; } }
+fn after_inc(rest: &mut [Stmt], x: VarId, c: u64, pos: u8) { // (b) uses of x after `x = x + c`, until a statement that could assign x
+    for (j, s) in rest.iter_mut().enumerate() { match s {
+        Stmt::Assign { var, value } => { if konst(ArithOp::Sub, x, value).map_or(false, |k| ce::decrement_elides(c, k, pos, false)) { relax(value, ArithOp::SubW); } if *var == x { return; } }
+        Stmt::If { then, els, .. } if j == 0 && pos == ce::POS_SAME_LIST => { after_inc(then, x, c, ce::POS_IF_ARM); after_inc(els, x, c, ce::POS_IF_ARM); return; }
+        Stmt::While { .. } => return,
+        _ => if writes(std::slice::from_mut(s), x) > 0 { return; } } }
+}
+fn elide_checks(ss: &mut [Stmt]) {
+    for i in 0..ss.len() { let (head, rest) = ss.split_at_mut(i + 1); match &mut head[i] {
+        Stmt::Assign { var, value } => if let Some(c) = konst(ArithOp::Add, *var, value) { after_inc(rest, *var, c, ce::POS_SAME_LIST); },
+        Stmt::If { then, els, .. } => { elide_checks(then); elide_checks(els); }
+        Stmt::While { cond, body, step } => { // (a) `while (i < n)` with the single `i = i + 1`
+            elide_checks(body); elide_checks(step);
+            let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { continue };
+            let ExprKind::Var(iv) = lhs.kind else { continue };
+            let fixed = match rhs.kind { ExprKind::Const(_) => true, ExprKind::Var(n) => n != iv && writes(body, n) + writes(step, n) == 0, _ => false };
+            let (mut k, mut n, mut inner) = (0, 0, false);
+            for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, nest| if v == iv { n += 1; inner |= nest; k = konst(ArithOp::Add, iv, e).unwrap_or(0); }); }
+            if ce::induction_elides(*op as u8, lhs.ty == rhs.ty, fixed, n, k, false, inner) { // a VarId is never addressed: address-taken locals live in slots
+                for l in [body, step] { stmt_each(l, false, &mut |v, e, _| if v == iv { relax(e, ArithOp::AddW); }); }
+            }
+        }
+        _ => {} } }
 }
