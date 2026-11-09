@@ -53,6 +53,16 @@ The law is `self_recovery_action` and `prior_commits_untouched` in `specs/crons/
 
 Lesson, 2026-11-10: a failed tick that resets the lane to an ancestor older than the pre-tick HEAD, or that resets master, drops green commits the tick did not make. Record the lane HEAD before writing. On a red typecheck, `git reset --hard` that recorded commit on this lane only. Do not force-push. Do not open the window.
 
+## Free-first routing (FREEFIRSTSUBAGENTMODE)
+
+The name is a bundle, not a second law. Load at tick start: `.claude/skills/work-cheap/SKILL.md`, `model-routing`, `swarm-economy`. The checked rules are `specs/claw/cost_policy.t27` and `specs/claw/model_route.t27`. Claude tiers stay in `model_route.t27`; do not copy them here. `cursor_route.t27` is not in the tree yet; on Cursor Cloud follow `work-cheap` (cheapest tier that passes the machine gate; Fast and 500k are not defaults).
+
+Order each tick: (1) local script — `gh`, `git`, `t27c check`, `t27c seal`, `python3 tools/*` with no LLM; (2) free bounded helper only when a file must change and the gate is not script-readable; (3) paid model only after two failures on the same bounded task or on owner approval for P0 security, complex integration, or final acceptance. Max two helpers at once; one task, one artifact, eight turns; no nested delegation. Merge, push to master, publish, window shell, and paid API stay gated (`specs/t27os/orchestrator.t27`).
+
+End each tick report with one routing ledger row (plain text): `task | cost_route | data_route | capability_route | model | turns | artifact | gate_proof`. Example: `reseal cron seal | local | repo | lane commit ok | none | 0 | t27c seal exit 0 | tools/check_seal_coverage.py later on CI`.
+
+Lesson, 2026-11-10 (Asia/Bangkok): resealing `crons_CronParetoImprovementLoop.json` with `t27c seal` plus `tri seals sync-twins` beat spawning a subagent to re-read CI logs.
+
 ## New `tri` commands (proposed, not built yet)
 
 The `tri pareto` contract is `specs/tri/commands/pareto_commands.t27`; no `tri` subcommand runs it yet.
