@@ -5,7 +5,7 @@ Part of #13473. This card does not publish and does not send mail.
 The executable check is `specs/automation/promotion_kernel.t27`.
 The same figures are in `docs/promotion/baseline.json`.
 
-Captured 2026-11-10 (UTC).
+Captured 2026-11-10 Asia/Bangkok (2026-11-09 UTC).
 
 ## GitHub
 
