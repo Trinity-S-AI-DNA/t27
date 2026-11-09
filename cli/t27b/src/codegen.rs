@@ -38,6 +38,9 @@ pub(crate) mod frame_layout;
 #[path = "../../../gen/rust/tri/t27b/trap_plan.rs"]
 #[allow(dead_code, unused_parens)]
 pub(crate) mod trap_plan;
+#[path = "../../../gen/rust/tri/t27b/ifconv_plan.rs"] // specs/tri/t27b/ifconv_plan.t27
+#[allow(dead_code, unused_parens)]
+mod ifc;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapStyle {
     /// In-process JIT: stubs record the site and branch to `trap_common`.
@@ -704,6 +707,7 @@ impl<'a> Gen<'a> {
                     self.release(v);
                 }
             },
+            Stmt::If { cond, then, els } if self.ifconv(cond, then, els) => {}
             Stmt::If { cond, then, els } => {
                 let l_else = self.new_label();
                 self.branch(cond, l_else, false);
@@ -1352,6 +1356,42 @@ impl<'a> Gen<'a> {
                 v
             }
         }
+    }
+
+    fn ifconv(&mut self, cond: &Expr, then: &[Stmt], els: &[Stmt]) -> bool {
+        let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { return false };
+        let (ExprKind::Var(g), ExprKind::Const(c)) = (&lhs.kind, &rhs.kind) else { return false };
+        if lhs.ty != Ty::U64 || !(0..4096).contains(c) || !matches!(self.homes[*g as usize], Home::Reg(_)) { return false; }
+        fn asg(ss: &[Stmt]) -> Option<Vec<(VarId, &Expr)>> { ss.iter().map(|s| if let Stmt::Assign { var, value } = s { Some((*var, value)) } else { None }).collect() }
+        let (Some(t), Some(e)) = (asg(then), asg(els)) else { return false };
+        let mut vars: Vec<VarId> = t.iter().chain(&e).map(|a| a.0).collect();
+        vars.sort(); vars.dedup();
+        if vars.len() > 2 || [&t, &e].iter().any(|a| a.iter().enumerate().any(|(i, x)| a[..i].iter().any(|y| y.0 == x.0))) { return false; }
+        let (mut regs, mut srcs) = (vec![], vec![]); for &v in &vars {
+            let Home::Reg(h) = self.homes[v as usize] else { return false };
+            let mut side = [(0, 0, h); 2];
+            for (n, a) in [&t, &e].iter().enumerate() {
+                let p = a.iter().position(|x| x.0 == v);
+                let own: Vec<VarId> = a[..p.unwrap_or(0)].iter().map(|x| x.0).collect();
+                let reg = |y: &Expr| match (y.ty, &y.kind) { (Ty::U64, ExprKind::Var(w)) if !own.contains(w) => match self.homes[*w as usize] { Home::Reg(r) => Some(r), _ => None }, _ => None };
+                side[n] = match p.map(|i| a[i].1).map(|y| (y, &y.kind)) {
+                    None => (ifc::AK_NONE, 0, h),
+                    Some((y, _)) if y.ty != Ty::U64 => return false,
+                    Some((_, ExprKind::Const(0))) => (ifc::AK_CONST, 0, ZR),
+                    Some((y, ExprKind::Const(k))) if *k > 0 => { srcs.push((X17, y)); (ifc::AK_CONST, *k as u64, X17) }
+                    Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => return false },
+                    Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::Sub), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
+                        (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
+                        _ => return false, },
+                    _ => return false, };
+            }
+            if !ifc::may_if_convert(ifc::guard_of_cmp(*op as u8), *c as u64, side[0].0, side[0].1, side[1].0, side[1].1, vars.len() as u32, srcs.iter().filter(|s| s.0 == X16).count() as u32, true, true) { return false; } regs.push((h, side[0].2, side[1].2));
+        }
+        srcs.sort_by_key(|s| s.0);
+        if srcs.windows(2).any(|w| w[0].0 == w[1].0) { return false; }
+        for (r, y) in srcs { self.eval_into(y, r); } let cc = self.compare(*op, lhs, rhs);
+        for (h, tr, er) in regs { self.emit(a64::csel(true, h, tr, er, cc)); }
+        true
     }
 
     /// One arm of a `Select`, evaluated and moved into `d`.

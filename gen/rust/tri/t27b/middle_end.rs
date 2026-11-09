@@ -120,10 +120,10 @@ pub fn pass_status(p: u32) -> u32 {
     if ((((p == PASS_FOLD) || (p == PASS_IDENT)) || (p == PASS_STRENGTH)) || (p == PASS_LICM_CONST)) {
         return STATUS_LIVE;
     }
-    if ((p == PASS_REGALLOC) || (p == PASS_ISEL_PEEPHOLE)) {
+    if (((p == PASS_REGALLOC) || (p == PASS_ISEL_PEEPHOLE)) || (p == PASS_IFCONV)) {
         return STATUS_LIVE;
     }
-    if ((p == PASS_IFCONV) || (p == PASS_INLINE)) {
+    if (p == PASS_INLINE) {
         return STATUS_DECISION_ONLY;
     }
     if ((p >= PASS_DCE) && (p <= PASS_LICM)) {
