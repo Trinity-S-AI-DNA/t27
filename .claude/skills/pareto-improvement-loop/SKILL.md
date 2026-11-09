@@ -82,6 +82,10 @@ Three variants live in `specs/acceleration/`:
 - `pareto_variant_parallel_tests.t27` — Variant B: parallel test shards by use-graph level (up to 8x throughput)
 - `pareto_variant_incremental_gen.t27` — Variant C: incremental gen cache with content-addressed artifacts (~90% gen time saved at 80% hit rate)
 
+## Traps
+
+- 2026-11-10 (Asia/Bangkok): PR #13541 stayed green on its cron seal while CI failed on `queen_dash` (#13506) and sieve dupes (#13505). Do not reseal or dedupe those paths from the Pareto lane. Land the sibling PRs on master, then `git merge origin/master` on the Pareto branch and re-run `gh pr checks` — no cherry-pick of their files.
+
 ## No foreign edits
 
 No `.rs`, `.py`, `.ts`, `.js`, `.sh`, `.zig`, `.c`, `.go`, `.v`, `.yml`, `.toml`, Dockerfile or Makefile is added by this skill. All logic is in `.t27`.
