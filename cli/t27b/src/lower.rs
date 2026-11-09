@@ -7682,11 +7682,9 @@ fn shadow_names(body: &[Node], mod_vars: &HashMap<String, Place>) -> HashSet<Str
 fn mutated(ns: &[Node], name: &str) -> bool {
     let (a, t) = flat(ns); aw::mutated(&a, &t, name.as_bytes())
 }
-
 fn count_assigns(ns: &[Node], counts: &mut HashMap<String, u32>) {
     marked(ns, ax::assign_targets).for_each(|n| *counts.entry(n.name.clone()).or_insert(0) += 1);
 }
-
 /// A clause the front-end kept only as verbatim text: a childless StmtExpr
 /// named `<word>:` (`measure:`, `target:`), its text in `value`.
 fn is_prose_clause(n: &Node) -> bool {
@@ -7707,28 +7705,24 @@ fn undeclared_field_type(ty: &str, declared: &HashSet<&str>) -> Option<String> {
     let base = (r >= 0).then(|| &ty[(r / tt::HALF) as usize..(r % tt::HALF) as usize])?;
     tt::undeclared(base.as_bytes(), declared.contains(base)).then(|| base.to_string())
 }
-
 /// t27c's Zig backend writes every `_cse*` temporary the optimizer made at
 /// the very top of the fn body. One that reads a local of the body then
 /// names it before its declaration: "use of undeclared identifier".
 fn cse_hoist_defect(f: &Node) -> Option<String> {
     marked(&f.children, ax::cse_reads).find(|n| !f.params.iter().any(|(p, _)| *p == n.name)).map(|n| n.name.clone())
 }
-
 /// The reference's `collect_mutable_names`, exactly: assignment targets that
 /// are a name, or whose immediate base (index or field) is one, looking into
 /// `if`/`while`/`for` bodies and nowhere else.
 fn ref_mutable_names(ns: &[Node], out: &mut HashSet<String>) {
     out.extend(marked(ns, ax::mutable_names).map(|n| n.name.clone()));
 }
-
 /// Does Zig count `var name` as mutated anywhere in `ns`? An assignment whose
 /// target reaches `name` through fields and indexes but no `.*`, `&` of such
 /// a path, or a method call on it. Errs toward yes: a yes refuses nothing.
 fn zig_mutates(ns: &[Node], name: &str) -> bool {
     let (a, t) = flat(ns); aw::zig_mutates(&a, &t, name.as_bytes())
 }
-
 /// `x.len()` and `len(x)` lower as the length FIELD, as t27c's Zig backend
 /// prints both (W570; Zig has no `len` method on a slice or an array). Which
 /// call stands for which receiver is decided by the `lencall` module above;
@@ -7755,10 +7749,6 @@ impl<'a> Lower<'a> {
 }
 #[path = "../../../gen/rust/tri/t27b/check_elide_plan.rs"] #[allow(dead_code, unused_parens)]
 mod ce; // t27c gen-rust of specs/tri/t27b/check_elide_plan.t27
-#[path = "../../../gen/rust/tri/t27b/if_convert_plan.rs"] #[allow(dead_code, unused_parens)]
-mod ic; // t27c gen-rust of specs/tri/t27b/if_convert_plan.t27 -- stub, always false until CFG pass
-#[path = "../../../gen/rust/tri/t27b/countdown_plan.rs"] #[allow(dead_code, unused_parens)]
-mod cd; // t27c gen-rust of specs/tri/t27b/countdown_plan.t27 -- stub, always false until loop-rotation pass
 fn stmt_each(ss: &mut [Stmt], nest: bool, f: &mut dyn FnMut(VarId, &mut Expr, bool)) { // nest: the write sits in an inner while
     for s in ss { match s {
         Stmt::Assign { var, value } => f(*var, value, nest),
@@ -7794,10 +7784,7 @@ fn after_inc(rest: &mut [Stmt], x: VarId, c: u64, pos: u8) { // (b) uses of x af
 fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
     for i in 0..ss.len() { let (before, tail) = ss.split_at_mut(i); let (cur, rest) = tail.split_first_mut().unwrap(); match cur {
         Stmt::Assign { var, value } => if let Some(c) = konst(ArithOp::Add, *var, value) { after_inc(rest, *var, c, ce::POS_SAME_LIST); },
-        Stmt::If { then, els, .. } => { elide_checks(then, rets); elide_checks(els, rets);
-            // if-conversion stub -- specs/tri/t27b/if_convert_plan.t27; returns false until CFG pass wired
-            let _ = ic::if_convert_ok(false, false, false, false, false);
-        }
+        Stmt::If { then, els, .. } => { elide_checks(then, rets); elide_checks(els, rets); }
         Stmt::While { cond, body, step } => { // (a) `while (i < n)` with the single `i = i + 1`
             elide_checks(body, rets); elide_checks(step, rets);
             let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { continue };
@@ -7805,8 +7792,6 @@ fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
             let fixed = match rhs.kind { ExprKind::Const(_) => true, ExprKind::Var(n) => n != iv && writes(body, n) + writes(step, n) == 0, _ => false };
             let (mut k, mut n, mut inner) = (0, 0, false);
             for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, nest| if v == iv { n += 1; inner |= nest; k = konst(ArithOp::Add, iv, e).unwrap_or(0); }); }
-            // countdown stub -- specs/tri/t27b/countdown_plan.t27; returns false until loop-rotation pass wired
-            let _ = cd::countdown_ok(false, false, false, false, false);
             if ce::induction_elides(*op as u8, lhs.ty == rhs.ty, fixed, n, k, false, inner) { // a VarId is never addressed: address-taken locals live in slots
                 let top = |l: &[Stmt]| l.iter().any(|s| matches!(s, Stmt::Assign { var, .. } if *var == iv));
                 let every = top(step) || (top(body) && !has_cont(body));
@@ -7820,6 +7805,12 @@ fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
                     if ce::accumulator_elides(true, every, le, n, m, k, same, false, inner) { for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == a { relax(e, ArithOp::AddW); }); } }
                 }
             }
+            { let ExprKind::Cmp { op: o2, lhs: l2, rhs: r2 } = &cond.kind else { unreachable!() }; // countdown: specs/tri/t27b/countdown_plan.t27 Refs #13421
+              let (op2, iv_ty, rhs2) = (*o2 as u8, l2.ty, r2.clone());
+              if op2 == 2 && k == 1 && n == 1 && fixed && writes(body, iv) == 0 && init0(before, iv) == Some(0) {
+                for s in before.iter_mut().rev() { match s { Stmt::Assign { var, value } if *var == iv => { *value = rhs2; break; } Stmt::Assign { .. } => {} _ => break } }
+                for l in [&mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { if let ExprKind::Arith { op: ref mut ao, .. } = e.kind { if matches!(ao, ArithOp::Add | ArithOp::AddW) { *ao = ArithOp::SubW; } } }); }
+                cond.kind = ExprKind::Var(iv); cond.ty = iv_ty; } }
         }
         _ => {} } }
 }
