@@ -263,10 +263,13 @@ impl<'a> Gen<'a> {
         self.code.push(w);
     }
 
-    /// Decision boundary only; no hand-written executor.
-    /// Returns the spec's inline/reject verdict; execution stays with `call`.
-    fn try_inline(&mut self, func: FuncId, args: &[Expr]) -> bool {
+    /// A select-shaped callee (inline.t27 `select_shape_ok`): each argument once, then cmp + cset/csel, no `bl`.
+    fn try_inline(&mut self, func: FuncId, args: &[Expr], dst: Option<Reg>) -> Option<V> {
         let f = &self.prog.funcs[func as usize];
+        let [Stmt::If { cond, then, els }, Stmt::Return(Some(Expr { kind: ExprKind::Const(b), .. }))] = f.body.as_slice() else { return None };
+        let ([Stmt::Return(Some(Expr { kind: ExprKind::Const(a), .. }))], true, ExprKind::Cmp { op, lhs, rhs }) = (then.as_slice(), els.is_empty(), &cond.kind) else { return None };
+        let k = |e: &Expr| match e.kind { ExprKind::Var(i) => (inline_decision::SK_PARAM, i as u64), ExprKind::Const(c) => (inline_decision::SK_IMM, c as u64), _ => (inline_decision::SK_OTHER, 0) };
+        let (l, r, w64) = (k(lhs), k(rhs), |t: Option<Ty>| matches!(t, Some(Ty::I64 | Ty::U64)));
         let cf = inline_decision::CalleeFacts {
             is_test: f.is_test,
             is_invariant: f.is_invariant,
@@ -284,8 +287,20 @@ impl<'a> Gen<'a> {
             caller_size: self.code.len() as u32,
             result_used: true,
         };
-        let _decision = inline_decision::should_inline_call(cf, sf);
-        false
+        if !(inline_decision::should_inline_call(cf, sf) && inline_decision::select_shape_ok(true, l.0, l.1, r.0, r.1, f.nparams as u32, f.vars[..f.nparams].iter().all(|v| w64(Some(v.ty))), w64(f.ret), w64(Some(lhs.ty)))) { return None; }
+        let vals: Vec<V> = args.iter().map(|x| self.eval(x)).collect();
+        let (mut x, mut y, mut op2) = (if l.0 == inline_decision::SK_PARAM { vals[l.1 as usize] } else { V::Const(l.1 as i128) }, if r.0 == inline_decision::SK_PARAM { vals[r.1 as usize] } else { V::Const(r.1 as i128) }, *op);
+        if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) { (x, y, op2) = (y, x, op2.swap()); }
+        let rx = self.use_nz(x, X16, lhs.ty); // not ZR: reg 31 in cmp_imm is SP
+        match y { V::Const(c) if (0..4096).contains(&c) => self.emit(a64::cmp_imm(true, rx, c as u32)), _ => { let ry = self.use_(y, X17, lhs.ty); self.emit(a64::cmp(true, rx, ry)) } }
+        for v in vals.into_iter().rev() { self.release(v); }
+        let (c, (d, t)) = (cond_for(op2, lhs.ty), self.dest(dst));
+        match inline_decision::select_form(*a as u64, *b as u64) {
+            inline_decision::SF_CSET => self.emit(a64::cset(true, d, c)),
+            inline_decision::SF_CSET_INV => self.emit(a64::cset(true, d, Cond::from_bits(a64::invert_bits(c as u32)))),
+            _ => { let (p, q) = (self.use_(V::Const(*a), X16, Ty::U64), self.use_(V::Const(*b), X17, Ty::U64)); self.emit(a64::csel(true, d, p, q, c)) }
+        }
+        Some(self.done(d, t))
     }
     fn new_label(&mut self) -> Label {
         self.labels.push(None);
@@ -767,7 +782,6 @@ impl<'a> Gen<'a> {
             }
             Stmt::Eval(e) => {
                 if let ExprKind::Call { func, args } = &e.kind {
-                    self.try_inline(*func, args);
                     self.call(*func, args, None, false);
                 } else {
                     let v = self.eval(e);
@@ -1019,7 +1033,7 @@ impl<'a> Gen<'a> {
                 self.done(d, t)
             }
             ExprKind::Call { func, args } => {
-                self.try_inline(*func, args);
+                if let Some(v) = self.try_inline(*func, args, dst) { return v; }
                 self.call(*func, args, dst, true)
             }
             ExprKind::FArith { op, lhs, rhs } => {
