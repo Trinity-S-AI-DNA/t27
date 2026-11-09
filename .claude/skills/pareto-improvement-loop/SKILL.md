@@ -85,6 +85,7 @@ Three variants live in `specs/acceleration/`:
 ## Traps
 
 - 2026-11-10 (Asia/Bangkok): PR #13541 stayed green on its cron seal while CI failed on `queen_dash` (#13506) and sieve dupes (#13505). Do not reseal or dedupe those paths from the Pareto lane. Land the sibling PRs on master, then `git merge origin/master` on the Pareto branch and re-run `gh pr checks` — no cherry-pick of their files.
+- Before editing for a red check, call `gate_patch_allowed` in `specs/crons/t27-pareto-improvement-loop.t27`; if the failure is not on this tick's task files, stop and wait for the owning lane.
 
 ## No foreign edits
 
