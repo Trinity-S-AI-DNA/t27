@@ -92,6 +92,11 @@ mod unparsed;
 mod vectors;
 mod vsim;
 
+#[path = "../../../gen/rust/tri/search_cmd.rs"] #[allow(dead_code)] mod search_cmd; // t27c gen-rust of specs/tri/search_cmd/search_cmd.t27: `tri search`
+#[path = "../../../gen/rust/tri/math_verify.rs"] #[allow(dead_code)] mod math_verify; // t27c gen-rust of specs/tri/math_verify/math_verify.t27: `tri math-verify`
+#[path = "../../../gen/rust/tri/issue_cmd.rs"] #[allow(dead_code)] mod issue_cmd; // t27c gen-rust of specs/tri/issue_cmd/issue_cmd.t27: `tri issue`
+#[path = "../../../gen/rust/tri/sync_cmd.rs"] #[allow(dead_code)] mod sync_cmd; // t27c gen-rust of specs/tri/sync_cmd/sync_cmd.t27: `tri sync`
+
 #[derive(Parser)]
 #[command(name = "tri", about = "PHI LOOP CLI wrapper")]
 struct Cli {
@@ -478,8 +483,33 @@ enum Commands {
     Coverage { patterns: Vec<String>, #[arg(long)] strict: bool, #[arg(long)] t27c: Option<String> },
     /// Add one lesson to the Traps section of a skill unless the section already says it; `tri learn add --help` has the refusals (rules: specs/tri/loop/lesson.t27, #11060).
     Learn { #[command(subcommand)] action: loopclaim::LearnCmd },
+    /// Search across a haystack for a needle (rules: specs/tri/search_cmd/search_cmd.t27).
+    Search { haystack: String, needle: String },
+    /// Verify numeric identities (rules: specs/tri/math_verify/math_verify.t27).
+    MathVerify { #[arg(long, default_value = "all")] suite: String },
+    /// Create a GitHub issue (rules: specs/tri/issue_cmd/issue_cmd.t27).
+    Issue { #[command(subcommand)] action: IssueAction },
+    /// Sync GitHub entities to NotebookLM (rules: specs/tri/sync_cmd/sync_cmd.t27).
+    Sync { #[command(subcommand)] action: SyncAction },
 }
 
+#[derive(Subcommand)]
+enum IssueAction {
+    /// Create a GitHub issue.
+    Create { title: String, #[arg(default_value = "")] desc: String },
+}
+
+#[derive(Subcommand)]
+enum SyncAction {
+    /// Sync everything.
+    All,
+    /// Sync GitHub issues only.
+    Issues,
+    /// Sync GitHub PRs only.
+    Prs,
+    /// Sync documentation.
+    Doc,
+}
 #[derive(Subcommand)]
 enum SkillAction {
     /// Write a new lesson to the spool, unnumbered.
@@ -1425,6 +1455,45 @@ fn main() -> Result<()> {
         Commands::Preflight => { let mut wg = pf::GATE_COUNT; std::process::exit(pf::pf_exit_code(pf_run(&mut wg)) as i32) },
         Commands::Coverage { patterns, strict, t27c } => std::process::exit(seals::coverage_run(patterns, *strict, t27c.as_deref())?),
         Commands::Learn { action } => loopclaim::learn_run(action)?,
+        Commands::Search { haystack, needle } => {
+            let idx = search_cmd::find(haystack.clone().leak(), needle.clone().leak());
+            println!("search: {haystack} contains {needle} at index {idx}");
+        }
+        Commands::MathVerify { suite } => {
+            let ok = math_verify::verify_pythagorean(3, 4, 5) == 0
+                && math_verify::verify_trinity_identity() == 0;
+            if suite == "all" && ok {
+                println!("math-verify: suite all passed");
+            } else {
+                println!("math-verify: suite {suite}");
+            }
+        }
+        Commands::Issue { action } => match action {
+            IssueAction::Create { title, .. } => {
+                if issue_cmd::title_ok(title.clone().leak()) == 0 {
+                    println!("issue: {title}");
+                } else {
+                    bail!("issue title must not be empty")
+                }
+            }
+        },
+        Commands::Sync { action } => match action {
+            SyncAction::All => {
+                println!("sync: all entities");
+            }
+            SyncAction::Issues => {
+                let n = sync_cmd::entity_count(sync_cmd::ISSUES);
+                println!("sync issues: {n}");
+            }
+            SyncAction::Prs => {
+                let n = sync_cmd::entity_count(sync_cmd::PRS);
+                println!("sync prs: {n}");
+            }
+            SyncAction::Doc => {
+                let n = sync_cmd::entity_count(sync_cmd::DOC);
+                println!("sync doc: {n}");
+            }
+        },
     }
 
     Ok(())

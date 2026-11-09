@@ -8,6 +8,8 @@ Thank you for helping improve T27. This repository is **spec-first**: behavior l
 2. Check **`OWNERS.md`** in the directory you touch (and the repo root **[`OWNERS.md`](OWNERS.md)**) for the **primary** Trinity agent / domain owner.
 3. Open or reference a **GitHub Issue**; pull requests should satisfy the project **Issue Gate** where applicable (`Closes #N`).
 4. Multi-agent coordination: **[`docs/coordination/TASK_PROTOCOL.md`](docs/coordination/TASK_PROTOCOL.md)**. A PR may add one **`docs/now/`** entry; it is optional -- see **[NOW entries](#now-entries-optional-one-file-each)** below (coordination anchor: [#141](https://github.com/gHashTag/t27/issues/141)).
+5. Choosing what to work on: the Pareto roadmap rule (hard gates beat score) lives in **`specs/queen/roadmap.t27`**.
+6. Choosing which model answers: the cost policy (correctness and privacy gates first) lives in **`specs/claw/cost_policy.t27`**.
 
 ## NOW entries (optional, one file each)
 
