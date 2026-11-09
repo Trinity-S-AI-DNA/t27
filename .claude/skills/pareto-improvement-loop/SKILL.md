@@ -36,6 +36,11 @@ The cron card `specs/crons/t27-pareto-improvement-loop.t27` runs every 15 minute
 | `specs/acceleration/coverage_hundred.t27` | Effective coverage: every spec tested, every change traced, no vacuous tests |
 | `specs/tri/commands/pareto_commands.t27` | `tri pareto audit|fix|verify|land|beat|self-heal` (proposed, not built yet), `tri experience save` |
 
+## Traps (2026-11-09, REQUIRED_CHECKS_V1)
+
+- A required check stays `pending` when its workflow never ran (path/branch filter, or `workflow_dispatch`-only). The fix class is one aggregate check `pr-ready` that always terminates; law: `specs/ci/pr_ready.t27`, host job `pr-ready` in `.github/workflows/gate-topology.yml`.
+- Do not add a new required ruleset context until its workflow runs on every pull request with no path filter (`scripts/ci/check_pr_branch_filters.py` reads `specs/claw/gates.t27` REASONS).
+
 ## Rules that keep past work intact
 
 - **Never break a past merge.** `fix_may_start` requires the PR gate ran and no own PR is red.
