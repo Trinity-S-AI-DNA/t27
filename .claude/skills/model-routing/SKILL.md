@@ -1,7 +1,7 @@
 ---
 id: model-routing
 name: model-routing
-description: Which model does which job -- a sub-task starts in a T27 OS pane on the free key tier, the orchestrator runs on Sonnet 5.5, Sonnet is the first escalation of a sub-task, and Opus 5.5 is reached only after failed attempts or on the owner's word. Load before spawning any subagent or pane, writing a workflow, or picking a model in TRI CLAW or the Queen.
+description: Which model does which job -- a sub-task starts in a T27 OS pane on the free key tier, the orchestrator runs on Sonnet 5.5, Sonnet is the first escalation of a sub-task, and Opus 5.5 is reached only after failed attempts or on the owner's word. A Cursor session follows specs/claw/cursor_route.t27. Load before spawning any subagent or pane, writing a workflow, or picking a model in TRI CLAW or the Queen.
 argument-hint: "[role: orchestrate|plan|review-final|implement|port|search|test|docs|fix]"
 ---
 
@@ -19,6 +19,8 @@ argument-hint: "[role: orchestrate|plan|review-final|implement|port|search|test|
 Owner directive 2026-10-20 (#11317, summarised): run lanes through T27 OS instead of paid subagents -- cheaper, and the owner watches every lane live in the window. It adds the pane tier below Sonnet for sub-tasks. It builds on the directive of 2026-10-19 (translated): "set Sonnet as the default model for all agents -- it is cheaper with the same result" (#10921), which keeps the orchestrator on Sonnet 5.5; that one replaced the 2026-10-18 rule (orchestration on Opus 5.5, #10493). The rule is part of TRI CLAW so development stays economical.
 
 **The law is `specs/claw/model_route.t27`.** This skill is how to follow it in a Claude Code session. If the two disagree, the spec wins; fix the skill.
+
+A Cursor session is a different host. It follows `specs/claw/cursor_route.t27`: a cheap task starts on `composer-2.5`, and `grok-4.7` is the escalation and the start for architecture, a conflict, or a multi-file refactor. Fast and a window above 256k are not defaults. If this skill and that spec disagree, the spec wins.
 
 ## The rule
 
@@ -54,6 +56,10 @@ Parallelism: about 3 working lanes (panes or subagents together) at once on this
 ## Audit
 
 `is_waste(role, tier, failed_attempts, owner_flag)` in the spec answers whether a run spent a stronger tier than `route` names. Use it when TRI CLAW or the Queen records which model ran a job.
+
+## Cursor cloud agents
+
+`route()` is the Claude Code table. A Cursor cloud subagent reads `cursor_pick(kind, failures)` in the same spec. A named cheap class (parse, test, a small `.t27` edit, screenshots, visual regression, the live work graph, UI kit) starts at `composer-2.5`. Architecture, a CRM contract, a wide refactor, a repeated failure, and any class the table does not name start at `grok-4.7-medium`. Two failures of a cheap class move that task to Grok. Fast and the long window are never the pick. At most 3 parallel subagents and 8 files in the brief. The cited list prices live next to `cursor_micro()`; they are not a measured saving.
 
 ## Not covered yet
 
