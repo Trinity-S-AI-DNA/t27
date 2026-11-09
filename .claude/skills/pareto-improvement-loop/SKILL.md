@@ -63,6 +63,10 @@ End each tick report with one routing ledger row (plain text): `task | cost_rout
 
 Lesson, 2026-11-10 (Asia/Bangkok): resealing `crons_CronParetoImprovementLoop.json` with `t27c seal` plus `tri seals sync-twins` beat spawning a subagent to re-read CI logs.
 
+## CRON_BATCH_V1 (cloud ticks)
+
+Load `.claude/skills/cron-batch/SKILL.md` at tick start. Law is `roadmap_dashboard_sync.t27` (500 ms debounce, 100 actions/cycle, overflow dead-letter); predicates on this cron card: `cron_tick_may_run`, `cron_actions_this_cycle`. One timer/subscription wake = **one** job: seal + at most one CI read when the batch includes a CI event. **No** `gh pr checks` on empty or duplicate wakes.
+
 ## New `tri` commands (proposed, not built yet)
 
 The `tri pareto` contract is `specs/tri/commands/pareto_commands.t27`; no `tri` subcommand runs it yet.
@@ -91,6 +95,7 @@ Three variants live in `specs/acceleration/`:
 - Before `git push`, call `batch_push_may_run(skill_only_tick, inherited_repo_gate_red, own_task_path, required_checks_pending)` in the same spec; when it is false, verify locally (`t27c seal --verify` on the lane specs) and record the tick under `/opt/cursor/artifacts/pareto-tick-*.txt`. While `required_checks_pending` and rollup `pass=0`, do **not** edit the PR body every tick — repeated edits cancel/requeue `check-linked-issue` and `fix-carries-source` on Actions; one consolidated PR footer after `pass>0` is enough.
 - Before a second `git merge origin/master` in the same CI window, call `merge_master_may_run(required_checks_pending, master_ahead)`; when required checks are still pending after the last push, wait.
 - Squash-merge of this lane's PR is **not** a pareto tick action: load `.claude/skills/merge-verdict/SKILL.md` and evaluate `specs/claw/merge_verdict.t27` on a CI/PR subscription wake; emit one `M\t` line before any merge.
+- Token burn: if the last artifact shows the same CI rollup as this turn and no subscription fired, emit SKIP per `cron-batch` — do not call `gh` again.
 
 ## No foreign edits
 
