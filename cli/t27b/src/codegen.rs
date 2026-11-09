@@ -654,14 +654,12 @@ impl<'a> Gen<'a> {
         match v {
             V::Reg(r) => r,
             V::Temp(i) if i < TEMP_REGS => 9 + i as Reg,
-            V::Temp(i) => {
-                let off = self.slot_of_temp(i);
-                self.ldr_slot(scratch, off);
-                scratch
-            }
+            V::Temp(i) => { let off = self.slot_of_temp(i); self.ldr_slot(scratch, off); scratch }
             V::Const(0) => ZR,
             V::Const(c) => {
-                self.mov_imm(ty.is64(), scratch, a64::canon(c as u64, ty.is64()));
+                let can = a64::canon(c as u64, ty.is64());
+                if let Some(r) = self.hoist.iter().find(|h| h.0 == can && h.1 == ty.is64()).map(|h| h.2) { return r; }
+                self.mov_imm(ty.is64(), scratch, can);
                 scratch
             }
         }
@@ -2002,6 +2000,7 @@ fn loop_limits(ss: &[Stmt], out: &mut Vec<(i128, bool)>) {
                 }
                 for b in [body, step] { loop_limits(b, out); }
             }
+            Stmt::Assign { value, .. } => { if let ExprKind::Const(c) = &value.kind { if !value.ty.is_float() && value.ty != Ty::I128 { out.push((*c, value.ty.is64())); } } }
             Stmt::If { then, els, .. } => { loop_limits(then, out); loop_limits(els, out); }
             _ => {}
         }
