@@ -1,50 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 ; T27F renderer, FPGA target: one VfGraph frame as AXI4-Lite register writes to a fill engine on the AX7203
-; Refs gHashTag/t27#13297
-; The draw list is vf_render_web's vf_draw_ops, so the browser vector path and the board draw the same rects
-; Each FILL op becomes one fill command (FR-001 fpga_fill_rect), each non-blank label char one glyph command
-; (FR-002 fpga_draw_glyph, a 35-bit 5x7 bitmap); colours come from vf_pixel_color through the draw list (FR-003)
-; A node with w or h 0 gets no fill command (FR-004)
+; Refs gHashTag/t27#13297 gHashTag/t27#13214
+; Style: the UI Kit painter. The boxes are vf_render_web's draw list (vc_box in theme TH_T27), and the labels are the
+;   Outfit glyphs vct_render draws (vf_type, anti-aliased): one engine command, FILL, carries both
+; The plan, in order:
+;   1. FB_W and FB_H
+;   2. one FILL per draw-list FILL op with w and h over 0, the boxes in the painter's order
+;   3. the text as row spans: the engine model replays steps 1-2 into a base frame, vct_render paints the full frame,
+;      and each maximal run of equal colour where the two differ becomes one FILL of height 1
+;   So the engine needs no font: the board draws exactly vct_render's pixels, and a test pins that byte for byte
 ; Register map, byte offsets from VF_FPGA_BASE (the Vivado default for the first AXI peripheral behind a
 ; MicroBlaze, since the AX7203 xc7a200t has no hard CPU); writing CTRL runs the command:
-;   0x00 CTRL  1 = FILL rect X Y W H with RGB, 2 = GLYPH at X Y in RGB
+;   0x00 CTRL  1 = FILL rect X Y W H with RGB
 ;   0x04 STATUS read-only, bit 0 busy: the host polls it between commands, the plan holds writes only
-;   0x08 X  0x0C Y  0x10 W  0x14 H  0x18 RGB  0x1C GLYPH_LO (bits 0..31)  0x20 GLYPH_HI (bits 32..34)
-;   0x24 FB_W  0x28 FB_H
-; Glyph bit 5 * r + 4 - c is pixel (c, r) of the frame_render FONT cell, row 0 on top
-; vf_fpga_engine is the software model of that engine; its tests pin the model to vf_render_rgb byte for byte
-; Two hosts: one driver exposing fpga_fill_rect / fpga_draw_glyph, or a bus bridge exposing fpga_axi_write
-; NOT here: the engine RTL, the board top, the HDMI pins, the bridge; nothing has been flashed
+;   0x08 X  0x0C Y  0x10 W  0x14 H  0x18 RGB  0x1C, 0x20 reserved  0x24 FB_W  0x28 FB_H
+; vf_fpga_engine is the software model of that engine; NOT here: the engine RTL, the board top, the HDMI pins,
+; the bridge; nothing has been flashed
 ; The externs make this spec t27b-only; the tests call only the pure functions, never an extern
 
 module t27f_vf_render_fpga;
 use t27f::visual_factory_contract::VfGraph;
-use t27f::visual_factory_contract::VF_BUTTON;
 use t27f::visual_factory_contract::VF_CARD;
 use t27f::vf_layout::VfLayout;
 use t27f::vf_layout::vf_layout;
-use t27f::vf_pixel::vf_pixel_color;
-use t27f::vf_pixel::VF_PX_BG;
-use t27f::vf_render::vf_render_rgb;
-use t27f::vf_render::VF_R_OK;
-use t27f::vf_render::VF_R_SMALL;
-use t27f::vf_render::VF_R_TEXT_LIGHT;
-use t27f::frame_render::FONT;
-use t27f::frame_render::glyph_index;
-use t27f::frame_render::FONT_W;
-use t27f::frame_render::FONT_H;
-use t27f::frame_render::FONT_ADVANCE;
+use t27f::vf_card::vc_fill;
+use t27f::vf_card::VC_OK;
+use t27f::vf_card::VC_BAD_RASTER;
+use t27f::vf_card_tok::vct_render;
+use t27f::vf_theme::TH_T27;
+use t27f::vf_theme::TH_ACCENT;
+use t27f::vf_theme::TH_BORDER;
+use t27f::vf_theme::TH_CARD_BORDER;
+use t27f::vf_theme::th_color;
+use t27f::vf_theme::th_kind_color;
 use t27f::vf_render_web::vf_draw_ops;
 use t27f::vf_render_web::vf_rgb_at;
 use t27f::vf_render_web::VF_OP_WORDS;
 use t27f::vf_render_web::VF_OP_FILL;
-use t27f::vf_render_web::VF_OP_TEXT;
 use t27f::vf_menu::vf_menu_graph;
 use t27f::vf_menu::VF_MENU_H;
 
-; ---- the host imports (FR-001, FR-002) and the raw bus write ----
+; ---- the host imports: a driver taking whole commands, or a bus bridge taking raw writes ----
 fn fpga_fill_rect(x: u32, y: u32, w: u32, h: u32, rgb: u32) -> void { @extern("fpga_fill_rect"); }
-fn fpga_draw_glyph(x: u32, y: u32, bitmap: u64, fg: u32) -> void { @extern("fpga_draw_glyph"); }
 fn fpga_axi_write(addr: u32, data: u32) -> void { @extern("fpga_axi_write"); }
 
 pub const VF_FPGA_BASE : u32 = 0x44A00000;
@@ -55,31 +52,18 @@ pub const VF_FR_Y : u32 = 0x0C;
 pub const VF_FR_W : u32 = 0x10;
 pub const VF_FR_H : u32 = 0x14;
 pub const VF_FR_RGB : u32 = 0x18;
-pub const VF_FR_GLYPH_LO : u32 = 0x1C;
-pub const VF_FR_GLYPH_HI : u32 = 0x20;
 pub const VF_FR_FB_W : u32 = 0x24;
 pub const VF_FR_FB_H : u32 = 0x28;
 pub const VF_CMD_FILL : u32 = 1;
-pub const VF_CMD_GLYPH : u32 = 2;
+; the write-list capacity the menu frame needs, with room: 2 + 6 * (8 boxes + the text spans)
+pub const VF_F_CAP : u32 = 32768;
 
-; the menu frame and its write list: 2 + 6 * (13 fills + 25 glyphs) = 230 writes
-pub var VF_F_ADDR : [512]u32 = [0] ** 512;
-pub var VF_F_DATA : [512]u32 = [0] ** 512;
+pub var VF_F_ADDR : [32768]u32 = [0] ** 32768;
+pub var VF_F_DATA : [32768]u32 = [0] ** 32768;
 pub var VF_F_OPS : [240]u32 = [0] ** 240;
-pub var VF_F_RGB : [94500]u8 = [0] ** 94500;
-pub var VF_F_RGB2 : [94500]u8 = [0] ** 94500;
-
-; the 35-bit bitmap of a character: row r of the FONT cell in bits 5 * r .. 5 * r + 4, the leftmost pixel high
-pub fn vf_glyph_bitmap(c: u8) -> u64 {
-    var gi : u32 = glyph_index(c);
-    var bm : u64 = 0;
-    var r : u32 = FONT_H;
-    while r > 0 {
-        r = r - 1;
-        bm = bm * 32 + (FONT[gi as usize][r as usize] as u64);
-    }
-    return bm;
-}
+pub var VF_F_RGB : [121500]u8 = [0] ** 121500;
+pub var VF_F_FULL : [121500]u8 = [0] ** 121500;
+pub var VF_F_BASE : [121500]u8 = [0] ** 121500;
 
 ; one bus write into the list when it fits; the count grows either way
 fn vf_fpga_put(addr: []u32, data: []u32, n: u32, reg: u32, d: u32) -> u32 {
@@ -100,19 +84,9 @@ pub fn vf_fpga_fill_writes(addr: []u32, data: []u32, n: u32, x: u32, y: u32, w: 
     return vf_fpga_put(addr, data, m, VF_FR_CTRL, VF_CMD_FILL);
 }
 
-; the six writes one fpga_draw_glyph call makes on the bus
-pub fn vf_fpga_glyph_writes(addr: []u32, data: []u32, n: u32, x: u32, y: u32, bm: u64, fg: u32) -> u32 {
-    var m : u32 = vf_fpga_put(addr, data, n, VF_FR_X, x);
-    m = vf_fpga_put(addr, data, m, VF_FR_Y, y);
-    m = vf_fpga_put(addr, data, m, VF_FR_GLYPH_LO, (bm % 4294967296) as u32);
-    m = vf_fpga_put(addr, data, m, VF_FR_GLYPH_HI, (bm / 4294967296) as u32);
-    m = vf_fpga_put(addr, data, m, VF_FR_RGB, fg);
-    return vf_fpga_put(addr, data, m, VF_FR_CTRL, VF_CMD_GLYPH);
-}
-
-; the whole frame as bus writes: the frame size, then a fill per FILL op with w and h over 0, then a glyph per
-; non-blank label char; 0 when the frame is refused or the draw-list buffer is short
-pub fn vf_fpga_plan(g: VfGraph, l: VfLayout, fb_w: u32, fb_h: u32, ops: []u32, addr: []u32, data: []u32) -> u32 {
+; steps 1 and 2: the frame size, then one fill per draw-list FILL op with w and h over 0; the count of writes,
+; 0 when the frame is refused or the draw-list buffer is short
+pub fn vf_fpga_box_plan(g: VfGraph, l: VfLayout, fb_w: u32, fb_h: u32, ops: []u32, addr: []u32, data: []u32) -> u32 {
     if fb_w == 0 or fb_h == 0 or fb_w > 4096 or fb_h > 4096 {
         return 0;
     }
@@ -128,18 +102,45 @@ pub fn vf_fpga_plan(g: VfGraph, l: VfLayout, fb_w: u32, fb_h: u32, ops: []u32, a
         if ops[at] == VF_OP_FILL and ops[at + 3] > 0 and ops[at + 4] > 0 {
             n = vf_fpga_fill_writes(addr, data, n, ops[at + 1], ops[at + 2], ops[at + 3], ops[at + 4], ops[at + 5]);
         }
-        if ops[at] == VF_OP_TEXT {
-            let s : str = g.text[ops[at + 3]];
-            var i : u32 = 0;
-            while i < (s.len as u32) {
-                var bm : u64 = vf_glyph_bitmap(s[i as usize]);
-                if bm != 0 {
-                    n = vf_fpga_glyph_writes(addr, data, n, ops[at + 1] + i * FONT_ADVANCE, ops[at + 2], bm, ops[at + 4]);
+        k = k + 1;
+    }
+    return n;
+}
+
+; the whole frame as bus writes: the box plan, then the text spans (step 3). full receives vct_render's frame and base
+; the box plan's replay, both fb_w * fb_h * 3 bytes. 0 when the frame is refused, a buffer is short, or the writes
+; do not fit addr and data
+pub fn vf_fpga_plan(g: VfGraph, l: VfLayout, fb_w: u32, fb_h: u32, ops: []u32, full: []u8, base: []u8, addr: []u32, data: []u32) -> u32 {
+    var n : u32 = vf_fpga_box_plan(g, l, fb_w, fb_h, ops, addr, data);
+    if n == 0 or n > (addr.len as u32) or n > (data.len as u32) {
+        return 0;
+    }
+    if vf_fpga_engine(addr, data, n, base, fb_w, fb_h) != VC_OK {
+        return 0;
+    }
+    if vct_render(g, l, full, fb_w, fb_h, TH_T27) != VC_OK {
+        return 0;
+    }
+    var y : u32 = 0;
+    while y < fb_h {
+        var x : u32 = 0;
+        while x < fb_w {
+            var c : u32 = vf_rgb_at(full, fb_w, x, y);
+            if c == vf_rgb_at(base, fb_w, x, y) {
+                x = x + 1;
+            } else {
+                var x0 : u32 = x;
+                x = x + 1;
+                while x < fb_w and vf_rgb_at(full, fb_w, x, y) == c and vf_rgb_at(base, fb_w, x, y) != c {
+                    x = x + 1;
                 }
-                i = i + 1;
+                n = vf_fpga_fill_writes(addr, data, n, x0, y, x - x0, 1, c);
             }
         }
-        k = k + 1;
+        y = y + 1;
+    }
+    if n > (addr.len as u32) or n > (data.len as u32) {
+        return 0;
     }
     return n;
 }
@@ -157,35 +158,61 @@ pub fn vf_fpga_cmd_count(addr: []const u32, data: []const u32, n: u32, cmd: u32)
     return cnt;
 }
 
-; host route 1: a driver that takes whole commands; a FILL with w or h 0 is never sent (FR-004)
-pub fn vf_fpga_present(g: VfGraph, l: VfLayout, fb_w: u32, fb_h: u32, ops: []u32) -> u8 {
-    if fb_w == 0 or fb_h == 0 or fb_w > 4096 or fb_h > 4096 {
-        return VF_R_SMALL;
+; replay a write list into an RGB frame w x h through vc_fill, the painter's own fill; VC_BAD_RASTER for a refused frame,
+; a short buffer, or a write outside the register window
+pub fn vf_fpga_engine(addr: []const u32, data: []const u32, n: u32, rgb: []u8, w: u32, h: u32) -> u32 {
+    if w == 0 or h == 0 or w > 4096 or h > 4096 {
+        return VC_BAD_RASTER;
     }
-    var no : u32 = vf_draw_ops(g, l, fb_w, fb_h, ops);
-    if no * VF_OP_WORDS > (ops.len as u32) {
-        return VF_R_SMALL;
+    if w * h * 3 > (rgb.len as u32) {
+        return VC_BAD_RASTER;
     }
+    var rx : u32 = 0;
+    var ry : u32 = 0;
+    var rw : u32 = 0;
+    var rh : u32 = 0;
+    var rc : u32 = 0;
     var k : u32 = 0;
-    while k < no {
-        var at : usize = (k * VF_OP_WORDS) as usize;
-        if ops[at] == VF_OP_FILL and ops[at + 3] > 0 and ops[at + 4] > 0 {
-            fpga_fill_rect(ops[at + 1], ops[at + 2], ops[at + 3], ops[at + 4], ops[at + 5]);
+    while k < n {
+        var a : u32 = addr[k as usize];
+        var d : u32 = data[k as usize];
+        if a < VF_FPGA_BASE or a > VF_FPGA_BASE + VF_FR_FB_H {
+            return VC_BAD_RASTER;
         }
-        if ops[at] == VF_OP_TEXT {
-            let s : str = g.text[ops[at + 3]];
-            var i : u32 = 0;
-            while i < (s.len as u32) {
-                var bm : u64 = vf_glyph_bitmap(s[i as usize]);
-                if bm != 0 {
-                    fpga_draw_glyph(ops[at + 1] + i * FONT_ADVANCE, ops[at + 2], bm, ops[at + 4]);
-                }
-                i = i + 1;
-            }
+        var off : u32 = a - VF_FPGA_BASE;
+        if off == VF_FR_X { rx = d; }
+        if off == VF_FR_Y { ry = d; }
+        if off == VF_FR_W { rw = d; }
+        if off == VF_FR_H { rh = d; }
+        if off == VF_FR_RGB { rc = d; }
+        if off == VF_FR_CTRL and d == VF_CMD_FILL {
+            vc_fill(rgb, w, h, rx, ry, rx + rw, ry + rh, rc);
         }
         k = k + 1;
     }
-    return VF_R_OK;
+    return VC_OK;
+}
+
+; host route 1: a driver that takes whole commands, fed from the plan's writes; returns the commands sent
+pub fn vf_fpga_present(addr: []const u32, data: []const u32, n: u32) -> u32 {
+    var reg : [8]u32 = [0; 8];
+    var sent : u32 = 0;
+    var k : u32 = 0;
+    while k < n and k < (addr.len as u32) and k < (data.len as u32) {
+        var off : u32 = 0xFFFFFFFF;
+        if addr[k as usize] >= VF_FPGA_BASE {
+            off = addr[k as usize] - VF_FPGA_BASE;
+        }
+        if off >= VF_FR_X and off <= VF_FR_RGB {
+            reg[(off / 4) as usize] = data[k as usize];
+        }
+        if off == VF_FR_CTRL and data[k as usize] == VF_CMD_FILL {
+            fpga_fill_rect(reg[2], reg[3], reg[4], reg[5], reg[6]);
+            sent = sent + 1;
+        }
+        k = k + 1;
+    }
+    return sent;
 }
 
 ; host route 2: a bus bridge (JTAG-to-AXI or UART-to-AXI) that takes the plan's writes one by one
@@ -198,190 +225,110 @@ pub fn vf_fpga_send(addr: []const u32, data: []const u32, n: u32) -> u32 {
     return k;
 }
 
-; ---- the software model of the fill engine: what the RTL must do with the writes ----
-fn vf_eng_set(rgb: []u8, w: u32, x: u32, y: u32, col: u32) -> void {
-    var at : usize = ((y * w + x) * 3) as usize;
-    rgb[at] = ((col / 65536) % 256) as u8;
-    rgb[at + 1] = ((col / 256) % 256) as u8;
-    rgb[at + 2] = (col % 256) as u8;
-}
-
-; FILL: every pixel of x <= px < x + rw, y <= py < y + rh inside the frame
-fn vf_eng_fill(rgb: []u8, w: u32, h: u32, x: u32, y: u32, rw: u32, rh: u32, col: u32) -> void {
-    var py : u32 = y;
-    while py < y + rh and py < h {
-        var px : u32 = x;
-        while px < x + rw and px < w {
-            vf_eng_set(rgb, w, px, py, col);
-            px = px + 1;
-        }
-        py = py + 1;
-    }
-}
-
-; GLYPH: the set bits of the 35-bit bitmap, bit 5 * r + 4 - c at (x + c, y + r), clipped to the frame
-fn vf_eng_glyph(rgb: []u8, w: u32, h: u32, x: u32, y: u32, lo: u32, hi: u32, col: u32) -> void {
-    var r : u32 = 0;
-    while r < FONT_H {
-        var c : u32 = 0;
-        while c < FONT_W {
-            var bit : u32 = 5 * r + 4 - c;
-            var on : u32 = 0;
-            if bit < 32 {
-                on = (lo >> bit) & 1;
-            } else {
-                on = (hi >> (bit - 32)) & 1;
-            }
-            if on == 1 and x + c < w and y + r < h {
-                vf_eng_set(rgb, w, x + c, y + r, col);
-            }
-            c = c + 1;
-        }
-        r = r + 1;
-    }
-}
-
-; replay a write list into an RGB frame w x h; VF_R_SMALL for a refused frame, a short buffer, or a write
-; outside the register window
-pub fn vf_fpga_engine(addr: []const u32, data: []const u32, n: u32, rgb: []u8, w: u32, h: u32) -> u8 {
-    if w == 0 or h == 0 or w > 4096 or h > 4096 {
-        return VF_R_SMALL;
-    }
-    if w * h * 3 > (rgb.len as u32) {
-        return VF_R_SMALL;
-    }
-    var rx : u32 = 0;
-    var ry : u32 = 0;
-    var rw : u32 = 0;
-    var rh : u32 = 0;
-    var rc : u32 = 0;
-    var lo : u32 = 0;
-    var hi : u32 = 0;
-    var k : u32 = 0;
-    while k < n {
-        var a : u32 = addr[k as usize];
-        var d : u32 = data[k as usize];
-        if a < VF_FPGA_BASE or a > VF_FPGA_BASE + VF_FR_FB_H {
-            return VF_R_SMALL;
-        }
-        var off : u32 = a - VF_FPGA_BASE;
-        if off == VF_FR_X { rx = d; }
-        if off == VF_FR_Y { ry = d; }
-        if off == VF_FR_W { rw = d; }
-        if off == VF_FR_H { rh = d; }
-        if off == VF_FR_RGB { rc = d; }
-        if off == VF_FR_GLYPH_LO { lo = d; }
-        if off == VF_FR_GLYPH_HI { hi = d; }
-        if off == VF_FR_CTRL and d == VF_CMD_FILL {
-            vf_eng_fill(rgb, w, h, rx, ry, rw, rh, rc);
-        }
-        if off == VF_FR_CTRL and d == VF_CMD_GLYPH {
-            vf_eng_glyph(rgb, w, h, rx, ry, lo, hi, rc);
-        }
-        k = k + 1;
-    }
-    return VF_R_OK;
-}
-
-test menu_fill_count {
+test box_plan_count {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
-    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA);
-    // background + 6 outlines + 6 fills; Targets, Browser, Desktop 7 chars each, FPGA 4: 25 glyphs
-    assert vf_fpga_cmd_count(&VF_F_ADDR, &VF_F_DATA, n, VF_CMD_FILL) == 13;
-    assert vf_fpga_cmd_count(&VF_F_ADDR, &VF_F_DATA, n, VF_CMD_GLYPH) == 25;
-    assert n == 230;
+    // the frame size + 8 boxes: background, card edge + inside, Browser (PRIMARY, one rect), Desktop and FPGA edge + inside
+    var nb : u32 = vf_fpga_box_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA);
+    assert nb == 50;
+    assert vf_fpga_cmd_count(&VF_F_ADDR, &VF_F_DATA, nb, VF_CMD_FILL) == 8;
+    // the full plan adds only text spans, each one FILL of height 1
+    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_FULL, &VF_F_BASE, &VF_F_ADDR, &VF_F_DATA);
+    assert n > 50;
+    assert (n - 2) % 6 == 0;
+    assert vf_fpga_cmd_count(&VF_F_ADDR, &VF_F_DATA, n, VF_CMD_FILL) == (n - 2) / 6;
+    assert n <= VF_F_CAP;
+    var s : u32 = 50;
+    var tall : u32 = 0;
+    while s < n {
+        if VF_F_DATA[(s + 3) as usize] != 1 {
+            tall = tall + 1;
+        }
+        s = s + 6;
+    }
+    assert tall == 0;
 }
 
 test zero_size_node_gets_no_fill {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
-    // the FPGA button squashed to w 0: its outline and its fill both go (13 - 2)
+    // the FPGA button squashed to w 0: its outline and its inside both go (8 - 2 boxes)
     l.w[5] = 0;
-    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA);
-    assert vf_fpga_cmd_count(&VF_F_ADDR, &VF_F_DATA, n, VF_CMD_FILL) == 11;
-    // the Desktop button 2 wide: an outline and no fill (11 - 1)
+    assert vf_fpga_box_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA) == 38;
+    // the Desktop button 2 wide: an outline and no inside (6 - 1)
     l.w[4] = 2;
-    n = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA);
-    assert vf_fpga_cmd_count(&VF_F_ADDR, &VF_F_DATA, n, VF_CMD_FILL) == 10;
-    // a refused frame plans no write at all
-    assert vf_fpga_plan(g, l, 0, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA) == 0;
+    assert vf_fpga_box_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA) == 32;
+    // a refused frame or a short buffer plans no write at all
+    assert vf_fpga_plan(g, l, 0, VF_MENU_H, &VF_F_OPS, &VF_F_FULL, &VF_F_BASE, &VF_F_ADDR, &VF_F_DATA) == 0;
     var tiny : [12]u32 = [0; 12];
-    assert vf_fpga_plan(g, l, 375, VF_MENU_H, &tiny, &VF_F_ADDR, &VF_F_DATA) == 0;
+    assert vf_fpga_box_plan(g, l, 375, VF_MENU_H, &tiny, &VF_F_ADDR, &VF_F_DATA) == 0;
+    var few : [40]u32 = [0; 40];
+    assert vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_FULL, &VF_F_BASE, &few, &few) == 0;
+    var short : [10]u8 = [0; 10];
+    assert vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &short, &VF_F_BASE, &VF_F_ADDR, &VF_F_DATA) == 0;
 }
 
 test register_writes {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
-    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA);
-    assert n == 230;
+    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_FULL, &VF_F_BASE, &VF_F_ADDR, &VF_F_DATA);
+    assert n > 50;
     assert VF_F_ADDR[0] == 0x44A00024;
     assert VF_F_DATA[0] == 375;
     assert VF_F_ADDR[1] == 0x44A00028;
-    assert VF_F_DATA[1] == 84;
-    // the background fill: X Y W H RGB CTRL
+    assert VF_F_DATA[1] == 108;
+    // the background fill: X Y W H RGB CTRL, black
     assert VF_F_ADDR[2] == 0x44A00008;
     assert VF_F_DATA[4] == 375;
-    assert VF_F_DATA[5] == 84;
+    assert VF_F_DATA[5] == 108;
     assert VF_F_ADDR[6] == 0x44A00018;
-    assert VF_F_DATA[6] == VF_PX_BG;
+    assert VF_F_DATA[6] == 0;
     assert VF_F_ADDR[7] == 0x44A00000;
     assert VF_F_DATA[7] == VF_CMD_FILL;
-    // the last write runs the last glyph: the A of FPGA
-    assert VF_F_ADDR[229] == 0x44A00000;
-    assert VF_F_DATA[229] == VF_CMD_GLYPH;
-    assert VF_F_DATA[228] == VF_R_TEXT_LIGHT;
-}
-
-test fill_colours_from_vf_pixel {
-    var g : VfGraph = vf_menu_graph(375);
-    var l : VfLayout = vf_layout(g);
-    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA);
-    assert n == 230;
-    // fill command 2 (writes 14..19) is the card fill, 8 (writes 50..55) the Browser fill: RGB is write 4 of 6
-    assert VF_F_DATA[18] == vf_pixel_color(g, l, 360, 50);
-    assert VF_F_DATA[54] == vf_pixel_color(g, l, 90, 40);
-    assert VF_F_DATA[54] == 1402304;
-}
-
-test glyph_bitmap_rows {
-    // row r of the cell sits in bits 5 * r .. 5 * r + 4
-    var bm : u64 = vf_glyph_bitmap(65);
-    var gi : usize = glyph_index(65) as usize;
-    assert (bm % 32) == (FONT[gi][0] as u64);
-    assert ((bm / 32) % 32) == (FONT[gi][1] as u64);
-    assert ((bm / 1073741824) % 32) == (FONT[gi][6] as u64);
-    assert bm < 34359738368;
-    assert vf_glyph_bitmap(32) == 0;
-    assert vf_glyph_bitmap(7) == 0;
+    // the theme's colours, RGB is write 5 of 6: card edge, card inside, Browser accent, Desktop edge and inside
+    assert VF_F_DATA[12] == th_color(TH_T27, TH_CARD_BORDER);
+    assert VF_F_DATA[18] == th_kind_color(TH_T27, VF_CARD as u32);
+    assert VF_F_DATA[24] == th_color(TH_T27, TH_ACCENT);
+    assert VF_F_DATA[24] == 65416;
+    assert VF_F_DATA[30] == 3355443;
+    assert VF_F_DATA[36] == th_color(TH_T27, TH_BORDER);
+    // the last write runs the last span, one row high
+    assert VF_F_ADDR[(n - 1) as usize] == 0x44A00000;
+    assert VF_F_DATA[(n - 1) as usize] == VF_CMD_FILL;
+    assert VF_F_DATA[(n - 3) as usize] == 1;
 }
 
 test engine_equals_raster {
     var g : VfGraph = vf_menu_graph(375);
     var l : VfLayout = vf_layout(g);
-    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_ADDR, &VF_F_DATA);
-    assert vf_fpga_engine(&VF_F_ADDR, &VF_F_DATA, n, &VF_F_RGB, 375, VF_MENU_H) == VF_R_OK;
-    assert vf_render_rgb(g, l, &VF_F_RGB2, 375, VF_MENU_H) == VF_R_OK;
-    // every byte, labels included: the board model and the raster agree on all 94500
+    var n : u32 = vf_fpga_plan(g, l, 375, VF_MENU_H, &VF_F_OPS, &VF_F_FULL, &VF_F_BASE, &VF_F_ADDR, &VF_F_DATA);
+    assert n > 50;
+    assert vf_fpga_engine(&VF_F_ADDR, &VF_F_DATA, n, &VF_F_RGB, 375, VF_MENU_H) == VC_OK;
+    // every byte, the Outfit labels included: the board model and vct_render agree on all 121500
+    assert vct_render(g, l, &VF_F_FULL, 375, VF_MENU_H, TH_T27) == VC_OK;
     var bad : u32 = 0;
     var i : usize = 0;
-    while i < 94500 {
-        if VF_F_RGB[i] != VF_F_RGB2[i] {
+    while i < 121500 {
+        if VF_F_RGB[i] != VF_F_FULL[i] {
             bad = bad + 1;
         }
         i = i + 1;
     }
     assert bad == 0;
-    assert vf_rgb_at(&VF_F_RGB, 375, 90, 40) == 1402304;
-    // negative control: drop the last glyph's run write and the A of FPGA goes missing
-    assert vf_fpga_engine(&VF_F_ADDR, &VF_F_DATA, n - 1, &VF_F_RGB, 375, VF_MENU_H) == VF_R_OK;
+    assert vf_rgb_at(&VF_F_RGB, 375, 17, 53) == 65416;
+    // negative control: drop the last span's run write and its pixels go missing
+    assert vf_fpga_engine(&VF_F_ADDR, &VF_F_DATA, n - 1, &VF_F_RGB, 375, VF_MENU_H) == VC_OK;
     var miss : u32 = 0;
     i = 0;
-    while i < 94500 {
-        if VF_F_RGB[i] != VF_F_RGB2[i] {
+    while i < 121500 {
+        if VF_F_RGB[i] != VF_F_FULL[i] {
             miss = miss + 1;
         }
         i = i + 1;
     }
     assert miss > 0;
+    // a write outside the register window is refused
+    var ba : [1]u32 = [0x44A0002C; 1];
+    var bd : [1]u32 = [0; 1];
+    assert vf_fpga_engine(&ba, &bd, 1, &VF_F_RGB, 375, VF_MENU_H) == VC_BAD_RASTER;
 }
