@@ -7442,7 +7442,7 @@ fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.clos
 /// and returns false when the slot is busy or the OS refuses; thread_join(slot) waits for it.
 const THREAD_ZIG: &str = r#"
 const __t27_Thread = @import("std").Thread;
-var __t27_threads: [256]?__t27_Thread = [_]?__t27_Thread{null} ** 256;
+var __t27_threads: [256]?__t27_Thread = @splat(null);
 fn __t27_thread_spawn(slot: usize, comptime f: anytype, arg: usize) bool {
     if (slot >= __t27_threads.len or __t27_threads[slot] != null) return false;
     __t27_threads[slot] = __t27_Thread.spawn(.{}, f, .{arg}) catch return false;
@@ -7796,10 +7796,8 @@ impl Codegen {
             }
             // #6451: the REPEAT form `[v; n]` arrives as the text `v;n`, and
             // was emitted as `{ v;n }` -- "expected ',' after initializer".
-            // Zig spells it `{ v } ** n`; every caller writes the `[_]T` in
-            // front, so `[_]T{ v } ** n` is the whole value. A Rust width
-            // suffix on the value (`0i32`, `0.0f64`) is not Zig either; the
-            // element type already carries the width.
+            // A Rust width suffix on the value (`0i32`, `0.0f64`) is not Zig
+            // either; the element type already carries the width.
             if parts.len() == 1 {
                 let mut d = 0i32;
                 let mut semi = None;
@@ -7813,9 +7811,11 @@ impl Codegen {
                 }
                 if let Some(i) = semi {
                     let v = parts[0][..i].trim().to_string();
-                    let n = parts[0][i + 1..].trim().to_string();
-                    if !v.is_empty() && !n.is_empty() {
-                        self.write(&format!("{} }} ** {}", Self::strip_rust_num_suffix(&v), n));
+                    let _n = parts[0][i + 1..].trim().to_string();
+                    if !v.is_empty() && !_n.is_empty() {
+                        // Zig has no `**` repeat operator (#13591): the value
+                        // lowers to @splat; the count rides the target type.
+                        self.write(&format!("@splat({})", Self::strip_rust_num_suffix(&v)));
                         return;
                     }
                 }
@@ -10859,6 +10859,23 @@ impl Codegen {
                     // failing with "cannot compare strings with ==". When either
                     // side is a string literal the comparison is a string
                     // comparison, so lower it to std.mem.eql.
+                    // #13591: Zig has no `**` repeat operator; a single-element
+                    // pattern lowers to @splat, the count rides the target type.
+                    if op == "**" {
+                        let a = &node.children[0];
+                        if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 {
+                            self.write("@compileError(\"multi-element array repeat has no Zig lowering (#13591)\")");
+                            return;
+                        }
+                        self.write("@splat(");
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
+                            self.gen_expr(&a.children[0]);
+                        } else {
+                            self.gen_expr_maybe_paren(a);
+                        }
+                        self.write(")");
+                        return;
+                    }
                     let is_str = |n: &Node| {
                         n.kind == NodeKind::ExprLiteral && n.extra_kind == "string"
                     };
@@ -11096,13 +11113,14 @@ impl Codegen {
                     self.write(".{}");
                     return;
                 }
-                if let Some((val, count)) = txt.rsplit_once(';') {
+                if let Some((val, _count)) = txt.rsplit_once(';') {
                     // #6451: `[0i32; 2]` kept the Rust width suffix -- "number
                     // '0i32' has leading zero"; the target type carries it.
+                    // Zig has no `**` repeat operator (#13591): the value lowers
+                    // to @splat and the count is carried by the target type.
                     self.write(&format!(
-                        ".{{ {} }} ** {}",
-                        Self::strip_rust_num_suffix(val.trim()),
-                        count.trim()
+                        "@splat({})",
+                        Self::strip_rust_num_suffix(val.trim())
                     ));
                 } else {
                     // Split on TOP-LEVEL commas only -- elements may be calls
@@ -11169,8 +11187,8 @@ impl Codegen {
                                 // W609: the REPEAT form `[v; n]` is stored as
                                 // element text `v;n` and `gen_array_literal_braces`
                                 // splits on commas only, so it emitted the raw
-                                // `{ 0;21 }`. Zig spells it `[_]T{v} ** n`.
-                                // Caught by the corpus check, not by reasoning.
+                                // `{ 0;21 }`. Caught by the corpus check, not by
+                                // reasoning.
                                 let lit = &field.children[0];
                                 let repeat = if lit.children.is_empty() {
                                     lit.extra_size
@@ -11182,8 +11200,11 @@ impl Codegen {
                                 };
                                 match repeat {
                                     Some((v, n)) => self.write(&format!(
-                                        "@constCast(&[_]{}{{ {} }} ** {})",
-                                        elem, v, n
+                                        // Zig has no `**` repeat operator (#13591):
+                                        // tile the one-element pattern in a comptime
+                                        // block, then take the address of the result.
+                                        "@constCast(&(blk: {{ const t = [_]{}{{ {} }}; var r: [{}]{} = undefined; var i: usize = 0; while (i < {}) : (i += 1) {{ r[i] = t[i % t.len]; }} break :blk r; }}))",
+                                        elem, v, n, elem, n
                                     )),
                                     None => {
                                         self.write(&format!("@constCast(&[_]{}", elem));
