@@ -1316,7 +1316,7 @@ enum Commands {
     GenJson { input: String },
     /// Write the bytes of a spec's `str` constant to gen/text/<spec>/NAME, or to -o (t27#13011)
     #[command(name = "gen-text")]
-    GenText { input: String, #[arg(long = "const")] name: String, #[arg(short, long)] output: Option<String> },
+    GenText { input: String, #[arg(long = "const", conflicts_with = "func", required_unless_present = "func")] name: Option<String>, #[arg(long = "fn")] func: Option<String>, #[arg(long, requires = "func")] buf: Option<usize>, #[arg(short, long)] output: Option<String> },
 
     /// Compute deterministic test_vector_hash from conformance JSON
     Conformance {
@@ -5594,20 +5594,43 @@ fn run_gen_json(input_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `gen-text` (t27#13011): the bytes of a spec's `str` const, unchanged, to gen/text/ or -o; the decisions are specs/compiler/gen_text.t27.
-fn run_gen_text(input: &str, name: &str, output: Option<&str>) -> anyhow::Result<()> {
+/// `gen-text` (t27#13011): the bytes of a spec's `str` const, or of the buffer a spec fn fills (`--fn`), unchanged, to gen/text/ or -o; the decisions are specs/compiler/gen_text.t27.
+fn run_gen_text(input: &str, name: Option<&str>, func: Option<&str>, cap: Option<usize>, output: Option<&str>) -> anyhow::Result<()> {
     let (ast, _) = ast_for_codegen(input)?;
+    let name = func.or(name).unwrap_or_default();
     let node = ast.children.iter().find(|n| n.kind == compiler::NodeKind::ConstDecl && n.name == name);
     let lit = node.and_then(|n| n.children.first()).filter(|c| c.extra_kind == "string");
-    anyhow::ensure!(gen_text::text_check(node.is_some(), lit.is_some()) == gen_text::TEXT_WRITE, "gen-text: {input} declares no string const {name}");
+    let bytes = if func.is_some() { text_fn_bytes(&ast, input, name, cap.unwrap_or(gen_text::DEFAULT_BUF))? } else {
+        anyhow::ensure!(gen_text::text_check(node.is_some(), lit.is_some()) == gen_text::TEXT_WRITE, "gen-text: {input} declares no string const {name}");
+        lit.map_or_else(Vec::new, |l| l.value.chars().map(|c| c as u32 as u8).collect())
+    };
     let mut buf = [0u8; 512];
     let n = gen_text::default_path(input.as_bytes(), name.as_bytes(), &mut buf);
     anyhow::ensure!(output.is_some() || (0 < n && n <= buf.len()), "gen-text: {input} has no default path, pass -o");
     let dest = output.map_or_else(|| String::from_utf8_lossy(&buf[..n.min(buf.len())]).into_owned(), String::from);
     if let Some(dir) = Path::new(&dest).parent() { fs::create_dir_all(dir)?; }
-    fs::write(&dest, lit.map_or_else(Vec::new, |l| l.value.chars().map(|c| c as u32 as u8).collect()))?;
+    fs::write(&dest, bytes)?;
     eprintln!("gen-text: wrote {dest}");
     Ok(())
+}
+
+/// `gen-text --fn`: run the spec fn in the Zig harness that gen_text::harness spells and return the bytes it wrote.
+fn text_fn_bytes(ast: &compiler::Node, input: &str, name: &str, cap: usize) -> anyhow::Result<Vec<u8>> {
+    let f = ast.children.iter().find(|n| n.kind == compiler::NodeKind::FnDecl && n.name == name);
+    let sig = f.map_or_else(String::new, |f| format!("{}->{}", f.params.iter().map(|p| p.1.as_str()).collect::<Vec<_>>().join(","), f.extra_return_type));
+    anyhow::ensure!(gen_text::fn_check(f.is_some(), sig.as_bytes()) == gen_text::FN_OK, "gen-text: {input} declares no fn {name}(out: []u8) or (out: []u8, cap: usize) returning u32 or usize (found '{sig}')");
+    let zig = gen_resolved(input, compiler::Compiler::compile)?;
+    let dir = std::env::temp_dir().join(format!("t27-gen-text-{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let mut h = [0u8; 4096];
+    let n = gen_text::harness(name.as_bytes(), cap, gen_text::fn_has_cap(sig.as_bytes()), &mut h);
+    fs::write(dir.join("spec.zig"), zig)?;
+    fs::write(dir.join("main.zig"), &h[..n.min(h.len())])?;
+    let run = std::process::Command::new("zig").args(["run", "main.zig"]).current_dir(&dir).output();
+    let _ = fs::remove_dir_all(&dir);
+    let run = run.context("gen-text: cannot run zig")?;
+    anyhow::ensure!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr).lines().next().unwrap_or("gen-text: the evaluator failed"));
+    Ok(run.stdout)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -11599,7 +11622,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::GenTs { input } => run_gen_ts(&input)?,
         Commands::GenPython { input } => run_gen_python(&input)?,
         Commands::GenJson { input } => run_gen_json(&input)?,
-        Commands::GenText { input, name, output } => run_gen_text(&input, &name, output.as_deref())?,
+        Commands::GenText { input, name, func, buf, output } => run_gen_text(&input, name.as_deref(), func.as_deref(), buf, output.as_deref())?,
         Commands::Conformance { input } => run_conformance(&input)?,
         Commands::Path { input, synth } => {
             service::run_path(&std::env::current_dir()?, &input, synth)?
@@ -12040,7 +12063,7 @@ fn main() -> anyhow::Result<()> {
         Commands::GenTs { input } => run_gen_ts(&input)?,
         Commands::GenPython { input } => run_gen_python(&input)?,
         Commands::GenJson { input } => run_gen_json(&input)?,
-        Commands::GenText { input, name, output } => run_gen_text(&input, &name, output.as_deref())?,
+        Commands::GenText { input, name, func, buf, output } => run_gen_text(&input, name.as_deref(), func.as_deref(), buf, output.as_deref())?,
         Commands::Conformance { input } => run_conformance(&input)?,
         Commands::Path { input, synth } => {
             service::run_path(&std::env::current_dir()?, &input, synth)?
