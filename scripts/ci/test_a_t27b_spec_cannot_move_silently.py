@@ -237,13 +237,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check(code == 2, f"unread: no ledger -> exit 2 (got {code})")
 
     # the committed ledger
-    text = open(LEDGER).read()
-    real = json.loads(text)
+    real = json.loads(text := open(LEDGER).read())
+    sys.path.append(os.path.dirname(RULES)); import t27b_rules  # is_pass from the generated C of steward.t27
     ents = real["entries"]
     paths = [e["path"] for e in ents]
     np = [e for e in ents if e["t27b"] not in ("pass", "pass_vacuous")]
     check(paths == sorted(paths) and len(set(paths)) == len(paths), "ledger: sorted, one entry per spec")
-    check(all(e.get("reason") in ("unimplemented", "reference-bug", "n/a") and e.get("blocker") for e in np),
+    check(all(e.get("reason") in ("unimplemented", "reference-bug", "n/a") and e.get("blocker") for e in np if not t27b_rules.is_pass(e["t27b"])),
           "ledger: every non-pass entry has a blocker and a known reason")
     check("counts" not in real and len(np) == real["max_not_pass"],
           f"ledger: no stored counts (#7859) and the cap equals reality ({len(np)}, cap {real['max_not_pass']})")

@@ -1,0 +1,365 @@
+// SPDX-License-Identifier: Apache-2.0
+; T27F-006 scaling and antialiasing: vf_scale paints the merged vf_layout rectangles at any scale from 25 to 400 percent
+; Refs gHashTag/t27#13214, epic #13214
+; Every edge is a fraction of a pixel: a node rectangle, its 1-design-pixel outline and every font pixel of a label become rectangles
+; in Q8 output units (256 per pixel), and each output pixel takes the exact area the rectangle covers as its blend weight (0..256)
+; At 100 percent every edge sits on a pixel boundary, so every weight is 0 or 256 and the frame equals the flat vf_render frame byte for byte
+; At 50 or 150 percent an edge falls inside a pixel and that pixel becomes a mix of the two colours: that mix is the antialiasing
+; Painter order: nodes by index, each as an outline-coloured outer rectangle then a fill-coloured inner one; then every label, white
+; Reads VfGraph, VfLayout, vf_pixel, vf_render and frame_render, edits none of them
+; Limits: one flat fill per kind, 5x7 font scaled as area-covered squares (no hinting), no gamma (blend is linear on the stored bytes)
+; It is NOT a human-eye proof: tests pin pixel bytes, and a viewable frame is opened by a person
+; All arithmetic is u32 and non-negative: compare before subtracting
+
+module t27f_vf_scale;
+use t27f::visual_factory_contract::VfGraph;
+use t27f::visual_factory_contract::VF_TEXT;
+use t27f::visual_factory_contract::VF_BUTTON;
+use t27f::visual_factory_contract::VF_INPUT;
+use t27f::visual_factory_contract::VF_CARD;
+use t27f::visual_factory_contract::VF_BADGE;
+use t27f::vf_layout::VfLayout;
+use t27f::vf_layout::vf_layout;
+use t27f::vf_pixel::VF_PALETTE;
+use t27f::vf_pixel::vf_px_card;
+use t27f::vf_render::VF_R_BORDER;
+use t27f::vf_render::VF_R_TEXT_LIGHT;
+use t27f::vf_render::VF_R_OK;
+use t27f::vf_render::VF_R_SMALL;
+use t27f::vf_render::vf_render_rgb;
+use t27f::frame_render::FONT;
+use t27f::frame_render::FONT_W;
+use t27f::frame_render::FONT_H;
+use t27f::frame_render::FONT_ADVANCE;
+use t27f::frame_render::glyph_index;
+
+; the scale limits, in percent of the design size
+pub const VF_S_MIN : u32 = 25;
+pub const VF_S_MAX : u32 = 400;
+
+; the colour under the first paint: white
+pub const VF_S_BACK : u32 = 16777215;
+
+; test rasters: 750 x 384 x 3 = 864000 bytes holds 200 percent of the 375 card, and 768 x 192 x 3 = 442368 holds the flat reference
+pub var VF_S_RGB : [864000]u8 = [0] ** 864000;
+pub var VF_S_REF : [442368]u8 = [0] ** 442368;
+
+; design pixels to Q8 output units at pct percent: v * pct * 256 / 100
+pub fn vf_s_q(v: u32, pct: u32) -> u32 {
+    return v * pct * 64 / 25;
+}
+
+; how much of output pixel p the interval [a, b) covers, in Q8 units: 0 for none, 256 for all of it
+pub fn vf_s_cover(a: u32, b: u32, p: u32) -> u32 {
+    var lo : u32 = p * 256;
+    var hi : u32 = lo + 256;
+    var s : u32 = a;
+    if lo > s {
+        s = lo;
+    }
+    var e : u32 = b;
+    if hi < e {
+        e = hi;
+    }
+    if e <= s {
+        return 0;
+    }
+    return e - s;
+}
+
+; one channel: dst moved toward src by weight a (0..256), rounded; a = 0 keeps dst, a = 256 gives src
+pub fn vf_s_blend(dst: u32, src: u32, a: u32) -> u32 {
+    return (dst * (256 - a) + src * a + 128) / 256;
+}
+
+; paint the Q8 rectangle [x0, x1) x [y0, y1) in colour col over the raster, each pixel weighted by the area it covers
+fn vf_s_paint_rect(rgb: []u8, w: u32, h: u32, x0: u32, y0: u32, x1: u32, y1: u32, col: u32) -> void {
+    if x1 <= x0 {
+        return;
+    }
+    if y1 <= y0 {
+        return;
+    }
+    var pxe : u32 = (x1 + 255) / 256;
+    if pxe > w {
+        pxe = w;
+    }
+    var pye : u32 = (y1 + 255) / 256;
+    if pye > h {
+        pye = h;
+    }
+    var cr : u32 = (col / 65536) % 256;
+    var cg : u32 = (col / 256) % 256;
+    var cb : u32 = col % 256;
+    var py : u32 = y0 / 256;
+    while py < pye {
+        var cy : u32 = vf_s_cover(y0, y1, py);
+        var px : u32 = x0 / 256;
+        while px < pxe {
+            var a : u32 = vf_s_cover(x0, x1, px) * cy / 256;
+            if a > 0 {
+                var at : usize = ((py * w + px) * 3) as usize;
+                rgb[at] = vf_s_blend(rgb[at] as u32, cr, a) as u8;
+                rgb[at + 1] = vf_s_blend(rgb[at + 1] as u32, cg, a) as u8;
+                rgb[at + 2] = vf_s_blend(rgb[at + 2] as u32, cb, a) as u8;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+}
+
+; the label of one node: every set pixel of the 5x7 font as a white square, positioned in design pixels then scaled
+fn vf_s_label(rgb: []u8, w: u32, h: u32, ox: u32, oy: u32, s: str, pct: u32) -> void {
+    var i : usize = 0;
+    while i < s.len {
+        var gi : u32 = glyph_index(s[i]);
+        var gx : u32 = ox + (i as u32) * FONT_ADVANCE;
+        var r : u32 = 0;
+        while r < FONT_H {
+            var bits : u32 = FONT[gi as usize][r as usize] as u32;
+            var c : u32 = 0;
+            while c < FONT_W {
+                var on : u32 = (bits >> (FONT_W - 1 - c)) & 1;
+                if on == 1 {
+                    vf_s_paint_rect(rgb, w, h, vf_s_q(gx + c, pct), vf_s_q(oy + r, pct), vf_s_q(gx + c + 1, pct), vf_s_q(oy + r + 1, pct), VF_R_TEXT_LIGHT);
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+}
+
+; paint the graph into rgb (w * h * 3 bytes, top row first) at pct percent of the design size; w and h are the output size
+pub fn vf_render_scaled(g: VfGraph, l: VfLayout, rgb: []u8, w: u32, h: u32, pct: u32) -> u8 {
+    if w == 0 or h == 0 {
+        return VF_R_SMALL;
+    }
+    if w > 4096 or h > 4096 {
+        return VF_R_SMALL;
+    }
+    if pct < VF_S_MIN or pct > VF_S_MAX {
+        return VF_R_SMALL;
+    }
+    var need : u32 = w * h * 3;
+    if need > (rgb.len as u32) {
+        return VF_R_SMALL;
+    }
+
+    var k : u32 = 0;
+    while k < need {
+        rgb[k as usize] = 255;
+        k = k + 1;
+    }
+
+    var ni : u32 = 0;
+    while ni < l.node_count {
+        var x0 : u32 = vf_s_q(l.x[ni], pct);
+        var y0 : u32 = vf_s_q(l.y[ni], pct);
+        var x1 : u32 = vf_s_q(l.x[ni] + l.w[ni], pct);
+        var y1 : u32 = vf_s_q(l.y[ni] + l.h[ni], pct);
+        var fill : u32 = VF_PALETTE[g.kind[ni] as u32];
+        vf_s_paint_rect(rgb, w, h, x0, y0, x1, y1, VF_R_BORDER);
+        if l.w[ni] >= 2 and l.h[ni] >= 2 {
+            vf_s_paint_rect(rgb, w, h, vf_s_q(l.x[ni] + 1, pct), vf_s_q(l.y[ni] + 1, pct), vf_s_q(l.x[ni] + l.w[ni] - 1, pct), vf_s_q(l.y[ni] + l.h[ni] - 1, pct), fill);
+        }
+        ni = ni + 1;
+    }
+
+    var li : u32 = 0;
+    while li < l.node_count {
+        var kd : u8 = g.kind[li];
+        var labelled : bool = false;
+        if kd == VF_TEXT {
+            labelled = true;
+        }
+        if kd == VF_BADGE {
+            labelled = true;
+        }
+        if kd == VF_BUTTON {
+            labelled = true;
+        }
+        let s : str = g.text[li];
+        var has_text : bool = true;
+        if s == "" {
+            has_text = false;
+        }
+        if labelled and has_text {
+            var ty : u32 = l.y[li];
+            if l.h[li] > 7 {
+                ty = ty + (l.h[li] - 7) / 2;
+            }
+            vf_s_label(rgb, w, h, l.x[li] + 4, ty, s, pct);
+        }
+        li = li + 1;
+    }
+    return VF_R_OK;
+}
+
+; output size for a design size at pct percent, rounded up so a fractional last pixel still shows
+pub fn vf_s_size(v: u32, pct: u32) -> u32 {
+    return (v * pct + 99) / 100;
+}
+
+; red channel of the test-raster pixel (x, y) in a raster w wide
+fn vf_s_red(x: u32, y: u32, w: u32) -> u32 {
+    var at : usize = ((y * w + x) * 3) as usize;
+    return VF_S_RGB[at] as u32;
+}
+
+; colour 0xRRGGBB of the test-raster pixel (x, y) in a raster w wide
+fn vf_s_px(x: u32, y: u32, w: u32) -> u32 {
+    var at : usize = ((y * w + x) * 3) as usize;
+    var r : u32 = VF_S_RGB[at] as u32;
+    var gr : u32 = VF_S_RGB[at + 1] as u32;
+    var b : u32 = VF_S_RGB[at + 2] as u32;
+    return r * 65536 + gr * 256 + b;
+}
+
+; how many bytes differ between the scaled raster and the flat reference over n bytes
+fn vf_s_diff(n: u32) -> u32 {
+    var d : u32 = 0;
+    var k : u32 = 0;
+    while k < n {
+        if VF_S_RGB[k as usize] != VF_S_REF[k as usize] {
+            d = d + 1;
+        }
+        k = k + 1;
+    }
+    return d;
+}
+
+test cover_is_the_exact_area {
+    assert vf_s_cover(0, 256, 0) == 256;
+    assert vf_s_cover(64, 192, 0) == 128;
+    assert vf_s_cover(300, 400, 0) == 0;
+    assert vf_s_cover(300, 400, 1) == 100;
+    assert vf_s_cover(0, 256, 1) == 0;
+    assert vf_s_cover(384, 640, 1) == 128;
+    assert vf_s_cover(384, 640, 2) == 128;
+    assert vf_s_cover(500, 500, 1) == 0;
+}
+
+test q_and_blend {
+    assert vf_s_q(10, 100) == 2560;
+    assert vf_s_q(8, 150) == 3072;
+    assert vf_s_q(1, 150) == 384;
+    assert vf_s_q(1, 50) == 128;
+    assert vf_s_blend(0, 255, 128) == 128;
+    assert vf_s_blend(10, 200, 0) == 10;
+    assert vf_s_blend(10, 200, 256) == 200;
+    assert vf_s_blend(68, 245, 128) == 157;
+    assert vf_s_size(375, 100) == 375;
+    assert vf_s_size(375, 150) == 563;
+    assert vf_s_size(192, 150) == 288;
+    assert vf_s_size(375, 50) == 188;
+}
+
+test refusals {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_scaled(g, l, &VF_S_RGB, 375, 192, 100) == VF_R_OK;
+    assert vf_render_scaled(g, l, &VF_S_RGB, 0, 192, 100) == VF_R_SMALL;
+    assert vf_render_scaled(g, l, &VF_S_RGB, 375, 0, 100) == VF_R_SMALL;
+    assert vf_render_scaled(g, l, &VF_S_RGB, 375, 192, 24) == VF_R_SMALL;
+    assert vf_render_scaled(g, l, &VF_S_RGB, 375, 192, 401) == VF_R_SMALL;
+    var small : [10]u8 = [0; 10];
+    assert vf_render_scaled(g, l, &small, 375, 192, 100) == VF_R_SMALL;
+}
+
+test hundred_percent_is_the_flat_frame_375 {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_rgb(g, l, &VF_S_REF, 375, 192) == VF_R_OK;
+    assert vf_render_scaled(g, l, &VF_S_RGB, 375, 192, 100) == VF_R_OK;
+    assert vf_s_diff(216000) == 0;
+}
+
+test hundred_percent_is_the_flat_frame_768 {
+    var g : VfGraph = vf_px_card(768);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_rgb(g, l, &VF_S_REF, 768, 192) == VF_R_OK;
+    assert vf_render_scaled(g, l, &VF_S_RGB, 768, 192, 100) == VF_R_OK;
+    assert vf_s_diff(442368) == 0;
+}
+
+test two_hundred_percent_is_crisp {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_scaled(g, l, &VF_S_RGB, 750, 384, 200) == VF_R_OK;
+    assert vf_s_px(0, 0, 750) == VF_R_BORDER;
+    assert vf_s_px(1, 1, 750) == VF_R_BORDER;
+    assert vf_s_px(2, 100, 750) == VF_PALETTE[VF_CARD as u32];
+    assert vf_s_px(200, 240, 750) == VF_PALETTE[VF_INPUT as u32];
+    assert vf_s_px(300, 360, 750) == VF_PALETTE[VF_BUTTON as u32];
+    assert vf_s_px(749, 383, 750) == VF_R_BORDER;
+}
+
+test one_hundred_fifty_percent_mixes_the_edge {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_scaled(g, l, &VF_S_RGB, 563, 288, 150) == VF_R_OK;
+    assert vf_s_px(0, 100, 563) == VF_R_BORDER;
+    assert vf_s_red(1, 100, 563) == 157;
+    assert vf_s_px(2, 100, 563) == VF_PALETTE[VF_CARD as u32];
+    assert vf_s_px(561, 100, 563) == VF_R_BORDER;
+    assert vf_s_red(562, 100, 563) == 162;
+}
+
+test fifty_percent_turns_the_outline_grey {
+    var g : VfGraph = vf_px_card(768);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_scaled(g, l, &VF_S_RGB, 384, 96, 50) == VF_R_OK;
+    assert vf_s_red(0, 50, 384) == 157;
+    assert vf_s_px(100, 50, 384) == VF_PALETTE[VF_CARD as u32];
+    assert vf_s_px(300, 10, 384) == VF_PALETTE[VF_CARD as u32];
+}
+
+test labels_survive_scaling {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_scaled(g, l, &VF_S_RGB, 750, 384, 200) == VF_R_OK;
+    var seen : u32 = 0;
+    var y : u32 = 340;
+    while y < 356 {
+        var x : u32 = 24;
+        while x < 74 {
+            if vf_s_px(x, y, 750) == VF_R_TEXT_LIGHT {
+                seen = seen + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    assert seen >= 1;
+    g.text[6] = "";
+    assert vf_render_scaled(g, l, &VF_S_RGB, 750, 384, 200) == VF_R_OK;
+    var gone : u32 = 0;
+    y = 340;
+    while y < 356 {
+        var x : u32 = 24;
+        while x < 74 {
+            if vf_s_px(x, y, 750) == VF_R_TEXT_LIGHT {
+                gone = gone + 1;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    assert gone == 0;
+}
+
+test layout_break_shows_when_scaled {
+    var g : VfGraph = vf_px_card(375);
+    var l : VfLayout = vf_layout(g);
+    assert vf_render_scaled(g, l, &VF_S_RGB, 750, 384, 200) == VF_R_OK;
+    var before : u32 = vf_s_px(600, 20, 750);
+    assert before == VF_PALETTE[VF_CARD as u32];
+    l.w[1] = 400;
+    assert vf_render_scaled(g, l, &VF_S_RGB, 750, 384, 200) == VF_R_OK;
+    var after : u32 = vf_s_px(600, 20, 750);
+    assert after == VF_PALETTE[VF_TEXT as u32];
+    assert after != before;
+}
