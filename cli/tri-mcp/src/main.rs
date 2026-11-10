@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Result;
@@ -61,17 +62,31 @@ struct AkashicEvent {
     metadata: Value,
 }
 
-fn gateway_observation_call(name: &str, args: &Value) -> Result<Value> {
+fn gateway_observation_call(name: &str, args: &Value, root: &Path) -> Result<Value> {
     static WINDOW: AtomicU32 = AtomicU32::new(0);
+    static DENIED: AtomicU32 = AtomicU32::new(0);
     // The generated law takes &'static str; interning here is framing only.
     let name: &'static str = Box::leak(name.to_string().into_boxed_str());
     let h2: String = args.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let host: &'static str = Box::leak(h2.into_boxed_str());
     let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let scope: &'static str = Box::leak(format!("{}:{}", host, port).into_boxed_str());
     let count = WINDOW.fetch_add(1, Ordering::Relaxed) + 1;
     let idx = gateway_policy::tool_index(name, name.len());
     let d = gateway_policy::gateway_gate(gateway_policy::MCP_CALL, idx, host, host.len(), port, count);
+    if d != gateway_policy::ALLOW { DENIED.fetch_add(1, Ordering::Relaxed); }
     let h = gateway_policy::request_hash(name, name.len());
+    // Audit sink (host plumbing): one law-encoded line per call, appended to
+    // the gateway's OWN audit log under .trinity/ -- no arbitrary file access.
+    let mut abuf = [0u8; 256];
+    let an = gateway_policy::audit_encode(&mut abuf, 256,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|x| x.as_secs()).unwrap_or(0),
+        "dsh-session", 11, name, name.len(), scope, scope.len(),
+        d, if d == gateway_policy::DENY_RATE { 2 } else { 0 }, h);
+    let log_path = root.join(".trinity/gateway-audit.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = std::io::Write::write_all(&mut f, &abuf[..an]);
+    }
     let mut buf = [0u8; 128];
     let n = gateway_policy::response_decision(&mut buf, 128, d,
         if d == gateway_policy::DENY_RATE { 2 } else { 0 }, h);
@@ -84,13 +99,31 @@ fn gateway_observation_call(name: &str, args: &Value) -> Result<Value> {
     if name == "cdp.observe" {
         return cdp_observe_live(host, port, &decision);
     }
-    Ok(serde_json::json!({
-        "tool": name,
-        "policy_version": gateway_policy::POLICY_VERSION,
-        "connected": false,
-        "note": "observation-only V1: no live DSH/CDP connection is made",
-        "decision": serde_json::from_str::<Value>(&decision)?,
-    }))
+    // V12 introspection tools (all read-only, law-gated).
+    if idx == 3 {
+        return Ok(serde_json::json!({"tool": name,
+            "requests": count, "denied": DENIED.load(Ordering::Relaxed),
+            "decision": serde_json::from_str::<Value>(&decision)?}));
+    }
+    if idx == 4 {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let ok = std::net::TcpStream::connect_timeout(&addr,
+            std::time::Duration::from_millis(800)).is_ok();
+        return Ok(serde_json::json!({"tool": name, "reachable": ok,
+            "host": host, "port": port}));
+    }
+    if idx == 5 || idx == 9 {
+        let log_path = root.join(".trinity/gateway-audit.log");
+        let data = std::fs::read(&log_path).unwrap_or_default();
+        let start = data.len().saturating_sub(2048);
+        return Ok(serde_json::json!({"tool": name,
+            "tail": String::from_utf8_lossy(&data[start..])}));
+    }
+    let mut ob = [0u8; 256];
+    let on = gateway_policy::observation_response(idx, &mut ob, 256);
+    Ok(serde_json::json!({"tool": name,
+        "observation": serde_json::from_str::<Value>(std::str::from_utf8(&ob[..on])?)?,
+        "decision": serde_json::from_str::<Value>(&decision)?}))
 }
 
 // V7: one read-only HTTP/1.0 GET of the CDP target list. Anything beyond the
@@ -356,6 +389,13 @@ fn build_tools_list() -> Vec<Value> {
         serde_json::json!({"name": "gateway.status", "description": "Gateway policy version and counters (observation-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
         serde_json::json!({"name": "dsh.status", "description": "DSH health read via loopback 127.0.0.1:3081 only; V1 makes no live connection.", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
         serde_json::json!({"name": "cdp.observe", "description": "CDP observation on loopback 127.0.0.1:9222..9332 only; observe-only.", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.metrics", "description": "Gateway call counters: requests served, denials (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.health", "description": "Loopback TCP reachability probe of the requested endpoint (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.policy.audit", "description": "Tail of the gateway audit log (law-encoded lines, hashes only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.config.get", "description": "Effective gateway policy summary (version, tools, routes; no secrets).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.routes.list", "description": "Configured loopback routes: DSH 3081, CDP 9222..9332 (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.version", "description": "Gateway policy version and tool count (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.logs.head", "description": "Head of the gateway audit log (same source as policy.audit).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
     ]
 }
 
@@ -372,7 +412,9 @@ fn jsonrpc_error_code(msg: &str) -> i32 {
 fn handle_tools_list() -> Result<Value> {
     // D1 (owner-approved 2026-11-11): expose only the three observation-only
     // gateway tools; legacy tri_* handlers stay transport-only, unlisted.
-    let gw = ["gateway.status", "dsh.status", "cdp.observe"];
+    let gw = ["gateway.status", "dsh.status", "cdp.observe", "gateway.metrics",
+        "gateway.health", "gateway.policy.audit", "gateway.config.get",
+        "gateway.routes.list", "gateway.version", "gateway.logs.head"];
     let tools: Vec<Value> = build_tools_list()
         .into_iter()
         .filter(|t| t.get("name").and_then(|n| n.as_str())
@@ -406,7 +448,7 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
         "tri_experience_save" => cmd_experience_save(root, &arguments),
         "tri_health" => cmd_health(root),
         n if n == "gateway.status" || n == "dsh.status" || n == "cdp.observe" => {
-            gateway_observation_call(n, &arguments)
+            gateway_observation_call(n, &arguments, root)
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
     };

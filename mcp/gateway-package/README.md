@@ -15,11 +15,15 @@ Requires the `tri-mcp` binary built at the absolute path pinned in
 `cordis.patch.json` (`command:`), and `cwd:` set to a t27 checkout (the
 server resolves the repo root from its working directory).
 
-## Tools (exactly three, read-only)
+## Tools (ten, all read-only)
 
-`gateway.status`, `dsh.status`, `cdp.observe` -- loopback-only endpoints,
-dry-run/observation semantics, policy refusals recorded. No shell, no file
-writes, no credentials, no browser mutation, no policy self-modification.
+Core: `gateway.status`, `dsh.status`, `cdp.observe` -- loopback-only
+endpoints, observation semantics, policy refusals recorded.
+V12 introspection: `gateway.metrics`, `gateway.health`, `gateway.policy.audit`,
+`gateway.config.get`, `gateway.routes.list`, `gateway.version`,
+`gateway.logs.head` (tail of the gateway's own audit log).
+No shell, no file writes, no credentials, no browser mutation, no policy
+self-modification.
 
 ## Rollback
 
