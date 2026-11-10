@@ -447,7 +447,11 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
         "tri_verdict" => cmd_verdict(root),
         "tri_experience_save" => cmd_experience_save(root, &arguments),
         "tri_health" => cmd_health(root),
-        n if n == "gateway.status" || n == "dsh.status" || n == "cdp.observe" => {
+        n if n == "gateway.status" || n == "dsh.status" || n == "cdp.observe"
+            || n == "gateway.metrics" || n == "gateway.health"
+            || n == "gateway.policy.audit" || n == "gateway.config.get"
+            || n == "gateway.routes.list" || n == "gateway.version"
+            || n == "gateway.logs.head" => {
             gateway_observation_call(n, &arguments, root)
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
