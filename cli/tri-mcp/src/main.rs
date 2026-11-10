@@ -65,21 +65,16 @@ fn gateway_observation_call(name: &str, args: &Value) -> Result<Value> {
     static WINDOW: AtomicU32 = AtomicU32::new(0);
     // The generated law takes &'static str; interning here is framing only.
     let name: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let host: &'static str = Box::leak(
-        args.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string().into_boxed_str(),
-    );
+    let h2: String = args.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let host: &'static str = Box::leak(h2.into_boxed_str());
     let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     let count = WINDOW.fetch_add(1, Ordering::Relaxed) + 1;
     let idx = gateway_policy::tool_index(name, name.len());
-    let d = gateway_policy::gateway_gate(
-        gateway_policy::MCP_CALL, idx, host, host.len(), port, count,
-    );
+    let d = gateway_policy::gateway_gate(gateway_policy::MCP_CALL, idx, host, host.len(), port, count);
     let h = gateway_policy::request_hash(name, name.len());
     let mut buf = [0u8; 128];
-    let n = gateway_policy::response_decision(
-        &mut buf, 128, d,
-        if d == gateway_policy::DENY_RATE { 2 } else { 0 }, h,
-    );
+    let n = gateway_policy::response_decision(&mut buf, 128, d,
+        if d == gateway_policy::DENY_RATE { 2 } else { 0 }, h);
     let decision = String::from_utf8_lossy(&buf[..n]).to_string();
     if d != gateway_policy::ALLOW {
         anyhow::bail!("gateway policy denied: {}", decision);
@@ -315,6 +310,9 @@ fn build_tools_list() -> Vec<Value> {
                 "required": []
             }
         }),
+        serde_json::json!({"name": "gateway.status", "description": "Gateway policy version and counters (observation-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "dsh.status", "description": "DSH health read via loopback 127.0.0.1:3081 only; V1 makes no live connection.", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "cdp.observe", "description": "CDP observation on loopback 127.0.0.1:9222..9332 only; observe-only.", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
     ]
 }
 
