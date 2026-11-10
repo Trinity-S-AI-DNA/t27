@@ -5588,7 +5588,7 @@ fn text_fn_bytes(ast: &compiler::Node, input: &str, name: &str, cap: usize) -> a
     let sig = f.map_or_else(String::new, |f| format!("{}->{}", f.params.iter().map(|p| p.1.as_str()).collect::<Vec<_>>().join(","), f.extra_return_type));
     anyhow::ensure!(gen_text::fn_check(f.is_some(), sig.as_bytes()) == gen_text::FN_OK, "gen-text: {input} declares no fn {name}(out: []u8) or (out: []u8, cap: usize) returning u32 or usize (found '{sig}')");
     let zig = gen_resolved(input, compiler::Compiler::compile)?;
-    let dir = env::temp_dir().join(format!("t27-gen-text-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("t27-gen-text-{}", std::process::id()));
     fs::create_dir_all(&dir)?;
     let mut h = [0u8; 4096];
     let n = gen_text::harness(name.as_bytes(), cap, gen_text::fn_has_cap(sig.as_bytes()), &mut h);
