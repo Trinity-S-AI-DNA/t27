@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -9,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+// M1 gateway: decisions live in the generated .t27 law (V2); framing only.
+#[path = "../../../gen/rust/tri/gateway_policy.rs"]
+mod gateway_policy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveSkill {
@@ -54,6 +59,38 @@ struct AkashicEvent {
     result: String,
     error: Option<String>,
     metadata: Value,
+}
+
+fn gateway_observation_call(name: &str, args: &Value) -> Result<Value> {
+    static WINDOW: AtomicU32 = AtomicU32::new(0);
+    // The generated law takes &'static str; interning here is framing only.
+    let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let host: &'static str = Box::leak(
+        args.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string().into_boxed_str(),
+    );
+    let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let count = WINDOW.fetch_add(1, Ordering::Relaxed) + 1;
+    let idx = gateway_policy::tool_index(name, name.len());
+    let d = gateway_policy::gateway_gate(
+        gateway_policy::MCP_CALL, idx, host, host.len(), port, count,
+    );
+    let h = gateway_policy::request_hash(name, name.len());
+    let mut buf = [0u8; 128];
+    let n = gateway_policy::response_decision(
+        &mut buf, 128, d,
+        if d == gateway_policy::DENY_RATE { 2 } else { 0 }, h,
+    );
+    let decision = String::from_utf8_lossy(&buf[..n]).to_string();
+    if d != gateway_policy::ALLOW {
+        anyhow::bail!("gateway policy denied: {}", decision);
+    }
+    Ok(serde_json::json!({
+        "tool": name,
+        "policy_version": gateway_policy::POLICY_VERSION,
+        "connected": false,
+        "note": "observation-only V1: no live DSH/CDP connection is made",
+        "decision": serde_json::from_str::<Value>(&decision)?,
+    }))
 }
 
 fn find_repo_root() -> Option<PathBuf> {
@@ -309,6 +346,9 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
         "tri_verdict" => cmd_verdict(root),
         "tri_experience_save" => cmd_experience_save(root, &arguments),
         "tri_health" => cmd_health(root),
+        n if n == "gateway.status" || n == "dsh.status" || n == "cdp.observe" => {
+            gateway_observation_call(n, &arguments)
+        }
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
     };
 

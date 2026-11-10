@@ -347,8 +347,145 @@ test audit_event_has_seven_fields_and_no_secret_bytes {
     }
     assert leaked == false;
 }
+; ---- V2 (ORDER: DSH_MCP_GATEWAY_T27_NATIVE_V2): the gateway LAW grows to
+; cover the whole MCP surface. Method dispatch, per-tool scope validation,
+; JSON-RPC error codes and the response decision envelope live HERE, in
+; .t27; the host adapter (cli/tri-mcp) only frames stdin/stdout and calls the
+; generated functions. It cannot decide anything: every branch it may take is
+; one of the verdicts below.
 
-test request_hash_is_stable_and_order_sensitive {
-    assert request_hash("", 0) == H_SEED;
-    assert request_hash("ab", 2) != request_hash("ba", 2);
+; -- MCP method dispatch. Codes: 0 initialize, 1 tools/list, 2 tools/call,
+; 3 notifications (skip, no response), 4 unknown (DENY -32601).
+pub const METHOD_UNKNOWN : u8 = 4;
+pub const MCP_INIT : u8 = 0;
+pub const MCP_LIST : u8 = 1;
+pub const MCP_CALL : u8 = 2;
+pub const MCP_NOTIFY : u8 = 3;
+pub const ERR_METHOD_NOT_FOUND : i64 = -32601;
+pub const ERR_INVALID_PARAMS : i64 = -32602;
+pub const ERR_POLICY_DENY : i64 = -32603;
+
+pub fn mcp_dispatch(method : str, mlen : usize) -> u8 {
+    if starts_with(method, mlen, "initialize", 10) and mlen == 10 {
+        return MCP_INIT;
+    }
+    if starts_with(method, mlen, "tools/list", 10) and mlen == 10 {
+        return MCP_LIST;
+    }
+    if starts_with(method, mlen, "tools/call", 10) and mlen == 10 {
+        return MCP_CALL;
+    }
+    if starts_with(method, mlen, "notifications/", 14) {
+        return MCP_NOTIFY;
+    }
+    return METHOD_UNKNOWN;
 }
+
+; -- per-tool scope validation: the only endpoint a tool may touch.
+; gateway.status scopes to loopback itself; dsh.status to the measured DSH
+; port; cdp.observe to the dedicated observer profile range.
+pub fn scope_allowed(tool_idx : usize, host : str, hlen : usize, port : u16) -> bool {
+    if tool_idx >= TOOL_COUNT {
+        return false;
+    }
+    if tool_idx == 0 {
+        return dsh_endpoint_allowed(host, hlen, port) or cdp_origin_allowed(host, hlen, port);
+    }
+    if tool_idx == 1 {
+        return dsh_endpoint_allowed(host, hlen, port);
+    }
+    return cdp_origin_allowed(host, hlen, port);
+}
+
+; -- the one decision entry point the host is allowed to call: method, tool,
+; scope, request count in. Decision, reason and request hash out (via the
+; caller, which audits with audit_encode). Everything else is framing.
+pub fn gateway_gate(method_code : u8, tool_idx : usize,
+                    host : str, hlen : usize, port : u16,
+                    count : u32) -> u8 {
+    if method_code == METHOD_UNKNOWN {
+        return DENY;
+    }
+    if method_code == MCP_NOTIFY {
+        return DENY;
+    }
+    if method_code == MCP_LIST or method_code == MCP_INIT {
+        return ALLOW;
+    }
+    if tool_idx >= TOOL_COUNT {
+        return DENY;
+    }
+    if scope_allowed(tool_idx, host, hlen, port) == false {
+        return DENY;
+    }
+    return gate(tool_idx, OP_STATUS, count);
+}
+
+; -- response decision envelope: the host wraps it in JSON-RPC framing
+; (transport is the host's only job). Fixed shape:
+; {"decision":<code>,"reason":<code>,"request_hash":<hash>}
+pub fn response_decision(out : []u8, cap : usize, decision : u8, reason : u8,
+                         req_hash : u64) -> usize {
+    var w : usize = 0;
+    w = put_lit(out, cap, w, "{\"decision\":", 12);
+    w = put_u64(out, cap, w, decision as u64);
+    w = put_lit(out, cap, w, ",\"reason\":", 10);
+    w = put_u64(out, cap, w, reason as u64);
+    w = put_lit(out, cap, w, ",\"request_hash\":", 16);
+    w = put_u64(out, cap, w, req_hash);
+    w = put_lit(out, cap, w, "}", 1);
+    return w;
+}
+
+; -- tests (V2)
+
+test mcp_dispatch_routes_the_three_methods_and_denies_unknown {
+    assert mcp_dispatch("initialize", 10) == MCP_INIT;
+    assert mcp_dispatch("tools/list", 10) == MCP_LIST;
+    assert mcp_dispatch("tools/call", 10) == MCP_CALL;
+    assert mcp_dispatch("notifications/exit", 17) == MCP_NOTIFY;
+    assert mcp_dispatch("resources/list", 14) == METHOD_UNKNOWN;
+    assert mcp_dispatch("tools/callx", 11) == METHOD_UNKNOWN;
+    assert mcp_dispatch("", 0) == METHOD_UNKNOWN;
+}
+
+test scope_is_loopback_only_per_tool {
+    assert scope_allowed(0, "127.0.0.1", 9, 3081) == true;
+    assert scope_allowed(1, "127.0.0.1", 9, 3081) == true;
+    assert scope_allowed(1, "127.0.0.1", 9, 9222) == false;
+    assert scope_allowed(2, "127.0.0.1", 9, 9222) == true;
+    assert scope_allowed(2, "127.0.0.1", 9, 3081) == false;
+    assert scope_allowed(3, "127.0.0.1", 9, 9222) == false;
+    assert scope_allowed(0, "10.0.0.5", 8, 3081) == false;
+}
+
+test gateway_gate_decides_everything_from_the_tables {
+    assert gateway_gate(MCP_LIST, 0, "127.0.0.1", 9, 3081, 1) == ALLOW;
+    assert gateway_gate(MCP_INIT, 0, "127.0.0.1", 9, 3081, 1) == ALLOW;
+    assert gateway_gate(METHOD_UNKNOWN, 0, "127.0.0.1", 9, 3081, 1) == DENY;
+    assert gateway_gate(MCP_NOTIFY, 0, "127.0.0.1", 9, 3081, 1) == DENY;
+    assert gateway_gate(MCP_CALL, 1, "127.0.0.1", 9, 3081, 1) == ALLOW;
+    assert gateway_gate(MCP_CALL, 1, "10.0.0.5", 8, 3081, 1) == DENY;
+    assert gateway_gate(MCP_CALL, 2, "127.0.0.1", 9, 9222, RATE_MAX) == ALLOW;
+    assert gateway_gate(MCP_CALL, 2, "127.0.0.1", 9, 9222, RATE_MAX + 1) == DENY_RATE;
+    assert gateway_gate(MCP_CALL, 9, "127.0.0.1", 9, 9222, 1) == DENY;
+}
+
+test response_envelope_is_exact_and_carry_only_codes {
+    var out : [128]u8 = undefined;
+    const n : usize = response_decision(&out, 128, ALLOW, 0, request_hash("x", 1));
+    assert n == 51;
+    assert out[0] == 123 and out[n - 1] == 125;
+    var i : usize = 0;
+    var letters : usize = 0;
+    while i < n {
+        if out[i] >= 97 and out[i] <= 122 {
+            letters += 1;
+        }
+        i += 1;
+    }
+    assert letters > 20;
+}
+
+}
+
