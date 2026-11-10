@@ -4752,7 +4752,11 @@ fn run_debug_hir(input_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_gen_verilog_hir(input_path: &str, with_sva: bool, sva_behaviors: Option<&str>) -> anyhow::Result<()> {
+fn run_gen_verilog_hir(
+    input_path: &str,
+    with_sva: bool,
+    sva_behaviors: Option<&str>,
+) -> anyhow::Result<()> {
     let path = Path::new(input_path);
     let source = fs::read_to_string(path)?;
     typecheck_gate(path, &source)?;
@@ -5030,8 +5034,20 @@ fn run_gen_trit_stdlib(output: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_gen_behavior_sva(name: &str, given: &str, when: &str, then: &str, index: usize, output: Option<&str>) -> anyhow::Result<()> {
-    let behavior = behavior_sva::Behavior { name, given, when, then };
+fn run_gen_behavior_sva(
+    name: &str,
+    given: &str,
+    when: &str,
+    then: &str,
+    index: usize,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    let behavior = behavior_sva::Behavior {
+        name,
+        given,
+        when,
+        then,
+    };
     // build_behavior_sva_file always uses 0-based enumerate indexing. For the
     // CLI we honour --index by splicing the user-indexed block in place of the
     // auto-indexed one so the timescale/nettype band is preserved.
@@ -5057,7 +5073,10 @@ fn run_gen_behavior_sva(name: &str, given: &str, when: &str, then: &str, index: 
     Ok(())
 }
 
-fn run_gen_pipeline_stage2(module_name: &str, output: Option<&str>) -> anyhow::Result<()> {
+fn run_gen_pipeline_stage2(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
     let verilog = bitnet_pipeline::build_pipeline_stage2(module_name);
     write_verilog_to_output(&verilog, output, "pipeline_stage2")
 }
@@ -5067,12 +5086,20 @@ fn run_gen_double_buffer_ctrl(module_name: &str, output: Option<&str>) -> anyhow
     write_verilog_to_output(&verilog, output, "double_buffer_ctrl")
 }
 
-fn run_gen_weight_prefetch_ctrl(module_name: &str, output: Option<&str>) -> anyhow::Result<()> {
+fn run_gen_weight_prefetch_ctrl(
+    module_name: &str,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
     let verilog = bitnet_buffers::build_weight_prefetch_ctrl(module_name);
     write_verilog_to_output(&verilog, output, "weight_prefetch_ctrl")
 }
 
-fn run_gen_axi_lite_slave(module_name: &str, addr_width: u32, data_width: u32, output: Option<&str>) -> anyhow::Result<()> {
+fn run_gen_axi_lite_slave(
+    module_name: &str,
+    addr_width: u32,
+    data_width: u32,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
     let verilog = bitnet_axi::build_axi_lite_slave(module_name, addr_width, data_width);
     write_verilog_to_output(&verilog, output, "axi_lite_slave")
 }
@@ -5092,7 +5119,12 @@ fn run_gen_bitnet_engine_top(module_name: &str, output: Option<&str>) -> anyhow:
     write_verilog_to_output(&verilog, output, "bitnet_engine_top")
 }
 
-fn run_gen_bitnet_bundle(top_name: &str, axi_addr_width: u32, axi_data_width: u32, output_dir: &str) -> anyhow::Result<()> {
+fn run_gen_bitnet_bundle(
+    top_name: &str,
+    axi_addr_width: u32,
+    axi_data_width: u32,
+    output_dir: &str,
+) -> anyhow::Result<()> {
     let cfg = bitnet_bundle::BundleConfig {
         top_name,
         axi_addr_width,
