@@ -11,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-// M1 gateway: decisions live in the generated .t27 law (V2); framing only.
+// M1 gateway law: generated .t27 (V2); this adapter frames only.
 #[path = "../../../gen/rust/tri/gateway_policy.rs"]
 mod gateway_policy;
 
