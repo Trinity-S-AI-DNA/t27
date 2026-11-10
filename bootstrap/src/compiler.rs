@@ -23,6 +23,9 @@ mod verilog_void_tail;
 #[path = "../gen/rust/compiler/cse_hoist.rs"]
 #[allow(dead_code, unused_parens)]
 mod cse_hoist;
+#[path = "../gen/rust/compiler/rust_num_suffix.rs"]
+#[allow(dead_code, unused_parens, unused_variables, non_snake_case, clippy::all)]
+mod rust_num_suffix;
 // specs/compiler/int_type_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
 #[path = "../gen/rust/compiler/int_type_names.rs"]
 #[allow(dead_code, unused_parens)]
@@ -7813,10 +7816,11 @@ impl Codegen {
                     let v = parts[0][..i].trim().to_string();
                     let _n = parts[0][i + 1..].trim().to_string();
                     if !v.is_empty() && !_n.is_empty() {
-                        // Zig has no `**` repeat operator (#13591): the value
-                        // lowers to @splat; the count rides the target type.
-                        self.write(&format!("@splat({})", Self::strip_rust_num_suffix(&v)));
-                        return;
+                        // #13591: Zig has no `**`; @splat, count rides the type.
+                        // The suffix strip is the gen-rust port in
+                        // specs/compiler/rust_num_suffix.t27.
+                        let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes());
+                        self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));                        return;
                     }
                 }
             }
@@ -7826,26 +7830,6 @@ impl Codegen {
     }
 
     /// `0i32` -> `0`, `1.5f64` -> `1.5`, `7usize` -> `7`; anything that is not
-    /// a numeric literal with a Rust width suffix is returned unchanged.
-    fn strip_rust_num_suffix(v: &str) -> String {
-        for suf in [
-            "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "f64",
-            "f32", "u8", "i8",
-        ] {
-            if let Some(num) = v.strip_suffix(suf) {
-                let num = num.strip_suffix('_').unwrap_or(num);
-                let body = num.strip_prefix('-').unwrap_or(num);
-                if !body.is_empty()
-                    && body.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                    && body.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
-                {
-                    return num.to_string();
-                }
-            }
-        }
-        v.to_string()
-    }
-
     /// Locals a block declares with one of the given explicit types.
     fn collect_typed_locals(stmts: &[Node], types: &[&str]) -> Vec<String> {
         let mut out = Vec::new();
@@ -10863,16 +10847,9 @@ impl Codegen {
                     // pattern lowers to @splat, the count rides the target type.
                     if op == "**" {
                         let a = &node.children[0];
-                        if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 {
-                            self.write("@compileError(\"multi-element array repeat has no Zig lowering (#13591)\")");
-                            return;
-                        }
+                        if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         self.write("@splat(");
-                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
-                            self.gen_expr(&a.children[0]);
-                        } else {
-                            self.gen_expr_maybe_paren(a);
-                        }
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { self.gen_expr(&a.children[0]); } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
                     }
@@ -11114,14 +11091,9 @@ impl Codegen {
                     return;
                 }
                 if let Some((val, _count)) = txt.rsplit_once(';') {
-                    // #6451: `[0i32; 2]` kept the Rust width suffix -- "number
-                    // '0i32' has leading zero"; the target type carries it.
-                    // Zig has no `**` repeat operator (#13591): the value lowers
-                    // to @splat and the count is carried by the target type.
-                    self.write(&format!(
-                        "@splat({})",
-                        Self::strip_rust_num_suffix(val.trim())
-                    ));
+                    // #6451/#13591: count rides the target type; @splat the value.
+                    let n = rust_num_suffix::rust_num_suffix_len(val.trim().as_bytes());
+                    self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));
                 } else {
                     // Split on TOP-LEVEL commas only -- elements may be calls
                     // with their own commas.
@@ -11200,9 +11172,7 @@ impl Codegen {
                                 };
                                 match repeat {
                                     Some((v, n)) => self.write(&format!(
-                                        // Zig has no `**` repeat operator (#13591):
-                                        // tile the one-element pattern in a comptime
-                                        // block, then take the address of the result.
+                                        // #13591: tile the pattern in a comptime block.
                                         "@constCast(&(blk: {{ const t = [_]{}{{ {} }}; var r: [{}]{} = undefined; var i: usize = 0; while (i < {}) : (i += 1) {{ r[i] = t[i % t.len]; }} break :blk r; }}))",
                                         elem, v, n, elem, n
                                     )),
@@ -25648,35 +25618,13 @@ struct FnEntry {
 /// `resolve_type_str` only matches whole strings, so `[]Trit` and `[3]Trit`
 /// both fall through to `Custom("[]Trit")` -- the wrapper, not the type. A
 /// check that consulted `Custom(..)` directly would therefore compare a name
-/// nothing ever declares and report every array as unresolved.
+/// nothing ever declares and report every array as unresolved. The base-name
+/// resolution itself is the gen-rust port in
+/// specs/compiler/type_base_name.t27 (0 = no base name, result in tb_out).
 fn type_base_name(t: &str) -> Option<String> {
-    let mut t = t.trim();
-    loop {
-        let before = t;
-        t = t.trim_start_matches('*').trim_start_matches('&');
-        t = t.trim_end_matches('?');
-        t = t.trim();
-        if let Some(rest) = t.strip_prefix("const ") {
-            t = rest.trim();
-        }
-        if let Some(rest) = t.strip_prefix('[') {
-            // `[]T` and `[N]T` alike: everything up to the first `]`.
-            if let Some(i) = rest.find(']') {
-                t = rest[i + 1..].trim();
-            }
-        }
-        if t == before {
-            break;
-        }
-    }
-    let ok = !t.is_empty()
-        && t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if ok {
-        Some(t.to_string())
-    } else {
-        None
-    }
+    let n = rust_num_suffix::type_base_name_len(t.as_bytes());
+    if n == 0 { return None; }
+    Some(String::from_utf8_lossy(unsafe { &rust_num_suffix::tb_out[..n] }).to_string())
 }
 
 /// Every type name this tree declares: structs, enums, and the Zig-shaped
