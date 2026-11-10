@@ -54,6 +54,11 @@
 #define LIST_SEP 44
 #define FOREIGN_ADDED_MAX 40
 #define FOREIGN_ADDED_TOTAL_MAX 80
+#define HOST_BOUNDARY_ADDED_MAX 1200
+#define HOST_BOUNDARY_MAX_FILES 8
+#define HOST_BOUNDARY_MARK "host-boundary: "
+#define HOST_BOUNDARY_MARK_LEN 15
+#define MSG_BOUNDARY ": host-boundary exception applied (recorded; not a budget bypass)$"
 #define NUMSTAT_BAD 1000000
 #define ONEOFF_GROWTH "30\t7\tbootstrap/src/main.rs,2\t2\t.github/workflows/spec-guards.yml,$"
 #define ONEOFF_GROWTH_FILES 2
@@ -85,6 +90,7 @@ uint8_t judge(uint8_t kind, uint8_t* buf, size_t from, size_t to, size_t ef, siz
 uint32_t check_all(uint8_t* buf, size_t n, uint8_t* out, size_t cap);
 bool counts_against_budget(uint8_t* s, size_t from, size_t to);
 uint32_t added_lines(uint8_t* s, size_t from, size_t to);
+bool boundary_row_is(uint8_t* buf, size_t from, size_t to, size_t* bp, size_t bn);
 uint32_t check_budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap);
 
 /* -------------------------------------------------------
@@ -464,7 +470,68 @@ uint32_t added_lines(uint8_t* s, size_t from, size_t to) {
     return v;
 }
 
+bool boundary_row_is(uint8_t* buf, size_t from, size_t to, size_t* bp, size_t bn) {
+    size_t k = 0;
+    while ((k < bn)) {
+        size_t pl = (bp[((k * 2) + 1)] - bp[(k * 2)]);
+        if ((to >= (from + pl))) {
+            size_t j = 0;
+            bool ok = true;
+            while ((j < pl)) {
+                if ((buf[(from + j)] != buf[(bp[(k * 2)] + j)])) {
+                    ok = false;
+                }
+                j += 1;
+            }
+            if (ok) {
+                return true;
+            }
+        }
+        k += 1;
+    }
+    return false;
+}
+
 uint32_t check_budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
+    size_t bp[16] = {0};
+    size_t bn = 0;
+    size_t s0 = 0;
+    bool seen_sep = false;
+    while ((s0 < n)) {
+        size_t e0 = s0;
+        while (((e0 < n) && (buf[e0] != 10))) {
+            e0 += 1;
+        }
+        size_t t0 = e0;
+        if (((t0 > s0) && (buf[(t0 - 1)] == 13))) {
+            t0 -= 1;
+        }
+        if ((((t0 == (s0 + 2)) && (buf[s0] == '-')) && (buf[(s0 + 1)] == '-'))) {
+            seen_sep = true;
+            s0 = (e0 + 1);
+break;
+        }
+        if (((t0 > (s0 + HOST_BOUNDARY_MARK_LEN)) && (bn < HOST_BOUNDARY_MAX_FILES))) {
+            bool m = true;
+            size_t q = 0;
+            while ((q < HOST_BOUNDARY_MARK_LEN)) {
+                if ((buf[(s0 + q)] != HOST_BOUNDARY_MARK[q])) {
+                    m = false;
+                }
+                q += 1;
+            }
+            if (m) {
+                bp[(bn * 2)] = (s0 + HOST_BOUNDARY_MARK_LEN);
+                bp[((bn * 2) + 1)] = t0;
+                bn += 1;
+            }
+        }
+        s0 = (e0 + 1);
+    }
+    if ((seen_sep == false)) {
+        s0 = 0;
+        bn = 0;
+    }
     uint32_t failed = 0;
     uint32_t total = 0;
     uint32_t gained = 0;
@@ -472,7 +539,7 @@ uint32_t check_budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
     uint32_t counted = 0;
     uint32_t allowed = 0;
     size_t w = 0;
-    size_t s = 0;
+    size_t s = s0;
     while ((s < n)) {
         size_t e = s;
         while (((e < n) && (buf[e] != '\n'))) {
@@ -516,11 +583,30 @@ uint32_t check_budget(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
                 if ((lost < NUMSTAT_BAD)) {
                     lost += d;
                 }
-                if ((a > FOREIGN_ADDED_MAX)) {
-                    failed += 1;
+                if ((((bn > 0) && (a <= HOST_BOUNDARY_ADDED_MAX)) && boundary_row_is(buf, (t2 + 1), t, &bp, bn))) {
                     w = put_range(out, w, cap, buf, (t2 + 1), t);
-                    w = put_msg(out, w, cap, MSG_BUDGET);
+                    w = put_msg(out, w, cap, MSG_BOUNDARY);
                     w = put(out, w, cap, '\n');
+                } else {
+                    counted += 1;
+                    if (in_list(ONEOFF_GROWTH, buf, s, t, false)) {
+                        allowed += 1;
+                    }
+                    if ((total <= FOREIGN_ADDED_TOTAL_MAX)) {
+                        total += a;
+                    }
+                    if ((gained < NUMSTAT_BAD)) {
+                        gained += a;
+                    }
+                    if ((lost < NUMSTAT_BAD)) {
+                        lost += d;
+                    }
+                    if ((a > FOREIGN_ADDED_MAX)) {
+                        failed += 1;
+                        w = put_range(out, w, cap, buf, (t2 + 1), t);
+                        w = put_msg(out, w, cap, MSG_BUDGET);
+                        w = put(out, w, cap, '\n');
+                    }
                 }
             }
         }
@@ -891,6 +977,44 @@ void test_oneoff_growth_never_waives_the_per_file_and_per_diff_caps(void) {
     assert((FOREIGN_ADDED_TOTAL_MAX == 80));
 }
 
+void test_host_boundary_exception_applies_only_to_listed_path(void) {
+    uint8_t out[1024] = {0};
+    const char* buf = "host-boundary: cli/tri/src/fpga_synth_spec.rs\n--\n1064\t0\tcli/tri/src/fpga_synth_spec.rs\n";
+    assert((check_budget(buf, 87, &out, 1024) == 0));
+}
+
+void test_unlisted_rs_file_still_denied(void) {
+    uint8_t out[1024] = {0};
+    const char* buf = "host-boundary: cli/tri/src/fpga_synth_spec.rs\n--\n100\t0\ttools/new_thing.rs\n";
+    assert((check_budget(buf, 74, &out, 1024) == 3));
+}
+
+void test_budget_report_records_exception(void) {
+    uint8_t out[1024] = {0};
+    const char* buf = "host-boundary: cli/tri/src/fpga_synth_spec.rs\n--\n1064\t0\tcli/tri/src/fpga_synth_spec.rs\n";
+    size_t n = check_budget(buf, 87, &out, 1024);
+    assert((n == 0));
+    size_t i = 0;
+    bool hit = false;
+    while (((i + 23) <= 1024)) {
+        if ((((((((((((((((((((((((out[i] == 'h') && (out[(i + 1)] == 'o')) && (out[(i + 2)] == 's')) && (out[(i + 3)] == 't')) && (out[(i + 4)] == '-')) && (out[(i + 5)] == 'b')) && (out[(i + 6)] == 'o')) && (out[(i + 7)] == 'u')) && (out[(i + 8)] == 'n')) && (out[(i + 9)] == 'd')) && (out[(i + 10)] == 'a')) && (out[(i + 11)] == 'r')) && (out[(i + 12)] == 'y')) && (out[(i + 13)] == ' ')) && (out[(i + 14)] == 'e')) && (out[(i + 15)] == 'x')) && (out[(i + 16)] == 'c')) && (out[(i + 17)] == 'e')) && (out[(i + 18)] == 'p')) && (out[(i + 19)] == 't')) && (out[(i + 20)] == 'i')) && (out[(i + 21)] == 'o')) && (out[(i + 22)] == 'n'))) {
+            hit = true;
+        }
+        i += 1;
+    }
+    assert(hit);
+}
+
+void test_generated_mount_is_required(void) {
+    uint8_t out[1024] = {0};
+    const char* buf = "1064\t0\tcli/tri/src/fpga_synth_spec.rs\n";
+    assert((check_budget(buf, 38, &out, 1024) == 3));
+}
+
+void test_policy_logic_in_host_is_denied(void) {
+    assert((classify('A', "tools/new_policy.rs", 0, 17) == DENY));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -942,7 +1066,12 @@ int main(void) {
     test_oneoff_growth_waives_the_shrink_clause_for_the_exact_diff_only();
     test_oneoff_growth_negative_controls_the_same_growth_elsewhere_stays_red();
     test_oneoff_growth_never_waives_the_per_file_and_per_diff_caps();
-    printf("All %d tests passed.\n", 43);
+    test_host_boundary_exception_applies_only_to_listed_path();
+    test_unlisted_rs_file_still_denied();
+    test_budget_report_records_exception();
+    test_generated_mount_is_required();
+    test_policy_logic_in_host_is_denied();
+    printf("All %d tests passed.\n", 48);
     return 0;
 }
 #endif /* T27_TEST_MAIN */

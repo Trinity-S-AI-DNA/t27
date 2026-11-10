@@ -17,6 +17,11 @@ mod elab;
 mod fleet;
 mod fmtmine;
 mod fpga;
+
+/// `tri fpga synth-spec` host glue (NEW foreign file, moved out of fpga.rs
+/// per own_language.t27 lines 56-60).
+#[path = "fpga_synth_spec.rs"]
+mod fpga_synth_spec;
 mod gates;
 mod gendet;
 mod hooks;
