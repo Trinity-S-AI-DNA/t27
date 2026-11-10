@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,8 +32,8 @@ mod misread;
 mod night;
 mod oneaway;
 mod payout;
-mod window;
-mod modreach;
+#[path = "../../../gen/rust/tri/window/window.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] mod window_rules; mod window; // t27c gen-rust of specs/tri/window.t27
+#[path = "../../../gen/rust/tri/modreach/modreach.rs"] #[allow(dead_code, unused_parens)] mod modreach_rules; mod modreach; // t27c gen-rust of specs/tools/tri/modreach.t27
 mod mutate;
 mod nownote;
 mod orphaned;
@@ -80,7 +80,9 @@ mod pf; // t27c gen-rust of specs/tri/preflight/preflight.t27: the push prefligh
 mod renum;
 mod reseal;
 mod rtl;
-mod scratch;
+#[path = "../../../gen/rust/tri/scratch/scratch.rs"] #[allow(dead_code, unused_parens)] mod scratch_rules; mod scratch; // t27c gen-rust of specs/tools/tri/scratch.t27
+#[path = "../../../gen/rust/tri/status/status.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] pub mod status_rules; // t27c gen-rust of specs/tri/status.t27
+pub use crate::status_rules::*;
 mod seals;
 mod skillnum;
 mod sweep;
@@ -798,27 +800,25 @@ fn cmd_status(root: &Path) -> Result<()> {
     let skill = load_active_skill(root)?;
     let reg = load_registry(root)?;
     let git = git_short_hash();
+    println!("{}", format_header());
 
-    println!("=== PHI LOOP STATUS ===");
-    println!(
-        "git: {}",
-        if git.is_empty() {
-            "unknown".into()
-        } else {
-            git
-        }
-    );
+    if git.is_empty() {
+        println!("{}", format_git_unknown());
+    } else {
+        println!("{} {}", format_git_prefix(), git);
+    }
 
     match skill.status.as_str() {
         "active" => {
             println!(
-                "skill: {} ({})",
+                "{} {} ({})",
+                format_skill_active_prefix(),
                 skill.skill_id.as_deref().unwrap_or("?"),
                 skill.description.as_deref().unwrap_or("?")
             );
         }
         _ => {
-            println!("skill: none");
+            println!("{}", format_skill_none());
         }
     }
 

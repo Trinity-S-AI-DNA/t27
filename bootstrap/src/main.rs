@@ -11088,7 +11088,17 @@ fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
 
     // Execute the assertions (t27#11730): generate Zig and run `zig test` when it
     // compiles; specs that do not compile keep the legacy declaration-only result.
-    let src = fs::read_to_string(input_path).unwrap_or_default();
+    // W569 splice (t27 test): the same `use_resolve::resolve` splice `gen` runs,
+    // so a test block that names an imported declaration (`use t27os::homes::home_of_agent`)
+    // compiles too. Safety contract is the same one `gen_resolved` carries: if the
+    // spliced source stops parsing, the raw source is used.
+    let raw = fs::read_to_string(input_path).unwrap_or_default();
+    let path = std::path::Path::new(input_path);
+    let spliced = use_resolve::resolve(path, &raw);
+    let src = match compiler::Compiler::parse_ast(&spliced) {
+        Ok(_) => spliced,
+        Err(_) => raw,
+    };
     if let Ok(ast) = compiler::Compiler::parse_ast(&src) {
         let mut codegen = compiler::Codegen::new();
         codegen.gen_zig(&ast);
