@@ -10,7 +10,7 @@ pub const TOOL_COUNT: usize = 10;
 
 pub const TOOLS: [&'static str; 10] = ["gateway.status", "dsh.status", "cdp.observe", "gateway.metrics", "gateway.health", "gateway.policy.audit", "gateway.config.get", "gateway.routes.list", "gateway.version", "gateway.logs.head"];
 
-pub const TOOL_LENS: [usize; 10] = [14, 10, 11, 15, 14, 20, 16, 17, 15, 16];
+pub const TOOL_LENS: [usize; 10] = [14, 10, 11, 15, 14, 20, 18, 19, 15, 17];
 
 pub const DSH_HOST: &'static str = "127.0.0.1";
 
