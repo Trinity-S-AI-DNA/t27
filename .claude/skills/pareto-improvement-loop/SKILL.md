@@ -1,6 +1,6 @@
 ---
 name: pareto-improvement-loop
-description: Fifteen-minute continuous improvement tick: audit swarm state, Pareto-rank weak points, fix the top one in .t27, verify with receipts, land green, beat the hive feed, never break past work. Auto-fix on, self-heal reverts red changes.
+description: Fifteen-minute continuous improvement tick: audit swarm state, Pareto-rank weak points, fix the top one in .t27, verify with receipts, land green, beat the hive feed, never break past work. A red typecheck rolls that lane back to its pre-tick HEAD and leaves older commits in place. Where this page and the cron spec disagree, the spec wins.
 ---
 
 <!-- only-t27-rule -->
@@ -38,12 +38,34 @@ The cron card `specs/crons/t27-pareto-improvement-loop.t27` runs every 15 minute
 
 ## Rules that keep past work intact
 
-- **Never break a past merge.** `fix_may_start` requires the PR gate ran and no own PR is red.
-- **Self-heal:** `should_rollback` reverts a change that red-checks past the 3-tick window.
+The law is `self_recovery_action` and `prior_commits_untouched` in `specs/crons/t27-pareto-improvement-loop.t27`. Where this skill and that spec disagree, the spec wins.
+
+- **Own files only.** A tick commits only the task files it named. `tick_commit_allowed` calls `oc_commit_ok`; the body is not copied.
+- **Red typecheck.** Roll this lane back to the HEAD recorded before the tick wrote (`SR_ROLLBACK_LANE`). If that HEAD was not recorded, move no ref (`SR_REFUSE`). Do not guess an older commit.
+- **Prior commits stay.** The rollback target is that pre-tick HEAD. Commits older than it stay. This is not a reset of master and not a force-push.
+- **Window.** `oc_window_open` stays false. A tick that asks to open the window is refused.
+- **Never break a past merge.** `fix_may_start` calls `pick_may_run`: the PR gate ran and no own PR is red.
+- **Later window.** `should_rollback` in `specs/acceleration/auto_fix_self_heal.t27` still reverts a landed change that red-checks past `ROLLBACK_WINDOW` (3 ticks). That is a second gate. It does not replace the pre-tick rollback above.
 - **Lane hygiene:** only own released lanes are removed, at most 8 per tick (reuses `specs/tri/worktrees/reap.t27`).
 - **L1 traceability:** every commit body carries a local `Closes|Fixes|Resolves|Refs|Updates #N`.
 - **Foreign-edits budget:** net-negative (added ≤ deleted), ≤40 lines/file, ≤80/PR; no `--no-verify`/`LEFTHOOK=0`.
 - **ASCII only** (L3): `bootstrap/build.rs` fails the build on any Cyrillic under `specs/`.
+
+Lesson, 2026-11-10: a failed tick that resets the lane to an ancestor older than the pre-tick HEAD, or that resets master, drops green commits the tick did not make. Record the lane HEAD before writing. On a red typecheck, `git reset --hard` that recorded commit on this lane only. Do not force-push. Do not open the window.
+
+## Free-first routing (FREEFIRSTSUBAGENTMODE)
+
+The name is a bundle, not a second law. Load at tick start: `.claude/skills/work-cheap/SKILL.md`, `model-routing`, `swarm-economy`. The checked rules are `specs/claw/cost_policy.t27` and `specs/claw/model_route.t27`. Claude tiers stay in `model_route.t27`; do not copy them here. `cursor_route.t27` is not in the tree yet; on Cursor Cloud follow `work-cheap` (cheapest tier that passes the machine gate; Fast and 500k are not defaults).
+
+Order each tick: (1) local script — `gh`, `git`, `t27c check`, `t27c seal`, `python3 tools/*` with no LLM; (2) free bounded helper only when a file must change and the gate is not script-readable; (3) paid model only after two failures on the same bounded task or on owner approval for P0 security, complex integration, or final acceptance. Max two helpers at once; one task, one artifact, eight turns; no nested delegation. Merge, push to master, publish, window shell, and paid API stay gated (`specs/t27os/orchestrator.t27`).
+
+End each tick report with one routing ledger row (plain text): `task | cost_route | data_route | capability_route | model | turns | artifact | gate_proof`. Example: `reseal cron seal | local | repo | lane commit ok | none | 0 | t27c seal exit 0 | tools/check_seal_coverage.py later on CI`.
+
+Lesson, 2026-11-10 (Asia/Bangkok): resealing `crons_CronParetoImprovementLoop.json` with `t27c seal` plus `tri seals sync-twins` beat spawning a subagent to re-read CI logs.
+
+## CRON_BATCH_V1 (cloud ticks)
+
+Load `.claude/skills/cron-batch/SKILL.md` at tick start (includes **T27L_AUTOMATION_CONTROL_V1**). Law: `roadmap_dashboard_sync.t27`, `specs/t27os/t27l.t27`, predicates `cron_tick_may_run`, `automation_empty_tick`, `t27l_action_*` on this cron card. Wake only when actionable; empty tick = zero model calls. **No** `gh pr checks` on empty or duplicate wakes.
 
 ## New `tri` commands (proposed, not built yet)
 
@@ -63,6 +85,17 @@ Three variants live in `specs/acceleration/`:
 - `pareto_variant_hot_seal.t27` — Variant A: hot-path seal reuse with prefetch (~28% avg cost vs cold baseline)
 - `pareto_variant_parallel_tests.t27` — Variant B: parallel test shards by use-graph level (up to 8x throughput)
 - `pareto_variant_incremental_gen.t27` — Variant C: incremental gen cache with content-addressed artifacts (~90% gen time saved at 80% hit rate)
+
+## Traps
+
+- 2026-11-10 (Asia/Bangkok): PR #13541 stayed green on its cron seal while CI failed on `queen_dash` (#13506) and sieve dupes (#13505). Do not reseal or dedupe those paths from the Pareto lane. Land the sibling PRs on master, then `git merge origin/master` on the Pareto branch and re-run `gh pr checks` — no cherry-pick of their files.
+- Before editing for a red check, use `pareto_fix_may_start` in `specs/crons/t27-pareto-improvement-loop.t27` (wraps `gate_patch_allowed` + `fix_may_start`); if it is false, stop and wait for the owning lane.
+- At STEP AUDIT, `inherited_repo_gate_red(duplicate_bodies_red, seal_coverage_red)` names the two master-debt checks this lane does not patch; pass flags from `gh pr checks`, not from memory.
+- Mass "required check pending" on PRs is a gate class, not per-PR whack-a-mole. Law: `specs/ci/pr_ready_aggregate.t27` (aggregate `pr-ready`, always terminal on latest SHA). Host: `.github/workflows/pr-ready.yml` after owner labels foreign workflow work; until then fix master debt (#13505 dupes, #13506 queen_dash) per sibling lanes.
+- Before `git push`, call `batch_push_may_run(skill_only_tick, inherited_repo_gate_red, own_task_path, required_checks_pending)` in the same spec; when it is false, verify locally (`t27c seal --verify` on the lane specs) and record the tick under `/opt/cursor/artifacts/pareto-tick-*.txt`. While `required_checks_pending` and rollup `pass=0`, do **not** edit the PR body every tick — repeated edits cancel/requeue `check-linked-issue` and `fix-carries-source` on Actions; one consolidated PR footer after `pass>0` is enough.
+- Before a second `git merge origin/master` in the same CI window, call `merge_master_may_run(required_checks_pending, master_ahead)`; when required checks are still pending after the last push, wait.
+- Squash-merge of this lane's PR is **not** a pareto tick action: load `.claude/skills/merge-verdict/SKILL.md` and evaluate `specs/claw/merge_verdict.t27` on a CI/PR subscription wake; emit one `M\t` line before any merge.
+- Token burn: if the last artifact shows the same CI rollup as this turn and no subscription fired, emit SKIP per `cron-batch` — do not call `gh` again.
 
 ## No foreign edits
 
