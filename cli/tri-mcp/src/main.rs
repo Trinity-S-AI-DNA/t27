@@ -316,9 +316,27 @@ fn build_tools_list() -> Vec<Value> {
     ]
 }
 
+// JSON-RPC error code for an adapter error: -32601 for the unknown
+// method/tool family (owner-approved 2026-11-11), -32603 otherwise.
+fn jsonrpc_error_code(msg: &str) -> i32 {
+    if msg.starts_with("Unknown") {
+        -32601
+    } else {
+        -32603
+    }
+}
+
 fn handle_tools_list() -> Result<Value> {
+    // D1 (owner-approved 2026-11-11): expose only the three observation-only
+    // gateway tools; legacy tri_* handlers stay transport-only, unlisted.
+    let gw = ["gateway.status", "dsh.status", "cdp.observe"];
+    let tools: Vec<Value> = build_tools_list()
+        .into_iter()
+        .filter(|t| t.get("name").and_then(|n| n.as_str())
+            .map_or(false, |n| gw.contains(&n)))
+        .collect();
     Ok(serde_json::json!({
-        "tools": build_tools_list()
+        "tools": tools
     }))
 }
 
@@ -352,6 +370,9 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
 
     match result {
         Ok(v) => Ok(v),
+        // D2 (owner-approved 2026-11-11): unknown tool surfaces as a JSON-RPC
+        // -32601 error, not a text result; other failures stay text results.
+        Err(e) if jsonrpc_error_code(&e.to_string()) == -32601 => Err(e),
         Err(e) => Ok(tool_error_text(&e.to_string())),
     }
 }
@@ -1022,7 +1043,7 @@ fn main() -> Result<()> {
                 Err(e) => serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": {"code": -32603, "message": e.to_string()}
+                    "error": {"code": jsonrpc_error_code(&e.to_string()), "message": e.to_string()}
                 }),
             };
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
@@ -1031,4 +1052,20 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod gateway_adapter_tests {
+    use super::*;
+    // D1: exactly the three gateway tools; D2: -32601 for the unknown family.
+    #[test]
+    fn adapter_d1_d2() {
+        let names: Vec<String> = handle_tools_list().unwrap()["tools"]
+            .as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, vec!["gateway.status", "dsh.status", "cdp.observe"]);
+        assert_eq!(jsonrpc_error_code("Unknown tool: shell.run"), -32601);
+        assert_eq!(jsonrpc_error_code("Unknown method: bogus"), -32601);
+        assert_eq!(jsonrpc_error_code("gateway policy denied"), -32603);
+    }
 }
