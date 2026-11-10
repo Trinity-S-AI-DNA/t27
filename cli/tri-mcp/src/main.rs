@@ -79,6 +79,11 @@ fn gateway_observation_call(name: &str, args: &Value) -> Result<Value> {
     if d != gateway_policy::ALLOW {
         anyhow::bail!("gateway policy denied: {}", decision);
     }
+    // V7 read-only observation: only cdp.observe contacts a live endpoint, and
+    // only GET /json/list -- no input events, no navigation, no storage reads.
+    if name == "cdp.observe" {
+        return cdp_observe_live(host, port, &decision);
+    }
     Ok(serde_json::json!({
         "tool": name,
         "policy_version": gateway_policy::POLICY_VERSION,
@@ -86,6 +91,41 @@ fn gateway_observation_call(name: &str, args: &Value) -> Result<Value> {
         "note": "observation-only V1: no live DSH/CDP connection is made",
         "decision": serde_json::from_str::<Value>(&decision)?,
     }))
+}
+
+// V7: one read-only HTTP/1.0 GET of the CDP target list. Anything beyond the
+// law's OBSERVABLE outputs (url, title, a DOM type summary) is never fetched.
+fn cdp_observe_live(host: &str, port: u16, decision: &str) -> Result<Value> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let envelope = |connected: bool, extra: Value| -> Result<Value> {
+        Ok(serde_json::json!({
+            "tool": "cdp.observe",
+            "policy_version": gateway_policy::POLICY_VERSION,
+            "connected": connected,
+            "outputs": ["url", "title", "domSummary"],
+            "actions": "none: navigation, click, input, form submit and credential or storage export are DENY rows in policy.t27",
+            "decision": serde_json::from_str::<Value>(decision)?,
+            "observed": extra,
+        }))
+    };
+    let ok = (|| -> anyhow::Result<Value> {
+        let mut s = TcpStream::connect((host, port))?;
+        s.write_all(format!("GET /json/list HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n").as_bytes())?;
+        let mut raw = String::new();
+        s.read_to_string(&mut raw)?;
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        let pages: Vec<Value> = serde_json::from_str::<Vec<Value>>(body)
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| t["type"] == "page")
+            .map(|t| serde_json::json!({"url": t["url"], "title": t["title"],
+                "domSummary": {"targetType": t["type"]}}))
+            .collect();
+        envelope(true, serde_json::json!({"pages": pages, "count": pages.len()}))
+    })()
+    .or_else(|e| envelope(false, serde_json::json!({"error": e.to_string()})))?;
+    Ok(ok)
 }
 
 fn find_repo_root() -> Option<PathBuf> {
