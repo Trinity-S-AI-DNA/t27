@@ -111,9 +111,12 @@ fn cdp_observe_live(host: &str, port: u16, decision: &str) -> Result<Value> {
     };
     let ok = (|| -> anyhow::Result<Value> {
         let mut s = TcpStream::connect((host, port))?;
-        s.write_all(format!("GET /json/list HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n").as_bytes())?;
+        s.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+        s.write_all(format!("GET /json/list HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n").as_bytes())?;
         let mut raw = String::new();
-        s.read_to_string(&mut raw)?;
+        // Chrome keeps the socket alive past Connection: close; the timeout
+        // bounds the read once the full body is in.
+        let _ = s.read_to_string(&mut raw);
         let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
         let pages: Vec<Value> = serde_json::from_str::<Vec<Value>>(body)
             .unwrap_or_default()
