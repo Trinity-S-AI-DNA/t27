@@ -188,8 +188,7 @@ fn vps_journal_bytes() -> Vec<u8> {
     const VPS_JOURNALCTL_ARGS: [&str; 7] = ["journalctl", "--output=json", "-n", "60",
         "--unit=dsh.service", "--unit=dsh-ladder.service", "--unit=caddy"];
     let out = std::process::Command::new("ssh").arg(VPS_SSH_ALIAS)
-        .args(VPS_JOURNALCTL_ARGS).output()
-        .output();
+        .args(VPS_JOURNALCTL_ARGS).output();
     match out {
         Ok(o) if o.status.success() => o.stdout,
         _ => Vec::new(),
