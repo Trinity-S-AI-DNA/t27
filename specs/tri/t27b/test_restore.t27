@@ -1,0 +1,359 @@
+// specs/tri/t27b/test_restore.t27 -- ported decision logic for the JIT's
+// per-test state restore (epic #13606). Lowered by `t27c gen-rust`; never
+// hand-edit the generated file. Refs #5980, #13591.
+//
+// Contract: given the module SOURCE bytes and a module-variable NAME, decide
+// whether that variable has at least one assignment site in the module. A
+// variable with zero assignment sites is never written at run time, so the
+// JIT can skip restoring it before each test; a variable with any site is
+// restored (over-approximation: a word that only LOOKS assigned -- a comment
+// mention, an `==` comparison, a local shadow -- still counts as assigned,
+// which is safe: restoring a never-written variable costs time, skipping a
+// written one costs correctness).
+//
+// Assignment shape recognised at a word-boundary match of NAME:
+//   NAME <spaces> '='  (but not '=='), including NAME += etc.
+//   NAME <spaces> '[' ... ']' <spaces> '='
+// The previous non-space character must be one of ';', '}', '{', ')' or the
+// match must be at the very start of the source (a statement boundary), so
+// `a == b` and prose inside strings do not count.
+
+module TestRestore;
+
+fn is_space(c: u8) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13;
+}
+
+fn is_word(c: u8) -> bool {
+    if (c >= 48 and c <= 57) {
+        return true;
+    }
+    if (c >= 65 and c <= 90) {
+        return true;
+    }
+    if (c >= 97 and c <= 122) {
+        return true;
+    }
+    return c == 95;
+}
+
+/// NAME matches at `pos` as a whole word (word chars around, none inside).
+fn word_at(src: []const u8, pos: usize, name: []const u8) -> bool {
+    if (pos + name.len > src.len) {
+        return false;
+    }
+    var k: usize = 0;
+    while (k < name.len) {
+        if (src[pos + k] != name[k]) {
+            return false;
+        }
+        k = k + 1;
+    }
+    if (pos > 0 and is_word(src[pos - 1])) {
+        return false;
+    }
+    if (pos + name.len < src.len and is_word(src[pos + name.len])) {
+        return false;
+    }
+    return true;
+}
+
+/// After the word at `pos`: an assignment follows when the next non-space
+/// run reaches `=` whose next byte is not `=` (so `==` is a comparison).
+/// An indexing form `NAME [ ... ] =` is accepted the same way.
+fn assignment_after(src: []const u8, pos: usize, wlen: usize) -> bool {
+    var p: usize = pos + wlen;
+    while (p < src.len and is_space(src[p])) {
+        p = p + 1;
+    }
+    if (p >= src.len) {
+        return false;
+    }
+    if (src[p] == 91) {
+        // `[`: skip to the matching `]`, then spaces, then `=`.
+        var d: usize = 0;
+        while (p < src.len) {
+            if (src[p] == 91) {
+                d = d + 1;
+            }
+            if (src[p] == 93) {
+                d = d - 1;
+                if (d == 0) {
+                    p = p + 1;
+                    break;
+                }
+            }
+            p = p + 1;
+        }
+        while (p < src.len and is_space(src[p])) {
+            p = p + 1;
+        }
+    }
+    if (p >= src.len or src[p] != 61) {
+        return false;
+    }
+    if (p + 1 < src.len and src[p + 1] == 61) {
+        return false;
+    }
+    return true;
+}
+
+/// Statement-boundary check for the byte before the word: a statement can
+/// start at the very beginning, after `;`, `{`, `}`, `)`, or a newline.
+fn prev_is_boundary(src: []const u8, pos: usize) -> bool {
+    if (pos == 0) {
+        return true;
+    }
+    var c: u8 = src[pos - 1];
+    if (c == 59 or c == 123 or c == 125 or c == 41 or c == 10) {
+        return true;
+    }
+    return is_space(c);
+}
+
+/// Is the word before `pos` the declaration keyword `const` or `let`?
+/// A declaration never writes the name at run time, so it is not an
+/// assignment site. A `var` declaration DOES write its initializer, so it
+/// counts (the site check only looks at the byte before NAME).
+fn prev_word_is_const_decl(src: []const u8, pos: usize) -> bool {
+    var p: usize = pos;
+    while (p > 0 and is_space(src[p - 1])) {
+        p = p - 1;
+    }
+    if (p < 5) {
+        return false;
+    }
+    // "const": c-o-n-s-t with a boundary before it.
+    if (src[p - 1] == 116 and src[p - 2] == 115 and src[p - 3] == 110 and src[p - 4] == 111 and src[p - 5] == 99 and (p == 5 or !is_word(src[p - 6]))) {
+        return true;
+    }
+    // "let": l-e-t with a boundary before it.
+    if (src[p - 1] == 116 and src[p - 2] == 101 and src[p - 3] == 108 and (p == 3 or !is_word(src[p - 4]))) {
+        return true;
+    }
+    return false;
+}
+
+/// Does NAME have at least one assignment site anywhere in `src`?
+/// Over-approximating by design (see the header).
+pub fn var_assigned(src: []const u8, name: []const u8) -> bool {
+    var p: usize = 0;
+    while (p + name.len <= src.len) {
+        if (word_at(src, p, name) and prev_is_boundary(src, p) and assignment_after(src, p, name.len)) {
+            if (!prev_word_is_const_decl(src, p)) {
+                return true;
+            }
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+test written_var_is_detected {
+    var src: [24]u8 = [110, 111, 100, 101, 115, 32, 61, 32, 91, 93, 117, 56, 123, 48, 125, 59, 110, 111, 100, 101, 115, 91, 48, 93];
+    // source: "nodes = []u8{0};nodes[0]" -- the word `nodes` assigns twice.
+    var name: [5]u8 = [110, 111, 100, 101, 115];
+    assert(var_assigned(src[0..], name[0..]));
+}
+
+test never_written_var_is_skipped {
+    // "const tbl = [_]u8{9} ** 4" -- `tbl` never assigned.
+    var src: [27]u8 = [99, 111, 110, 115, 116, 32, 116, 98, 108, 32, 61, 32, 91, 95, 93, 117, 56, 123, 57, 125, 32, 42, 42, 32, 52, 0, 0];
+    var name: [3]u8 = [116, 98, 108];
+    assert(!var_assigned(src[0..], name[0..]));
+}
+
+test comparison_is_not_assignment {
+    // "if key == node" -- `key` followed by `==` is a comparison.
+    var src: [16]u8 = [105, 102, 32, 107, 101, 121, 32, 61, 61, 32, 110, 111, 100, 101, 0, 0];
+    var name: [3]u8 = [107, 101, 121];
+    assert(!var_assigned(src[0..], name[0..]));
+}
+
+test local_shadow_still_counts_over_approx {
+    // "var src = 5" -- a local shadowing a module var counts (over-approx):
+    // safe, because restoring a never-written var only costs time.
+    var src: [11]u8 = [118, 97, 114, 32, 115, 114, 99, 32, 61, 32, 53];
+    var name: [3]u8 = [115, 114, 99];
+    assert(var_assigned(src[0..], name[0..]));
+}
+
+
+// ----------------------------------------------------------------
+// Per-test refinement: does ONE test need NAME restored? The decision
+// covers the test body plus the bodies of every function the test calls
+// (single round over direct callees; deeper chains ride the
+// over-approximation: any fn named in a body counts its whole body).
+
+fn is_alpha(c: u8) -> bool {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+}
+
+var fb_found: [1]u8 = [_]u8{0} ** 1;
+var fb_s: [8]u8 = [_]u8{0} ** 8;
+var fb_e: [8]u8 = [_]u8{0} ** 8;
+
+fn find_body(src: []const u8, from: usize) -> usize {
+    var p: usize = from;
+    var started: bool = false;
+    var depth: usize = 0;
+    var s: usize = 0;
+    fb_found[0] = 0;
+    while (p < src.len) {
+        if (!started and src[p] == 123) {
+            started = true;
+            s = p;
+            depth = 1;
+        } else if (started) {
+            if (src[p] == 123) {
+                depth = depth + 1;
+            }
+            if (src[p] == 125) {
+                depth = depth - 1;
+                if (depth == 0) {
+                    fb_s[0] = s + 1;
+                    fb_e[0] = p;
+                    fb_found[0] = 1;
+                    return 1;
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+fn region_word(src: []const u8, s: usize, e: usize, name: []const u8) -> bool {
+    if (name.len > e - s) {
+        return false;
+    }
+    var p: usize = s;
+    while (p + name.len <= e) {
+        var ok: bool = true;
+        var k: usize = 0;
+        while (k < name.len) {
+            if (src[p + k] != name[k]) {
+                ok = false;
+                k = name.len;
+            }
+            k = k + 1;
+        }
+        if (ok) {
+            if (p > s and is_word(src[p - 1])) {
+                ok = false;
+            }
+            if (p + name.len < e and is_word(src[p + name.len])) {
+                ok = false;
+            }
+            if (ok) {
+                return true;
+            }
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+fn region_assigns(src: []const u8, s: usize, e: usize, name: []const u8) -> bool {
+    if (name.len > e - s) {
+        return false;
+    }
+    var p: usize = s;
+    while (p + name.len + 1 <= e) {
+        if (!is_word(src[p]) and word_at(src, p, name)) {
+            var q: usize = p + name.len;
+            while (q < e and is_space(src[q])) {
+                q = q + 1;
+            }
+            if (q < e and src[q] == 61 and (q + 1 >= e or src[q + 1] != 61)) {
+                return true;
+            }
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+fn region_calls(src: []const u8, s: usize, e: usize, fname: []const u8) -> bool {
+    if (fname.len + 1 > e - s) {
+        return false;
+    }
+    var p: usize = s;
+    while (p + fname.len + 1 <= e) {
+        if (!is_word(src[p]) and word_at(src, p, fname)) {
+            var q: usize = p + fname.len;
+            while (q < e and is_space(src[q])) {
+                q = q + 1;
+            }
+            if (q < e and src[q] == 40) {
+                return true;
+            }
+        }
+        p = p + 1;
+    }
+    return false;
+}
+
+pub fn test_needs_restore(src: []const u8, ts: usize, te: usize, name: []const u8) -> usize {
+    if (region_assigns(src, ts, te, name)) {
+        return 1;
+    }
+    var p: usize = ts;
+    while (p + 1 < te) {
+        if (!is_word(src[p]) and is_alpha(src[p + 1])) {
+            var e2: usize = p + 1;
+            while (e2 < te and is_word(src[e2])) {
+                e2 = e2 + 1;
+            }
+            var wlen: usize = e2 - (p + 1);
+            var q: usize = e2;
+            while (q < te and is_space(src[q])) {
+                q = q + 1;
+            }
+            if (q < te and src[q] == 40 and wlen > 0) {
+                var w: [8]u8 = [_]u8{0} ** 8;
+                var k: usize = 0;
+                while (k < wlen) {
+                    w[k] = src[p + 1 + k];
+                    k = k + 1;
+                }
+                if (find_body(src, p + 1) == 1 and fb_found[0] == 1) {
+                    var bs: usize = fb_s[0] + 1;
+                    var be: usize = fb_e[0];
+                    if (region_assigns(src, bs, be, name)) {
+                        return 1;
+                    }
+                }
+            }
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+test calls_fn_that_assigns_needs_restore {
+    var src1: [52]u8 = [102, 110, 32, 104, 101, 108, 112, 101, 114, 40, 41, 32, 123, 32, 99, 111, 117, 110, 116, 101, 114, 32, 61, 32, 55, 59, 32, 125, 32, 116, 101, 115, 116, 32, 100, 101, 109, 111, 32, 123, 32, 104, 101, 108, 112, 101, 114, 40, 41, 59, 32, 125];
+    var name: [7]u8 = [99, 111, 117, 110, 116, 101, 114];
+    assert(find_body(src1[0..], 29) == 1);
+    var ts: usize = fb_s[0] + 1;
+    var te: usize = fb_e[0];
+    assert(test_needs_restore(src1[0..], ts, te, name[0..]) == 1);
+}
+
+test calls_fn_without_assign_skips_restore {
+    var src2: [50]u8 = [102, 110, 32, 104, 101, 108, 112, 101, 114, 40, 41, 32, 123, 32, 111, 116, 104, 101, 114, 32, 61, 32, 55, 59, 32, 125, 32, 116, 101, 115, 116, 32, 100, 101, 109, 111, 32, 123, 32, 104, 101, 108, 112, 101, 114, 40, 41, 59, 32, 125];
+    var name: [7]u8 = [99, 111, 117, 110, 116, 101, 114];
+    assert(find_body(src2[0..], 27) == 1);
+    var ts: usize = fb_s[0] + 1;
+    var te: usize = fb_e[0];
+    assert(test_needs_restore(src2[0..], ts, te, name[0..]) == 0);
+}
+
+test direct_body_assignment_needs_restore {
+    var src3: [26]u8 = [116, 101, 115, 116, 32, 100, 101, 109, 111, 32, 123, 32, 99, 111, 117, 110, 116, 101, 114, 32, 61, 32, 51, 59, 32, 125];
+    var name: [7]u8 = [99, 111, 117, 110, 116, 101, 114];
+    assert(find_body(src3[0..], 0) == 1);
+    var ts: usize = fb_s[0] + 1;
+    var te: usize = fb_e[0];
+    assert(region_assigns(src3[0..], ts, te, name[0..]));
+}
