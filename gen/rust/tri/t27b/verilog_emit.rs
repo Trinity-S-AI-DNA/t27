@@ -3381,9 +3381,9 @@ pub fn child_holding(nodes: &[u8], c: usize, d: usize) -> usize {
     return c;
 }
 
-pub fn dec_len(v: u64) -> usize {
+pub fn dec_len(v: usize) -> usize {
     let mut n: usize = 1;
-    let mut x: u64 = v;
+    let mut x: usize = v;
     while (x >= 10) {
         x = (x / 10);
         n = (n + 1);
@@ -3483,7 +3483,7 @@ pub fn put_bytes(out: &mut [u8], at: usize, s: &[u8], a: usize, b: usize) -> usi
 }
 
 pub fn put_dec(out: &mut [u8], at: usize, v: u64) -> usize {
-    let n: usize = dec_len(v);
+    let n: usize = dec_len((v as usize));
     let mut x: u64 = v;
     let mut k: usize = n;
     while (k > 0) {

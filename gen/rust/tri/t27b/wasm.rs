@@ -2384,6 +2384,16 @@ pub fn u32_at(nodes: &[u8], at: usize) -> usize {
     return (((b0 + (b1 * 256)) + (b2 * 65536)) + (b3 * 16777216));
 }
 
+pub fn dec_len(v: usize) -> usize {
+    let mut n: usize = 1;
+    let mut x: usize = v;
+    while (x >= 10) {
+        x = (x / 10);
+        n = (n + 1);
+    }
+    return n;
+}
+
 pub fn holds(out: &[u8], n: usize, w: &'static str) -> bool {
     let mut i: usize = 0;
     while ((i + w.len()) <= n) {
