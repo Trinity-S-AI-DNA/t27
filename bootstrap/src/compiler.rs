@@ -10851,10 +10851,7 @@ impl Codegen {
                         self.write("@splat(");
                         if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
                             self.gen_expr(&a.children[0]);
-                        } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() {
-                            // splat the element TEXT; gen_expr gave @splat(.{ 0 }) (#13591)
-                            let t = a.extra_size.trim(); self.write(t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t));
-                        } else { self.gen_expr_maybe_paren(a); }
+                        } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() { let t = a.extra_size.trim(); self.write(t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t)); } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
                     }
