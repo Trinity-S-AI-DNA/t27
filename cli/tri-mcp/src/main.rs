@@ -15,6 +15,8 @@ use uuid::Uuid;
 // M1 gateway law: generated .t27 (V2); this adapter frames only.
 #[path = "../../../gen/rust/tri/gateway_policy.rs"]
 mod gateway_policy;
+#[path = "../../../gen/rust/tri/gateway_log_contract.rs"]
+mod gateway_log_contract;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveSkill {
@@ -113,11 +115,15 @@ fn gateway_observation_call(name: &str, args: &Value, root: &Path) -> Result<Val
             "host": host, "port": port}));
     }
     if idx == 5 || idx == 9 {
+        // EPIC 2 (T27_LOG_OBSERVABILITY_V1): ingestion through the generated
+        // log-contract law -- every line is redacted (mandatory) and parsed
+        // into a schema event; malformed lines fail closed (dropped).
         let log_path = root.join(".trinity/gateway-audit.log");
         let data = std::fs::read(&log_path).unwrap_or_default();
-        let start = data.len().saturating_sub(2048);
+        let events = audit_events(&data, if idx == 5 { 20 } else { 10 }, idx == 9);
         return Ok(serde_json::json!({"tool": name,
-            "tail": String::from_utf8_lossy(&data[start..])}));
+            "events": events, "count": events.len(),
+            "decision": serde_json::from_str::<Value>(&decision)?}));
     }
     let mut ob = [0u8; 256];
     let on = gateway_policy::observation_response(idx, &mut ob, 256);
@@ -162,6 +168,28 @@ fn cdp_observe_live(host: &str, port: u16, decision: &str) -> Result<Value> {
     })()
     .or_else(|e| envelope(false, serde_json::json!({"error": e.to_string()})))?;
     Ok(ok)
+}
+
+/// EPIC 2: turn raw audit bytes into redacted schema events via the
+/// generated log-contract law. max_lines bounds the result; head selects
+/// the FIRST max_lines (logs.head) instead of the LAST (policy.audit).
+fn audit_events(data: &[u8], max_lines: usize, head: bool) -> Vec<Value> {
+    let lines: Vec<&[u8]> = data.split(|b: &u8| *b == b'\n')
+        .filter(|l: &&[u8]| !l.is_empty())
+        .collect();
+    let start = if head { 0 } else { lines.len().saturating_sub(max_lines) };
+    let end = if head { max_lines.min(lines.len()) } else { lines.len() };
+    let mut events = Vec::new();
+    for line in &lines[start..end] {
+        let mut rbuf = [0u8; 1024];
+        let rn = gateway_log_contract::redact_line(line, line.len(), &mut rbuf, 1024);
+        let mut ebuf = [0u8; 1024];
+        let en = gateway_log_contract::audit_line_to_event(&rbuf[..rn], rn, &mut ebuf, 1024);
+        if en > 0 {
+            events.push(Value::String(String::from_utf8_lossy(&ebuf[..en]).to_string()));
+        }
+    }
+    events
 }
 
 fn find_repo_root() -> Option<PathBuf> {
@@ -1152,9 +1180,53 @@ mod gateway_adapter_tests {
         let names: Vec<String> = handle_tools_list().unwrap()["tools"]
             .as_array().unwrap().iter()
             .map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(names, vec!["gateway.status", "dsh.status", "cdp.observe"]);
+        assert_eq!(names, vec![
+            "gateway.status", "dsh.status", "cdp.observe", "gateway.metrics",
+            "gateway.health", "gateway.policy.audit", "gateway.config.get",
+            "gateway.routes.list", "gateway.version", "gateway.logs.head"]);
         assert_eq!(jsonrpc_error_code("Unknown tool: shell.run"), -32601);
         assert_eq!(jsonrpc_error_code("Unknown method: bogus"), -32601);
         assert_eq!(jsonrpc_error_code("gateway policy denied"), -32603);
+    }
+}
+
+#[cfg(test)]
+mod gateway_contract_tests {
+    use super::*;
+
+    /// EPIC 2 acceptance: ingestion applies the law -- redaction is
+    /// mandatory, malformed lines fail closed, events carry schema fields.
+    #[test]
+    fn audit_events_redacts_and_parses() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(b"1794336737\tdsh-session\tdsh.status\t127.0.0.1:3081\t0\t0\t111\n");
+        data.extend_from_slice(b"1794336738\tdsh-session\tgateway.metrics\t127.0.0.1:3081\t0\t0 --token=secretvalue\t222\n");
+        let ev = audit_events(&data, 20, false);
+        assert_eq!(ev.len(), 2, "both well-formed lines become events");
+        let joined: String = ev.iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+        assert!(joined.contains("\"tool\":\"dsh.status\""));
+        assert!(joined.contains("\"tool\":\"gateway.metrics\""));
+        assert!(joined.contains("[REDACTED]"), "token value must be redacted");
+        assert!(!joined.contains("secretvalue"), "the secret must not survive");
+    }
+
+    #[test]
+    fn audit_events_head_vs_tail() {
+        let mut data: Vec<u8> = Vec::new();
+        for i in 0..15 {
+            data.extend_from_slice(format!("100{}\tbee\ttri-mcp\t127.0.0.1:3081\t0\t0\t{}\n", i, 900 + i).as_bytes());
+        }
+        assert_eq!(audit_events(&data, 10, true).len(), 10);
+        let tail = audit_events(&data, 10, false);
+        assert_eq!(tail.len(), 10);
+        assert!(tail[9].as_str().unwrap().contains("\"timestamp\":10014"), "tail keeps the LAST lines");
+    }
+
+    #[test]
+    fn audit_events_malformed_lines_fail_closed() {
+        let data = b"garbage line with no tabs\nanother\n".to_vec();
+        assert_eq!(audit_events(&data, 20, false).len(), 0, "malformed lines produce no events");
     }
 }
