@@ -10849,7 +10849,18 @@ impl Codegen {
                         let a = &node.children[0];
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         self.write("@splat(");
-                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { self.gen_expr(&a.children[0]); } else { self.gen_expr_maybe_paren(a); }
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
+                            self.gen_expr(&a.children[0]);
+                        } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() {
+                            // The element text lives in extra_size ("0", or
+                            // "0;32" for a nested repeat). Splatted through
+                            // `gen_expr` it came out `@splat(.{ 0 })` -- "type
+                            // 'u8' does not support array initialization
+                            // syntax" on every scalar repeat. Splat the value,
+                            // not a one-element tuple of it.
+                            let t = a.extra_size.trim();
+                            self.write(t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t));
+                        } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
                     }

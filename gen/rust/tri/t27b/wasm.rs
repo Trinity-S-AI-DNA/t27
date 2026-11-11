@@ -4,6 +4,16 @@
 // This backend emits declarations only. The spec's checks live in
 // the Zig and Verilog outputs; do not read this file as verified.
 
+pub fn dec_len(v: usize) -> usize {
+    let mut n: usize = 1;
+    let mut x: usize = v;
+    while (x >= 10) {
+        x = (x / 10);
+        n = (n + 1);
+    }
+    return n;
+}
+
 pub const MAGIC0: u8 = 0x00;
 
 pub const MAGIC1: u8 = 0x61;
