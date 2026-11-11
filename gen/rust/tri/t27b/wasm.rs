@@ -803,27 +803,27 @@ pub fn refusal_detail(code: u8) -> &'static str {
 }
 
 pub fn uncarried_return_detail(out: &mut [u8], at: usize, ty: &[u8]) -> usize {
-    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter exports scalar returns, `");
-    n = put_bytes(out, n, ty);
-    return put_bytes(out, n, b"` here");
+    let mut n: usize = put_str(out, at, b"the wasm32 emitter exports scalar returns, `");
+    n = put_str(out, n, ty);
+    return put_str(out, n, b"` here");
 }
 
 pub fn i32_params_detail(out: &mut [u8], at: usize, ty: &[u8]) -> usize {
-    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter carries i32 parameters, `");
-    n = put_bytes(out, n, ty);
-    return put_bytes(out, n, b"` here");
+    let mut n: usize = put_str(out, at, b"the wasm32 emitter carries i32 parameters, `");
+    n = put_str(out, n, ty);
+    return put_str(out, n, b"` here");
 }
 
 pub fn i32_results_detail(out: &mut [u8], at: usize, ty: &[u8]) -> usize {
-    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter carries i32 results here, `");
-    n = put_bytes(out, n, ty);
-    return put_bytes(out, n, b"` instead");
+    let mut n: usize = put_str(out, at, b"the wasm32 emitter carries i32 results here, `");
+    n = put_str(out, n, ty);
+    return put_str(out, n, b"` instead");
 }
 
 pub fn arith_op_detail(out: &mut [u8], at: usize, op: u8) -> usize {
-    let mut n: usize = put_bytes(out, at, b"the wasm32 emitter lowers + - * / & | ^ << >> on the i32 carrier, `");
-    n = put_bytes(out, n, arith_debug_name(op).as_bytes());
-    return put_bytes(out, n, b"` here");
+    let mut n: usize = put_str(out, at, b"the wasm32 emitter lowers + - * / & | ^ << >> on the i32 carrier, `");
+    n = put_str(out, n, arith_debug_name(op).as_bytes());
+    return put_str(out, n, b"` here");
 }
 
 pub fn put_u32_dec(out: &mut [u8], at: usize, v: u32) -> usize {
@@ -839,15 +839,15 @@ pub fn put_u32_dec(out: &mut [u8], at: usize, v: u32) -> usize {
 }
 
 pub fn refusal_message(out: &mut [u8], at: usize, construct: &[u8], line: u32, func: &[u8], detail: &[u8]) -> usize {
-    let mut n: usize = put_bytes(out, at, b"unsupported construct ");
-    n = put_bytes(out, n, construct);
-    n = put_bytes(out, n, b" at line ");
+    let mut n: usize = put_str(out, at, b"unsupported construct ");
+    n = put_str(out, n, construct);
+    n = put_str(out, n, b" at line ");
     n = put_u32_dec(out, n, line);
-    n = put_bytes(out, n, b" (fn ");
-    n = put_bytes(out, n, func);
-    n = put_bytes(out, n, b": ");
-    n = put_bytes(out, n, detail);
-    return put_bytes(out, n, b")");
+    n = put_str(out, n, b" (fn ");
+    n = put_str(out, n, func);
+    n = put_str(out, n, b": ");
+    n = put_str(out, n, detail);
+    return put_str(out, n, b")");
 }
 
 pub fn refused_local_variable(var_idx: u32, nparams: u32) -> bool {
@@ -1368,7 +1368,7 @@ pub fn walk_prog(names_out: &mut [u8], descs_out: &mut [u8], bodies_out: &mut [u
                 return 0;
             }
             let mut a: usize = (fact_name_off(facts, i) as usize);
-            nn = put_bytes(names_out, nn, &strings[(a) as usize..((a + nl)) as usize]);
+            nn = put_str(names_out, nn, &strings[(a) as usize..((a + nl)) as usize]);
             let mut ro: usize = (fact_ret_off(facts, i) as usize);
             let mut rl: usize = (fact_ret_len(facts, i) as usize);
             let mut bo: usize = bn;
@@ -1489,7 +1489,7 @@ pub fn refusal_detail_for(out: &mut [u8], at: usize, code: u8, ty: &[u8], op: u8
     if (code == REF_ARITHMETIC_OP) {
         return arith_op_detail(out, at, op);
     }
-    return put_bytes(out, at, refusal_detail(code).as_bytes());
+    return put_str(out, at, refusal_detail(code).as_bytes());
 }
 
 pub fn bodies_cap(facts: &[u8], strings: &[u8], nodes: &[u8]) -> usize {
@@ -1878,7 +1878,7 @@ pub fn walk_prog_locals(names_out: &mut [u8], descs_out: &mut [u8], bodies_out: 
                 return 0;
             }
             let mut a: usize = (fact_name_off(facts, i) as usize);
-            nn = put_bytes(names_out, nn, &strings[(a) as usize..((a + nl)) as usize]);
+            nn = put_str(names_out, nn, &strings[(a) as usize..((a + nl)) as usize]);
             let mut ro: usize = (fact_ret_off(facts, i) as usize);
             let mut rl: usize = (fact_ret_len(facts, i) as usize);
             let mut bo: usize = bn;
@@ -2305,19 +2305,118 @@ pub fn compose_module_with_image_l(out: &mut [u8], names: &[u8], descs: &[u8], b
     return n;
 }
 
+pub const B_DOT: u8 = 46;
+
+pub const FIELDS: usize = 8;
+
+pub const F_NAME: usize = 0;
+
+pub const REC: usize = 72;
+
+pub fn count(nodes: &[u8]) -> usize {
+    return (nodes.len() / REC);
+}
+
+pub fn has_at(s: &[u8], lo: usize, hi: usize, w: &[u8]) -> bool {
+    if ((hi - lo) < w.len()) {
+        return false;
+    }
+    let mut k: usize = 0;
+    while (k < w.len()) {
+        if (s[((lo + k)) as usize] != w[(k) as usize]) {
+            return false;
+        }
+        k = (k + 1);
+    }
+    return true;
+}
+
+pub fn hi(nodes: &[u8], i: usize, f: usize) -> usize {
+    return u32_at(nodes, (((i * REC) + 12) + (f * 8)));
+}
+
+pub fn kind(nodes: &[u8], i: usize) -> u8 {
+    return nodes[((i * REC)) as usize];
+}
+
+pub fn lo(nodes: &[u8], i: usize, f: usize) -> usize {
+    return u32_at(nodes, (((i * REC) + 8) + (f * 8)));
+}
+
+pub fn names(nodes: &[u8], text: &[u8], i: usize, name: &[u8]) -> bool {
+    let a: usize = lo(nodes, i, F_NAME);
+    let b: usize = hi(nodes, i, F_NAME);
+    if !(has_at(text, a, b, name)) {
+        return false;
+    }
+    return (((b - a) == name.len()) || (text[((a + name.len())) as usize] == B_DOT));
+}
+
+pub fn node(nodes: &mut [u8], i: usize, k: u8, e: usize, a: usize, b: usize) -> () {
+    nodes[((i * REC)) as usize] = k;
+    put32(nodes, ((i * REC) + 4), e);
+    let mut f: usize = 0;
+    while (f < FIELDS) {
+        put32(nodes, (((i * REC) + 8) + (f * 8)), a);
+        put32(nodes, (((i * REC) + 12) + (f * 8)), a);
+        f = (f + 1);
+    }
+    put32(nodes, ((i * REC) + 12), b);
+}
+
+pub fn put32(nodes: &mut [u8], at: usize, v: usize) -> () {
+    nodes[(at) as usize] = ((v % 256) as _);
+    nodes[((at + 1)) as usize] = (((v / 256) % 256) as _);
+    nodes[((at + 2)) as usize] = (((v / 65536) % 256) as _);
+    nodes[((at + 3)) as usize] = ((v / 16777216) as _);
+}
+
+pub fn set(nodes: &mut [u8], i: usize, f: usize, a: usize, b: usize) -> () {
+    put32(nodes, (((i * REC) + 8) + (f * 8)), a);
+    put32(nodes, (((i * REC) + 12) + (f * 8)), b);
+}
+
+pub fn u32_at(nodes: &[u8], at: usize) -> usize {
+    let b0: usize = (nodes[(at) as usize] as usize);
+    let b1: usize = (nodes[((at + 1)) as usize] as usize);
+    let b2: usize = (nodes[((at + 2)) as usize] as usize);
+    let b3: usize = (nodes[((at + 3)) as usize] as usize);
+    return (((b0 + (b1 * 256)) + (b2 * 65536)) + (b3 * 16777216));
+}
+
+pub fn holds(out: &[u8], n: usize, w: &'static str) -> bool {
+    let mut i: usize = 0;
+    while ((i + w.len()) <= n) {
+        let mut k: usize = 0;
+        while ((k < w.len()) && (out[((i + k)) as usize] == w.as_bytes()[(k) as usize])) {
+            k = (k + 1);
+        }
+        if (k == w.len()) {
+            return true;
+        }
+        i = (i + 1);
+    }
+    return false;
+}
+
+pub fn put_bytes(out: &mut [u8], at: usize, s: &[u8], a: usize, b: usize) -> usize {
+    let mut k: usize = a;
+    let mut q: usize = at;
+    while (k < b) {
+        out[(q) as usize] = s[(k) as usize];
+        q = (q + 1);
+        k = (k + 1);
+    }
+    return q;
+}
+
+pub fn put_str(out: &mut [u8], at: usize, s: &[u8]) -> usize {
+    return put_bytes(out, at, s, 0, s.len());
+}
+
 pub const AT: u8 = 64;
 
 pub const ROW: usize = 16;
-
-pub fn dec_len(v: usize) -> usize {
-    let mut n: usize = 1;
-    let mut x: usize = v;
-    while (x >= 10) {
-        x = (x / 10);
-        n = (n + 1);
-    }
-    return n;
-}
 
 pub fn exported(names: &[u8], fns: &[u8], i: usize, at: usize) -> bool {
     if (fn_at(fns, i) == 0) {
@@ -2348,12 +2447,113 @@ pub fn name_len(names: &[u8], at: usize) -> usize {
     return n;
 }
 
-pub fn put_bytes(out: &mut [u8], at: usize, src: &[u8]) -> usize {
-    let mut i: usize = 0;
-    while (i < src.len()) {
-        out[((at + i)) as usize] = src[(i) as usize];
-        i = (i + 1);
+pub const B_BANG: u8 = 33;
+
+pub const B_LBRACK: u8 = 91;
+
+pub const B_LPAREN: u8 = 40;
+
+pub const B_QUEST: u8 = 63;
+
+pub const B_STAR: u8 = 42;
+
+pub const NONE: i64 = -1;
+
+pub const SHAPE_ANON_STRUCT: u8 = 7;
+
+pub const SHAPE_ARRAY: u8 = 2;
+
+pub const SHAPE_ERROR_UNION: u8 = 6;
+
+pub const SHAPE_GENERIC: u8 = 8;
+
+pub const SHAPE_OPTIONAL: u8 = 4;
+
+pub const SHAPE_PLAIN: u8 = 0;
+
+pub const SHAPE_POINTER: u8 = 5;
+
+pub const SHAPE_SLICE: u8 = 1;
+
+pub const SHAPE_TUPLE: u8 = 3;
+
+pub const SHAPE_UNDECLARED: u8 = 9;
+
+pub fn last_of(s: &[u8], lo: usize, hi: usize, b: u8) -> i64 {
+    let mut i: usize = hi;
+    while (i > lo) {
+        i = (i - 1);
+        if (s[(i) as usize] == b) {
+            return (i as _);
+        }
     }
-    return (at + src.len());
+    return NONE;
+}
+
+pub fn same(s: &[u8], w: &'static str) -> bool {
+    if (s.len() != w.len()) {
+        return false;
+    }
+    let mut k: usize = 0;
+    while (k < w.len()) {
+        if (s[(k) as usize] != w.as_bytes()[(k) as usize]) {
+            return false;
+        }
+        k = (k + 1);
+    }
+    return true;
+}
+
+pub fn shape(s: &[u8]) -> u8 {
+    if (s.len() == 0) {
+        return SHAPE_PLAIN;
+    }
+    if starts(s, 0, s.len(), "[]") {
+        return SHAPE_SLICE;
+    }
+    if (s[0] == B_LBRACK) {
+        return SHAPE_ARRAY;
+    }
+    if (s[0] == B_LPAREN) {
+        return SHAPE_TUPLE;
+    }
+    if (s[0] == B_QUEST) {
+        return SHAPE_OPTIONAL;
+    }
+    if (s[0] == B_STAR) {
+        return SHAPE_POINTER;
+    }
+    if (last_of(s, 0, s.len(), B_BANG) != NONE) {
+        return SHAPE_ERROR_UNION;
+    }
+    if starts(s, 0, s.len(), "struct") {
+        return SHAPE_ANON_STRUCT;
+    }
+    if (last_of(s, 0, s.len(), B_LPAREN) != NONE) {
+        return SHAPE_GENERIC;
+    }
+    if ((((s[0] >= 65) && (s[0] <= 90)) && !(same(s, "Result"))) && !(same(s, "Option"))) {
+        return SHAPE_UNDECLARED;
+    }
+    return SHAPE_PLAIN;
+}
+
+pub fn starts(s: &[u8], lo: usize, hi: usize, w: &'static str) -> bool {
+    if ((hi - lo) < w.len()) {
+        return false;
+    }
+    return same(&s[(lo) as usize..((lo + w.len())) as usize], w);
+}
+
+pub const FLAG_PUB: usize = 2;
+
+pub const META: usize = 16;
+
+pub fn is_pub(meta: &[u8], i: usize) -> bool {
+    return ((meta_word(meta, i, 0) & FLAG_PUB) == FLAG_PUB);
+}
+
+pub fn meta_word(meta: &[u8], i: usize, w: usize) -> usize {
+    return u32_at(meta, ((i * META) + (w * 4)));
 }
 
