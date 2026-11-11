@@ -198,17 +198,22 @@ pub fn real_tools(root: &std::path::Path) -> Result<SynthTools> {
         .map(|p| root.join(p))
         .find(|p| p.is_file())
         .ok_or_else(|| anyhow!("t27c is not built; `cargo build --release -p t27c` first"))?;
+    // Tool resolution is environment-first and machine-independent: each path
+    // may be pinned via an OPENXC7_* variable, else it is looked up on PATH,
+    // else the bare name is kept so a missing tool fails AT USE with a clear
+    // command name -- never at construction, and never via a home path.
+    let pin = |var: &str, tool: &str| -> PathBuf {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| which(tool).unwrap_or_else(|_| PathBuf::from(tool)))
+    };
     Ok(SynthTools {
         t27c,
-        yosys: which("yosys")?,
-        nextpnr: PathBuf::from("/Users/playra/.local/bin/nextpnr-xilinx"),
-        fasm2frames_python: PathBuf::from("/Users/playra/openxc7-src/venv/bin/python3"),
-        fasm2frames_py: PathBuf::from(
-            "/Users/playra/openxc7-src/prjxray/utils/fasm2frames.py",
-        ),
-        xc7frames2bit: PathBuf::from(
-            "/Users/playra/openxc7-src/prjxray/build/tools/xc7frames2bit",
-        ),
+        yosys: pin("OPENXC7_YOSYS", "yosys"),
+        nextpnr: pin("OPENXC7_NEXTPNR", "nextpnr-xilinx"),
+        fasm2frames_python: pin("OPENXC7_PYTHON", "python3"),
+        fasm2frames_py: pin("OPENXC7_FASM2FRAMES", "fasm2frames.py"),
+        xc7frames2bit: pin("OPENXC7_XC7FRAMES2BIT", "xc7frames2bit"),
         chipdb: PathBuf::new(), // resolved per part in synth_spec_impl
     })
 }
