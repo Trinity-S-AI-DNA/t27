@@ -33,10 +33,34 @@ export function apply() {
           headers: { 'content-type': 'application/json' },
         });
       };
-      return ctx.webServer.register({
-        resource: '/api/t27-gateway/audit',
-        handler: (request) => serveAudit(request),
+      const tcp = (port) => new Promise((resolve) => {
+        const net = require('node:net');
+        const sock = net.connect({ host: '127.0.0.1', port });
+        const done = (ok) => { sock.destroy(); resolve(ok); };
+        sock.setTimeout(800); sock.once('connect', () => done(true));
+        sock.once('timeout', () => done(false)); sock.once('error', () => done(false));
       });
+      const serveHealth = async () => {
+        let auditOk = false;
+        try { readFileSync(AUDIT_LOG, 'utf8'); auditOk = true; } catch { auditOk = false; }
+        const dsh = await tcp(3081);
+        const ladder = await tcp(3131);
+        return new Response(JSON.stringify({
+          host: 'local', idempotent: true, mutating: false,
+          checks: [
+            { name: 'gateway-audit-log', ok: auditOk },
+            { name: 'dsh-web-3081', ok: dsh },
+            { name: 'ladder-3131', ok: ladder },
+            { name: 'caddy-route', ok: null, note: 'vps-only: not checkable from local' },
+          ],
+          anomalies: [!auditOk && 'audit log unreadable', !dsh && 'dsh-web unreachable',
+            !ladder && 'ladder unreachable'].filter(Boolean),
+        }), { headers: { 'content-type': 'application/json' } });
+      };
+      return ctx.webServer.register([
+        { resource: '/api/t27-gateway/audit', handler: (request) => serveAudit(request) },
+        { resource: '/api/t27-gateway/health', handler: () => serveHealth() },
+      ]);
     },
   };
 }
