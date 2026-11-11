@@ -10850,8 +10850,14 @@ impl Codegen {
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         self.write("@splat(");
                         if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
-                            self.gen_expr(&a.children[0]);
-                        } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() { let t = a.extra_size.trim(); self.write(t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t)); } else { self.gen_expr_maybe_paren(a); }
+                            let c = &a.children[0];
+                            if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" {
+                                // `[7usize; 3]`: the element is a Rust-suffixed
+                                // literal; the array type carries the width.
+                                let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes());
+                                self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] }));
+                            } else { self.gen_expr(c); }
+                        } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
                     }
