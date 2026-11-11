@@ -28,4 +28,33 @@ self-modification.
 ## Rollback
 
 `plugin_manager remove_bundle @local/t27-gateway` removes the bundle and
-its three tools from every session in the profile.
+all ten read-only tools from every session in the profile:
+
+- `gateway.status`
+- `dsh.status`
+- `cdp.observe`
+- `gateway.metrics`
+- `gateway.health`
+- `gateway.policy.audit`
+- `gateway.config.get`
+- `gateway.routes.list`
+- `gateway.version`
+- `gateway.logs.head`
+
+Reinstalling the package restores all ten tools.
+
+## Uninstall
+
+In DSH Web UI, use **Uninstall** on the `@local/t27-gateway` plugin card.
+This removes the bundle, its registered tools, and its dashboard resources
+from the profile.
+
+For a session with sufficient rights:
+
+```bash
+plugin_manager remove_bundle @local/t27-gateway
+```
+
+After uninstall, `gateway.status`, `dsh.status`, `cdp.observe`, and the
+seven V12 introspection tools are no longer available. Reinstalling the
+local package restores them.
