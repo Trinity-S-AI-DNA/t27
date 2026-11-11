@@ -92,7 +92,7 @@ mod unparsed;
 mod vectors;
 mod vsim;
 
-#[path = "../../../gen/rust/tri/search_cmd.rs"] #[allow(dead_code)] mod search_cmd; // t27c gen-rust of specs/tri/search_cmd/search_cmd.t27: `tri search`
+#[path = "../../../gen/rust/tri/search_cmd/search_cmd.rs"] #[allow(dead_code)] mod search_cmd; // t27c gen-rust of specs/tri/search_cmd/search_cmd.t27: `tri search`
 #[path = "../../../gen/rust/tri/math_verify.rs"] #[allow(dead_code)] mod math_verify; // t27c gen-rust of specs/tri/math_verify/math_verify.t27: `tri math-verify`
 #[path = "../../../gen/rust/tri/issue_cmd.rs"] #[allow(dead_code)] mod issue_cmd; // t27c gen-rust of specs/tri/issue_cmd/issue_cmd.t27: `tri issue`
 #[path = "../../../gen/rust/tri/sync_cmd.rs"] #[allow(dead_code)] mod sync_cmd; // t27c gen-rust of specs/tri/sync_cmd/sync_cmd.t27: `tri sync`
