@@ -1376,7 +1376,7 @@ fn debug(no_jstart: bool) -> Result<()> {
 // build glue — all stages are invoked as plain external commands.
 // ---------------------------------------------------------------------------
 
-fn which(tool: &str) -> Result<PathBuf> {
+pub(crate) fn which(tool: &str) -> Result<PathBuf> {
     let path_env = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH not set"))?;
     for dir in std::env::split_paths(&path_env) {
         let candidate = dir.join(tool);
@@ -1401,7 +1401,7 @@ fn run_step(tool: &str, args: &[&str], cwd: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn repo_root() -> Result<PathBuf> {
+pub(crate) fn repo_root() -> Result<PathBuf> {
     let mut dir = std::env::current_dir()?;
     let mut cargo_fallback: Option<PathBuf> = None;
     loop {
