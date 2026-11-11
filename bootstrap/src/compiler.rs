@@ -10852,14 +10852,8 @@ impl Codegen {
                         if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
                             self.gen_expr(&a.children[0]);
                         } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() {
-                            // The element text lives in extra_size ("0", or
-                            // "0;32" for a nested repeat). Splatted through
-                            // `gen_expr` it came out `@splat(.{ 0 })` -- "type
-                            // 'u8' does not support array initialization
-                            // syntax" on every scalar repeat. Splat the value,
-                            // not a one-element tuple of it.
-                            let t = a.extra_size.trim();
-                            self.write(t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t));
+                            // splat the element TEXT; gen_expr gave @splat(.{ 0 }) (#13591)
+                            let t = a.extra_size.trim(); self.write(t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t));
                         } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
