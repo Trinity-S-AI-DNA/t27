@@ -58,3 +58,19 @@ plugin_manager remove_bundle @local/t27-gateway
 After uninstall, `gateway.status`, `dsh.status`, `cdp.observe`, and the
 seven V12 introspection tools are no longer available. Reinstalling the
 local package restores them.
+
+## Shell-side log access (E6 substitute)
+
+The `tri logs` CLI commands are budget-gated (#13613); until an owner
+decision lands, the same read-only view is available from the shell by
+driving the installed binary over stdio directly:
+
+```bash
+cd <repo checkout>
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"gateway.policy.audit","arguments":{"host":"127.0.0.1","port":3081}}}\n' \
+  | ./target/debug/tri-mcp | python3 -m json.tool
+```
+
+`host` selects the ingestion: loopback address = local audit log, `"vps"`
+= the pinned read-only ssh journalctl (60 lines, redacted by the law).
+Events are law-encoded JSON strings with timestamp/component/status.
