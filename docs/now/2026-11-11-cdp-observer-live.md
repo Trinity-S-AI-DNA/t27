@@ -14,7 +14,7 @@ browser launch allowed.
   155.0.8309.26). A completely FRESH `--user-data-dir` means zero credentials,
   zero extensions, no default profile — the user's signed-in profile was never
   touched.
-- Flags: `--headless=new --user-data-dir=/Users/playra/t27/.claude/
+- Flags: `--headless=new --user-data-dir=<repo>/.claude/
   cdp-observer-profile --remote-debugging-port=9223 --no-first-run
   --no-default-browser-check --disable-extensions about:blank`.
   CDP binds loopback by default; `/json/version` confirmed Chrome/155 on
