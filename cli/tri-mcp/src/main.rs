@@ -69,7 +69,7 @@ fn gateway_observation_call(name: &str, args: &Value, root: &Path) -> Result<Val
     static DENIED: AtomicU32 = AtomicU32::new(0);
     // The generated law takes &'static str; interning here is framing only.
     let name: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let h2: String = args.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let h2: String = args.get("host").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let host: &'static str = Box::leak(h2.into_boxed_str());
     let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     let scope: &'static str = Box::leak(format!("{}:{}", host, port).into_boxed_str());
@@ -115,13 +115,22 @@ fn gateway_observation_call(name: &str, args: &Value, root: &Path) -> Result<Val
             "host": host, "port": port}));
     }
     if idx == 5 || idx == 9 {
-        // EPIC 2 (T27_LOG_OBSERVABILITY_V1): ingestion through the generated
-        // log-contract law -- every line is redacted (mandatory) and parsed
-        // into a schema event; malformed lines fail closed (dropped).
+        // E2: local ingestion through the generated log-contract law.
+        // E3 (T27_LOG_OBSERVABILITY_V1): host=="vps" ingests the VPS
+        // journal via EXACTLY ONE allowlisted read-only journalctl command
+        // over the existing ssh alias -- no shell, no writes; every MESSAGE
+        // passes the law's mandatory redaction; malformed lines are dropped.
         let log_path = root.join(".trinity/gateway-audit.log");
+        if host == "vps" {
+            let data = vps_journal_bytes();
+            let events = vps_events(&data, if idx == 5 { 20 } else { 10 });
+            return Ok(serde_json::json!({"tool": name, "host": "vps",
+                "events": events, "count": events.len(),
+                "decision": serde_json::from_str::<Value>(&decision)?}));
+        }
         let data = std::fs::read(&log_path).unwrap_or_default();
         let events = audit_events(&data, if idx == 5 { 20 } else { 10 }, idx == 9);
-        return Ok(serde_json::json!({"tool": name,
+        return Ok(serde_json::json!({"tool": name, "host": "local",
             "events": events, "count": events.len(),
             "decision": serde_json::from_str::<Value>(&decision)?}));
     }
@@ -156,7 +165,7 @@ fn cdp_observe_live(host: &str, port: u16, decision: &str) -> Result<Value> {
         // Chrome keeps the socket alive past Connection: close; the timeout
         // bounds the read once the full body is in.
         let _ = s.read_to_string(&mut raw);
-        let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default();
         let pages: Vec<Value> = serde_json::from_str::<Vec<Value>>(body)
             .unwrap_or_default()
             .iter()
@@ -168,6 +177,70 @@ fn cdp_observe_live(host: &str, port: u16, decision: &str) -> Result<Value> {
     })()
     .or_else(|e| envelope(false, serde_json::json!({"error": e.to_string()})))?;
     Ok(ok)
+}
+
+/// E3 (T27_LOG_OBSERVABILITY_V1): read-only VPS journal ingestion. The
+/// spawned command is a PINNED constant -- read-only journalctl over the
+/// existing ssh alias, no shell interpretation, no writes, bounded -n 60.
+/// Output: one JSON object per line (journald --output=json).
+fn vps_journal_bytes() -> Vec<u8> {
+    const VPS_SSH_ALIAS: &str = "givel-vps";
+    const VPS_JOURNALCTL_ARGS: [&str; 7] = ["journalctl", "--output=json", "-n", "60",
+        "--unit=dsh.service", "--unit=dsh-ladder.service", "--unit=caddy"];
+    let out = std::process::Command::new("ssh").arg(VPS_SSH_ALIAS)
+        .args(VPS_JOURNALCTL_ARGS).output()
+        .output();
+    match out {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => Vec::new(),
+    }
+}
+
+/// Map one journald JSON line to a law event: ts (micros->secs), unit->source
+/// mapping, PRIORITY->level, MESSAGE redacted by the law. Host label "vps".
+fn vps_line_to_event(line: &[u8], out: &mut [u8], cap: usize) -> usize {
+    let v: Value = match serde_json::from_slice(line) { Ok(v) => v, Err(_) => return 0 };
+    let unit = v.get("_SYSTEMD_UNIT").and_then(|x| x.as_str()).unwrap_or_default().as_bytes().to_vec();
+    let unit_str = String::from_utf8_lossy(&unit).to_string();
+    let source: &'static str = if unit_str.contains("ladder") { "dsh-ladder" }
+        else if unit_str.contains("caddy") { "caddy" }
+        else { "dsh-web" };
+    let prio = v.get("PRIORITY").and_then(|x| x.as_str())
+        .and_then(|p| p.parse::<u8>().ok()).unwrap_or(6);
+    let level = if prio <= 2 { 3u8 } else if prio <= 4 { 2 } else { 1 };
+    let msg = v.get("MESSAGE").and_then(|x| x.as_str()).unwrap_or_default();
+    let ts_us = v.get("__REALTIME_TIMESTAMP").and_then(|x| x.as_str())
+        .and_then(|t| t.parse::<u64>().ok()).unwrap_or(0) / 1_000_000;
+    let mut rbuf = [0u8; 1024];
+    let msg_bytes = msg.as_bytes();
+    let rn = gateway_log_contract::redact_line(msg_bytes, msg.len(), &mut rbuf, 1024);
+    let mut w = 0usize;
+    w = gateway_log_contract::put_lit(out, cap, w, "{\"timestamp\":", 13);
+    w = gateway_log_contract::put_u64(out, cap, w, ts_us);
+    w = gateway_log_contract::put_lit(out, cap, w, ",\"host\":\"vps\",\"source\":\"", 24);
+    w = gateway_log_contract::put_lit(out, cap, w, source, source.len());
+    w = gateway_log_contract::put_lit(out, cap, w, "\",\"component\":\"", 15);
+    w = gateway_log_contract::put_span(out, cap, w, &unit, 0, unit.len());
+    w = gateway_log_contract::put_lit(out, cap, w, "\",\"level\":", 10);
+    w = gateway_log_contract::put_u64(out, cap, w, level as u64);
+    w = gateway_log_contract::put_lit(out, cap, w, ",\"message\":\"", 12);
+    w = gateway_log_contract::put_span(out, cap, w, &rbuf[..rn], 0, rn);
+    gateway_log_contract::put_lit(out, cap, w, "\"}", 2)
+}
+
+/// E3: parse journald JSON lines (bounded count) into law events.
+fn vps_events(raw: &[u8], max_lines: usize) -> Vec<Value> {
+    let mut events = Vec::new();
+    for line in raw.split(|b: &u8| *b == b'\n') {
+        if line.is_empty() { continue; }
+        if events.len() >= max_lines { break; }
+        let mut ebuf = [0u8; 2048];
+        let en = vps_line_to_event(line, &mut ebuf, 2048);
+        if en > 0 {
+            events.push(Value::String(String::from_utf8_lossy(&ebuf[..en]).to_string()));
+        }
+    }
+    events
 }
 
 /// EPIC 2: turn raw audit bytes into redacted schema events via the
@@ -458,7 +531,7 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
         .get("params")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default();
     let arguments = params
         .get("arguments")
         .cloned()
@@ -1142,7 +1215,7 @@ fn main() -> Result<()> {
         };
 
         let id = request.get("id").cloned();
-        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or_default();
 
         let result = match method {
             "initialize" => handle_initialize(),
@@ -1204,7 +1277,7 @@ mod gateway_contract_tests {
         let ev = audit_events(&data, 20, false);
         assert_eq!(ev.len(), 2, "both well-formed lines become events");
         let joined: String = ev.iter()
-            .map(|v| v.as_str().unwrap_or(""))
+            .map(|v| v.as_str().unwrap_or_default())
             .collect();
         assert!(joined.contains("\"tool\":\"dsh.status\""));
         assert!(joined.contains("\"tool\":\"gateway.metrics\""));
@@ -1228,5 +1301,46 @@ mod gateway_contract_tests {
     fn audit_events_malformed_lines_fail_closed() {
         let data = b"garbage line with no tabs\nanother\n".to_vec();
         assert_eq!(audit_events(&data, 20, false).len(), 0, "malformed lines produce no events");
+    }
+}
+
+#[cfg(test)]
+mod vps_ingestion_tests {
+    use super::*;
+
+    /// E3 acceptance: a journald JSON line becomes a vps-labelled law event
+    /// with the MESSAGE redacted (token value consumed by [REDACTED]).
+    #[test]
+    fn vps_line_maps_unit_priority_and_redacts_message() {
+        let raw = format!("{{\"__REALTIME_TIMESTAMP\":\"1794337015000000\",\"_SYSTEMD_UNIT\":\"dsh.service\",\"PRIORITY\":\"6\",\"MESSAGE\":\"dsh web answered token=secretvalue\"}}");
+        let mut out = [0u8; 512];
+        let n = vps_line_to_event(raw.as_bytes(), &mut out, 512);
+        assert!(n > 80, "event emitted, n={n}");
+        let s = String::from_utf8_lossy(&out[..n]).to_string();
+        assert!(s.contains("\"host\":\"vps\""), "{}", s);
+        assert!(s.contains("\"source\":\"dsh-web\""), "{}", s);
+        assert!(s.contains("\"level\":1"), "{}", s);
+        assert!(s.contains("[REDACTED]"), "{}", s);
+        assert!(!s.contains("secretvalue"), "{}", s);
+    }
+
+    /// A malformed journald line fails closed (no event).
+    #[test]
+    fn vps_malformed_line_dropped() {
+        let raw = b"not json at all";
+        let mut out = [0u8; 128];
+        assert_eq!(vps_line_to_event(raw, &mut out, 128), 0);
+    }
+
+    /// Level mapping: PRIORITY 0-2 -> error(3), 3-4 -> warn(2), 5+ -> info(1).
+    #[test]
+    fn vps_priority_maps_to_contract_levels() {
+        for (prio, want) in [("0", 3u8), ("3", 2u8), ("6", 1u8)] {
+            let raw = format!("{{\"__REALTIME_TIMESTAMP\":\"1\",\"PRIORITY\":\"{prio}\",\"MESSAGE\":\"m\"}}");
+            let mut out = [0u8; 256];
+            vps_line_to_event(raw.as_bytes(), &mut out, 256);
+            let s = String::from_utf8_lossy(&out[..]).to_string();
+            assert!(s.contains(&format!("\"level\":{want}")), "prio={prio}: {s}");
+        }
     }
 }
