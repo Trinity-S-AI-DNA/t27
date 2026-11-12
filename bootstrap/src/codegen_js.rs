@@ -148,6 +148,15 @@ pub(crate) struct Bound {
     /// once the body is done, so a later `const` of the same spelling is
     /// still checked the ordinary way.
     locals: BTreeSet<String>,
+    /// Set while a function body lowers. t27 traps the moment an integer
+    /// value leaves its declared width -- including INTERMEDIATE values, probed
+    /// on `(zoom_milli * 12) / 10` over `u16`: 5462 traps on the product
+    /// 65544 before the division ever runs. Inside a body, every integer
+    /// arithmetic step is wrapped in that width's check helper; at module
+    /// level (const data, folded at compile time) it stays unwrapped.
+    runtime_checks: bool,
+    /// The check helpers a body needed, by width, emitted in the preamble.
+    helpers: std::cell::RefCell<BTreeSet<String>>,
 }
 
 impl Bound {
@@ -354,6 +363,16 @@ const PY_RESERVED: &[&str] = &[
     "try", "while", "with", "yield",
 ];
 
+fn parse_helper_width(helper: &str) -> Result<(u32, bool), String> {
+    let rest = helper.strip_prefix("__chk_").ok_or("bad helper name")?;
+    let (signed, digits) = match rest.split_at(1) {
+        ("i", d) => (true, d),
+        ("u", d) => (false, d),
+        _ => return Err("bad helper width".into()),
+    };
+    digits.parse::<u32>().map(|w| (w, signed)).map_err(|_| "bad helper width".into())
+}
+
 pub fn generate(ast: &Node, source_name: &str) -> Result<String, String> {
     generate_reported(ast, source_name).map(|(code, _)| code)
 }
@@ -415,8 +434,10 @@ fn fn_body(t: &Target, node: &Node, bound: &mut Bound) -> Result<String, String>
     for (name, _) in &node.params {
         bound.locals.insert(name.clone());
     }
+    bound.runtime_checks = true;
     let mut lines: Vec<String> = Vec::new();
     let result = lower_stmts(t, node, &node.children, "", bound, &mut lines);
+    bound.runtime_checks = false;
     bound.locals.clear();
     for name in &saved {
         bound.locals.insert(name.clone());
@@ -573,6 +594,7 @@ pub fn generate_reported(ast: &Node, source_name: &str) -> Result<(String, usize
     let mut decl_order: Vec<String> = Vec::new();
     let mut missing = NotEmitted::default();
     let mut bound = Bound::in_spec(ast);
+    bound.runtime_checks = false;
 
     for node in &ast.children {
         match node.kind {
@@ -682,6 +704,25 @@ pub fn generate_reported(ast: &Node, source_name: &str) -> Result<(String, usize
     out.push_str("\n// Declaration order, which the spec's own laws depend on.\n");
     out.push_str(&format!("export const __STRUCT_ORDER__ = [{}];\n", list(&struct_order)));
     out.push_str(&format!("export const __DECL_ORDER__ = [{}];\n", list(&decl_order)));
+    if !bound.helpers.borrow().is_empty() {
+        let mut preamble = String::new();
+        for helper in bound.helpers.borrow().iter() {
+            let (w, signed) = parse_helper_width(helper)?;
+            let (lo, hi) = if signed { (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1) } else { (0, (1i64 << w) - 1) };
+            preamble.push_str(&format!(
+                "// t27 trap semantics: an integer value outside its declared width is a runtime error.\nfunction {helper}(v) {{ if (!(Number.isInteger(v) && v >= {lo} && v <= {hi})) throw new RangeError(\"{ty} overflow\"); return v }}\n",
+                ty = format!("{}{}", if signed { "i" } else { "u" }, w)
+            ));
+        }
+        // The preamble belongs right after the file header, before the first
+        // export: helpers must exist wherever a body references them.
+        if let Some(pos) = out.find("\n\n") {
+            let at = pos + 2;
+            out.insert_str(at, &preamble);
+        } else {
+            out.push_str(&preamble);
+        }
+    }
     out.push_str(&missing.finish(&JS));
     Ok((out, missing.len()))
 }
@@ -1078,7 +1119,27 @@ pub(crate) fn expr_typed(t: &Target, node: &Node, ty: &str, scope: &Bound) -> Re
             // JavaScript's own precedence rules would be a second chance to get
             // it wrong for no gain in readability.
             let op = node.extra_op.trim();
+            let wrap = |scope: &Bound, value: String| -> String {
+                if !scope.runtime_checks {
+                    return value;
+                }
+                if let Some((w, signed)) = int_width(ty) {
+                    let helper = format!("__chk_{}{}", if signed { "i" } else { "u" }, w);
+                    scope.helpers.borrow_mut().insert(helper.clone());
+                    return format!("{}({})", helper, value);
+                }
+                value
+            };
+            let checked = |op: &str, a: &str, b: &str| -> String {
+                match op {
+                    "/" => format!("Math.trunc({} / {})", a, b),
+                    other => format!("({} {} {})", a, other, b),
+                }
+            };
             match op {
+                "+" | "-" | "*" | "%" if scope.runtime_checks && int_width(ty).is_some() => {
+                    Ok(wrap(scope, checked(op, &a, &b)))
+                }
                 "+" | "-" | "*" | "%" => Ok(format!("({} {} {})", a, op, b)),
                 "/" if t.is_py() => Ok(if int_width(ty).is_some() {
                     // Python's `//` truncates toward negative infinity, which
@@ -1095,6 +1156,7 @@ pub(crate) fn expr_typed(t: &Target, node: &Node, ty: &str, scope: &Bound) -> Re
                     // JavaScript's `/` is always real division: without this,
                     // `UART_CLOCK_HZ / UART_BAUD_RATE` ships 868.0555... where
                     // every other backend writes 868.
+                    Some(_) if scope.runtime_checks => Ok(wrap(scope, format!("Math.trunc({} / {})", a, b))),
                     Some(_) => Ok(format!("Math.trunc({} / {})", a, b)),
                     None => Ok(format!("({} / {})", a, b)),
                 },
