@@ -143,6 +143,11 @@ pub(crate) struct Bound {
     /// Every top-level declaration in the spec, whether or not it is reached
     /// yet. What separates `declared further down` from `not here at all`.
     declared: BTreeSet<String>,
+    /// Parameter names of the function whose body is being lowered. A body's
+    /// identifiers resolve to these, not to the module's consts; empty again
+    /// once the body is done, so a later `const` of the same spelling is
+    /// still checked the ordinary way.
+    locals: BTreeSet<String>,
 }
 
 impl Bound {
@@ -188,6 +193,10 @@ impl Bound {
 
     /// Whether `name` has a value here, and if not, precisely why not.
     pub(crate) fn resolve(&self, t: &Target, name: &str, line: u32) -> Result<(), String> {
+        // Inside a function body a parameter is the binding an identifier reads.
+        if self.locals.contains(name) {
+            return Ok(());
+        }
         if js_name(t, name).is_ok_and(|js| self.emitted.contains(&js)) {
             return Ok(());
         }
@@ -349,6 +358,203 @@ pub fn generate(ast: &Node, source_name: &str) -> Result<String, String> {
     generate_reported(ast, source_name).map(|(code, _)| code)
 }
 
+/// A function body, lowered statement by statement, into the lines of a
+/// `function` declaration.
+///
+/// What a body may hold, and nothing else: a `return`, a local with its
+/// initialiser, an assignment, a bare expression, and an `if` whose branches
+/// hold the same again. Integer arithmetic keeps the spec's truncating
+/// `/` (expr_typed already emits `Math.trunc` under an integer type), and
+/// comparisons map onto `===` and friends. A body that holds anything this
+/// range does not name is announced in `__NOT_EMITTED__`, exactly as a
+/// declaration the backend cannot print is -- the consumer decides whether
+/// an announced omission is fatal, and the second-brain slice's generator
+/// fails its build on one.
+///
+/// One semantic boundary, said here because nowhere else would say it:
+/// t27's integer types wrap, JavaScript's number does not. A body whose
+/// intermediate values stay inside its declared widths lowers exactly; one
+/// that overflows does not, and no mask is guessed at. The fixture spec
+/// pins its own values inside `u16`, and its test blocks are what the
+/// compiler checks -- the artifact is not asked to re-wrap.
+/// A function body, lowered statement by statement, into the lines of a
+/// `function` declaration.
+///
+/// What a body may hold, and nothing else: a `return`, a local with its
+/// initialiser, an assignment, a bare expression, and an `if` whose branches
+/// hold the same again. Integer arithmetic keeps the spec's truncating
+/// `/` (`expr_typed` already emits `Math.trunc` under an integer type) and
+/// comparisons map onto `===` and friends. A body that holds anything this
+/// range does not name is refused here, which routes it into
+/// `__NOT_EMITTED__` -- the consumer decides whether an announced omission
+/// is fatal, and the second-brain slice's generator fails its build on one.
+///
+/// One semantic boundary, said here because nowhere else would say it:
+/// t27's integer types wrap, a JavaScript number does not. A body whose
+/// intermediate values stay inside its declared widths lowers exactly; one
+/// that overflows does not, and no mask is guessed at. The fixture spec
+/// pins its values inside `u16`, and its test blocks are what the compiler
+/// checks -- the artifact is not asked to re-wrap.
+fn fn_body(t: &Target, node: &Node, bound: &mut Bound) -> Result<String, String> {
+    let tag = t.tag;
+    for (name, ty) in &node.params {
+        if !is_primitive_type(ty) {
+            return Err(format!(
+                "{tag}: the parameter {} of fn {} has type {}, and this backend lowers scalar parameters only",
+                name, node.name, ty
+            ));
+        }
+    }
+    if !node.extra_return_type.is_empty() && !is_primitive_type(&node.extra_return_type) {
+        return Err(format!(
+            "{tag}: fn {} returns {}, and this backend lowers scalar returns only",
+            node.name, node.extra_return_type
+        ));
+    }
+    let saved: Vec<String> = bound.locals.iter().cloned().collect();
+    for (name, _) in &node.params {
+        bound.locals.insert(name.clone());
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let result = lower_stmts(t, node, &node.children, "", bound, &mut lines);
+    bound.locals.clear();
+    for name in &saved {
+        bound.locals.insert(name.clone());
+    }
+    result?;
+    // t27 TRAPS when an integer value leaves its declared width (a Zig panic,
+    // probed on `view_zoom_in(65535)` over `u16`); a JavaScript number sails
+    // through. The artifact says the same thing a trap says: an argument or a
+    // returned value outside the declared width throws RangeError, in both
+    // directions. Intermediates are not separately checked -- the fixture
+    // spec's test blocks are where the compiler pins those.
+    let mut guards: Vec<String> = Vec::new();
+    for (name, ty) in &node.params {
+        if let Some((w, signed)) = int_width(ty) {
+            let js = js_name(t, name)?;
+            let (lo, hi) = if signed { (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1) } else { (0, (1i64 << w) - 1) };
+            guards.push(format!(
+                "  if (!(Number.isInteger({js}) && {js} >= {lo} && {js} <= {hi})) throw new RangeError(\"{name} out of {ty}\");"
+            ));
+        }
+    }
+    let ret_guard = int_width(&node.extra_return_type)
+        .map(|(w, signed)| {
+            let (lo, hi) = if signed { (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1) } else { (0, (1i64 << w) - 1) };
+            format!("if (!(Number.isInteger(__r) && __r >= {lo} && __r <= {hi})) throw new RangeError(\"result out of {}\");", node.extra_return_type)
+        });
+    let mut code = format!(
+        "export function {}({}) {{\n",
+        js_name(t, &node.name)?,
+        node.params.iter().map(|(n, _)| js_name(t, n)).collect::<Result<Vec<_>, _>>()?.join(", ")
+    );
+    for g in &guards {
+        code.push_str(g);
+        code.push('\n');
+    }
+    let guarded = ret_guard.is_some();
+    for line in &lines {
+        if let Some(rest) = line.strip_prefix("return ") {
+            let expr = rest.strip_suffix(';').unwrap_or(rest);
+            if guarded {
+                code.push_str(&format!("  const __r = {expr};\n"));
+                code.push_str(&ret_guard.clone().unwrap());
+                code.push('\n');
+                code.push_str("  return __r;\n");
+                continue;
+            }
+        }
+        code.push_str(line);
+        code.push('\n');
+    }
+    code.push_str("}\n");
+    Ok(code)
+}
+
+/// The statements of one body or one `if` branch, appended to `lines`.
+fn lower_stmts(
+    t: &Target,
+    owner: &Node,
+    stmts: &[Node],
+    indent: &str,
+    bound: &mut Bound,
+    lines: &mut Vec<String>,
+) -> Result<(), String> {
+    let tag = t.tag;
+    for stmt in stmts {
+        match stmt.kind {
+            NodeKind::ExprReturn => {
+                let child = stmt.children.first().ok_or_else(|| {
+                    format!(
+                        "{tag}: a return in fn {} at line {} returns nothing, and only a value lowers here",
+                        owner.name, stmt.line
+                    )
+                })?;
+                let value = expr_typed(t, child, &owner.extra_return_type, bound)?;
+                lines.push(format!("{indent}return {value};"));
+            }
+            NodeKind::StmtLocal | NodeKind::StmtAssign => {
+                let child = stmt.children.first().ok_or_else(|| {
+                    format!(
+                        "{tag}: the assignment to {} in fn {} at line {} has no value",
+                        stmt.name, owner.name, stmt.line
+                    )
+                })?;
+                let value = expr_typed(t, child, &stmt.extra_type, bound)?;
+                let name = js_name(t, &stmt.name)?;
+                lines.push(format!("{indent}{name} = {value};"));
+                if stmt.kind == NodeKind::StmtLocal {
+                    bound.locals.insert(stmt.name.clone());
+                }
+            }
+            NodeKind::StmtExpr => {
+                let child = stmt.children.first().ok_or_else(|| {
+                    format!(
+                        "{tag}: a bare statement in fn {} at line {} holds nothing",
+                        owner.name, stmt.line
+                    )
+                })?;
+                let value = expr_typed(t, child, "", bound)?;
+                lines.push(format!("{indent}{value};"));
+            }
+            NodeKind::StmtIf => {
+                let cond = stmt.children.first().ok_or_else(|| {
+                    format!(
+                        "{tag}: an if in fn {} at line {} has no condition",
+                        owner.name, stmt.line
+                    )
+                })?;
+                let condition = expr_typed(t, cond, "", bound)?;
+                let mut branches = stmt.children.iter().skip(1);
+                let then_branch = branches.next().ok_or_else(|| {
+                    format!(
+                        "{tag}: an if in fn {} at line {} has no then branch",
+                        owner.name, stmt.line
+                    )
+                })?;
+                lines.push(format!("{indent}if ({condition}) {{"));
+                lower_stmts(t, owner, &then_branch.children, &format!("{indent}  "), bound, lines)?;
+                let else_branch = branches.next();
+                match else_branch {
+                    Some(b) => {
+                        lines.push(format!("{indent}}} else {{"));
+                        lower_stmts(t, owner, &b.children, &format!("{indent}  "), bound, lines)?;
+                    }
+                    None => {}
+                }
+                lines.push(format!("{indent}}}"));
+            }
+            ref other => {
+                return Err(format!(
+                    "{tag}: a {other:?} in fn {} at line {} is more body than this backend lowers",
+                    owner.name, stmt.line
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The artifact, and how many declarations it announced instead of printing.
 ///
 /// Callers that only want the file use `generate`. The Spec Explorer wants both:
@@ -439,11 +645,22 @@ pub fn generate_reported(ast: &Node, source_name: &str) -> Result<(String, usize
                 decl_order.push(node.name.clone());
             }
             NodeKind::UseDecl => {}
-            // Announced, never dropped in silence.
-            NodeKind::FnDecl => out.push_str(&format!(
-                "// t27c gen-js: fn {} was not emitted -- this backend lowers declarations, not bodies.\n",
-                node.name
-            )),
+            // A body this backend can lower prints; one it cannot is announced
+            // in __NOT_EMITTED__, the same fate as an unprintable declaration.
+            NodeKind::FnDecl => match js_name(&JS, &node.name).and_then(|name| {
+                let code = fn_body(&JS, node, &mut bound)?;
+                bound.claim(&JS, &name)?;
+                Ok((name, code))
+            }) {
+                Ok((name, code)) => {
+                    out.push_str(&code);
+                    decl_order.push(node.name.clone());
+                }
+                Err(why) => {
+                    bound.refuse(&node.name);
+                    missing.record(&mut out, &JS, &format!("fn {}", describe(node)), &why)
+                }
+            },
             NodeKind::TestBlock | NodeKind::BenchBlock | NodeKind::InvariantBlock => {
                 out.push_str(&format!(
                     "// t27c gen-js: a {:?} was not emitted -- it is checked by the compiler, not by the artifact.\n",
