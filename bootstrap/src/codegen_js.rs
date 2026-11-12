@@ -157,6 +157,10 @@ pub(crate) struct Bound {
     runtime_checks: bool,
     /// The check helpers a body needed, by width, emitted in the preamble.
     helpers: std::cell::RefCell<BTreeSet<String>>,
+    /// The names of the spec's own functions. A body may call these; a call to
+    /// anything else is refused, because the artifact must not name what it
+    /// does not declare.
+    spec_fns: BTreeSet<String>,
 }
 
 impl Bound {
@@ -171,7 +175,13 @@ impl Bound {
             .filter(|n| !n.name.is_empty())
             .map(|n| n.name.clone())
             .collect();
-        Self { declared, ..Default::default() }
+        let spec_fns = ast
+            .children
+            .iter()
+            .filter(|n| n.kind == NodeKind::FnDecl)
+            .map(|n| n.name.clone())
+            .collect();
+        Self { declared, spec_fns, ..Default::default() }
     }
 
     pub(crate) fn claim(&mut self, t: &Target, name: &str) -> Result<(), String> {
@@ -523,9 +533,14 @@ fn lower_stmts(
                 })?;
                 let value = expr_typed(t, child, &stmt.extra_type, bound)?;
                 let name = js_name(t, &stmt.name)?;
-                lines.push(format!("{indent}{name} = {value};"));
+                // A local declares its binding; an assignment rewrites one. The
+                // distinction is JavaScript's `let` versus bare assignment --
+                // collapsing them made every local an implicit global.
                 if stmt.kind == NodeKind::StmtLocal {
+                    lines.push(format!("{indent}let {name} = {value};"));
                     bound.locals.insert(stmt.name.clone());
+                } else {
+                    lines.push(format!("{indent}{name} = {value};"));
                 }
             }
             NodeKind::StmtExpr => {
@@ -1208,6 +1223,25 @@ pub(crate) fn expr_typed(t: &Target, node: &Node, ty: &str, scope: &Bound) -> Re
                 Ok(field) => format!("{}.{}", base, field),
                 Err(_) => format!("{}[{}]", base, js_string(&node.name)),
             })
+        }
+        NodeKind::ExprCall => {
+            // Inside a function body a call to one of the spec's own functions
+        // is exactly what the spec means; the generated module declares
+        // every one of them, so the name resolves at load. A call to
+        // anything else stays a refusal: the artifact must not name what
+        // it does not declare.
+        if !scope.spec_fns.contains(&node.name) {
+            return Err(format!(
+                "{tag}: a call to {} at line {} names a function this spec does not declare -- the artifact only calls its own",
+                node.name, node.line
+            ));
+        }
+        let args: Result<Vec<String>, String> = node
+            .children
+            .iter()
+            .map(|a| expr_typed(t, a, "", scope))
+            .collect();
+        Ok(format!("{}({})", js_name(t, &node.name)?, args?.join(", ")))
         }
         other => Err(format!(
             "{tag}: {:?} at line {} is not a constant expression. This backend emits data, never code.",
