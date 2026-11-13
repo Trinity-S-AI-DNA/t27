@@ -11130,9 +11130,9 @@ impl Codegen {
                 }
                 if let Some((val, _count)) = txt.rsplit_once(';') {
                     // #6451/#13591: count rides the target type; @splat the value.
-                    // Emit .{val}**n per the spec: gen-zig prints [v; n] as .{ v } ** n
-                    let n = rust_num_suffix::rust_num_suffix_len(val.trim().as_bytes());
-                    self.write(&format!(".{{{}}}**{}", val=val, n=n));
+                    let sv = Self::splat_scalar(val.trim());
+                    let n = rust_num_suffix::rust_num_suffix_len(sv.as_bytes());
+                    self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));
                 } else {
                     // Split on TOP-LEVEL commas only -- elements may be calls
                     // with their own commas.
