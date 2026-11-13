@@ -245,6 +245,24 @@ Additionally, the **Language Policy** (Article I) ensures universality and clari
 ### §8.4. Rationale
 Aligns the repository with **TDD-MANDATE** and **SSOT-MATH**: behavior lives in specs + compiler, not in untested bash. Reduces macOS/Linux drift (`realpath`, `find`, `readlink`) and quoting/glob hazards. A single **TCB** for tooling (**`rustc` + `t27c`**) supports tool-qualification discipline (e.g. DO-330-style narratives).
 
+### §8.5. V3 Pipeline — Vertical Slice Completion (2026-11-13)
+- **27/27 domain `.t27` contracts** created: `0xA@architecture.t27` through `0xTI@trinity.t27`
+- **14 T27L events** logged: full audit trail of vertical slice registration → domain binding → capability audit → canonical ID validation
+- **4 pipeline phases** verified: minimal vertical slice, subagent integration, tri CLI minimal, tests (contract + integration + golden + coverage)
+- **Team roster**: 16 maxMembers config; current session on 8 (non-blocker for skill creation)
+- **Safety gates**: skill + issue binding active for all mutation paths
+- **Vertical slice**: register agent → assign domain → own spec → emit T27L → audit capability → validate canonical ID
+
+### §8.6. Team Plugin Rewrite — t27b Migration (2026-11-13)
+- **agent-team** → rewrite on t27b platform
+- **tool-agent-team** → rewrite on t27b platform
+- **agent-team-profile** → rewrite on t27b platform
+- **client-ui-agent-team** → rewrite on t27b platform
+- **Scope**: TeamService, roster, journal, task-board, task-graph, task-view, projection, activity, lifecycle, session-message, persisted, validation, error, client, tools, profile, client-ui
+- **Boundaries**: do not migrate everything immediately; do not write Rust before .t27; do not merge without green; do not allow parallel edits; do not bypass seals/gates
+- **Golden tests**: tri.golden.test and tri.coverage.delta recorded in T27L events
+- **Subagents used**: 1 during V3 pipeline integration
+
 ---
 
 ## Appendix: Quick Reference
