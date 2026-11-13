@@ -525,22 +525,45 @@ fn lower_stmts(
                 lines.push(format!("{indent}return {value};"));
             }
             NodeKind::StmtLocal | NodeKind::StmtAssign => {
-                let child = stmt.children.first().ok_or_else(|| {
-                    format!(
-                        "{tag}: the assignment to {} in fn {} at line {} has no value",
-                        stmt.name, owner.name, stmt.line
-                    )
-                })?;
-                let value = expr_typed(t, child, &stmt.extra_type, bound)?;
-                let name = js_name(t, &stmt.name)?;
-                // A local declares its binding; an assignment rewrites one. The
-                // distinction is JavaScript's `let` versus bare assignment --
-                // collapsing them made every local an implicit global.
-                if stmt.kind == NodeKind::StmtLocal {
+                // Two shapes: a local owns its name (`stmt.name`) and one value
+                // child; an assignment carries BOTH operands as children -- the
+                // target identifier first, the new value second -- and names
+                // itself nothing. Treating an assignment like a local made the
+                // target `""` and refused the whole function.
+                if stmt.kind == NodeKind::StmtAssign {
+                    let target = stmt.children.first().ok_or_else(|| {
+                        format!(
+                            "{tag}: an assignment in fn {} at line {} has no target",
+                            owner.name, stmt.line
+                        )
+                    })?;
+                    if target.kind != NodeKind::ExprIdentifier {
+                        return Err(format!(
+                            "{tag}: the assignment in fn {} at line {} targets a {:?}, and only a named variable lowers here",
+                            owner.name, stmt.line, target.kind
+                        ));
+                    }
+                    let value_node = stmt.children.get(1).ok_or_else(|| {
+                        format!(
+                            "{tag}: the assignment to {} in fn {} at line {} has no value",
+                            target.name, owner.name, stmt.line
+                        )
+                    })?;
+                    let value = expr_typed(t, value_node, &stmt.extra_type, bound)?;
+                    let name = js_name(t, &target.name)?;
+                    bound.locals.insert(target.name.clone());
+                    lines.push(format!("{indent}{name} = {value};"));
+                } else {
+                    let child = stmt.children.first().ok_or_else(|| {
+                        format!(
+                            "{tag}: the local {} in fn {} at line {} has no initialiser",
+                            stmt.name, owner.name, stmt.line
+                        )
+                    })?;
+                    let value = expr_typed(t, child, &stmt.extra_type, bound)?;
+                    let name = js_name(t, &stmt.name)?;
                     lines.push(format!("{indent}let {name} = {value};"));
                     bound.locals.insert(stmt.name.clone());
-                } else {
-                    lines.push(format!("{indent}{name} = {value};"));
                 }
             }
             NodeKind::StmtExpr => {
