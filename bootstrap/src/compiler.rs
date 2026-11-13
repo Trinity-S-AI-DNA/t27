@@ -7772,8 +7772,38 @@ impl Codegen {
 
     /// Emit an array literal's elements as `{ e0, e1 }` -- the braces that
     /// follow an explicit `[_]T` prefix, where `.{ … }` cannot be used.
-    fn gen_array_literal_braces(&mut self, node: &Node) {
-        self.write("{ ");
+    /// #13625: `@splat` takes a scalar VALUE, not a tuple. A repeat whose
+    /// element is a one-element array literal (`.{ 9.0 } ** 8`, stored with or
+    /// without the braces) must splat the inner scalar `9.0`; splatting the
+    /// tuple emits `@splat(.{ 9.0 })`, which zig rejects on element types
+    /// ("type 'f32' does not support array initialization syntax"). 385 seals
+    /// went stale on master because of exactly this shape.
+    fn splat_scalar(v: &str) -> String {
+        let t = v.trim();
+        // `.{ X }` or `{ X }` with a single top-level element -> `X`
+        for open in [".{", "{"] {
+            if t.starts_with(open) && t.ends_with('}') && t.len() > open.len() + 1 {
+                let inner = t[open.len()..t.len() - 1].trim();
+                // single element: no top-level comma inside
+                let mut depth = 0i32;
+                let mut top_comma = false;
+                for ch in inner.chars() {
+                    match ch {
+                        '(' | '[' | '{' => depth += 1,
+                        ')' | ']' | '}' => depth -= 1,
+                        ',' if depth == 0 => top_comma = true,
+                        _ => {}
+                    }
+                }
+                if !top_comma && !inner.is_empty() {
+                    return inner.to_string();
+                }
+            }
+        }
+        t.to_string()
+    }
+
+    fn gen_array_literal_braces(&mut self, node: &Node) {        self.write("{ ");
         if !node.children.is_empty() {
             for (i, elem) in node.children.iter().enumerate() {
                 if i > 0 {
@@ -11100,8 +11130,9 @@ impl Codegen {
                 }
                 if let Some((val, _count)) = txt.rsplit_once(';') {
                     // #6451/#13591: count rides the target type; @splat the value.
+                    // Emit .{val}**n per the spec: gen-zig prints [v; n] as .{ v } ** n
                     let n = rust_num_suffix::rust_num_suffix_len(val.trim().as_bytes());
-                    self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));
+                    self.write(&format!(".{{{}}}**{}", val=val, n=n));
                 } else {
                     // Split on TOP-LEVEL commas only -- elements may be calls
                     // with their own commas.
