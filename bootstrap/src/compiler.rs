@@ -26,6 +26,9 @@ mod cse_hoist;
 #[path = "../gen/rust/compiler/rust_num_suffix.rs"]
 #[allow(dead_code, unused_parens, unused_variables, non_snake_case, clippy::all)]
 mod rust_num_suffix;
+#[path = "../gen/rust/compiler/splat_scalar.rs"]
+#[allow(dead_code, unused_parens, unused_variables, non_snake_case, clippy::all)]
+mod splat_scalar;
 // specs/compiler/int_type_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
 #[path = "../gen/rust/compiler/int_type_names.rs"]
 #[allow(dead_code, unused_parens)]
@@ -7772,33 +7775,6 @@ impl Codegen {
 
     /// Emit an array literal's elements as `{ e0, e1 }` -- the braces that
     /// follow an explicit `[_]T` prefix, where `.{ … }` cannot be used.
-    /// #13625: @splat takes a scalar VALUE, not a tuple: a repeat whose
-    /// element is a one-element array literal must splat the inner scalar.
-    fn splat_scalar(v: &str) -> String {
-        let t = v.trim();
-        // `.{ X }` or `{ X }` with a single top-level element -> `X`
-        for open in [".{", "{"] {
-            if t.starts_with(open) && t.ends_with('}') && t.len() > open.len() + 1 {
-                let inner = t[open.len()..t.len() - 1].trim();
-                // single element: no top-level comma inside
-                let mut depth = 0i32;
-                let mut top_comma = false;
-                for ch in inner.chars() {
-                    match ch {
-                        '(' | '[' | '{' => depth += 1,
-                        ')' | ']' | '}' => depth -= 1,
-                        ',' if depth == 0 => top_comma = true,
-                        _ => {}
-                    }
-                }
-                if !top_comma && !inner.is_empty() {
-                    return inner.to_string();
-                }
-            }
-        }
-        t.to_string()
-    }
-
     fn gen_array_literal_braces(&mut self, node: &Node) {        self.write("{ ");
         if !node.children.is_empty() {
             for (i, elem) in node.children.iter().enumerate() {
@@ -7823,10 +7799,10 @@ impl Codegen {
             if !cur.trim().is_empty() {
                 parts.push(cur.trim().to_string());
             }
-            // #6451: the REPEAT form `[v; n]` arrives as the text `v;n`, and
-            // was emitted as `{ v;n }` -- "expected ',' after initializer".
-            // A Rust width suffix on the value (`0i32`, `0.0f64`) is not Zig
-            // either; the element type already carries the width.
+            // #6451: the REPEAT form `[v; n]` arrives as the text `v;n` (it was
+            // `{ v;n }`, "expected ',' after initializer"); a Rust width suffix
+            // on the value (`0i32`, `0.0f64`) is not Zig either -- the element
+            // type already carries the width.
             if parts.len() == 1 {
                 let mut d = 0i32;
                 let mut semi = None;
@@ -7843,8 +7819,7 @@ impl Codegen {
                     let _n = parts[0][i + 1..].trim().to_string();
                     if !v.is_empty() && !_n.is_empty() {
                         // #13591: Zig has no `**`; @splat, count rides the type.
-                        // The suffix strip is the gen-rust port in
-                        // specs/compiler/rust_num_suffix.t27.
+                        // The suffix strip is the gen-rust port in specs/compiler/rust_num_suffix.t27.
                         let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes());
                         self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));                        return;
                     }
@@ -10875,15 +10850,8 @@ impl Codegen {
                         let a = &node.children[0];
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         self.write("@splat(");
-                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
-                            let c = &a.children[0];
-                            if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" {
-                                // `[7usize; 3]`: the element is a Rust-suffixed
-                                // literal; the array type carries the width.
-                                let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes());
-                                self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] }));
-                            } else { self.gen_expr(c); }
-                        } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
+                        eprintln!("SITEA children={} etype={:?} esize={:?}", a.children.len(), a.extra_type, a.extra_size);
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && a.extra_size.trim().contains(';') { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
                     }
@@ -11114,9 +11082,8 @@ impl Codegen {
                 }
 
                 // Otherwise the parser stored the literal's ELEMENT TEXT in
-                // extra_size ("1,2,3" for a list, "0;4" for a repeat).
-                // Emit Zig anonymous-list forms, which coerce to the typed
-                // array target: `.{ e1, e2, .. }` and `.{ v } ** n`.
+                // extra_size ("1,2,3" for a list, "0;4" for a repeat); emit
+                // Zig anonymous-list forms, which coerce to the typed target.
                 let txt = node.extra_size.trim().to_string();
                 // No children and no element text, or a TYPED literal (whose extra_size is its dimension,
                 // `[_]S{}` -> `.{ _ }`, 17 specs), is the EMPTY literal; else `.{  }` had a phantom element.
@@ -11125,10 +11092,17 @@ impl Codegen {
                     return;
                 }
                 if let Some((val, _count)) = txt.rsplit_once(';') {
-                    // #6451/#13591: count rides the target type; @splat the value.
-                    let sv = Self::splat_scalar(val.trim());
-                    let n = rust_num_suffix::rust_num_suffix_len(sv.as_bytes());
-                    self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));
+                    // #6451/#13591: @splat the value; one-element `.{ X }` unwraps via specs/compiler/splat_scalar.t27 (#13625).
+                    // `[""; 64]` arrives as txt=";64": the parser strips the quotes, so an EMPTY
+                    // element text can only be the empty string literal; emit `""` (#13625).
+                    let tv = val.trim();
+                    let (bytes, n) = if tv.is_empty() {
+                        ("\"\"".as_bytes(), 2usize)
+                    } else {
+                        let sn = splat_scalar::splat_scalar_len(tv.as_bytes());
+                        if sn == 0 { (tv.as_bytes(), tv.len()) } else { let n = rust_num_suffix::rust_num_suffix_len(unsafe { &splat_scalar::ss_out[..sn] }); (unsafe { &rust_num_suffix::ns_out[..n] }, n) }
+                    };
+                    self.write(&format!("@splat({})", String::from_utf8_lossy(bytes)));
                 } else {
                     // Split on TOP-LEVEL commas only -- elements may be calls
                     // with their own commas.
