@@ -298,3 +298,33 @@ documents addressed to other people's agents, the six negative controls, and the
 `;`-alone-on-a-line trap that silently discards a `module` declaration. This
 section is a pointer, not a copy -- the recorded defect in this codebase family
 is the hand-copied rule that only two of its three homes knew about.
+
+## V3 Pipeline — Vertical Slice Completion (2026-11-13)
+- **27/27 domain `.t27` contracts** created: `0xA@architecture.t27` through `0xTI@trinity.t27`
+- **14 T27L events** logged: full audit trail of vertical slice registration → domain binding → capability audit → canonical ID validation
+- **4 pipeline phases** verified: minimal vertical slice, subagent integration, tri CLI minimal, tests (contract + integration + golden + coverage)
+- **Team roster**: 16 maxMembers config; current session on 8 (non-blocker for skill creation)
+- **Safety gates**: skill + issue binding active for all mutation paths
+- **Vertical slice**: register agent → assign domain → own spec → emit T27L → audit capability → validate canonical ID
+
+## Team Plugin Rewrite — t27b Migration (2026-11-13)
+- **agent-team** → rewrite on t27b platform
+- **tool-agent-team** → rewrite on t27b platform
+- **agent-team-profile** → rewrite on t27b platform
+- **client-ui-agent-team** → rewrite on t27b platform
+- **Scope**: TeamService, roster, journal, task-board, task-graph, task-view, projection, activity, lifecycle, session-message, persisted, validation, error, client, tools, profile, client-ui
+- **Boundaries**: do not migrate everything immediately; do not write Rust before .t27; do not merge without green; do not allow parallel edits; do not bypass seals/gates
+- **Golden tests**: tri.golden.test and tri.coverage.delta recorded in T27L events
+- **Subagents used**: 1 during V3 pipeline integration
+
+## Where t27 work lives (owner, 2026-10-25: agents litter the home folder and fill the disk)
+
+On 2026-10-25 the disk held 2.8 GiB free and the app refused to make a worktree (it needs 5.4 GiB). The cause was agent litter, not work: dozens of `~/t27-wt-*`, `~/t27-lane-*`, `~/t27-lanes/*` clones and worktrees, `/private/tmp/opencode` trees (19.5 GiB), and nested clones inside lane folders. Cleaning freed about 38 GiB. The rules, in one place:
+
+- **One home.** All t27 work lives in `~/t27` (the main clone) and its worktrees under `~/t27/.claude/worktrees/` (the app makes them). Sibling repos have one fixed home each (`~/t27os`, `~/trios`, `~/t27-mcp`, `~/trinity`); never a second clone of any of them.
+- **No litter outside it.** No clone, worktree or scratch tree in `~`, `~/t27-*`, `~/t27-lanes`, `/tmp` or `/private/tmp` (including `opencode` and other agent-tool temp trees). A lane needs a branch, not a folder: use the app's worktree, and when the work is merged or parked, remove it (skill `self-cleanup`). A worktree is yours to remove only when it is clean, pushed (or its branch parked as a local `rescue/<name>` ref), and no process uses it.
+- **Look before you make one.** More than 5.4 GiB must be free before a new worktree or a build (`df -g .`); under 8 GiB the status bar says low disk. Heavy builds and sweeps are not run on the Mac (see the lab rule above).
+- **Park, do not push, rescue work.** Unmerged work you cannot land is kept as `refs/heads/rescue/<name>` in the main clone and is never pushed.
+- **Foreign-language scratch is forbidden** here as everywhere (`only-t27`); a scratch file in `/tmp` is litter too.
+- **Short terminal commands.** A long `run_in_terminal` command hides the approval button; keep each under about 110 characters, one pipeline (skill `short-terminal-commands`).
+- **The DOCTOR watches this.** The T27 OS DOCTOR (`specs/t27os/doctor.t27`, host `glass_window.t27`) lists agent-litter roots (`/private/tmp/`, `/tmp/`, `~/t27-lanes/`, `~/t27-lane-*`, `~/t27-wt-*`, `.codex`, `.gemini`), offers only folders that are clean, pushed and not in use by a process (lsof check, fails closed), and says "low disk" under 6 GiB with the total it could free. Non-repo scratch trees and loose lane files are not watched yet (follow-up issue).
