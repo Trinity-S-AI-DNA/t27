@@ -7772,12 +7772,8 @@ impl Codegen {
 
     /// Emit an array literal's elements as `{ e0, e1 }` -- the braces that
     /// follow an explicit `[_]T` prefix, where `.{ … }` cannot be used.
-    /// #13625: `@splat` takes a scalar VALUE, not a tuple. A repeat whose
-    /// element is a one-element array literal (`.{ 9.0 } ** 8`, stored with or
-    /// without the braces) must splat the inner scalar `9.0`; splatting the
-    /// tuple emits `@splat(.{ 9.0 })`, which zig rejects on element types
-    /// ("type 'f32' does not support array initialization syntax"). 385 seals
-    /// went stale on master because of exactly this shape.
+    /// #13625: @splat takes a scalar VALUE, not a tuple: a repeat whose
+    /// element is a one-element array literal must splat the inner scalar.
     fn splat_scalar(v: &str) -> String {
         let t = v.trim();
         // `.{ X }` or `{ X }` with a single top-level element -> `X`
