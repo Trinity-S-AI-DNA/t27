@@ -10850,7 +10850,6 @@ impl Codegen {
                         let a = &node.children[0];
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         self.write("@splat(");
-                        eprintln!("SITEA children={} etype={:?} esize={:?}", a.children.len(), a.extra_type, a.extra_size);
                         if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && a.extra_size.trim().contains(';') { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
@@ -11092,20 +11091,11 @@ impl Codegen {
                     return;
                 }
                 if let Some((val, _count)) = txt.rsplit_once(';') {
-                    // #6451/#13591: @splat the value; one-element `.{ X }` unwraps via specs/compiler/splat_scalar.t27 (#13625).
-                    // `[""; 64]` arrives as txt=";64": the parser strips the quotes, so an EMPTY
-                    // element text can only be the empty string literal; emit `""` (#13625).
-                    let tv = val.trim();
-                    let (bytes, n) = if tv.is_empty() {
-                        ("\"\"".as_bytes(), 2usize)
-                    } else {
-                        let sn = splat_scalar::splat_scalar_len(tv.as_bytes());
-                        if sn == 0 { (tv.as_bytes(), tv.len()) } else { let n = rust_num_suffix::rust_num_suffix_len(unsafe { &splat_scalar::ss_out[..sn] }); (unsafe { &rust_num_suffix::ns_out[..n] }, n) }
-                    };
-                    self.write(&format!("@splat({})", String::from_utf8_lossy(bytes)));
+                    // #6451/#13591: @splat the value; `.{ X }` unwraps via specs/compiler/splat_scalar.t27; an EMPTY element text (the parser strips `""`) is the empty string (#13625).
+                    let tv = val.trim(); let sn = splat_scalar::splat_scalar_len(tv.as_bytes()); let n = if sn == 0 { tv.len() } else { rust_num_suffix::rust_num_suffix_len(unsafe { &splat_scalar::ss_out[..sn] }) };
+                    self.write(&format!("@splat({})", String::from_utf8_lossy(if sn == 0 { if tv.is_empty() { b"\"\"" } else { tv.as_bytes() } } else { unsafe { &rust_num_suffix::ns_out[..n] } })));
                 } else {
-                    // Split on TOP-LEVEL commas only -- elements may be calls
-                    // with their own commas.
+                    // Split on TOP-LEVEL commas only -- elements may be calls with their own commas.
                     let mut elems: Vec<String> = Vec::new();
                     let mut depth = 0i32;
                     let mut cur = String::new();
