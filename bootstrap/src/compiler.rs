@@ -7431,14 +7431,14 @@ the parser used to read it as `{}` followed by a negation",
 /// The whole host syscall layer (Linux): open/read/write/close on a real fd, return the count or -errno.
 const HOST_IO_ZIG: &str = r#"
 const __t27_posix = @import("std").posix;
-fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
+fn __t27_host_ret(r: isize) i32 { return @truncate(r); }
 fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
     const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
-    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
+    return __t27_host_ret(@intCast(__t27_posix.system.open(path, f, @as(u32, 0o644))));
 }
-fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
-fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
-fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(@intCast(__t27_posix.system.read(fd, b.ptr, b.len))); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(@intCast(__t27_posix.system.write(fd, b.ptr, b.len))); }
+fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(@intCast(__t27_posix.system.close(fd))); }
 "#;
 
 /// #10876: OS threads in 256 numbered slots. thread_spawn(slot, f, arg) runs f(arg) on a new thread
