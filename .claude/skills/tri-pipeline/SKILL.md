@@ -55,6 +55,7 @@ export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache ZIG_LOCAL_CACHE_DIR=$TMPDIR/zig-lo
 - `t27c gen-verilog | gen-c | gen-rust | gen <spec>` print to stdout (`gen` is Zig). `tri gen <spec>` runs gen-verilog, gen-c and gen-rust to stdout and writes nothing.
 - `t27b verilog <spec>` (native backend, `cargo build --release -p t27b`) is the path for FPGA board tops: it can instantiate primitives and other modules, takes pin attributes `<port>_LOC|IOSTANDARD|SLEW|IN_TERM` (no XDC), and writes a testbench under `-DT27B_TESTBENCH`. It **refuses signed types** (exit 2): fixed-point hardware specs keep a sign flag with unsigned magnitudes.
 - `t27b test <spec> [--check]` is the AArch64 JIT runner (fast; prints total runtime asserts, not per test). Exit 4 means the JIT and the interpreter disagree.
+- `t27c gen-verilog` emits an unbound `<name>_len` wire for `.len` on a slice parameter or a local slice, so iverilog fails with "Unable to bind" (7 errors in `specs/fpga/synth_spec_pipeline.t27`, #13818). Workaround across `specs/fpga`: avoid `.len` and pass an explicit size argument (see `specs/fpga/bridge.t27` near line 98). iverilog may be missing on the VPS lab; install it there with apt.
 - AX7203 caveat (#10498): `t27c fpga-build` defaults to the Wukong fgg676 part and `t27c fpga-flash` has no ax7203 board; the AX7203 is `xc7a200tfbg484-2` (`fpga/HARDWARE_SSOT.md`). Follow M0 (`specs/fpga/rc_filter_ax7203.t27`, #10276) for the board flow.
 
 ## Foreign code in
