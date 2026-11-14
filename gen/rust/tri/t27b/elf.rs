@@ -228,7 +228,7 @@ pub fn write_elf(out: &mut [u8], text: &[u8], names: &[u8], fns: &[u8], refs: &[
     let sh: usize = (sto + strsize);
     let shoff: usize = sh_off(sh);
     put_ehdr(out, shoff);
-    put_bytes(out, EHDR_SIZE, text);
+    put_bytes(out, EHDR_SIZE, text, 0, text.len());
     put_group(out, ro, blobs, lens, 0, nblobs);
     put_group(out, (dat + (8 * ng)), blobs, lens, nblobs, nall);
     let mut i: usize = 0;
@@ -322,6 +322,77 @@ pub fn e2_tables(text: &mut [u8], names: &mut [u8], fns: &mut [u8], refs: &mut [
     blobs[10] = 0;
     blobs[11] = 0;
     blobs[12] = 1;
+}
+
+pub const B_DOT: u8 = 46;
+
+pub const F_NAME: usize = 0;
+
+pub const REC: usize = 72;
+
+pub fn has_at(s: &[u8], lo: usize, hi: usize, w: &[u8]) -> bool {
+    if ((hi - lo) < w.len()) {
+        return false;
+    }
+    let mut k: usize = 0;
+    while (k < w.len()) {
+        if (s[((lo + k)) as usize] != w[(k) as usize]) {
+            return false;
+        }
+        k = (k + 1);
+    }
+    return true;
+}
+
+pub fn hi(nodes: &[u8], i: usize, f: usize) -> usize {
+    return u32_at(nodes, (((i * REC) + 12) + (f * 8)));
+}
+
+pub fn lo(nodes: &[u8], i: usize, f: usize) -> usize {
+    return u32_at(nodes, (((i * REC) + 8) + (f * 8)));
+}
+
+pub fn names(nodes: &[u8], text: &[u8], i: usize, name: &[u8]) -> bool {
+    let a: usize = lo(nodes, i, F_NAME);
+    let b: usize = hi(nodes, i, F_NAME);
+    if !(has_at(text, a, b, name)) {
+        return false;
+    }
+    return (((b - a) == name.len()) || (text[((a + name.len())) as usize] == B_DOT));
+}
+
+pub fn u32_at(nodes: &[u8], at: usize) -> usize {
+    let b0: usize = (nodes[(at) as usize] as usize);
+    let b1: usize = (nodes[((at + 1)) as usize] as usize);
+    let b2: usize = (nodes[((at + 2)) as usize] as usize);
+    let b3: usize = (nodes[((at + 3)) as usize] as usize);
+    return (((b0 + (b1 * 256)) + (b2 * 65536)) + (b3 * 16777216));
+}
+
+pub fn holds(out: &[u8], n: usize, w: &'static str) -> bool {
+    let mut i: usize = 0;
+    while ((i + w.len()) <= n) {
+        let mut k: usize = 0;
+        while ((k < w.len()) && (out[((i + k)) as usize] == w.as_bytes()[(k) as usize])) {
+            k = (k + 1);
+        }
+        if (k == w.len()) {
+            return true;
+        }
+        i = (i + 1);
+    }
+    return false;
+}
+
+pub fn put_bytes(out: &mut [u8], at: usize, s: &[u8], a: usize, b: usize) -> usize {
+    let mut k: usize = a;
+    let mut q: usize = at;
+    while (k < b) {
+        out[(q) as usize] = s[(k) as usize];
+        q = (q + 1);
+        k = (k + 1);
+    }
+    return q;
 }
 
 pub const ARM64_RELOC_PAGE21: u32 = 3;
@@ -447,15 +518,6 @@ pub fn name_len(names: &[u8], at: usize) -> usize {
     return n;
 }
 
-pub fn put_bytes(out: &mut [u8], at: usize, src: &[u8]) -> usize {
-    let mut i: usize = 0;
-    while (i < src.len()) {
-        out[((at + i)) as usize] = src[(i) as usize];
-        i = (i + 1);
-    }
-    return (at + src.len());
-}
-
 pub fn put_group(out: &mut [u8], base: usize, blobs: &[u8], lens: &[u8], from: usize, to: usize) -> () {
     let mut src: usize = 0;
     let mut k: usize = 0;
@@ -466,7 +528,7 @@ pub fn put_group(out: &mut [u8], base: usize, blobs: &[u8], lens: &[u8], from: u
     let mut at: usize = 0;
     while (k < to) {
         let n: usize = blob_len(lens, k);
-        put_bytes(out, (base + at), &blobs[(src) as usize..((src + n)) as usize]);
+        put_bytes(out, (base + at), blobs, src, (src + n));
         src = (src + n);
         at = align_up((at + n), 8);
         k = (k + 1);
@@ -540,5 +602,26 @@ pub fn ref_count(refs: &[u8]) -> usize {
 
 pub fn ref_word(refs: &[u8], i: usize) -> usize {
     return get_u64(refs, (ROW * i));
+}
+
+pub fn same(s: &[u8], w: &'static str) -> bool {
+    if (s.len() != w.len()) {
+        return false;
+    }
+    let mut k: usize = 0;
+    while (k < w.len()) {
+        if (s[(k) as usize] != w.as_bytes()[(k) as usize]) {
+            return false;
+        }
+        k = (k + 1);
+    }
+    return true;
+}
+
+pub fn starts(s: &[u8], lo: usize, hi: usize, w: &'static str) -> bool {
+    if ((hi - lo) < w.len()) {
+        return false;
+    }
+    return same(&s[(lo) as usize..((lo + w.len())) as usize], w);
 }
 

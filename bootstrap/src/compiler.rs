@@ -7431,14 +7431,14 @@ the parser used to read it as `{}` followed by a negation",
 /// The whole host syscall layer (Linux): open/read/write/close on a real fd, return the count or -errno.
 const HOST_IO_ZIG: &str = r#"
 const __t27_posix = @import("std").posix;
-fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
+fn __t27_host_ret(r: isize) i32 { return @truncate(r); }
 fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
     const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
-    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
+    return __t27_host_ret(@intCast(__t27_posix.system.open(path, f, @as(u32, 0o644))));
 }
-fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
-fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
-fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(@intCast(__t27_posix.system.read(fd, b.ptr, b.len))); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(@intCast(__t27_posix.system.write(fd, b.ptr, b.len))); }
+fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(@intCast(__t27_posix.system.close(fd))); }
 "#;
 
 /// #10876: OS threads in 256 numbered slots. thread_spawn(slot, f, arg) runs f(arg) on a new thread
@@ -10849,7 +10849,15 @@ impl Codegen {
                         let a = &node.children[0];
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         self.write("@splat(");
-                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { self.gen_expr(&a.children[0]); } else { self.gen_expr_maybe_paren(a); }
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() {
+                            let c = &a.children[0];
+                            if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" {
+                                // `[7usize; 3]`: the element is a Rust-suffixed
+                                // literal; the array type carries the width.
+                                let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes());
+                                self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] }));
+                            } else { self.gen_expr(c); }
+                        } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
                     }
