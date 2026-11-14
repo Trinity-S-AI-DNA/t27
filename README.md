@@ -95,7 +95,7 @@ The golden-master CI fast path includes:
 
 | Boundary | Rule |
 |---|---|
-| **No `.sh` files on critical path** | Use `tri`/t27c instead of shell scripts |
+| **No `.sh` files on critical path** | Use `tri` / `t27c` over shell scripts |
 | **All new specs → `.t27`** | Language-first: LANG-EN (Law L3 — English identifiers only) |
 | **Seals/gates not relaxed** | Current strictness maintained — no bypass |
 | **No merge without green** | All 8 GOLDEN CHAIN gates must pass before merge |
