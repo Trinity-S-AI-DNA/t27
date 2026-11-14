@@ -11,8 +11,12 @@ this folder cannot open images in its session: the sheets below were built and m
 
 ## Gallery
 
-- `gallery/overview.png` (1840 x 3756): every story, dark and light side by side, one row per story with its
-  number and id; story 34 is a red row that says it was not rendered.
+- `gallery/overview.png` (1500 x 4908, full scale): every story, dark and light side by side, one row per story
+  with its number and id (component, variant, state); story 34 is a red row that says it was not rendered.
+  Rebuilt in iteration 3 (#13677) from the frames rendered 2026-11-14 06:51 UTC.
+- `gallery/before_after_badges.png` (1500 x 562, half scale): iteration 3, the six stories whose bytes changed
+  when a badge fill was sized to its label (20..24 badges, 30 task card), columns before dark, after dark,
+  before light, after light. The other 56 frames are byte-equal to iteration 2.
 - `gallery/before_after.png` (1670 x 1067, half scale): the 18 stories whose bytes changed against the previous
   set (`cd7fec5`, PR #13671), columns before dark, after dark, before light, after light.
 
@@ -53,7 +57,10 @@ layout height is 0 and the host refuses the raster. The fix belongs to `specs/t2
 
 ## Known defects, not fixed here
 
-- Badge text can run past its fill (owner's screenshot, 2026-11-14): horizontal text padding is not symmetric.
+- Badge text ran past its fill (owner's screenshot, 2026-11-14). Iteration 3 (#13677): `vc_node` paints a badge at
+  least as wide as its label plus the style pad on each side and centres the label. Measured: the six stories with
+  a badge changed, nothing else did. Not measured: ink bounds against the fill in pixels (no pixel test yet), and
+  the sheets were not looked at by the agent. The defect stays in the regression set: stories 20..24 and 30.
 - No story caption inside the renderer: the row labels of the sheets come from ffmpeg, not from a `.t27` gallery.
 
 ## Files
