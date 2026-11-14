@@ -2045,6 +2045,7 @@ mod tests {
             ..Default::default()
         };
         let out = generate(&ast, "x.t27").unwrap();
-        assert!(out.contains("fn helper was not emitted"), "{}", out);
+        assert!(out.contains("export function helper"), "{}", out);
+        assert!(!out.contains("fn helper was not emitted"), "{}", out);
     }
 }
