@@ -6,10 +6,10 @@ use std::process::Command;
 pub use crate::gendet_rules::*;
 
 const BACKENDS: &[(&str, &str)] = &[
-    (gendet_rules::BACKEND_CMD_0, gendet_rules::BACKEND_LABEL_0),
-    (gendet_rules::BACKEND_CMD_1, gendet_rules::BACKEND_LABEL_1),
-    (gendet_rules::BACKEND_CMD_2, gendet_rules::BACKEND_LABEL_2),
-    (gendet_rules::BACKEND_CMD_3, gendet_rules::BACKEND_LABEL_3),
+    (BACKEND_CMD_0, BACKEND_LABEL_0),
+    (BACKEND_CMD_1, BACKEND_LABEL_1),
+    (BACKEND_CMD_2, BACKEND_LABEL_2),
+    (BACKEND_CMD_3, BACKEND_LABEL_3),
 ];
 
 #[derive(Subcommand)]
@@ -31,7 +31,7 @@ pub fn run(cmd: &EmitCmd) -> Result<()> {
 }
 
 fn determinism(only: Option<&str>, limit: Option<usize>, runs: usize) -> Result<()> {
-    if !gendet_rules::runs_ok(runs) {
+    if !runs_ok(runs) {
         bail!("--runs must be at least 2: one run cannot disagree with itself");
     }
     let root = repo_root()?;
@@ -40,7 +40,7 @@ fn determinism(only: Option<&str>, limit: Option<usize>, runs: usize) -> Result<
         bail!("no compiler at {}\n  Build it first: cargo build --release -p t27c", t27c.display());
     }
     if let Some(b) = only {
-        if !gendet_rules::backend_is_known(b) {
+        if !matches!(b, BACKEND_CMD_0 | BACKEND_CMD_1 | BACKEND_CMD_2 | BACKEND_CMD_3) {
             bail!("unknown backend `{b}` -- expected one of: {}", BACKENDS.iter().map(|(c,_)| *c).collect::<Vec<_>>().join(", "));
         }
     }
