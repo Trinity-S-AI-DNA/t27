@@ -1,0 +1,243 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/vps/ladder_protocol_map.t27 -- the LAW of the VPS protocol adapter (owner verdict 2026-11-11:
+; protocol logic lives in .t27, the generated artifact runs on the VPS, the loader .mjs is thin glue only).
+; Every decision the adapter makes comes from this spec:
+;   - which model may be served (the allowlist, packed two u64 words little-endian),
+;   - which request shapes are valid (Anthropic Messages, OpenAI Responses),
+;   - how a chat finish reason maps to each protocol's stop vocabulary,
+;   - which features are refused explicitly,
+;   - the effective max_tokens law,
+;   - that the adapter binds loopback only.
+; The generated TypeScript (t27b ts) is the executable artifact; the loader must not decide anything itself.
+; --
+; Feature codes shared by both sides (the loader maps JSON fields onto these codes):
+;   0 text, 1 tool_calls, 2 tool_results, 3 stream, 4 max_tokens, 10 web_search,
+;   11 code_interpreter, 12 computer_use, 13 file_outputs
+; Model id "glm-5.3-flash" packed little-endian: low = "glm-5.3-" (8 bytes), high = "flash".
+; --
+; ASCII only (L3)
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module VpsLadderProtocolMap;
+
+/// "glm-5.3-flash" packed little-endian as four u32 words:
+/// bytes 0x67,0x6c,0x6d,0x2d | 0x35,0x2e,0x33,0x2d | 0x66,0x6c,0x61,0x73 | 0x68
+pub const MODEL_WORD0 : u32 = 0x2d6d6c67; // "glm-"
+pub const MODEL_WORD1 : u32 = 0x2d332e35; // "5.3-"
+pub const MODEL_WORD2 : u32 = 0x73616c66; // "flas"
+pub const MODEL_WORD3 : u32 = 0x00000068; // "h"
+pub const MODEL_NAME_LEN : u32 = 13;
+
+/// 127.0.0.1 packed little-endian.
+pub const BIND_LOOPBACK_U32 : u32 = 0x0100007f;
+
+/// Default max_tokens when a request omits it (both protocols), and its cap.
+pub const MAX_TOKENS_DEFAULT : u32 = 2048;
+pub const MAX_TOKENS_CAP : u32 = 8192;
+
+/// Stop-vocabulary codes on the chat side (what Ladder returns in finish_reason).
+pub const CHAT_STOP : u8 = 0;
+pub const CHAT_LENGTH : u8 = 1;
+pub const CHAT_TOOL_CALLS : u8 = 2;
+
+/// Anthropic stop_reason codes (the loader writes these strings).
+pub const ANTH_END_TURN : u8 = 0;
+pub const ANTH_MAX_TOKENS : u8 = 1;
+pub const ANTH_TOOL_USE : u8 = 2;
+pub const ANTH_UNSUPPORTED : u8 = 255;
+
+/// Responses status codes.
+pub const RESP_COMPLETED : u8 = 1;
+pub const RESP_INCOMPLETE : u8 = 2;
+pub const RESP_UNSUPPORTED : u8 = 255;
+
+// ----------------------------------------------------------------------------------------------------------
+// Validation.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Matches the little-endian u32 word of the packed model id at word index idx.
+pub fn word_matches(got: u32, idx: u32) -> bool {
+    if (idx == 0) { return got == MODEL_WORD0; }
+    if (idx == 1) { return got == MODEL_WORD1; }
+    if (idx == 2) { return got == MODEL_WORD2; }
+    if (idx == 3) { return got == MODEL_WORD3; }
+    return false;
+}
+
+/// The whole allowlist check: length and all four words.
+pub fn model_allowed(len: u32, w0: u32, w1: u32, w2: u32, w3: u32) -> bool {
+    if (len != MODEL_NAME_LEN) { return false; }
+    return word_matches(w0, 0) and word_matches(w1, 1) and word_matches(w2, 2) and word_matches(w3, 3);
+}
+
+/// Validates an Anthropic Messages request; returns the HTTP-ish verdict:
+/// 0 = valid, 400 = missing model or max_tokens, 403 = model not on the allowlist.
+pub fn anth_req_verdict(has_model: bool, max_tokens: u32, name_ok: bool) -> u32 {
+    if (!has_model) { return 400; }
+    if (max_tokens == 0) { return 400; }
+    if (!name_ok) { return 403; }
+    return 0;
+}
+
+/// Validates an OpenAI Responses request; 0 = valid, 400 = missing model, 403 = refused model.
+pub fn resp_req_verdict(has_model: bool, name_ok: bool) -> u32 {
+    if (!has_model) { return 400; }
+    if (!name_ok) { return 403; }
+    return 0;
+}
+
+/// A feature code is served only if it is in the supported set {0,1,2,3,4}; everything else is
+/// refused explicitly (the loader answers 400 with the refusal name, never silently drops it).
+pub fn feature_supported(code: u8) -> bool {
+    if (code == 0) { return true; } // text
+    if (code == 1) { return true; } // tool_calls
+    if (code == 2) { return true; } // tool_results
+    if (code == 3) { return true; } // stream
+    if (code == 4) { return true; } // max_tokens
+    return false;
+}
+
+/// Resolves the effective max_tokens: absent/0 -> MAX_TOKENS_DEFAULT, capped at MAX_TOKENS_CAP.
+pub fn effective_max_tokens(requested: u32) -> u32 {
+    if (requested == 0) { return MAX_TOKENS_DEFAULT; }
+    if (requested > MAX_TOKENS_CAP) { return MAX_TOKENS_CAP; }
+    return requested;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Mappings.
+// ----------------------------------------------------------------------------------------------------------
+
+/// chat finish_reason -> Anthropic stop_reason; an unmapped code is ANTH_UNSUPPORTED (the loader
+/// must then answer with an explicit 502 rather than inventing a value).
+pub fn anth_stop_reason(chat_finish: u8) -> u8 {
+    if (chat_finish == CHAT_STOP) { return ANTH_END_TURN; }
+    if (chat_finish == CHAT_LENGTH) { return ANTH_MAX_TOKENS; }
+    if (chat_finish == CHAT_TOOL_CALLS) { return ANTH_TOOL_USE; }
+    return ANTH_UNSUPPORTED;
+}
+
+/// chat finish_reason -> Responses status; an unmapped code is RESP_UNSUPPORTED.
+pub fn resp_status(chat_finish: u8) -> u8 {
+    if (chat_finish == CHAT_STOP) { return RESP_COMPLETED; }
+    if (chat_finish == CHAT_LENGTH) { return RESP_INCOMPLETE; }
+    if (chat_finish == CHAT_TOOL_CALLS) { return RESP_COMPLETED; }
+    return RESP_UNSUPPORTED;
+}
+
+/// Loopback-only access rule: the only packed address the adapter may bind or trust.
+pub fn loopback_only(ip_packed_le: u32) -> bool {
+    return ip_packed_le == BIND_LOOPBACK_U32;
+}
+
+// ----------------------------------------------------------------------------------------------------------
+// Tests (L4).
+// ----------------------------------------------------------------------------------------------------------
+
+test the_allowlisted_model_passes_and_others_are_refused {
+    assert model_allowed(MODEL_NAME_LEN, MODEL_WORD0, MODEL_WORD1, MODEL_WORD2, MODEL_WORD3);
+    assert !model_allowed(5, MODEL_WORD0, MODEL_WORD1, MODEL_WORD2, MODEL_WORD3);
+    // "gpt-4" packed little-endian
+    assert !model_allowed(5, 0x74707167, 0, 0, 0); // "gptq" packed, wrong words and length
+    // right words, wrong length
+    assert !model_allowed(12, MODEL_WORD0, MODEL_WORD1, MODEL_WORD2, MODEL_WORD3);
+}
+
+test anthropic_request_verdicts {
+    assert anth_req_verdict(true, 100, true) == 0;
+    assert anth_req_verdict(false, 100, true) == 400;
+    assert anth_req_verdict(true, 0, true) == 400;
+    assert anth_req_verdict(true, 100, false) == 403;
+}
+
+test responses_request_verdicts {
+    assert resp_req_verdict(true, true) == 0;
+    assert resp_req_verdict(false, true) == 400;
+    assert resp_req_verdict(true, false) == 403;
+}
+
+test supported_features_are_exactly_the_five {
+    assert feature_supported(0);
+    assert feature_supported(1);
+    assert feature_supported(2);
+    assert feature_supported(3);
+    assert feature_supported(4);
+    assert !feature_supported(10); // web_search
+    assert !feature_supported(11); // code_interpreter
+    assert !feature_supported(12); // computer_use
+    assert !feature_supported(13); // file_outputs
+    assert !feature_supported(200);
+}
+
+test effective_max_tokens_follows_the_law {
+    assert effective_max_tokens(0) == MAX_TOKENS_DEFAULT;
+    assert effective_max_tokens(100) == 100;
+    assert effective_max_tokens(100000) == MAX_TOKENS_CAP;
+}
+
+test stop_vocabularies_map_exactly {
+    assert anth_stop_reason(CHAT_STOP) == ANTH_END_TURN;
+    assert anth_stop_reason(CHAT_LENGTH) == ANTH_MAX_TOKENS;
+    assert anth_stop_reason(CHAT_TOOL_CALLS) == ANTH_TOOL_USE;
+    assert anth_stop_reason(9) == ANTH_UNSUPPORTED;
+    assert resp_status(CHAT_STOP) == RESP_COMPLETED;
+    assert resp_status(CHAT_LENGTH) == RESP_INCOMPLETE;
+    assert resp_status(CHAT_TOOL_CALLS) == RESP_COMPLETED;
+    assert resp_status(9) == RESP_UNSUPPORTED;
+}
+
+
+/// Feature codes the adapter may strip from a request instead of refusing it: the tool is removed
+/// before Ladder sees the request, so the model can never invoke it. Codes outside
+/// {supported} ∪ {strippable} are refused outright.
+pub fn feature_strippable(code: u32) -> bool {
+    if (code == 10) { return true; } // web_search
+    if (code == 11) { return true; } // code_interpreter
+    if (code == 12) { return true; } // computer_use
+    if (code == 13) { return true; } // file_outputs
+    return false;
+}
+
+test cloud_only_tools_are_stripped_not_served {
+    assert feature_strippable(10);
+    assert feature_strippable(11);
+    assert feature_strippable(12);
+    assert feature_strippable(13);
+    assert !feature_strippable(0); // core features are never strippable
+    assert !feature_strippable(3);
+    assert !feature_strippable(200);
+}
+
+
+/// Chat-side role codes the Ladder upstream accepts: 0 system, 1 user, 2 assistant, 3 tool.
+/// Client roles map onto these: OpenAI Responses "developer" is a system prompt on the chat side.
+pub const CHAT_ROLE_SYSTEM : u8 = 0;
+pub const CHAT_ROLE_USER : u8 = 1;
+pub const CHAT_ROLE_ASSISTANT : u8 = 2;
+pub const CHAT_ROLE_TOOL : u8 = 3;
+
+/// Client role codes: 0 system, 1 user, 2 assistant, 3 tool, 4 developer.
+/// Returns the chat-side role; 255 = unmapped (the loader refuses rather than passes it through).
+pub fn chat_role(client_role: u8) -> u8 {
+    if (client_role == 0) { return CHAT_ROLE_SYSTEM; }
+    if (client_role == 1) { return CHAT_ROLE_USER; }
+    if (client_role == 2) { return CHAT_ROLE_ASSISTANT; }
+    if (client_role == 3) { return CHAT_ROLE_TOOL; }
+    if (client_role == 4) { return CHAT_ROLE_SYSTEM; } // developer -> system
+    return 255;
+}
+
+test developer_role_maps_to_system_and_unknowns_are_refused {
+    assert chat_role(0) == CHAT_ROLE_SYSTEM;
+    assert chat_role(1) == CHAT_ROLE_USER;
+    assert chat_role(2) == CHAT_ROLE_ASSISTANT;
+    assert chat_role(3) == CHAT_ROLE_TOOL;
+    assert chat_role(4) == CHAT_ROLE_SYSTEM;
+    assert chat_role(9) == 255;
+}
+
+test the_adapter_binds_loopback_only {
+    assert loopback_only(BIND_LOOPBACK_U32);
+    assert !loopback_only(0); // 0.0.0.0
+    assert !loopback_only(0x0100007f + 1);
+}
