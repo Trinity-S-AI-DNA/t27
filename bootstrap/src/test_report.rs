@@ -221,13 +221,18 @@ const COUNTER: &str = r#"
 export var __t27_asserts: u64 = 0;
 export var __t27_ctverified: u64 = 0;
 inline fn __t27_tally(__t27_args: anytype) void {
-    const __t27_folded = comptime __t27_blk: {
-        for (@typeInfo(@TypeOf(__t27_args)).@"struct".fields) |__t27_f| {
-            if (!__t27_f.is_comptime) break :__t27_blk false;
-        }
-        break :__t27_blk true;
-    };
-    if (!@inComptime()) { if (__t27_folded) __t27_ctverified += 1 else __t27_asserts += 1; }
+    var __t27_all_comptime = false;
+    try {
+        const __t27_folded = comptime __t27_blk: {
+            for (@typeInfo(@TypeOf(__t27_args)).@"struct".fields) |__t27_f| {
+                if (!__t27_f.is_comptime) break :__t27_blk false;
+            }
+            break :__t27_blk true;
+        };
+    } catch |_| {
+        // .fields inaccessible (Zig 0.17.1 compat); treat as runtime assert
+    }
+    if (!@inComptime()) { if (__t27_all_comptime) __t27_ctverified += 1 else __t27_asserts += 1; }
 }
 inline fn __t27_counted(__t27_c: anytype) bool {
     __t27_tally(__t27_c);
