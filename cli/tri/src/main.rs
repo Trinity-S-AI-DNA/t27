@@ -32,7 +32,7 @@ mod misread;
 mod night;
 mod oneaway;
 mod payout;
-mod window;
+#[path = "../../../gen/rust/tri/window/window.rs"] #[allow(dead_code, unused_parens, unused_mut, unused_variables, non_snake_case, clippy::all)] mod window_rules; mod window; // t27c gen-rust of specs/tri/window.t27
 mod modreach;
 mod mutate;
 mod nownote;
