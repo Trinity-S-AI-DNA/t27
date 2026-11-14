@@ -137,6 +137,46 @@ Who reads the cards, and what each reader can and cannot tell you:
 So "is this cron working?" is answered by the host, never by the card or the
 page: `gh run list -R <repo> --workflow <file> --event schedule` for
 `github-actions`, the 999 Inngest dashboard for `inngest`, the service logs for
+
+## 8. tri-mcp-agent-toolkit skill
+
+Unified agent workflow: TRI CLI + MCP tools decision tree. Skill `tri-mcp-agent-toolkit`
+provides the MCP vs tri choice with safety gates, evidence preservation, and cost tier
+routing per AGENT-WORKFLOW-MAP.md.
+
+- **Decision tree**: MCP vs tri choice per task type (read-only vs mutation)
+- **MCP→tri mapping**: All 10 tools mapped (MCP-TRI-MAPPING.md)
+- **Safety gates**: Skill + issue binding required for mutation (`tri git commit`)
+- **Evidence law**: 12 durable evidence items (AGENT-WORKFLOW-MAP.md items 1-12)
+- **Cost tier routing**: FREE → PAID EXCEPTION → PANEL escalation
+- **Go/No-Go**: 5/7 items verified before skill execution
+
+Skill file: `.agents/worktrees/dsh-14f1ef64-5c84/.agents/skills/tri-mcp-agent-toolkit/skill.md`
+
+Primary commands:
+- `tri-mcp-agent-toolkit decide <task>` — choose MCP or tri path
+- `tri-mcp-agent-toolkit map <tool>` — show MCP→tri mapping
+- `tri-mcp-agent-toolkit safety-check` — verify safety gates
+- `tri-mcp-agent-toolkit evidence` — show 12 evidence items
+- `tri-mcp-agent-toolkit cost-tier` — determine cost tier
+
+Agent onboarding:
+- [ ] Read skill.md before first task
+- [ ] Run `tri-mcp-agent-toolkit decide "sample task"`
+- [ ] Verify safety gates: `tri skill status`
+- [ ] Review evidence law: 12 items documented
+- [ ] Cost tier: identify FREE/PAID EXCEPTION/PANEL
+- [ ] Test claim: `tri claim acquire` + release
+- [ ] Test completion: `tri verdict` + `tri git commit` + `tri wrapup`
+
+Related skills:
+- `tri` — full PHI LOOP workflow (specs/skills/tri)
+- `wrap-up` — NotebookLM upload (skills/wrap-up)
+- `phi-loop` — 5-step mutation workflow (skills/phi-loop)
+
+So "is this cron working?" is answered by the host, never by the card or the
+page: `gh run list -R <repo> --workflow <file> --event schedule` for
+`github-actions`, the 999 Inngest dashboard for `inngest`, the service logs for
 `timer` and `railway-cron`. Put what you measured into the card's `NOTE` with
 its date, and re-measure a `NOTE` before you repeat it.
 
@@ -661,6 +701,24 @@ The signature image of the project, on every home surface (t27.ai main page, the
 3. **The motion is a .t27 law, one for every platform.** Spiral radius, angular speed, drift, the pointer push and the limits live in one spec (extend `specs/t27f/petal_menu.t27`, which owns the 27-petal geometry) with tests; the site, T27 OS and the FPGA draw from it. No hand-written animation logic in TS, Swift or Verilog.
 4. **Calm and legible.** Formulas never cover the logo or the petals' hit areas, never overlap each other, and slow down near the pointer instead of fleeing; respect reduced-motion settings (static orbit). Black ground, matte glass, formulas in white at reading size.
 5. **Science first.** Clicking a formula opens its card: the expression, the predicted and measured value, the deviation, the source (CODATA or PDG) and the paper. The visual invites a check; it never claims more than the registry proves.
+
+## V3 Pipeline — Vertical Slice Completion (2026-11-13)
+- **27/27 domain `.t27` contracts** created: `0xA@architecture.t27` through `0xTI@trinity.t27`
+- **14 T27L events** logged: full audit trail of vertical slice registration → domain binding → capability audit → canonical ID validation
+- **4 pipeline phases** verified: minimal vertical slice, subagent integration, tri CLI minimal, tests (contract + integration + golden + coverage)
+- **Team roster**: 16 maxMembers config; current session on 8 (non-blocker for skill creation)
+- **Safety gates**: skill + issue binding active for all mutation paths
+- **Vertical slice**: register agent → assign domain → own spec → emit T27L → audit capability → validate canonical ID
+
+## Team Plugin Rewrite — t27b Migration (2026-11-13)
+- **agent-team** → rewrite on t27b platform
+- **tool-agent-team** → rewrite on t27b platform
+- **agent-team-profile** → rewrite on t27b platform
+- **client-ui-agent-team** → rewrite on t27b platform
+- **Scope**: TeamService, roster, journal, task-board, task-graph, task-view, projection, activity, lifecycle, session-message, persisted, validation, error, client, tools, profile, client-ui
+- **Boundaries**: do not migrate everything immediately; do not write Rust before .t27; do not merge without green; do not allow parallel edits; do not bypass seals/gates
+- **Golden tests**: tri.golden.test and tri.coverage.delta recorded in T27L events
+- **Subagents used**: 1 during V3 pipeline integration
 
 ## Epic progress posts
 

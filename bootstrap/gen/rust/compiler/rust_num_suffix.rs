@@ -53,42 +53,42 @@ pub fn rust_num_suffix_len(v: &[u8]) -> usize {
         let mut t2: u8 = 0;
         let mut t3: u8 = 0;
         let mut t4: u8 = 0;
-        while (i < 13) {
+        while (i < 14) {
             if (i == 0) {
-                tlen = 4;
+                tlen = 5;
                 t0 = 117;
-                t1 = 49;
-                t2 = 50;
-                t3 = 56;
-                t4 = 0;
+                t1 = 115;
+                t2 = 105;
+                t3 = 122;
+                t4 = 101;
             } else {
                 if (i == 1) {
-                    tlen = 5;
-                    t0 = 105;
-                    t1 = 115;
-                    t2 = 105;
-                    t3 = 122;
-                    t4 = 101;
+                    tlen = 4;
+                    t0 = 117;
+                    t1 = 49;
+                    t2 = 50;
+                    t3 = 56;
+                    t4 = 0;
                 } else {
                     if (i == 2) {
-                        tlen = 4;
+                        tlen = 5;
                         t0 = 105;
-                        t1 = 49;
-                        t2 = 50;
-                        t3 = 56;
-                        t4 = 0;
+                        t1 = 115;
+                        t2 = 105;
+                        t3 = 122;
+                        t4 = 101;
                     } else {
                         if (i == 3) {
-                            tlen = 3;
-                            t0 = 117;
-                            t1 = 54;
-                            t2 = 52;
-                            t3 = 0;
+                            tlen = 4;
+                            t0 = 105;
+                            t1 = 49;
+                            t2 = 50;
+                            t3 = 56;
                             t4 = 0;
                         } else {
                             if (i == 4) {
                                 tlen = 3;
-                                t0 = 105;
+                                t0 = 117;
                                 t1 = 54;
                                 t2 = 52;
                                 t3 = 0;
@@ -96,15 +96,15 @@ pub fn rust_num_suffix_len(v: &[u8]) -> usize {
                             } else {
                                 if (i == 5) {
                                     tlen = 3;
-                                    t0 = 117;
-                                    t1 = 51;
-                                    t2 = 50;
+                                    t0 = 105;
+                                    t1 = 54;
+                                    t2 = 52;
                                     t3 = 0;
                                     t4 = 0;
                                 } else {
                                     if (i == 6) {
                                         tlen = 3;
-                                        t0 = 105;
+                                        t0 = 117;
                                         t1 = 51;
                                         t2 = 50;
                                         t3 = 0;
@@ -112,15 +112,15 @@ pub fn rust_num_suffix_len(v: &[u8]) -> usize {
                                     } else {
                                         if (i == 7) {
                                             tlen = 3;
-                                            t0 = 117;
-                                            t1 = 49;
-                                            t2 = 54;
+                                            t0 = 105;
+                                            t1 = 51;
+                                            t2 = 50;
                                             t3 = 0;
                                             t4 = 0;
                                         } else {
                                             if (i == 8) {
                                                 tlen = 3;
-                                                t0 = 105;
+                                                t0 = 117;
                                                 t1 = 49;
                                                 t2 = 54;
                                                 t3 = 0;
@@ -128,34 +128,52 @@ pub fn rust_num_suffix_len(v: &[u8]) -> usize {
                                             } else {
                                                 if (i == 9) {
                                                     tlen = 3;
-                                                    t0 = 102;
-                                                    t1 = 54;
-                                                    t2 = 52;
+                                                    t0 = 105;
+                                                    t1 = 49;
+                                                    t2 = 54;
                                                     t3 = 0;
                                                     t4 = 0;
                                                 } else {
                                                     if (i == 10) {
                                                         tlen = 3;
                                                         t0 = 102;
-                                                        t1 = 51;
-                                                        t2 = 50;
+                                                        t1 = 54;
+                                                        t2 = 52;
                                                         t3 = 0;
                                                         t4 = 0;
                                                     } else {
                                                         if (i == 11) {
-                                                            tlen = 2;
-                                                            t0 = 117;
-                                                            t1 = 56;
-                                                            t2 = 0;
+                                                            tlen = 3;
+                                                            t0 = 102;
+                                                            t1 = 51;
+                                                            t2 = 50;
                                                             t3 = 0;
                                                             t4 = 0;
                                                         } else {
-                                                            tlen = 2;
-                                                            t0 = 105;
-                                                            t1 = 56;
-                                                            t2 = 0;
-                                                            t3 = 0;
-                                                            t4 = 0;
+                                                            if (i == 12) {
+                                                                tlen = 2;
+                                                                t0 = 117;
+                                                                t1 = 56;
+                                                                t2 = 0;
+                                                                t3 = 0;
+                                                                t4 = 0;
+                                                            } else {
+                                                                if (i == 13) {
+                                                                    tlen = 2;
+                                                                    t0 = 105;
+                                                                    t1 = 56;
+                                                                    t2 = 0;
+                                                                    t3 = 0;
+                                                                    t4 = 0;
+                                                                } else {
+                                                                    tlen = 2;
+                                                                    t0 = 105;
+                                                                    t1 = 56;
+                                                                    t2 = 0;
+                                                                    t3 = 0;
+                                                                    t4 = 0;
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
