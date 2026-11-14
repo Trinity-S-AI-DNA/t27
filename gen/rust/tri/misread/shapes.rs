@@ -4,7 +4,7 @@
 // This backend emits declarations only. The spec's checks live in
 // the Zig and Verilog outputs; do not read this file as verified.
 
-pub const NO_FIELD: usize = 18446744073709551615;
+pub const NO_FIELD: usize = 4294967295;
 
 pub fn field_type_at(line: &[u8]) -> usize {
     let a: usize = trim_lo(line, 0, line.len());
