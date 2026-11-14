@@ -7432,13 +7432,10 @@ the parser used to read it as `{}` followed by a negation",
 const HOST_IO_ZIG: &str = r#"
 const __t27_posix = @import("std").posix;
 fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
-fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
-    const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
-    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
-}
-fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
-fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
-fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 { const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{}; return @intCast(__t27_posix.openat(__t27_posix.AT.FDCWD, std.mem.span(path), f, 0o644) catch return -1); }
+fn __t27_host_read(fd: i32, b: []u8) i32 { if (@import("builtin").os.tag == .macos) return @intCast(@as(isize, std.c.read(@intCast(fd), b.ptr, b.len))); return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { if (@import("builtin").os.tag == .macos) return @intCast(@as(isize, std.c.write(@intCast(fd), b.ptr, b.len))); return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
+fn __t27_host_close(fd: i32) i32 { if (@import("builtin").os.tag == .macos) { _ = std.c.close(@intCast(fd)); return 0; } return __t27_host_ret(__t27_posix.system.close(fd)); }
 "#;
 
 /// #10876: OS threads in 256 numbered slots. thread_spawn(slot, f, arg) runs f(arg) on a new thread
