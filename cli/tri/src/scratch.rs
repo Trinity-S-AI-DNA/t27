@@ -43,6 +43,8 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::scratch_rules::*;
 
 pub struct Finding {
     pub file: PathBuf,
@@ -160,7 +162,6 @@ pub fn judge(path: &Path, s: &str) -> Option<Finding> {
         key,
     })
 }
-
 pub fn advice() -> String {
     [
         "  Fix: an AtomicUsize counter AND the pid. Not either one, and not",
@@ -243,7 +244,6 @@ pub fn run(gate: bool, self_check: bool) -> Result<()> {
     }
     Ok(())
 }
-
 /// Negative control: the gate must SEE a planted collision, and must not fire on
 /// the fixed shape. A gate that cannot fail is not a gate.
 fn run_self_check() -> Result<()> {
