@@ -117,6 +117,30 @@ lab host; runbook section 1). The release-relevant claim this run DOES make:
 the optimizer work changed no verdict anywhere in 3,212 files, and no new
 engine disagreement appeared.
 
+## NATIVE RUNTIME MEASUREMENT -- bench_audit, 2026-11-16 (Apple Silicon, native)
+
+The paper's runtime claim for this witness, measured for the first time in
+the release line: verdict_benchmark_200m (verdict_fn x 200M,
+CALLS_TARGET=200_000_000), CLOCK_MONOTONIC around the whole loop, inputs
+made opaque for the C side (volatile seed) because clang -O2 otherwise
+folds the entire loop to a constant.
+
+- t27b JIT (release binary, --macho object + C timing driver):
+  2.18 / 1.91 / 1.94 ns per call -> about 1.9 ns/call (435 -> 383 ms per 200M)
+- same loop in C, clang -O2: 1.68 / 2.04 ns per call -> about 1.9 ns/call
+- results agree (acc % 2 == 0 on both sides).
+
+Honest verdict: runtime parity with an optimizing C compiler on this
+witness, within run-to-run noise; the instruction-count parity from the
+word audit shows up as wall-clock parity. One witness, one host (M-series
+Mac, not the paper's qemu protocol) -- the full suite stays the lab
+runbook's job.
+
+Reproduce: t27b build specs/tri/shootout/bench_audit.t27 -o ba.o --macho,
+link with a CLOCK_MONOTONIC driver, 200e6 calls; C twin with a volatile
+seed, clang -O2. Scratch drivers were measurement plumbing and were
+deleted, not committed (own-language law).
+
 ## PINNED-REVISION COVERAGE -- the paper's criterion, met locally (2026-11-15)
 
 The paper's coverage metric, reproduced locally with today's release binary:
