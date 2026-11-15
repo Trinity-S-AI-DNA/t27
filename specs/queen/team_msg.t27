@@ -219,6 +219,84 @@ pub fn team_claim_lands(deps: u64, done: u64, holder: u32, me: u32, expired: boo
     return claim_lands(holder, me, expired, fence, fence_read);
 }
 
+; --- 6b. Team port piece 1 (gHashTag/t27#13894): member statuses and task-graph validation ----------
+; Read from the DSH Team plugin (deepseek-harness packages/experimental/agent-team roster.ts and
+; task-graph.ts, read-only): a member is provisioning until its child session settles, then active
+; (shown as running or inactive by whether its agent runs) or failed; an active member never becomes
+; failed (the source calls that edge impossible) and nothing returns to provisioning.
+
+pub const MS_PROVISIONING : u8 = 0;
+pub const MS_RUNNING : u8 = 1;
+pub const MS_INACTIVE : u8 = 2;
+pub const MS_FAILED : u8 = 3;
+
+pub fn member_status_known(s: u8) -> bool {
+    return s <= MS_FAILED;
+}
+
+/// Is a change of a member's status from `from` to `to` allowed? provisioning settles to running,
+/// inactive or failed; running and inactive swap; failed is final; a repeat is not a change.
+pub fn member_transition_allowed(from: u8, to: u8) -> bool {
+    if (member_status_known(from) == false) { return false; }
+    if (member_status_known(to) == false) { return false; }
+    if (from == MS_PROVISIONING) { return to != MS_PROVISIONING; }
+    if (from == MS_RUNNING) { return to == MS_INACTIVE; }
+    if (from == MS_INACTIVE) { return to == MS_RUNNING; }
+    return false;
+}
+
+/// Validation codes, in the order they are tried.
+pub const DEP_OK : u8 = 0;
+pub const DEP_MISSING : u8 = 1;
+pub const DEP_DUPLICATE : u8 = 2;
+pub const DEP_SELF : u8 = 3;
+pub const DEP_CYCLE : u8 = 4;
+/// "No offending task": one past the last task number.
+pub const DEP_NO_TASK : u64 = 64;
+
+pub struct DepCheck {
+    code: u8,
+    task: u64,
+}
+
+/// How many bits are set in a mask.
+pub fn mask_count(m: u64) -> u32 {
+    var n : u32 = 0;
+    var k : u64 = 0;
+    while (k < 64) {
+        if (((m >> k) & 1) == 1) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// The lowest task number in a mask, or DEP_NO_TASK for an empty one.
+pub fn mask_first(m: u64) -> u64 {
+    var k : u64 = 0;
+    while (k < 64) {
+        if (((m >> k) & 1) == 1) { return k; }
+        k = k + 1;
+    }
+    return DEP_NO_TASK;
+}
+
+/// Validate one task written with its blockers. `deps` is the blocker mask, `listed` the number of
+/// blockers the author wrote (a repeat makes it larger than the mask's count), `exist` the tasks that
+/// exist, `downstream` the tasks that already wait on `task`, directly or not (the caller keeps that
+/// closure). Order: self, duplicate, missing, cycle. The offender is `task` for self and duplicate
+/// (a mask cannot say which blocker repeated), the lowest absent blocker for missing, and the lowest
+/// blocker that already waits on `task` for cycle.
+pub fn dep_check(task: u64, deps: u64, listed: u32, exist: u64, downstream: u64) -> DepCheck {
+    if (task >= 64) { return DepCheck{.code = DEP_MISSING, .task = task}; }
+    if (deps_without_self(task, deps) == false) { return DepCheck{.code = DEP_SELF, .task = task}; }
+    if (listed != mask_count(deps)) { return DepCheck{.code = DEP_DUPLICATE, .task = task}; }
+    var absent : u64 = deps - (deps & exist);
+    if (absent != 0) { return DepCheck{.code = DEP_MISSING, .task = mask_first(absent)}; }
+    var loop : u64 = deps & downstream;
+    if (loop != 0) { return DepCheck{.code = DEP_CYCLE, .task = mask_first(loop)}; }
+    return DepCheck{.code = DEP_OK, .task = DEP_NO_TASK};
+}
+
 ; --- 7. The record of a cross-session note ----------------------------------------------------------
 
 /// The body itself is not in the row: only its hash and length, so the store keeps no free text
@@ -368,4 +446,68 @@ test a_note_row_carries_no_body {
     assert n.seq == 3;
     assert n.body_len == 40;
     assert tm_may_send(n.tag, ROLE_SOLO, false) == true;
+}
+
+test member_status_transitions_follow_the_roster {
+    assert member_transition_allowed(MS_PROVISIONING, MS_RUNNING) == true;
+    assert member_transition_allowed(MS_PROVISIONING, MS_INACTIVE) == true;
+    assert member_transition_allowed(MS_PROVISIONING, MS_FAILED) == true;
+    assert member_transition_allowed(MS_RUNNING, MS_INACTIVE) == true;
+    assert member_transition_allowed(MS_INACTIVE, MS_RUNNING) == true;
+}
+
+test a_refused_status_transition_stays_refused {
+    assert member_transition_allowed(MS_RUNNING, MS_FAILED) == false;
+    assert member_transition_allowed(MS_INACTIVE, MS_FAILED) == false;
+    assert member_transition_allowed(MS_RUNNING, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_INACTIVE, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_FAILED, MS_RUNNING) == false;
+    assert member_transition_allowed(MS_FAILED, MS_INACTIVE) == false;
+    assert member_transition_allowed(MS_FAILED, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_PROVISIONING, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_RUNNING, MS_RUNNING) == false;
+    assert member_transition_allowed(4, MS_RUNNING) == false;
+    assert member_transition_allowed(MS_PROVISIONING, 4) == false;
+}
+
+test a_clean_task_list_entry_validates_ok {
+    assert dep_check(3, 6, 2, 63, 0).code == DEP_OK;
+    assert dep_check(3, 6, 2, 63, 0).task == DEP_NO_TASK;
+    assert dep_check(3, 0, 0, 63, 0).code == DEP_OK;
+    assert mask_count(6) == 2;
+    assert mask_first(6) == 1;
+    assert mask_first(0) == DEP_NO_TASK;
+}
+
+test a_missing_blocker_names_the_lowest_absent_task {
+    assert dep_check(3, 6, 2, 2, 0).code == DEP_MISSING;
+    assert dep_check(3, 6, 2, 2, 0).task == 2;
+    assert dep_check(3, 6, 2, 4, 0).task == 1;
+    assert dep_check(3, 6, 2, 6, 0).code == DEP_OK;
+    assert dep_check(64, 0, 0, 63, 0).code == DEP_MISSING;
+}
+
+test a_repeated_blocker_is_a_duplicate {
+    assert dep_check(3, 6, 3, 63, 0).code == DEP_DUPLICATE;
+    assert dep_check(3, 6, 3, 63, 0).task == 3;
+    assert dep_check(3, 6, 2, 63, 0).code == DEP_OK;
+}
+
+test a_task_that_blocks_itself_is_refused_as_self {
+    assert dep_check(1, 6, 2, 63, 0).code == DEP_SELF;
+    assert dep_check(1, 6, 2, 63, 0).task == 1;
+    assert dep_check(0, 6, 2, 63, 0).code == DEP_OK;
+}
+
+test a_blocker_that_already_waits_on_the_task_is_a_cycle {
+    assert dep_check(3, 6, 2, 63, 4).code == DEP_CYCLE;
+    assert dep_check(3, 6, 2, 63, 4).task == 2;
+    assert dep_check(3, 6, 2, 63, 8).code == DEP_OK;
+    assert dep_check(3, 6, 2, 63, 2).task == 1;
+}
+
+test validation_codes_are_tried_in_order {
+    assert dep_check(1, 6, 3, 0, 6).code == DEP_SELF;
+    assert dep_check(3, 6, 3, 0, 6).code == DEP_DUPLICATE;
+    assert dep_check(3, 6, 2, 0, 6).code == DEP_MISSING;
 }
