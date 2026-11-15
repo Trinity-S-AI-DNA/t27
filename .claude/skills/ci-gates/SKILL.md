@@ -33,6 +33,8 @@ decision 2026-10-04 (#5935); no hook and no CI job asks for an entry any more.
 2. Save `gh run view <id> --log-failed` to a file and grep the verdict lines (`FAIL`, `STALE`, `##[error]`). The tail of the log is checkout cleanup, not the error.
 3. Before blaming a token, probe the host with no token. The Queen export 404 was a deleted Railway app (`Application not found` on `/`), not a bad secret (#13824, #13825).
 4. Before fixing a red, find the open issue or PR that owns it (Seal Coverage: #13746, PR #13799). Dated reading on master f8bcb2b9: `t27b native` failed 165 of 200 master runs since 2026-11-03 (#6490).
+5. After a schedule is removed, close the duplicate alert issues it opened as not planned, with a pointer (29 "The swarm is not answering" issues, #13828).
+6. A workflow that failed on every run was never tested: prove its fix with one `gh workflow run <file> --ref master` (Queue Health Report, #13830, run 43665116754).
 
 ---
 
