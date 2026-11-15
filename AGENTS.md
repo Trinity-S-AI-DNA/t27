@@ -702,23 +702,16 @@ The signature image of the project, on every home surface (t27.ai main page, the
 4. **Calm and legible.** Formulas never cover the logo or the petals' hit areas, never overlap each other, and slow down near the pointer instead of fleeing; respect reduced-motion settings (static orbit). Black ground, matte glass, formulas in white at reading size.
 5. **Science first.** Clicking a formula opens its card: the expression, the predicted and measured value, the deviation, the source (CODATA or PDG) and the paper. The visual invites a check; it never claims more than the registry proves.
 
-## V3 Pipeline — Vertical Slice Completion (2026-11-13)
-- **27/27 domain `.t27` contracts** created: `0xA@architecture.t27` through `0xTI@trinity.t27`
-- **14 T27L events** logged: full audit trail of vertical slice registration → domain binding → capability audit → canonical ID validation
-- **4 pipeline phases** verified: minimal vertical slice, subagent integration, tri CLI minimal, tests (contract + integration + golden + coverage)
-- **Team roster**: 16 maxMembers config; current session on 8 (non-blocker for skill creation)
-- **Safety gates**: skill + issue binding active for all mutation paths
-- **Vertical slice**: register agent → assign domain → own spec → emit T27L → audit capability → validate canonical ID
+## Agent domains, canonical ids and the Team port (corrected 2026-11-15, #13846)
 
-## Team Plugin Rewrite — t27b Migration (2026-11-13)
-- **agent-team** → rewrite on t27b platform
-- **tool-agent-team** → rewrite on t27b platform
-- **agent-team-profile** → rewrite on t27b platform
-- **client-ui-agent-team** → rewrite on t27b platform
-- **Scope**: TeamService, roster, journal, task-board, task-graph, task-view, projection, activity, lifecycle, session-message, persisted, validation, error, client, tools, profile, client-ui
-- **Boundaries**: do not migrate everything immediately; do not write Rust before .t27; do not merge without green; do not allow parallel edits; do not bypass seals/gates
-- **Golden tests**: tri.golden.test and tri.coverage.delta recorded in T27L events
-- **Subagents used**: 1 during V3 pipeline integration
+The 2026-11-13 "V3 pipeline" note that stood here (commits cc937f9106 and e841ec909d) claimed 27/27 domain contracts `0xA@architecture.t27` .. `0xTI@trinity.t27`, a 20-file Team rewrite on t27b and a 16-member roster. None of those exist. What does:
+
+- **The 27 agents** are `specs/agents/a.t27` .. `specs/agents/ti.t27` (alphabet v3.0, `docs/agents/AGENTS_ALPHABET.md`): ids `t27/A` .. `t27/TI`, registers R0..R26, layers Archetypal (A-I), Spiritual (J-R), Physical (S-Ti).
+- **The 27 domains and the canonical ids** are naming V3 in `specs/queen/agent_registry.t27` section 9f (slugs fixed by the owner 2026-11-09, #13398, epic #12945): codes T27A..T27Z plus T27# (kernel), slugs in `AN_SLUGS`, 106 role ids `0x<Role>@<slug>.t27` such as `0xCompiler@build.t27`. `an_id_ok` is the test of an id: a role under 3 characters or a slug outside `AN_SLUGS` (`0xA@architecture.t27`, `0xK@kernel.t27`) is not canonical.
+- **`specs/domains/`** holds two files (`domain-g.t27`, `domain-pr.paretO.t27`). Their ids do not pass `an_id_ok`, and their tests compare constants with themselves. `specs/mega_epic/mega_epic_pipeline_events.t27` does not parse (line 30).
+- **`.trinity/agent_events.jsonl`**: the lines dated 2026-11-13 are not written by any tool in the tree, so they are not an audit trail.
+- **Team port** (DSH `packages/experimental/agent-team`, `tool-agent-team`, `agent-team-profile`, `client-ui-agent-team`, about 3,650 source lines, in gHashTag/deepseek-harness): not started. Its t27 home is `specs/queen/team_msg.t27` (#13310): lead and mates, tags 28..35, mail accept/hold/refuse, `deps_ready`, `deps_without_self`, `team_claim_lands`, `TEAM_MAX_MATES = 5`. Missing in .t27: task-graph checks (missing, duplicate, cycle), write-scope overlap, roster states, the journal reducer. Host glue (session handles, the subagent seam) and the TSX/CSS panel stay TypeScript and need `owner-approved-foreign`. `t27b ts` emits consts and scalar fns only, so sets are bitmasks, as in `team_msg.t27`. Epic #13633.
+- **Boundaries** (owner, 2026-11-13): one piece at a time; the .t27 spec before any host code; land only on green; one writer per file; no seal or gate bypassed.
 
 ## Epic progress posts
 
