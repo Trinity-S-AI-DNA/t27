@@ -3,7 +3,8 @@
 Status: installed 2026-11-15 after the owner approval recorded as a comment on
 issue #13979. `gitlab-runner verify` reported the runner valid. A trial
 pipeline ran on 2026-11-15 13:31 UTC and its job succeeded (see "Trial
-pipeline" below). The trial project is empty, so a large clone is not proven.
+pipeline" below). A full mirror of this repository and a job at the memory
+limit were run on 2026-11-15 (section "Mirror pipeline" below).
 
 ## Step 1: precondition
 
@@ -77,6 +78,20 @@ then `cat /sys/fs/cgroup/memory.max`. Push the file, then check that the job
 passes on the `vps-docker-1g` runner and that the printed limit is
 805306368.
 
+## Mirror pipeline (2026-11-15)
+
+The public GitHub repository was mirrored into the project `root/t27` (branch `master`) with a server-side fetch from the public URL, no credential. The fetch took 44 s and landed commit `6f9b74e1bfa7528de58eba169fbc68c62ad8e617`. The CI config lives on branch `main` of the same project (project setting `ci_config_path`), so the mirrored tree is unchanged and no pipeline file is in this repository.
+
+Pipeline 3 ran on `master` with `GIT_DEPTH: 0`, started 13:59 UTC, pipeline duration 94 s, on runner `vps-docker-1g` (image `alpine:3.20`). No runner or host limit was changed.
+
+| Job | Result | Duration | Measured |
+| --- | --- | --- | --- |
+| `trial` | success | 74 s | first fetch of the repository into the build directory; limit `805306368` |
+| `clone` | success | 4 s | reused the fetched repository; checked out `6f9b74e1`; `.git` 466.4M, working tree 383.8M, 107 top-level entries; limit `805306368`; script container peak `5050368` |
+| `limit` | failed, exit code 137 (allowed to fail) | 15 s | `head -c 900m /dev/zero \| tail -c 900m \| wc -c`; the kernel log shows a memory-cgroup OOM kill of `tail` at anon-rss 783744 kB inside the job container |
+
+Host after the run: memory available 4170 MB of 7941 MB, swap used 2718 MB of 4095 MB. All six containers stayed up (`gitlab` healthy at 2.271 GiB of 3.418 GiB, `gitlab-runner` at 91 MiB of 256 MiB, and the four other service containers unchanged). Only the job container was stopped by the limit.
+
 ## Do not touch
 
 - any other unit, container or file on the host
@@ -92,7 +107,7 @@ GitLab stays unchanged throughout.
 
 ## Open items
 
-- The trial project is empty, so a large clone is not proven.
-- No job has reached the 768 MiB limit yet; a job that does is still to be run.
+- Full depth is shown by `GIT_DEPTH: 0` and the 466.4M `.git`; the commit count was not read, because the job image has no git.
+- The memory peak of the runner's git helper container during the fetch was not measured; `5050368` is the script container only.
 - The GitLab container uses about 2.5 GiB of its 3.4 GiB limit. Re-measure
   memory before raising any runner or job limit.
