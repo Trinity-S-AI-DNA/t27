@@ -64,6 +64,36 @@ pipelines ran in sequence.
 | GitLab container memory | not recorded before the run (2.16 GiB at the first repository) | 2.009 GiB of 3.418 GiB |
 | Disk used by `/opt/gitlab` data | not recorded | disk figure printed by the run: 22G |
 
+## Generated pipeline (#13941, #13995)
+
+The pipeline file is rendered from `specs/ci/gitlab_lane.t27` by
+`t27c gen-text specs/ci/gitlab_lane.t27 --fn gl_pipeline_yaml`. The first render
+was 4062 bytes, md5 55b3dc756ee61dcf51c1de64c889f8dd. It is stored as
+`pipeline.yml` on GitLab `root/t27`, branch `main`. It is not in the GitHub
+tree: the own-language gate refuses a root `.yml` file.
+
+| Mirror | Head | Result | Pipeline |
+|---|---|---|---|
+| t27-mcp | 335e7e5172, unchanged, not fetched | success, 12 of 12 jobs, 55 s | 17 |
+| t27os | ed54560c5b to 4535f577eb, fetched in 2 s | success, 12 of 12 jobs, 54 s | 19 |
+
+The runner record got the tag `vps-docker-1g` and `run_untagged` true. No limit
+was changed. The jobs were print-only in those two runs.
+
+#13995 gives two jobs a real command; every other job stays print-only:
+
+- `prefetch` fails when `.git/HEAD` differs from `$CI_COMMIT_SHA`. The job image
+  is plain alpine (busybox, no git binary) and the runner checks out a detached
+  HEAD, so that file holds the sha.
+- `guard` lists the `.t27` files, counts the bytes above 0x7F in each with
+  `tr -d` and `wc -c`, prints `non-ascii: <file>` for each hit and fails at the
+  end if there was one.
+
+The render with these commands is 4354 bytes, fingerprint 900205 (the pinned
+tests in the spec). Its md5 and its delivery to GitLab, and the recorded
+pipelines on two mirrors and the planted non-ASCII run, are to be recorded
+after delivery.
+
 ## Open items
 
 1. The mirrors are a one-time snapshot. No scheduled update exists. A future
