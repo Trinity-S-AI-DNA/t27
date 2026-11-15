@@ -17,6 +17,7 @@
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
 use crate::lower::me;
+use crate::lower::pass_event;
 use std::collections::HashMap;
 
 // t27b-generated inline decision source of truth: specs/tri/t27b/inline.t27.
@@ -291,7 +292,8 @@ impl<'a> Gen<'a> {
             caller_size: self.code.len() as u32,
             result_used: true,
         };
-        if !(inline_decision::should_inline_call(cf, sf) && inline_decision::select_shape_ok(true, l.0, l.1, r.0, r.1, f.nparams as u32, f.vars[..f.nparams].iter().all(|v| w64(Some(v.ty))), w64(f.ret), w64(Some(lhs.ty)))) { return None; }
+        if !(inline_decision::should_inline_call(cf, sf) && inline_decision::select_shape_ok(true, l.0, l.1, r.0, r.1, f.nparams as u32, f.vars[..f.nparams].iter().all(|v| w64(Some(v.ty))), w64(f.ret), w64(Some(lhs.ty)))) { pass_event("inline_verdict_fn", false, "should_inline_call or select_shape_ok false"); return None; }
+        pass_event("inline_verdict_fn", true, "select-shaped callee inlined");
         let vals: Vec<V> = args.iter().map(|x| self.eval(x)).collect();
         let (mut x, mut y, mut op2) = (if l.0 == inline_decision::SK_PARAM { vals[l.1 as usize] } else { V::Const(l.1 as i128) }, if r.0 == inline_decision::SK_PARAM { vals[r.1 as usize] } else { V::Const(r.1 as i128) }, *op);
         if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) { (x, y, op2) = (y, x, op2.swap()); }
@@ -421,9 +423,9 @@ impl<'a> Gen<'a> {
             a64::mov_imm(sf, X16, v, &mut words);
             if self.hoist.iter().any(|h| (h.0, h.1) == (v, sf)) { continue; }
             match me::licm_hoist_const(words.len() as u32, !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64), home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64), framed, self.hoist.len() as u32) {
-                me::LICM_CALLER => { self.hoist.push((v, sf, (nint + taken_caller) as Reg)); taken_caller += 1; }
-                me::LICM_CALLEE => { let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.hoist.push((v, sf, r)); }
-                _ => {}
+                me::LICM_CALLER => { pass_event("licm_body_const", true, "const hoisted to caller-saved reg"); self.hoist.push((v, sf, (nint + taken_caller) as Reg)); taken_caller += 1; }
+                me::LICM_CALLEE => { pass_event("licm_body_const", true, "const hoisted to callee-saved reg"); let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.hoist.push((v, sf, r)); }
+                _ => pass_event("licm_body_const", false, "LICM_NONE (needs >= 2 insns or no free reg)"),
             }
         }
         self.temp_base = frame_layout::temp_base_of(slots, self.used_callee.len() as u32);
@@ -727,7 +729,7 @@ impl<'a> Gen<'a> {
                     self.release(v);
                 }
             },
-            Stmt::If { cond, then, els } if self.ifconv(cond, then, els) => {}
+            Stmt::If { cond, then, els } if { let ic = self.ifconv(cond, then, els); pass_event("ifconv", ic, if ic { "if converted to csel" } else { "shape mismatch (var/const/reg/srcs guard)" }); ic } => {}
             Stmt::If { cond, then, els } => {
                 let l_else = self.new_label();
                 self.branch(cond, l_else, false);
@@ -1826,6 +1828,7 @@ impl<'a> Gen<'a> {
                             if (last & 0xFFFF_0FE0) == 0x9A9F_07E0 && (last & 31) == ry as u32 {
                                 let (si, csf) = ((last >> 12) & 0xf, (last >> 31) != 0);
                                 if cp::cinc_ok(s, true, true, true, csf, true) {
+                                    pass_event("cinc", true, "cset+add folded to csinc");
                                     let ol = self.code.len();
                                     self.code.pop();
                                     for xl in self.labels.iter_mut() {
