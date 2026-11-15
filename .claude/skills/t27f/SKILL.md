@@ -750,3 +750,5 @@ them, say that it is missing; do not simulate it.
 ## Traps
 
 - 2026-10-25 2026-10-25 own-language refuses a new .html: hold the page as a PAGE array of lines in a .t27 spec, emit it with t27c gen-js, materialise the artefact into gitignored build/, and keep the materialiser inside a .md (#12218)
+- 2026-11-15 PR #13798: a spec whose invariant walks thousands of comptime steps passes `t27c check`, but CI spec-guards scores it `head 1000000` (does not compile) because Zig exceeds the default 1000 backwards-branch quota. Put `@setEvalBranchQuota(2000000);` at the top of that invariant (#13808).
+- 2026-11-15 The Mac load hook names `t27-lanes/fs-lab.sh`, which does not exist in the home folder. Run `t27c test-report <spec> --specs-dir specs` instead; it ran fine from a subagent worktree (#13808).

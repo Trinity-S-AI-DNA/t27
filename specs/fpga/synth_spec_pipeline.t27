@@ -1,0 +1,334 @@
+module FpgaSynthSpecPipeline;
+// Decision layer for `tri fpga synth-spec`, .t27-native (owner 2026-11-03:
+// everything new on .t27, zero Rust, zero exceptions). Pure logic only; the
+// process-spawn / file-I/O boundary lives in a separate host spec
+// (synth_spec_pipeline_host.t27), the same split as editors.t27 versus
+// editors_host.t27.
+//
+// DRY note: the admission law (verilog_match_of / build_admitted /
+// build_outcome / outcome codes) is the same body as specs/fpga/
+// synth_receipt.t27. It is INLINED here ONLY because t27c 0.5.2 cross-module
+// import is broken in this checkout ("unable to load <module>.zig", ledger
+// addendum 16, #5980/#11777). When import resolves, replace the inlined block
+// with `use fpga::synth_receipt;` and delete the duplicated functions -- the
+// two copies are pinned by the same u8 matrix below so a drift is caught by
+// a test, not by an accident.
+
+// ---- admission law (inlined from specs/fpga/synth_receipt.t27) ----------
+pub const OUTCOME_ADMISSION_REJECTED : u8 = 0;
+pub const OUTCOME_STAGE_FAILED : u8 = 1;
+pub const OUTCOME_BITSTREAM_PRODUCED : u8 = 2;
+
+pub fn verilog_match_of(gen_hash_none: u8, seal_present: u8, verify_ok: u8, input_recorded: u8) -> u8 {
+    if (gen_hash_none == 1) { return 0; }
+    if (seal_present == 0) { return 3; }
+    if (verify_ok == 1 && input_recorded == 1) { return 1; }
+    return 2;
+}
+
+pub fn build_admitted(gen_hash_none: u8, verilog_match: u8, stage_synth: u8) -> u8 {
+    if (gen_hash_none == 1) { return 0; }
+    if (verilog_match == 2) { return 0; }
+    if (verilog_match == 3) { return 0; }
+    if (stage_synth == 2) { return 0; }
+    return 1;
+}
+
+pub fn build_outcome(admission_ok: u8, any_stage_failed: u8, bit_ok: u8) -> u8 {
+    if (admission_ok == 0) { return OUTCOME_ADMISSION_REJECTED; }
+    if (any_stage_failed == 1) { return OUTCOME_STAGE_FAILED; }
+    if (bit_ok == 1) { return OUTCOME_BITSTREAM_PRODUCED; }
+    return OUTCOME_STAGE_FAILED;
+}
+
+pub fn proven_claim(verilog_match: u8, stage_frames_bit: u8, functionality_check_run: u8) -> u8 {
+    if (verilog_match == 1) {
+        if (stage_frames_bit == 1) {
+            if (functionality_check_run == 1) { return 2; } // behavior checked on target
+            return 1;                                       // bitstream_produced only
+        }
+    }
+    return 0;
+}
+// ---- end inlined admission law -----------------------------------------
+
+// Stage ids, fixed and sequential.
+pub const ST_SEAL_VERIFY : u8 = 0;
+pub const ST_GEN_VERILOG : u8 = 1;
+pub const ST_YOSYS : u8 = 2;
+pub const ST_NEXTPNR : u8 = 3;
+pub const ST_FASM2FRAMES : u8 = 4;
+pub const ST_XC7FRAMES2BIT : u8 = 5;
+pub const STAGE_COUNT : u8 = 6;
+
+pub const STAGE_NAMES : [6]str = [
+    "seal_verify",
+    "gen_verilog",
+    "yosys",
+    "nextpnr",
+    "fasm2frames",
+    "xc7frames2bit"
+];
+
+pub const STAGE_NOT_RUN : u8 = 0;
+pub const STAGE_OK : u8 = 1;
+pub const STAGE_FAILED : u8 = 2;
+
+/// Admission verdict for a run.
+pub fn admit(gen_hash_none: u8, seal_present: u8, verify_ok: u8, gen_stage_status: u8) -> u8 {
+    let vm = verilog_match_of(gen_hash_none, seal_present, verify_ok, 1);
+    return build_admitted(gen_hash_none, vm, gen_stage_status);
+}
+
+/// May stage `stage` run? Admission stages (0,1) always run; downstream
+/// (>=2) only when admitted and nothing failed before it.
+pub fn stage_runs(admitted: u8, prior_failed: u8, stage: u8) -> u8 {
+    if (stage == ST_SEAL_VERIFY or stage == ST_GEN_VERILOG) { return 1; }
+    if (admitted == 0) { return 0; }
+    if (prior_failed == 1) { return 0; }
+    return 1;
+}
+
+/// Final verdict for the receipt.
+pub fn run_verdict(admitted: u8, any_stage_failed: u8, bit_ok: u8) -> u8 {
+    return build_outcome(admitted, any_stage_failed, bit_ok);
+}
+
+test admission_refusal_matrix {
+    assert_eq(admit(1, 1, 1, STAGE_OK), 0);     // R1 typecheck refusal
+    assert_eq(admit(0, 0, 1, STAGE_OK), 0);     // seal absent -> vm 3
+    assert_eq(admit(0, 1, 0, STAGE_OK), 0);     // oracle mismatch -> vm 2
+    assert_eq(admit(0, 1, 1, STAGE_FAILED), 0); // gen stage failed
+    assert_eq(admit(0, 1, 1, STAGE_OK), 1);     // all good
+}
+
+test downstream_gating {
+    assert_eq(stage_runs(0, 0, ST_SEAL_VERIFY), 1);
+    assert_eq(stage_runs(0, 0, ST_GEN_VERILOG), 1);
+    assert_eq(stage_runs(0, 0, ST_YOSYS), 0);
+    assert_eq(stage_runs(0, 0, ST_XC7FRAMES2BIT), 0);
+    assert_eq(stage_runs(1, 0, ST_YOSYS), 1);
+    assert_eq(stage_runs(1, 0, ST_NEXTPNR), 1);
+    assert_eq(stage_runs(1, 1, ST_NEXTPNR), 0);
+    assert_eq(stage_runs(1, 1, ST_FASM2FRAMES), 0);
+}
+
+test verdict_mapping {
+    assert_eq(run_verdict(0, 0, 1), OUTCOME_ADMISSION_REJECTED);
+    assert_eq(run_verdict(1, 1, 0), OUTCOME_STAGE_FAILED);
+    assert_eq(run_verdict(1, 0, 1), OUTCOME_BITSTREAM_PRODUCED);
+    assert_eq(run_verdict(1, 0, 0), OUTCOME_STAGE_FAILED); // zero exit, no .bit
+}
+
+invariant refusal_never_reaches_downstream {
+    assert stage_runs(0, 0, ST_YOSYS) == 0;
+    assert stage_runs(0, 0, ST_XC7FRAMES2BIT) == 0;
+}
+
+test claim_is_never_functionality_unless_checked {
+    assert_eq(proven_claim(1, 1, 0), 1); // bitstream produced, not checked
+    assert_eq(proven_claim(1, 1, 1), 2); // functionality checked on target
+    assert_eq(proven_claim(1, 0, 1), 0); // no bitstream
+}
+
+// ---- the OpenXC7 recipe, as executable commands -------------------------
+// Source: fpga/HARDWARE_SSOT.md section 8 (yosys -> nextpnr-xilinx ->
+// fasm2frames -> xc7frames2bit). These are the DECISIONS of what each stage
+// runs; the host boundary (synth_spec_pipeline_host.t27) only spawns the
+// built command. Builders write to `out` and return the byte length, the
+// gen-c-safe string idiom (no str.len / str==).
+
+/// Append s at out[pos..]; returns the number of bytes written.
+fn append_at(out: []u8, pos: usize, s: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < s.len) {
+        out[pos + i] = s[i];
+        i = i + 1;
+    }
+    return s.len;
+}
+
+fn bytes_eq(a: []const u8, b: []const u8) -> bool {
+    if (a.len != b.len) { return false; }
+    var i : usize = 0;
+    while (i < a.len) {
+        if (a[i] != b[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The yosys -p script for one design: read the Verilog, synth to xc7,
+/// write the json that nextpnr consumes.
+pub fn yosys_script(verilog: []const u8, module: []const u8, json: []const u8, out: []u8) -> usize {
+    var p : usize = 0;
+    p += append_at(out, p, "read_verilog ");
+    p += append_at(out, p, verilog);
+    p += append_at(out, p, "; synth_xilinx -family xc7 -top ");
+    p += append_at(out, p, module);
+    p += append_at(out, p, " -flatten; write_json ");
+    p += append_at(out, p, json);
+    return p;
+}
+
+test yosys_script_matches_the_recipe {
+    var b : [512]u8 = undefined;
+    var k : usize = 0;
+    while (k < 512) { b[k] = 0; k = k + 1; }
+    const n : usize = yosys_script("m.v", "blink_test_top", "m.json", b[0..512]);
+    const want : []const u8 = "read_verilog m.v; synth_xilinx -family xc7 -top blink_test_top -flatten; write_json m.json";
+    assert bytes_eq(b[0..n], want);
+}
+
+test append_and_eq_helpers {
+    var b : [8]u8 = undefined;
+    var k : usize = 0;
+    while (k < 8) { b[k] = 0; k = k + 1; }
+    const n : usize = append_at(b[0..8], 0, "ab");
+    assert n == 2;
+    assert b[0] == 97;
+    assert b[1] == 98;
+    assert bytes_eq(b[0..2], "ab");
+    assert bytes_eq("ab", "ab");
+    assert bytes_eq("ab", "ac") == false;
+}
+
+/// seal-verify: `t27c seal <spec> --verify`. The oracle whose stdout the host
+/// scans for "all hashes MATCH".
+pub fn seal_verify_cmd(t27c: []const u8, spec: []const u8, out: []u8) -> usize {
+    var p : usize = 0;
+    p += append_at(out, p, t27c);
+    p += append_at(out, p, " seal ");
+    p += append_at(out, p, spec);
+    p += append_at(out, p, " --verify");
+    return p;
+}
+
+/// gen-verilog: `t27c gen-verilog <spec>` (stdout is the generated Verilog,
+/// hashed by the pipeline before yosys).
+pub fn gen_verilog_cmd(t27c: []const u8, spec: []const u8, out: []u8) -> usize {
+    var p : usize = 0;
+    p += append_at(out, p, t27c);
+    p += append_at(out, p, " gen-verilog ");
+    p += append_at(out, p, spec);
+    return p;
+}
+
+/// nextpnr place-and-route; --ignore-loops is appended only when ring-osc
+/// designs need it (an explicit opt-in, never inferred from a spec name).
+pub fn nextpnr_cmd(chipdb: []const u8, xdc: []const u8, json: []const u8, fasm: []const u8, ignore_loops: u8, out: []u8) -> usize {
+    var p : usize = 0;
+    p += append_at(out, p, "--chipdb ");
+    p += append_at(out, p, chipdb);
+    p += append_at(out, p, " --xdc ");
+    p += append_at(out, p, xdc);
+    p += append_at(out, p, " --json ");
+    p += append_at(out, p, json);
+    p += append_at(out, p, " --fasm ");
+    p += append_at(out, p, fasm);
+    if (ignore_loops == 1) {
+        p += append_at(out, p, " --ignore-loops");
+    }
+    return p;
+}
+
+test nextpnr_ignore_loops_is_explicit {
+    var b : [512]u8 = undefined;
+    var k : usize = 0;
+    while (k < 512) { b[k] = 0; k = k + 1; }
+    const n0 : usize = nextpnr_cmd("c.bin", "t.xdc", "m.json", "m.fasm", 0, b[0..512]);
+    const want0 : []const u8 = "--chipdb c.bin --xdc t.xdc --json m.json --fasm m.fasm";
+    assert bytes_eq(b[0..n0], want0);
+    const n1 : usize = nextpnr_cmd("c.bin", "t.xdc", "m.json", "m.fasm", 1, b[0..512]);
+    const want1 : []const u8 = "--chipdb c.bin --xdc t.xdc --json m.json --fasm m.fasm --ignore-loops";
+    assert bytes_eq(b[0..n1], want1);
+}
+
+/// fasm2frames: `python fasm2frames.py --db-root <db> --part <part> <fasm> <frames>`.
+pub fn fasm2frames_cmd(db_root: []const u8, part: []const u8, fasm: []const u8, frames: []const u8, out: []u8) -> usize {
+    var p : usize = 0;
+    p += append_at(out, p, "--db-root ");
+    p += append_at(out, p, db_root);
+    p += append_at(out, p, " --part ");
+    p += append_at(out, p, part);
+    p += append_at(out, p, " ");
+    p += append_at(out, p, fasm);
+    p += append_at(out, p, " ");
+    p += append_at(out, p, frames);
+    return p;
+}
+
+/// xc7frames2bit: `--frm_file <frames> --output_file <bit> --part_file <part.yaml> --part_name <part>`.
+pub fn xc7frames2bit_cmd(frames: []const u8, bit: []const u8, part_yaml: []const u8, part: []const u8, out: []u8) -> usize {
+    var p : usize = 0;
+    p += append_at(out, p, "--frm_file ");
+    p += append_at(out, p, frames);
+    p += append_at(out, p, " --output_file ");
+    p += append_at(out, p, bit);
+    p += append_at(out, p, " --part_file ");
+    p += append_at(out, p, part_yaml);
+    p += append_at(out, p, " --part_name ");
+    p += append_at(out, p, part);
+    return p;
+}
+
+test fasm2frames_cmd_shape {
+    var b : [512]u8 = undefined;
+    var k : usize = 0;
+    while (k < 512) { b[k] = 0; k = k + 1; }
+    const n : usize = fasm2frames_cmd("prjxray-db/artix7", "xc7a200tfbg484-2", "m.fasm", "m.frames", b[0..512]);
+    const want : []const u8 = "--db-root prjxray-db/artix7 --part xc7a200tfbg484-2 m.fasm m.frames";
+    assert bytes_eq(b[0..n], want);
+}
+
+// ---- seal-oracle verdict and watchdog decisions ------------------------
+
+/// Does the seal oracle's stdout carry the success line "all hashes MATCH"?
+/// The host captures the bytes; THIS decision (what counts as verified) is
+/// here, not in the host.
+pub fn contains_all_match(buf: []const u8, n: usize) -> bool {
+    const needle : []const u8 = "all hashes MATCH";
+    if (n < needle.len) { return false; }
+    var i : usize = 0;
+    while (i + needle.len <= n) {
+        var j : usize = 0;
+        var hit : bool = true;
+        while (j < needle.len) {
+            if (buf[i + j] != needle[j]) { hit = false; j = needle.len; }
+            j = j + 1;
+        }
+        if (hit) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Has the watchdog budget run out? The host kills the child and reports
+/// TIMEOUT (a stage failure), never a tool result; this is the decision.
+pub fn should_kill(elapsed_ms: u32, timeout_ms: u32) -> bool {
+    return elapsed_ms >= timeout_ms;
+}
+
+test seal_oracle_verdict {
+    var b : [64]u8 = undefined;
+    var k : usize = 0;
+    while (k < 64) { b[k] = 0; k = k + 1; }
+    const ok : []const u8 = "gen_hash_zig: MATCH\n\nall hashes MATCH\n";
+    var i : usize = 0;
+    while (i < ok.len) { b[i] = ok[i]; i = i + 1; }
+    assert contains_all_match(b[0..64], ok.len);
+    var bad : [32]u8 = undefined;
+    k = 0;
+    while (k < 32) { bad[k] = 0; k = k + 1; }
+    const badstr : []const u8 = "all hashes MISMATCH";
+    i = 0;
+    while (i < badstr.len) { bad[i] = badstr[i]; i = i + 1; }
+    assert contains_all_match(bad[0..32], badstr.len) == false;
+}
+
+test watchdog_decision {
+    assert should_kill(999, 1000) == false;
+    assert should_kill(1000, 1000);
+    assert should_kill(1001, 1000);
+}
+endmodule

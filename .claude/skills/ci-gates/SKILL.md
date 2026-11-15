@@ -27,6 +27,15 @@ set are dated readings, not the rule. The rule is the ruleset:
 `check-now-freshness` and `check`, a `docs/now/` entry per PR) was removed by owner
 decision 2026-10-04 (#5935); no hook and no CI job asks for an entry any more.
 
+**Triage master reds first (2026-11-15, #13826).** Four steps, in this order:
+
+1. Count reds per workflow in one call: `gh run list --branch master --limit 150 --json name,conclusion`, grouped by name. A workflow red many runs in a row is inherited, not yours.
+2. Save `gh run view <id> --log-failed` to a file and grep the verdict lines (`FAIL`, `STALE`, `##[error]`). The tail of the log is checkout cleanup, not the error.
+3. Before blaming a token, probe the host with no token. The Queen export 404 was a deleted Railway app (`Application not found` on `/`), not a bad secret (#13824, #13825).
+4. Before fixing a red, find the open issue or PR that owns it (Seal Coverage: #13746, PR #13799). Dated reading on master f8bcb2b9: `t27b native` failed 165 of 200 master runs since 2026-11-03 (#6490).
+5. After a schedule is removed, close the duplicate alert issues it opened as not planned, with a pointer (29 "The swarm is not answering" issues, #13828).
+6. A workflow that failed on every run was never tested: prove its fix with one `gh workflow run <file> --ref master` (Queue Health Report, #13830, run 43665116754).
+
 ---
 
 ## 1. A gate that cannot fail reads as coverage, and is worse than none
@@ -17503,3 +17512,7 @@ change to a non-required workflow — nothing. See §550 and the merge-critical 
 - 2026-10-19 On a Mac a spec that no longer compiles under Zig cannot be re-sealed: 't27c seal --save' refuses, rightly. If gen_hash_zig, c and rust still MATCH in 'seal --verify', the recorded test pass is still the evidence for that Zig and only the moved hash is set, to the value verify prints; say so in the PR. (#11103)
 - 2026-10-19 't27b test <spec> --check' cross-checks the JIT against the interpreter; a scratch array declared without a value passes the JIT and faults the interpreter on a read of bytes never written, which turns t27b-native-ratchet red for every PR: run --check on every new spec and start scratch arrays at zero. (#11131)
 - 2026-10-25 2026-10-25 editing a spec is not done at git commit: t27c gen-rust into its gen copy, t27c seal spec --save, tri seals sync-twins, or L2 STALE COPY and spec-guards fail for work that looks finished (#12192)
+- 2026-11-15 symptom: a workflow_dispatch of seal-coverage on master stays pending, then shows as cancelled. Cause: the concurrency group `seal-coverage-${{ github.ref }}` keeps one pending run per ref, so a newer master push displaces it. Fix: dispatch on a diagnostic branch whose relevant files are byte-identical to master (`--ref <branch> -f only="<specs>"`). (#13844)
+- 2026-11-15 a resync that pipes the per-test report through `tail` hides failures in big specs (glass_window has 128 tests). Grep for `failed` and the summary instead (#13858). The step summary is not readable through the API, so read the job log (`gh run view <id> --log`).
+- 2026-11-15 Before filing a fix issue for a failing spec, search what is open: `gh issue list -R Trinity-S-AI-DNA/t27 --search "<spec name> in:title"` and the same with `gh pr list`; when one exists, comment the evidence there instead. #13857 and #13867 duplicated #13801 and #13800, whose fix PRs #13859 and #13866 were already open in another session. (#13875)
+- 2026-11-15 Never enable auto-merge on a PR whose spec-guards is red because of the PR itself (a new or changed sealed spec without its CI seal): spec-guards is not a required check, so auto-merge lands it anyway (#13885 merged with 271 stale against master's 270). Fix: dispatch seal-coverage with only=<spec>, take the seal from the resealed-seals artifact, commit only that file, and enable auto-merge only when the stale count is at or below master's. (#13887)
