@@ -123,8 +123,44 @@ created the pipeline anyway.
 Host: 4734 MB available before, 4637 MB after, 6 containers both times. No
 runner, container or host limit was changed.
 
-Not done: the other nine mirrors still use `smoke.yml`; no scheduled mirror
-update exists; the build, suite, seal and visual jobs still only print.
+Not done: the other nine mirrors moved to `pipeline.yml`, see the next
+subsection; no scheduled mirror update exists; the build, suite, seal and visual
+jobs still only print.
+
+### Nine mirrors on the generated pipeline (#13998)
+
+2026-11-15, about 16:08-16:17 UTC: one `gitlab-rails runner` process switched
+nine mirrors from `smoke.yml@root/t27:main` to `pipeline.yml@root/t27:main` (the
+4354-byte render) and started one pipeline on each with
+`Ci::CreatePipelineService`. Heads were compared first (`git ls-remote` against
+the mirrored head); only 2 of 9 had moved and only those were fetched
+(ghashtag.github.io 3 s, trinity 2 s). 0 of the nine are left on `smoke.yml`; all
+12 lab mirrors now use `pipeline.yml`. Nothing in a mirrored tree was changed;
+the guard was not weakened.
+
+| Mirror | Pipeline | State | Successful jobs | Duration | Files guard named |
+|---|---|---|---|---|---|
+| agent-mail-mcp | 25 | failed | 4/12 | 22 s | 1 |
+| trios-trainer-igla | 26 | success | 12/12 | 54 s | 0 |
+| trios-railway | 27 | skipped | 0/0 | - | - (head commit message asks to skip CI; recorded, not worked around) |
+| leela | 28 | success | 12/12 | 53 s | 0 |
+| turbobaby-user-bot | 29 | success | 12/12 | 58 s | 0 |
+| ghashtag.github.io | 30 | failed | 4/12 | 42 s | 752 |
+| trinity-fpga | 31 | failed | 4/12 | 30 s | 62 |
+| trinity | 32 | failed | 4/12 | 43 s | 741 |
+| trios | 33 | failed | 4/12 | 26 s | 15 |
+
+- Every failed pipeline failed in the same job: `guard`, exit code 1, script
+  failure; each log was read. The count is the number of `non-ascii:` lines in
+  the guard job log, i.e. `.t27` files with non-ASCII bytes. These are findings
+  about the mirrored trees, to be fixed in their source repositories.
+- When `guard` fails, the later stages (seal, reseal, visual, shot_dark,
+  shot_light, vr_diff, report) are skipped, so a failed pipeline has 4 successful
+  jobs (prefetch, build, suite, diagnose) and no report job.
+- Host: 4676 MB available and 6 containers before; 4796 MB and 6 containers
+  after all pipelines finished. No runner, container or host limit was changed.
+- Not done: scheduled mirror update; a job image with t27c (build and suite
+  still only print); fixes for the non-ASCII files.
 
 ## Open items
 
