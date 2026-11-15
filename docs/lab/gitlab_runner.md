@@ -3,7 +3,8 @@
 Status: installed 2026-11-15 after the owner approval recorded as a comment on
 issue #13979. `gitlab-runner verify` reported the runner valid. A trial
 pipeline ran on 2026-11-15 13:31 UTC and its job succeeded (see "Trial
-pipeline" below). The trial project is empty, so a large clone is not proven.
+pipeline" below). A full mirror of this repository and a job at the memory
+limit were run on 2026-11-15 (section "Mirror pipeline" below).
 
 ## Step 1: precondition
 
