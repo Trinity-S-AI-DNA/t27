@@ -4,6 +4,19 @@
 
 **Goal:** ALL specs live in `t27/specs/` as canonical source of truth.
 
+
+![t27b backend shootout: one spec, five backends](docs/blog/t27b-backend-shootout.svg)
+
+**Learn more:** [t27.ai](https://t27.ai) - [Benchmark walkthrough: one spec, five backends](https://t27.ai/blog/one-spec-five-targets-the-t27-backend-shootout/)
+
+| Measured (t27b vs clang -O2; arm64, warm cache, median of 3) | t27b | clang -O2 |
+|---|---|---|
+| Compile time | ~1.0 ms | 70-110 ms (70-100x slower) |
+| Artifact size | 608 B | 17,016 B (28x larger) |
+| Runtime | within 2.4% of clang -O2 | baseline |
+
+Sources: BENCHMARKS.md and the benchmark walkthrough above.
+
 > *Accepted: all specs from our repositories are transferred to a single `t27` as canonical source of truth.*
 > *Other repositories may contain implementation/host adapters, but **specs, contracts, tests and golden artifacts live in `t27`**; in `golden-master` only what passed GOLDEN CHAIN enters.*
 
