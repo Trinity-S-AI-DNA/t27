@@ -31,8 +31,8 @@
 #define K_ADDED 4
 #define BY_USE 0
 #define BY_STEM 1
-#define BACKENDS "c,verilog,rust,zig,json,$"
-#define SUBCOMMANDS "gen-c,gen-verilog,gen-rust,gen,gen-json,$"
+#define BACKENDS "c,verilog,rust,zig,json,text,$"
+#define SUBCOMMANDS "gen-c,gen-verilog,gen-rust,gen,gen-json,gen-text,$"
 #define NOT_FOUND 65535
 #define GEN_ROOT "gen/$"
 #define GEN_ROOT_LEN 4
@@ -799,13 +799,14 @@ size_t text_end(uint8_t* buf, size_t s, size_t e) {
    ------------------------------------------------------- */
 
 /* invariant: the_backend_table_is_pinned */
-/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(BACKENDS) == 5) */
-/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(SUBCOMMANDS) == 5) */
+/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(BACKENDS) == 6) */
+/* invariant the_backend_table_is_pinned is not a C constant expression: (list_len(SUBCOMMANDS) == 6) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "c", 0, 1) == list_index(SUBCOMMANDS, "gen-c", 0, 5)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "verilog", 0, 7) == list_index(SUBCOMMANDS, "gen-verilog", 0, 11)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "rust", 0, 4) == list_index(SUBCOMMANDS, "gen-rust", 0, 8)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "zig", 0, 3) == list_index(SUBCOMMANDS, "gen", 0, 3)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "json", 0, 4) == list_index(SUBCOMMANDS, "gen-json", 0, 8)) */
+/* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(BACKENDS, "text", 0, 4) == list_index(SUBCOMMANDS, "gen-text", 0, 8)) */
 /* invariant the_backend_table_is_pinned is not a C constant expression: (list_index(SUBCOMMANDS, "gen-zig", 0, 7) == NOT_FOUND) */
 
 /* invariant: the_fixed_lengths_are_the_pieces_lengths */

@@ -1,0 +1,391 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/native_policy.t27 -- the safety defaults of the T27 OS native line (Refs #13212, FR-006):
+// the tool allowlist, the approval gate for command and network tools, the refusal of a spawn that no
+// policy grants, the redaction law and the names of the environment variables that may carry a secret.
+//
+// THE RULES, as code:
+//   1. A tool runs only if it is on the allowlist AND its class lets it run. The default allowlist holds
+//      the two read-only tools and nothing else.
+//   2. A command tool and a network tool are HELD until an explicit approval for that tool exists. A
+//      held call is never run, never retried and never turned into an allow by a later default.
+//   3. A spawn tool is refused unless the policy carries a spawn grant (the default has none). An agent
+//      therefore cannot start an agent on its own.
+//   4. A secret is read from the environment (names below) or a supported secret store; its VALUE is
+//      never written to a log, a report or a repository file. redact_secret and redact_bearer are the
+//      law that turns any text into text without it; leaks() is the check the acceptance suite runs on
+//      every artifact.
+//   5. An audit line names a tool and a decision, never an argument: it holds no secret by construction.
+// ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osNativePolicy;
+
+use t27os::session_store::put_bytes;
+use t27os::native_provider::find_from;
+use t27os::native_provider::NOT_FOUND;
+use std::mem::bytes_eq;
+
+// ---- tools and classes -------------------------------------------------------------------------------------
+
+pub const TOOL_NONE : u32 = 0;
+pub const TOOL_READ_TEXT : u32 = 1;
+pub const TOOL_CLOCK : u32 = 2;
+pub const TOOL_RUN_COMMAND : u32 = 3;
+pub const TOOL_HTTP_FETCH : u32 = 4;
+pub const TOOL_SPAWN_AGENT : u32 = 5;
+pub const TOOL_MAX : u32 = 5;
+
+pub const CLASS_NONE : u32 = 0;
+pub const CLASS_READ_ONLY : u32 = 1;
+pub const CLASS_COMMAND : u32 = 2;
+pub const CLASS_NETWORK : u32 = 3;
+pub const CLASS_SPAWN : u32 = 4;
+
+pub fn tool_name(t: u32) -> []const u8 {
+    if (t == TOOL_READ_TEXT) { return "read_text"; }
+    if (t == TOOL_CLOCK) { return "clock"; }
+    if (t == TOOL_RUN_COMMAND) { return "run_command"; }
+    if (t == TOOL_HTTP_FETCH) { return "http_fetch"; }
+    if (t == TOOL_SPAWN_AGENT) { return "spawn_agent"; }
+    return "none";
+}
+
+pub fn tool_class(t: u32) -> u32 {
+    if (t == TOOL_READ_TEXT or t == TOOL_CLOCK) { return CLASS_READ_ONLY; }
+    if (t == TOOL_RUN_COMMAND) { return CLASS_COMMAND; }
+    if (t == TOOL_HTTP_FETCH) { return CLASS_NETWORK; }
+    if (t == TOOL_SPAWN_AGENT) { return CLASS_SPAWN; }
+    return CLASS_NONE;
+}
+
+/// True for a tool that only reads and cannot change anything: the only kind an agent may call by default.
+pub fn is_read_only(t: u32) -> bool {
+    return tool_class(t) == CLASS_READ_ONLY;
+}
+
+// ---- the policy --------------------------------------------------------------------------------------------
+
+/// allow and approved are masks, bit t of the number set when tool t is listed (2^t). spawn_ok is the
+/// explicit spawn grant. A policy is a value: every change returns a new one.
+pub struct NativePolicy {
+    allow: u32,
+    approved: u32,
+    spawn_ok: bool,
+}
+
+/// 2^t for a tool id; 0 for an id out of range.
+pub fn bit_of(t: u32) -> u32 {
+    if (t == 0 or t > TOOL_MAX) { return 0; }
+    var b : u32 = 1;
+    var i : u32 = 0;
+    while (i < t) {
+        b = b * 2;
+        i = i + 1;
+    }
+    return b;
+}
+
+pub fn mask_has(mask: u32, t: u32) -> bool {
+    const b : u32 = bit_of(t);
+    if (b == 0) { return false; }
+    return (mask / b) % 2 == 1;
+}
+
+/// The default: the two read-only tools allowed; nothing approved; no spawn grant.
+pub fn default_policy() -> NativePolicy {
+    return NativePolicy { allow: bit_of(TOOL_READ_TEXT) + bit_of(TOOL_CLOCK), approved: 0, spawn_ok: false };
+}
+
+/// Lists a tool on the allowlist. Listing is not approving: a command or network tool is still held.
+pub fn allow_tool(p: NativePolicy, t: u32) -> NativePolicy {
+    if (bit_of(t) == 0 or mask_has(p.allow, t)) { return p; }
+    return NativePolicy { allow: p.allow + bit_of(t), approved: p.approved, spawn_ok: p.spawn_ok };
+}
+
+/// An explicit approval for a command or network tool. It has no effect on any other tool.
+pub fn approve_tool(p: NativePolicy, t: u32) -> NativePolicy {
+    const c : u32 = tool_class(t);
+    if ((c != CLASS_COMMAND and c != CLASS_NETWORK) or mask_has(p.approved, t)) { return p; }
+    return NativePolicy { allow: p.allow, approved: p.approved + bit_of(t), spawn_ok: p.spawn_ok };
+}
+
+/// The spawn grant: the one switch that lets an allowlisted spawn tool run.
+pub fn grant_spawn(p: NativePolicy) -> NativePolicy {
+    return NativePolicy { allow: p.allow, approved: p.approved, spawn_ok: true };
+}
+
+// ---- the decision ------------------------------------------------------------------------------------------
+
+pub const DEC_ALLOW : u32 = 0;
+pub const DEC_HOLD_APPROVAL : u32 = 1;
+pub const DEC_DENY_NOT_LISTED : u32 = 2;
+pub const DEC_DENY_NO_SPAWN_POLICY : u32 = 3;
+pub const DEC_DENY_UNKNOWN : u32 = 4;
+/// Not a policy verdict: the caller's own per-run tool budget is spent (decide never returns it).
+pub const DEC_DENY_LIMIT : u32 = 5;
+/// No decision has been taken yet.
+pub const DEC_UNSET : u32 = 255;
+
+pub fn decision_label(d: u32) -> []const u8 {
+    if (d == DEC_ALLOW) { return "allow"; }
+    if (d == DEC_HOLD_APPROVAL) { return "hold_approval"; }
+    if (d == DEC_DENY_NOT_LISTED) { return "deny_not_listed"; }
+    if (d == DEC_DENY_NO_SPAWN_POLICY) { return "deny_no_spawn_policy"; }
+    if (d == DEC_DENY_LIMIT) { return "deny_tool_limit"; }
+    return "deny_unknown";
+}
+
+/// The verdict for one tool call under policy p. Only DEC_ALLOW runs anything.
+pub fn decide(p: NativePolicy, t: u32) -> u32 {
+    const c : u32 = tool_class(t);
+    if (c == CLASS_NONE) { return DEC_DENY_UNKNOWN; }
+    if (mask_has(p.allow, t) == false) { return DEC_DENY_NOT_LISTED; }
+    if (c == CLASS_SPAWN) {
+        if (p.spawn_ok) { return DEC_ALLOW; }
+        return DEC_DENY_NO_SPAWN_POLICY;
+    }
+    if (c == CLASS_COMMAND or c == CLASS_NETWORK) {
+        if (mask_has(p.approved, t)) { return DEC_ALLOW; }
+        return DEC_HOLD_APPROVAL;
+    }
+    return DEC_ALLOW;
+}
+
+pub fn may_run(p: NativePolicy, t: u32) -> bool {
+    return decide(p, t) == DEC_ALLOW;
+}
+
+/// "tool=<name> decision=<label>\n": the audit line. It carries no argument, so no secret can enter it.
+/// Returns the length; 0 when `out` is shorter than 64 bytes.
+pub fn audit_line(t: u32, d: u32, out: []u8) -> usize {
+    if (out.len < 64) { return 0; }
+    var n : usize = put_bytes(out, 0, "tool=");
+    n = put_bytes(out, n, tool_name(t));
+    n = put_bytes(out, n, " decision=");
+    n = put_bytes(out, n, decision_label(d));
+    out[n] = 10;
+    return n + 1;
+}
+
+// ---- secrets and redaction ---------------------------------------------------------------------------------
+
+/// The only environment variables the native line reads. Names only: no value is ever stored here.
+pub const ENV_HOST : str = "T27OS_LMSTUDIO_HOST";
+pub const ENV_PORT : str = "T27OS_LMSTUDIO_PORT";
+pub const ENV_MODEL : str = "T27OS_LMSTUDIO_MODEL";
+pub const ENV_KEY : str = "T27OS_LMSTUDIO_API_KEY";
+
+pub fn env_name_known(name: []const u8) -> bool {
+    return bytes_eq(name, ENV_HOST) or bytes_eq(name, ENV_PORT) or bytes_eq(name, ENV_MODEL) or bytes_eq(name, ENV_KEY);
+}
+
+/// True for the one variable whose value is a secret: it is redacted from everything that is written.
+pub fn env_is_secret(name: []const u8) -> bool {
+    return bytes_eq(name, ENV_KEY);
+}
+
+pub const REDACTED : str = "[REDACTED]";
+pub const REDACT_FAIL : usize = 4294967295;
+pub const BEARER : str = "Bearer ";
+
+fn put_checked(out: []u8, at: usize, s: []const u8) -> usize {
+    if (at == REDACT_FAIL or at + s.len > out.len) { return REDACT_FAIL; }
+    return put_bytes(out, at, s);
+}
+
+/// Copies text into out with every occurrence of `secret` replaced by [REDACTED]. Returns the length, or
+/// REDACT_FAIL when out is too short (never a clipped copy). An empty secret changes nothing.
+pub fn redact_secret(text: []const u8, secret: []const u8, out: []u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < text.len) {
+        const hit : usize = find_from(text, secret, i);
+        if (hit == NOT_FOUND) {
+            return put_checked(out, n, text[i..text.len]);
+        }
+        n = put_checked(out, n, text[i..hit]);
+        n = put_checked(out, n, REDACTED);
+        if (n == REDACT_FAIL) { return n; }
+        i = hit + secret.len;
+    }
+    return n;
+}
+
+/// Replaces the token after every "Bearer " with [REDACTED], whatever its value: the net for a key the
+/// caller did not know to pass. The token ends at a space, CR, LF or a double quote.
+pub fn redact_bearer(text: []const u8, out: []u8) -> usize {
+    var n : usize = 0;
+    var i : usize = 0;
+    while (i < text.len) {
+        const hit : usize = find_from(text, BEARER, i);
+        if (hit == NOT_FOUND) {
+            return put_checked(out, n, text[i..text.len]);
+        }
+        const start : usize = hit + 7;
+        n = put_checked(out, n, text[i..start]);
+        var e : usize = start;
+        while (e < text.len and text[e] != 32 and text[e] != 10 and text[e] != 13 and text[e] != 34) {
+            e = e + 1;
+        }
+        n = put_checked(out, n, REDACTED);
+        if (n == REDACT_FAIL) { return n; }
+        i = e;
+    }
+    return n;
+}
+
+/// True when `secret` (non-empty) appears in `artifact`. The acceptance suite runs this on every log image
+/// and report it writes.
+pub fn leaks(artifact: []const u8, secret: []const u8) -> bool {
+    if (secret.len == 0) { return false; }
+    return find_from(artifact, secret, 0) != NOT_FOUND;
+}
+
+// ---- the tests ---------------------------------------------------------------------------------------------
+
+test "the_default_policy_runs_only_the_two_read_only_tools" {
+    const p : NativePolicy = default_policy();
+    assert decide(p, TOOL_READ_TEXT) == DEC_ALLOW;
+    assert decide(p, TOOL_CLOCK) == DEC_ALLOW;
+    assert decide(p, TOOL_RUN_COMMAND) == DEC_DENY_NOT_LISTED;
+    assert decide(p, TOOL_HTTP_FETCH) == DEC_DENY_NOT_LISTED;
+    assert decide(p, TOOL_SPAWN_AGENT) == DEC_DENY_NOT_LISTED;
+    assert is_read_only(TOOL_CLOCK);
+    assert is_read_only(TOOL_RUN_COMMAND) == false;
+}
+
+test "a_tool_outside_the_allowlist_is_rejected_and_an_unknown_id_is_unknown" {
+    const p : NativePolicy = default_policy();
+    assert may_run(p, TOOL_RUN_COMMAND) == false;
+    assert decide(p, 0) == DEC_DENY_UNKNOWN;
+    assert decide(p, 99) == DEC_DENY_UNKNOWN;
+    assert may_run(p, 99) == false;
+}
+
+test "a_listed_command_or_network_tool_is_held_until_it_is_approved" {
+    var p : NativePolicy = allow_tool(default_policy(), TOOL_RUN_COMMAND);
+    p = allow_tool(p, TOOL_HTTP_FETCH);
+    assert decide(p, TOOL_RUN_COMMAND) == DEC_HOLD_APPROVAL;
+    assert decide(p, TOOL_HTTP_FETCH) == DEC_HOLD_APPROVAL;
+    assert may_run(p, TOOL_RUN_COMMAND) == false;
+    const q : NativePolicy = approve_tool(p, TOOL_RUN_COMMAND);
+    assert decide(q, TOOL_RUN_COMMAND) == DEC_ALLOW;
+    assert decide(q, TOOL_HTTP_FETCH) == DEC_HOLD_APPROVAL;
+}
+
+test "an_approval_without_a_listing_runs_nothing" {
+    const p : NativePolicy = approve_tool(default_policy(), TOOL_RUN_COMMAND);
+    assert decide(p, TOOL_RUN_COMMAND) == DEC_DENY_NOT_LISTED;
+}
+
+test "an_approval_does_not_apply_to_a_read_only_or_a_spawn_tool" {
+    const p : NativePolicy = approve_tool(default_policy(), TOOL_CLOCK);
+    assert p.approved == 0;
+    const q : NativePolicy = approve_tool(allow_tool(default_policy(), TOOL_SPAWN_AGENT), TOOL_SPAWN_AGENT);
+    assert q.approved == 0;
+    assert decide(q, TOOL_SPAWN_AGENT) == DEC_DENY_NO_SPAWN_POLICY;
+}
+
+test "a_spawn_without_a_policy_is_refused_and_with_a_grant_is_allowed" {
+    const p : NativePolicy = allow_tool(default_policy(), TOOL_SPAWN_AGENT);
+    assert decide(p, TOOL_SPAWN_AGENT) == DEC_DENY_NO_SPAWN_POLICY;
+    const q : NativePolicy = grant_spawn(p);
+    assert decide(q, TOOL_SPAWN_AGENT) == DEC_ALLOW;
+    // the grant alone does not list the tool
+    assert decide(grant_spawn(default_policy()), TOOL_SPAWN_AGENT) == DEC_DENY_NOT_LISTED;
+}
+
+test "listing_twice_changes_nothing_and_an_unknown_tool_cannot_be_listed" {
+    const base : NativePolicy = default_policy();
+    const p : NativePolicy = allow_tool(base, TOOL_CLOCK);
+    assert p.allow == base.allow;
+    const q : NativePolicy = allow_tool(base, 77);
+    assert q.allow == base.allow;
+}
+
+test "the_audit_line_names_the_tool_and_the_verdict_and_nothing_else" {
+    var out : [96]u8 = undefined;
+    const n : usize = audit_line(TOOL_RUN_COMMAND, DEC_HOLD_APPROVAL, out[0..96]);
+    const want : []const u8 = "tool=run_command decision=hold_approval\n";
+    assert n == want.len;
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+    assert audit_line(TOOL_CLOCK, DEC_ALLOW, out[0..32]) == 0;
+}
+
+test "the_tool_limit_verdict_has_its_own_label_and_decide_never_returns_it" {
+    var out : [96]u8 = undefined;
+    const n : usize = audit_line(TOOL_CLOCK, DEC_DENY_LIMIT, out[0..96]);
+    const want : []const u8 = "tool=clock decision=deny_tool_limit\n";
+    assert n == want.len;
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+    var t : u32 = 0;
+    while (t <= TOOL_MAX + 1) {
+        assert decide(allow_tool(default_policy(), TOOL_CLOCK), t) != DEC_DENY_LIMIT;
+        t = t + 1;
+    }
+}
+
+test "redact_secret_removes_every_copy_of_the_secret" {
+    const text : []const u8 = "key=sk-test-1234 again sk-test-1234 end";
+    var out : [96]u8 = undefined;
+    const n : usize = redact_secret(text, "sk-test-1234", out[0..96]);
+    assert n != REDACT_FAIL;
+    assert leaks(out[0..n], "sk-test-1234") == false;
+    const want : []const u8 = "key=[REDACTED] again [REDACTED] end";
+    assert n == want.len;
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+}
+
+test "the_leak_check_sees_a_secret_that_was_not_redacted" {
+    // negative control: the raw text leaks, the redacted text does not
+    const text : []const u8 = "token sk-test-1234 used";
+    assert leaks(text, "sk-test-1234");
+    assert leaks(text, "") == false;
+    assert leaks(text, "sk-other") == false;
+}
+
+test "redact_secret_refuses_a_buffer_that_is_too_short_and_leaves_an_empty_secret_alone" {
+    var tiny : [8]u8 = undefined;
+    assert redact_secret("abc sk-test-1234", "sk-test-1234", tiny[0..8]) == REDACT_FAIL;
+    var out : [32]u8 = undefined;
+    assert redact_secret("plain text", "", out[0..32]) == 10;
+}
+
+test "redact_bearer_hides_any_token_after_the_header_word" {
+    const text : []const u8 = "Authorization: Bearer abc.def-123\r\nHost: x\r\n";
+    var out : [96]u8 = undefined;
+    const n : usize = redact_bearer(text, out[0..96]);
+    assert n != REDACT_FAIL;
+    assert leaks(out[0..n], "abc.def-123") == false;
+    const want : []const u8 = "Authorization: Bearer [REDACTED]\r\nHost: x\r\n";
+    assert n == want.len;
+    var i : usize = 0;
+    while (i < n) {
+        assert out[i] == want[i];
+        i = i + 1;
+    }
+}
+
+test "a_text_without_the_bearer_word_is_copied_unchanged" {
+    var out : [32]u8 = undefined;
+    assert redact_bearer("GET /v1/models", out[0..32]) == 14;
+}
+
+test "only_the_key_variable_is_a_secret_and_unknown_names_are_not_read" {
+    assert env_name_known("T27OS_LMSTUDIO_HOST");
+    assert env_name_known("T27OS_LMSTUDIO_API_KEY");
+    assert env_name_known("HOME") == false;
+    assert env_is_secret("T27OS_LMSTUDIO_API_KEY");
+    assert env_is_secret("T27OS_LMSTUDIO_HOST") == false;
+}
