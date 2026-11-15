@@ -137,6 +137,14 @@ an `AGENTS:` line. Purpose: make the system's hard-to-follow work transparent to
 - The sandbox cannot create worktrees or write `.git/config`: create them from a Terminal tab.
 - Use Sonnet subagents for the work, at most three at once on this 8 GB Mac; the orchestrator
   merges, builds, launches and screenshots.
+- Stale UI base (2026-11-15, #13879). Symptom: the native window shows an older header, themes or layout than
+  master. Cause: a stability bundle built from a stale branch (lane/uikit-sync was 63 commits behind master).
+  Fix: before every native build or launch run `git fetch origin`, `git rev-parse HEAD`,
+  `git rev-parse origin/master` and `git diff --stat HEAD origin/master`; if HEAD differs, stop with reason
+  STALE_UI_BASE; build only from fresh master, or from an explicitly labelled EXPERIMENTAL base (suspect
+  commits applied on top of fresh master in an isolated worktree, never pushed). Verification: build base SHA
+  equals origin/master SHA; header and theme behaviour match master; Dark and Light screenshots recorded.
+  Applies to: all T27 OS native stability and UI verification builds.
 
 ## The 27 petals are the 27 agents (owner, 2026-10-20)
 
