@@ -89,10 +89,42 @@ was changed. The jobs were print-only in those two runs.
   `tr -d` and `wc -c`, prints `non-ascii: <file>` for each hit and fails at the
   end if there was one.
 
-The render with these commands is 4354 bytes, fingerprint 900205 (the pinned
-tests in the spec). Its md5 and its delivery to GitLab, and the recorded
-pipelines on two mirrors and the planted non-ASCII run, are to be recorded
-after delivery.
+The render with these commands (from master 1f354589de, `t27c gen-text
+specs/ci/gitlab_lane.t27 --fn gl_pipeline_yaml`) is 4354 bytes, md5
+81256964011bb06ed706e20f3086e434, fingerprint 900205 (the pinned tests in the
+spec). The spec tests on the lab host through generated Zig: 33 of 33 passed.
+
+Delivered 2026-11-15 as `pipeline.yml` on `root/t27`, branch `main` (the commit
+carries `[skip ci]`); the stored blob is 4354 bytes. Delivery and both mirror
+pipelines were started by one rails process.
+
+| Mirror | Head | Result | Pipeline |
+|---|---|---|---|
+| t27-mcp | 335e7e5172, unchanged, not fetched | success, 12 of 12 jobs, 52 s | 21 |
+| t27os | 4535f577eb, unchanged, not fetched | failed, 22 s | 22 |
+
+On t27-mcp, `prefetch` and `guard` ran their real commands. On t27os, `prefetch`,
+`build`, `suite` and `diagnose` succeeded; `guard` failed with exit code 1 and
+named 5 `.t27` files under `specs/os/bots/` that hold non-ASCII bytes; the 7
+later jobs were skipped. This is a true finding about the mirrored tree, not a
+pipeline defect, and the files were not changed. So the "12 of 12 on t27os"
+target of #13995 is not met, and the reason is recorded here.
+
+Negative control: a private scratch project `root/guard-control` holds
+`planted.t27` with one non-ASCII character (commit 47b878f40d). Pipeline 23
+failed: `prefetch` succeeded, `guard` exited with code 1 and logged
+`non-ascii: ./planted.t27`. The push event also created pipeline 24 for the same
+commit.
+
+Trap: `Ci::CreatePipelineService` called in the same rails process that created
+the project answered "insufficient permission to run a pipeline"; the push event
+created the pipeline anyway.
+
+Host: 4734 MB available before, 4637 MB after, 6 containers both times. No
+runner, container or host limit was changed.
+
+Not done: the other nine mirrors still use `smoke.yml`; no scheduled mirror
+update exists; the build, suite, seal and visual jobs still only print.
 
 ## Open items
 
