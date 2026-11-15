@@ -298,3 +298,7 @@ documents addressed to other people's agents, the six negative controls, and the
 `;`-alone-on-a-line trap that silently discards a `module` declaration. This
 section is a pointer, not a copy -- the recorded defect in this codebase family
 is the hand-copied rule that only two of its three homes knew about.
+
+## Agent domains and the Team port
+
+The 27 agents, the naming V3 domains and canonical ids, and the state of the Team port are one section of AGENTS.md, "Agent domains, canonical ids and the Team port". The 2026-11-13 "27/27 domain contracts" note was not true of the tree (#13846); this is a pointer, not a copy.

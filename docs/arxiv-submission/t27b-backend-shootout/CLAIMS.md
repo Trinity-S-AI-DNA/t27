@@ -1,5 +1,10 @@
 # Claims and evidence
 
+Paper: "GOLDEN SPECS: t27b --- A Fast Baseline AArch64 Compiler for a
+Specification-First Language". Claim boundary: GOLDEN SPECS provides
+reproducible evidence, not unconditional proof; agreement with the reference
+is self-consistency behind one shared front end, not independent proof.
+
 Every claim in `main.tex` maps to one committed artifact:
 
 - Report: `docs/reports/t27b-bench-2026-10.md` (sections A-E).

@@ -1,0 +1,386 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/model_budget.t27 -- THE BUDGET AND THE SWITCH: may this send start, at all, on this
+; account, under this limit? Owner, 2026-11-04 (epic #13172). The trace spec records what happened;
+; this spec decides whether it may happen.
+; --
+; Laws this spec keeps:
+;   1. RESERVE BEFORE SEND. A paid send takes a reservation first; the provider's report reconciles
+;      it afterwards. An overrun is reported as an overrun (never clamped), and the next send sees it.
+;   2. PARALLEL SENDS COUNT EACH OTHER. The room is limit - spent - reserved: a reservation held by
+;      an in-flight attempt is already spent as far as the next attempt is concerned.
+;   3. AN UNKNOWN PRICE DOES NOT SPEND. When the price table has no price for the model, the cost of
+;      the send is unknown, and a budget that cannot name the cost refuses the send instead of
+;      calling it zero.
+;   4. AN UNFUNDED ACCOUNT IS NEVER RETRIED ON THE SAME ACCOUNT. This is the rule the incident broke:
+;      the ladder's 402 became a 503, the client saw TRANSIENT and retried five times. Here the
+;      decision is taken from the class, not from the status line, and the only retry an unfunded
+;      refusal may get is one on a DIFFERENT account when one is ready.
+;   5. A SWITCH INTO A PAID PROVIDER IS EXPLICIT. Free -> paid and paid -> paid both need the policy
+;      bit; a cross-provider switch needs its own bit. No silent paid switch, ever.
+;   6. A BLOCK SWITCH STOPS NEW PAID SENDS ONLY. Free sends continue; the sends already in flight are
+;      not cancelled and stay visible (the panel lists them apart, model_control_panel.t27).
+;   7. ATTEMPTS AND TIME ARE CAPPED. An attempt count and an elapsed-time cap are checked before a
+;      send, so a retry loop cannot outlive its turn.
+;   8. LIMITS ARE SCOPED. One limit per task, agent, credential and period; the scope is an index
+;      into a flat table, and a period that has rolled resets its counter.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27OsModelBudget;
+
+use t27os::model_trace::MT_UNFUNDED;
+use t27os::model_trace::MT_CREDENTIAL;
+use t27os::model_trace::MT_UNWIRED;
+use t27os::model_trace::MT_UNKNOWN;
+use t27os::model_trace::MT_RATE;
+use t27os::model_trace::MT_TRANSIENT;
+use t27os::model_trace::CK_UNKNOWN;
+use t27os::model_trace::CK_ESTIMATED;
+use t27os::editors::same_bytes;
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::session_store::csv_field;
+
+// ---- 1. The decision ----
+
+pub const BU_ALLOW : u32 = 0;
+pub const BU_DENY_BLOCKED : u32 = 1;
+pub const BU_DENY_UNKNOWN_PRICE : u32 = 2;
+pub const BU_DENY_MODEL : u32 = 3;
+pub const BU_DENY_ATTEMPTS : u32 = 4;
+pub const BU_DENY_DURATION : u32 = 5;
+pub const BU_DENY_LIMIT : u32 = 6;
+pub const DECISION_WORDS : str = "allow,blocked,unknown_price,model,attempts,duration,limit";
+
+pub fn decision_word(d: u32, out: []u8) -> usize {
+    const n : usize = csv_field(DECISION_WORDS, d, out);
+    if (n == 0) { return put_bytes(out, 0, "allow"); }
+    return n;
+}
+
+/// A limit of "no limit" is a real choice, not a missing number.
+pub const BU_UNLIMITED : u64 = 18446744073709551615;
+
+/// The room left for one more send: limit - spent - reserved. Unlimited stays unlimited.
+pub fn room(spent: u64, reserved: u64, limit: u64) -> u64 {
+    if (limit == BU_UNLIMITED) { return BU_UNLIMITED; }
+    const used : u64 = spent + reserved;
+    if (used >= limit) { return 0; }
+    return limit - used;
+}
+
+/// Does the expected cost fit the room? This is law 2: the reservation of a parallel send is
+/// already counted in `reserved`.
+pub fn reserve_fits(spent: u64, reserved: u64, limit: u64, expected: u64) -> bool {
+    if (limit == BU_UNLIMITED) { return true; }
+    return expected <= room(spent, reserved, limit);
+}
+
+pub fn reserve_after(reserved: u64, expected: u64) -> u64 { return reserved + expected; }
+
+pub fn release_after(reserved: u64, expected: u64) -> u64 {
+    if (expected >= reserved) { return 0; }
+    return reserved - expected;
+}
+
+/// The provider's report against the reservation. An overrun is a fact to report, not an error to
+/// clamp: the next send must see it.
+pub fn reconcile_over(reserved: u64, reported: u64) -> bool { return reported > reserved; }
+
+/// The absolute difference between the reservation and the report, in micro-units.
+pub fn reconcile_delta(reserved: u64, reported: u64) -> u64 {
+    if (reported >= reserved) { return reported - reserved; }
+    return reserved - reported;
+}
+
+// ---- 2. The gate: may this send start? ----
+
+/// The cells the gate reads. Everything is a number so the panel and the tests feed the same shape.
+pub const BG_SPENT : usize = 0;
+pub const BG_RESERVED : usize = 1;
+pub const BG_LIMIT : usize = 2;
+pub const BG_EXPECTED : usize = 3;
+pub const BG_COST_KIND : usize = 4;
+pub const BG_MODEL : usize = 5;
+pub const BG_ALLOWED : usize = 6;
+pub const BG_ATTEMPTS : usize = 7;
+pub const BG_MAX_ATTEMPTS : usize = 8;
+pub const BG_ELAPSED : usize = 9;
+pub const BG_MAX_MS : usize = 10;
+pub const BG_PAID : usize = 11;
+pub const BG_BLOCKED : usize = 12;
+pub const BG_CELLS : usize = 13;
+
+pub fn model_allowed(mask: u64, m: u32) -> bool {
+    if (m >= 64) { return false; }
+    return (mask >> m) % 2 == 1;
+}
+
+/// The order is the order of the questions: is the send forbidden by the switch, can its price be
+/// named, is its model allowed, is there an attempt and time left, does it fit the budget. The
+/// reason word says which question refused it.
+pub fn gate(g: []const u64, why: []u8) -> u32 {
+    if (g[BG_BLOCKED] != 0 and g[BG_PAID] != 0) {
+        return BU_DENY_BLOCKED;
+    }
+    if (g[BG_COST_KIND] == (CK_UNKNOWN as u64)) {
+        return BU_DENY_UNKNOWN_PRICE;
+    }
+    if (model_allowed(g[BG_ALLOWED], @intCast(g[BG_MODEL])) == false) {
+        return BU_DENY_MODEL;
+    }
+    if (g[BG_ATTEMPTS] >= g[BG_MAX_ATTEMPTS]) {
+        return BU_DENY_ATTEMPTS;
+    }
+    if (g[BG_ELAPSED] >= g[BG_MAX_MS]) {
+        return BU_DENY_DURATION;
+    }
+    if (reserve_fits(g[BG_SPENT], g[BG_RESERVED], g[BG_LIMIT], g[BG_EXPECTED]) == false) {
+        return BU_DENY_LIMIT;
+    }
+    return BU_ALLOW;
+}
+
+/// The same gate with the reason written out, for the panel's one line.
+pub fn gate_line(g: []const u64, out: []u8) -> usize {
+    var w : [24]u8 = undefined;
+    const d : u32 = gate(g, w[0..24]);
+    var n : usize = put_bytes(out, 0, "decision=");
+    const wn : usize = decision_word(d, w[0..24]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " room=");
+    n = put_dec(out, n, room(g[BG_SPENT], g[BG_RESERVED], g[BG_LIMIT]));
+    return n;
+}
+
+// ---- 3. The retry decision ----
+
+pub const RT_NO : u32 = 0;
+pub const RT_WAIT : u32 = 1;
+pub const RT_OTHER_ACCOUNT : u32 = 2;
+pub const RETRY_WORDS : str = "no,wait,other_account";
+
+pub fn retry_word(r: u32, out: []u8) -> usize {
+    const n : usize = csv_field(RETRY_WORDS, r, out);
+    if (n == 0) { return put_bytes(out, 0, "no"); }
+    return n;
+}
+
+/// Law 4, stated once: an unfunded refusal gets a different account or nothing; a credential, an
+/// unwired route and an unknown answer get nothing; only a rate limit and a transient answer wait,
+/// and only while the attempt cap has room.
+pub fn retry_after_refusal(c: u32, other_account_ready: bool, attempts: u32, max_attempts: u32) -> u32 {
+    if (c == MT_UNFUNDED) {
+        if (other_account_ready) { return RT_OTHER_ACCOUNT; }
+        return RT_NO;
+    }
+    if (c == MT_CREDENTIAL or c == MT_UNWIRED or c == MT_UNKNOWN) { return RT_NO; }
+    if (attempts >= max_attempts) { return RT_NO; }
+    return RT_WAIT;
+}
+
+// ---- 4. The switch into a paid provider ----
+
+/// Policy bits. No bit is set by default: an unconfigured node does not switch into a paid provider.
+pub const FB_PAID : u32 = 0;
+pub const FB_CROSS_PROVIDER : u32 = 1;
+
+pub fn fallback_into_paid_allowed(policy: u32, paid_to: bool) -> bool {
+    if (paid_to == false) { return true; }
+    return (policy >> FB_PAID) % 2 == 1;
+}
+
+pub fn fallback_cross_provider_allowed(policy: u32, same_provider: bool) -> bool {
+    if (same_provider) { return true; }
+    return (policy >> FB_CROSS_PROVIDER) % 2 == 1;
+}
+
+/// Law 6: the block switch stops a NEW paid send. It does not cancel what is in flight; the panel
+/// lists those apart.
+pub fn send_stopped(blocked: bool, paid: bool) -> bool {
+    return blocked and paid;
+}
+
+// ---- 5. Limits are scoped and periods roll ----
+
+pub const S_TASK : u32 = 0;
+pub const S_AGENT : u32 = 1;
+pub const S_CREDENTIAL : u32 = 2;
+pub const S_PERIOD : u32 = 3;
+pub const S_COUNT : u32 = 4;
+
+/// One limit per scope. A scope that was never set reads as unlimited, which is the honest reading
+/// of "nobody said otherwise" -- the gate still refuses what it cannot price.
+pub fn limit_for(limits: []const u64, scope: u32) -> u64 {
+    if (scope >= S_COUNT) { return BU_UNLIMITED; }
+    if (limits[scope] == 0) { return BU_UNLIMITED; }
+    return limits[scope];
+}
+
+/// The bucket a moment belongs to, given a period length. A roll is a different number.
+pub fn period_bucket(now_ms: u64, period_ms: u64) -> u64 {
+    if (period_ms == 0) { return 0; }
+    return now_ms / period_ms;
+}
+
+/// True when the stored bucket is not the current one: the counter for this period starts at zero.
+pub fn period_rolled(stored_bucket: u64, now_ms: u64, period_ms: u64) -> bool {
+    return stored_bucket != period_bucket(now_ms, period_ms);
+}
+
+// ---- 6. Tests ----
+
+test a_parallel_send_counts_the_other_reservations {
+    // limit 1000, 100 spent, 800 already reserved by an in-flight send
+    assert room(100, 800, 1000) == 100;
+    assert reserve_fits(100, 800, 1000, 200) == false;
+    assert reserve_fits(100, 800, 1000, 100);
+    assert reserve_fits(100, 800, 1000, 101) == false;
+    assert reserve_after(800, 100) == 900;
+    assert release_after(800, 300) == 500;
+    assert release_after(100, 300) == 0;
+    assert room(1000, 0, 1000) == 0;
+    assert room(0, 0, BU_UNLIMITED) == BU_UNLIMITED;
+    assert reserve_fits(999999, 999999, BU_UNLIMITED, 999999);
+}
+
+test an_unknown_price_is_refused_instead_of_called_zero {
+    var g : [BG_CELLS]u64 = undefined;
+    var i : usize = 0;
+    while (i < BG_CELLS) { g[i] = 0; i = i + 1; }
+    g[BG_LIMIT] = 1000000;
+    g[BG_EXPECTED] = 0;
+    g[BG_COST_KIND] = CK_UNKNOWN;
+    g[BG_ALLOWED] = 63;
+    g[BG_MAX_ATTEMPTS] = 5;
+    g[BG_MAX_MS] = 100000;
+    var w : [24]u8 = undefined;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_DENY_UNKNOWN_PRICE;
+    // the same send with a known price is allowed: the refusal was about knowledge, not room
+    g[BG_COST_KIND] = CK_ESTIMATED;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_ALLOW;
+}
+
+test the_attempt_and_time_caps_stop_a_retry_loop {
+    var g : [BG_CELLS]u64 = undefined;
+    var i : usize = 0;
+    while (i < BG_CELLS) { g[i] = 0; i = i + 1; }
+    g[BG_LIMIT] = BU_UNLIMITED;
+    g[BG_ALLOWED] = 63;
+    g[BG_MAX_ATTEMPTS] = 5;
+    g[BG_MAX_MS] = 100000;
+    g[BG_ATTEMPTS] = 5;
+    var w : [24]u8 = undefined;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_DENY_ATTEMPTS;
+    g[BG_ATTEMPTS] = 4;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_ALLOW;
+    g[BG_ELAPSED] = 100000;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_DENY_DURATION;
+}
+
+test a_model_outside_the_allowed_mask_is_refused {
+    var g : [BG_CELLS]u64 = undefined;
+    var i : usize = 0;
+    while (i < BG_CELLS) { g[i] = 0; i = i + 1; }
+    g[BG_LIMIT] = BU_UNLIMITED;
+    g[BG_ALLOWED] = 5; // models 0 and 2 only
+    g[BG_MAX_ATTEMPTS] = 5;
+    g[BG_MAX_MS] = 1000;
+    g[BG_MODEL] = 1;
+    var w : [24]u8 = undefined;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_DENY_MODEL;
+    g[BG_MODEL] = 2;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_ALLOW;
+    assert model_allowed(5, 0);
+    assert model_allowed(5, 1) == false;
+    assert model_allowed(5, 2);
+    assert model_allowed(5, 64) == false;
+}
+
+test the_block_switch_stops_new_paid_sends_and_leaves_free_ones_alone {
+    var g : [BG_CELLS]u64 = undefined;
+    var i : usize = 0;
+    while (i < BG_CELLS) { g[i] = 0; i = i + 1; }
+    g[BG_LIMIT] = BU_UNLIMITED;
+    g[BG_ALLOWED] = 63;
+    g[BG_MAX_ATTEMPTS] = 5;
+    g[BG_MAX_MS] = 1000;
+    g[BG_BLOCKED] = 1;
+    g[BG_PAID] = 1;
+    var w : [24]u8 = undefined;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_DENY_BLOCKED;
+    assert send_stopped(true, true);
+    assert send_stopped(true, false) == false;
+    // a free send still passes the same gate with the switch on
+    g[BG_PAID] = 0;
+    assert gate(g[0..BG_CELLS], w[0..24]) == BU_ALLOW;
+    assert send_stopped(false, true) == false;
+}
+
+test an_unfunded_refusal_is_never_retried_on_the_same_account {
+    // the incident: five attempts, each walking back into the same unfunded tail rung
+    assert retry_after_refusal(MT_UNFUNDED, false, 0, 5) == RT_NO;
+    assert retry_after_refusal(MT_UNFUNDED, false, 4, 5) == RT_NO;
+    // a second account is the only retry an unfunded refusal may get
+    assert retry_after_refusal(MT_UNFUNDED, true, 0, 5) == RT_OTHER_ACCOUNT;
+    assert retry_after_refusal(MT_CREDENTIAL, true, 0, 5) == RT_NO;
+    assert retry_after_refusal(MT_UNWIRED, true, 0, 5) == RT_NO;
+    assert retry_after_refusal(MT_UNKNOWN, true, 0, 5) == RT_NO;
+    // rate and transient wait, but only inside the cap
+    assert retry_after_refusal(MT_RATE, false, 0, 5) == RT_WAIT;
+    assert retry_after_refusal(MT_TRANSIENT, false, 4, 5) == RT_WAIT;
+    assert retry_after_refusal(MT_TRANSIENT, false, 5, 5) == RT_NO;
+}
+
+test a_switch_into_a_paid_provider_needs_its_own_policy_bit {
+    // free -> free and anything -> free is not a paid switch
+    assert fallback_into_paid_allowed(0, false);
+    assert fallback_into_paid_allowed(0, true) == false;
+    assert fallback_into_paid_allowed(1, true);
+    // a paid switch across providers needs the cross-provider bit as well
+    assert fallback_cross_provider_allowed(0, true);
+    assert fallback_cross_provider_allowed(0, false) == false;
+    assert fallback_cross_provider_allowed(2, false);
+    assert fallback_cross_provider_allowed(1, false) == false;
+}
+
+test an_overrun_is_reported_and_not_clamped {
+    assert reconcile_over(500, 420) == false;
+    assert reconcile_delta(500, 420) == 80;
+    assert reconcile_over(500, 560);
+    assert reconcile_delta(500, 560) == 60;
+    assert reconcile_over(500, 500) == false;
+    assert reconcile_delta(500, 500) == 0;
+}
+
+test a_scope_with_no_limit_is_unlimited_and_a_rolled_period_resets {
+    var limits : [S_COUNT]u64 = undefined;
+    limits[S_TASK] = 0;
+    limits[S_AGENT] = 250000;
+    limits[S_CREDENTIAL] = 0;
+    limits[S_PERIOD] = 1000000;
+    assert limit_for(limits[0..S_COUNT], S_TASK) == BU_UNLIMITED;
+    assert limit_for(limits[0..S_COUNT], S_AGENT) == 250000;
+    assert limit_for(limits[0..S_COUNT], 9) == BU_UNLIMITED;
+    assert period_bucket(1000, 1000) == 1;
+    assert period_rolled(0, 1000, 1000);
+    assert period_rolled(1, 1000, 1000) == false;
+    assert period_rolled(1, 2000, 1000);
+    assert period_bucket(1234, 0) == 0;
+}
+
+test the_gate_line_names_the_decision_and_the_room {
+    var g : [BG_CELLS]u64 = undefined;
+    var i : usize = 0;
+    while (i < BG_CELLS) { g[i] = 0; i = i + 1; }
+    g[BG_LIMIT] = 1000;
+    g[BG_SPENT] = 100;
+    g[BG_RESERVED] = 800;
+    g[BG_EXPECTED] = 200;
+    g[BG_ALLOWED] = 63;
+    g[BG_MAX_ATTEMPTS] = 5;
+    g[BG_MAX_MS] = 1000;
+    var out : [48]u8 = undefined;
+    const n : usize = gate_line(g[0..BG_CELLS], out[0..48]);
+    assert n == 23;
+    assert same_bytes(out[0..n], "decision=limit room=100");
+}
