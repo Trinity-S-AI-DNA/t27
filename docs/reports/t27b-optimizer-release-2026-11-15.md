@@ -130,11 +130,15 @@ folds the entire loop to a constant.
 - same loop in C, clang -O2: 1.68 / 2.04 ns per call -> about 1.9 ns/call
 - results agree (acc % 2 == 0 on both sides).
 
-Honest verdict: runtime parity with an optimizing C compiler on this
-witness, within run-to-run noise; the instruction-count parity from the
-word audit shows up as wall-clock parity. One witness, one host (M-series
-Mac, not the paper's qemu protocol) -- the full suite stays the lab
-runbook's job.
+CORRECTION 2026-11-16 (quiet-machine re-run): the parity sentence above
+was machine-load noise. On a quiet host: t27b JIT about 1.9 ns/call,
+clang -O2 about 1.25 ns/call -- t27b is about 1.5x slower on this
+witness. Instruction count tells the same story: t27b 10 loop
+instructions vs clang 7 (clang folds sub(add(x,c),c) to the old value via
+SSA value-tracking and hoists the loop-invariant imm12; both passes are
+STATUS_MISSING/DISP_BLOCKER in middle_end.t27). Follow-up lane with the
+full asm diff: issue #14012. The release criterion (GCC -O2 word parity,
+10 = 10) stands; wall-clock parity on this witness does NOT yet stand.
 
 Reproduce: t27b build specs/tri/shootout/bench_audit.t27 -o ba.o --macho,
 link with a CLOCK_MONOTONIC driver, 200e6 calls; C twin with a volatile
