@@ -415,18 +415,19 @@ fn qualified_refs(text: &str, modules: &[String]) -> Vec<(String, String, bool)>
 fn identifiers(text: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     for line in text.lines() {
-        let code = match line.find("//") {
-            Some(p) => &line[..p],
-            None => line,
-        };
+        // #13937: t27 comments start at `;`; per-line quote state keeps a `;` in a
+        // literal as code; an escaped quote can cut early -- loud, never silent.
+        let (mut code, mut in_str) = (String::new(), false);
+        for (i, c) in line.char_indices() {
+            if c == '"' { in_str = !in_str; }
+            if !in_str && (c == ';' || (c == '/' && line[i..].starts_with("//"))) { break; }
+            code.push(c);
+        }
         let mut cur = String::new();
         let mut builtin = false;
-        let mut prev = ' ';
-        for c in code.chars() {
+        for (i, c) in code.char_indices() {
             if c.is_alphanumeric() || c == '_' {
-                if cur.is_empty() {
-                    builtin = prev == '@';
-                }
+                if cur.is_empty() { builtin = i > 0 && code[..i].ends_with('@'); }
                 cur.push(c);
             } else {
                 if !builtin && !cur.is_empty() && !cur.chars().next().unwrap().is_ascii_digit() {
@@ -435,7 +436,6 @@ fn identifiers(text: &str) -> HashSet<String> {
                     cur.clear();
                 }
             }
-            prev = c;
         }
         if !builtin && !cur.is_empty() && !cur.chars().next().unwrap().is_ascii_digit() {
             out.insert(cur);
