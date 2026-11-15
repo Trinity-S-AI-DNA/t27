@@ -7,7 +7,7 @@ Last updated: 2026-08-22
 - Branch: `fix/2415-conformance-pipefail`
 - Issue: #2415 · lands on top of #2403
 
-### Что легло
+### What landed
 
 One line in `.github/workflows/fpga-build.yml` — `set -o pipefail` at the top of the
 "Execute conformance vectors" step — plus the comment explaining why.
@@ -20,7 +20,7 @@ so the default `bash -e {0}` applies and `-o pipefail` is not on.
 **This is the defect #2242 removed from `fpga-formal`**, in the same file, 115 lines below
 the corrected pattern at `:638-640`.
 
-### Границы честности (BINDING)
+### Honesty boundaries (BINDING)
 
 - **The rest of #2403 is untouched and is good.** Registry-scoped execution with the
   remainder printed as visible debt is the honest shape. This changes one line.
