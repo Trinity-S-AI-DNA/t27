@@ -93,6 +93,6 @@ GitLab stays unchanged throughout.
 ## Open items
 
 - The trial project is empty, so a large clone is not proven.
-- No job that reaches the 768 MiB limit is still to be run.
+- No job has reached the 768 MiB limit yet; a job that does is still to be run.
 - The GitLab container uses about 2.5 GiB of its 3.4 GiB limit. Re-measure
   memory before raising any runner or job limit.
