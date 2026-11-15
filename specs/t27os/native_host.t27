@@ -1,0 +1,663 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 OS native_host (v0.3.0): where the native chat slice, the agent runner and the swarm coordinator
+// touch the machine through libSystem. No decisions live here; every rule is a tested fn in native_provider
+// (request bytes, reply parsing, error classes, the wait verdict), native_log (the append-only log, recovery),
+// native_policy (tools, approval, env names), native_agent and native_swarm (the state machines).
+//
+// What this file does, and nothing else:
+//   - reads the four LM Studio settings from the environment (T27OS_LMSTUDIO_HOST / _PORT / _MODEL / _API_KEY),
+//     only those four names (native_policy env_name_known), and never prints or stores a value;
+//   - one HTTP exchange with the loopback server over AF_INET (socket, connect, write, poll, read to EOF), with
+//     a deadline and a cancel file checked at every poll slice;
+//   - the durable log: the whole image is written to <name>.log.part, fsynced, closed and renamed over
+//     <name>.log (the same order profile_host.t27 uses), so a crash leaves the old file or the new one;
+//   - recovery: the image is read back and native_log keeps every complete event up to the first bad line;
+//   - one chat turn on a session, one agent run, one swarm run (members one at a time).
+//
+// Not here, on purpose: DSH, NVIDIA, fallback between providers, key rotation, streaming (the call is a single
+// non-streaming request that closes the connection after the reply), compaction of the log.
+//
+// A path passed to libSystem is a byte buffer with a 0 byte right after the last path byte; every path below is
+// built by host_session_file into a zeroed buffer, which supplies it.
+//
+// Specs holding @extern cannot run under t27c; the pure rules are tested in their own specs, and this file's
+// tests stay on paths that reach no extern (name building, port parsing, the env-name guard): t27c stubs an
+// extern with 0, and the t27b corpus run in CI stops on an import called outside an object ("import
+// sys_getenv run outside an object"), so a test that reached one would disagree between the two runners.
+// Every test that needs libSystem (files, the cancel file, a socket, the clock) is in group G of
+// native_accept.t27, with the real call.
+//
+// Refs gHashTag/t27#13212.
+module T27osNativeHost;
+
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::pty_logic::put_pollfd;
+use t27os::pty_logic::tv_ms;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_creat;
+use t27os::pty_sys::sys_rename;
+use t27os::pty_sys::sys_unlink;
+use t27os::pty_sys::sys_mkdir;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_connect;
+use t27os::pty_sys::sys_poll;
+use t27os::pty_sys::sys_gettimeofday;
+use t27os::pty_sys::sys_signal;
+use t27os::pty_client::SOCK_STREAM;
+use t27os::router_sock::AF_INET;
+use t27os::router_sock::sockaddr_in_fill;
+use t27os::ladder_serve::ls_parse_port;
+use t27os::native_policy::env_name_known;
+use t27os::native_policy::ENV_HOST;
+use t27os::native_policy::ENV_PORT;
+use t27os::native_policy::ENV_MODEL;
+use t27os::native_policy::ENV_KEY;
+use t27os::native_policy::TOOL_CLOCK;
+use t27os::native_policy::DEC_ALLOW;
+use t27os::native_provider::ERR_NONE;
+use t27os::native_provider::ERR_CONNECT;
+use t27os::native_provider::ERR_CANCELLED;
+use t27os::native_provider::ERR_BAD_REPLY;
+use t27os::native_provider::ERR_BAD_REQUEST;
+use t27os::native_provider::ERR_REFUSED;
+use t27os::native_provider::ReplyInfo;
+use t27os::native_provider::error_label;
+use t27os::native_provider::classify_status;
+use t27os::native_provider::wait_verdict;
+use t27os::native_provider::endpoint_is_loopback;
+use t27os::native_provider::models_request;
+use t27os::native_provider::chat_request_close;
+use t27os::native_provider::parse_reply;
+use t27os::native_provider::http_status;
+use t27os::native_provider::body_offset;
+use t27os::native_provider::compact_json;
+use t27os::native_provider::pick_chat_model;
+use t27os::native_log::LOG_MAX;
+use t27os::native_log::EV_USER_INPUT;
+use t27os::native_log::EV_PROVIDER_REQUEST;
+use t27os::native_log::EV_PROVIDER_RESPONSE;
+use t27os::native_log::EV_ERROR;
+use t27os::native_log::EV_TOKEN_USAGE;
+use t27os::native_log::ST_ACTIVE;
+use t27os::native_log::ST_IDLE;
+use t27os::native_log::Cur;
+use t27os::native_log::Recovered;
+use t27os::native_log::cur_new;
+use t27os::native_log::cur_from;
+use t27os::native_log::recover;
+use t27os::native_log::continuable;
+use t27os::native_log::emit;
+use t27os::native_log::emit_state;
+use t27os::native_log::request_payload;
+use t27os::native_log::usage_payload;
+use t27os::native_agent::NativeAgent;
+use t27os::native_agent::AG_NEW;
+use t27os::native_agent::AG_RUNNING;
+use t27os::native_agent::AG_FAILED;
+use t27os::native_agent::AE_BAD_CONTRACT;
+use t27os::native_agent::AE_LOG_FULL;
+use t27os::native_agent::RESULT_MAX;
+use t27os::native_agent::compose_prompt;
+use t27os::native_agent::agent_start;
+use t27os::native_agent::agent_request_tool;
+use t27os::native_agent::agent_tool_result;
+use t27os::native_agent::agent_finish;
+use t27os::native_agent::agent_fail;
+use t27os::native_agent::agent_cancel;
+use t27os::native_swarm::Swarm;
+use t27os::native_swarm::NO_MEMBER;
+use t27os::native_swarm::SW_RUNNING;
+use t27os::native_swarm::swarm_start;
+use t27os::native_swarm::swarm_next;
+use t27os::native_swarm::swarm_begin;
+use t27os::native_swarm::swarm_report;
+use t27os::native_swarm::swarm_finish;
+use t27os::native_swarm::swarm_cancel;
+
+fn sys_fsync(fd: i32) -> i32 { return @extern("fsync"); }
+
+pub const HOST_PATH_CAP : usize = 192;
+/// Logs are private: owner read and write only (0600); the folder is 0700.
+pub const HOST_FILE_MODE : u32 = 384;
+pub const HOST_DIR_MODE : u32 = 448;
+/// One poll waits this long, then the deadline and the cancel file are looked at again.
+pub const HOST_SLICE_MS : i32 = 200;
+pub const HOST_TIMEOUT_MS : u64 = 60000;
+pub const HOST_MODELS_MS : u64 = 10000;
+/// The prompt a turn accepts (the request body buffer in native_provider is 4096 bytes), the reply text kept
+/// in the log, and the tokens a chat turn asks for.
+pub const HOST_PROMPT_MAX : usize = 1500;
+pub const HOST_REPLY_KEEP : usize = 4096;
+pub const HOST_MAX_TOKENS : u32 = 256;
+pub const HOST_AGENT_TOKENS : u32 = 120;
+pub const HOST_SIGPIPE : i32 = 13;
+
+// ---- the clock, the environment, the file names ------------------------------------------------------------
+
+pub fn host_now_ms() -> u64 {
+    var tv : [16]u8 = [0] ** 16;
+    sys_gettimeofday(tv[0..16], 0);
+    return tv_ms(tv[0..16]);
+}
+
+/// The value of one of the four T27OS_LMSTUDIO_* variables, copied to `out`. Returns its length; 0 when the
+/// name is not one of those four, the variable is unset or empty, or the value does not fit.
+pub fn host_env(name: []const u8, out: []u8) -> usize {
+    if (env_name_known(name) == false or name.len > 31) { return 0; }
+    var nb : [32]u8 = [0] ** 32;
+    _ = put_bytes(nb[0..32], 0, name);
+    const p : u64 = sys_getenv(nb[0..32]);
+    if (p == 0) { return 0; }
+    const n : u64 = sys_strlen(p);
+    if (n == 0 or n > @as(u64, out.len)) { return 0; }
+    _ = sys_peek(out[0..out.len], p, n);
+    return @as(usize, n);
+}
+
+/// "<dir>/s<id>.<ext>" with a 0 byte after it. Returns the path length; 0 when `out` is too short or the
+/// folder name is empty.
+pub fn host_session_file(dir: []const u8, id: u64, ext: []const u8, out: []u8) -> usize {
+    if (dir.len == 0 or out.len < dir.len + ext.len + 32) { return 0; }
+    var n : usize = put_bytes(out, 0, dir);
+    n = put_bytes(out, n, "/s");
+    n = put_dec(out, n, id);
+    n = put_bytes(out, n, ".");
+    n = put_bytes(out, n, ext);
+    out[n] = 0;
+    return n;
+}
+
+pub fn host_exists(path: []const u8) -> bool {
+    const fd : i32 = sys_open_ro(path, 0);
+    if (fd < 0) { return false; }
+    _ = sys_close(fd);
+    return true;
+}
+
+/// Makes every folder of `dir` (0700) that is not there; true when the last one can be opened.
+pub fn host_ensure_dir(dir: []const u8) -> bool {
+    if (dir.len == 0 or dir.len >= 190) { return false; }
+    var b : [192]u8 = [0] ** 192;
+    var i : usize = 0;
+    while (i < dir.len) {
+        b[i] = dir[i];
+        i = i + 1;
+    }
+    i = 1;
+    while (i < dir.len) {
+        if (b[i] == 47) {
+            b[i] = 0;
+            _ = sys_mkdir(b[0..192], HOST_DIR_MODE);
+            b[i] = 47;
+        }
+        i = i + 1;
+    }
+    _ = sys_mkdir(b[0..192], HOST_DIR_MODE);
+    return host_exists(b[0..192]);
+}
+
+// ---- the durable log ---------------------------------------------------------------------------------------
+
+/// Writes img[0..len] as <dir>/s<id>.log: create the .part, write every byte, fsync, close, rename over the
+/// target. Any failure unlinks the .part and leaves the old log as it was. True only after the rename.
+pub fn host_save(dir: []const u8, id: u64, img: []const u8, len: usize) -> bool {
+    if (len > img.len) { return false; }
+    var part : [192]u8 = [0] ** 192;
+    var fin : [192]u8 = [0] ** 192;
+    if (host_session_file(dir, id, "log.part", part[0..192]) == 0) { return false; }
+    if (host_session_file(dir, id, "log", fin[0..192]) == 0) { return false; }
+    const fd : i32 = sys_creat(part[0..192], HOST_FILE_MODE);
+    if (fd < 0) { return false; }
+    var wrote : usize = 0;
+    var ok : bool = true;
+    while (ok and wrote < len) {
+        const w : i64 = sys_write(fd, img[wrote..len], @as(u64, len - wrote));
+        if (w <= 0) {
+            ok = false;
+        } else {
+            wrote = wrote + @as(usize, @intCast(w));
+        }
+    }
+    if (ok) { ok = sys_fsync(fd) == 0; }
+    const closed : i32 = sys_close(fd);
+    if (closed != 0) { ok = false; }
+    if (ok) { ok = sys_rename(part[0..192], fin[0..192]) == 0; }
+    if (ok == false) { _ = sys_unlink(part[0..192]); }
+    return ok;
+}
+
+/// Reads <dir>/s<id>.log into `buf`. Returns the bytes read; 0 when there is no such log.
+pub fn host_load(dir: []const u8, id: u64, buf: []u8) -> usize {
+    var p : [192]u8 = [0] ** 192;
+    if (host_session_file(dir, id, "log", p[0..192]) == 0) { return 0; }
+    const fd : i32 = sys_open_ro(p[0..192], 0);
+    if (fd < 0) { return 0; }
+    var n : usize = 0;
+    var more : bool = true;
+    while (more and n < buf.len) {
+        const r : i64 = sys_read(fd, buf[n..buf.len], @as(u64, buf.len - n));
+        if (r <= 0) {
+            more = false;
+        } else {
+            n = n + @as(usize, @intCast(r));
+        }
+    }
+    _ = sys_close(fd);
+    return n;
+}
+
+pub fn host_log_exists(dir: []const u8, id: u64) -> bool {
+    var p : [192]u8 = [0] ** 192;
+    if (host_session_file(dir, id, "log", p[0..192]) == 0) { return false; }
+    return host_exists(p[0..192]);
+}
+
+// ---- cancellation ------------------------------------------------------------------------------------------
+
+/// Asks for the session (or agent, or swarm) `id` to stop: creates <dir>/s<id>.cancel. A run looks for it
+/// before every provider call and at every poll slice of an exchange.
+pub fn host_cancel(dir: []const u8, id: u64) -> bool {
+    var p : [192]u8 = [0] ** 192;
+    if (host_session_file(dir, id, "cancel", p[0..192]) == 0) { return false; }
+    const fd : i32 = sys_creat(p[0..192], HOST_FILE_MODE);
+    if (fd < 0) { return false; }
+    return sys_close(fd) == 0;
+}
+
+pub fn host_cancel_requested(dir: []const u8, id: u64) -> bool {
+    var p : [192]u8 = [0] ** 192;
+    if (host_session_file(dir, id, "cancel", p[0..192]) == 0) { return false; }
+    return host_exists(p[0..192]);
+}
+
+pub fn host_cancel_clear(dir: []const u8, id: u64) -> void {
+    var p : [192]u8 = [0] ** 192;
+    if (host_session_file(dir, id, "cancel", p[0..192]) == 0) { return; }
+    _ = sys_unlink(p[0..192]);
+}
+
+// ---- the LM Studio endpoint --------------------------------------------------------------------------------
+
+/// The server this process talks to. The key (when there is one) is held here and nowhere else.
+pub struct Endpoint {
+    port: u16,
+    host_len: usize,
+    model_len: usize,
+    key_len: usize,
+    host: [64]u8,
+    model: [128]u8,
+    key: [256]u8,
+}
+
+pub fn endpoint_new() -> Endpoint {
+    return Endpoint { port: 1234, host_len: 0, model_len: 0, key_len: 0,
+                      host: [0] ** 64, model: [0] ** 128, key: [0] ** 256 };
+}
+
+fn ep_host(e: *Endpoint) -> []const u8 {
+    return e.host[0..e.host_len];
+}
+
+/// Zeroes the key bytes.
+pub fn endpoint_clear(e: *Endpoint) -> void {
+    var i : usize = 0;
+    while (i < 256) {
+        e.key[i] = 0;
+        i = i + 1;
+    }
+    e.key_len = 0;
+}
+
+pub struct Exchange {
+    err: u32,
+    len: usize,
+}
+
+/// One request and its whole reply over a fresh loopback connection. The reply is read to EOF into `resp`
+/// (a full buffer is ERR_BAD_REPLY), the deadline and the cancel file are checked at every poll slice, and
+/// the socket is always closed. `cancel` may be empty.
+pub fn host_exchange(e: *Endpoint, req: []const u8, resp: []u8, limit_ms: u64, cancel: []const u8) -> Exchange {
+    var x : Exchange = Exchange { err: ERR_NONE, len: 0 };
+    var addr : [16]u8 = [0] ** 16;
+    if (sockaddr_in_fill(e.port, ep_host(e), addr[0..16]) != 16) {
+        x.err = ERR_BAD_REQUEST;
+        return x;
+    }
+    _ = sys_signal(HOST_SIGPIPE, 1);
+    const fd : i32 = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        x.err = ERR_CONNECT;
+        return x;
+    }
+    if (sys_connect(fd, addr[0..16], 16) < 0) {
+        _ = sys_close(fd);
+        x.err = ERR_CONNECT;
+        return x;
+    }
+    var sent : usize = 0;
+    var bad : bool = false;
+    while (bad == false and sent < req.len) {
+        const w : i64 = sys_write(fd, req[sent..req.len], @as(u64, req.len - sent));
+        if (w <= 0) {
+            bad = true;
+        } else {
+            sent = sent + @as(usize, @intCast(w));
+        }
+    }
+    if (bad) {
+        _ = sys_close(fd);
+        x.err = ERR_CONNECT;
+        return x;
+    }
+    const start : u64 = host_now_ms();
+    var pf : [8]u8 = [0] ** 8;
+    var done : bool = false;
+    while (done == false) {
+        var stop : bool = false;
+        if (cancel.len > 0) { stop = host_exists(cancel); }
+        const v : u32 = wait_verdict(stop, start, host_now_ms(), limit_ms);
+        if (v != ERR_NONE) {
+            x.err = v;
+            done = true;
+        } else {
+            put_pollfd(pf[0..8], 0, @as(u32, @intCast(fd)));
+            const pr : i32 = sys_poll(pf[0..8], 1, HOST_SLICE_MS);
+            if (pr < 0) {
+                x.err = ERR_CONNECT;
+                done = true;
+            } else if (pr > 0) {
+                if (x.len >= resp.len) {
+                    x.err = ERR_BAD_REPLY;
+                    done = true;
+                } else {
+                    const r : i64 = sys_read(fd, resp[x.len..resp.len], @as(u64, resp.len - x.len));
+                    if (r < 0) {
+                        x.err = ERR_CONNECT;
+                        done = true;
+                    } else if (r == 0) {
+                        done = true;
+                    } else {
+                        x.len = x.len + @as(usize, @intCast(r));
+                    }
+                }
+            }
+        }
+    }
+    _ = sys_close(fd);
+    return x;
+}
+
+/// Fills the endpoint from the environment (host default 127.0.0.1, port default 1234; a host that is not a
+/// loopback address is ERR_REFUSED). With no model set it asks GET /v1/models and takes the first chat model.
+/// Returns ERR_NONE or the error class; the key is read here and kept in `e` only.
+pub fn host_endpoint_load(e: *Endpoint, resp: []u8, scratch: []u8) -> u32 {
+    e.port = 1234;
+    e.host_len = put_bytes(e.host[0..64], 0, "127.0.0.1");
+    const hn : usize = host_env(ENV_HOST, e.host[0..64]);
+    if (hn > 0) { e.host_len = hn; }
+    if (endpoint_is_loopback(ep_host(e)) == false) { return ERR_REFUSED; }
+    var pb : [8]u8 = [0] ** 8;
+    const pn : usize = host_env(ENV_PORT, pb[0..8]);
+    if (pn > 0) {
+        const pv : u32 = ls_parse_port(pb[0..pn]);
+        if (pv == 0) { return ERR_BAD_REQUEST; }
+        e.port = @as(u16, @intCast(pv));
+    }
+    e.key_len = host_env(ENV_KEY, e.key[0..256]);
+    e.model_len = host_env(ENV_MODEL, e.model[0..128]);
+    if (e.model_len > 0) { return ERR_NONE; }
+    var rq : [320]u8 = [0] ** 320;
+    const rn : usize = models_request(ep_host(e), rq[0..320]);
+    if (rn == 0) { return ERR_BAD_REQUEST; }
+    const x : Exchange = host_exchange(e, rq[0..rn], resp, HOST_MODELS_MS, "");
+    if (x.err != ERR_NONE) { return x.err; }
+    const st : u32 = http_status(resp[0..x.len]);
+    const sc : u32 = classify_status(st);
+    if (sc != ERR_NONE) { return sc; }
+    const off : usize = body_offset(resp[0..x.len]);
+    const cn : usize = compact_json(resp[off..x.len], scratch);
+    if (cn == 0) { return ERR_BAD_REPLY; }
+    e.model_len = pick_chat_model(scratch[0..cn], e.model[0..128]);
+    if (e.model_len == 0) { return ERR_BAD_REPLY; }
+    return ERR_NONE;
+}
+
+/// One non-streaming chat call. The request bytes (they hold the key) are zeroed as soon as the exchange ends.
+/// `scratch` must be at least as long as the reply; `content` takes the assistant text.
+pub fn host_chat(e: *Endpoint, prompt: []const u8, max_tokens: u32, limit_ms: u64, cancel: []const u8,
+                 resp: []u8, scratch: []u8, content: []u8) -> ReplyInfo {
+    var info : ReplyInfo = ReplyInfo { err: ERR_NONE, status: 0, content_len: 0, prompt_tokens: 0, completion_tokens: 0 };
+    var req : [6144]u8 = [0] ** 6144;
+    const rn : usize = chat_request_close(ep_host(e), e.key[0..e.key_len], e.model[0..e.model_len], prompt, max_tokens, req[0..6144]);
+    if (rn == 0) {
+        info.err = ERR_BAD_REQUEST;
+        return info;
+    }
+    const x : Exchange = host_exchange(e, req[0..rn], resp, limit_ms, cancel);
+    var z : usize = 0;
+    while (z < 6144) {
+        req[z] = 0;
+        z = z + 1;
+    }
+    if (x.err != ERR_NONE) {
+        info.err = x.err;
+        return info;
+    }
+    return parse_reply(resp[0..x.len], scratch, content);
+}
+
+// ---- one chat turn on a durable session --------------------------------------------------------------------
+
+pub struct NativeTurn {
+    ok: bool,
+    err: u32,
+    content_len: usize,
+    events: u32,
+}
+
+/// "class=<n> label=<label>": the error event of a provider failure. No provider text, no secret.
+fn provider_error_payload(class: u32, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "class=");
+    n = put_dec(out, n, @as(u64, class));
+    n = put_bytes(out, n, " label=");
+    return put_bytes(out, n, error_label(class));
+}
+
+/// One prompt on session `id`. A new session starts; an existing one continues when native_log says it is
+/// continuable (a closed or damaged log is refused). The user input, the session state and the provider
+/// request are saved before the network call, so a crash in the middle leaves a log that recovers. The reply
+/// (or a classified error), the token usage and state IDLE are saved after it, and the reply text is printed
+/// to standard output as the visible output. `img` is LOG_MAX bytes; `scratch` is at least as long as `resp`.
+pub fn host_turn(dir: []const u8, id: u64, e: *Endpoint, prompt: []const u8,
+                 img: []u8, resp: []u8, scratch: []u8, content: []u8) -> NativeTurn {
+    var t : NativeTurn = NativeTurn { ok: false, err: ERR_NONE, content_len: 0, events: 0 };
+    if (id == 0 or prompt.len == 0 or prompt.len > HOST_PROMPT_MAX or img.len < LOG_MAX) {
+        t.err = ERR_BAD_REQUEST;
+        return t;
+    }
+    if (host_ensure_dir(dir) == false) {
+        t.err = ERR_REFUSED;
+        return t;
+    }
+    const n : usize = host_load(dir, id, img);
+    const r : Recovered = recover(img[0..n], scratch);
+    if (n > 0 and continuable(r) == false) {
+        t.err = ERR_REFUSED;
+        return t;
+    }
+    var c : Cur = cur_new();
+    if (n > 0) { c = cur_from(r); }
+    c = emit(img, c, EV_USER_INPUT, prompt);
+    c = emit_state(img, c, ST_ACTIVE);
+    var rp : [160]u8 = [0] ** 160;
+    const rpn : usize = request_payload(e.model[0..e.model_len], HOST_MAX_TOKENS, rp[0..160]);
+    c = emit(img, c, EV_PROVIDER_REQUEST, rp[0..rpn]);
+    if (c.ok == false or host_save(dir, id, img, c.len) == false) {
+        t.err = ERR_REFUSED;
+        return t;
+    }
+    var cp : [192]u8 = [0] ** 192;
+    const cpn : usize = host_session_file(dir, id, "cancel", cp[0..192]);
+    const info : ReplyInfo = host_chat(e, prompt, HOST_MAX_TOKENS, HOST_TIMEOUT_MS, cp[0..cpn], resp, scratch, content);
+    if (info.err == ERR_NONE) {
+        var keep : usize = info.content_len;
+        if (keep > HOST_REPLY_KEEP) { keep = HOST_REPLY_KEEP; }
+        c = emit(img, c, EV_PROVIDER_RESPONSE, content[0..keep]);
+        var up : [64]u8 = [0] ** 64;
+        const un : usize = usage_payload(info.prompt_tokens, info.completion_tokens, up[0..64]);
+        c = emit(img, c, EV_TOKEN_USAGE, up[0..un]);
+        t.content_len = keep;
+    } else {
+        var ep : [96]u8 = [0] ** 96;
+        const en : usize = provider_error_payload(info.err, ep[0..96]);
+        c = emit(img, c, EV_ERROR, ep[0..en]);
+        t.err = info.err;
+    }
+    c = emit_state(img, c, ST_IDLE);
+    const saved : bool = c.ok and host_save(dir, id, img, c.len);
+    t.events = @as(u32, @intCast(c.seq - 1));
+    t.ok = saved and info.err == ERR_NONE;
+    if (saved == false and t.err == ERR_NONE) { t.err = ERR_REFUSED; }
+    if (t.ok) {
+        _ = sys_write(1, content[0..t.content_len], @as(u64, t.content_len));
+        _ = sys_write(1, "\n", 1);
+    }
+    return t;
+}
+
+// ---- one agent run -----------------------------------------------------------------------------------------
+
+/// Runs one ONESHOT agent to a final state and returns its status. Its log is its own session: <dir>/s<agent_id>.log,
+/// refused when that file already exists (a log is append-only; an id is never reused). The one optional
+/// tool is the clock, asked through native_agent (policy decides; only a read-only tool can be allowed). A
+/// cancel file for the agent id, seen before the provider call or during it, ends the run cancelled. The log is
+/// saved after the contract and tool step and again at the end; a final save that fails makes the agent
+/// AG_FAILED / AE_LOG_FULL, because its result is not durable. `img` is LOG_MAX bytes.
+pub fn host_run_agent(dir: []const u8, a: *NativeAgent, tool: u32, e: *Endpoint,
+                      img: []u8, resp: []u8, scratch: []u8, content: []u8) -> u32 {
+    if (a.status != AG_NEW or img.len < LOG_MAX or host_ensure_dir(dir) == false) { return a.status; }
+    if (host_log_exists(dir, a.agent_id)) {
+        a.status = AG_FAILED;
+        a.error = AE_BAD_CONTRACT;
+        return a.status;
+    }
+    var c : Cur = agent_start(a, img, cur_new());
+    if (a.status != AG_RUNNING) { return a.status; }
+    var tool_out : [40]u8 = [0] ** 40;
+    var tn : usize = 0;
+    if (tool != 0) {
+        c = agent_request_tool(a, tool, img, c);
+        if (a.last_decision == DEC_ALLOW and tool == TOOL_CLOCK) {
+            tn = put_dec(tool_out[0..40], 0, host_now_ms());
+            c = agent_tool_result(a, tool, tool_out[0..tn], img, c);
+        }
+    }
+    var cp : [192]u8 = [0] ** 192;
+    const cpn : usize = host_session_file(dir, a.agent_id, "cancel", cp[0..192]);
+    if (host_exists(cp[0..192])) {
+        c = agent_cancel(a, img, c);
+    } else {
+        if (host_save(dir, a.agent_id, img, c.len) == false) {
+            a.status = AG_FAILED;
+            a.error = AE_LOG_FULL;
+            return a.status;
+        }
+        var pm : [1024]u8 = [0] ** 1024;
+        const pn : usize = compose_prompt(a, tool_out[0..tn], pm[0..1024]);
+        var maxt : u32 = HOST_AGENT_TOKENS;
+        if (a.budget_tokens < maxt) { maxt = a.budget_tokens; }
+        const info : ReplyInfo = host_chat(e, pm[0..pn], maxt, HOST_TIMEOUT_MS, cp[0..cpn], resp, scratch, content);
+        if (info.err == ERR_NONE) {
+            var keep : usize = info.content_len;
+            if (keep > RESULT_MAX) { keep = RESULT_MAX; }
+            c = agent_finish(a, content[0..keep], info.prompt_tokens, info.completion_tokens, img, c);
+        } else if (info.err == ERR_CANCELLED) {
+            c = agent_cancel(a, img, c);
+        } else {
+            c = agent_fail(a, info.err, img, c);
+        }
+    }
+    if (host_save(dir, a.agent_id, img, c.len) == false) {
+        a.status = AG_FAILED;
+        a.error = AE_LOG_FULL;
+    }
+    return a.status;
+}
+
+// ---- one swarm run -----------------------------------------------------------------------------------------
+
+/// Runs the swarm's members one at a time, in the order swarm_next names them, each as host_run_agent under the
+/// same endpoint; a cancel file for the swarm id, looked for before each member, cancels everything not yet run
+/// (no provider call is made for it). The three agents are the members assigned to `sw` in index order. The
+/// coordinator's own log is <dir>/s<swarm_id>.log. Returns the swarm status. `simg` and `img` are LOG_MAX bytes.
+pub fn host_run_swarm(dir: []const u8, sw: *Swarm, a0: *NativeAgent, a1: *NativeAgent, a2: *NativeAgent, e: *Endpoint,
+                      simg: []u8, img: []u8, resp: []u8, scratch: []u8, content: []u8) -> u32 {
+    if (simg.len < LOG_MAX or host_ensure_dir(dir) == false) { return sw.status; }
+    var c : Cur = swarm_start(sw, simg, cur_new());
+    var idx : usize = swarm_next(sw);
+    while (idx != NO_MEMBER and sw.status == SW_RUNNING) {
+        if (host_cancel_requested(dir, sw.swarm_id)) {
+            c = swarm_cancel(sw, simg, c);
+        } else if (swarm_begin(sw, idx)) {
+            if (idx == 0) {
+                _ = host_run_agent(dir, a0, TOOL_CLOCK, e, img, resp, scratch, content);
+                c = swarm_report(sw, idx, a0, simg, c);
+            } else if (idx == 1) {
+                _ = host_run_agent(dir, a1, TOOL_CLOCK, e, img, resp, scratch, content);
+                c = swarm_report(sw, idx, a1, simg, c);
+            } else {
+                _ = host_run_agent(dir, a2, TOOL_CLOCK, e, img, resp, scratch, content);
+                c = swarm_report(sw, idx, a2, simg, c);
+            }
+        }
+        idx = swarm_next(sw);
+    }
+    if (sw.status == SW_RUNNING) { c = swarm_finish(sw, simg, c); }
+    _ = host_save(dir, sw.swarm_id, simg, c.len);
+    return sw.status;
+}
+
+// ---- tests (no LM Studio needed; stub-safe) ----------------------------------------------------------------
+// Under t27c every @extern is a stub of its return type (0), so no test here may depend on a file, a socket
+// or the clock doing real work, and none may reach an extern at all (see the header). These four hold with the
+// stubs and with libSystem. The host-behaviour tests (save and read back, a missing log, the cancel file, a
+// closed port) are group G of native_accept.t27, which needs an extern-capable t27b.
+
+test the_session_file_names_are_built_with_a_trailing_zero {
+    var out : [64]u8 = [0] ** 64;
+    const n : usize = host_session_file("d", 12, "log", out[0..64]);
+    assert n == 9;
+    assert out[0] == 100;
+    assert out[2] == 115;
+    assert out[3] == 49;
+    assert out[4] == 50;
+    assert out[5] == 46;
+    assert out[9] == 0;
+    var tiny : [8]u8 = [0] ** 8;
+    assert host_session_file("d", 12, "log", tiny[0..8]) == 0;
+    assert host_session_file("", 12, "log", out[0..64]) == 0;
+}
+
+test the_port_is_one_to_65535_in_decimal {
+    assert ls_parse_port("1234") == 1234;
+    assert ls_parse_port("65535") == 65535;
+    assert ls_parse_port("0") == 0;
+    assert ls_parse_port("65536") == 0;
+    assert ls_parse_port("12a") == 0;
+    assert ls_parse_port("") == 0;
+    assert ls_parse_port("123456") == 0;
+}
+
+test only_the_four_lmstudio_names_are_ever_read {
+    var out : [64]u8 = [0] ** 64;
+    assert host_env("HOME", out[0..64]) == 0;
+    assert host_env("PATH", out[0..64]) == 0;
+    assert host_env("T27OS_LMSTUDIO", out[0..64]) == 0;
+}

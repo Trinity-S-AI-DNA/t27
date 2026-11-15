@@ -21,6 +21,7 @@ module QueenTeamMsg;
 
 use queen::actors;
 use queen::control::claim_lands;
+use queen::control::NO_HOLDER;
 use queen::agent_card::ROLE_SOLO;
 use queen::agent_card::ROLE_LEAD;
 use queen::agent_card::ROLE_MATE;
@@ -219,6 +220,255 @@ pub fn team_claim_lands(deps: u64, done: u64, holder: u32, me: u32, expired: boo
     return claim_lands(holder, me, expired, fence, fence_read);
 }
 
+; --- 6b. Team port piece 1 (gHashTag/t27#13894): member statuses and task-graph validation ----------
+; Read from the DSH Team plugin (deepseek-harness packages/experimental/agent-team roster.ts and
+; task-graph.ts, read-only): a member is provisioning until its child session settles, then active
+; (shown as running or inactive by whether its agent runs) or failed; an active member never becomes
+; failed (the source calls that edge impossible) and nothing returns to provisioning.
+
+pub const MS_PROVISIONING : u8 = 0;
+pub const MS_RUNNING : u8 = 1;
+pub const MS_INACTIVE : u8 = 2;
+pub const MS_FAILED : u8 = 3;
+
+pub fn member_status_known(s: u8) -> bool {
+    return s <= MS_FAILED;
+}
+
+/// Is a change of a member's status from `from` to `to` allowed? provisioning settles to running,
+/// inactive or failed; running and inactive swap; failed is final; a repeat is not a change.
+pub fn member_transition_allowed(from: u8, to: u8) -> bool {
+    if (member_status_known(from) == false) { return false; }
+    if (member_status_known(to) == false) { return false; }
+    if (from == MS_PROVISIONING) { return to != MS_PROVISIONING; }
+    if (from == MS_RUNNING) { return to == MS_INACTIVE; }
+    if (from == MS_INACTIVE) { return to == MS_RUNNING; }
+    return false;
+}
+
+/// Validation codes, in the order they are tried.
+pub const DEP_OK : u8 = 0;
+pub const DEP_MISSING : u8 = 1;
+pub const DEP_DUPLICATE : u8 = 2;
+pub const DEP_SELF : u8 = 3;
+pub const DEP_CYCLE : u8 = 4;
+/// "No offending task": one past the last task number.
+pub const DEP_NO_TASK : u64 = 64;
+
+pub struct DepCheck {
+    code: u8,
+    task: u64,
+}
+
+/// How many bits are set in a mask.
+pub fn mask_count(m: u64) -> u32 {
+    var n : u32 = 0;
+    var k : u64 = 0;
+    while (k < 64) {
+        if (((m >> k) & 1) == 1) { n = n + 1; }
+        k = k + 1;
+    }
+    return n;
+}
+
+/// The lowest task number in a mask, or DEP_NO_TASK for an empty one.
+pub fn mask_first(m: u64) -> u64 {
+    var k : u64 = 0;
+    while (k < 64) {
+        if (((m >> k) & 1) == 1) { return k; }
+        k = k + 1;
+    }
+    return DEP_NO_TASK;
+}
+
+/// Validate one task written with its blockers. `deps` is the blocker mask, `listed` the number of
+/// blockers the author wrote (a repeat makes it larger than the mask's count), `exist` the tasks that
+/// exist, `downstream` the tasks that already wait on `task`, directly or not (the caller keeps that
+/// closure). Order: self, duplicate, missing, cycle. The offender is `task` for self and duplicate
+/// (a mask cannot say which blocker repeated), the lowest absent blocker for missing, and the lowest
+/// blocker that already waits on `task` for cycle.
+pub fn dep_check(task: u64, deps: u64, listed: u32, exist: u64, downstream: u64) -> DepCheck {
+    if (task >= 64) { return DepCheck{.code = DEP_MISSING, .task = task}; }
+    if (deps_without_self(task, deps) == false) { return DepCheck{.code = DEP_SELF, .task = task}; }
+    if (listed != mask_count(deps)) { return DepCheck{.code = DEP_DUPLICATE, .task = task}; }
+    var absent : u64 = deps - (deps & exist);
+    if (absent != 0) { return DepCheck{.code = DEP_MISSING, .task = mask_first(absent)}; }
+    var loop : u64 = deps & downstream;
+    if (loop != 0) { return DepCheck{.code = DEP_CYCLE, .task = mask_first(loop)}; }
+    return DepCheck{.code = DEP_OK, .task = DEP_NO_TASK};
+}
+
+; --- 6c. Team port piece 2 (gHashTag/t27#13906): the task board -------------------------------------
+; Read from the DSH Team plugin task-board (read-only): four statuses; a claim needs an unowned pending
+; task whose blockers are all completed; release and complete need an in_progress task and its owner
+; or the lead; reopen needs a completed task; delete is refused while a live task depends on it.
+; Chosen here, not read: reopen and release both return the task to pending; a deleted blocker never
+; counts as done, so its dependents stay blocked; the board window is 8 tasks (the array shape
+; actor_view.t27 already uses), wider lists page by 8. Slot i is task number i.
+
+pub const TS_PENDING : u8 = 0;
+pub const TS_IN_PROGRESS : u8 = 1;
+pub const TS_COMPLETED : u8 = 2;
+pub const TS_DELETED : u8 = 3;
+/// An unused slot on the board: it is no task and is never counted.
+pub const TS_EMPTY : u8 = 255;
+pub const BOARD_SLOTS : u32 = 8;
+/// "No claimable task": one past the last slot.
+pub const BOARD_NONE : u32 = 8;
+
+/// Refusal codes, one per rule broken, in the order each rule tries them.
+pub const BR_OK : u8 = 0;
+pub const BR_UNKNOWN_STATUS : u8 = 1;
+pub const BR_NOT_PENDING : u8 = 2;
+pub const BR_OWNED : u8 = 3;
+pub const BR_BLOCKED : u8 = 4;
+pub const BR_NOT_IN_PROGRESS : u8 = 5;
+pub const BR_NOT_OWNER : u8 = 6;
+pub const BR_NOT_COMPLETED : u8 = 7;
+pub const BR_ALREADY_DELETED : u8 = 8;
+pub const BR_HAS_LIVE_DEPENDENT : u8 = 9;
+
+pub fn task_status_known(s: u8) -> bool {
+    return s <= TS_DELETED;
+}
+
+/// Allowed status changes: pending starts (claim) or is deleted; in_progress goes back (release),
+/// finishes (complete) or is deleted; completed reopens to pending or is deleted; deleted is final;
+/// a repeat is not a change.
+pub fn task_transition_allowed(from: u8, to: u8) -> bool {
+    if (task_status_known(from) == false) { return false; }
+    if (task_status_known(to) == false) { return false; }
+    if (from == TS_DELETED) { return false; }
+    if (to == TS_DELETED) { return true; }
+    if (from == TS_PENDING) { return to == TS_IN_PROGRESS; }
+    if (from == TS_IN_PROGRESS) {
+        if (to == TS_PENDING) { return true; }
+        return to == TS_COMPLETED;
+    }
+    return to == TS_PENDING;
+}
+
+/// Claim: an unowned pending task whose blockers are all completed (`done` is the completed mask).
+pub fn claim_refusal(status: u8, owner: u32, deps: u64, done: u64) -> u8 {
+    if (task_status_known(status) == false) { return BR_UNKNOWN_STATUS; }
+    if (status != TS_PENDING) { return BR_NOT_PENDING; }
+    if (owner != NO_HOLDER) { return BR_OWNED; }
+    if (deps_ready(deps, done) == false) { return BR_BLOCKED; }
+    return BR_OK;
+}
+
+/// Release and complete share one rule: an in_progress task, and the caller is its owner or the lead.
+pub fn holder_refusal(status: u8, owner: u32, me: u32, role: u8) -> u8 {
+    if (task_status_known(status) == false) { return BR_UNKNOWN_STATUS; }
+    if (status != TS_IN_PROGRESS) { return BR_NOT_IN_PROGRESS; }
+    if (role == ROLE_LEAD) { return BR_OK; }
+    if (me != NO_HOLDER and me == owner) { return BR_OK; }
+    return BR_NOT_OWNER;
+}
+
+pub fn release_refusal(status: u8, owner: u32, me: u32, role: u8) -> u8 {
+    return holder_refusal(status, owner, me, role);
+}
+
+pub fn complete_refusal(status: u8, owner: u32, me: u32, role: u8) -> u8 {
+    return holder_refusal(status, owner, me, role);
+}
+
+/// Reopen: only a completed task.
+pub fn reopen_refusal(status: u8) -> u8 {
+    if (task_status_known(status) == false) { return BR_UNKNOWN_STATUS; }
+    if (status != TS_COMPLETED) { return BR_NOT_COMPLETED; }
+    return BR_OK;
+}
+
+/// Delete: refused while a live task depends on it. `live_deps` is the union of the blocker masks of
+/// the live tasks (board_live_deps).
+pub fn delete_refusal(status: u8, task: u64, live_deps: u64) -> u8 {
+    if (task_status_known(status) == false) { return BR_UNKNOWN_STATUS; }
+    if (status == TS_DELETED) { return BR_ALREADY_DELETED; }
+    if (task >= 64) { return BR_UNKNOWN_STATUS; }
+    if ((live_deps & bit(task)) != 0) { return BR_HAS_LIVE_DEPENDENT; }
+    return BR_OK;
+}
+
+/// The completed tasks of a board, as a mask.
+pub fn board_done(statuses: [8]u8) -> u64 {
+    var m : u64 = 0;
+    var i : u32 = 0;
+    while (i < BOARD_SLOTS) {
+        if (statuses[i] == TS_COMPLETED) { m = m | bit(i); }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// The union of the blocker masks of the live tasks (pending or in_progress).
+pub fn board_live_deps(statuses: [8]u8, deps: [8]u64) -> u64 {
+    var m : u64 = 0;
+    var i : u32 = 0;
+    while (i < BOARD_SLOTS) {
+        if (statuses[i] == TS_PENDING) { m = m | deps[i]; }
+        if (statuses[i] == TS_IN_PROGRESS) { m = m | deps[i]; }
+        i = i + 1;
+    }
+    return m;
+}
+
+/// The next claimable task: the lowest slot that passes the claim rule, or BOARD_NONE.
+pub fn next_claimable(statuses: [8]u8, owners: [8]u32, deps: [8]u64) -> u32 {
+    var done : u64 = board_done(statuses);
+    var i : u32 = 0;
+    while (i < BOARD_SLOTS) {
+        if (claim_refusal(statuses[i], owners[i], deps[i], done) == BR_OK) { return i; }
+        i = i + 1;
+    }
+    return BOARD_NONE;
+}
+
+pub struct BoardSummary {
+    pending: u32,
+    in_progress: u32,
+    completed: u32,
+    deleted: u32,
+    blocked: u32,
+}
+
+/// Count per status, and how many pending tasks wait on a blocker that is not completed.
+pub fn board_summary(statuses: [8]u8, deps: [8]u64) -> BoardSummary {
+    var done : u64 = board_done(statuses);
+    var p : u32 = 0;
+    var g : u32 = 0;
+    var c : u32 = 0;
+    var d : u32 = 0;
+    var b : u32 = 0;
+    var i : u32 = 0;
+    while (i < BOARD_SLOTS) {
+        if (statuses[i] == TS_PENDING) {
+            p = p + 1;
+            if (deps_ready(deps[i], done) == false) { b = b + 1; }
+        }
+        if (statuses[i] == TS_IN_PROGRESS) { g = g + 1; }
+        if (statuses[i] == TS_COMPLETED) { c = c + 1; }
+        if (statuses[i] == TS_DELETED) { d = d + 1; }
+        i = i + 1;
+    }
+    return BoardSummary{.pending = p, .in_progress = g, .completed = c, .deleted = d, .blocked = b};
+}
+
+/// Fixture A: 0 completed, 1 pending (ready), 2 pending (blocked on 0 and 3), 3 in_progress by 7,
+/// 4 deleted, 5..7 empty.
+pub const TB_STATUS : [8]u8 = [2, 0, 0, 1, 3, 255, 255, 255];
+pub const TB_OWNER : [8]u32 = [5, 0, 0, 7, 0, 0, 0, 0];
+pub const TB_DEPS : [8]u64 = [0, 1, 9, 0, 0, 0, 0, 0];
+/// Fixture B: 0 pending but owned, 1 pending blocked on 0, 2 pending free.
+pub const TB2_STATUS : [8]u8 = [0, 0, 0, 255, 255, 255, 255, 255];
+pub const TB2_OWNER : [8]u32 = [4, 0, 0, 0, 0, 0, 0, 0];
+pub const TB2_DEPS : [8]u64 = [0, 1, 0, 0, 0, 0, 0, 0];
+/// Fixture C: nothing to claim: 0 completed, 1 in_progress, 2 pending blocked on 1.
+pub const TB3_STATUS : [8]u8 = [2, 1, 0, 255, 255, 255, 255, 255];
+pub const TB3_OWNER : [8]u32 = [1, 2, 0, 0, 0, 0, 0, 0];
+pub const TB3_DEPS : [8]u64 = [0, 0, 2, 0, 0, 0, 0, 0];
+
 ; --- 7. The record of a cross-session note ----------------------------------------------------------
 
 /// The body itself is not in the row: only its hash and length, so the store keeps no free text
@@ -368,4 +618,167 @@ test a_note_row_carries_no_body {
     assert n.seq == 3;
     assert n.body_len == 40;
     assert tm_may_send(n.tag, ROLE_SOLO, false) == true;
+}
+
+test member_status_transitions_follow_the_roster {
+    assert member_transition_allowed(MS_PROVISIONING, MS_RUNNING) == true;
+    assert member_transition_allowed(MS_PROVISIONING, MS_INACTIVE) == true;
+    assert member_transition_allowed(MS_PROVISIONING, MS_FAILED) == true;
+    assert member_transition_allowed(MS_RUNNING, MS_INACTIVE) == true;
+    assert member_transition_allowed(MS_INACTIVE, MS_RUNNING) == true;
+}
+
+test a_refused_status_transition_stays_refused {
+    assert member_transition_allowed(MS_RUNNING, MS_FAILED) == false;
+    assert member_transition_allowed(MS_INACTIVE, MS_FAILED) == false;
+    assert member_transition_allowed(MS_RUNNING, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_INACTIVE, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_FAILED, MS_RUNNING) == false;
+    assert member_transition_allowed(MS_FAILED, MS_INACTIVE) == false;
+    assert member_transition_allowed(MS_FAILED, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_PROVISIONING, MS_PROVISIONING) == false;
+    assert member_transition_allowed(MS_RUNNING, MS_RUNNING) == false;
+    assert member_transition_allowed(4, MS_RUNNING) == false;
+    assert member_transition_allowed(MS_PROVISIONING, 4) == false;
+}
+
+test a_clean_task_list_entry_validates_ok {
+    assert dep_check(3, 6, 2, 63, 0).code == DEP_OK;
+    assert dep_check(3, 6, 2, 63, 0).task == DEP_NO_TASK;
+    assert dep_check(3, 0, 0, 63, 0).code == DEP_OK;
+    assert mask_count(6) == 2;
+    assert mask_first(6) == 1;
+    assert mask_first(0) == DEP_NO_TASK;
+}
+
+test a_missing_blocker_names_the_lowest_absent_task {
+    assert dep_check(3, 6, 2, 2, 0).code == DEP_MISSING;
+    assert dep_check(3, 6, 2, 2, 0).task == 2;
+    assert dep_check(3, 6, 2, 4, 0).task == 1;
+    assert dep_check(3, 6, 2, 6, 0).code == DEP_OK;
+    assert dep_check(64, 0, 0, 63, 0).code == DEP_MISSING;
+}
+
+test a_repeated_blocker_is_a_duplicate {
+    assert dep_check(3, 6, 3, 63, 0).code == DEP_DUPLICATE;
+    assert dep_check(3, 6, 3, 63, 0).task == 3;
+    assert dep_check(3, 6, 2, 63, 0).code == DEP_OK;
+}
+
+test a_task_that_blocks_itself_is_refused_as_self {
+    assert dep_check(1, 6, 2, 63, 0).code == DEP_SELF;
+    assert dep_check(1, 6, 2, 63, 0).task == 1;
+    assert dep_check(0, 6, 2, 63, 0).code == DEP_OK;
+}
+
+test a_blocker_that_already_waits_on_the_task_is_a_cycle {
+    assert dep_check(3, 6, 2, 63, 4).code == DEP_CYCLE;
+    assert dep_check(3, 6, 2, 63, 4).task == 2;
+    assert dep_check(3, 6, 2, 63, 8).code == DEP_OK;
+    assert dep_check(3, 6, 2, 63, 2).task == 1;
+}
+
+test validation_codes_are_tried_in_order {
+    assert dep_check(1, 6, 3, 0, 6).code == DEP_SELF;
+    assert dep_check(3, 6, 3, 0, 6).code == DEP_DUPLICATE;
+    assert dep_check(3, 6, 2, 0, 6).code == DEP_MISSING;
+}
+
+invariant the_task_statuses_are_contiguous { assert TS_IN_PROGRESS == TS_PENDING + 1 and TS_COMPLETED == TS_IN_PROGRESS + 1 and TS_DELETED == TS_COMPLETED + 1 and BOARD_NONE == BOARD_SLOTS; }
+
+test task_status_transitions_follow_the_board {
+    assert task_transition_allowed(TS_PENDING, TS_IN_PROGRESS) == true;
+    assert task_transition_allowed(TS_IN_PROGRESS, TS_PENDING) == true;
+    assert task_transition_allowed(TS_IN_PROGRESS, TS_COMPLETED) == true;
+    assert task_transition_allowed(TS_COMPLETED, TS_PENDING) == true;
+    assert task_transition_allowed(TS_PENDING, TS_DELETED) == true;
+    assert task_transition_allowed(TS_IN_PROGRESS, TS_DELETED) == true;
+    assert task_transition_allowed(TS_COMPLETED, TS_DELETED) == true;
+}
+
+test a_refused_task_transition_stays_refused {
+    assert task_transition_allowed(TS_PENDING, TS_COMPLETED) == false;
+    assert task_transition_allowed(TS_COMPLETED, TS_IN_PROGRESS) == false;
+    assert task_transition_allowed(TS_DELETED, TS_PENDING) == false;
+    assert task_transition_allowed(TS_DELETED, TS_DELETED) == false;
+    assert task_transition_allowed(TS_PENDING, TS_PENDING) == false;
+    assert task_transition_allowed(TS_COMPLETED, TS_COMPLETED) == false;
+    assert task_transition_allowed(4, TS_PENDING) == false;
+    assert task_transition_allowed(TS_PENDING, 4) == false;
+}
+
+test a_claim_needs_an_unowned_pending_task_with_done_blockers {
+    assert claim_refusal(TS_PENDING, 0, 0, 0) == BR_OK;
+    assert claim_refusal(TS_PENDING, 0, 3, 3) == BR_OK;
+    assert claim_refusal(TS_IN_PROGRESS, 0, 0, 0) == BR_NOT_PENDING;
+    assert claim_refusal(TS_COMPLETED, 0, 0, 0) == BR_NOT_PENDING;
+    assert claim_refusal(TS_DELETED, 0, 0, 0) == BR_NOT_PENDING;
+    assert claim_refusal(TS_PENDING, 5, 0, 0) == BR_OWNED;
+    assert claim_refusal(TS_PENDING, 0, 9, 1) == BR_BLOCKED;
+    assert claim_refusal(7, 0, 0, 0) == BR_UNKNOWN_STATUS;
+}
+
+test claim_refusals_are_tried_in_order {
+    assert claim_refusal(TS_IN_PROGRESS, 5, 9, 0) == BR_NOT_PENDING;
+    assert claim_refusal(TS_PENDING, 5, 9, 0) == BR_OWNED;
+    assert claim_refusal(TS_PENDING, 0, 9, 0) == BR_BLOCKED;
+    assert claim_refusal(TS_PENDING, 0, 9, 9) == BR_OK;
+}
+
+test release_and_complete_need_the_owner_or_the_lead {
+    assert release_refusal(TS_IN_PROGRESS, 7, 7, ROLE_MATE) == BR_OK;
+    assert complete_refusal(TS_IN_PROGRESS, 7, 7, ROLE_MATE) == BR_OK;
+    assert release_refusal(TS_IN_PROGRESS, 7, 9, ROLE_LEAD) == BR_OK;
+    assert complete_refusal(TS_IN_PROGRESS, 7, 9, ROLE_LEAD) == BR_OK;
+    assert release_refusal(TS_IN_PROGRESS, 7, 9, ROLE_MATE) == BR_NOT_OWNER;
+    assert complete_refusal(TS_IN_PROGRESS, 7, 9, ROLE_MATE) == BR_NOT_OWNER;
+    assert complete_refusal(TS_IN_PROGRESS, 7, 0, ROLE_MATE) == BR_NOT_OWNER;
+    assert release_refusal(TS_PENDING, 0, 7, ROLE_LEAD) == BR_NOT_IN_PROGRESS;
+    assert complete_refusal(TS_COMPLETED, 7, 7, ROLE_MATE) == BR_NOT_IN_PROGRESS;
+    assert complete_refusal(TS_DELETED, 7, 7, ROLE_LEAD) == BR_NOT_IN_PROGRESS;
+    assert complete_refusal(9, 7, 7, ROLE_LEAD) == BR_UNKNOWN_STATUS;
+}
+
+test reopen_needs_a_completed_task {
+    assert reopen_refusal(TS_COMPLETED) == BR_OK;
+    assert reopen_refusal(TS_PENDING) == BR_NOT_COMPLETED;
+    assert reopen_refusal(TS_IN_PROGRESS) == BR_NOT_COMPLETED;
+    assert reopen_refusal(TS_DELETED) == BR_NOT_COMPLETED;
+    assert reopen_refusal(9) == BR_UNKNOWN_STATUS;
+}
+
+test delete_is_refused_while_a_live_task_depends_on_it {
+    assert board_live_deps(TB_STATUS, TB_DEPS) == 9;
+    assert delete_refusal(TS_COMPLETED, 0, 9) == BR_HAS_LIVE_DEPENDENT;
+    assert delete_refusal(TS_IN_PROGRESS, 3, 9) == BR_HAS_LIVE_DEPENDENT;
+    assert delete_refusal(TS_PENDING, 1, 9) == BR_OK;
+    assert delete_refusal(TS_PENDING, 2, 9) == BR_OK;
+    assert delete_refusal(TS_DELETED, 4, 0) == BR_ALREADY_DELETED;
+    assert delete_refusal(8, 4, 0) == BR_UNKNOWN_STATUS;
+    assert delete_refusal(TS_PENDING, 64, 0) == BR_UNKNOWN_STATUS;
+}
+
+test a_finished_or_deleted_dependent_does_not_hold_a_delete {
+    assert board_live_deps(TB3_STATUS, TB3_DEPS) == 2;
+    assert board_done(TB_STATUS) == 1;
+    assert board_done(TB3_STATUS) == 1;
+    assert board_done(TB2_STATUS) == 0;
+    assert delete_refusal(TS_COMPLETED, 0, 0) == BR_OK;
+}
+
+test the_next_claimable_task_is_the_lowest_that_passes_the_claim_rule {
+    assert next_claimable(TB_STATUS, TB_OWNER, TB_DEPS) == 1;
+    assert next_claimable(TB2_STATUS, TB2_OWNER, TB2_DEPS) == 2;
+    assert next_claimable(TB3_STATUS, TB3_OWNER, TB3_DEPS) == BOARD_NONE;
+}
+
+test the_board_summary_counts_each_status_and_the_blocked {
+    assert board_summary(TB_STATUS, TB_DEPS).pending == 2;
+    assert board_summary(TB_STATUS, TB_DEPS).in_progress == 1;
+    assert board_summary(TB_STATUS, TB_DEPS).completed == 1;
+    assert board_summary(TB_STATUS, TB_DEPS).deleted == 1;
+    assert board_summary(TB_STATUS, TB_DEPS).blocked == 1;
+    assert board_summary(TB2_STATUS, TB2_DEPS).blocked == 1;
+    assert board_summary(TB3_STATUS, TB3_DEPS).blocked == 1;
+    assert board_summary(TB3_STATUS, TB3_DEPS).pending == 1;
 }
