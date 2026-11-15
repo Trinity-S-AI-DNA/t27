@@ -15,7 +15,7 @@
 - Tier 1 excludes every specification gen-c cannot compile.
 - Clang -O2 folded the test at compile time on 11 of 20 specifications; its ratios use the remaining 9.
 - At the measured revision `t27b build` wrote Mach-O objects only and did not link.
-- Post-snapshot changes (ELF64 objects, `t27b run`, `t27b verilog`, the larger corpus) were not re-measured, and no later lab figure is used.
+- Post-snapshot changes (ELF64 objects, `t27b run`, `t27b verilog`, the larger corpus) were not re-measured, and no later lab figure is used. This includes the optimizer passes merged after the snapshot (check_elide #13397 #13403, cinc #13415, ifconv #13383, countdown #13422 #13452, licm_body_const #13425, golden-spec correction #13498): as of 2026-11-10 none fire on the `bench_audit` witness (hot loop 21 words against GCC -O2's 10; `specs/tri/t27b/golden_spec.t27`, #12871 #13453), so the paper's "unoptimising compiler" code-quality claim is if anything conservative for the current tree.
 - The measurement harness is not committed; the report lists its commands.
 - t27b is not an optimising compiler and not a replacement for LLVM.
 - No front end for C, Rust, Zig, Go or Python exists. Cross-language lowering is not claimed.
