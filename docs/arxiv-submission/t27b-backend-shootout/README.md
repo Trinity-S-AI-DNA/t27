@@ -1,4 +1,8 @@
-# t27b: a fast baseline AArch64 compiler (arXiv draft)
+# GOLDEN SPECS: t27b --- A Fast Baseline AArch64 Compiler for a Specification-First Language (arXiv draft)
+
+Subtitle: Corpus-Scale Differential Measurement against Zig, GCC and Clang
+Pipelines. Claim boundary: GOLDEN SPECS provides reproducible evidence, not
+unconditional proof.
 
 Status: draft. Not submitted. Tracking issue: #13202.
 

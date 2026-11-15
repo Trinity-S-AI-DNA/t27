@@ -2,14 +2,29 @@
 // specs/crons/t27-pareto-improvement-loop.t27 -- the 15-minute continuous improvement cycle.
 // Every tick: audit the swarm state, find weak points by Pareto, fix the top one in .t27,
 // verify locally with real receipts, land green through the merge train, write the beat to the hive,
-// and never break a past merge. Self-healing: any tick that red-checks rolls back its own change
-// before the next tick starts. All logic in .t27; no foreign edits.
+// and never break a past merge. A failed tick leaves prior commits untouched: it may
+// commit only its own task files, and a red typecheck rolls that lane back to the
+// pre-tick HEAD. It never resets master, never force-pushes, and the window stays
+// blocked. All logic in .t27; no foreign edits.
 // phi^2 + 1/phi^2 = 3 | TRINITY
 ; Issue: #8220
 
 module CronParetoImprovementLoop;
 
+use ci::pr_ready_aggregate::aggregate_passes;
+use ci::pr_ready_aggregate::T_SUCCESS;
 use crons::t27os-night-loop::pick_may_run;
+use tri::trigit::roadmap_dashboard_sync::RD_CYCLE_MAX;
+use tri::trigit::roadmap_dashboard_sync::RD_DEBOUNCE_MS;
+use tri::trigit::roadmap_dashboard_sync::rd_cycle_now;
+use tri::trigit::roadmap_dashboard_sync::rd_cycle_overflow;
+use tri::trigit::roadmap_dashboard_sync::rd_debounce_fire;
+use tri::trigit::roadmap_dashboard_sync::rd_ev_deadletter;
+use t27os::t27l::tl_action_id;
+use t27os::t27l::tl_surface_id;
+use t27os::orchestrator::oc_branch_ok;
+use t27os::orchestrator::oc_commit_ok;
+use t27os::orchestrator::oc_window_open;
 
 pub const KIND : str = "cron";
 pub const ID : str = "launchd/mac/t27-pareto-improvement-loop";
@@ -34,7 +49,9 @@ pub const CONTROL : str = "code-only";
 // 4 VERIFY -- t27c test + seal on the branch; real corpus receipt compare vs master.
 // 5 LAND   -- commit with L1 reference, push once per batch, open PR, merge when green.
 // 6 BEAT   -- post the tick's verdict (pass/fail/cost/n/repro footer) to the hive feed.
-// 7 SELF-HEAL-- if this tick's change red-checks anything, revert it before the next tick.
+// 7 SELF-HEAL-- a red typecheck rolls this lane back to its pre-tick HEAD
+//    (self_recovery_action). A change that stays red past ROLLBACK_WINDOW is reverted
+//    before the next tick. Neither path resets master or force-pushes.
 
 pub const STEP_AUDIT : u8 = 0;
 pub const STEP_PARETO : u8 = 1;
@@ -70,6 +87,148 @@ test fix_start_waits_for_gate_and_repairs {
     assert fix_may_start(true, 0);
     assert fix_may_start(false, 0) == false;
     assert fix_may_start(true, 1) == false;
+}
+
+/// May this tick patch a red CI check? Only when the failing path is in this tick's task files.
+/// Repo-wide gates on master debt (duplicate bodies, foreign stale seals) are not lane-owned.
+pub fn gate_patch_allowed(own_task_path: bool) -> bool {
+    return own_task_path;
+}
+
+test inherited_repo_gate_not_lane_owned {
+    assert gate_patch_allowed(true);
+    assert gate_patch_allowed(false) == false;
+}
+
+/// May this tick start a fix on a red check? Requires an own-task path and the night-loop gate.
+pub fn pareto_fix_may_start(own_task_path: bool, pr_gate_done: bool, own_red_prs: u32) -> bool {
+    if (gate_patch_allowed(own_task_path) == false) { return false; }
+    return fix_may_start(pr_gate_done, own_red_prs);
+}
+
+test pareto_fix_refuses_inherited_red {
+    assert pareto_fix_may_start(false, true, 0) == false;
+    assert pareto_fix_may_start(true, true, 0);
+}
+
+/// May this tick push to GitHub? Skill-only ticks pause while repo-wide gates are red on master
+/// debt so Actions queue churn does not restart thirty checks for no lane-owned delta.
+pub fn batch_push_may_run(skill_only_tick: bool, inherited_repo_gate_red: bool, own_task_path: bool, required_checks_pending: bool) -> bool {
+    if (required_checks_pending) { return false; }
+    if (inherited_repo_gate_red && skill_only_tick) { return false; }
+    if (inherited_repo_gate_red && own_task_path == false) { return false; }
+    return true;
+}
+
+test batch_push_pauses_skill_only_while_inherited_red {
+    assert batch_push_may_run(true, true, false, false) == false;
+    assert batch_push_may_run(false, true, true, false);
+    assert batch_push_may_run(true, false, false, false);
+}
+
+test batch_push_waits_while_required_ci_pending {
+    assert batch_push_may_run(false, false, true, true) == false;
+    assert batch_push_may_run(false, false, true, false);
+}
+
+/// May this tick merge origin/master? Wait while required checks on the lane PR are still pending
+/// after the last push, so two merges in one window do not stack two full CI matrices.
+pub fn merge_master_may_run(required_checks_pending: bool, master_ahead: bool) -> bool {
+    if (master_ahead == false) { return false; }
+    if (required_checks_pending) { return false; }
+    return true;
+}
+
+test merge_master_waits_for_ci_after_push {
+    assert merge_master_may_run(true, true) == false;
+    assert merge_master_may_run(false, true);
+    assert merge_master_may_run(false, false) == false;
+}
+
+// ---- CRON_BATCH_V1 (cloud Cursor ticks): debounce, one bounded job, dead-letter overflow ----
+// Law: specs/tri/trigit/roadmap_dashboard_sync.t27 (RD_DEBOUNCE_MS 500, RD_CYCLE_MAX 100,
+// rd_debounce_fire, rd_cycle_now/overflow, t27l message_deadlettered 72). Event wake: subscriptions,
+// not tight polling (skill cron-batch).
+
+/// May this agent turn run? Only when at least one pending event debounces (500 ms quiet or max wait).
+pub fn cron_tick_may_run(pending_events: u32, quiet_ms: u64, oldest_pending_ms: u64) -> bool {
+    return rd_debounce_fire(pending_events, quiet_ms, oldest_pending_ms);
+}
+
+/// Tool actions allowed this cycle; overflow replans next cycle or dead-letter per t27m.
+pub fn cron_actions_this_cycle(planned_actions: u32) -> u32 {
+    return rd_cycle_now(planned_actions);
+}
+
+pub fn cron_actions_overflow(planned_actions: u32) -> u32 {
+    return rd_cycle_overflow(planned_actions);
+}
+
+test cron_batch_refuses_empty_poll_wakeup {
+    assert cron_tick_may_run(0, 1000, 0) == false;
+    assert cron_tick_may_run(1, RD_DEBOUNCE_MS, 0);
+}
+
+test cron_batch_caps_actions_and_dead_letters_overflow {
+    assert cron_actions_this_cycle(50) == 50;
+    assert cron_actions_this_cycle(100) == RD_CYCLE_MAX;
+    assert cron_actions_this_cycle(101) == RD_CYCLE_MAX;
+    assert cron_actions_overflow(101) == 1;
+    assert rd_ev_deadletter() == 72;
+}
+
+// ---- T27L_AUTOMATION_CONTROL_V1: registered actions only; host writer may be absent ----
+// Schema: specs/t27os/t27l.t27 (tl_event_line, tl_validate_line, TL_DUP idempotency).
+// Proposed `tri t27l tail|validate|export` are NOT BUILT in this repo snapshot — report INTEGRATION_GAP
+// before claiming a line was persisted.
+
+/// Empty reconciliation: no pending events, or no state change and no actions — zero model calls, no T27L spam.
+pub fn automation_empty_tick(pending_events: u32, actions_run: u32, state_changed: bool) -> bool {
+    if (pending_events == 0) { return true; }
+    if (state_changed == false and actions_run == 0) { return true; }
+    return false;
+}
+
+pub fn t27l_action_batch_started() -> u8 { return tl_action_id("cron_cycle_started"); }
+pub fn t27l_action_batch_completed() -> u8 { return tl_action_id("cron_cycle_completed"); }
+pub fn t27l_action_empty_skip() -> u8 { return tl_action_id("schedule_skipped"); }
+pub fn t27l_action_deadletter() -> u8 { return tl_action_id("message_deadlettered"); }
+pub fn t27l_action_artifact_ok() -> u8 { return tl_action_id("artifact_verified"); }
+pub fn t27l_action_feed_missing() -> u8 { return tl_action_id("bridge_event_unverified"); }
+pub fn t27l_surface_time() -> u8 { return tl_surface_id("time"); }
+
+test t27l_automation_maps_owner_lifecycle_to_registered_actions {
+    assert t27l_action_batch_started() == 79;
+    assert t27l_action_batch_completed() == 80;
+    assert t27l_action_empty_skip() == 89;
+    assert t27l_action_deadletter() == 72;
+    assert t27l_action_artifact_ok() == 155;
+    assert automation_empty_tick(0, 0, false);
+    assert automation_empty_tick(3, 0, false);
+    assert automation_empty_tick(3, 1, true) == false;
+}
+
+/// STEP AUDIT: repo-wide gates red on master debt, not on this tick's task files.
+pub fn inherited_repo_gate_red(duplicate_bodies_red: bool, seal_coverage_red: bool) -> bool {
+    return duplicate_bodies_red or seal_coverage_red;
+}
+
+test audit_treats_dupes_and_coverage_as_inherited {
+    assert inherited_repo_gate_red(true, false);
+    assert inherited_repo_gate_red(false, true);
+    assert inherited_repo_gate_red(false, false) == false;
+}
+
+/// STEP LAND: close this lane's PR only when aggregate pr-ready is green and master-debt gates are not red.
+pub fn tick_merge_target_met(aggregate_posted: bool, aggregate_state: u8, duplicate_bodies_red: bool, seal_coverage_red: bool) -> bool {
+    if (inherited_repo_gate_red(duplicate_bodies_red, seal_coverage_red)) { return false; }
+    return aggregate_passes(aggregate_posted, aggregate_state);
+}
+
+test land_waits_on_inherited_then_pr_ready {
+    assert tick_merge_target_met(true, T_SUCCESS, false, false);
+    assert tick_merge_target_met(true, T_SUCCESS, true, false) == false;
+    assert tick_merge_target_met(false, T_SUCCESS, false, false) == false;
 }
 
 /// Is an anomaly Pareto-ranked: its impact is at least the floor, or its frequency meets the floor?
@@ -119,11 +278,106 @@ test verdicts_have_names {
     assert verdict_name(99).len > 0;
 }
 
+// ---- Self-recovery: a failed tick leaves prior commits untouched (Refs #13534) ----
+// Competitor note, 2026-11-10: a bounded improvement loop (detect, one fix,
+// keep the last green commit) is the pattern. This card states that contract.
+// No rate, cost, or pass count is claimed.
+// The commit gate is oc_commit_ok and the branch gate is oc_branch_ok. Neither
+// body is copied. pick_may_run stays the predicate for starting a fix.
+
+pub const SR_KEEP : u8 = 0;
+pub const SR_ROLLBACK_LANE : u8 = 1;
+pub const SR_REFUSE : u8 = 2;
+
+/// A tick may commit only its own task files, on its own lane, with no secret.
+pub fn tick_commit_allowed(own_lane: bool, task_files_only: bool, has_secret: bool) -> bool {
+    return oc_commit_ok(own_lane, task_files_only, has_secret);
+}
+
+/// Recovery may move only this lane. Master, a force-push, a shared rebase, and
+/// any request to open the window are refused. oc_window_open stays false.
+pub fn recovery_lane_ok(branch_is_master: bool, force_push: bool, rebase_shared: bool, window_requested: bool) -> bool {
+    if (oc_window_open()) { return false; }
+    if (window_requested) { return false; }
+    return oc_branch_ok(branch_is_master, force_push, rebase_shared);
+}
+
+/// SR_KEEP: the typecheck was green and the commit is only this tick's files.
+/// SR_ROLLBACK_LANE: the typecheck was red and this lane's pre-tick HEAD is known.
+/// SR_REFUSE: move no ref. lane_ok is recovery_lane_ok (not master, no force-push,
+/// no shared rebase, window stays shut). commit_ok is tick_commit_allowed.
+/// A red typecheck with no recorded HEAD does not guess an older commit.
+pub fn self_recovery_action(lane_ok: bool, own_lane: bool, commit_ok: bool, typecheck_red: bool, pre_tick_known: bool) -> u8 {
+    if (lane_ok == false) { return SR_REFUSE; }
+    if (own_lane == false) { return SR_REFUSE; }
+    if (typecheck_red) {
+        if (pre_tick_known) { return SR_ROLLBACK_LANE; }
+        return SR_REFUSE;
+    }
+    if (commit_ok == false) { return SR_REFUSE; }
+    return SR_KEEP;
+}
+
+/// True when the action leaves every commit older than the pre-tick HEAD in place.
+/// Rollback counts only when the target is that pre-tick HEAD on the lane.
+pub fn prior_commits_untouched(action: u8, target_is_pre_tick: bool, branch_is_master: bool, force_push: bool) -> bool {
+    if (force_push) { return false; }
+    if (action == SR_REFUSE) { return true; }
+    if (action == SR_KEEP) { return branch_is_master == false; }
+    if (action == SR_ROLLBACK_LANE) {
+        if (branch_is_master) { return false; }
+        return target_is_pre_tick;
+    }
+    return false;
+}
+
+test a_tick_commits_only_its_own_task_files {
+    assert tick_commit_allowed(true, true, false);
+    assert tick_commit_allowed(true, false, false) == false;
+    assert tick_commit_allowed(false, true, false) == false;
+    assert tick_commit_allowed(true, true, true) == false;
+    assert self_recovery_action(true, true, true, false, true) == SR_KEEP;
+    assert self_recovery_action(true, true, false, false, true) == SR_REFUSE;
+}
+
+test a_red_typecheck_rolls_the_lane_back_to_its_pre_tick_head {
+    assert self_recovery_action(true, true, true, true, true) == SR_ROLLBACK_LANE;
+    assert self_recovery_action(true, true, false, true, true) == SR_ROLLBACK_LANE;
+    assert self_recovery_action(true, true, true, true, false) == SR_REFUSE;
+    assert self_recovery_action(true, false, true, true, true) == SR_REFUSE;
+}
+
+test recovery_never_resets_master_never_force_pushes_and_the_window_stays_blocked {
+    assert oc_window_open() == false;
+    assert recovery_lane_ok(false, false, false, false);
+    assert recovery_lane_ok(true, false, false, false) == false;
+    assert recovery_lane_ok(false, true, false, false) == false;
+    assert recovery_lane_ok(false, false, true, false) == false;
+    assert recovery_lane_ok(false, false, false, true) == false;
+    assert self_recovery_action(false, true, true, true, true) == SR_REFUSE;
+    assert self_recovery_action(recovery_lane_ok(true, false, false, false), true, true, true, true) == SR_REFUSE;
+    assert self_recovery_action(recovery_lane_ok(false, true, false, false), true, true, true, true) == SR_REFUSE;
+    assert self_recovery_action(recovery_lane_ok(false, false, false, true), true, true, true, true) == SR_REFUSE;
+}
+
+test a_failed_tick_leaves_prior_commits_untouched {
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, true, false, false);
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, false, false, false) == false;
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, true, true, false) == false;
+    assert prior_commits_untouched(SR_ROLLBACK_LANE, true, false, true) == false;
+    assert prior_commits_untouched(SR_KEEP, true, false, false);
+    assert prior_commits_untouched(SR_KEEP, true, true, false) == false;
+    assert prior_commits_untouched(SR_REFUSE, false, true, false);
+    assert prior_commits_untouched(99, true, false, false) == false;
+}
+
 invariant pareto_floors_are_sane {
     assert PARETO_IMPACT_FLOOR > 0 and PARETO_IMPACT_FLOOR <= 100;
     assert PARETO_FREQ_FLOOR > 0;
     assert ROLLBACK_WINDOW > 0;
     assert STEPS == 7;
+    assert SR_KEEP == 0 and SR_ROLLBACK_LANE == 1 and SR_REFUSE == 2;
+    assert oc_window_open() == false;
 }
 
 test negative_control_refutes_drifted_card {

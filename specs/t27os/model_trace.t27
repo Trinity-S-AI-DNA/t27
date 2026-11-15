@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/model_trace.t27 -- ONE MODEL REQUEST AS A RECORD: who asked, which model was
+; resolved and why, whose credential was used, what the upstream and the gateway said, how many
+; tokens moved and what it cost (known, estimated or unknown). Owner, 2026-11-04, after a turn
+; failed five times with 503 "deepseek unfunded" while nothing anywhere recorded which provider
+; was actually called or what it cost (epic #13172).
+; --
+; Laws this spec keeps:
+;   1. A RECORD IS PER ATTEMPT. request_id groups attempts; attempt_id and parent_attempt_id give
+;      the retry tree, so five retries of one turn are five records, not one.
+;   2. TWO STATUSES ARE KEPT. upstream_status is what the provider said (or 0 when it was never
+;      called); gateway_status is what the client saw. The ladder's 402 -> 503 rewrite is exactly
+;      the case where they differ, and the pair is recorded, never collapsed to one number.
+;   3. AMBIGUITY IS A FIELD. When the gateway status classifies differently from the body's class,
+;      the record says so (ambiguous = 1) and both classes survive. The incident class is UNFUNDED
+;      carried inside a 503; a reader that trusts the status alone sees TRANSIENT, which is how the
+;      client came to retry an unfunded refusal five times.
+;   4. NO SECRET EVER REACHES A RECORD. A credential is named by kind, source name and slot
+;      (env:T27_DEEPSEEK_KEY#0, keychain:ai.t27.os/zai#2, store:~/.dsh/.credentials.yaml#3). A
+;      string that looks like a key ("sk-" prefix, or a 32+ byte run with no separator) is refused
+;      by record_ok before a line is written -- refused, not masked after the fact.
+;   5. MONEY HAS THREE KINDS. known (the provider reported it), estimated (our price table), unknown
+;      (nobody knows). unknown prints as "unknown", never as zero. A known zero prints as a zero,
+;      because a request that never left the node really did cost nothing.
+;   6. TOKENS HAVE AN UNKNOWN. usage_known = 0 prints in=unknown, not in=0: no usage report is not
+;      a report of no usage.
+;   7. THE PRICE TABLE IS VERSIONED. Every estimated cost carries PRICE_VERSION, so a price change
+;      is visible in old records instead of silently rewriting them.
+; ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27OsModelTrace;
+
+use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
+use t27os::session_store::csv_field;
+use t27os::editors::same_bytes;
+
+// ---- 1. The class of an answer (mirrors ladder_doctor.t27's vocabulary, does not import it) ----
+
+pub const MT_OK : u32 = 0;
+pub const MT_UNFUNDED : u32 = 1;
+pub const MT_CREDENTIAL : u32 = 2;
+pub const MT_RATE : u32 = 3;
+pub const MT_TRANSIENT : u32 = 4;
+pub const MT_UNWIRED : u32 = 5;
+pub const MT_UNKNOWN : u32 = 6;
+pub const MT_CLASSES : u32 = 7;
+
+pub const CLASS_WORDS : str = "ok,unfunded,credential,rate,transient,unwired,unknown";
+
+/// What an HTTP status means on its own. 0 is "no answer at all" and is TRANSIENT, never OK.
+pub fn classify_status(http: u32) -> u32 {
+    if (http == 200) { return MT_OK; }
+    if (http == 402) { return MT_UNFUNDED; }
+    if (http == 401 or http == 403) { return MT_CREDENTIAL; }
+    if (http == 429) { return MT_RATE; }
+    if (http == 404 or http == 405 or http == 501) { return MT_UNWIRED; }
+    if (http == 0) { return MT_TRANSIENT; }
+    if (http >= 500 and http <= 599) { return MT_TRANSIENT; }
+    return MT_UNKNOWN;
+}
+
+/// The class the record keeps: the body's class wins when it names one, because the gateway status
+/// is the envelope and the body is the cause. A 503 carrying an unfunded body is UNFUNDED.
+pub fn classify_pair(gateway: u32, body_class: u32) -> u32 {
+    if (body_class < MT_CLASSES and body_class != MT_OK and body_class != MT_UNKNOWN) { return body_class; }
+    return classify_status(gateway);
+}
+
+/// True when the two views disagree. This is the field the incident needed and did not have.
+pub fn ambiguous(gateway: u32, body_class: u32) -> bool {
+    if (body_class >= MT_CLASSES or body_class == MT_OK) { return false; }
+    return classify_status(gateway) != body_class;
+}
+
+/// Only RATE and TRANSIENT may be retried at all. UNFUNDED, CREDENTIAL, UNWIRED and UNKNOWN are
+/// final for this attempt; the incident happened because a 402 was re-labelled 503 (TRANSIENT).
+pub fn retryable(c: u32) -> bool {
+    return c == MT_RATE or c == MT_TRANSIENT;
+}
+
+/// The same rule stated as the one the client must ask: may this refusal be retried on the SAME
+/// account? A confirmed insufficient balance never is, whatever the status line says.
+pub fn retry_on_same_account(c: u32) -> bool {
+    if (c == MT_UNFUNDED) { return false; }
+    return retryable(c);
+}
+
+// ---- 2. Why this model (route reasons) ----
+
+pub const RR_DIRECT : u32 = 0;
+pub const RR_FALLBACK : u32 = 1;
+pub const RR_STICKY : u32 = 2;
+pub const RR_HARNESS : u32 = 3;
+pub const RR_UNKNOWN : u32 = 4;
+pub const ROUTE_WORDS : str = "direct,fallback,sticky,harness,unknown";
+
+/// The reason words a record prints. An out-of-range reason is "unknown", never "direct".
+pub fn route_word(r: u32, out: []u8) -> usize {
+    const n : usize = csv_field(ROUTE_WORDS, r, out);
+    if (n == 0) { return put_bytes(out, 0, "unknown"); }
+    return n;
+}
+
+pub fn class_word(c: u32, out: []u8) -> usize {
+    const n : usize = csv_field(CLASS_WORDS, c, out);
+    if (n == 0) { return put_bytes(out, 0, "unknown"); }
+    return n;
+}
+
+/// Why an attempt was retried. none = it was not; the rest name the signal that caused the retry.
+pub const RW_NONE : u32 = 0;
+pub const RW_GATEWAY_5XX : u32 = 1;
+pub const RW_RATE : u32 = 2;
+pub const RW_TRANSIENT : u32 = 3;
+pub const RW_MANUAL : u32 = 4;
+pub const RETRY_WORDS : str = "none,gateway_5xx,rate,transient,manual";
+
+pub fn retry_word(r: u32, out: []u8) -> usize {
+    const n : usize = csv_field(RETRY_WORDS, r, out);
+    if (n == 0) { return put_bytes(out, 0, "none"); }
+    return n;
+}
+
+// ---- 3. Credentials are named, never copied ----
+
+pub const CS_NONE : u32 = 0;
+pub const CS_ENV : u32 = 1;
+pub const CS_KEYCHAIN : u32 = 2;
+pub const CS_STORE : u32 = 3;
+/// The record does not know which credential served the attempt. It is NOT "none": a credential was
+/// used (or refused), the log simply has no field for it. A reader must not read this as "no key".
+pub const CS_UNKNOWN : u32 = 4;
+pub const CRED_WORDS : str = "none,env,keychain,store,unknown";
+
+pub fn cred_kind_word(k: u32, out: []u8) -> usize {
+    const n : usize = csv_field(CRED_WORDS, k, out);
+    if (n == 0) { return put_bytes(out, 0, "none"); }
+    return n;
+}
+
+/// "env:T27_DEEPSEEK_KEY#0": the kind, the config source's NAME and the slot. The value is never
+/// an argument of this function, so it cannot be written by accident. An unknown kind prints
+/// "not-recorded" -- never "none", which would claim no credential was involved.
+pub fn cred_word(kind: u32, name: []const u8, slot: u32, out: []u8) -> usize {
+    if (kind == CS_UNKNOWN) { return put_bytes(out, 0, "not-recorded"); }
+    var n : usize = cred_kind_word(kind, out);
+    n = put_bytes(out, n, ":");
+    n = put_bytes(out, n, name);
+    n = put_bytes(out, n, "#");
+    n = put_dec(out, n, @as(u64, slot));
+    return n;
+}
+
+fn is_sep(c: u8) -> bool {
+    return c == 32 or c == 58 or c == 44 or c == 61 or c == 34 or c == 47 or c == 10 or c == 45 or c == 46;
+}
+
+/// A string that could be a key: the "sk-" marker, or 32+ bytes with no separator. The check is
+/// deliberately blunt -- a false refusal costs one message, a false acceptance costs a key.
+pub fn looks_secret(s: []const u8) -> bool {
+    var i : usize = 0;
+    var run : usize = 0;
+    while (i < s.len) {
+        // "sk-" only at the start of a token: "task-unknown" is a task id, not a key
+        if ((i == 0 or is_sep(s[i - 1])) and s[i] == 115 and i + 2 < s.len and s[i + 1] == 107 and s[i + 2] == 45) { return true; }
+        // an Authorization header value: "Bearer " names a credential whatever follows it
+        if ((i == 0 or is_sep(s[i - 1])) and i + 6 < s.len and s[i] == 66 and s[i + 1] == 101 and s[i + 2] == 97 and s[i + 3] == 114 and s[i + 4] == 101 and s[i + 5] == 114) { return true; }
+        if (is_sep(s[i])) {
+            run = 0;
+        } else {
+            run = run + 1;
+            if (run >= 32) { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// ---- 4. Money ----
+
+pub const CK_KNOWN : u32 = 0;
+pub const CK_ESTIMATED : u32 = 1;
+pub const CK_UNKNOWN : u32 = 2;
+pub const COST_WORDS : str = "known,estimated,unknown";
+
+pub fn cost_kind_word(k: u32, out: []u8) -> usize {
+    const n : usize = csv_field(COST_WORDS, k, out);
+    if (n == 0) { return put_bytes(out, 0, "unknown"); }
+    return n;
+}
+
+/// Micro-units of one currency unit, printed with six decimals from integer arithmetic: no float
+/// ever touches money here.
+pub fn put_micro(out: []u8, at: usize, micro: u64) -> usize {
+    var n : usize = put_dec(out, at, micro / 1000000);
+    n = put_bytes(out, n, ".");
+    const frac : u64 = micro % 1000000;
+    var div : u64 = 100000;
+    while (div > 0) {
+        out[n] = @intCast(48 + (frac / div) % 10);
+        n = n + 1;
+        div = div / 10;
+    }
+    return n;
+}
+
+/// "known:usd 0.001370", "estimated:usd 0.000000", "unknown". An unknown never prints a number.
+pub fn cost_word(kind: u32, micro: u64, out: []u8) -> usize {
+    if (kind == CK_UNKNOWN) { return put_bytes(out, 0, "unknown"); }
+    var n : usize = 0;
+    if (kind == CK_KNOWN) {
+        n = put_bytes(out, 0, "known:usd ");
+    } else {
+        n = put_bytes(out, 0, "estimated:usd ");
+    }
+    return put_micro(out, n, micro);
+}
+
+// ---- 5. The price table, versioned ----
+
+pub const PRICE_VERSION : str = "2026-11-04.1";
+/// No published price for this model: an estimate is impossible and must say so.
+pub const PRICE_NONE : u64 = 18446744073709551615;
+
+/// Models the ladder can serve, in the order the ladder knows them. `unknown` is a real cell so a
+/// record with an unrecorded model can point at it instead of inventing index 0.
+pub const MODEL_COUNT : u32 = 6;
+pub const MODEL_NAMES : str = "glm-4.5-flash,glm-4.7-flash,glm-5.3-flash,gemma4:31b-cloud,deepseek-chat,unknown";
+pub const MODEL_UNKNOWN : u32 = 5;
+
+/// Micro-units of USD per 1000 tokens: input (cache miss), output, input (cache hit).
+/// z.ai and ollama are the free plans the ladder is allowed to use; deepseek-chat is the published
+/// price of 2026-11-04 (0.27 / 1.10 / 0.07 USD per million). A model with no published price is
+/// PRICE_NONE, which makes every estimate for it unknown.
+pub fn price_in(m: u32) -> u64 {
+    if (m == 0 or m == 1 or m == 2) { return 0; }
+    if (m == 3) { return 0; }
+    if (m == 4) { return 270; }
+    return PRICE_NONE;
+}
+
+pub fn price_out(m: u32) -> u64 {
+    if (m == 0 or m == 1 or m == 2) { return 0; }
+    if (m == 3) { return 0; }
+    if (m == 4) { return 1100; }
+    return PRICE_NONE;
+}
+
+pub fn price_cached(m: u32) -> u64 {
+    if (m == 0 or m == 1 or m == 2) { return 0; }
+    if (m == 3) { return 0; }
+    if (m == 4) { return 70; }
+    return PRICE_NONE;
+}
+
+pub fn model_index(name: []const u8) -> u32 {
+    var i : u32 = 0;
+    var tmp : [32]u8 = undefined;
+    while (i < MODEL_COUNT) {
+        const n : usize = csv_field(MODEL_NAMES, i, tmp[0..32]);
+        if (same_bytes(tmp[0..n], name)) { return i; }
+        i = i + 1;
+    }
+    return MODEL_UNKNOWN;
+}
+
+pub fn model_name(m: u32, out: []u8) -> usize {
+    const n : usize = csv_field(MODEL_NAMES, m, out);
+    if (n == 0) { return put_bytes(out, 0, "unknown"); }
+    return n;
+}
+
+/// Estimated micro-units for a usage report, or PRICE_NONE when any part of the price is unknown.
+pub fn estimate(m: u32, tin: u64, tout: u64, tcached: u64) -> u64 {
+    const pi : u64 = price_in(m);
+    const po : u64 = price_out(m);
+    const pc : u64 = price_cached(m);
+    if (pi == PRICE_NONE or po == PRICE_NONE or pc == PRICE_NONE) { return PRICE_NONE; }
+    var miss : u64 = 0;
+    if (tin > tcached) { miss = tin - tcached; }
+    return (miss * pi + tcached * pc + tout * po) / 1000;
+}
+
+/// The kind an estimate deserves: estimated when a price exists, unknown when it does not.
+pub fn estimate_kind(m: u32) -> u32 {
+    if (price_in(m) == PRICE_NONE) { return CK_UNKNOWN; }
+    if (price_out(m) == PRICE_NONE) { return CK_UNKNOWN; }
+    if (price_cached(m) == PRICE_NONE) { return CK_UNKNOWN; }
+    return CK_ESTIMATED;
+}
+
+// ---- 6. The record itself ----
+
+/// The numeric cells of one attempt record. Strings (ids, host, credential name) travel beside the
+/// cells in record_line; everything that can be a number is a cell so the panel never parses text.
+pub const TR_REQUESTED_MODEL : usize = 0;
+pub const TR_RESOLVED_PROVIDER : usize = 1;
+pub const TR_RESOLVED_MODEL : usize = 2;
+pub const TR_ROUTE_REASON : usize = 3;
+pub const TR_FALLBACK_RUNG : usize = 4;
+pub const TR_POLICY : usize = 5;
+pub const TR_CRED_KIND : usize = 6;
+pub const TR_CRED_SLOT : usize = 7;
+pub const TR_STARTED_MS : usize = 8;
+pub const TR_DURATION_MS : usize = 9;
+pub const TR_UPSTREAM : usize = 10;
+pub const TR_GATEWAY : usize = 11;
+pub const TR_BODY_CLASS : usize = 12;
+pub const TR_RETRY_REASON : usize = 13;
+pub const TR_RETRY_DELAY : usize = 14;
+pub const TR_USAGE_KNOWN : usize = 15;
+pub const TR_IN : usize = 16;
+pub const TR_OUT : usize = 17;
+pub const TR_CACHED : usize = 18;
+pub const TR_COST_KIND : usize = 19;
+pub const TR_COST_MICRO : usize = 20;
+pub const TR_ATTEMPT : usize = 21;
+pub const TR_PARENT : usize = 22;
+pub const TR_CELLS : usize = 23;
+
+pub const PROVIDER_WORDS : str = "zai,ollama,deepseek,unknown";
+pub const PROVIDER_UNKNOWN : u32 = 3;
+
+/// Routing policy versions, in the order they were deployed. A record points at one; a policy change
+/// is a new cell, never a silent rewrite of history.
+pub const POLICY_WORDS : str = "2026-11-04.1";
+
+pub fn policy_word(i: u32, out: []u8) -> usize {
+    const n : usize = csv_field(POLICY_WORDS, i, out);
+    if (n == 0) { return put_bytes(out, 0, "unknown"); }
+    return n;
+}
+
+pub fn provider_name(p: u32, out: []u8) -> usize {
+    const n : usize = csv_field(PROVIDER_WORDS, p, out);
+    if (n == 0) { return put_bytes(out, 0, "unknown"); }
+    return n;
+}
+
+/// The class the record keeps, from its own cells. The panel and the tests read this, never a
+/// second implementation of the rule.
+pub fn record_class(c: []const u64) -> u32 {
+    return classify_pair(@intCast(c[TR_GATEWAY]), @intCast(c[TR_BODY_CLASS]));
+}
+
+pub fn record_ambiguous(c: []const u64) -> bool {
+    return ambiguous(@intCast(c[TR_GATEWAY]), @intCast(c[TR_BODY_CLASS]));
+}
+
+/// Refuse a record whose strings could carry a secret. Checked before writing, not after.
+pub fn record_ok(task: []const u8, session: []const u8, agent: []const u8, req: []const u8, host: []const u8, cred: []const u8) -> bool {
+    if (looks_secret(task)) { return false; }
+    if (looks_secret(session)) { return false; }
+    if (looks_secret(agent)) { return false; }
+    if (looks_secret(req)) { return false; }
+    if (looks_secret(host)) { return false; }
+    if (looks_secret(cred)) { return false; }
+    return true;
+}
+
+/// One line, one attempt: "key=value" pairs separated by one space, values never contain a space.
+/// The field order is fixed and is the contract the panel and the tests read.
+pub fn record_line(c: []const u64, task: []const u8, session: []const u8, agent: []const u8, req: []const u8, host: []const u8, cred: []const u8, out: []u8) -> usize {
+    var w : [32]u8 = undefined;
+    var n : usize = 0;
+    n = put_bytes(out, n, "task=");
+    n = put_bytes(out, n, task);
+    n = put_bytes(out, n, " session=");
+    n = put_bytes(out, n, session);
+    n = put_bytes(out, n, " agent=");
+    n = put_bytes(out, n, agent);
+    n = put_bytes(out, n, " req=");
+    n = put_bytes(out, n, req);
+    n = put_bytes(out, n, " attempt=");
+    n = put_dec(out, n, c[TR_ATTEMPT]);
+    n = put_bytes(out, n, " parent=");
+    n = put_dec(out, n, c[TR_PARENT]);
+    n = put_bytes(out, n, " model=");
+    var wn : usize = model_name(@intCast(c[TR_REQUESTED_MODEL]), w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " provider=");
+    wn = provider_name(@intCast(c[TR_RESOLVED_PROVIDER]), w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " pmodel=");
+    wn = model_name(@intCast(c[TR_RESOLVED_MODEL]), w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " host=");
+    n = put_bytes(out, n, host);
+    n = put_bytes(out, n, " route=");
+    wn = route_word(@intCast(c[TR_ROUTE_REASON]), w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " fallback=");
+    n = put_dec(out, n, c[TR_FALLBACK_RUNG]);
+    n = put_bytes(out, n, " policy=");
+    wn = policy_word(@intCast(c[TR_POLICY]), w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " cred=");
+    n = put_bytes(out, n, cred);
+    n = put_bytes(out, n, " start=");
+    n = put_dec(out, n, c[TR_STARTED_MS]);
+    n = put_bytes(out, n, " dur=");
+    n = put_dec(out, n, c[TR_DURATION_MS]);
+    n = put_bytes(out, n, " up=");
+    n = put_dec(out, n, c[TR_UPSTREAM]);
+    n = put_bytes(out, n, " gw=");
+    n = put_dec(out, n, c[TR_GATEWAY]);
+    n = put_bytes(out, n, " err=");
+    wn = class_word(record_class(c), w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " retry=");
+    wn = retry_word(@intCast(c[TR_RETRY_REASON]), w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " delay=");
+    n = put_dec(out, n, c[TR_RETRY_DELAY]);
+    if (c[TR_USAGE_KNOWN] == 0) {
+        n = put_bytes(out, n, " in=unknown out=unknown cached=unknown");
+    } else {
+        n = put_bytes(out, n, " in=");
+        n = put_dec(out, n, c[TR_IN]);
+        n = put_bytes(out, n, " out=");
+        n = put_dec(out, n, c[TR_OUT]);
+        n = put_bytes(out, n, " cached=");
+        n = put_dec(out, n, c[TR_CACHED]);
+    }
+    n = put_bytes(out, n, " cost=");
+    wn = cost_word(@intCast(c[TR_COST_KIND]), c[TR_COST_MICRO], w[0..32]);
+    n = put_bytes(out, n, w[0..wn]);
+    n = put_bytes(out, n, " price=");
+    n = put_bytes(out, n, PRICE_VERSION);
+    return n;
+}
+
+// ---- 7. Tests ----
+
+test a_503_carrying_an_unfunded_body_is_unfunded_and_ambiguous {
+    // the incident: the ladder's boundary turned a 402 into a 503 and the client read TRANSIENT
+    assert classify_status(503) == MT_TRANSIENT;
+    assert classify_status(402) == MT_UNFUNDED;
+    assert classify_pair(503, MT_UNFUNDED) == MT_UNFUNDED;
+    assert ambiguous(503, MT_UNFUNDED);
+    assert ambiguous(402, MT_UNFUNDED) == false;
+    assert ambiguous(503, MT_OK) == false;
+}
+
+test an_unfunded_refusal_is_never_retried_on_the_same_account {
+    // the exact rule the incident broke: 402 became 503, 503 is retryable, so five retries ran
+    assert retryable(MT_TRANSIENT);
+    assert retry_on_same_account(MT_TRANSIENT);
+    assert retryable(MT_RATE);
+    assert retry_on_same_account(MT_RATE);
+    assert retry_on_same_account(MT_UNFUNDED) == false;
+    assert retry_on_same_account(MT_CREDENTIAL) == false;
+    assert retry_on_same_account(MT_UNWIRED) == false;
+    assert retry_on_same_account(MT_UNKNOWN) == false;
+}
+
+test an_unknown_status_is_unknown_never_transient {
+    assert classify_status(418) == MT_UNKNOWN;
+    assert classify_status(0) == MT_TRANSIENT;
+    assert classify_status(200) == MT_OK;
+    assert classify_status(404) == MT_UNWIRED;
+    assert classify_status(429) == MT_RATE;
+}
+
+test a_credential_is_named_by_source_and_slot {
+    var out : [64]u8 = undefined;
+    const n : usize = cred_word(CS_ENV, "T27_DEEPSEEK_KEY", 0, out[0..64]);
+    assert n == 22;
+    assert same_bytes(out[0..n], "env:T27_DEEPSEEK_KEY#0");
+    const k : usize = cred_word(CS_KEYCHAIN, "ai.t27.os/zai", 2, out[0..64]);
+    assert same_bytes(out[0..k], "keychain:ai.t27.os/zai#2");
+    const s : usize = cred_word(CS_STORE, "~/.dsh/.credentials.yaml", 3, out[0..64]);
+    assert same_bytes(out[0..s], "store:~/.dsh/.credentials.yaml#3");
+    // a record with no credential field says so; it never claims "none"
+    const u : usize = cred_word(CS_UNKNOWN, "", 0, out[0..64]);
+    assert same_bytes(out[0..u], "not-recorded");
+}
+
+test a_key_shaped_string_is_refused_before_a_line_is_written {
+    assert looks_secret("sk-test-0000-abcd");
+    assert looks_secret("Authorization: Bearer abc");
+    assert looks_secret("abcdefghijklmnopqrstuvwxyz0123456789");
+    assert looks_secret("env:T27_DEEPSEEK_KEY#0") == false;
+    assert looks_secret("session-832c3ca7-75bd-42ec-b34b-e1e222892491") == false;
+    assert looks_secret("127.0.0.1:3131") == false;
+    assert record_ok("task-1", "session-832c3ca7", "dsh", "req-1", "127.0.0.1:3131", "env:T27_DEEPSEEK_KEY#0");
+    assert record_ok("task-1", "session-832c3ca7", "dsh", "req-1", "127.0.0.1:3131", "sk-live-0000000000000000000000000000") == false;
+}
+
+test money_has_three_kinds_and_an_unknown_is_not_zero {
+    var out : [48]u8 = undefined;
+    const u : usize = cost_word(CK_UNKNOWN, 0, out[0..48]);
+    assert same_bytes(out[0..u], "unknown");
+    const k : usize = cost_word(CK_KNOWN, 0, out[0..48]);
+    assert same_bytes(out[0..k], "known:usd 0.000000");
+    const e : usize = cost_word(CK_ESTIMATED, 1370, out[0..48]);
+    assert same_bytes(out[0..e], "estimated:usd 0.001370");
+    const big : usize = cost_word(CK_KNOWN, 123456789, out[0..48]);
+    assert same_bytes(out[0..big], "known:usd 123.456789");
+}
+
+test a_published_price_gives_an_estimate_and_no_price_gives_unknown {
+    assert price_in(MODEL_UNKNOWN) == PRICE_NONE;
+    assert estimate(MODEL_UNKNOWN, 1000, 1000, 0) == PRICE_NONE;
+    assert estimate_kind(MODEL_UNKNOWN) == CK_UNKNOWN;
+    // deepseek-chat: 1000 input (none cached) + 1000 output = 270 + 1100 micro
+    assert estimate(4, 1000, 1000, 0) == 1370;
+    // 500 cached input + 500 miss + 100 output = 70*500/1000 + 270*500/1000 + 1100*100/1000
+    assert estimate(4, 1000, 100, 500) == 35 + 135 + 110;
+    assert estimate_kind(4) == CK_ESTIMATED;
+    assert estimate(0, 5000, 5000, 0) == 0;
+    assert estimate_kind(0) == CK_ESTIMATED;
+}
+
+test the_model_and_provider_tables_line_up {
+    var out : [32]u8 = undefined;
+    const a : usize = model_name(0, out[0..32]);
+    assert same_bytes(out[0..a], "glm-4.5-flash");
+    const b : usize = model_name(4, out[0..32]);
+    assert same_bytes(out[0..b], "deepseek-chat");
+    assert model_index("deepseek-chat") == 4;
+    assert model_index("not-a-model") == MODEL_UNKNOWN;
+    const p : usize = provider_name(2, out[0..32]);
+    assert same_bytes(out[0..p], "deepseek");
+    assert provider_name(9, out[0..32]) == 7;
+    assert same_bytes(out[0..7], "unknown");
+}
+
+test the_incident_record_prints_every_field {
+    // the tail attempt of the 2026-11-04 incident, reconstructed from the session transcript and
+    // ladder.log: attempt 4 of 5, rung 2 deepseek, no key, local 402 body behind a gateway 503,
+    // no usage report, no cost, a 2116 ms retry delay.
+    var c : [TR_CELLS]u64 = undefined;
+    c[TR_REQUESTED_MODEL] = 0;
+    c[TR_RESOLVED_PROVIDER] = 2;
+    c[TR_RESOLVED_MODEL] = 4;
+    c[TR_ROUTE_REASON] = RR_FALLBACK;
+    c[TR_FALLBACK_RUNG] = 2;
+    c[TR_POLICY] = 0;
+    c[TR_CRED_KIND] = CS_ENV;
+    c[TR_CRED_SLOT] = 0;
+    c[TR_STARTED_MS] = 1793766889402;
+    c[TR_DURATION_MS] = 238398;
+    c[TR_UPSTREAM] = 402;
+    c[TR_GATEWAY] = 503;
+    c[TR_BODY_CLASS] = MT_UNFUNDED;
+    c[TR_RETRY_REASON] = RW_GATEWAY_5XX;
+    c[TR_RETRY_DELAY] = 2116;
+    c[TR_USAGE_KNOWN] = 0;
+    c[TR_IN] = 0;
+    c[TR_OUT] = 0;
+    c[TR_CACHED] = 0;
+    c[TR_COST_KIND] = CK_UNKNOWN;
+    c[TR_COST_MICRO] = 0;
+    c[TR_ATTEMPT] = 4;
+    c[TR_PARENT] = 3;
+    assert record_class(c[0..TR_CELLS]) == MT_UNFUNDED;
+    assert record_ambiguous(c[0..TR_CELLS]);
+    assert record_ok("task-unknown", "session-832c3ca7", "dsh", "req-unknown", "127.0.0.1:3131", "env:T27_DEEPSEEK_KEY#0");
+    var out : [512]u8 = undefined;
+    const n : usize = record_line(c[0..TR_CELLS], "task-unknown", "session-832c3ca7", "dsh", "req-unknown", "127.0.0.1:3131", "env:T27_DEEPSEEK_KEY#0", out[0..512]);
+    assert n == 397;
+    assert same_bytes(out[0..n], "task=task-unknown session=session-832c3ca7 agent=dsh req=req-unknown attempt=4 parent=3 model=glm-4.5-flash provider=deepseek pmodel=deepseek-chat host=127.0.0.1:3131 route=fallback fallback=2 policy=2026-11-04.1 cred=env:T27_DEEPSEEK_KEY#0 start=1793766889402 dur=238398 up=402 gw=503 err=unfunded retry=gateway_5xx delay=2116 in=unknown out=unknown cached=unknown cost=unknown price=2026-11-04.1");
+}
+
+test a_reported_usage_prints_numbers_and_an_estimate_carries_the_version {
+    var c : [TR_CELLS]u64 = undefined;
+    var i : usize = 0;
+    while (i < TR_CELLS) { c[i] = 0; i = i + 1; }
+    c[TR_REQUESTED_MODEL] = 4;
+    c[TR_RESOLVED_PROVIDER] = 2;
+    c[TR_RESOLVED_MODEL] = 4;
+    c[TR_ROUTE_REASON] = RR_DIRECT;
+    c[TR_GATEWAY] = 200;
+    c[TR_UPSTREAM] = 200;
+    c[TR_BODY_CLASS] = MT_OK;
+    c[TR_USAGE_KNOWN] = 1;
+    c[TR_IN] = 1000;
+    c[TR_OUT] = 1000;
+    c[TR_CACHED] = 500;
+    c[TR_COST_KIND] = CK_ESTIMATED;
+    c[TR_COST_MICRO] = estimate(4, 1000, 1000, 500);
+    var out : [512]u8 = undefined;
+    const n : usize = record_line(c[0..TR_CELLS], "t", "s", "a", "r", "h", "env:X#0", out[0..512]);
+    var i2 : usize = 0;
+    var seen_cost : bool = false;
+    while (i2 + 8 <= n) {
+        if (same_bytes(out[i2..i2 + 8], "cost=est")) { seen_cost = true; }
+        i2 = i2 + 1;
+    }
+    assert seen_cost;
+    assert record_class(c[0..TR_CELLS]) == MT_OK;
+    assert record_ambiguous(c[0..TR_CELLS]) == false;
+}
+
+test a_route_word_out_of_range_is_unknown {
+    var out : [16]u8 = undefined;
+    const a : usize = route_word(RR_FALLBACK, out[0..16]);
+    assert same_bytes(out[0..a], "fallback");
+    const b : usize = route_word(99, out[0..16]);
+    assert same_bytes(out[0..b], "unknown");
+    const c : usize = class_word(99, out[0..16]);
+    assert same_bytes(out[0..c], "unknown");
+    const d : usize = retry_word(99, out[0..16]);
+    assert same_bytes(out[0..d], "none");
+}
