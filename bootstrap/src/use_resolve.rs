@@ -415,6 +415,41 @@ fn qualified_refs(text: &str, modules: &[String]) -> Vec<(String, String, bool)>
 fn identifiers(text: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     for line in text.lines() {
+        // #13937: t27's own comment marker is `;`, and this scan only cut `//`.
+        // Every prose word of a `;` comment therefore entered the pull
+        // frontier as if it were code: the word "append" in a comment named
+        // sync/schema.t27's `fn append`, which was spliced with the
+        // `op_arena` globals it references left behind, and the generated
+        // module answered `undeclared identifier 'op_arena_len'`. A `;`
+        // inside a string literal is punctuation, not a comment, so the cut
+        // walks the string state; an escaped quote keeps it. Same-line
+        // multi-statements would under-pull after this cut, but they are
+        // loud (an undeclared identifier) where the comment words were
+        // silent (a broken splice), and the corpus writes one statement per
+        // line.
+        let mut no_comment = String::new();
+        let mut in_str = false;
+        let mut esc = false;
+        for c in line.chars() {
+            if esc {
+                esc = false;
+            } else if in_str {
+                if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                no_comment.push(c);
+            } else if c == ';' {
+                break;
+            } else {
+                if c == '"' {
+                    in_str = true;
+                }
+                no_comment.push(c);
+            }
+        }
+        let line = no_comment.as_str();
         let code = match line.find("//") {
             Some(p) => &line[..p],
             None => line,
