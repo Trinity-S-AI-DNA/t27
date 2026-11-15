@@ -27,6 +27,9 @@
 #define R_OTHER 4
 #define R_UNREADABLE 5
 #define COMPILER_ROOTS "bootstrap/,cli/,Cargo.toml,Cargo.lock,build.rs,$"
+#define HEAVY_NARROW 2
+#define GOLDEN_SET "specs/tri/t27b/golden_spec.t27,$"
+#define ALL_FROM 16
 #define C_ALL_OUTSIDE 16
 #define C_ALL_UNDER_SPECS 17
 #define C_ALL_UNREADABLE 18
@@ -35,9 +38,11 @@
 #define ci_affected__KINDS "ACDMRT$"
 #define LIST_END 36
 #define LIST_SEP 44
+#define MARK_CORPUS "--corpus$"
 #define MARK_GRAPH "--graph$"
 #define PROSE_ANYWHERE_EXTS "md,$"
 #define ci_affected__PROSE_EXTS "md,txt,$"
+#define RUN_ALL 0xFFFFFFFF
 #define SEALS_ROOT ".trinity/seals/,$"
 #define SEAL_EXTS "json,$"
 #define SPECS_ROOT "specs/,$"
@@ -74,16 +79,32 @@ uint8_t path_reason(uint8_t* s, size_t from, size_t to);
 uint8_t line_reason(uint8_t* buf, size_t s, size_t t);
 uint8_t heavy_reason(uint8_t* buf, size_t n);
 uint8_t heavy_decision(uint8_t* buf, size_t n);
+size_t dir_start(uint8_t* s, size_t from, size_t to);
+bool seal_matches_spec(uint8_t* s, size_t sf, size_t st, uint8_t* p, size_t pf, size_t pt);
+bool ends_with_name(uint8_t* s, size_t mf, size_t mt, uint8_t* p, size_t bf, size_t bt);
+bool seal_has_spec(uint8_t* buf, size_t g, uint8_t* s, size_t sf, size_t st);
+bool seals_are_owned(uint8_t* buf, size_t g);
+uint8_t heavy_narrow(uint8_t* buf, size_t n);
+bool golden_has(uint8_t* s, size_t f, size_t t);
+bool corpus_has(uint8_t* buf, size_t n, size_t c, uint8_t* s, size_t f, size_t t);
+bool golden_in_corpus(uint8_t* buf, size_t n);
+uint32_t narrow_list(uint8_t* buf, size_t n, uint8_t* set, size_t scap, uint8_t* tmp, size_t tcap, uint8_t* out, size_t cap);
+size_t closure(uint8_t* buf, size_t n, uint8_t* set, size_t scap);
 uint8_t diff_class(uint8_t* buf, size_t s, size_t t);
 size_t ci_affected__ext_dot(uint8_t* s, size_t from, size_t to);
 size_t first_tab(uint8_t* buf, size_t s, size_t t);
 bool ci_affected__in_list(uint8_t* list, uint8_t* s, size_t from, size_t to);
+bool in_set(uint8_t* set, size_t sn, uint8_t* s, size_t f, size_t t);
 size_t last_tab(uint8_t* buf, size_t s, size_t t);
 bool line_is(uint8_t* buf, size_t s, size_t t, uint8_t* lit);
 uint8_t lower(uint8_t c);
 size_t marker_at(uint8_t* buf, size_t n, size_t from, uint8_t* lit);
 uint8_t path_class(uint8_t* s, size_t from, size_t to);
+size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c);
+bool run_all(uint8_t* buf, size_t n);
 bool same(uint8_t* a, size_t af, size_t at, uint8_t* b, size_t bf, size_t bt);
+uint32_t select_affected(uint8_t* buf, size_t n, uint8_t* set, size_t scap, uint8_t* out, size_t cap);
+size_t set_add(uint8_t* set, size_t sn, size_t scap, uint8_t* s, size_t f, size_t t);
 size_t base_start(uint8_t* s, size_t from, size_t to);
 uint8_t existing(uint8_t kind, uint8_t r);
 size_t policy_own_language__ext_dot(uint8_t* s, size_t from, size_t to);
@@ -165,6 +186,287 @@ uint8_t heavy_decision(uint8_t* buf, size_t n) {
     return HEAVY_RUN;
 }
 
+size_t dir_start(uint8_t* s, size_t from, size_t to) {
+    size_t b = base_start(s, from, to);
+    if ((b <= from)) {
+        return to;
+    }
+    size_t d = from;
+    size_t i = from;
+    while (((i + 1) < b)) {
+        if ((s[i] == '/')) {
+            d = (i + 1);
+        }
+        i += 1;
+    }
+    return d;
+}
+
+bool seal_matches_spec(uint8_t* s, size_t sf, size_t st, uint8_t* p, size_t pf, size_t pt) {
+    if ((path_class(p, pf, pt) != C_SEED)) {
+        return false;
+    }
+    size_t sb = base_start(s, sf, st);
+    size_t u = sb;
+    while (((u < st) && (s[u] != '_'))) {
+        u += 1;
+    }
+    if ((u >= st)) {
+        return false;
+    }
+    size_t d = dir_start(p, pf, pt);
+    if ((d >= pt)) {
+        return false;
+    }
+    size_t b = base_start(p, pf, pt);
+    if ((same(s, sb, u, p, d, (b - 1)) == false)) {
+        return false;
+    }
+    size_t x = policy_own_language__ext_dot(s, sf, st);
+    if ((x >= st)) {
+        return false;
+    }
+    size_t pe = policy_own_language__ext_dot(p, pf, pt);
+    return ends_with_name(s, (u + 1), x, p, b, pe);
+}
+
+bool ends_with_name(uint8_t* s, size_t mf, size_t mt, uint8_t* p, size_t bf, size_t bt) {
+    if ((bt <= bf)) {
+        return false;
+    }
+    size_t i = mt;
+    size_t j = bt;
+    while (true) {
+        while (((i > mf) && (s[(i - 1)] == '_'))) {
+            i -= 1;
+        }
+        while (((j > bf) && (p[(j - 1)] == '_'))) {
+            j -= 1;
+        }
+        if ((j == bf)) {
+            return true;
+        }
+        if ((i == mf)) {
+            return false;
+        }
+        if ((lower(s[(i - 1)]) != lower(p[(j - 1)]))) {
+            return false;
+        }
+        i -= 1;
+        j -= 1;
+    }
+    return false;
+}
+
+bool seal_has_spec(uint8_t* buf, size_t g, uint8_t* s, size_t sf, size_t st) {
+    size_t i = 0;
+    while ((i < g)) {
+        size_t e = line_end(buf, i, g);
+        size_t t = text_end(buf, i, e);
+        if ((t > i)) {
+            size_t p2 = last_tab(buf, i, t);
+            if (seal_matches_spec(s, sf, st, buf, (p2 + 1), t)) {
+                return true;
+            }
+        }
+        i = (e + 1);
+    }
+    return false;
+}
+
+bool seals_are_owned(uint8_t* buf, size_t g) {
+    size_t i = 0;
+    while ((i < g)) {
+        size_t e = line_end(buf, i, g);
+        size_t t = text_end(buf, i, e);
+        if ((t > i)) {
+            size_t p1 = first_tab(buf, i, t);
+            size_t p2 = last_tab(buf, i, t);
+            if (has_prefix(SEALS_ROOT, buf, (p2 + 1), t)) {
+                if ((p2 > p1)) {
+                    return false;
+                }
+                if ((seal_has_spec(buf, g, buf, (p2 + 1), t) == false)) {
+                    return false;
+                }
+            } else if (((p2 > p1) && has_prefix(SEALS_ROOT, buf, (p1 + 1), p2))) {
+                return false;
+            }
+        }
+        i = (e + 1);
+    }
+    return true;
+}
+
+uint8_t heavy_narrow(uint8_t* buf, size_t n) {
+    uint8_t r = heavy_reason(buf, n);
+    if ((r == R_PROSE)) {
+        return HEAVY_SKIP;
+    }
+    if ((r > R_SPEC)) {
+        return HEAVY_RUN;
+    }
+    size_t g = marker_at(buf, n, 0, MARK_GRAPH);
+    if ((seals_are_owned(buf, g) == false)) {
+        return HEAVY_RUN;
+    }
+    if ((r == R_SEAL)) {
+        return HEAVY_RUN;
+    }
+    return HEAVY_NARROW;
+}
+
+bool golden_has(uint8_t* s, size_t f, size_t t) {
+    size_t i = 0;
+    while ((GOLDEN_SET[i] != LIST_END)) {
+        size_t j = i;
+        while (((GOLDEN_SET[j] != LIST_SEP) && (GOLDEN_SET[j] != LIST_END))) {
+            j += 1;
+        }
+        if (same(GOLDEN_SET, i, j, s, f, t)) {
+            return true;
+        }
+        if ((GOLDEN_SET[j] == LIST_END)) {
+            return false;
+        }
+        i = (j + 1);
+    }
+    return false;
+}
+
+bool corpus_has(uint8_t* buf, size_t n, size_t c, uint8_t* s, size_t f, size_t t) {
+    size_t i = (line_end(buf, c, n) + 1);
+    while ((i < n)) {
+        size_t e = line_end(buf, i, n);
+        size_t x = text_end(buf, i, e);
+        if (((x > i) && same(buf, i, x, s, f, t))) {
+            return true;
+        }
+        i = (e + 1);
+    }
+    return false;
+}
+
+bool golden_in_corpus(uint8_t* buf, size_t n) {
+    size_t g = marker_at(buf, n, 0, MARK_GRAPH);
+    if ((g >= n)) {
+        return false;
+    }
+    size_t c = marker_at(buf, n, g, MARK_CORPUS);
+    if ((c >= n)) {
+        return false;
+    }
+    size_t i = 0;
+    while ((GOLDEN_SET[i] != LIST_END)) {
+        size_t j = i;
+        while (((GOLDEN_SET[j] != LIST_SEP) && (GOLDEN_SET[j] != LIST_END))) {
+            j += 1;
+        }
+        if ((corpus_has(buf, n, c, GOLDEN_SET, i, j) == false)) {
+            return false;
+        }
+        if ((GOLDEN_SET[j] == LIST_END)) {
+            return true;
+        }
+        i = (j + 1);
+    }
+    return true;
+}
+
+uint32_t narrow_list(uint8_t* buf, size_t n, uint8_t* set, size_t scap, uint8_t* tmp, size_t tcap, uint8_t* out, size_t cap) {
+    if ((golden_in_corpus(buf, n) == false)) {
+        return RUN_ALL;
+    }
+    uint32_t k = select_affected(buf, n, set, scap, tmp, tcap);
+    if ((k == RUN_ALL)) {
+        return RUN_ALL;
+    }
+    size_t w = 0;
+    uint32_t count = 0;
+    size_t i = 0;
+    while ((GOLDEN_SET[i] != LIST_END)) {
+        size_t j = i;
+        while (((GOLDEN_SET[j] != LIST_SEP) && (GOLDEN_SET[j] != LIST_END))) {
+            j += 1;
+        }
+        size_t q = i;
+        while ((q < j)) {
+            w = put(out, w, cap, GOLDEN_SET[q]);
+            q += 1;
+        }
+        w = put(out, w, cap, '\n');
+        count += 1;
+        if ((GOLDEN_SET[j] == LIST_END)) {
+break;
+        }
+        i = (j + 1);
+    }
+    size_t s = 0;
+    uint32_t seen = 0;
+    while ((seen < k)) {
+        size_t e = line_end(tmp, s, tcap);
+        size_t t = text_end(tmp, s, e);
+        seen += 1;
+        if ((golden_has(tmp, s, t) == false)) {
+            size_t m = s;
+            while ((m < t)) {
+                w = put(out, w, cap, tmp[m]);
+                m += 1;
+            }
+            w = put(out, w, cap, '\n');
+            count += 1;
+        }
+        s = (e + 1);
+    }
+    if ((w > cap)) {
+        return RUN_ALL;
+    }
+    return count;
+}
+
+size_t closure(uint8_t* buf, size_t n, uint8_t* set, size_t scap) {
+    size_t g = marker_at(buf, n, 0, MARK_GRAPH);
+    size_t c = marker_at(buf, n, g, MARK_CORPUS);
+    size_t sn = 0;
+    size_t s = 0;
+    while ((s < g)) {
+        size_t e = line_end(buf, s, g);
+        size_t t = text_end(buf, s, e);
+        if ((t > s)) {
+            size_t p1 = first_tab(buf, s, t);
+            size_t p2 = last_tab(buf, s, t);
+            if ((path_class(buf, (p2 + 1), t) == C_SEED)) {
+                sn = set_add(set, sn, scap, buf, (p2 + 1), t);
+            }
+            if ((p2 > p1)) {
+                if ((path_class(buf, (p1 + 1), p2) == C_SEED)) {
+                    sn = set_add(set, sn, scap, buf, (p1 + 1), p2);
+                }
+            }
+        }
+        s = (e + 1);
+    }
+    size_t gs = (line_end(buf, g, n) + 1);
+    bool grew = true;
+    while ((grew && (sn <= scap))) {
+        grew = false;
+        s = gs;
+        while (((s < c) && (sn <= scap))) {
+            size_t e = line_end(buf, s, c);
+            size_t t = text_end(buf, s, e);
+            size_t p = first_tab(buf, s, t);
+            if (((p < t) && (p > s))) {
+                if ((in_set(set, sn, buf, (p + 1), t) && (in_set(set, sn, buf, s, p) == false))) {
+                    sn = set_add(set, sn, scap, buf, s, p);
+                    grew = true;
+                }
+            }
+            s = (e + 1);
+        }
+    }
+    return sn;
+}
+
 uint8_t diff_class(uint8_t* buf, size_t s, size_t t) {
     if ((t <= s)) {
         return C_NOTHING;
@@ -238,6 +540,18 @@ bool ci_affected__in_list(uint8_t* list, uint8_t* s, size_t from, size_t to) {
         if ((list[i] == LIST_SEP)) {
             i += 1;
         }
+    }
+    return false;
+}
+
+bool in_set(uint8_t* set, size_t sn, uint8_t* s, size_t f, size_t t) {
+    size_t i = 0;
+    while ((i < sn)) {
+        size_t e = line_end(set, i, sn);
+        if (same(set, i, e, s, f, t)) {
+            return true;
+        }
+        i = (e + 1);
     }
     return false;
 }
@@ -317,6 +631,33 @@ uint8_t path_class(uint8_t* s, size_t from, size_t to) {
     return C_ALL_UNDER_SPECS;
 }
 
+size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c) {
+    if ((w < cap)) {
+        out[w] = c;
+    }
+    return (w + 1);
+}
+
+bool run_all(uint8_t* buf, size_t n) {
+    size_t g = marker_at(buf, n, 0, MARK_GRAPH);
+    if ((g >= n)) {
+        return true;
+    }
+    size_t c = marker_at(buf, n, g, MARK_CORPUS);
+    if ((c >= n)) {
+        return true;
+    }
+    size_t s = 0;
+    while ((s < g)) {
+        size_t e = line_end(buf, s, g);
+        if ((diff_class(buf, s, text_end(buf, s, e)) >= ALL_FROM)) {
+            return true;
+        }
+        s = (e + 1);
+    }
+    return false;
+}
+
 bool same(uint8_t* a, size_t af, size_t at, uint8_t* b, size_t bf, size_t bt) {
     if (((at - af) != (bt - bf))) {
         return false;
@@ -329,6 +670,60 @@ bool same(uint8_t* a, size_t af, size_t at, uint8_t* b, size_t bf, size_t bt) {
         k += 1;
     }
     return true;
+}
+
+uint32_t select_affected(uint8_t* buf, size_t n, uint8_t* set, size_t scap, uint8_t* out, size_t cap) {
+    if (run_all(buf, n)) {
+        return RUN_ALL;
+    }
+    size_t sn = closure(buf, n, set, scap);
+    if ((sn > scap)) {
+        return RUN_ALL;
+    }
+    size_t g = marker_at(buf, n, 0, MARK_GRAPH);
+    size_t c = marker_at(buf, n, g, MARK_CORPUS);
+    uint32_t count = 0;
+    size_t w = 0;
+    size_t s = (line_end(buf, c, n) + 1);
+    while ((s < n)) {
+        size_t e = line_end(buf, s, n);
+        size_t t = text_end(buf, s, e);
+        if (((t > s) && in_set(set, sn, buf, s, t))) {
+            size_t i = s;
+            while ((i < t)) {
+                w = put(out, w, cap, buf[i]);
+                i += 1;
+            }
+            w = put(out, w, cap, '\n');
+            count += 1;
+        }
+        s = (e + 1);
+    }
+    if ((w > cap)) {
+        return RUN_ALL;
+    }
+    return count;
+}
+
+size_t set_add(uint8_t* set, size_t sn, size_t scap, uint8_t* s, size_t f, size_t t) {
+    if ((sn > scap)) {
+        return sn;
+    }
+    if (in_set(set, sn, s, f, t)) {
+        return sn;
+    }
+    if ((((sn + (t - f)) + 1) > scap)) {
+        return (scap + 1);
+    }
+    size_t w = sn;
+    size_t i = f;
+    while ((i < t)) {
+        set[w] = s[i];
+        w += 1;
+        i += 1;
+    }
+    set[w] = '\n';
+    return (w + 1);
 }
 
 size_t base_start(uint8_t* s, size_t from, size_t to) {
@@ -554,6 +949,109 @@ void test_the_markers_end_the_change_list(void) {
     assert((heavy_decision("M\tdocs/a.md\n--graph\nx\ty\n--corpus\nspecs/a.t27\n", 45) == HEAVY_SKIP));
 }
 
+void test_narrow_a_single_spec_is_narrow(void) {
+    assert((heavy_narrow("M\tspecs/a/b.t27\n", 16) == HEAVY_NARROW));
+    assert((heavy_narrow("A\tspecs/a/b.t27\nM\tdocs/x.md\n", 28) == HEAVY_NARROW));
+    assert((heavy_narrow("M\tspecs/a/b.t27\nM\tspecs/c/d.t27\n", 32) == HEAVY_NARROW));
+}
+
+void test_narrow_a_spec_with_its_seal_is_narrow(void) {
+    assert((heavy_narrow("M\tspecs/ci/heavy_skip.t27\nM\t.trinity/seals/ci_CiHeavySkip.json\n", 63) == HEAVY_NARROW));
+}
+
+void test_narrow_a_seal_without_its_spec_runs(void) {
+    assert((heavy_narrow("M\t.trinity/seals/ci_CiHeavySkip.json\n", 37) == HEAVY_RUN));
+    assert((heavy_narrow("M\tspecs/tri/x.t27\nM\t.trinity/seals/ci_CiHeavySkip.json\n", 55) == HEAVY_RUN));
+}
+
+void test_narrow_a_siblings_seal_does_not_pass_and_the_name_rule_is_case_and_underscore_blind(void) {
+    assert((heavy_narrow("M\tspecs/ci/affected.t27\nM\t.trinity/seals/ci_CiHeavySkip.json\n", 61) == HEAVY_RUN));
+    assert((heavy_narrow("M\tspecs/ci/gitlab_lane.t27\nM\t.trinity/seals/ci_GitlabLane.json\n", 63) == HEAVY_NARROW));
+}
+
+void test_narrow_a_renamed_seal_runs(void) {
+    assert((heavy_narrow("M\tspecs/ci/a.t27\nR100\t.trinity/seals/ci_A.json\t.trinity/seals/ci_B.json\n", 72) == HEAVY_RUN));
+}
+
+void test_narrow_prose_still_skips(void) {
+    assert((heavy_narrow("M\tREADME.md\nA\tdocs/blog/post.md\n", 32) == HEAVY_SKIP));
+    assert((heavy_narrow("M\tdocs/a.md\n--graph\nx\ty\n--corpus\nspecs/a.t27\n", 45) == HEAVY_SKIP));
+}
+
+void test_narrow_negative_control_compiler_workflow_tool_ledger_run(void) {
+    assert((heavy_narrow("M\tspecs/a/b.t27\nM\tbootstrap/src/main.rs\n", 40) == HEAVY_RUN));
+    assert((heavy_narrow("M\tspecs/a/b.t27\nM\t.github/workflows/ci.yml\n", 43) == HEAVY_RUN));
+    assert((heavy_narrow("M\tspecs/a/b.t27\nM\ttools/dupe_scan.py\n", 37) == HEAVY_RUN));
+    assert((heavy_narrow("M\tspecs/a/b.t27\nM\tCargo.lock\n", 29) == HEAVY_RUN));
+    assert((heavy_narrow("M\tspecs/a/b.t27\nM\tspecs/RUST_DIALECT.json\n", 42) == HEAVY_RUN));
+}
+
+void test_narrow_negative_control_unreadable_runs(void) {
+    assert((heavy_narrow("", 0) == HEAVY_RUN));
+    assert((heavy_narrow("Q\tspecs/a/b.t27\n", 16) == HEAVY_RUN));
+    assert((heavy_narrow("M specs/a/b.t27\n", 16) == HEAVY_RUN));
+    assert((heavy_narrow("M\t\"specs/a b.t27\"\n", 18) == HEAVY_RUN));
+}
+
+void test_narrow_the_old_answers_are_unchanged(void) {
+    assert((heavy_decision("M\tspecs/a/b.t27\n", 16) == HEAVY_RUN));
+    assert((heavy_decision("M\tREADME.md\n", 12) == HEAVY_SKIP));
+    assert((HEAVY_NARROW != HEAVY_RUN));
+    assert((HEAVY_NARROW != HEAVY_SKIP));
+}
+
+void test_narrow_the_golden_set_is_well_formed_and_starts_with_the_t27b_spec(void) {
+    assert((golden_has("specs/tri/t27b/golden_spec.t27", 0, 30) == true));
+    assert((golden_has("specs/a/b.t27", 0, 13) == false));
+    assert((policy_own_language__in_list(GOLDEN_SET, "specs/tri/t27b/golden_spec.t27", 0, 30, false) == true));
+    assert((GOLDEN_SET[0] == 's'));
+}
+
+void test_narrow_list_puts_the_golden_set_first_without_duplicates(void) {
+    uint8_t set[256] = {0};
+    uint8_t tmp[256] = {0};
+    uint8_t out[256] = {0};
+    const uint8_t inp[] = "M\tspecs/a/b.t27\n--graph\n--corpus\nspecs/a/b.t27\nspecs/tri/t27b/golden_spec.t27\n";
+    assert((narrow_list(inp, 78, &set, 256, &tmp, 256, &out, 256) == 2));
+    assert((out[0] == 's'));
+    assert((out[30] == '\n'));
+    assert((out[31] == 's'));
+    assert((out[44] == '\n'));
+}
+
+void test_narrow_list_golden_spec_in_the_diff_is_listed_once(void) {
+    uint8_t set[256] = {0};
+    uint8_t tmp[256] = {0};
+    uint8_t out[256] = {0};
+    const uint8_t inp[] = "M\tspecs/tri/t27b/golden_spec.t27\n--graph\n--corpus\nspecs/tri/t27b/golden_spec.t27\n";
+    assert((narrow_list(inp, 81, &set, 256, &tmp, 256, &out, 256) == 1));
+}
+
+void test_narrow_golden_in_corpus_is_an_exact_whole_line_match(void) {
+    assert((golden_in_corpus("M\tspecs/a/b.t27\n--graph\n--corpus\nspecs/a/b.t27\nspecs/tri/t27b/golden_spec.t27\n", 78) == true));
+    assert((golden_in_corpus("M\tspecs/a/b.t27\n--graph\n--corpus\nspecs/a/b.t27\n", 47) == false));
+    assert((golden_in_corpus("M\tspecs/a/b.t27\n--graph\n--corpus\nspecs/tri/t27b/golden_spec.t27x\n", 65) == false));
+    assert((golden_in_corpus("M\tspecs/a/b.t27\n--graph\n--corpus\nxspecs/tri/t27b/golden_spec.t27\n", 65) == false));
+    assert((golden_in_corpus("M\tspecs/a/b.t27\n--graph\n", 24) == false));
+}
+
+void test_narrow_list_runs_all_when_the_golden_path_is_not_in_the_corpus(void) {
+    uint8_t set[256] = {0};
+    uint8_t tmp[256] = {0};
+    uint8_t out[256] = {0};
+    assert((narrow_list("M\tspecs/a/b.t27\n--graph\n--corpus\nspecs/a/b.t27\n", 47, &set, 256, &tmp, 256, &out, 256) == RUN_ALL));
+    assert((narrow_list("M\tspecs/a/b.t27\n--graph\n--corpus\nspecs/tri/t27b/golden_spec.t27x\n", 65, &set, 256, &tmp, 256, &out, 256) == RUN_ALL));
+    assert((narrow_list("M\tspecs/a/b.t27\n--graph\n--corpus\nxspecs/tri/t27b/golden_spec.t27\n", 65, &set, 256, &tmp, 256, &out, 256) == RUN_ALL));
+    assert((narrow_list("M\tspecs/a/b.t27\n--graph\n", 24, &set, 256, &tmp, 256, &out, 256) == RUN_ALL));
+}
+
+void test_narrow_list_asks_for_everything_when_the_input_does(void) {
+    uint8_t set[64] = {0};
+    uint8_t tmp[64] = {0};
+    uint8_t out[64] = {0};
+    assert((narrow_list("M\tbootstrap/src/x.rs\n--graph\n--corpus\nspecs/a.t27\n", 50, &set, 64, &tmp, 64, &out, 64) == RUN_ALL));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -569,7 +1067,22 @@ int main(void) {
     test_a_rename_is_judged_by_both_paths();
     test_negative_control_unreadable_input_runs_them();
     test_the_markers_end_the_change_list();
-    printf("All %d tests passed.\n", 7);
+    test_narrow_a_single_spec_is_narrow();
+    test_narrow_a_spec_with_its_seal_is_narrow();
+    test_narrow_a_seal_without_its_spec_runs();
+    test_narrow_a_siblings_seal_does_not_pass_and_the_name_rule_is_case_and_underscore_blind();
+    test_narrow_a_renamed_seal_runs();
+    test_narrow_prose_still_skips();
+    test_narrow_negative_control_compiler_workflow_tool_ledger_run();
+    test_narrow_negative_control_unreadable_runs();
+    test_narrow_the_old_answers_are_unchanged();
+    test_narrow_the_golden_set_is_well_formed_and_starts_with_the_t27b_spec();
+    test_narrow_list_puts_the_golden_set_first_without_duplicates();
+    test_narrow_list_golden_spec_in_the_diff_is_listed_once();
+    test_narrow_golden_in_corpus_is_an_exact_whole_line_match();
+    test_narrow_list_runs_all_when_the_golden_path_is_not_in_the_corpus();
+    test_narrow_list_asks_for_everything_when_the_input_does();
+    printf("All %d tests passed.\n", 22);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
