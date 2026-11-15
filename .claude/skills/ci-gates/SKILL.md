@@ -27,6 +27,13 @@ set are dated readings, not the rule. The rule is the ruleset:
 `check-now-freshness` and `check`, a `docs/now/` entry per PR) was removed by owner
 decision 2026-10-04 (#5935); no hook and no CI job asks for an entry any more.
 
+**Triage master reds first (2026-11-15, #13826).** Four steps, in this order:
+
+1. Count reds per workflow in one call: `gh run list --branch master --limit 150 --json name,conclusion`, grouped by name. A workflow red many runs in a row is inherited, not yours.
+2. Save `gh run view <id> --log-failed` to a file and grep the verdict lines (`FAIL`, `STALE`, `##[error]`). The tail of the log is checkout cleanup, not the error.
+3. Before blaming a token, probe the host with no token. The Queen export 404 was a deleted Railway app (`Application not found` on `/`), not a bad secret (#13824, #13825).
+4. Before fixing a red, find the open issue or PR that owns it (Seal Coverage: #13746, PR #13799). Dated reading on master f8bcb2b9: `t27b native` failed 165 of 200 master runs since 2026-11-03 (#6490).
+
 ---
 
 ## 1. A gate that cannot fail reads as coverage, and is worse than none
