@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/router_dispatch.t27 -- THE per-attempt decision function of the stage-2 router: what the real
+; walk calls once per attempt, composed from the runtime, glue, stream, cache and provider laws. No new rule
+; lives here; every decision is a composition the existing specs already own.
+;   (a) Attempt begin: one entry that resets the stream accumulator AND the slot's remembered route, so a
+;       fallback attempt never inherits the failed one's usage or its pinned route.
+;   (b) Route for an attempt: pin key (host-sid path with the user_id fallback, through the trusted
+;       rg_pin_key alphabet) -> rr_get -> rg_pin_valid -> rr_route_chain; a pin that fell out of the chain
+;       is honoured nowhere and cleared from the state in the same call; a flag bit says which happened.
+;   (c) Fragment feed: dispatch by the caller-supplied protocol flag -- the same W469 boundary law as
+;       rr_sticky_key; the byte-level classifier stays transform.t27's.
+;   (d) Attempt finish: rs_close + the demotion law (pr_after over the rr_route_chain inputs); when the
+;       reply says next, the slot's pin is cleared and rewritten to the demoted chain's head; exactly ONE
+;       rg_attempt_line is emitted, carrying this attempt's counters only.
+; ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osRouterDispatch;
+
+use t27os::router_runtime::rr_get;
+use t27os::router_runtime::rr_set;
+use t27os::router_runtime::rr_clear;
+use t27os::router_runtime::rr_route_chain;
+use t27os::router_runtime::RR_STRIDE;
+use t27os::router_glue::rg_pin_key;
+use t27os::router_glue::rg_attempt_line;
+use t27os::router_glue::RG_ABORTED;
+use t27os::router_stream::rs_begin;
+use t27os::router_stream::rs_anthropic;
+use t27os::router_stream::rs_openai;
+use t27os::router_stream::rs_close;
+use t27os::router_stream::RS_FIELDS;
+use t27os::router_stream::RS_INCOMPLETE;
+use t27os::router_cache::rc_pin_key;
+use t27os::router_cache::rc_cache_class;
+use t27os::router_cache::RC_UNKNOWN;
+use t27os::router_cache::RC_MISS;
+use t27os::provider_router::pr_after;
+use t27os::provider_router::pr_nth;
+use t27os::provider_router::pr_should_next;
+use t27os::session_store::put_bytes;
+use t27os::editors::same_bytes;
+
+// ---- flags of rd_route_for -------------------------------------------------------------------------
+
+/// The pin was honoured: the composed chain starts at the remembered route.
+pub const RD_PIN_HELD : u64 = 1;
+/// The pin was a ghost: it fell out of the current chain and was cleared from the state.
+pub const RD_PIN_CLEARED : u64 = 2;
+
+// ---- (a) attempt begin ------------------------------------------------------------------------------
+
+/// The single entry of an attempt. It resets BOTH halves of the per-attempt state in one call: the
+/// stream accumulator (rs_begin law -- nothing survives from the previous attempt) and this slot's
+/// remembered route (rr_clear law -- the previous attempt's sticky route never leaks into the next).
+/// The walk calls nothing else before feeding fragments.
+pub fn rd_begin_attempt(st: []u64, pin_state: []u8, slot: u32) -> void {
+    rs_begin(st);
+    rr_clear(pin_state, slot);
+}
+
+// ---- (b) route for an attempt -----------------------------------------------------------------------
+
+/// The chain one attempt is sent on. Composition, in order:
+///   1. the trusted pin key (rg_pin_key alphabet) over the host-sid path: rc_pin_key gives the host sid
+///      or the request's metadata.user_id fallback; the host pane is single-owner, so the session key
+///      stands in for both the owner and the sid fields. A refused key runs the attempt UNPINNED.
+///   2. the slot's remembered route (rr_get) and its validity for the CURRENT chain (rg_pin_valid law).
+///   3. rr_route_chain: pr_chain with the remembered route first when valid, the plain chain otherwise.
+/// Automatic maintenance: a remembered route that fell out of the chain is cleared from pin_state in the
+/// same call (a ghost pin is never kept for a chain that no longer holds it). out_flags[0] carries
+/// RD_PIN_HELD, RD_PIN_CLEARED, or 0 (no pin, no key). Returns the composed chain's length.
+pub fn rd_route_for(out_chain: []u8, out_flags: []u64, order: []const u8, pin_state: []u8, slot: u32, host_sid: []const u8, profile: []const u8, request_body: []const u8) -> usize {
+    out_flags[0] = 0;
+    var session : [64]u8 = undefined;
+    var key : [132]u8 = undefined;
+    const ns : usize = rc_pin_key(session[0..64], host_sid, request_body);
+    if (ns == 0) { return rr_route_chain(out_chain, order, ""); }
+    const nk : usize = rg_pin_key(key[0..132], session[0..ns], profile, session[0..ns]);
+    if (nk == 0) { return rr_route_chain(out_chain, order, ""); }
+    const off : usize = @as(usize, @intCast(slot)) * RR_STRIDE;
+    const nr : usize = rr_get(pin_state, slot);
+    const remembered : []const u8 = pin_state[off..off + nr];
+    const n : usize = rr_route_chain(out_chain, order, remembered);
+    if (nr > 0) {
+        var head : [48]u8 = undefined;
+        const nh : usize = pr_nth(out_chain[0..n], 0, head[0..48]);
+        if (nh == nr and same_bytes(head[0..nh], remembered)) {
+            out_flags[0] = RD_PIN_HELD;
+        } else {
+            rr_clear(pin_state, slot);
+            out_flags[0] = RD_PIN_CLEARED;
+        }
+    }
+    return n;
+}
+
+// ---- (c) fragment feed ------------------------------------------------------------------------------
+
+/// Dispatch ONE stream fragment to the accumulator by the caller-supplied protocol flag: rs_openai for
+/// an OpenAI-protocol route, rs_anthropic for an Anthropic-protocol route. Same W469 boundary law as
+/// rr_sticky_key: the route's protocol is the caller's knowledge; the byte-level classifier itself
+/// stays transform.t27's, and this function adds no parsing of its own.
+pub fn rd_feed(st: []u64, openai_proto: bool, frag: []const u8) -> void {
+    if (openai_proto) { rs_openai(st, frag); } else { rs_anthropic(st, frag); }
+}
+
+// ---- (d) attempt finish -----------------------------------------------------------------------------
+
+/// After the upstream reply: rs_close (clean closes the record; an abort marks it INCOMPLETE), then the
+/// demotion law over the rr_route_chain inputs -- pr_after on the composed chain. When the reply says
+/// next (pr_should_next on the status; the walk passes a body-marked next as its retry status), the
+/// slot's pin is CLEARED and REWRITTEN to the demoted chain's head, so the next attempt starts further
+/// down the order, never on the endpoint that just failed. Exactly ONE rg_attempt_line is emitted,
+/// carrying this attempt's counters only. Returns the ledger line's length.
+pub fn rd_finish(out_line: []u8, st: []u64, pin_state: []u8, slot: u32, order: []const u8, attempt: []const u8, key: []const u8, route: []const u8, status: u32, clean: bool) -> usize {
+    rs_close(st, clean);
+    const off : usize = @as(usize, @intCast(slot)) * RR_STRIDE;
+    const nr : usize = rr_get(pin_state, slot);
+    const remembered : []const u8 = pin_state[off..off + nr];
+    var chain : [96]u8 = undefined;
+    var n : usize = rr_route_chain(chain[0..96], order, remembered);
+    var after : [96]u8 = undefined;
+    const m : usize = pr_after(after[0..96], chain[0..n], status, "");
+    var demoted : bool = false;
+    if (pr_should_next(status, "")) {
+        demoted = m != n or same_bytes(after[0..m], chain[0..n]) == false;
+    }
+    if (demoted) {
+        rr_clear(pin_state, slot);
+        var head : [48]u8 = undefined;
+        const nh : usize = pr_nth(after[0..m], 0, head[0..48]);
+        if (nh > 0) { rr_set(pin_state, slot, head[0..nh]); }
+        n = m;
+    }
+    return rg_attempt_line(out_line, attempt, key, route, st);
+}
+
+// ---- tests ----------------------------------------------------------------------------------------
+
+test "a_valid_pin_is_honoured_and_heads_the_chain" {
+    var state : [96]u8 = undefined;
+    var flags : [1]u64 = undefined;
+    var chain : [96]u8 = undefined;
+    rr_set(state[0..], 0, "kie");
+    const n : usize = rd_route_for(chain[0..96], flags[0..1], "zai,kie,nemotron", state[0..], 0, "sid-9", "zai", "{}");
+    assert same_bytes(chain[0..n], "kie,zai,nemotron");
+    assert flags[0] == RD_PIN_HELD;
+    // the honoured pin stays in the state
+    assert rr_get(state[0..], 0) == 3;
+}
+
+test "a_ghost_pin_is_cleared_from_the_state_and_the_plain_chain_is_used" {
+    var state : [96]u8 = undefined;
+    var flags : [1]u64 = undefined;
+    var chain : [96]u8 = undefined;
+    rr_set(state[0..], 0, "ghost");
+    const n : usize = rd_route_for(chain[0..96], flags[0..1], "zai,kie,nemotron", state[0..], 0, "sid-9", "zai", "{}");
+    assert same_bytes(chain[0..n], "zai,kie,nemotron");
+    assert flags[0] == RD_PIN_CLEARED;
+    // the ghost was removed from the state in the same call
+    assert rr_get(state[0..], 0) == 0;
+}
+
+test "two_slots_are_independent_through_rd_route_for" {
+    var state : [96]u8 = undefined;
+    var flags : [1]u64 = undefined;
+    var chain : [96]u8 = undefined;
+    rr_set(state[0..], 0, "kie");
+    rr_set(state[0..], 1, "nemotron");
+    const n0 : usize = rd_route_for(chain[0..96], flags[0..1], "zai,kie,nemotron", state[0..], 0, "sid-9", "zai", "{}");
+    assert same_bytes(chain[0..n0], "kie,zai,nemotron");
+    assert flags[0] == RD_PIN_HELD;
+    const n1 : usize = rd_route_for(chain[0..96], flags[0..1], "zai,kie,nemotron", state[0..], 1, "sid-9", "zai", "{}");
+    assert same_bytes(chain[0..n1], "nemotron,zai,kie");
+    assert flags[0] == RD_PIN_HELD;
+    // a profile change yields a different trusted key, but the slot pins stay put
+    rr_clear(state[0..], 1);
+    const n2 : usize = rd_route_for(chain[0..96], flags[0..1], "zai,kie,nemotron", state[0..], 0, "sid-9", "openrouter", "{}");
+    assert same_bytes(chain[0..n2], "kie,zai,nemotron");
+    assert rr_get(state[0..], 0) == 3;
+}
+
+test "usage_split_across_message_start_and_message_delta_yields_one_line_with_the_input_kept" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var state : [96]u8 = undefined;
+    var line : [160]u8 = undefined;
+    rd_begin_attempt(st[0..], state[0..], 0);
+    rd_feed(st[0..], false, "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":80}}}");
+    rd_feed(st[0..], false, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}");
+    const n : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie", "att-1", "owner-1.zai.sid-9", "zai", 200, true);
+    // exactly one line: attempt,key,route,schema,mask,total,read,write,class,flags,reason
+    assert same_bytes(line[0..n], "att-1,owner-1.zai.sid-9,zai,0,3,180,80,0,1,2,0");
+    assert st[0] == 180;
+    assert st[1] == 80;
+    assert (st[5] & RS_INCOMPLETE) == 0;
+}
+
+test "cumulative_openai_deltas_are_replaced_never_double_counted" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var state : [96]u8 = undefined;
+    var line : [160]u8 = undefined;
+    rd_begin_attempt(st[0..], state[0..], 0);
+    // cumulative usage frames: the same totals grow, the accumulator replaces, never adds
+    rd_feed(st[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":3}}");
+    rd_feed(st[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":9}}");
+    const n : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie", "att-2", "owner-1.zai.sid-9", "zai", 200, true);
+    // completion_tokens is no usage field of the law; the read bit stays clear, so UNKNOWN + NO_FIELD
+    assert same_bytes(line[0..n], "att-2,owner-1.zai.sid-9,zai,1,1,40,0,0,2,2,1");
+    assert st[0] == 40;
+    assert st[2] == 0;
+}
+
+test "the_openrouter_usage_chunk_counts_once_even_when_repeated" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var state : [96]u8 = undefined;
+    rd_begin_attempt(st[0..], state[0..], 0);
+    // the usage chunk before [DONE] arrives twice (relay retry of the last chunk): replaced, not summed
+    rd_feed(st[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"prompt_tokens_details\":{\"cached_tokens\":60}}}");
+    rd_feed(st[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"prompt_tokens_details\":{\"cached_tokens\":60}}}");
+    var line : [160]u8 = undefined;
+    const n : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie", "att-3", "owner-1.zai.sid-9", "zai", 200, true);
+    assert same_bytes(line[0..n], "att-3,owner-1.zai.sid-9,zai,1,3,100,60,0,1,2,0");
+    assert st[0] == 100;
+    assert st[1] == 60;
+}
+
+test "an_abort_is_unknown_with_the_aborted_reason_never_miss" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var state : [96]u8 = undefined;
+    var line : [160]u8 = undefined;
+    rr_set(state[0..], 0, "zai");
+    rd_begin_attempt(st[0..], state[0..], 0);
+    rr_set(state[0..], 0, "zai");
+    // usage never arrives; the stream dies mid-flight
+    rd_feed(st[0..], false, "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30}}}");
+    const n : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie", "att-4", "owner-1.zai.sid-9", "zai", 429, false);
+    // class UNKNOWN (2), reason RG_ABORTED (2); never folded into MISS (0)
+    assert same_bytes(line[0..n], "att-4,owner-1.zai.sid-9,zai,0,1,30,0,0,2,3,2");
+    assert rc_cache_class((st[3] & 2) != 0, st[1]) == RC_UNKNOWN;
+    assert rc_cache_class((st[3] & 2) != 0, st[1]) != RC_MISS;
+    assert (st[5] & RS_INCOMPLETE) != 0;
+}
+
+test "two_sessions_are_isolated_end_to_end_through_route_and_attempt" {
+    var st1 : [RS_FIELDS]u64 = undefined;
+    var st2 : [RS_FIELDS]u64 = undefined;
+    var s1 : [96]u8 = undefined;
+    var s2 : [96]u8 = undefined;
+    var c1 : [96]u8 = undefined;
+    var c2 : [96]u8 = undefined;
+    var f : [1]u64 = undefined;
+    rr_set(s1[0..], 0, "kie");
+    rr_set(s2[0..], 0, "nemotron");
+    const n1 : usize = rd_route_for(c1[0..96], f[0..1], "zai,kie,nemotron", s1[0..], 0, "sid-1", "zai", "{}");
+    assert same_bytes(c1[0..n1], "kie,zai,nemotron");
+    const n2 : usize = rd_route_for(c2[0..96], f[0..1], "zai,kie,nemotron", s2[0..], 0, "sid-2", "zai", "{}");
+    assert same_bytes(c2[0..n2], "nemotron,zai,kie");
+    // each attempt carries its own accumulator and its own pin
+    rd_begin_attempt(st1[0..], s1[0..], 0);
+    rr_set(s1[0..], 0, "kie");
+    rd_begin_attempt(st2[0..], s2[0..], 0);
+    rr_set(s2[0..], 0, "nemotron");
+    rd_feed(st1[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":11}}");
+    rd_feed(st2[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":22}}");
+    var l1 : [160]u8 = undefined;
+    var l2 : [160]u8 = undefined;
+    const m1 : usize = rd_finish(l1[0..160], st1[0..], s1[0..], 0, "zai,kie,nemotron", "a-1", "owner-1.zai.sid-1", "kie", 200, true);
+    const m2 : usize = rd_finish(l2[0..160], st2[0..], s2[0..], 0, "zai,kie,nemotron", "a-2", "owner-1.zai.sid-2", "nemotron", 200, true);
+    assert same_bytes(l1[0..m1], "a-1,owner-1.zai.sid-1,kie,1,1,11,0,0,2,2,1");
+    assert same_bytes(l2[0..m2], "a-2,owner-1.zai.sid-2,nemotron,1,1,22,0,0,2,2,1");
+    assert st1[0] == 11;
+    assert st2[0] == 22;
+}
+
+test "a_429_fallback_resets_usage_and_the_pin_and_the_pin_moves_behind" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var state : [96]u8 = undefined;
+    var line : [160]u8 = undefined;
+    // attempt 1 pinned on zai, dies on a 429 after partial usage
+    rr_set(state[0..], 0, "zai");
+    rd_begin_attempt(st[0..], state[0..], 0);
+    rr_set(state[0..], 0, "zai");
+    rd_feed(st[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":180}}");
+    const n1 : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie,nemotron", "att-5", "owner-1.zai.sid-9", "zai", 429, false);
+    assert same_bytes(line[0..n1], "att-5,owner-1.zai.sid-9,zai,1,1,180,0,0,2,3,2");
+    // the reply said next: the pin cleared, then rewritten to the demoted chain's head (kie)
+    assert rr_get(state[0..], 0) == 3;
+    var head : [48]u8 = undefined;
+    const k : usize = rr_get(state[0..], 0);
+    assert same_bytes(state[0..k], "kie");
+    // attempt 2: the single begin wipes the failed attempt's usage AND the old pin is gone
+    rd_begin_attempt(st[0..], state[0..], 0);
+    assert st[0] == 0;
+    assert st[1] == 0;
+    rd_feed(st[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":50}}");
+    const n2 : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie,nemotron", "att-6", "owner-1.zai.sid-9", "kie", 200, true);
+    assert same_bytes(line[0..n2], "att-6,owner-1.zai.sid-9,kie,1,1,50,0,0,2,2,1");
+    assert n2 > 0;
+}
+
+test "a_200_keeps_the_pin_where_it_is" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var state : [96]u8 = undefined;
+    var line : [160]u8 = undefined;
+    rr_set(state[0..], 0, "kie");
+    rd_begin_attempt(st[0..], state[0..], 0);
+    rr_set(state[0..], 0, "kie");
+    rd_feed(st[0..], true, "{\"choices\":[],\"usage\":{\"prompt_tokens\":70}}");
+    const n : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie,nemotron", "att-7", "owner-1.zai.sid-9", "kie", 200, true);
+    assert same_bytes(line[0..n], "att-7,owner-1.zai.sid-9,kie,1,1,70,0,0,2,2,1");
+    // the good reply keeps the session pinned where it is
+    const k : usize = rr_get(state[0..], 0);
+    assert k == 3;
+    assert same_bytes(state[0..k], "kie");
+}
+
+test "the_demotion_only_rewrites_the_pin_when_the_reply_says_next" {
+    var st : [RS_FIELDS]u64 = undefined;
+    var state : [96]u8 = undefined;
+    var line : [160]u8 = undefined;
+    rr_set(state[0..], 0, "zai");
+    rd_begin_attempt(st[0..], state[0..], 0);
+    rr_set(state[0..], 0, "zai");
+    // a 400 without the subscription mark does not demote; the pin stays zai
+    const n : usize = rd_finish(line[0..160], st[0..], state[0..], 0, "zai,kie", "att-8", "owner-1.zai.sid-9", "zai", 400, true);
+    assert n > 0;
+    const k : usize = rr_get(state[0..], 0);
+    assert same_bytes(state[0..k], "zai");
+    // and the demotion law itself is only pr_should_next, never a local reimplementation
+    assert pr_should_next(429, "");
+    assert pr_should_next(200, "") == false;
+}

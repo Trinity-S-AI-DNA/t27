@@ -58,7 +58,7 @@ t27os:
 	$$LD -o $$O/t27os-pty $$O/pty_server.o; \
 	$$LD -o $$O/plist_main $$O/plist_main.o; \
 	$$LD -lobjc $(foreach f,$(T27OS_FRAMEWORKS),-framework $(f)) -o $$A/MacOS/T27OS $$O/glass_window.o; \
-	T27OS_BUILD=$(T27OS_BUILD) $$O/plist_main > $$A/Info.plist; plutil -lint $$A/Info.plist >/dev/null; \
+	T27OS_BUILD=$(T27OS_BUILD) $$O/plist_main > $$A/Info.plist; plutil -lint $$A/Info.plist >/dev/null; mkdir -p $$A/Resources; cp specs/t27os/icon/AppIcon.icns $$A/Resources/; \
 	ID="$${T27OS_SIGN_ID:--}"; codesign --force --sign "$$ID" $$O/T27OS.app; codesign --force --sign "$$ID" $$O/t27os-pty; \
 	echo "built $$O/T27OS.app and $$O/t27os-pty (build $(T27OS_BUILD), signed with $$ID)"
 

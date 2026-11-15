@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: Apache-2.0
+; The next-step law of the event-driven Queen loop, first slice (Refs #6657, #12884).
+; Stage 1 names the first refusal reason of one candidate; stage 2 picks one admissible
+; candidate by the Queen's own order (queen::priority::outranks).
+; A step parked for approval does not stop an independent step; an unread report never
+; blocks the next step; an empty budget refuses new execution; nothing admissible = WAIT.
+; Pure functions: no clock, no event source, no approval semantics, no runtime. Not measured.
+; decide is the call point in queen::control: R_DISPATCH -> next_source -> SRC_AUTO -> pick.
+; pick refuses a count above MAX_CANDIDATES with PICK_BAD_INPUT; it never clamps the count.
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenNextStep;
+
+use queen::priority::eligible;
+use queen::priority::outranks;
+use queen::control::EV_REVIEW;
+use queen::control::EV_TASK_ENDED;
+use queen::control::EV_WORKER_IDLE;
+use queen::control::EV_HEARTBEAT;
+use queen::control::R_DISPATCH;
+use queen::control::SRC_MANUAL;
+use queen::control::SRC_AUTO;
+use queen::control::NO_HOLDER;
+use queen::control::reaction_of;
+use queen::control::event_applies;
+use queen::control::next_source;
+use queen::control::claim_lands;
+use queen::control::fence_after_claim;
+
+pub const NS_OK : u8 = 0;
+pub const NS_NO_PERMISSION : u8 = 1;
+pub const NS_PARKED : u8 = 2;
+pub const NS_BLOCKED : u8 = 3;
+pub const NS_NO_SLOT : u8 = 4;
+pub const NS_NO_BUDGET : u8 = 5;
+pub const NS_NOT_ISOLATED : u8 = 6;
+pub const NS_NONE : u8 = 255;
+
+/// Checks in this order and returns the first failure: permitted == false -> NS_NO_PERMISSION;
+/// parked -> NS_PARKED; eligible(open_blockers) == false -> NS_BLOCKED; slots_free == 0 -> NS_NO_SLOT;
+/// budget_left == 0 -> NS_NO_BUDGET; isolated == false -> NS_NOT_ISOLATED; else NS_OK.
+pub fn unavailable_reason(permitted: bool, parked: bool, open_blockers: u32,
+    slots_free: u32, budget_left: u32, isolated: bool) -> u8 {
+    if (permitted == false) { return NS_NO_PERMISSION; }
+    if (parked == true) { return NS_PARKED; }
+    if (eligible(open_blockers) == false) { return NS_BLOCKED; }
+    if (slots_free == 0) { return NS_NO_SLOT; }
+    if (budget_left == 0) { return NS_NO_BUDGET; }
+    if (isolated == false) { return NS_NOT_ISOLATED; }
+    return NS_OK;
+}
+
+/// budget_left - cost, but 0 when cost > budget_left.
+pub fn budget_after(budget_left: u32, cost: u32) -> u32 {
+    var result : u32 = budget_left;
+    if (cost > budget_left) { result = 0; }
+    else { result = budget_left - cost; }
+    return result;
+}
+
+pub const ST_DONE : u8 = 1;
+pub const ST_VERIFIED : u8 = 2;
+pub const ST_NOTIFIED : u8 = 8;
+pub const ST_READ : u8 = 16;
+
+/// (status & bit) != 0.
+pub fn has(status: u8, bit: u8) -> bool {
+    return (status & bit) != 0;
+}
+
+/// has DONE and has VERIFIED. NOTIFIED and READ are ignored.
+pub fn next_may_start(status: u8) -> bool {
+    if (has(status, ST_DONE) == false) { return false; }
+    if (has(status, ST_VERIFIED) == false) { return false; }
+    return true;
+}
+
+pub const MAX_CANDIDATES : u32 = 4;
+
+pub const NO_PICK : u32 = 255;
+
+/// pick's answer to n > MAX_CANDIDATES: the count is refused, never clamped to 4.
+/// Distinct from NO_PICK, so a caller cannot read a bad count as WAIT.
+pub const PICK_BAD_INPUT : u32 = 254;
+
+/// 0 when next_may_start(prev_status), else 1. (A report's NOTIFIED / READ bits never change it.)
+pub fn blockers_from(prev_status: u8) -> u32 {
+    var x : u32 = 0;
+    if (next_may_start(prev_status) == false) { x = 1; }
+    return x;
+}
+
+/// n > MAX_CANDIDATES -> PICK_BAD_INPUT, before any element is read. Otherwise only a
+/// candidate i < n whose reason[i] == NS_OK is admissible; return the admissible i that
+/// outranks every other admissible one (queen::priority::outranks), or NO_PICK when none is.
+pub fn pick(reason: [4]u8, eff: [4]u8, level: [4]u8, index: [4]u32, n: u32) -> u32 {
+    if (n > MAX_CANDIDATES) { return PICK_BAD_INPUT; }
+    var best : u32 = NO_PICK;
+    var i : u32 = 0;
+    while (i < n) {
+        if (reason[i] == NS_OK) {
+            if (best == NO_PICK) { best = i; }
+            else if (outranks(eff[i], level[i], index[i], eff[best], level[best], index[best]) == true) {
+                best = i;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// decide's answers besides a candidate index, NO_PICK (WAIT) and PICK_BAD_INPUT.
+/// D_STALE: the event is a redelivery or older than the last one applied; nothing changes.
+pub const D_STALE : u32 = 253;
+/// D_NO_DISPATCH: the event's reaction in queen::control is not R_DISPATCH; no choice is made.
+pub const D_NO_DISPATCH : u32 = 252;
+/// D_MANUAL: a person's assignment is pending and is taken before the automatic choice.
+pub const D_MANUAL : u32 = 251;
+
+/// The call point in queen::control: an applied event whose reaction is R_DISPATCH reaches
+/// next_source, and its SRC_AUTO branch is answered by pick. Checks in this order:
+/// event_applies(last_applied, seq) == false -> D_STALE; reaction_of(kind) != R_DISPATCH ->
+/// D_NO_DISPATCH; pick == PICK_BAD_INPUT -> PICK_BAD_INPUT; next_source(manual_pending,
+/// pick != NO_PICK) == SRC_MANUAL -> D_MANUAL; SRC_AUTO -> the picked index; else NO_PICK.
+/// Pure: the caller updates task state before the call and records the answer after it.
+pub fn decide(kind: u8, last_applied: u64, seq: u64, manual_pending: bool,
+    reason: [4]u8, eff: [4]u8, level: [4]u8, index: [4]u32, n: u32) -> u32 {
+    if (event_applies(last_applied, seq) == false) { return D_STALE; }
+    if (reaction_of(kind) != R_DISPATCH) { return D_NO_DISPATCH; }
+    var p : u32 = pick(reason, eff, level, index, n);
+    if (p == PICK_BAD_INPUT) { return PICK_BAD_INPUT; }
+    var auto_ok : bool = p != NO_PICK;
+    var src : u8 = next_source(manual_pending, auto_ok);
+    if (src == SRC_MANUAL) { return D_MANUAL; }
+    if (src == SRC_AUTO) { return p; }
+    return NO_PICK;
+}
+
+test stage1_order {
+    var r1 : u8 = unavailable_reason(false, true, 1, 0, 0, false);
+    assert r1 == NS_NO_PERMISSION;
+    var r2 : u8 = unavailable_reason(true, true, 1, 0, 0, false);
+    assert r2 == NS_PARKED;
+    var r3 : u8 = unavailable_reason(true, false, 1, 0, 0, false);
+    assert r3 == NS_BLOCKED;
+    var r4 : u8 = unavailable_reason(true, false, 0, 0, 0, false);
+    assert r4 == NS_NO_SLOT;
+    var r5 : u8 = unavailable_reason(true, false, 0, 1, 0, false);
+    assert r5 == NS_NO_BUDGET;
+    var r6 : u8 = unavailable_reason(true, false, 0, 1, 1, false);
+    assert r6 == NS_NOT_ISOLATED;
+    var r7 : u8 = unavailable_reason(true, false, 0, 1, 1, true);
+    assert r7 == NS_OK;
+}
+
+test budget_saturates {
+    var b1 : u32 = budget_after(5, 3);
+    assert b1 == 2;
+    var b2 : u32 = budget_after(3, 5);
+    assert b2 == 0;
+    var b3 : u32 = budget_after(0, 0);
+    assert b3 == 0;
+}
+
+test unread_report_never_blocks {
+    var s1 : bool = next_may_start(ST_DONE | ST_VERIFIED);
+    assert s1 == true;
+    var s2 : bool = next_may_start(ST_DONE | ST_VERIFIED | ST_NOTIFIED);
+    assert s2 == true;
+    var s3 : bool = next_may_start(ST_DONE | ST_VERIFIED | ST_NOTIFIED | ST_READ);
+    assert s3 == true;
+    var s4 : bool = next_may_start(ST_DONE);
+    assert s4 == false;
+    var s5 : bool = next_may_start(ST_READ);
+    assert s5 == false;
+}
+
+test approval_wait_is_unavailable {
+    var r1 : u8 = unavailable_reason(true, true, 0, 1, 1, true);
+    assert r1 == NS_PARKED;
+    var reason : [4]u8 = [NS_PARKED, 0, 0, 0];
+    var pick_result : u32 = pick(reason, [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], 1);
+    assert pick_result == NO_PICK;
+}
+
+test independent_permitted_is_picked {
+    var A_eff : [4]u8 = [1, 2, 0, 0];
+    var A_level : [4]u8 = [0, 0, 0, 0];
+    var A_index : [4]u32 = [0, 1, 2, 3];
+    var A_reason : [4]u8 = [NS_PARKED, NS_OK, NS_OK, NS_OK];
+    var outranks_result : bool = outranks(1, 0, 0, 2, 0, 1);
+    assert outranks_result == true;
+    var pick_result : u32 = pick(A_reason, A_eff, A_level, A_index, 2);
+    assert pick_result == 1;
+}
+
+test unread_report_does_not_change_pick {
+    var b1 : u32 = blockers_from(ST_DONE | ST_VERIFIED);
+    assert b1 == 0;
+    var b2 : u32 = blockers_from(ST_DONE | ST_VERIFIED | ST_NOTIFIED);
+    assert b2 == 0;
+    var b3 : u32 = blockers_from(ST_DONE | ST_VERIFIED | ST_NOTIFIED | ST_READ);
+    assert b3 == 0;
+    var r_unread : u8 = unavailable_reason(true, false, b2, 1, 1, true);
+    var pick_unread : u32 = pick([r_unread, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], 1);
+    assert pick_unread == 0;
+    var r_read : u8 = unavailable_reason(true, false, b3, 1, 1, true);
+    var pick_read : u32 = pick([r_read, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], 1);
+    assert pick_read == 0;
+    var b4 : u32 = blockers_from(ST_DONE);
+    assert b4 == 1;
+    var r_blocked : u8 = unavailable_reason(true, false, b4, 1, 1, true);
+    assert r_blocked == NS_BLOCKED;
+    var pick_blocked : u32 = pick([r_blocked, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], 1);
+    assert pick_blocked == NO_PICK;
+}
+
+test nothing_available_waits {
+    var pick_n0 : u32 = pick([0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], 0);
+    assert pick_n0 == NO_PICK;
+    var pick_4 : u32 = pick([NS_PARKED, NS_BLOCKED, NS_NO_SLOT, NS_NO_BUDGET], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], 4);
+    assert pick_4 == NO_PICK;
+}
+
+test exhausted_budget_refuses {
+    var b1 : u32 = budget_after(1, 1);
+    assert b1 == 0;
+    var r1 : u8 = unavailable_reason(true, false, 0, 1, b1, true);
+    assert r1 == NS_NO_BUDGET;
+    var r2 : u8 = unavailable_reason(true, false, 0, 1, 2, true);
+    assert r2 == NS_OK;
+}
+
+test pick_by_queen_order {
+    var eff : [4]u8 = [2, 1, 1, 3];
+    var level : [4]u8 = [0, 1, 0, 0];
+    var index : [4]u32 = [0, 1, 2, 3];
+    var reason : [4]u8 = [NS_OK, NS_OK, NS_OK, NS_OK];
+    var pick_4 : u32 = pick(reason, eff, level, index, 4);
+    assert pick_4 == 2;
+    var pick_2 : u32 = pick(reason, eff, level, index, 2);
+    assert pick_2 == 1;
+}
+
+test pick_input_bounds {
+    var ok : [4]u8 = [NS_OK, NS_OK, NS_OK, NS_OK];
+    var eff : [4]u8 = [3, 3, 3, 0];
+    var level : [4]u8 = [0, 0, 0, 0];
+    var index : [4]u32 = [0, 1, 2, 3];
+    var p0 : u32 = pick(ok, eff, level, index, 0);
+    assert p0 == NO_PICK;
+    var p3 : u32 = pick(ok, eff, level, index, 3);
+    assert p3 == 0;
+    var p4 : u32 = pick(ok, eff, level, index, 4);
+    assert p4 == 3;
+    var p5 : u32 = pick(ok, eff, level, index, 5);
+    assert p5 == PICK_BAD_INPUT;
+    var p255 : u32 = pick(ok, eff, level, index, 255);
+    assert p255 == PICK_BAD_INPUT;
+    var pmax : u32 = pick(ok, eff, level, index, 4294967295);
+    assert pmax == PICK_BAD_INPUT;
+}
+
+test event_to_decision_a_parked_b_picked {
+    // A (index 0) outranks B but is parked for approval; B (index 1) waits on task P.
+    var eff : [4]u8 = [0, 2, 0, 0];
+    var level : [4]u8 = [0, 0, 0, 0];
+    var index : [4]u32 = [0, 1, 2, 3];
+    var r_a : u8 = unavailable_reason(true, true, 0, 1, 1, true);
+    assert r_a == NS_PARKED;
+    // before the accept: P is done, not verified, so B is blocked and the answer is WAIT
+    var p_before : u8 = ST_DONE;
+    var b0 : u32 = blockers_from(p_before);
+    var r_b0 : u8 = unavailable_reason(true, false, b0, 1, 1, true);
+    assert r_b0 == NS_BLOCKED;
+    var d0 : u32 = decide(EV_REVIEW, 4, 5, false, [r_a, r_b0, 0, 0], eff, level, index, 2);
+    assert d0 == NO_PICK;
+    // EV_REVIEW seq 6 accepts P: the state update sets VERIFIED, B is unblocked and picked
+    var p_after : u8 = p_before | ST_VERIFIED;
+    var b1 : u32 = blockers_from(p_after);
+    var r_b1 : u8 = unavailable_reason(true, false, b1, 1, 1, true);
+    assert r_b1 == NS_OK;
+    var d1 : u32 = decide(EV_REVIEW, 5, 6, false, [r_a, r_b1, 0, 0], eff, level, index, 2);
+    assert d1 == 1;
+}
+
+test event_to_decision_unread_report_same_answer {
+    var eff : [4]u8 = [0, 2, 0, 0];
+    var level : [4]u8 = [0, 0, 0, 0];
+    var index : [4]u32 = [0, 1, 2, 3];
+    var r_a : u8 = unavailable_reason(true, true, 0, 1, 1, true);
+    var b_plain : u32 = blockers_from(ST_DONE | ST_VERIFIED);
+    var b_unread : u32 = blockers_from(ST_DONE | ST_VERIFIED | ST_NOTIFIED);
+    var b_read : u32 = blockers_from(ST_DONE | ST_VERIFIED | ST_NOTIFIED | ST_READ);
+    var r_plain : u8 = unavailable_reason(true, false, b_plain, 1, 1, true);
+    var r_unread : u8 = unavailable_reason(true, false, b_unread, 1, 1, true);
+    var r_read : u8 = unavailable_reason(true, false, b_read, 1, 1, true);
+    var d_plain : u32 = decide(EV_REVIEW, 5, 6, false, [r_a, r_plain, 0, 0], eff, level, index, 2);
+    var d_unread : u32 = decide(EV_REVIEW, 5, 6, false, [r_a, r_unread, 0, 0], eff, level, index, 2);
+    var d_read : u32 = decide(EV_REVIEW, 5, 6, false, [r_a, r_read, 0, 0], eff, level, index, 2);
+    assert d_plain == 1;
+    assert d_unread == d_plain;
+    assert d_read == d_plain;
+}
+
+test event_to_decision_repeat_assigns_once {
+    var eff : [4]u8 = [0, 2, 0, 0];
+    var level : [4]u8 = [0, 0, 0, 0];
+    var index : [4]u32 = [0, 1, 2, 3];
+    var reason : [4]u8 = [NS_PARKED, NS_OK, 0, 0];
+    var holder : u32 = NO_HOLDER;
+    var fence : u64 = 0;
+    var assigned : u32 = 0;
+    // first delivery of seq 6: B is picked and agent 7 claims it at the fence it read
+    var d1 : u32 = decide(EV_REVIEW, 5, 6, false, reason, eff, level, index, 2);
+    assert d1 == 1;
+    var read1 : u64 = fence;
+    if (d1 < MAX_CANDIDATES) {
+        if (claim_lands(holder, 7, false, fence, read1) == true) {
+            holder = 7;
+            fence = fence_after_claim(fence);
+            assigned = assigned + 1;
+        }
+    }
+    // redelivery of seq 6 after it was applied: no decision, so no claim is tried
+    var d2 : u32 = decide(EV_REVIEW, 6, 6, false, reason, eff, level, index, 2);
+    assert d2 == D_STALE;
+    if (d2 < MAX_CANDIDATES) { assigned = assigned + 1; }
+    // a second claimant that still holds the old fence read cannot land either
+    var second : bool = claim_lands(holder, 9, false, fence, read1);
+    assert second == false;
+    assert assigned == 1;
+    assert holder == 7;
+    assert fence == 1;
+}
+
+test event_to_decision_wait_and_other_answers {
+    var eff : [4]u8 = [0, 0, 0, 0];
+    var level : [4]u8 = [0, 0, 0, 0];
+    var index : [4]u32 = [0, 1, 2, 3];
+    var none : [4]u8 = [NS_PARKED, NS_BLOCKED, NS_NO_SLOT, NS_NO_BUDGET];
+    var ok : [4]u8 = [NS_OK, NS_OK, NS_OK, NS_OK];
+    var w : u32 = decide(EV_REVIEW, 5, 6, false, none, eff, level, index, 4);
+    assert w == NO_PICK;
+    var d_idle : u32 = decide(EV_WORKER_IDLE, 5, 6, false, ok, eff, level, index, 4);
+    assert d_idle == 0;
+    var d_end : u32 = decide(EV_TASK_ENDED, 5, 6, false, ok, eff, level, index, 4);
+    assert d_end == D_NO_DISPATCH;
+    var d_beat : u32 = decide(EV_HEARTBEAT, 5, 6, false, ok, eff, level, index, 4);
+    assert d_beat == D_NO_DISPATCH;
+    var d_man : u32 = decide(EV_REVIEW, 5, 6, true, ok, eff, level, index, 4);
+    assert d_man == D_MANUAL;
+    var d_bad : u32 = decide(EV_REVIEW, 5, 6, false, ok, eff, level, index, 5);
+    assert d_bad == PICK_BAD_INPUT;
+    var d_old : u32 = decide(EV_REVIEW, 6, 5, false, ok, eff, level, index, 4);
+    assert d_old == D_STALE;
+}
+
+invariant next_step_constants {
+    assert NS_NONE == 255;
+    assert PICK_BAD_INPUT != NO_PICK;
+    assert PICK_BAD_INPUT >= MAX_CANDIDATES;
+    assert D_STALE < PICK_BAD_INPUT;
+    assert D_NO_DISPATCH < D_STALE;
+    assert D_MANUAL < D_NO_DISPATCH;
+    assert D_MANUAL >= MAX_CANDIDATES;
+}
