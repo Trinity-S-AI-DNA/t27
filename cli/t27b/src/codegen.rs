@@ -175,6 +175,148 @@ struct Gen<'a> {
     /// middle_end.t27 LICM_CONST: constants built once in the prologue (canonical value, sf, register).
     hoist: Vec<(u64, bool, Reg)>,
 }
+
+// ----------------------------------------------------------------------------------------------------------
+// PASS_SSA slice (#14012, middle_end.t27 ssa_inc_facts): the INC-IF fold.
+//   w = w + c;  if (w cmp k) { A } else { B }
+// becomes
+//   vt = w + c;  if (vt cmp k) { A' } else { B'; w = vt }
+// so an arm's `w - c` reads the pre-increment home of w (ordered selects,
+// ifconv_plan.t27 arm_reads_ok_ordered) and the separate `sub w, #c` disappears.
+// ----------------------------------------------------------------------------------------------------------
+fn ssa_local_inc(f: &mut Func) -> bool {
+    let mut ctr = 0u32;
+    ssa_body(&mut f.body, &mut f.vars, &mut ctr)
+}
+
+/// The step statement: `w = w + c` with `w` U64 and `0 < c < 4096`.
+fn ssa_step(s: &Stmt) -> Option<(VarId, i128, ArithOp)> {
+    if let Stmt::Assign { var: w, value } = s {
+        if let ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::AddW), lhs, rhs, .. } = &value.kind {
+            if value.ty == Ty::U64 {
+                if let (ExprKind::Var(x), ExprKind::Const(c)) = (&lhs.kind, &rhs.kind) {
+                    if *x == *w && (1..4096).contains(c) {
+                        return Some((*w, *c, *o));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Does every read of `w` in this arm value sit in the fold shape `w - c`, or is a plain
+/// `Var(w)` (a read of the NEW w)? Anything else (a call argument, a deeper mix) refuses.
+fn ssa_reads_foldable(e: &Expr, w: VarId, c: i128) -> bool {
+    match &e.kind {
+        ExprKind::Const(_) => true,
+        ExprKind::Var(v) if *v == w => true,
+        ExprKind::Arith { op: o @ (ArithOp::Sub | ArithOp::SubW), lhs, rhs, .. } => {
+            if let (ExprKind::Var(v), ExprKind::Const(k)) = (&lhs.kind, &rhs.kind) {
+                if *v == w && *k == c {
+                    return true; // the fold: reads the OLD w
+                }
+            }
+            ssa_reads_foldable(lhs, w, c) && ssa_reads_foldable(rhs, w, c)
+        }
+        ExprKind::Arith { lhs, rhs, .. } | ExprKind::Cmp { lhs, rhs, .. } => ssa_reads_foldable(lhs, w, c) && ssa_reads_foldable(rhs, w, c),
+        ExprKind::And(a, b) | ExprKind::Or(a, b) => ssa_reads_foldable(a, w, c) && ssa_reads_foldable(b, w, c),
+        ExprKind::Not(a) | ExprKind::BitNot(a) => ssa_reads_foldable(a, w, c),
+        ExprKind::Call { args, .. } => args.iter().all(|a| !ssa_mentions(a, w)),
+        _ => !ssa_mentions(e, w),
+    }
+}
+
+fn ssa_mentions(e: &Expr, w: VarId) -> bool {
+    match &e.kind {
+        ExprKind::Const(_) => false,
+        ExprKind::Var(v) => *v == w,
+        ExprKind::Arith { lhs, rhs, .. } | ExprKind::Cmp { lhs, rhs, .. } => ssa_mentions(lhs, w) || ssa_mentions(rhs, w),
+        ExprKind::And(a, b) | ExprKind::Or(a, b) => ssa_mentions(a, w) || ssa_mentions(b, w),
+        ExprKind::Not(a) | ExprKind::BitNot(a) => ssa_mentions(a, w),
+        ExprKind::Call { args, .. } => args.iter().any(|a| ssa_mentions(a, w)),
+        _ => false,
+    }
+}
+
+/// Rewrite one arm value: the fold node `w - c` becomes a plain read of `w` (the old value, taken before
+/// w's own select emits); every other read of the NEW w becomes a read of the temp `vt`.
+fn ssa_rw(e: &Expr, w: VarId, c: i128, vt: VarId) -> Expr {
+    let k = match &e.kind {
+        ExprKind::Arith { op: o @ (ArithOp::Sub | ArithOp::SubW), lhs, rhs, site } => {
+            if let (ExprKind::Var(v), ExprKind::Const(k)) = (&lhs.kind, &rhs.kind) {
+                if *v == w && *k == c {
+                    return Expr { ty: e.ty, kind: ExprKind::Var(w) };
+                }
+            }
+            ExprKind::Arith { op: *o, lhs: Box::new(ssa_rw(lhs, w, c, vt)), rhs: Box::new(ssa_rw(rhs, w, c, vt)), site: *site }
+        }
+        ExprKind::Arith { op, lhs, rhs, site } => ExprKind::Arith { op: *op, lhs: Box::new(ssa_rw(lhs, w, c, vt)), rhs: Box::new(ssa_rw(rhs, w, c, vt)), site: *site },
+        ExprKind::Cmp { op, lhs, rhs } => ExprKind::Cmp { op: *op, lhs: Box::new(ssa_rw(lhs, w, c, vt)), rhs: Box::new(ssa_rw(rhs, w, c, vt)) },
+        ExprKind::And(a, b) => ExprKind::And(Box::new(ssa_rw(a, w, c, vt)), Box::new(ssa_rw(b, w, c, vt))),
+        ExprKind::Or(a, b) => ExprKind::Or(Box::new(ssa_rw(a, w, c, vt)), Box::new(ssa_rw(b, w, c, vt))),
+        ExprKind::Not(a) => ExprKind::Not(Box::new(ssa_rw(a, w, c, vt))),
+        ExprKind::BitNot(a) => ExprKind::BitNot(Box::new(ssa_rw(a, w, c, vt))),
+        ExprKind::Var(v) if *v == w => ExprKind::Var(vt),
+        _ => return e.clone(),
+    };
+    Expr { ty: e.ty, kind: k }
+}
+
+fn ssa_body(ss: &mut [Stmt], vars: &mut Vec<Var>, ctr: &mut u32) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < ss.len() {
+        let Some((w, c, op)) = ssa_step(&ss[i]) else { i += 1; continue };
+        let (stmt_i, if_s) = ss.split_at_mut(i + 1);
+        let Stmt::If { cond, then, els } = &mut if_s[0] else { i += 1; continue };
+        // the if must compare w against a constant (after the rewrite: against vt)
+        let Expr { ty: Ty::Bool, kind: ExprKind::Cmp { lhs, .. } } = cond else { i += 1; continue };
+        if !matches!(&lhs.kind, ExprKind::Var(g) if *g == w) { i += 1; continue; }
+        let ok = |b: &Vec<Stmt>| b.iter().all(|s| matches!(s, Stmt::Assign { .. }));
+        if !ok(then) || !ok(els) { i += 1; continue; }
+        let wt = then.iter().any(|s| matches!(s, Stmt::Assign { var, .. } if *var == w));
+        let we = els.iter().any(|s| matches!(s, Stmt::Assign { var, .. } if *var == w));
+        if wt == we { i += 1; continue; } // exactly one branch defines w
+        let f_then = then.iter().all(|s| if let Stmt::Assign { value, .. } = s { ssa_reads_foldable(value, w, c) } else { false });
+        let f_els = els.iter().all(|s| if let Stmt::Assign { value, .. } = s { ssa_reads_foldable(value, w, c) } else { false });
+        if !f_then || !f_els { i += 1; continue; }
+        if vars.len() + 1 > VarId::MAX as usize { i += 1; continue; }
+        let vt = vars.len() as VarId;
+        vars.push(Var { name: format!("__t27b_ssa{}", ctr), ty: Ty::U64 });
+        *ctr += 1;
+        // step becomes vt = w + c (same op: a checked add keeps its trap site)
+        if let Stmt::Assign { var, .. } = &mut stmt_i[i] { *var = vt; }
+        // the if now compares vt
+        if let ExprKind::Cmp { lhs, .. } = &mut cond.kind {
+            if let ExprKind::Var(g) = &mut lhs.kind { *g = vt; }
+        }
+        // rewrite arms; the branch that never defined w gains `w = vt`, so w is defined on both paths
+        for b in [&mut *then, &mut *els] {
+            let defines_w = b.iter().any(|s| matches!(s, Stmt::Assign { var, .. } if *var == w));
+            for s in b.iter_mut() {
+                if let Stmt::Assign { value, .. } = s { *value = ssa_rw(value, w, c, vt); }
+            }
+            if !defines_w {
+                b.push(Stmt::Assign { var: w, value: Expr { ty: Ty::U64, kind: ExprKind::Var(vt) } });
+            }
+        }
+        changed = true;
+        i += 2;
+    }
+    for s in ss.iter_mut() {
+        if let Stmt::While { body, step, .. } = s {
+            changed |= ssa_body(body, vars, ctr);
+            changed |= ssa_body(step, vars, ctr);
+        }
+        if let Stmt::If { then, els, .. } = s {
+            changed |= ssa_body(then, vars, ctr);
+            changed |= ssa_body(els, vars, ctr);
+        }
+    }
+    changed
+}
+
 /// Compile every function of `prog` (tests too when `with_tests`).
 pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec<FuncCode>, CodegenError> {
     let mut out = Vec::with_capacity(prog.funcs.len());
@@ -187,7 +329,9 @@ pub fn compile(prog: &Program, style: TrapStyle, with_tests: bool) -> Result<Vec
     Ok(out)
 }
 pub fn compile_func(prog: &Program, id: FuncId, style: TrapStyle) -> Result<FuncCode, CodegenError> {
-    let f = &prog.funcs[id as usize];
+    let mut fown = prog.funcs[id as usize].clone();
+    ssa_local_inc(&mut fown); // #14012: the INC-IF fold, before homes are planned
+    let f = &fown;
     let mut g = Gen {
         prog,
         f,
@@ -1389,7 +1533,7 @@ impl<'a> Gen<'a> {
         let mut vars: Vec<VarId> = t.iter().chain(&e).map(|a| a.0).collect();
         vars.sort(); vars.dedup();
         if vars.len() > 2 || [&t, &e].iter().any(|a| a.iter().enumerate().any(|(i, x)| a[..i].iter().any(|y| y.0 == x.0))) { return false; }
-        let (mut regs, mut srcs) = (vec![], vec![]); for &v in &vars {
+        let (mut regs, mut srcs, mut sel_reads) = (vec![], vec![], vec![]); for vi in 0..vars.len() { let v = vars[vi]; // #14012: vi tracks the reader for ordered emission
             let Home::Reg(h) = self.homes[v as usize] else { return false };
             let mut side = [(0, 0, h); 2];
             for (n, a) in [&t, &e].iter().enumerate() {
@@ -1401,7 +1545,7 @@ impl<'a> Gen<'a> {
                     Some((y, _)) if y.ty != Ty::U64 => { return false },
                     Some((_, ExprKind::Const(0))) => (ifc::AK_CONST, 0, ZR),
                     Some((y, ExprKind::Const(k))) if *k > 0 => { let hc = a64::canon(*k as u64, true); let hr = self.hoist.iter().find(|h| h.0 == hc && h.1).map(|h| h.2); let r = hr.unwrap_or(X17); srcs.push((r, y)); (ifc::AK_CONST, *k as u64, r) } // #14012: prefer a hoisted reg, X17 rebuild only as fallback
-                    Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => { return false } },
+                    Some((y, ExprKind::Var(w))) => { let sel = vars.contains(w); if sel { sel_reads.push((vi, *w)); } match reg(y) { Some(r) if ifc::arm_reads_ok_ordered(ifc::AK_VAR, false, sel, true) => (ifc::AK_VAR, 0, r), _ => { return false } } } // #14012: only when this select emits before the read local's
                     Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::AddW | ArithOp::Sub | ArithOp::SubW), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
                         (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub | ArithOp::SubW) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
                         _ => { return false } },
@@ -1409,10 +1553,22 @@ impl<'a> Gen<'a> {
             }
             if !ifc::may_if_convert(ifc::guard_of_cmp(*op as u8), *c as u64, side[0].0, side[0].1, side[1].0, side[1].1, vars.len() as u32, srcs.iter().filter(|s| s.0 == X16).count() as u32, true, true) { return false; } regs.push((h, side[0].2, side[1].2));
         }
+        // #14012 ordered emission: a select that another arm READS emits first, so the reader lands on the
+        // pre-select home (ifconv_plan.t27 select_may_emit). At most one read edge exists (<= 2 vars, no
+        // self-reads here); a mutual pair never frees either side and must bail.
+        let order: Vec<usize> = if sel_reads.is_empty() { (0..vars.len()).collect() } else {
+            if sel_reads.len() != 1 { return false; }
+            let (ri, target) = sel_reads[0];
+            let Some(ti) = vars.iter().position(|&x| x == target) else { return false };
+            if ti == ri || !ifc::select_may_emit(0) { return false; }
+            let mut o: Vec<usize> = (0..vars.len()).filter(|&x| x != ti).collect(); // the reader first
+            o.push(ti); // the read local emits last, after every reader
+            o
+        };
         srcs.sort_by_key(|s| s.0);
         if srcs.windows(2).any(|w| w[0].0 == w[1].0) { return false; }
         for (r, y) in srcs { self.eval_into(y, r); } let cc = self.compare(*op, lhs, rhs);
-        for (h, tr, er) in regs { self.emit(a64::csel(true, h, tr, er, cc)); }
+        for vi in order { let (h, tr, er) = regs[vi]; self.emit(a64::csel(true, h, tr, er, cc)); }
         true
     }
 
