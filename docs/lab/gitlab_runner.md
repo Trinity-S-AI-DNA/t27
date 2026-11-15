@@ -1,8 +1,9 @@
 # GitLab runner on the lab VPS
 
 Status: installed 2026-11-15 after the owner approval recorded as a comment on
-issue #13979. `gitlab-runner verify` reported the runner valid. No job has been
-run yet; the first real pipeline run is still open.
+issue #13979. `gitlab-runner verify` reported the runner valid. A trial
+pipeline ran on 2026-11-15 13:31 UTC and its job succeeded (see "Trial
+pipeline" below). The trial project is empty, so a large clone is not proven.
 
 ## Step 1: precondition
 
@@ -55,8 +56,26 @@ variable: `token` in `config.toml`.
 
 - `docker exec gitlab-runner gitlab-runner verify` must say "is valid".
 - `docker stats --no-stream gitlab-runner` must show usage under 256 MiB.
-  Measured: 89 MiB.
+  Measured: 89 MiB at install; 92 MiB after the trial job.
 - Every other container on the host must still be up.
+
+## Trial pipeline
+
+Result of the trial run on 2026-11-15:
+
+- time: 13:31 UTC
+- job `trial` ran on runner `vps-docker-1g` and succeeded in 4 s
+- the clone over `http://gitlab:8929` (container network) worked
+- inside the job, `cat /sys/fs/cgroup/memory.max` printed `805306368`
+  (768 MiB), so the job container limit is in force
+- after the job, the runner container used 92 MiB of its 256 MiB limit
+- the host had 3793 MB available
+
+How to repeat it: create a project in GitLab with a one-job CI config
+(`.gitlab-ci.yml`) whose `trial` job runs the script `echo runner-ok` and
+then `cat /sys/fs/cgroup/memory.max`. Push the file, then check that the job
+passes on the `vps-docker-1g` runner and that the printed limit is
+805306368.
 
 ## Do not touch
 
@@ -73,6 +92,7 @@ GitLab stays unchanged throughout.
 
 ## Open items
 
-- The first real pipeline run has not been done.
+- The trial project is empty, so a large clone is not proven.
+- No job that reaches the 768 MiB limit is still to be run.
 - The GitLab container uses about 2.5 GiB of its 3.4 GiB limit. Re-measure
   memory before raising any runner or job limit.
