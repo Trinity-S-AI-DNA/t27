@@ -17,6 +17,7 @@
 use crate::a64::{self, Cond, Ext, LogOp, Reg, Shift, SP, ZR};
 use crate::ir::*;
 use crate::lower::me;
+use crate::lower::pass_event;
 use std::collections::HashMap;
 
 // t27b-generated inline decision source of truth: specs/tri/t27b/inline.t27.
@@ -293,7 +294,8 @@ impl<'a> Gen<'a> {
             caller_size: self.code.len() as u32,
             result_used: true,
         };
-        if !(inline_decision::should_inline_call(cf, sf) && inline_decision::select_shape_ok(true, l.0, l.1, r.0, r.1, f.nparams as u32, f.vars[..f.nparams].iter().all(|v| w64(Some(v.ty))), w64(f.ret), w64(Some(lhs.ty)))) { return None; }
+        if !(inline_decision::should_inline_call(cf, sf) && inline_decision::select_shape_ok(true, l.0, l.1, r.0, r.1, f.nparams as u32, f.vars[..f.nparams].iter().all(|v| w64(Some(v.ty))), w64(f.ret), w64(Some(lhs.ty)))) { pass_event("inline_verdict_fn", false, "should_inline_call or select_shape_ok false"); return None; }
+        pass_event("inline_verdict_fn", true, "select-shaped callee inlined");
         let vals: Vec<V> = args.iter().map(|x| self.eval(x)).collect();
         let (mut x, mut y, mut op2) = (if l.0 == inline_decision::SK_PARAM { vals[l.1 as usize] } else { V::Const(l.1 as i128) }, if r.0 == inline_decision::SK_PARAM { vals[r.1 as usize] } else { V::Const(r.1 as i128) }, *op);
         if matches!(x, V::Const(_)) && !matches!(y, V::Const(_)) { (x, y, op2) = (y, x, op2.swap()); }
@@ -419,13 +421,14 @@ impl<'a> Gen<'a> {
         loop_limits(&f.body, &mut lim);
         let framed = frame_layout::needs_frame(frame_layout::FrameFacts { has_call, saves_callee: taken_callee > 0, has_var_slots: slots > 0, has_temp_slots: false, has_agg: self.agg_bytes > 0, uses_lr: false, has_stack_params: self.stack_params });
         for (c, sf) in lim {
+            if a64::canon(c as u64, sf) == 0 { continue; } // ZR is free; a hoisted 0 wastes a bound slot (#14012)
             let (v, mut words) = (a64::canon(c as u64, sf), Vec::new());
             a64::mov_imm(sf, X16, v, &mut words);
             if self.hoist.iter().any(|h| (h.0, h.1) == (v, sf)) { continue; }
-            match me::licm_hoist_const(words.len() as u32, !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64), home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64), framed, self.hoist.len() as u32) {
-                me::LICM_CALLER => { self.hoist.push((v, sf, (nint + taken_caller) as Reg)); taken_caller += 1; }
-                me::LICM_CALLEE => { let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.hoist.push((v, sf, r)); }
-                _ => {}
+            match me::licm_loop_imm(words.len() as u32, !has_call && home_plan::caller_pool_has(nint as u64, taken_caller as u64), home_plan::callee_pool_has(frame_layout::HOME_COUNT as u64, taken_callee as u64), framed, self.hoist.len() as u32, true) { // #14012: lim consts live in loop bodies, rebuilt per iteration
+                me::LICM_CALLER => { pass_event("licm_body_const", true, "loop const hoisted to caller-saved reg"); self.hoist.push((v, sf, (nint + taken_caller) as Reg)); taken_caller += 1; }
+                me::LICM_CALLEE => { pass_event("licm_body_const", true, "loop const hoisted to callee-saved reg"); let r = frame_layout::home_reg(taken_callee as u32) as Reg; taken_callee += 1; self.used_callee.push(r); self.hoist.push((v, sf, r)); }
+                _ => pass_event("licm_body_const", false, "LICM_NONE (needs >= 1 insn in loop, no free reg, or bound)"),
             }
         }
         self.temp_base = frame_layout::temp_base_of(slots, self.used_callee.len() as u32);
@@ -729,7 +732,7 @@ impl<'a> Gen<'a> {
                     self.release(v);
                 }
             },
-            Stmt::If { cond, then, els } if self.ifconv(cond, then, els) => {}
+            Stmt::If { cond, then, els } if { let ic = self.ifconv(cond, then, els); pass_event("ifconv", ic, if ic { "if converted to csel" } else { "shape mismatch (var/const/reg/srcs guard)" }); ic } => {}
             Stmt::If { cond, then, els } => {
                 let l_else = self.new_label();
                 self.branch(cond, l_else, false);
@@ -955,7 +958,7 @@ impl<'a> Gen<'a> {
 
     fn eval_into(&mut self, e: &Expr, r: Reg) {
         match &e.kind {
-            ExprKind::Const(c) => self.mov_imm(e.ty.is64(), r, a64::canon(*c as u64, e.ty.is64())),
+            ExprKind::Const(c) => { let hc = a64::canon(*c as u64, e.ty.is64()); if self.hoist.iter().any(|h| h.0 == hc && h.1 == e.ty.is64() && h.2 == r) { return; } self.mov_imm(e.ty.is64(), r, hc); } // #14012: already lives in a hoisted reg since the prologue
             ExprKind::Var(v) => match self.homes[*v as usize] {
                 Home::Reg(h) => {
                     if h != r {
@@ -1399,7 +1402,7 @@ impl<'a> Gen<'a> {
                     None => (ifc::AK_NONE, 0, h),
                     Some((y, _)) if y.ty != Ty::U64 => { return false },
                     Some((_, ExprKind::Const(0))) => (ifc::AK_CONST, 0, ZR),
-                    Some((y, ExprKind::Const(k))) if *k > 0 => { srcs.push((X17, y)); (ifc::AK_CONST, *k as u64, X17) }
+                    Some((y, ExprKind::Const(k))) if *k > 0 => { let hc = a64::canon(*k as u64, true); let hr = self.hoist.iter().find(|h| h.0 == hc && h.1).map(|h| h.2); let r = hr.unwrap_or(X17); srcs.push((r, y)); (ifc::AK_CONST, *k as u64, r) } // #14012: prefer a hoisted reg, X17 rebuild only as fallback
                     Some((y, ExprKind::Var(w))) => match reg(y) { Some(r) if ifc::arm_reads_ok(ifc::AK_VAR, false, vars.contains(w)) => (ifc::AK_VAR, 0, r), _ => { return false } },
                     Some((y, ExprKind::Arith { op: o @ (ArithOp::Add | ArithOp::AddW | ArithOp::Sub | ArithOp::SubW), lhs: l, rhs: r, .. })) => match (reg(l), &r.kind) {
                         (Some(_), ExprKind::Const(k)) if (0..4096).contains(k) && ifc::arm_reads_ok(ifc::AK_SUB_IMM, matches!(&l.kind, ExprKind::Var(w) if w == g), false) => { srcs.push((X16, y)); (if matches!(o, ArithOp::Sub | ArithOp::SubW) { ifc::AK_SUB_IMM } else { ifc::AK_ADD_IMM }, *k as u64, X16) }
@@ -1828,6 +1831,7 @@ impl<'a> Gen<'a> {
                             if (last & 0xFFFF_0FE0) == 0x9A9F_07E0 && (last & 31) == ry as u32 {
                                 let (si, csf) = ((last >> 12) & 0xf, (last >> 31) != 0);
                                 if cp::cinc_ok(s, true, true, true, csf, true) {
+                                    pass_event("cinc", true, "cset+add folded to csinc");
                                     let ol = self.code.len();
                                     self.code.pop();
                                     for xl in self.labels.iter_mut() {
