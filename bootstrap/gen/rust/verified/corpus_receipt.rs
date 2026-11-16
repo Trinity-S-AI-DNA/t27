@@ -535,13 +535,9 @@ pub fn lab_count(role: u8, next: u8, count: u32) -> u32 {
 
 pub const AUTH_BAD_SIGNATURE: u8 = 3;
 
-pub const AUTH_KEY_NOT_REGISTERED: u8 = 2;
-
 pub const AUTH_MISSING_NONE: u8 = 0;
 
 pub const AUTH_NONCE_NOT_CHALLENGE: u8 = 5;
-
-pub const AUTH_NO_NONCE: u8 = 4;
 
 pub const AUTH_UNSIGNED: u8 = 1;
 
@@ -551,40 +547,9 @@ pub const DEVICE_ROOTED_LEVELS: u8 = 0;
 
 pub const HEX_NOT_A_DIGIT: u32 = 16;
 
-pub const KEY_DIR: &'static str = ".trinity/keys";
-
-pub const LEVEL_AUTHOR: u8 = 1;
-
-pub const LEVEL_FRESH: u8 = 2;
-
-pub const LEVEL_NONE: u8 = 0;
-
 pub const LINE_END: u32 = 256;
 
-pub const NONCE_MIN_BYTES: u8 = 16;
-
 pub const RECEIPT_DOMAIN: &'static str = "t27-receipt-v1";
-
-pub fn auth_first_missing(signed: bool, key_registered: bool, signature_valid: bool, challenge_given: bool, nonce_bytes: u8, nonce_is_challenge: bool) -> u8 {
-    if (signed == false) {
-        return AUTH_UNSIGNED;
-    }
-    if (key_registered == false) {
-        return AUTH_KEY_NOT_REGISTERED;
-    }
-    if (signature_valid == false) {
-        return AUTH_BAD_SIGNATURE;
-    }
-    if challenge_given {
-        if (nonce_long_enough(nonce_bytes) == false) {
-            return AUTH_NO_NONCE;
-        }
-        if (nonce_is_challenge == false) {
-            return AUTH_NONCE_NOT_CHALLENGE;
-        }
-    }
-    return AUTH_MISSING_NONE;
-}
 
 pub fn domain_line_char(k: u32) -> u32 {
     if (k < (RECEIPT_DOMAIN.len() as u32)) {
@@ -624,29 +589,5 @@ pub fn hex_digit_value(c: u32) -> u32 {
         }
     }
     return HEX_NOT_A_DIGIT;
-}
-
-pub fn nonce_long_enough(nonce_bytes: u8) -> bool {
-    return (nonce_bytes >= NONCE_MIN_BYTES);
-}
-
-pub fn receipt_level(signed: bool, key_registered: bool, signature_valid: bool, challenge_given: bool, nonce_bytes: u8, nonce_is_challenge: bool) -> u8 {
-    let mut code: u8 = auth_first_missing(signed, key_registered, signature_valid, challenge_given, nonce_bytes, nonce_is_challenge);
-    if (code == AUTH_UNSIGNED) {
-        return LEVEL_NONE;
-    }
-    if (code == AUTH_KEY_NOT_REGISTERED) {
-        return LEVEL_NONE;
-    }
-    if (code == AUTH_BAD_SIGNATURE) {
-        return LEVEL_NONE;
-    }
-    if (challenge_given == false) {
-        return LEVEL_AUTHOR;
-    }
-    if (code == AUTH_MISSING_NONE) {
-        return LEVEL_FRESH;
-    }
-    return LEVEL_AUTHOR;
 }
 

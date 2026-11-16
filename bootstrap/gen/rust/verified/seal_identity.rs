@@ -204,5 +204,3 @@ pub fn reuse_decision(spec: u8, closure: u8, toolchain: u8, config: u8, verdict_
     return REUSE;
 }
 
-pub const PASS: u8 = 0;
-

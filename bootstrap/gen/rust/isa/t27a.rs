@@ -1077,8 +1077,6 @@ pub const SRC1_SHIFT: u32 = 13;
 
 pub const SRC2_SHIFT: u32 = 18;
 
-pub const T27A_CONSUMER: &'static str = "gHashTag/trinity src/tri27/emu/decoder.zig since 180b29ef (trinity#1437) decodes and encodes through t27a_src1, t27a_src2, t27a_imm, t27a_imm_form and t27a_encode, vendored as src/tri27/emu/tri27_encoding.zig";
-
 pub const V3_SHIFT: u32 = 23;
 
 pub fn bundle3_word(dst: u32, src1: u32, src2: u32, v3: u32) -> u32 {

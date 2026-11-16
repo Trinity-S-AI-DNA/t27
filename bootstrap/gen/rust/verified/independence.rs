@@ -120,13 +120,6 @@ pub fn distinct_dies3(a: u64, b: u64, c: u64) -> u8 {
     return n;
 }
 
-pub fn run_die_level_with(run_level: u8, next_receipt_level: u8) -> u8 {
-    if (next_receipt_level < run_level) {
-        return next_receipt_level;
-    }
-    return run_level;
-}
-
 pub const RUN_MISSING_NONE: u8 = 0;
 
 pub const RUN_PRODUCER_MISMATCH: u8 = 4;
@@ -164,11 +157,4 @@ pub const LEVEL_AUTHOR: u8 = 1;
 pub const LEVEL_FRESH: u8 = 2;
 
 pub const LEVEL_NONE: u8 = 0;
-
-pub fn run_level_with(run_level: u8, next_receipt_level: u8) -> u8 {
-    if (next_receipt_level < run_level) {
-        return next_receipt_level;
-    }
-    return run_level;
-}
 

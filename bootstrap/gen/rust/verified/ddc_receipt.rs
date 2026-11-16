@@ -293,18 +293,6 @@ pub const DDC_CANNOT_RUN: u8 = 0;
 
 pub const DDC_MISCOMPILE: u8 = 1;
 
-pub const EV_AGREES: u8 = 2;
-
-pub const EV_NONE: u8 = 0;
-
-pub const EV_RUN_ONLY: u8 = 1;
-
-pub const NODE_T27A: u32 = 1;
-
-pub const NODE_T27B: u32 = 2;
-
-pub const NODE_THEORY: u32 = 5;
-
 pub const PAIR_JIT_INTERP: u8 = 0;
 
 pub const PAIR_T27B_CORE_FRONT: u8 = 2;
@@ -351,8 +339,6 @@ pub const ST_TYPECHECK: u32 = 2;
 
 pub const ST_ZIG: u32 = 64;
 
-pub const V_PASS: u8 = 0;
-
 pub fn compile_with(bin: u32, src: u32) -> u32 {
     if (src == SRC_LOGIN) {
         if (bin == BIN_TROJAN) {
@@ -380,19 +366,6 @@ pub fn ddc_verdict(built: u32, equal: u32, front_shared: bool) -> u8 {
         return DDC_AGREE_BACK_ENDS;
     }
     return DDC_AGREE_INDEPENDENT;
-}
-
-pub fn evidence(reference: u8, native: u8, asserts: u32) -> u8 {
-    if (native != V_PASS) {
-        return EV_NONE;
-    }
-    if (asserts == 0) {
-        return EV_NONE;
-    }
-    if (reference != V_PASS) {
-        return EV_RUN_ONLY;
-    }
-    return EV_AGREES;
 }
 
 pub fn path_a(pair: u8) -> u32 {
@@ -430,22 +403,6 @@ pub fn stage2(trusted: u32) -> u32 {
     return compile_with(stage1, SRC_COMPILER);
 }
 
-pub fn uses(node: u32, back_edge: bool) -> u32 {
-    if (node == NODE_T27A) {
-        if back_edge {
-            return (1 | 4);
-        }
-        return 1;
-    }
-    if (node == NODE_T27B) {
-        return (2 | 8);
-    }
-    if (node == NODE_THEORY) {
-        return 16;
-    }
-    return 0;
-}
-
 pub const HARDWARE_ROOTED: bool = false;
 
 pub fn text_is(a: &'static str, b: &'static str) -> bool {
@@ -464,13 +421,9 @@ pub fn text_is(a: &'static str, b: &'static str) -> bool {
 
 pub const AUTH_BAD_SIGNATURE: u8 = 3;
 
-pub const AUTH_KEY_NOT_REGISTERED: u8 = 2;
-
 pub const AUTH_MISSING_NONE: u8 = 0;
 
 pub const AUTH_NONCE_NOT_CHALLENGE: u8 = 5;
-
-pub const AUTH_NO_NONCE: u8 = 4;
 
 pub const AUTH_UNSIGNED: u8 = 1;
 
@@ -480,38 +433,9 @@ pub const DEVICE_ROOTED_LEVELS: u8 = 0;
 
 pub const HEX_NOT_A_DIGIT: u32 = 16;
 
-pub const LEVEL_AUTHOR: u8 = 1;
-
-pub const LEVEL_FRESH: u8 = 2;
-
-pub const LEVEL_NONE: u8 = 0;
-
 pub const LINE_END: u32 = 256;
 
-pub const NONCE_MIN_BYTES: u8 = 16;
-
 pub const RECEIPT_DOMAIN: &'static str = "t27-receipt-v1";
-
-pub fn auth_first_missing(signed: bool, key_registered: bool, signature_valid: bool, challenge_given: bool, nonce_bytes: u8, nonce_is_challenge: bool) -> u8 {
-    if (signed == false) {
-        return AUTH_UNSIGNED;
-    }
-    if (key_registered == false) {
-        return AUTH_KEY_NOT_REGISTERED;
-    }
-    if (signature_valid == false) {
-        return AUTH_BAD_SIGNATURE;
-    }
-    if challenge_given {
-        if (nonce_long_enough(nonce_bytes) == false) {
-            return AUTH_NO_NONCE;
-        }
-        if (nonce_is_challenge == false) {
-            return AUTH_NONCE_NOT_CHALLENGE;
-        }
-    }
-    return AUTH_MISSING_NONE;
-}
 
 pub fn domain_line_char(k: u32) -> u32 {
     if (k < (RECEIPT_DOMAIN.len() as u32)) {
@@ -551,29 +475,5 @@ pub fn hex_digit_value(c: u32) -> u32 {
         }
     }
     return HEX_NOT_A_DIGIT;
-}
-
-pub fn nonce_long_enough(nonce_bytes: u8) -> bool {
-    return (nonce_bytes >= NONCE_MIN_BYTES);
-}
-
-pub fn receipt_level(signed: bool, key_registered: bool, signature_valid: bool, challenge_given: bool, nonce_bytes: u8, nonce_is_challenge: bool) -> u8 {
-    let mut code: u8 = auth_first_missing(signed, key_registered, signature_valid, challenge_given, nonce_bytes, nonce_is_challenge);
-    if (code == AUTH_UNSIGNED) {
-        return LEVEL_NONE;
-    }
-    if (code == AUTH_KEY_NOT_REGISTERED) {
-        return LEVEL_NONE;
-    }
-    if (code == AUTH_BAD_SIGNATURE) {
-        return LEVEL_NONE;
-    }
-    if (challenge_given == false) {
-        return LEVEL_AUTHOR;
-    }
-    if (code == AUTH_MISSING_NONE) {
-        return LEVEL_FRESH;
-    }
-    return LEVEL_AUTHOR;
 }
 
