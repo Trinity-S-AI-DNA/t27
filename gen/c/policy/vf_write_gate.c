@@ -21,12 +21,16 @@
 #define ROLE_AGENT "agent"
 #define ROLE_ENGINE "engine"
 #define ROLE_OWNER "owner"
+#define ROLE_LANDING "landing"
+static const const char* GATE_BOOTSTRAP[2] = { "specs/policy/vf_write_gate.t27", "specs/t27f/vf_guard.t27" };
+#define GATE_BOOTSTRAP_COUNT 2
+static const size_t GATE_BOOTSTRAP_LENS[2] = { 30, 23 };
 #define GD_LAYERS 8
 static const const char* GD_LAYER_NAMES[8] = { "graph", "meaning", "layout", "theme", "render", "other", "contract", "check" };
 static const const char* GD_PATHS[51] = { "specs/t27f/visual_factory_contract.t27", "specs/t27f/vf_guard.t27", "specs/t27f/vf_ring1.t27", "specs/t27f/stories/task_card.t27", "specs/t27f/ui_kit.t27", "specs/t27f/vf_meaning.t27", "specs/t27f/vf_snapshot.t27", "specs/t27f/vf_layout.t27", "specs/t27f/vf_extent.t27", "specs/t27f/vf_theme.t27", "specs/t27f/outfit_r_data.t27", "specs/t27f/outfit_b_data.t27", "specs/t27f/outfit_atlas.t27", "specs/t27f/vf_brand.t27", "specs/t27f/vf_pixel.t27", "specs/t27f/vf_render.t27", "specs/t27f/vf_scale.t27", "specs/t27f/vf_type.t27", "specs/t27f/vf_card.t27", "specs/t27f/vf_diff.t27", "specs/t27f/vf_storybook.t27", "specs/t27os/vf_frame_main.t27", "specs/t27os/vf_type_main.t27", "specs/uikit/avatar.t27", "specs/uikit/badge.t27", "specs/uikit/bracket_frame.t27", "specs/uikit/button.t27", "specs/uikit/card.t27", "specs/uikit/catalog.t27", "specs/uikit/container.t27", "specs/uikit/control_center.t27", "specs/uikit/control_center_view.t27", "specs/uikit/design_tokens.t27", "specs/uikit/god_mode_toggle.t27", "specs/uikit/header_button.t27", "specs/uikit/hero_card.t27", "specs/uikit/input_model.t27", "specs/uikit/lamp.t27", "specs/uikit/light_dot.t27", "specs/uikit/native_tokens.t27", "specs/uikit/netlist_renderer.t27", "specs/uikit/object_registry.t27", "specs/uikit/plate.t27", "specs/uikit/stories.t27", "specs/uikit/stories_badge.t27", "specs/uikit/stories_bracket_frame.t27", "specs/uikit/stories_netlist.t27", "specs/uikit/stories_plate.t27", "specs/uikit/text.t27", "specs/uikit/theme_pill.t27", "specs/policy/vf_write_gate.t27" };
 #define GD_PATH_COUNT 51
 static const uint32_t GD_PATH_LAYER[51] = { 6, 7, 7, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 7, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 7 };
-static const size_t GD_PATH_LENS[51] = { 38, 23, 23, 32, 21, 25, 26, 24, 24, 23, 28, 28, 27, 23, 23, 24, 23, 22, 22, 22, 27, 29, 28, 22, 21, 29, 22, 20, 23, 25, 30, 35, 29, 31, 29, 25, 27, 20, 25, 29, 32, 31, 21, 23, 29, 37, 31, 29, 20, 26, 32 };
+static const size_t GD_PATH_LENS[51] = { 38, 23, 23, 32, 21, 25, 26, 24, 24, 23, 28, 28, 27, 23, 23, 24, 23, 22, 22, 22, 27, 29, 28, 22, 21, 29, 22, 20, 23, 25, 30, 35, 29, 31, 29, 25, 27, 20, 25, 29, 32, 31, 21, 23, 29, 37, 31, 29, 20, 26, 30 };
 #define GD_ROLES 3
 #define GL_CHECK 7
 #define GL_CONTRACT 6
@@ -46,6 +50,9 @@ bool ends_t27(uint8_t* buf, size_t from, size_t to);
 bool line_is_role(uint8_t* buf, size_t from, size_t to, const char* name, size_t nlen);
 uint32_t parse_role(uint8_t* buf, size_t n, size_t sp);
 bool kind_checked(uint8_t c);
+bool header_has_landing(uint8_t* buf, size_t n, size_t sp);
+uint32_t min_role_for_diff(uint8_t* buf, size_t n, size_t sp);
+uint32_t effective_role(uint8_t* buf, size_t n, size_t sp);
 uint32_t check_vf_writes(uint8_t* buf, size_t n, uint8_t* out, size_t cap);
 size_t put_str(uint8_t* dst, size_t cap, size_t w, const char* s, size_t s_len);
 size_t put(uint8_t* out, size_t w, size_t cap, uint8_t c);
@@ -56,6 +63,7 @@ bool gd_bytes_eq_len(uint8_t* path, size_t from, size_t to, const char* cand, si
 const char* gd_layer_name(uint32_t layer);
 uint32_t gd_layer_of_bytes(uint8_t* path, size_t from, size_t to);
 bool gd_may_write_bytes(uint8_t* path, size_t from, size_t to, uint32_t role);
+bool is_gate_bootstrap_bytes(uint8_t* path, size_t from, size_t to);
 
 /* -------------------------------------------------------
    Function implementations
@@ -132,11 +140,92 @@ bool kind_checked(uint8_t c) {
     return false;
 }
 
+bool header_has_landing(uint8_t* buf, size_t n, size_t sp) {
+    size_t s = 0;
+    while ((s < sp)) {
+        size_t e = s;
+        while (((e < n) && (buf[e] != '\n'))) {
+            e = (e + 1);
+        }
+        size_t t = e;
+        if (((t > s) && (buf[(t - 1)] == '\r'))) {
+            t = (t - 1);
+        }
+        if (((t > s) && line_is_role(buf, s, t, ROLE_LANDING, 7))) {
+            return true;
+        }
+        s = (e + 1);
+    }
+    return false;
+}
+
+uint32_t min_role_for_diff(uint8_t* buf, size_t n, size_t sp) {
+    bool need_engine = false;
+    size_t s = sp;
+    while (((s < n) && (buf[s] != '\n'))) {
+        s = (s + 1);
+    }
+    if ((s < n)) {
+        s = (s + 1);
+    }
+    while ((s < n)) {
+        size_t e = s;
+        while (((e < n) && (buf[e] != '\n'))) {
+            e = (e + 1);
+        }
+        size_t t = e;
+        if (((t > s) && (buf[(t - 1)] == '\r'))) {
+            t = (t - 1);
+        }
+        if ((t > s)) {
+            uint8_t k = buf[s];
+            if (kind_checked(k)) {
+                size_t p = s;
+                size_t i = s;
+                while ((i < t)) {
+                    if ((buf[i] == '\t')) {
+                        p = (i + 1);
+                    }
+                    i = (i + 1);
+                }
+                if (((p > s) && ends_t27(buf, p, t))) {
+                    size_t f = p;
+                    size_t path_to = t;
+                    if ((buf[f] == '"')) {
+                        f = (f + 1);
+                    }
+                    if (((path_to > f) && (buf[(path_to - 1)] == '"'))) {
+                        path_to = (path_to - 1);
+                    }
+                    if ((gd_may_write_bytes(buf, f, path_to, GR_AGENT) == false)) {
+                        if ((gd_may_write_bytes(buf, f, path_to, GR_ENGINE) == false)) {
+                            return GR_OWNER;
+                        }
+                        need_engine = true;
+                    }
+                }
+            }
+        }
+        s = (e + 1);
+    }
+    if (need_engine) {
+        return GR_ENGINE;
+    }
+    return GR_AGENT;
+}
+
+uint32_t effective_role(uint8_t* buf, size_t n, size_t sp) {
+    if (header_has_landing(buf, n, sp)) {
+        return min_role_for_diff(buf, n, sp);
+    }
+    return parse_role(buf, n, sp);
+}
+
 uint32_t check_vf_writes(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
     uint32_t denied = 0;
     size_t w = 0;
     size_t sp = sep_at(buf, n);
-    uint32_t role = parse_role(buf, n, sp);
+    uint32_t role = effective_role(buf, n, sp);
     size_t s = sp;
     while (((s < n) && (buf[s] != '\n'))) {
         s = (s + 1);
@@ -335,8 +424,30 @@ uint32_t gd_layer_of_bytes(uint8_t* path, size_t from, size_t to) {
 }
 
 bool gd_may_write_bytes(uint8_t* path, size_t from, size_t to, uint32_t role) {
+    if (is_gate_bootstrap_bytes(path, from, to)) {
+        if ((role == GR_ENGINE)) {
+            return true;
+        }
+        if ((role == GR_AGENT)) {
+            return true;
+        }
+    }
     uint32_t layer = gd_layer_of_bytes(path, from, to);
     return gd_allows(role, layer);
+}
+
+bool is_gate_bootstrap_bytes(uint8_t* path, size_t from, size_t to) {
+    uint32_t i = 0;
+    while ((i < GATE_BOOTSTRAP_COUNT)) {
+        size_t n = GATE_BOOTSTRAP_LENS[i];
+        const char* cand = GATE_BOOTSTRAP[i];
+        bool hit = gd_bytes_eq_len(path, from, to, cand, n);
+        if (hit) {
+            return true;
+        }
+        i = (i + 1);
+    }
+    return false;
 }
 
 /* -------------------------------------------------------
@@ -391,6 +502,40 @@ void test_unlisted_path_denied_for_agent(void) {
     assert((check_vf_writes(inp, 39, &out, 256) == 1));
 }
 
+void test_landing_picks_agent_for_graph_only(void) {
+    uint8_t out[256] = {0};
+    const char* inp = "landing\n--\nM\tspecs/t27f/ui_kit.t27\n";
+    assert((check_vf_writes(inp, 35, &out, 256) == 0));
+    assert((min_role_for_diff(inp, 35, 8) == 0));
+}
+
+void test_landing_picks_engine_for_gate_bootstrap_pr(void) {
+    uint8_t out[512] = {0};
+    const char* inp = "landing\n--\nM\tspecs/policy/vf_write_gate.t27\nM\tspecs/t27f/vf_guard.t27\nM\tspecs/t27f/vf_storybook.t27\n";
+    assert((min_role_for_diff(inp, 100, 8) == 1));
+    assert((check_vf_writes(inp, 100, &out, 512) == 0));
+}
+
+void test_landing_still_denies_agent_on_layout(void) {
+    uint8_t out[256] = {0};
+    const char* inp = "landing\n--\nM\tspecs/t27f/vf_layout.t27\n";
+    assert((min_role_for_diff(inp, 38, 8) == 1));
+    assert((check_vf_writes(inp, 38, &out, 256) == 0));
+}
+
+void test_landing_denies_contract_without_owner(void) {
+    uint8_t out[256] = {0};
+    const char* inp = "landing\n--\nM\tspecs/t27f/visual_factory_contract.t27\n";
+    assert((min_role_for_diff(inp, 52, 8) == 2));
+    assert((check_vf_writes(inp, 52, &out, 256) == 1));
+}
+
+void test_agent_allowed_gate_bootstrap_check(void) {
+    uint8_t out[256] = {0};
+    const char* inp = "agent\n--\nM\tspecs/policy/vf_write_gate.t27\n";
+    assert((check_vf_writes(inp, 42, &out, 256) == 0));
+}
+
 
 /* -------------------------------------------------------
    Test runner (compile with -DT27_TEST_MAIN to execute)
@@ -407,7 +552,12 @@ int main(void) {
     test_default_role_is_agent();
     test_ignores_deletions();
     test_unlisted_path_denied_for_agent();
-    printf("All %d tests passed.\n", 8);
+    test_landing_picks_agent_for_graph_only();
+    test_landing_picks_engine_for_gate_bootstrap_pr();
+    test_landing_still_denies_agent_on_layout();
+    test_landing_denies_contract_without_owner();
+    test_agent_allowed_gate_bootstrap_check();
+    printf("All %d tests passed.\n", 13);
     return 0;
 }
 #endif /* T27_TEST_MAIN */
