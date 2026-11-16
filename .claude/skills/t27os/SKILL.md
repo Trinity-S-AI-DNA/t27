@@ -194,9 +194,9 @@ change one piece, keep the rest, and put a shape used twice into one kit helper 
 - **Ground**: one tint for header, both sidebars and the logs: the bare window glass (BLEND_CLEAR shows the
   NSVisualEffectView blur), no black fill of their own. The right panel (`br_draw_panel`) is the reference colour.
 - **Logs** (`br_draw_down`): flush full width, one hairline on top, "Logs" muted, mono lines. Never a floating
-  rounded card (owner rejected it, 2026-11-16). Its ground is the footer ground: `draw_ground(.., BR_LOG_SURF)` with
-  `BR_LOG_SURF = SURF_SIDEBAR`, so footer, sidebars and logs are one glass. Any own fill over the page (a black tint,
-  then a grey 0.13 at 0.92) read a different colour from the footer: rejected twice, 2026-11-16.
+  rounded card (owner rejected it, 2026-11-16). Its ground is a bare glass wipe (BLEND_CLEAR), as the browser sidebars,
+  so footer, sidebars and logs are one glass. Any own fill (a black tint, a grey 0.13 at 0.92, draw_ground's tint +
+  frost in B8382) read a different colour from the footer: rejected three times, 2026-11-16.
 - **Tabs**: `tab_chip` (pill white 0.08, radius 7, row size, semibold, text white) is THE tab look; the right
   panel's "Agent" chat tab and the left "Agents" rubric both call it.
 - **Chips on one line**: the left "Agents" chip centre equals the right "Agent" chip centre, `WS_TOP + HEADER_H/2`
