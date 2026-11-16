@@ -74,6 +74,14 @@ Each test prints `PASS` or `FAIL`, then a total line `T27osNativeAccept: N passe
 
 Without LM Studio the live tests FAIL. They never pass on a mock and are never skipped.
 
+**Measured 2026-11-17 (master 0839e9de7c): the suite cannot reach 17/17 today, with or without LM Studio.**
+`native_host` gives 3 passed, 0 failed. `native_accept` gives 4 passed, 13 failed, with both
+`./target/release/t27b` (build 0) and `~/.t27os/bin/t27b` (build 7609). Every failure ends with
+`import sys_getenv | sys_mkdir | sys_gettimeofday run outside an object`: `t27b test` interprets the
+spec and does not execute `@extern` imports, so every test that touches a file, the clock or a socket
+fails, including the offline groups F and G. This is #13228 (host fakes: #13232). Until it is fixed,
+report 0.3.0 as `VERSION_CREATED: NO` with these counts, and do not blame LM Studio for the 13 failures.
+
 ## 5. Where the files go and how to reset
 
 Session, agent and swarm logs are written to `target/t27os/native-accept/` (gitignored). The fixed-id test
