@@ -186,6 +186,22 @@ What each console needs. "Source" = where its live data comes from today; "gap" 
 | 26 | Z Zero-Touch UX / Docs | t27u university: 7 course maps, lessons, blog | open lesson | courses.t27 (trinity) |
 | 27 | Ti Security / Reserve | secrets scan, key rotation, identity | rotate key | gitleaks, keys.t27 |
 
+## Browser page style = the UI Kit base (owner, 2026-11-16, PR t27#14072)
+
+The browser page (letter B) is the style the UI Kit grows from. **Develop it, never redraw it from scratch**:
+change one piece, keep the rest, and put a shape used twice into one kit helper in `glass_window.t27`.
+
+- **Ground**: one tint for header, both sidebars and the logs: the bare window glass (BLEND_CLEAR shows the
+  NSVisualEffectView blur), no black fill of their own. The right panel (`br_draw_panel`) is the reference colour.
+- **Logs** (`br_draw_down`): flush full width, one hairline on top, "Logs" muted, mono lines. Never a floating
+  rounded card (owner rejected it, 2026-11-16). The page runs on under it, so the rect is wiped, not tinted.
+- **Tabs**: `tab_chip` (pill white 0.08, radius 7, row size, semibold, text white) is THE tab look; the right
+  panel's "Agent" chat tab and the left "Agents" rubric both call it.
+- **Left sidebar**: only our agents (`AN_T27B_ROSTER`), under one rubric "Agents"; no extra menu items
+  (New tab / Dashboard / Issues were rejected). Rows: round mark, name regular, duty muted, hover pill 0.08 r7.
+- **Footer**: Cursor style, regular weight, sentence case (`sb_sentence`), hover chip.
+- Every build goes to `~/.t27os/saved/<name>`; never delete a saved bundle.
+
 ## One registry per letter (owner, 2026-10-20)
 
 Each of the 27 letters gathers, with no copy of any list: its TOOL t27<letter> (t27a assembler,
