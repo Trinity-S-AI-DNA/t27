@@ -57,11 +57,11 @@ bool is_blocking(const char* name, size_t name_len);
 const char* events_of(const char* name, size_t name_len);
 size_t events_len_of(const char* name, size_t name_len);
 uint32_t count_class(uint8_t c);
-bool rows_filled(size_t name_lens[static 70], size_t event_lens[static 70]);
+bool rows_filled(size_t name_lens[static 71], size_t event_lens[static 71]);
 bool every_row_filled(void);
-bool names_unique_in(const char* names[static 70], size_t lens[static 70]);
+bool names_unique_in(const char* names[static 71], size_t lens[static 71]);
 bool all_names_unique(void);
-bool classes_known(uint8_t cl[static 70]);
+bool classes_known(uint8_t cl[static 71]);
 bool all_classes_known(void);
 size_t line_len(uint8_t* dir_text, size_t dir_len, size_t start);
 bool line_eq_name(uint8_t* dir_text, size_t start, size_t len, const char* name, size_t name_len);
@@ -120,7 +120,7 @@ uint32_t count_class(uint8_t c) {
     return n;
 }
 
-bool rows_filled(size_t name_lens[static 70], size_t event_lens[static 70]) {
+bool rows_filled(size_t name_lens[static 71], size_t event_lens[static 71]) {
     for (size_t i = 0; i < 71; i++) {
         if ((name_lens[i] == 0)) {
             return false;
@@ -136,7 +136,7 @@ bool every_row_filled(void) {
     return rows_filled(NAME_LENS, EVENT_LENS);
 }
 
-bool names_unique_in(const char* names[static 70], size_t lens[static 70]) {
+bool names_unique_in(const char* names[static 71], size_t lens[static 71]) {
     for (size_t i = 0; i < 71; i++) {
         for (size_t j = (i + 1); j < 71; j++) {
             if (str_eq(names[i], lens[i], names[j], lens[j])) {
@@ -151,7 +151,7 @@ bool all_names_unique(void) {
     return names_unique_in(NAMES, NAME_LENS);
 }
 
-bool classes_known(uint8_t cl[static 70]) {
+bool classes_known(uint8_t cl[static 71]) {
     for (size_t i = 0; i < 71; i++) {
         if ((cl[i] != G_BLOCKING)) {
             if ((cl[i] != G_SOFT)) {
