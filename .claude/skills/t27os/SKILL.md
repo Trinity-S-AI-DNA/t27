@@ -207,6 +207,14 @@ change one piece, keep the rest, and put a shape used twice into one kit helper 
 - Every build goes to `~/.t27os/saved/<name>`; never delete a saved bundle. After every edit: commit, build a NEW
   folder, quit the old app, launch the new one and check `ps` shows that folder (2026-11-16: an edit shown on the old
   bundle read as "you launched the old version").
+- **Build number**: the build number follows the commit count, so commit BEFORE every build or the number does not
+  move (B8383-logs read 8382). Name the folder by the number (`saved/b8383`), and say the number in every report:
+  the owner checks the footer `0.2.0 B<n>` against it.
+- **Colour check**: a "same colour" claim is checked by `app_zoom` on the seam itself (logs over footer, sidebar
+  beside page), never judged from a full-window screenshot.
+- **Landing**: every `glass_window.t27` edit stales `t27os_T27osGlassWindow.json` (coverage red). Dispatch
+  `seal-coverage.yml --ref <branch> -f only=specs/t27os/glass_window.t27`, take the `resealed-seals` artifact of the
+  `workflow_dispatch` run, commit it as the last commit, then merge.
 - **Trap, JS inside t27 strings** (`BR_*_SCRIPT`): write `\\n` for a JS newline escape. A bare `\n` is a real line
   break inside a JS string: the whole `ctrl.mjs` fails to parse and every tab, close and new-tab job dies silently
   (tabs stopped switching, 2026-11-16). Check with `node --check ~/.t27os/browser/ctrl.mjs` after a tab click.
