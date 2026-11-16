@@ -186,6 +186,39 @@ What each console needs. "Source" = where its live data comes from today; "gap" 
 | 26 | Z Zero-Touch UX / Docs | t27u university: 7 course maps, lessons, blog | open lesson | courses.t27 (trinity) |
 | 27 | Ti Security / Reserve | secrets scan, key rotation, identity | rotate key | gitleaks, keys.t27 |
 
+## Browser page style = the UI Kit base (owner, 2026-11-16, PR t27#14072)
+
+The browser page (letter B) is the style the UI Kit grows from. **Develop it, never redraw it from scratch**:
+change one piece, keep the rest, and put a shape used twice into one kit helper in `glass_window.t27`.
+
+- **Ground**: one tint for header, both sidebars and the logs: the bare window glass (BLEND_CLEAR shows the
+  NSVisualEffectView blur), no black fill of their own. The right panel (`br_draw_panel`) is the reference colour.
+- **Logs** (`br_draw_down`): flush full width, one hairline on top, "Logs" muted, mono lines. Never a floating
+  rounded card (owner rejected it, 2026-11-16). Its ground is a bare glass wipe (BLEND_CLEAR), as the browser sidebars,
+  so footer, sidebars and logs are one glass. Any own fill (a black tint, a grey 0.13 at 0.92, draw_ground's tint +
+  frost in B8382) read a different colour from the footer: rejected three times, 2026-11-16.
+- **Tabs**: `tab_chip` (pill white 0.08, radius 7, row size, semibold, text white) is THE tab look; the right
+  panel's "Agent" chat tab and the left "Agents" rubric both call it.
+- **Chips on one line**: the left "Agents" chip centre equals the right "Agent" chip centre, `WS_TOP + HEADER_H/2`
+  (`sb_agents_top`, asserted).
+- **Left sidebar**: only our agents (`AN_T27B_ROSTER`), under one rubric "Agents"; no extra menu items
+  (New tab / Dashboard / Issues were rejected). Rows: round mark, name regular, duty muted, hover pill 0.08 r7.
+- **Footer**: Cursor style, regular weight, sentence case (`sb_sentence`), hover chip.
+- Every build goes to `~/.t27os/saved/<name>`; never delete a saved bundle. After every edit: commit, build a NEW
+  folder, quit the old app, launch the new one and check `ps` shows that folder (2026-11-16: an edit shown on the old
+  bundle read as "you launched the old version").
+- **Build number**: the build number follows the commit count, so commit BEFORE every build or the number does not
+  move (B8383-logs read 8382). Name the folder by the number (`saved/b8383`), and say the number in every report:
+  the owner checks the footer `0.2.0 B<n>` against it.
+- **Colour check**: a "same colour" claim is checked by `app_zoom` on the seam itself (logs over footer, sidebar
+  beside page), never judged from a full-window screenshot.
+- **Landing**: every `glass_window.t27` edit stales `t27os_T27osGlassWindow.json` (coverage red). Dispatch
+  `seal-coverage.yml --ref <branch> -f only=specs/t27os/glass_window.t27`, take the `resealed-seals` artifact of the
+  `workflow_dispatch` run, commit it as the last commit, then merge.
+- **Trap, JS inside t27 strings** (`BR_*_SCRIPT`): write `\\n` for a JS newline escape. A bare `\n` is a real line
+  break inside a JS string: the whole `ctrl.mjs` fails to parse and every tab, close and new-tab job dies silently
+  (tabs stopped switching, 2026-11-16). Check with `node --check ~/.t27os/browser/ctrl.mjs` after a tab click.
+
 ## One registry per letter (owner, 2026-10-20)
 
 Each of the 27 letters gathers, with no copy of any list: its TOOL t27<letter> (t27a assembler,
