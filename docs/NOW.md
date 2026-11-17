@@ -1,3 +1,5 @@
+**Last updated:** 2026-11-17
+
 > **FROZEN ARCHIVE -- do not add entries here.**
 >
 > This banner is the first line of the file on purpose. It used to be appended
