@@ -16,11 +16,11 @@ Ledger date: 2026-11-17. Sources: `/tmp/vf_review_package_14083.txt`, `/tmp/vf_b
 
 | Field | Value |
 |-------|-------|
-| Worktree | `/Users/playra/t27` |
-| Branch | `vf-p0-ci-fix` |
+| Worktree | `` `$(git rev-parse --show-toplevel)` `` |
+| Branch | `claude/vf-write-gate-p0` |
 | PR | #14083 (`claude/vf-write-gate-p0`) |
 | Merge-base | `a1f4791d07e2fd9947a021f0747a34aa75ff1bee` (origin/master) |
-| Branch HEAD | `912b81e4a33a240c7f896fbaaf6433f671749dc3` |
+| Branch HEAD | `ba23e49f0f19335fe4a471ee8ea74ea658138504` |
 
 ## Exact 3-file manifest (VF bundle IN)
 
@@ -65,7 +65,7 @@ Cross-ref only; browser host unblock is owner relaunch, not VF bundle scope. Bro
 
 ## Measured 2026-11-17 afternoon
 
-Remeasured on `/Users/playra/t27`, branch `vf-p0-ci-fix`, HEAD `912b81e4a33a240c7f896fbaaf6433f671749dc3`. No commit, no push. `gh pr view 14083` succeeded.
+Remeasured from repo root `` `$(git rev-parse --show-toplevel)` ``, branch `claude/vf-write-gate-p0`, HEAD `ba23e49f0f` (at write time). No commit, no push. `gh pr view 14083` succeeded.
 
 | Fact | Measurement |
 |------|-------------|
@@ -98,7 +98,7 @@ spec-guards failed log: `python3 tools/check_seal_currency.py` prints `STALE gen
 
 ## Measured 2026-11-17 later (read-only; no commit, no push)
 
-Worktree `/Users/playra/t27`, branch `vf-p0-ci-fix`. `MAC_HEAVY_OK=1` is the documented one-command override in `~/.claude/hooks/mac-no-heavy.py` (owner hook, 2026-10-09). Used only for the smoke compile and the two `t27c test-report` calls below.
+Repo root `` `$(git rev-parse --show-toplevel)` ``, branch `claude/vf-write-gate-p0`. `MAC_HEAVY_OK=1` is the documented one-command override in owner hook `mac-no-heavy.py` under `~/.claude/hooks/` (2026-10-09). Used only for the smoke compile and the two `t27c test-report` calls below.
 
 ### A. Issue #14080 exact failure
 
@@ -172,7 +172,7 @@ Ledger: 2026-11-17 coordinator pass. No commit, no push, no `gh issue edit`.
  3 files changed, 19 insertions(+), 7 deletions(-)
 ```
 
-(Command: `git diff --stat HEAD -- specs/policy/vf_write_gate.t27 gen/c/policy/vf_write_gate.c lefthook.yml` from `/Users/playra/t27`, branch `vf-p0-ci-fix`, HEAD `912b81e4a33a240c7f896fbaaf6433f671749dc3`.)
+(Command: `git diff --stat HEAD -- specs/policy/vf_write_gate.t27 gen/c/policy/vf_write_gate.c lefthook.yml` from `` `$(git rev-parse --show-toplevel)` ``, branch `claude/vf-write-gate-p0`, HEAD at measure time.)
 
 ### Commit message draft (owner applies; agent must not commit without phrase)
 
@@ -325,7 +325,7 @@ Land state: AWAITING_PUSH_APPROVAL
 
 ## LAND_READY_VERIFY
 
-Timestamp: **2026-11-17 ~13:45 +7**. Verifier: vf-write-gate-verify skill. CWD `/Users/playra/t27`, branch `vf-p0-ci-fix`, HEAD `912b81e4a33a240c7f896fbaaf6433f671749dc3`. No commit, no push, no issue edit. Browser specs and `vf_guard.t27` untouched.
+Timestamp: **2026-11-17 ~13:45 +7**. Verifier: vf-write-gate-verify skill. CWD `` `$(git rev-parse --show-toplevel)` ``, branch `claude/vf-write-gate-p0`. No commit, no push, no issue edit. Browser specs and `vf_guard.t27` untouched.
 
 | Step | Command / check | Expected | Result | Exit |
 |------|-----------------|----------|--------|------|

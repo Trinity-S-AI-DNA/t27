@@ -19,8 +19,8 @@ Verified 2026-11-17 on playra-mac (verifier lane VF_GATE_P0). Proof over narrati
 
 ## Execution context
 
-- **Worker (local process):** `cursor-agent … worker start --name playra-mac --worker-dir /Users/playra/t27` (pid observed via `ps`, not cursor.com UI).
-- **Agent CWD (this verifier):** `/Users/playra/t27` (main clone); branch `vf-p0-ci-fix`, HEAD `912b81e4a33a240c7f896fbaaf6433f671749dc3` (PR #14083 head at verify).
+- **Worker (local process):** `cursor-agent … worker start --name playra-mac --worker-dir $(git rev-parse --show-toplevel)` (pid observed via `ps`, not cursor.com UI).
+- **Agent CWD (this verifier):** `` `$(git rev-parse --show-toplevel)` `` (main clone); branch `claude/vf-write-gate-p0`, HEAD `ba23e49f0f19335fe4a471ee8ea74ea658138504` (PR #14083 head at verify).
 - **Worktree:** `~/t27/.claude/worktrees/vf-p0-ci-fix` may be **absent**; run verify on the main clone checked out to the same branch (or `git show vf-p0-ci-fix:…`).
 - **Legacy lane:** `claude/vf-write-gate-p0` / `~/t27/.claude/worktrees/vf-write-gate-p0` may also be gone — do not assume a worktree path.
 
@@ -153,7 +153,7 @@ Run `43928840687` (2026-11-16T18:26:33Z):
 | vf-diff | pass |
 | spec-guards | **fail** (committed `gen/c/claw/gates.c` drift vs regenerated) |
 | cli-tri | **fail** (`tri census pin --gate`: workflow step count 343→345) |
-| scan | **fail** (hardcoded `/Users/playra/` in `runs/ref_full*.txt`) |
+| scan | **fail** (hardcoded developer home paths in `runs/ref_full*.txt` -- fixed on branch) |
 | own-language | pending at snapshot |
 | emit-bitexact, corpus, coverage, t27b-native | pending |
 
@@ -201,7 +201,7 @@ Full help: `cursor-agent worker --help` on this machine (2026-11-17).
 ## Next executable tasks
 
 1. On PR branch: `tri census pin --bless` for workflow step census; regenerate/commit `gen/c/claw/gates.c` to fix spec-guards.
-2. Remove or quarantine `/Users/playra/` paths from `runs/ref_full*.txt` for scan gate.
+2. ~~Remove or quarantine developer home paths from `runs/ref_full*.txt` for scan gate~~ -- done on `runs/ref_*.txt` in #14083.
 3. ~~Document pre-commit/pre-push literal roles vs CI hardcoded `landing`~~ — done in this skill + working-tree `lefthook.yml`.
 4. Optional: extend `check_vf_writes` for rename lines `R*`.
 5. P1: implement FR-001–003 in `glass_window.t27` (#14008), then screenshot pipeline wiring.
