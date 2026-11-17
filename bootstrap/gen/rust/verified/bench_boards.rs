@@ -771,8 +771,6 @@ pub fn xsc_first_wrong(raw: u64) -> u8 {
     return DNA_OK;
 }
 
-pub const DIE_NAMED: u8 = 1;
-
 pub const HEX_NONE: u64 = 1099511627776;
 
 pub const READER_FUSE_TAG: &'static str = "FUSE_DNA ";
