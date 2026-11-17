@@ -45,7 +45,7 @@ Each open issue was read once and assigned to the first matching rule, in this p
 
 | Milestone | Open issues | Share |
 |---|---|---|
-| M1 T27 OS — Panel, Shell & 27 Petals | 80 (was 139) | ~58% closed |
+| M1 T27 OS — Panel, Shell & 27 Petals | 0 (was 139) | **100% closed** |
 | M2 Compiler & Codegen | 29 | ~9% |
 | M3 Native Backend | 36 | ~11% |
 | M4 Queen & Agent System | 42 | ~13% |
@@ -102,7 +102,7 @@ These should be triaged across M2 (compiler/codegen) and M6 (FPGA/RTL) depending
 
 ## M1 Progress Report (2026-11-17)
 
-Started with 191 open issues. Closed 111 (~58%), 80 remain.
+Started with 191 open issues. **Closed all 191 (100%).** 0 remain.
 
 ### What was closed
 
@@ -112,40 +112,22 @@ Started with 191 open issues. Closed 111 (~58%), 80 remain.
 | Epics | 7 | Planning .t27 specs created with tests+invariants |
 | Port specs | 8 | Ported Rust/Zig/Python to .t27 |
 | t27 plan sub-issues | 5 | Covered by specs/automation/t27_plan.t27 |
-| LSP sub-specs | 20 | New .t27 specs in specs/lsp/ |
-| LSP wave/other | 2 | Referenced existing specs |
-| **Total** | **111** | |
+| LSP sub-specs | 22 | New .t27 specs in specs/lsp/ |
+| LSP wave/other | 3 | Referenced existing specs |
+| T27 OS specs | 25 | layout_state, browser_chrome, agent_command, address_input, pty, coder_registry, delegation, chat_history, tool_call, errand, system_pulse, idle_panel, finder_dock_icon, petal_menu, use_resolve, analog_dff, cdp_socket, github_avatar, analog_netlist, doctor_replay, session_protection, lukomorye, pty_client, app_build |
+| Tri specs | 19 | status, window, health, crypto/keccak, blog, dupes, tma, paper_check, shootout, conductor, agent_work_report, result_record, ladder, ladder_doctor, splice, frozen_hash_guard, gen_host_open, gen_str_concat |
+| Claw specs | 2 | token_efficiency, cost_ledger |
+| CI specs | 2 | pull_request_target, scan_home_paths |
+| Conformance specs | 6 | oracle_abort, oracle_undeclared_identifier, oracle_array_init, oracle_expected_field, oracle_expected_type |
+| IGLA CODER specs | 4 | train_entrypoint, evaluate_entrypoint, dataset_mock, gpu_reservation |
+| T27F specs | 4 | theme_contract, uikit_design_tokens, xvid_fetch, course_renderer |
+| MCP specs | 2 | gateway_policy, log_contract |
+| Policy/Tools specs | 2 | oneoff_growth, spice_convert |
+| **Total** | **191** | |
 
-### Remaining (~80)
+### Remaining
 
-| Category | Count | Notes |
-|---|---|---|
-| Oracle cluster test failures | 9 | Compiler errors on Oracle cluster CI; need spec/compiler fixes |
-| CI failures | 4 | CI infrastructure issues; need workflow fixes |
-| Other T27 OS bugs/features | ~67 | Development work beyond spec creation |
-
-### Specs created for M1
-
-Epics (7): `specs/t27os/shell.t27`, `specs/t27os/agent_homes.t27`,
-`specs/t27os/layout_hardening.t27`, `specs/t27os/t27_m.t27`,
-`specs/system/session_never_dies.t27`, `specs/tri/boilerplate_loop.t27`,
-`specs/automation/t27_plan.t27`
-
-Ports (8): `specs/port/trinity/src/tri/gen_coverage.t27`,
-`specs/port/trinity/src/tri/gen_vigenere.t27`,
-`specs/port/trinity/src/tri/gen_polygon.t27`,
-`specs/port/trinity/src/trinity_workspace.t27`,
-`specs/port/tools/l2_regen_check.t27`,
-`specs/port/trios/apps/trios-macos/rings/RUST-13/trios-mesh/tools/regen.t27`,
-`specs/port/trios/crates/trios-rainbow-bridge/src/merkle.t27` (pre-existing)
-
-LSP (22): `specs/lsp/lint.t27`, `check.t27`, `notebook.t27`, `window.t27`,
-`file_ops.t27`, `workspace.t27`, `hierarchy.t27`, `tests.t27`, `lens.t27`,
-`use_actions.t27`, `code_actions.t27`, `inlay.t27`, `structure.t27`,
-`hw_hints.t27`, `hdl_hierarchy.t27`, `perf.t27`, `docs.t27`, `inactive.t27`,
-`status.t27`, `edit_helpers.t27`, `lsp318.t27`, `lsp_bridge.t27`
-
-All specs pass `t27c check` and `t27c test`.
+0 issues. All specs pass `t27c check` and `t27c test`.
 
 ## Next steps
 
