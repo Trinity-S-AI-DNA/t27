@@ -16,16 +16,20 @@ module T27OsBrowserLoopbackRunner;
 use t27os::browser_native_bridge::ROUTE_VIEW;
 use t27os::browser_native_bridge::ROUTE_INPUT;
 use t27os::browser_native_bridge::ROUTE_NONE;
+use t27os::browser_native_bridge::ROUTE_STATE;
 use t27os::browser_native_bridge::route_of;
 use t27os::browser_native_bridge::put_head;
+use t27os::browser_native_bridge::put_state_head;
 use t27os::browser_native_bridge::text_body;
 use t27os::browser_native_bridge::PIXEL_NONE;
+use t27os::browser_native_bridge::PIXEL_JSON;
 use t27os::browser_native_bridge::has_bytes;
 use t27os::browser_loopback_host::view_kind;
 use t27os::browser_loopback_host::view_serve_code;
 use t27os::browser_loopback_host::view_streams_file;
 use t27os::browser_loopback_host::view_wire_source;
 use t27os::browser_loopback_host::view_disk_path;
+use t27os::browser_loopback_host::state_path;
 use t27os::browser_native_bridge::PIXEL_JPEG;
 use t27os::browser_native_bridge::PIXEL_NATIVE;
 use t27os::browser_loopback_host::input_http_code;
@@ -36,6 +40,7 @@ use t27os::browser_loopback_sock::bridge_bind_refusal;
 use t27os::browser_loopback_sock::bridge_bind_bytes;
 use t27os::browser_loopback_host::inbox_path;
 use t27os::session_store::put_bytes;
+use t27os::session_store::put_dec;
 use t27os::browser_native_bridge::R_OK;
 use t27os::browser_native_framebuffer::export_enabled;
 use t27os::router_sock::AF_INET;
@@ -88,6 +93,125 @@ pub const INBOX_APPEND_FLAGS : i32 = 9;
 pub const SEEK_END : i32 = 2;
 
 fn sys_lseek(fd : i32, off : i64, whence : i32) -> i64 { return @extern("lseek"); }
+
+/// chmod(2): the state write creates the file via open(2) with no mode argument, so the
+/// fresh file lands 0000; one chmod makes it readable for curl and the browser.
+fn sys_chmod(p : []const u8, mode : i32) -> i32 { return @extern("chmod"); }
+
+/// rw-r--r-- for the state file (0644).
+pub const STATE_FILE_MODE : i32 = 420;
+
+
+/// open(2) for the state write: O_WRONLY (1) | O_CREAT (512) | O_TRUNC (1024).
+pub const STATE_WRITE_FLAGS : i32 = 1537;
+
+/// GET /live/state with no state file on disk (the writer has not run yet this launch).
+pub const R_STATE_MISSING : u32 = 503;
+
+/// T27OS_NO_STATE: exactly "1" skips the per-frame state.json write (roll-back gate).
+pub fn launch_state_write(state_off : bool) -> bool {
+    return !state_off;
+}
+
+/// The state-only JSON surface, v1 schema: focus, panes, indicators. Aggregates only --
+/// no widget content, no coordinates, no scene graph, no hotkeys (B-v0 boundary).
+pub fn state_json(out : []u8, pump : bool, browser_up : bool, seq : u64, ts : u64) -> usize {
+    var n : usize = put_bytes(out, 0, "{\"v\":1,\"seq\":");
+    n = put_dec(out, n, seq);
+    n = put_bytes(out, n, ",\"ts\":");
+    n = put_dec(out, n, ts);
+    n = put_bytes(out, n, ",\"view\":\"VIEW_ONLY\",\"focus\":{\"pane\":\"");
+    if (browser_up) { n = put_bytes(out, n, "browser"); }
+    else { n = put_bytes(out, n, "none"); }
+    n = put_bytes(out, n, "\"},\"panes\":[{\"id\":\"browser\",\"kind\":\"tab\",\"state\":\"");
+    if (browser_up) { n = put_bytes(out, n, "visible"); }
+    else { n = put_bytes(out, n, "hidden"); }
+    n = put_bytes(out, n, "\"}],\"indicators\":[{\"id\":\"petals\",\"count\":27},{\"id\":\"pump\",\"alive\":");
+    if (pump) { n = put_bytes(out, n, "true"); }
+    else { n = put_bytes(out, n, "false"); }
+    n = put_bytes(out, n, "}]}");
+    return n;
+}
+
+/// Write the state file into the data dir once per visible frame. Best effort: false when
+/// the path does not fit or the open/write fails; the frame loop ignores the result.
+pub fn bridge_state_write(hb : []const u8, pump : bool, browser_up : bool, seq : u64, ts : u64) -> bool {
+    var pb : [320]u8 = undefined;
+    const pn : usize = state_path(hb, pb[0..320]);
+    if (pn == 0) { return false; }
+    pb[pn] = 0;
+    var body : [512]u8 = undefined;
+    const bn : usize = state_json(body[0..512], pump, browser_up, seq, ts);
+    if (bn == 0) { return false; }
+    const fd : i32 = sys_open_ro(pb[0..320], STATE_WRITE_FLAGS);
+    if (fd < 0) { return false; }
+    const w : i64 = sys_write(fd, body[0..bn], @as(u64, bn));
+    _ = sys_close(fd);
+    _ = sys_chmod(pb[0..320], STATE_FILE_MODE);
+    return w >= @as(i64, @intCast(bn));
+}
+
+pub struct StatePlan {
+    http_code : u32,
+    stream : bool,
+}
+
+/// GET /live/state: 200 + stream state.json when it exists, 503 when the writer has not run.
+pub fn plan_state(size : usize) -> StatePlan {
+    var st : StatePlan = StatePlan { http_code: R_STATE_MISSING, stream: false };
+    if (size != 0) {
+        st.http_code = 200;
+        st.stream = true;
+    }
+    return st;
+}
+
+/// Head for the state response (application/json + X-T27-Seq; bodyless 503 like the view fallback).
+pub fn emit_state_head(plan : StatePlan, seq : u64, out : []u8) -> usize {
+    if (plan.http_code == 0) { return 0; }
+    if (plan.stream) { return put_state_head(out, plan.http_code, seq); }
+    const body : string = "state unavailable\n";
+    var n : usize = put_head(out, plan.http_code, PIXEL_NONE);
+    if (n == 0 or n + body.len > out.len) { return 0; }
+    var i : usize = 0;
+    while (i < body.len) {
+        out[n + i] = body[i];
+        i = i + 1;
+    }
+    return n + body.len;
+}
+
+/// Read the state file into out (bytes, 0 when missing); one read serves head seq and body.
+pub fn bridge_state_read(hb : []const u8, out : []u8) -> usize {
+    var pb : [320]u8 = undefined;
+    const pn : usize = state_path(hb, pb[0..320]);
+    if (pn == 0) { return 0; }
+    pb[pn] = 0;
+    const fd : i32 = sys_open_ro(pb[0..320], 0);
+    if (fd < 0) { return 0; }
+    const r : i64 = sys_read(fd, out, @as(u64, out.len));
+    _ = sys_close(fd);
+    if (r <= 0) { return 0; }
+    return @as(usize, @intCast(r));
+}
+
+/// The seq value after `"seq":` in one state body (0 when absent or unparsable).
+pub fn state_seq_of(body : []const u8) -> u64 {
+    var i : usize = 0;
+    while (i + 6 <= body.len) {
+        if (body[i] == 34 and body[i + 1] == 115 and body[i + 2] == 101 and body[i + 3] == 113 and body[i + 4] == 34 and body[i + 5] == 58) {
+            var n : u64 = 0;
+            var j : usize = i + 6;
+            while (j < body.len and body[j] >= 48 and body[j] <= 57) {
+                n = n * 10 + @as(u64, body[j] - 48);
+                j = j + 1;
+            }
+            return n;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
 
 /// The index just past the first empty line of an HTTP/1.x head (CR LF CR LF). 0 while incomplete.
 pub fn http_head_end(buf : []const u8) -> usize {
@@ -326,6 +450,15 @@ fn bridge_serve_conn(fd : i32, home : []const u8, pump_alive : bool, file_size :
         }
         return;
     }
+    if (route == ROUTE_STATE) {
+        var sbuf : [512]u8 = undefined;
+        const sn : usize = bridge_state_read(home, sbuf[0..512]);
+        const splan : StatePlan = plan_state(sn);
+        const wn : usize = emit_state_head(splan, state_seq_of(sbuf[0..sn]), wr[0..BRIDGE_WR_CAP]);
+        if (wn > 0) { _ = bridge_write_all(fd, wr[0..wn]); }
+        if (splan.stream) { _ = bridge_write_all(fd, sbuf[0..sn]); }
+        return;
+    }
     if (route == ROUTE_INPUT) {
         var line : [400]u8 = undefined;
         const ln : usize = post_body_line(req, head_end, req.len, line[0..400]);
@@ -507,6 +640,7 @@ pub fn bridge_poll_tick(listen_fd : i32, st_cfd : u32, st_got : u32, pump_alive 
     return bridge_state_word(st[BR_ST_CFD], st[BR_ST_GOT], busy);
 }
 
+
 /// Fresh st each call: one poll step (used when no cross-tick state is kept).
 pub fn bridge_serve_once(listen_fd : i32, home : []const u8, pump_alive : bool, file_size : usize, b0 : u8, b1 : u8, b2 : u8, b3 : u8) -> bool {
     var st : [2]u32 = undefined;
@@ -665,6 +799,64 @@ test bridge_poll_tick_bad_fd_keeps_slots {
     assert bridge_word_cfd(w) == 3;
     assert bridge_word_got(w) == 9;
     assert bridge_word_busy(w) == false;
+}
+
+test state_json_is_aggregates_only {
+    var b : [512]u8 = undefined;
+    const n : usize = state_json(b[0..512], true, true, 7, 1799990123);
+    assert n > 0;
+    assert has_bytes(b[0..n], "\"v\":1");
+    assert has_bytes(b[0..n], "\"seq\":7");
+    assert has_bytes(b[0..n], "\"ts\":1799990123");
+    assert has_bytes(b[0..n], "\"view\":\"VIEW_ONLY\"");
+    assert has_bytes(b[0..n], "\"pane\":\"browser\"");
+    assert has_bytes(b[0..n], "\"state\":\"visible\"");
+    assert has_bytes(b[0..n], "\"petals\"");
+    assert has_bytes(b[0..n], "\"pump\",\"alive\":true");
+    assert !has_bytes(b[0..n], "x\":");
+    assert !has_bytes(b[0..n], "coordinate");
+    assert !has_bytes(b[0..n], "hotkey");
+    const m : usize = state_json(b[0..512], false, false, 8, 1799990124);
+    assert has_bytes(b[0..m], "\"pane\":\"none\"");
+    assert has_bytes(b[0..m], "\"state\":\"hidden\"");
+    assert has_bytes(b[0..m], "\"pump\",\"alive\":false");
+    assert has_bytes(b[0..m], "\"seq\":8");
+}
+
+test plan_state_503_without_file_and_streams_200 {
+    const miss : StatePlan = plan_state(0);
+    assert miss.http_code == 503;
+    assert !miss.stream;
+    const full : StatePlan = plan_state(180);
+    assert full.http_code == 200;
+    assert full.stream;
+}
+
+test emit_state_head_carries_seq_and_view_only {
+    var h : [512]u8 = undefined;
+    const full : StatePlan = plan_state(180);
+    const n : usize = emit_state_head(full, 42, h[0..512]);
+    assert n > 0;
+    assert has_bytes(h[0..n], "application/json");
+    assert has_bytes(h[0..n], "X-T27-Seq: 42");
+    assert has_bytes(h[0..n], "X-T27-View: VIEW_ONLY");
+    assert has_bytes(h[0..n], "Cache-Control: no-store");
+    const miss : StatePlan = plan_state(0);
+    const m : usize = emit_state_head(miss, 0, h[0..512]);
+    assert has_bytes(h[0..m], "503");
+    assert has_bytes(h[0..m], "state unavailable");
+}
+
+test state_seq_of_reads_the_seq_field {
+    var b : [512]u8 = undefined;
+    const n : usize = state_json(b[0..512], true, true, 1847, 1);
+    assert state_seq_of(b[0..n]) == 1847;
+    assert state_seq_of(b[0..0]) == 0;
+}
+
+test launch_state_write_gate_off_wins {
+    assert launch_state_write(false);
+    assert !launch_state_write(true);
 }
 
 invariant bridge_listen_refuses_publish {
