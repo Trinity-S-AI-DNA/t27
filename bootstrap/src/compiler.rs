@@ -10874,7 +10874,10 @@ impl Codegen {
                                 self.write(")");
                             }
                             None if by_ref => {
-                                self.write("&");
+                                // Slice/array parameters are already pointers in C
+                                // (uint8_t *out), so &out would be uint8_t (**)
+                                // which does not match uint8_t *. Just emit the
+                                // identifier; it decays to a pointer on call.
                                 self.gen_expr(arg);
                             }
                             None => {
@@ -18530,6 +18533,15 @@ impl VerilogCodegen {
                             return;
                         }
                     }
+                    // W672: `.len()` on a slice parameter has no fixed length
+                    // in Verilog. Declare `s_len` as a port or refuse with a
+                    // diagnostic naming the line.
+                    let recv_safe = Self::verilog_safe_identifier(&recv);
+                    self.write(&format!(
+                        "// ERROR: .len() on slice parameter `{}` has no fixed length; declare `{}` as a port",
+                        recv, recv_safe
+                    ));
+                    return;
                 }
 
 
