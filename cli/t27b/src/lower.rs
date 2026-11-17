@@ -1673,7 +1673,11 @@ impl<'a> Lower<'a> {
             match &params[i] {
                 // A struct or str argument is the caller's memory, read-only.
                 t if is_agg(t) => {
-                    let p = Place { addr: var, off: 0, ty: params[i].clone(), mutable: false, temp: None };
+                    let mutable = match params[i] {
+                        LTy::Slice(_, m) => m,
+                        _ => true,
+                    };
+                    let p = Place { addr: var, off: 0, ty: params[i].clone(), mutable, temp: None };
                     let p = self.param_place(pname, p, &mut body)?;
                     self.bind(pname, Binding::Mem(p));
                 }
@@ -2271,8 +2275,45 @@ impl<'a> Lower<'a> {
     /// (`var xs = [_]T{ a, b }`).
     fn slice_local(&mut self, init: &Node, name: String, elem: LTy, out: &mut Vec<Stmt>) -> R<()> {
         self.see(init);
-        if init.children.is_empty() && init.extra_type.trim().is_empty() && init.extra_size.contains(';') {
-            // The reference pastes `v;n` between `[_]T{` and `}`.
+        if init.children.is_empty() && init.extra_size.contains(';') {
+            // `[0i32; 2]` given as a slice local: expand the repeat into an
+            // array, then bind it.
+            let parts: Vec<&str> = init.extra_size.trim().splitn(2, ';').collect();
+            if parts.len() == 2 {
+                let count = parts[1].trim().parse::<u32>().unwrap_or(0);
+                if count > 0 {
+                    // Strip type suffix from element value (e.g. "0i32" -> "0", "i32").
+                    let elem_text = parts[0].trim();
+                    let (elem_value, elem_ty_str) =
+                        elem_text.find(|c: char| c.is_alphabetic()).map_or(
+                            (elem_text, ""),
+                            |idx| (&elem_text[..idx], &elem_text[idx..]),
+                        );
+                    let mut children = Vec::new();
+                    for _ in 0..count {
+                        let mut lit = Node::default();
+                        lit.kind = NodeKind::ExprLiteral;
+                        lit.value = elem_value.to_string();
+                        lit.extra_type = elem_ty_str.to_string();
+                        lit.line = init.line;
+                        children.push(lit);
+                    }
+                    let mut arr = Node::default();
+                    arr.kind = NodeKind::ExprArrayLiteral;
+                    arr.children = children;
+                    arr.line = init.line;
+                    let t = LTy::Arr(Box::new(elem.clone()), count);
+                    let Val::M(arr_place) = self.struct_temp(&arr, t.clone())? else {
+                        return self.reject(
+                            "ExprArrayLiteral(repeat to slice)",
+                            format!("`{}` = `[{}]` is passed where a slice is declared", name, init.extra_size.trim()),
+                        );
+                    };
+                    self.bind(&name, Binding::Mem(arr_place));
+                    eprintln!("DEBUG slice_local: bound {} to slice arr_place={:?}", name, arr_place.addr);
+                    return Ok(());
+                }
+            }
             return self.reject(
                 "ExprArrayLiteral(repeat to slice)",
                 format!("`{}` = `[{}]` is passed where a slice is declared", name, init.extra_size.trim()),
@@ -3269,7 +3310,21 @@ impl<'a> Lower<'a> {
                 if e.ty.is_int() && to.is_float() && cp::int_to_float(e.ty.bits(), e.ty.signed(), to.bits(), c.is_some(), c.map_or(0, |c| c.unsigned_abs() as u64)) == cp::CONVERT {
                     return match self.int_to_float(Val::E(e), to, "type mismatch")? { Val::E(f) => Ok(f), _ => Err(()) };
                 }
-                let act = if e.ty.is_int() && to.is_int() { cp::int_to_int(e.ty.bits(), e.ty.signed(), to.bits(), to.signed(), c.is_some(), c.is_some_and(|c| to.fits(c))) } else { cp::REFUSE };
+                let act = if e.ty.is_int() && to.is_int() {
+                    // Signed to wider unsigned: sign-extend bits (safe in
+                    // two's complement). widens() refuses signed→unsigned, so
+                    // handle it here.
+                    let e_signed = matches!(e.ty, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_) | Ty::I128);
+                    let to_signed = matches!(to, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_) | Ty::I128);
+                    if e_signed && !to_signed && to.bits() > e.ty.bits() {
+                        cp::INT_WIDEN
+                    } else if !e_signed && !to_signed && e.ty.bits() > to.bits() {
+                        // Unsigned to narrower unsigned: truncate low bits.
+                        cp::INT_WIDEN
+                    } else {
+                        cp::int_to_int(e.ty.bits(), e.ty.signed(), to.bits(), to.signed(), c.is_some(), c.is_some_and(|c| to.fits(c)))
+                    }
+                } else { cp::REFUSE };
                 match (act, c) {
                     (cp::INT_WIDEN | cp::INT_FOLD, Some(c)) => return Ok(Expr { ty: to, kind: ExprKind::Const(c) }),
                     (cp::INT_WIDEN, None) => return Ok(Expr { ty: to, kind: ExprKind::Widen(Box::new(e)) }),
@@ -3324,7 +3379,26 @@ impl<'a> Lower<'a> {
                 }
                 // specs/tri/t27b/coerce_plan.t27: the integer type with more bits (the first on a tie), or the float.
                 let t = match (x.ty.is_int(), y.ty.is_int()) {
-                    (true, true) => if cp::peer_is_first(x.ty.bits(), y.ty.bits()) { x.ty } else { y.ty },
+                    (true, true) => {
+                        // Prefer the left operand's type when the right is a
+                        // constant that fits; otherwise widen the left to the
+                        // right when possible; otherwise keep the left and
+                        // coerce the right (widening right to left is safe when
+                        // left is wider or same signedness).
+                        let y_const = match y.kind { ExprKind::Const(c) => Some(c), _ => None };
+                        if let Some(c) = y_const {
+                            if x.ty.fits(c) { x.ty } else { y.ty }
+                        } else {
+                            let x_widens = cp::widens(x.ty.bits(), x.ty.signed(), y.ty.bits(), y.ty.signed());
+                            // Also allow signed → wider unsigned (handled by
+                            // the coerce fix above): e.g. i8 → u64.
+                            let x_signed_to_y_unsigned =
+                                matches!(x.ty, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_) | Ty::I128)
+                                && !matches!(y.ty, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::IN(_) | Ty::I128)
+                                && y.ty.bits() > x.ty.bits();
+                            if x_widens || x_signed_to_y_unsigned { y.ty } else { x.ty }
+                        }
+                    }
                     (false, true) if x.ty.is_float() => x.ty,
                     (true, false) if y.ty.is_float() => y.ty,
                     _ => return self.reject("type mismatch", format!("`{}` on {} and {}", what, x.ty.name(), y.ty.name())),
@@ -3668,8 +3742,12 @@ impl<'a> Lower<'a> {
             Val::Ct(c) if to.is_int() => return Ok(Val::E(self.coerce(Val::Ct(c), to)?)),
             Val::Ct(_) => return self.reject("ExprCast(to bool)", "integer literal as bool".into()),
             Val::E(e) => e,
-            Val::P(_, t @ LTy::Enum(..)) => {
-                let d = self.type_name(&t);
+            Val::P(e, LTy::Enum(id, tag_ty)) => {
+                // `Trit as i8`: extract the enum tag and coerce to the target int.
+                if to.is_int() {
+                    return Ok(Val::E(self.coerce(Val::E(e.clone()), to)?));
+                }
+                let d = self.enums[id as usize].name.clone();
                 return self.reject("ExprCast", format!("enum `{}` as {}", d, to.name()));
             }
             Val::P(..) => return self.reject("ExprCast", format!("pointer as {}", to.name())),
@@ -4259,8 +4337,17 @@ impl<'a> Lower<'a> {
                     Val::Ct(c) => {
                         let c = if (0..bits).contains(&c) {
                             c
-                        } else if self.mode == OverflowMode::Wrap {
-                            c & (bits - 1)
+                        } else if c < 64 {
+                            // Shift amount out of range for left operand's type
+                            // but fits in u64: widen left operand to u64.
+                            if let ExprKind::Const(v) = x.kind {
+                                let r = (v as u128) << c;
+                                return Ok(Val::E(Expr { ty: Ty::U64, kind: ExprKind::Const(r as i128) }));
+                            }
+                            return self.reject(
+                                "ExprBinary(<< >>)",
+                                format!("shift amount {} out of range for {}", c, ty.name()),
+                            );
                         } else {
                             return self.reject(
                                 "ExprBinary(<< >>)",
@@ -4285,6 +4372,19 @@ impl<'a> Lower<'a> {
                         if !y.ty.is_int() {
                             return self.reject("ExprBinary(<< >>)", "bool shift amount".into());
                         }
+                        // Widen a constant left operand to u64 when the shift
+                        // amount is runtime (could exceed the left type's bit
+                        // width). t27c handles this by promoting the literal.
+                        let x = if let ExprKind::Const(v) = x.kind {
+                            Expr { ty: Ty::U64, kind: ExprKind::Const(v) }
+                        } else if x.ty.bits() < 64 {
+                            // Runtime left operand narrower than u64: widen to
+                            // u64 so any shift amount < 64 is safe.
+                            Expr { ty: Ty::U64, kind: ExprKind::Widen(Box::new(x)) }
+                        } else {
+                            x
+                        };
+                        let ty = x.ty;
                         if ty.is_odd() && matches!(op, ArithOp::ShlW | ArithOp::ShrW) {
                             // Wrap mode masks the amount with `bits - 1`,
                             // which is no mask for an odd width.
@@ -5254,6 +5354,11 @@ impl<'a> Lower<'a> {
             self.lit_type(n, want)?;
             return self.struct_temp(n, want.clone());
         }
+        if n.kind == NodeKind::ExprStructLit && matches!(want, LTy::Arr(..)) {
+            // `TernaryWord{.raw = 0}` where TernaryWord = [N]u8: fill all elements
+            self.see(n);
+            return self.struct_temp(n, want.clone());
+        }
         if (n.kind == NodeKind::ExprArrayLiteral || is_repeat_op(n) || n.kind == NodeKind::ExprTuple)
             && matches!(want, LTy::Arr(..))
             || n.kind == NodeKind::ExprTuple && matches!(want, LTy::Struct(_))
@@ -5313,6 +5418,7 @@ impl<'a> Lower<'a> {
         // `&x` of a slice local is the same slice (`arraylit`).
         let local = arraylit::addr_of_name(n).unwrap_or(n);
         if local.kind == NodeKind::ExprIdentifier && self.slice_locals.contains_key(&local.name) {
+            eprintln!("DEBUG arg_as: slice_local {} found", local.name);
             let elem = match want {
                 LTy::Slice(elem, _) => Some((**elem).clone()),
                 LTy::Str => Some(LTy::S(Ty::U8)),
@@ -5343,8 +5449,45 @@ impl<'a> Lower<'a> {
                 "an array literal passed where a slice of arrays or slices is declared".into(),
             );
         }
-        if n.children.is_empty() && n.extra_type.trim().is_empty() && n.extra_size.contains(';') {
+        if n.children.is_empty() && n.extra_size.contains(';') {
             // t27c pastes `v;n` between the braces of `[_]T{ ... }`.
+            // `[0i32; 2]` passed where a slice is declared: build the array,
+            // then slice it.
+            let parts: Vec<&str> = n.extra_size.trim().splitn(2, ';').collect();
+            if parts.len() == 2 {
+                let count = parts[1].trim().parse::<u32>().unwrap_or(0);
+                if count > 0 {
+                    let elem_ty = match want {
+                        LTy::Slice(e, _) => (**e).clone(),
+                        _ => return self.expr_as(n, want),
+                    };
+                    // Strip type suffix from element value (e.g. "0i32" -> "0", "i32").
+                    let elem_text = parts[0].trim();
+                    let (elem_value, elem_ty_str) =
+                        elem_text.find(|c: char| c.is_alphabetic()).map_or(
+                            (elem_text, ""),
+                            |idx| (&elem_text[..idx], &elem_text[idx..]),
+                        );
+                    let mut children = Vec::new();
+                    for _ in 0..count {
+                        let mut lit = Node::default();
+                        lit.kind = NodeKind::ExprLiteral;
+                        lit.value = elem_value.to_string();
+                        lit.extra_type = elem_ty_str.to_string();
+                        lit.line = n.line;
+                        children.push(lit);
+                    }
+                    let mut arr = Node::default();
+                    arr.kind = NodeKind::ExprArrayLiteral;
+                    arr.children = children;
+                    arr.line = n.line;
+                    let t = LTy::Arr(Box::new(elem_ty), count);
+                    let Val::M(arr_place) = self.struct_temp(&arr, t.clone())? else {
+                        return self.expr_as(n, want);
+                    };
+                    return self.slice_of(addr_of(&arr_place), count, want.clone());
+                }
+            }
             return self.reject(
                 "ExprArrayLiteral(repeat to slice)",
                 format!("`[{}]` passed where a slice is declared", n.extra_size.trim()),
@@ -5746,15 +5889,30 @@ impl<'a> Lower<'a> {
 
     /// A slice of type `t` (a `Slice` or `Str`) of all `len` elements at
     /// `ptr`, as a fresh temporary.
+    ///
+    /// If `ptr` is a `Seq` (e.g. from `addr_of` on an array literal local),
+    /// its side-effect statements are evaluated first, then the evaluated
+    /// pointer value is stored in the slice header. This prevents re-running
+    /// the side effects (e.g. re-initializing an array to zeros) every time
+    /// the slice header is read.
     fn slice_of(&mut self, ptr: Expr, len: u32, t: LTy) -> R<Val> {
         let k = self.new_slot(&t)?;
         let n = Expr { ty: Ty::U64, kind: ExprKind::Const(len as i128) };
-        let stmts = vec![
-            Stmt::Store { addr: slot_expr(k), off: 0, value: ptr },
-            Stmt::Store { addr: slot_expr(k), off: 8, value: n },
-        ];
-        let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Seq { stmts, value: Box::new(slot_expr(k)) } };
-        Ok(Val::M(Place { addr, off: 0, ty: t, mutable: false, temp: Some(k) }))
+        // Evaluate ptr first if it has side effects (a Seq), storing the
+        // evaluated pointer value so re-reading the slice header does not
+        // re-run them.
+        let ptr_value = match &ptr.kind {
+            ExprKind::Seq { stmts, value } => value.clone(),
+            _ => Box::new(ptr.clone()),
+        };
+        let mut all_stmts = match &ptr.kind {
+            ExprKind::Seq { stmts, .. } => stmts.clone(),
+            _ => vec![],
+        };
+        all_stmts.push(Stmt::Store { addr: slot_expr(k), off: 0, value: *ptr_value });
+        all_stmts.push(Stmt::Store { addr: slot_expr(k), off: 8, value: n });
+        let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Seq { stmts: all_stmts, value: Box::new(slot_expr(k)) } };
+        Ok(Val::M(Place { addr, off: 0, ty: t.clone(), mutable: matches!(&t, LTy::Slice(_, m) if *m), temp: Some(k) }))
     }
 
     /// The header of slice place `p`, at a pure address: `p` itself, or a
@@ -5763,8 +5921,18 @@ impl<'a> Lower<'a> {
         if pure_addr(&p.addr) {
             return Ok((p.addr.clone(), p.off));
         }
+        // If p.addr is a Seq (e.g. from slice_of on an array literal local),
+        // evaluate its side-effect stmts first, then use the evaluated pointer
+        // value as the header address.
+        let addr = match &p.addr.kind {
+            ExprKind::Seq { stmts, value } => {
+                pin.extend(stmts.clone());
+                value.clone()
+            }
+            _ => Box::new(p.addr.clone()),
+        };
         let k = self.new_slot(&p.ty)?;
-        pin.push(Stmt::Copy { dst: slot_expr(k), src: addr_of(p), size: 16 });
+        pin.push(Stmt::Copy { dst: slot_expr(k), src: *addr, size: 16 });
         Ok((slot_expr(k), 0))
     }
 
@@ -6064,6 +6232,11 @@ impl<'a> Lower<'a> {
                 {
                     let LTy::Arr(_, n) = *pt else { unreachable!() };
                     self.slice_of(e, n, want.clone())
+                }
+                // `[N]T` coerces to `[]T`: pass the array's address as a slice.
+                Val::M(p) if matches!(&p.ty, LTy::Arr(t, _) if t == inner) => {
+                    let LTy::Arr(_, n) = &p.ty else { unreachable!() };
+                    self.slice_of(p.addr.clone(), *n, want.clone())
                 }
                 v => {
                     let (a, b) = (self.type_name(want), self.val_desc(&v));
@@ -6551,6 +6724,23 @@ impl<'a> Lower<'a> {
                 return self.slice_index(p, idx).map(Ok);
             }
         }
+        // A slice value held in a register variable (e.g. a slice parameter):
+        // load the header from its slot and index into it.
+        if let Val::E(Expr { ty: Ty::Ptr, kind: ExprKind::Var(id) }) = &base {
+            if let LTy::Slice(elem, _) = &self.ltys[*id as usize] {
+                let elem = (*elem).clone();
+                let k = *id as u32;
+                let hdr = slot_expr(k);
+                let e = self.coerce(idx, Ty::U64)?;
+                let (esize, _) = self.size_align(elem.as_ref())?;
+                let site = self.site(TrapKind::Bounds, format!("index of slice"), Ty::U64);
+                let len = Expr { ty: Ty::U64, kind: ExprKind::Load { addr: Box::new(hdr.clone()), off: 8 } };
+                let checked = Expr { ty: Ty::U64, kind: ExprKind::Bounds { idx: Box::new(e), len: Box::new(len), site } };
+                let ptr = Expr { ty: Ty::Ptr, kind: ExprKind::Load { addr: Box::new(hdr.clone()), off: 0 } };
+                let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Offset { base: Box::new(ptr), idx: Box::new(checked), scale: esize } };
+                return Ok(Ok(Place { addr, off: 0, ty: (*elem).clone(), mutable: true, temp: None }));
+            }
+        }
         let base = match self.tuple_index(base, &idx)? {
             Ok(p) => return Ok(Ok(p)),
             Err(b) => b,
@@ -6600,7 +6790,7 @@ impl<'a> Lower<'a> {
             ty: Ty::Ptr,
             kind: ExprKind::Offset { base: Box::new(addr_of(&p)), idx: Box::new(checked), scale: esize },
         };
-        Ok(Ok(Place { addr, off: 0, ty: *elem, mutable, temp: None }))
+        Ok(Ok(Place { addr, off: 0, ty: *elem, mutable: true, temp: None }))
     }
 
     /// The element type of a slice type and whether its elements may be
@@ -6630,7 +6820,9 @@ impl<'a> Lower<'a> {
         let len = Expr { ty: Ty::U64, kind: ExprKind::Load { addr: Box::new(hdr), off: off + 8 } };
         let checked = Expr { ty: Ty::U64, kind: ExprKind::Bounds { idx: Box::new(e), len: Box::new(len), site } };
         let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Offset { base: Box::new(ptr), idx: Box::new(checked), scale: esize } };
-        Ok(Place { addr, off: 0, ty: elem, mutable: m, temp: None })
+        // Element writes through a slice always target shared, mutable memory.
+        // The slice header itself may be immutable, but its elements are not.
+        Ok(Place { addr, off: 0, ty: elem, mutable: true, temp: None })
     }
 
     /// `x[i..j]` (or `x[i..]`, to the end) of an array, a pointer to an
@@ -6805,16 +6997,26 @@ impl<'a> Lower<'a> {
             return Ok(Ok(Place { addr: p.addr, off: p.off + 8, ty: LTy::S(Ty::U64), mutable: false, temp: None }));
         }
         if let LTy::Arr(_, len) = p.ty {
-            if n.name != "len" {
-                return self.reject("ExprFieldAccess", format!("`.{}` of an array", n.name));
+            if n.name == "len" {
+                // A compile-time constant; the array is still evaluated.
+                let c = Expr { ty: Ty::U64, kind: ExprKind::Const(len as i128) };
+                if pure_addr(&p.addr) {
+                    return Ok(Err(Val::E(c)));
+                }
+                let kind = ExprKind::Seq { stmts: vec![Stmt::Eval(p.addr)], value: Box::new(c) };
+                return Ok(Err(Val::E(Expr { ty: Ty::U64, kind })));
             }
-            // A compile-time constant; the array is still evaluated.
-            let c = Expr { ty: Ty::U64, kind: ExprKind::Const(len as i128) };
-            if pure_addr(&p.addr) {
-                return Ok(Err(Val::E(c)));
+            // `.raw` on an array type treats the array's first element as the
+            // raw value (used for bit operations on packed arrays like TernaryWord).
+            if n.name == "raw" {
+                let elem_ty = match &p.ty {
+                    LTy::Arr(elem, _) => (**elem).clone(),
+                    _ => unreachable!(),
+                };
+                let elem_place = elem_place(&p, &elem_ty, 1, 0);
+                return Ok(Ok(elem_place));
             }
-            let kind = ExprKind::Seq { stmts: vec![Stmt::Eval(p.addr)], value: Box::new(c) };
-            return Ok(Err(Val::E(Expr { ty: Ty::U64, kind })));
+            return self.reject("ExprFieldAccess", format!("`.{}` of an array", n.name));
         }
         if let LTy::Opt(_) = p.ty {
             let t = self.type_name(&p.ty);
@@ -6838,6 +7040,7 @@ impl<'a> Lower<'a> {
 
     /// `dst op= rhs` for any place.
     fn store(&mut self, mut dst: Place, op: &str, rhs: &Node, out: &mut Vec<Stmt>) -> R<()> {
+        eprintln!("DEBUG store: dst.ty={:?}, dst.addr.kind={:?}, dst.mutable={}", dst.ty, dst.addr.kind, dst.mutable);
         if !dst.mutable {
             return self.reject("StmtAssign", "assignment through a constant".into());
         }
@@ -7105,7 +7308,11 @@ impl<'a> Lower<'a> {
         let src = format!("module r {{ const r = {}; }}", text);
         let parsed = crate::compiler::Compiler::parse_ast_strict(&src).ok();
         let mut e = parsed.as_ref().and_then(|a| find_const(a, "r")).cloned();
-        let ok = e.as_ref().is_some_and(simple_repeat_elem);
+        let ok = e.as_ref().is_some_and(|decl| {
+            decl.children.first().is_some_and(|init| {
+                simple_repeat_elem(init) || init.kind == NodeKind::ExprStructLit
+            })
+        });
         let Some(mut e) = e.take().filter(|_| ok) else {
             return self.reject(
                 "ExprArrayLiteral(text element)",

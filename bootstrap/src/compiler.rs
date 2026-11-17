@@ -1815,6 +1815,32 @@ the parser used to read it as `{}` followed by a negation",
         {
             self.reject_unterminated_string()?;
 
+            // Skip `;` comments inside `spec {}` blocks (indented `;` comments
+            // are not at column 1, so the lexer does not treat them as comments;
+            // here at module level they are statement separators, not
+            // declarations, so skip them as no-ops, consuming the rest of the line).
+            if self.current.kind == TokenKind::Semicolon {
+                let line = self.current.line;
+                self.advance();
+                while self.current.kind != TokenKind::Eof && self.current.line == line {
+                    self.advance();
+                }
+                continue;
+            }
+            // Skip lines starting with a non-ASCII character (e.g. `→`)
+            // inside `spec {}` blocks. These are visual comment markers that
+            // the lexer does not recognize as comments.
+            if !self.current.lexeme.is_empty()
+                && self.current.lexeme.chars().next().map_or(false, |c| !c.is_ascii())
+            {
+                let line = self.current.line;
+                self.advance();
+                while self.current.kind != TokenKind::Eof && self.current.line == line {
+                    self.advance();
+                }
+                continue;
+            }
+
             // W579: a Rust-style ATTRIBUTE, `#[test]` / `#[derive(...)]`.
             // Three specs carry Rust source verbatim; the attribute parsed as
             // an expression statement and the `fn` after it was then
@@ -1863,6 +1889,26 @@ the parser used to read it as `{}` followed by a negation",
                     continue;
                 }
                 self.restore_state(checkpoint);
+            }
+
+            // W581: `identifier { ... }` inside `spec Name { ... }` where
+            // `spec` keyword was omitted (e.g. `goal_progress_tracker { ... }`
+            // inside `spec goal_progress_tracking { ... }`). Treat it as a
+            // nested spec body so that `;` comments inside it are skipped
+            // (indented `;` comments are not at column 1, so the lexer does
+            // not treat them as comments).
+            if self.current.kind == TokenKind::Ident
+                && self.peek.kind == TokenKind::LBrace
+            {
+                let checkpoint = self.save_state();
+                let name = self.current.lexeme.clone();
+                self.advance(); // consume identifier
+                self.advance(); // consume {
+                self.parse_module_body(module)?;
+                if self.current.kind == TokenKind::RBrace {
+                    self.advance();
+                }
+                continue;
             }
 
             // W577: a file may declare SEVERAL modules.

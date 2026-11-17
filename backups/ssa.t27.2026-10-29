@@ -1,0 +1,449 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/tri/t27b/ssa.t27 -- the CFG GRAPH LAW of the t27b middle end (production-codegen epic
+; t27#12877; the middle-end workstream t27#12871, written in t27 under the port epic t27#6198,
+; in the flat-table house style of specs/tri/t27b/wasm.t27).
+; --
+; What this floor decides: the control-flow graph appears here as FLAT TABLES -- t27 has no slice
+; of slices (#9103), so like wasm.t27's fact tables the input is one successor CSR table and the
+; law derives everything on top of it: the predecessor CSR, the rendering postorder, the reverse
+; postorder and its positions, the immediate dominators, and the dominance query (the back-edge
+; condition of every later loop pass). The middle passes of #12871 (constant folding, dead code
+; elimination, common subexpressions, loop invariant code motion, strength reduction) ask through
+; these; the glue (cli/t27b) owns the IR shapes and projects them onto the tables, and the law
+; owns the graph mathematics. This file's test blocks are the TDD evidence and run under `t27b
+; test` itself (layer 3 of the matryoshka: t27b runs the tests of the specs it is generated from).
+; --
+; The conventions every fn of this floor follows, pinned by the tests below:
+; - Blocks are u32 numbers 0..n-1 (n >= 1); the ENTRY is block 0. The glue renumbers a
+;   structured-IR function's blocks so the entry is 0; nothing here reads order beyond it.
+; - A successor table is a CSR pair: `start` holds n + 1 entries (the first is 0, the rest are
+;   monotone, the last is the edge total) and `list` holds that many successor numbers in
+;   0..n-1, each followed by its explicit length (`succ_len` -- t27 slices carry no length to
+;   the lowered code, the same discipline eval_arith and any_param_plan obey).
+; - `csr_ok` is the shape gate; a table that fails it, or an edge that names a block beyond
+;   n - 1, is refused with BAD_SHAPE -- fail closed, as the wasm floors refuse, rather than
+;   trusting the projection halfway.
+; - Unreached blocks (no path from the entry) exist in the code the tree IR cannot rule out
+;   yet. Every walk reports the REACHED count; an unreached block's idom stays UNDEF (the value
+;   n), its RPO position stays n, and `dominates` is false whenever one side is unreached.
+; - The dominators are the iterative Cooper-Harvey-Kennedy scheme over the RPO: sweep the
+;   reached blocks in RPO order until nothing changes, joining defined predecessor candidates
+;   through one `intersect` finger walk that always moves the finger with the greater RPO
+;   position (the walk that terminates on the entry's self pointer, not the inverted one).
+; - The graph contract is REDUCIBILITY -- t27b's structured IR (for, while, if) produces
+;   reduible CFGs through one loop header -- so no test pins an irreducible result; that is the
+;   documented unknown, not an assumption smuggled past a test.
+; - Every fn initializes the mutable arrays it is given before reading them: a caller hands in
+;   `undefined` buffers sized n (or n + 1, or the edge count), as this file's own tests do.
+; --
+; Deferred to later floors, one per middle pass that needs them: natural-loop bodies and their
+; iteration sets for LICM; phi placement and rename-driven value numbering for SSA values;
+; dominance frontiers -- each lands dressed with tests on this floor, never hand-written in the
+; glue.
+
+pub const BAD_SHAPE : u32 = 4294967295;
+pub const STATE_UNVISITED : u32 = 0;
+pub const STATE_INPROGRESS : u32 = 1;
+pub const STATE_DONE : u32 = 2;
+
+/// Is `start` a valid CSR offset table over n blocks whose edge total is `total`?
+pub fn csr_ok(n: u32, start: []const u32, total: u32) -> bool {
+    if (n == 0) { return false; }
+    if (start[0] != 0) { return false; }
+    if (start[n] != total) { return false; }
+    var i: u32 = 0;
+    while (i < n) {
+        if (start[i + 1] < start[i]) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+/// The predecessor CSR of a successor CSR: pred_start holds n + 1 exclusive offsets (pred_start[n]
+/// is the edge total) and pred_list holds the edges in 0..n-1 blocks in the successor CSR's index
+/// order. pred_list must have room for succ_len entries. Returns succ_len, or BAD_SHAPE when the
+/// successor table is not a CSR over n blocks or an edge names a block beyond n - 1.
+pub fn pred_csr(n: u32, succ_len: u32, start: []const u32, list: []const u32, pred_start: []u32, pred_list: []u32) -> u32 {
+    if (!csr_ok(n, start, succ_len)) { return BAD_SHAPE; }
+    var i: u32 = 0;
+    while (i < succ_len) {
+        if (list[i] >= n) { return BAD_SHAPE; }
+        i += 1;
+    }
+    i = 0;
+    while (i <= n) { pred_start[i] = 0; i += 1; }
+    i = 0;
+    while (i < n) {
+        var e: u32 = start[i];
+        while (e < start[i + 1]) {
+            pred_start[list[e] + 1] += 1;
+            e += 1;
+        }
+        i += 1;
+    }
+    var acc: u32 = 0;
+    i = 0;
+    while (i < n) {
+        acc += pred_start[i + 1];
+        pred_start[i + 1] = acc;
+        i += 1;
+    }
+    // The placement below consumes the exclusive offsets as running write cursors, so after it
+    // pred_start[j] holds the END of block j's pred span (which is block j + 1's start).
+    // Restore the exclusive starts right to left -- pred_start[j - 1] still holds its own end,
+    // which is block j's start -- and pin the head offset to 0.
+    i = 0;
+    while (i < n) {
+        var e: u32 = start[i];
+        while (e < start[i + 1]) {
+            const slot: u32 = pred_start[list[e]];
+            pred_list[slot] = i;
+            pred_start[list[e]] = slot + 1;
+            e += 1;
+        }
+        i += 1;
+    }
+    var j: u32 = n;
+    while (j > 0) {
+        pred_start[j] = pred_start[j - 1];
+        j -= 1;
+    }
+    pred_start[0] = 0;
+    return succ_len;
+}
+
+/// Depth-first postorder from the entry (block 0) over a successor CSR. state, path and cursors
+/// are n-entry scratch frames the fn initializes; order receives the postorder of the REACHED
+/// blocks in order[0 .. reached] in a deterministic CSR order (children in list order). Returns
+/// the reached count, or BAD_SHAPE on a malformed table. No recursion: an explicit
+/// node-and-cursor stack, so a linear chain of n blocks keeps the walk fixed-width and the
+/// later passes reproducible run for run.
+pub fn dfs_postorder(n: u32, succ_len: u32, start: []const u32, list: []const u32, state: []u32, path: []u32, cursors: []u32, order: []u32) -> u32 {
+    if (!csr_ok(n, start, succ_len)) { return BAD_SHAPE; }
+    var i: u32 = 0;
+    while (i < n) { state[i] = STATE_UNVISITED; i += 1; }
+    var sp: u32 = 1;
+    var written: u32 = 0;
+    path[0] = 0;
+    cursors[0] = start[0];
+    state[0] = STATE_INPROGRESS;
+    while (sp > 0) {
+        const b: u32 = path[sp - 1];
+        if (cursors[sp - 1] < start[b + 1]) {
+            const s: u32 = list[cursors[sp - 1]];
+            cursors[sp - 1] += 1;
+            if (s >= n) { return BAD_SHAPE; }
+            if (state[s] == STATE_UNVISITED) {
+                state[s] = STATE_INPROGRESS;
+                path[sp] = s;
+                cursors[sp] = start[s];
+                sp += 1;
+            }
+        } else {
+            order[written] = b;
+            written += 1;
+            state[b] = STATE_DONE;
+            sp -= 1;
+        }
+    }
+    return written;
+}
+
+/// The RPO is the postorder reversed: the entry first. Returns reached.
+pub fn rpo_reversed(reached: u32, order: []const u32, rpo: []u32) -> u32 {
+    var i: u32 = 0;
+    while (i < reached) {
+        rpo[i] = order[reached - 1 - i];
+        i += 1;
+    }
+    return reached;
+}
+
+/// pos[b] is the index of b in the RPO; n (the UNDEF value) for every unreached block.
+/// Returns reached.
+pub fn rpo_positions(n: u32, reached: u32, rpo: []const u32, pos: []u32) -> u32 {
+    var i: u32 = 0;
+    while (i < n) { pos[i] = n; i += 1; }
+    i = 0;
+    while (i < reached) {
+        pos[rpo[i]] = i;
+        i += 1;
+    }
+    return reached;
+}
+
+/// The immediate dominators over a CSR predecessor table, the iterative Cooper-Harvey-Kennedy
+/// scheme: sweep the reached blocks in RPO order (rpo and pos as `rpo_reversed` and
+/// `rpo_positions` built them), join each block's defined predecessor candidates through the
+/// `intersect` walk, and stop at the first sweep with no change. idom is the out array: n (the
+/// UNDEF value) for every unreached block, the entry starting its own chain. Returns 0 on
+/// convergence, BAD_SHAPE on a malformed predecessor table. Contract: a reducible graph -- the
+/// structured IR always is -- nothing here pins an irreducible result.
+pub fn idoms(n: u32, reached: u32, rpo: []const u32, pos: []const u32, pred_len: u32, pstart: []const u32, plist: []const u32, idom: []u32) -> u32 {
+    if (!csr_ok(n, pstart, pred_len)) { return BAD_SHAPE; }
+    var i: u32 = 0;
+    while (i < n) { idom[i] = n; i += 1; }
+    idom[0] = 0;
+    var changed: bool = true;
+    while (changed) {
+        changed = false;
+        var r: u32 = 1;
+        while (r < reached) {
+            const b: u32 = rpo[r];
+            var new_idom: u32 = n;
+            var e: u32 = pstart[b];
+            while (e < pstart[b + 1]) {
+                const p: u32 = plist[e];
+                if (idom[p] != n) {
+                    if (new_idom == n) { new_idom = p; }
+                    else {
+                        // The join's finger walk, in place: both fingers walk their idominator
+                        // chains toward the entry, and it is always the finger with the greater
+                        // RPO position that moves (the inverted walk would spin on the entry's
+                        // self pointer).
+                        var f1: u32 = new_idom;
+                        var f2: u32 = p;
+                        while (f1 != f2) {
+                            if (pos[f1] > pos[f2]) { f1 = idom[f1]; } else { f2 = idom[f2]; }
+                        }
+                        new_idom = f1;
+                    }
+                }
+                e += 1;
+            }
+            if ((new_idom != n) and (idom[b] != new_idom)) {
+                idom[b] = new_idom;
+                changed = true;
+            }
+            r += 1;
+        }
+    }
+    return 0;
+}
+
+/// Does block a dominate block b? A block dominates itself; the entry dominates every reached
+/// block; an unreached block is dominated by nothing and dominates nothing (UNDEF chains and the
+/// entry's self pointer stop the walk at once).
+pub fn dominates(n: u32, idom: []const u32, a: u32, b: u32) -> bool {
+    if (a >= n) { return false; }
+    // An unreached block (idom == the UNDEF value n) is dominated by nothing and dominates
+    // nothing; the entry starts its own chain (idom 0), so it passes this gate.
+    if (idom[a] == n) { return false; }
+    var x: u32 = b;
+    while (x != a) {
+        if (x >= n) { return false; }
+        if (x == 0) { return false; }
+        x = idom[x];
+    }
+    return true;
+}
+
+test the_csr_shape_gate {
+    var start: [8]u32 = undefined;
+    // A CSR over 3 blocks with 2 edges is fine.
+    start[0] = 0; start[1] = 1; start[2] = 2; start[3] = 2;
+    assert(csr_ok(3, start[0 .. 4], 2));
+    // A nonzero head offset and a non-monotone step are not.
+    start[0] = 1;
+    assert(!csr_ok(3, start[0 .. 4], 2));
+    start[0] = 0; start[2] = 0;
+    assert(!csr_ok(3, start[0 .. 4], 2));
+    start[0] = 0; start[2] = 2; start[3] = 3;
+    assert(csr_ok(3, start[0 .. 4], 3));
+    // Empty (total 0) tables are shaped.
+    start[1] = 0; start[2] = 0; start[3] = 0;
+    assert(csr_ok(3, start[0 .. 4], 0));
+    // The zero-block graph is refused: there is no walk without an entry.
+    assert(!csr_ok(0, start[0 .. 4], 0));
+}
+
+test a_malformed_table_is_refused {
+    var list: [4]u32 = undefined;
+    var pred_start: [8]u32 = undefined;
+    var pred_list: [8]u32 = undefined;
+    // An offset beyond the total.
+    var start: [4]u32 = undefined;
+    start[0] = 0; start[1] = 2; start[2] = 1; start[3] = 2;
+    assert(pred_csr(3, 2, start[0 .. 4], list[0 .. 2], pred_start[0 .. 8], pred_list[0 .. 8]) == BAD_SHAPE);
+    // An edge naming a block beyond n - 1.
+    start[0] = 0; start[1] = 1; start[2] = 2; start[3] = 2;
+    list[0] = 1; list[1] = 3;
+    assert(pred_csr(3, 2, start[0 .. 4], list[0 .. 2], pred_start[0 .. 8], pred_list[0 .. 8]) == BAD_SHAPE);
+}
+
+test a_linear_chain {
+    var start: [4]u32 = undefined;
+    var list: [2]u32 = undefined;
+    var pred_start: [8]u32 = undefined;
+    var pred_list: [8]u32 = undefined;
+    var state: [8]u32 = undefined;
+    var path: [8]u32 = undefined;
+    var cursors: [8]u32 = undefined;
+    var order: [8]u32 = undefined;
+    var rpo: [8]u32 = undefined;
+    var pos: [8]u32 = undefined;
+    var idom: [8]u32 = undefined;
+    // 0 -> 1 -> 2
+    start[0] = 0; start[1] = 1; start[2] = 2; start[3] = 2;
+    list[0] = 1; list[1] = 2;
+    const reached: u32 = dfs_postorder(3, 2, start[0 .. 4], list[0 .. 2], state[0 .. 8], path[0 .. 8], cursors[0 .. 8], order[0 .. 8]);
+    assert(reached == 3);
+    assert(order[0] == 2 and order[1] == 1 and order[2] == 0);
+    const total: u32 = pred_csr(3, 2, start[0 .. 4], list[0 .. 2], pred_start[0 .. 8], pred_list[0 .. 8]);
+    assert(total == 2);
+    assert(pred_start[0] == 0 and pred_start[1] == 0 and pred_start[2] == 1 and pred_start[3] == 2);
+    assert(pred_list[0] == 0 and pred_list[1] == 1);
+    const r: u32 = rpo_reversed(reached, order[0 .. 8], rpo[0 .. 8]);
+    assert(r == 3 and rpo[0] == 0 and rpo[1] == 1 and rpo[2] == 2);
+    const p: u32 = rpo_positions(3, reached, rpo[0 .. 8], pos[0 .. 8]);
+    assert(p == 3 and pos[0] == 0 and pos[1] == 1 and pos[2] == 2);
+    const c: u32 = idoms(3, reached, rpo[0 .. 8], pos[0 .. 8], total, pred_start[0 .. 8], pred_list[0 .. 8], idom[0 .. 8]);
+    assert(c == 0);
+    assert(idom[0] == 0 and idom[1] == 0 and idom[2] == 1);
+    // The entry dominates every reached block; a child never dominates its parent.
+    assert(dominates(3, idom[0 .. 8], 0, 1));
+    assert(dominates(3, idom[0 .. 8], 0, 2));
+    assert(dominates(3, idom[0 .. 8], 1, 2));
+    assert(dominates(3, idom[0 .. 8], 2, 2));
+    assert(!dominates(3, idom[0 .. 8], 2, 1));
+    assert(!dominates(3, idom[0 .. 8], 1, 0));
+}
+
+test a_diamond {
+    var start: [8]u32 = undefined;
+    var list: [8]u32 = undefined;
+    var pred_start: [8]u32 = undefined;
+    var pred_list: [8]u32 = undefined;
+    var state: [8]u32 = undefined;
+    var path: [8]u32 = undefined;
+    var cursors: [8]u32 = undefined;
+    var order: [8]u32 = undefined;
+    var rpo: [8]u32 = undefined;
+    var pos: [8]u32 = undefined;
+    var idom: [8]u32 = undefined;
+    // 0 -> 1, 0 -> 2, 1 -> 3, 2 -> 3
+    start[0] = 0; start[1] = 2; start[2] = 3; start[3] = 4; start[4] = 4;
+    list[0] = 1; list[1] = 2; list[2] = 3; list[3] = 3;
+    const reached: u32 = dfs_postorder(4, 4, start[0 .. 8], list[0 .. 8], state[0 .. 8], path[0 .. 8], cursors[0 .. 8], order[0 .. 8]);
+    assert(reached == 4);
+    assert(order[0] == 3 and order[1] == 1 and order[2] == 2 and order[3] == 0);
+    const total: u32 = pred_csr(4, 4, start[0 .. 8], list[0 .. 8], pred_start[0 .. 8], pred_list[0 .. 8]);
+    assert(total == 4);
+    assert(pred_start[0] == 0 and pred_start[1] == 0 and pred_start[2] == 1 and pred_start[3] == 2 and pred_start[4] == 4);
+    assert(pred_list[0] == 0 and pred_list[1] == 0 and pred_list[2] == 1 and pred_list[3] == 2);
+    const r: u32 = rpo_reversed(reached, order[0 .. 8], rpo[0 .. 8]);
+    assert(r == 4 and rpo[0] == 0 and rpo[1] == 2 and rpo[2] == 1 and rpo[3] == 3);
+    const p: u32 = rpo_positions(4, reached, rpo[0 .. 8], pos[0 .. 8]);
+    assert(p == 4 and pos[0] == 0 and pos[1] == 2 and pos[2] == 1 and pos[3] == 3);
+    const c: u32 = idoms(4, reached, rpo[0 .. 8], pos[0 .. 8], total, pred_start[0 .. 8], pred_list[0 .. 8], idom[0 .. 8]);
+    assert(c == 0);
+    assert(idom[0] == 0 and idom[1] == 0 and idom[2] == 0 and idom[3] == 0);
+    // The join is dominated by both arms only through their common parent, the entry.
+    assert(dominates(4, idom[0 .. 8], 0, 3));
+    assert(!dominates(4, idom[0 .. 8], 1, 3));
+    assert(!dominates(4, idom[0 .. 8], 2, 3));
+    assert(dominates(4, idom[0 .. 8], 1, 1));
+}
+
+test one_loop {
+    var start: [8]u32 = undefined;
+    var list: [8]u32 = undefined;
+    var pred_start: [8]u32 = undefined;
+    var pred_list: [8]u32 = undefined;
+    var state: [8]u32 = undefined;
+    var path: [8]u32 = undefined;
+    var cursors: [8]u32 = undefined;
+    var order: [8]u32 = undefined;
+    var rpo: [8]u32 = undefined;
+    var pos: [8]u32 = undefined;
+    var idom: [8]u32 = undefined;
+    // 0 -> 1; 1 -> 2; 2 -> 1 (the back edge), 2 -> 3
+    start[0] = 0; start[1] = 1; start[2] = 2; start[3] = 4; start[4] = 4;
+    list[0] = 1; list[1] = 2; list[2] = 1; list[3] = 3;
+    const reached: u32 = dfs_postorder(4, 4, start[0 .. 8], list[0 .. 8], state[0 .. 8], path[0 .. 8], cursors[0 .. 8], order[0 .. 8]);
+    assert(reached == 4);
+    assert(order[0] == 3 and order[1] == 2 and order[2] == 1 and order[3] == 0);
+    const total: u32 = pred_csr(4, 4, start[0 .. 8], list[0 .. 8], pred_start[0 .. 8], pred_list[0 .. 8]);
+    assert(total == 4);
+    assert(pred_start[0] == 0 and pred_start[1] == 0 and pred_start[2] == 2 and pred_start[3] == 3 and pred_start[4] == 4);
+    assert(pred_list[0] == 0 and pred_list[1] == 2 and pred_list[2] == 1 and pred_list[3] == 2);
+    const r: u32 = rpo_reversed(reached, order[0 .. 8], rpo[0 .. 8]);
+    assert(r == 4 and rpo[0] == 0 and rpo[1] == 1 and rpo[2] == 2 and rpo[3] == 3);
+    const p: u32 = rpo_positions(4, reached, rpo[0 .. 8], pos[0 .. 8]);
+    assert(p == 4 and pos[0] == 0 and pos[1] == 1 and pos[2] == 2 and pos[3] == 3);
+    const c: u32 = idoms(4, reached, rpo[0 .. 8], pos[0 .. 8], total, pred_start[0 .. 8], pred_list[0 .. 8], idom[0 .. 8]);
+    assert(c == 0);
+    assert(idom[0] == 0 and idom[1] == 0 and idom[2] == 1 and idom[3] == 2);
+    // The back edge condition: the target of the edge u -> v dominates u.
+    assert(dominates(4, idom[0 .. 8], 1, 2));
+    assert(!dominates(4, idom[0 .. 8], 2, 1));
+}
+
+test a_self_loop {
+    var start: [4]u32 = undefined;
+    var list: [4]u32 = undefined;
+    var pred_start: [8]u32 = undefined;
+    var pred_list: [8]u32 = undefined;
+    var state: [8]u32 = undefined;
+    var path: [8]u32 = undefined;
+    var cursors: [8]u32 = undefined;
+    var order: [8]u32 = undefined;
+    var rpo: [8]u32 = undefined;
+    var pos: [8]u32 = undefined;
+    var idom: [8]u32 = undefined;
+    // 0 -> 1; 1 -> 1 (self), 1 -> 2
+    start[0] = 0; start[1] = 1; start[2] = 3; start[3] = 3;
+    list[0] = 1; list[1] = 1; list[2] = 2;
+    const reached: u32 = dfs_postorder(3, 3, start[0 .. 4], list[0 .. 4], state[0 .. 8], path[0 .. 8], cursors[0 .. 8], order[0 .. 8]);
+    assert(reached == 3);
+    assert(order[0] == 2 and order[1] == 1 and order[2] == 0);
+    const total: u32 = pred_csr(3, 3, start[0 .. 4], list[0 .. 4], pred_start[0 .. 8], pred_list[0 .. 8]);
+    assert(total == 3);
+    assert(pred_start[0] == 0 and pred_start[1] == 0 and pred_start[2] == 2 and pred_start[3] == 3);
+    assert(pred_list[0] == 0 and pred_list[1] == 1 and pred_list[2] == 1);
+    const r: u32 = rpo_reversed(reached, order[0 .. 8], rpo[0 .. 8]);
+    assert(r == 3 and rpo[0] == 0 and rpo[1] == 1 and rpo[2] == 2);
+    const p: u32 = rpo_positions(3, reached, rpo[0 .. 8], pos[0 .. 8]);
+    assert(p == 3 and pos[0] == 0 and pos[1] == 1 and pos[2] == 2);
+    const c: u32 = idoms(3, reached, rpo[0 .. 8], pos[0 .. 8], total, pred_start[0 .. 8], pred_list[0 .. 8], idom[0 .. 8]);
+    assert(c == 0);
+    assert(idom[0] == 0 and idom[1] == 0 and idom[2] == 1);
+    // The self edge skips a block, and block 2 hangs off the loop body.
+    assert(dominates(3, idom[0 .. 8], 0, 1));
+    assert(dominates(3, idom[0 .. 8], 1, 2));
+    assert(!dominates(3, idom[0 .. 8], 2, 1));
+}
+
+test an_unreached_tail {
+    var start: [8]u32 = undefined;
+    var list: [8]u32 = undefined;
+    var state: [8]u32 = undefined;
+    var path: [8]u32 = undefined;
+    var cursors: [8]u32 = undefined;
+    var order: [8]u32 = undefined;
+    var rpo: [8]u32 = undefined;
+    var pos: [8]u32 = undefined;
+    var pred_start: [8]u32 = undefined;
+    var pred_list: [8]u32 = undefined;
+    var idom: [8]u32 = undefined;
+    // 0 -> 1 only; blocks 2 and 3 have no edges.
+    start[0] = 0; start[1] = 1; start[2] = 1; start[3] = 1; start[4] = 1;
+    list[0] = 1;
+    const reached: u32 = dfs_postorder(4, 1, start[0 .. 8], list[0 .. 8], state[0 .. 8], path[0 .. 8], cursors[0 .. 8], order[0 .. 8]);
+    assert(reached == 2);
+    assert(order[0] == 1 and order[1] == 0);
+    const total: u32 = pred_csr(4, 1, start[0 .. 8], list[0 .. 8], pred_start[0 .. 8], pred_list[0 .. 8]);
+    assert(total == 1);
+    const r: u32 = rpo_reversed(reached, order[0 .. 8], rpo[0 .. 8]);
+    assert(r == 2 and rpo[0] == 0 and rpo[1] == 1);
+    const p: u32 = rpo_positions(4, reached, rpo[0 .. 8], pos[0 .. 8]);
+    assert(p == 2);
+    assert(pos[0] == 0 and pos[1] == 1 and pos[2] == 4 and pos[3] == 4);
+    const c: u32 = idoms(4, reached, rpo[0 .. 8], pos[0 .. 8], total, pred_start[0 .. 8], pred_list[0 .. 8], idom[0 .. 8]);
+    assert(c == 0);
+    assert(idom[0] == 0 and idom[1] == 0 and idom[2] == 4 and idom[3] == 4);
+    // Nothing dominates an unreached block, and an unreached block dominates nothing.
+    assert(!dominates(4, idom[0 .. 8], 0, 2));
+    assert(!dominates(4, idom[0 .. 8], 2, 0));
+    assert(!dominates(4, idom[0 .. 8], 2, 2));
+}
