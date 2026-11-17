@@ -22,13 +22,14 @@
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+#[allow(dead_code, unused_parens)]
+pub use crate::modreach_rules::*;
 
 /// One edge out of a source file: the paths a declaration can resolve to.
 #[derive(Debug, PartialEq)]
 pub struct Edge {
     pub candidates: Vec<PathBuf>,
 }
-
 /// Every file `src` reaches, given that `src` itself lives at `here` and its child
 /// modules live under `dir`.
 ///
@@ -423,7 +424,6 @@ pub fn run(gate: bool) -> Result<()> {
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
