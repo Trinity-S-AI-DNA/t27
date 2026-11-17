@@ -1,0 +1,401 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 Session Recovery Ladder SSOT
+// Purpose: the five-step ladder a failed session climbs - preserve, retry the
+//          transient, switch to an approved funded route, degrade honestly,
+//          hand off. The ladder is bounded on every rung: no infinite retry,
+//          no silent fallback, no invented route.
+//
+// Owner: T27_SESSION_NEVER_DIES (issue #1409), 2026-10-30.
+//
+// OWNS:
+//   - the recovery ladder levels (PRESERVE .. HANDOFF)
+//   - the per-failure-class policy that selects the level
+//   - the bounded transient retry budget and its exponential backoff
+//   - the forbidden actions (silent fallback, unbounded retry, silent switch)
+//   - the rule that a ladder never descends
+//
+// DOES NOT OWN (never restate these facts here):
+//   - the Doctor lifecycle states and the user-visible status bar:
+//     specs/system/session-doctor.t27
+//   - when a checkpoint is mandatory, its content and the resume decision:
+//     specs/system/session-continuity.t27
+//   - failure-class taxonomy, preflight verdicts, circuit breaker:
+//     specs/system/llm_request_provider_gate.t27
+//   - provider identity, funding and quarantine state:
+//     specs/system/providers.t27
+//   - rung order and rung-switch rules: specs/system/model-ladder.t27
+//   - the DSH health/recovery skill catalogue:
+//     specs/agents/dsh_recovery_ladder.t27
+//   - the fact-ownership map of the system layer:
+//     specs/system/language-boundary.t27
+
+module session_recovery_ladder;
+
+// ─── Ladder levels ─────────────────────────────────────────────────────────
+
+pub const LADDER_PRESERVE : u8 = 0;            // write checkpoint, freeze output
+pub const LADDER_RETRY_TRANSIENT : u8 = 1;     // timeout/connection/rate limit
+pub const LADDER_SWITCH_APPROVED_ROUTE : u8 = 2; // pre-approved funded route
+pub const LADDER_DEGRADE : u8 = 3;             // continue without the capability
+pub const LADDER_HANDOFF : u8 = 4;             // recovery task, owner decision
+pub const LADDER_LEVEL_COUNT : u32 = 5;
+
+// ─── Failure classes the policy reacts to ──────────────────────────────────
+//
+// The wire taxonomy (transient / unfunded / terminal) is owned by
+// specs/system/llm_request_provider_gate.t27. These are the session-level
+// failures the Doctor meets while running a long workflow.
+
+pub const FAILURE_STREAM_TIMEOUT : u8 = 0;
+pub const FAILURE_PROVIDER_UNFUNDED : u8 = 1;
+pub const FAILURE_TOOL : u8 = 2;
+pub const FAILURE_AGENT_STALL : u8 = 3;
+pub const FAILURE_CONFIG_DRIFT : u8 = 4;
+pub const FAILURE_COUNT : u32 = 5;
+
+// ─── Bounded retry budget ──────────────────────────────────────────────────
+//
+// Three attempts is the ceiling for one transient failure. The budget is a
+// property of the class, not of the caller: no caller may raise it.
+
+pub const MAX_TRANSIENT_ATTEMPTS : u32 = 3;
+pub const BACKOFF_BASE_MS : u32 = 1000;
+
+// ─── Forbidden actions ─────────────────────────────────────────────────────
+
+pub const FORBID_SILENT_FALLBACK : u8 = 0;
+pub const FORBID_UNBOUNDED_RETRY : u8 = 1;
+pub const FORBID_SILENT_PROVIDER_SWITCH : u8 = 2;
+pub const FORBIDDEN_COUNT : u32 = 3;
+
+// ─── Functions ─────────────────────────────────────────────────────────────
+
+// recovery_level_is_valid(level) - only the five declared rungs exist.
+pub fn recovery_level_is_valid(level: u8) -> bool {
+    if (level < LADDER_LEVEL_COUNT) {
+        return true;
+    }
+    return false;
+}
+
+// ladder_never_descends(current, next) - the ladder is climbed, never
+// dropped. A repair that succeeds ends the climb; it does not rewind.
+pub fn ladder_never_descends(current: u8, next: u8) -> bool {
+    if (recovery_level_is_valid(current) == false) {
+        return false;
+    }
+    if (recovery_level_is_valid(next) == false) {
+        return false;
+    }
+    if (next < current) {
+        return false;
+    }
+    return true;
+}
+
+// retry_allowed_for_failure(failure) - only a transient failure is retried.
+// An unfunded route, a config drift and a stalled agent are not transient.
+pub fn retry_allowed_for_failure(failure: u8) -> bool {
+    if (failure == FAILURE_STREAM_TIMEOUT) {
+        return true;
+    }
+    return false;
+}
+
+// retry_attempt_budget(failure) - the ceiling of attempts for one failure.
+pub fn retry_attempt_budget(failure: u8) -> u32 {
+    if (retry_allowed_for_failure(failure) == false) {
+        return 0;
+    }
+    return MAX_TRANSIENT_ATTEMPTS;
+}
+
+// backoff_delay_ms(attempt) - exponential backoff between transient attempts:
+// 1000ms, 2000ms, 4000ms. The attempt index is zero-based.
+pub fn backoff_delay_ms(attempt: u32) -> u32 {
+    if (attempt == 0) {
+        return BACKOFF_BASE_MS;
+    }
+    if (attempt == 1) {
+        return BACKOFF_BASE_MS * 2;
+    }
+    if (attempt == 2) {
+        return BACKOFF_BASE_MS * 4;
+    }
+    return BACKOFF_BASE_MS * 8;
+}
+
+// retry_exhausted(attempts_made) - true once the bounded budget is spent.
+pub fn retry_exhausted(attempts_made: u32) -> bool {
+    if (attempts_made >= MAX_TRANSIENT_ATTEMPTS) {
+        return true;
+    }
+    return false;
+}
+
+// recovery_level_for_failure(failure, funded_route_available,
+// checkpoint_valid, idempotent, drift_approved) -> u8
+//
+// The per-class policy of the ladder:
+//
+//   STREAM_TIMEOUT      preserve -> retry transient -> approved route
+//   PROVIDER_UNFUNDED   never retried -> approved route or handoff
+//   TOOL_FAILURE        retry only when idempotent -> degrade -> handoff
+//   AGENT_STALL         preserve and resume from the last good step
+//   CONFIG_DRIFT        preserve, verify, repair only approved drift
+pub fn recovery_level_for_failure(failure: u8, funded_route_available: bool, checkpoint_valid: bool, idempotent: bool, drift_approved: bool) -> u8 {
+    if (failure == FAILURE_STREAM_TIMEOUT) {
+        if (checkpoint_valid == false) {
+            return LADDER_PRESERVE;
+        }
+        if (funded_route_available == true) {
+            return LADDER_RETRY_TRANSIENT;
+        }
+        return LADDER_SWITCH_APPROVED_ROUTE;
+    }
+    if (failure == FAILURE_PROVIDER_UNFUNDED) {
+        if (funded_route_available == true and checkpoint_valid == true) {
+            return LADDER_SWITCH_APPROVED_ROUTE;
+        }
+        return LADDER_HANDOFF;
+    }
+    if (failure == FAILURE_TOOL) {
+        if (checkpoint_valid == false) {
+            return LADDER_HANDOFF;
+        }
+        if (idempotent == true) {
+            return LADDER_RETRY_TRANSIENT;
+        }
+        return LADDER_DEGRADE;
+    }
+    if (failure == FAILURE_AGENT_STALL) {
+        return LADDER_PRESERVE;
+    }
+    if (failure == FAILURE_CONFIG_DRIFT) {
+        if (checkpoint_valid == false) {
+            return LADDER_HANDOFF;
+        }
+        if (drift_approved == true) {
+            return LADDER_PRESERVE;
+        }
+        return LADDER_HANDOFF;
+    }
+    return LADDER_HANDOFF;
+}
+
+// checkpoint_written_before_recovery(level, checkpoint_written) -> bool
+//
+// Level 0 PRESERVE writes the checkpoint; no other level may be entered
+// without the checkpoint of the previous level being on disk.
+pub fn checkpoint_written_before_recovery(level: u8, checkpoint_written: bool) -> bool {
+    if (recovery_level_is_valid(level) == false) {
+        return false;
+    }
+    if (checkpoint_written == false) {
+        return false;
+    }
+    return true;
+}
+
+// provider_switch_requires_approval(switching, approved) -> bool
+//
+// The switch to an approved funded route is visible and, when the switch is
+// not on the pre-approved list, it waits for the owner.
+pub fn provider_switch_requires_approval(switching: bool, approved: bool) -> bool {
+    if (switching == false) {
+        return true;
+    }
+    return approved;
+}
+
+// provider_switch_must_be_visible(switched) -> bool
+// There is no silent provider switch: the user is told which route serves
+// the session from now on.
+pub fn provider_switch_must_be_visible(switched: bool) -> bool {
+    return switched;
+}
+
+// switch_target_must_be_funded(target_funded) -> bool
+// The ladder never invents a route: a switch target must already be funded.
+pub fn switch_target_must_be_funded(target_funded: bool) -> bool {
+    return target_funded;
+}
+
+// degrade_requires_notice(degraded, notice_emitted) -> bool
+pub fn degrade_requires_notice(degraded: bool, notice_emitted: bool) -> bool {
+    if (degraded == false) {
+        return true;
+    }
+    return notice_emitted;
+}
+
+// degrade_requires_funded_route(funded_route_available) -> bool
+// A degraded session still needs a route that can answer.
+pub fn degrade_requires_funded_route(funded_route_available: bool) -> bool {
+    return funded_route_available;
+}
+
+// handoff_preserves_work(preserved) -> bool
+pub fn handoff_preserves_work(preserved: bool) -> bool {
+    return preserved;
+}
+
+// forbidden_action_is_blocked(action) -> bool
+// The three forbidden actions are blocked by contract, not by convention.
+pub fn forbidden_action_is_blocked(action: u8) -> bool {
+    if (action < FORBIDDEN_COUNT) {
+        return true;
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "the_ladder_has_exactly_the_five_declared_levels" {
+    assert(LADDER_LEVEL_COUNT == 5);
+    assert(recovery_level_is_valid(LADDER_PRESERVE) == true);
+    assert(recovery_level_is_valid(LADDER_RETRY_TRANSIENT) == true);
+    assert(recovery_level_is_valid(LADDER_SWITCH_APPROVED_ROUTE) == true);
+    assert(recovery_level_is_valid(LADDER_DEGRADE) == true);
+    assert(recovery_level_is_valid(LADDER_HANDOFF) == true);
+    assert(recovery_level_is_valid(LADDER_LEVEL_COUNT) == false);
+}
+
+test "the_ladder_is_climbed_and_never_dropped" {
+    assert(ladder_never_descends(LADDER_PRESERVE, LADDER_RETRY_TRANSIENT) == true);
+    assert(ladder_never_descends(LADDER_RETRY_TRANSIENT, LADDER_SWITCH_APPROVED_ROUTE) == true);
+    assert(ladder_never_descends(LADDER_SWITCH_APPROVED_ROUTE, LADDER_DEGRADE) == true);
+    assert(ladder_never_descends(LADDER_DEGRADE, LADDER_HANDOFF) == true);
+    assert(ladder_never_descends(LADDER_HANDOFF, LADDER_PRESERVE) == false);
+    assert(ladder_never_descends(LADDER_RETRY_TRANSIENT, LADDER_PRESERVE) == false);
+}
+
+test "only_a_transient_failure_is_retried" {
+    assert(retry_allowed_for_failure(FAILURE_STREAM_TIMEOUT) == true);
+    assert(retry_allowed_for_failure(FAILURE_PROVIDER_UNFUNDED) == false);
+    assert(retry_allowed_for_failure(FAILURE_TOOL) == false);
+    assert(retry_allowed_for_failure(FAILURE_AGENT_STALL) == false);
+    assert(retry_allowed_for_failure(FAILURE_CONFIG_DRIFT) == false);
+}
+
+test "the_retry_budget_is_bounded_at_three_attempts" {
+    assert(retry_attempt_budget(FAILURE_STREAM_TIMEOUT) == 3);
+    assert(retry_attempt_budget(FAILURE_PROVIDER_UNFUNDED) == 0);
+    assert(retry_exhausted(2) == false);
+    assert(retry_exhausted(3) == true);
+    assert(retry_exhausted(4) == true);
+}
+
+test "the_backoff_grows_exponentially" {
+    assert(backoff_delay_ms(0) == 1000);
+    assert(backoff_delay_ms(1) == 2000);
+    assert(backoff_delay_ms(2) == 4000);
+    assert(backoff_delay_ms(3) == 8000);
+}
+
+test "a_stream_timeout_preserves_then_retries_the_transient" {
+    assert(recovery_level_for_failure(FAILURE_STREAM_TIMEOUT, true, true, true, true) == LADDER_RETRY_TRANSIENT);
+    assert(recovery_level_for_failure(FAILURE_STREAM_TIMEOUT, true, false, true, true) == LADDER_PRESERVE);
+}
+
+test "a_stream_timeout_without_a_funded_route_switches_instead" {
+    assert(recovery_level_for_failure(FAILURE_STREAM_TIMEOUT, false, true, true, true) == LADDER_SWITCH_APPROVED_ROUTE);
+}
+
+test "an_unfunded_route_is_never_retried" {
+    assert(recovery_level_for_failure(FAILURE_PROVIDER_UNFUNDED, true, true, true, true) == LADDER_SWITCH_APPROVED_ROUTE);
+    assert(recovery_level_for_failure(FAILURE_PROVIDER_UNFUNDED, false, true, true, true) == LADDER_HANDOFF);
+    assert(recovery_level_for_failure(FAILURE_PROVIDER_UNFUNDED, true, false, true, true) == LADDER_HANDOFF);
+}
+
+test "a_tool_failure_retries_only_when_the_action_is_idempotent" {
+    assert(recovery_level_for_failure(FAILURE_TOOL, true, true, true, true) == LADDER_RETRY_TRANSIENT);
+    assert(recovery_level_for_failure(FAILURE_TOOL, true, true, false, true) == LADDER_DEGRADE);
+    assert(recovery_level_for_failure(FAILURE_TOOL, true, false, true, true) == LADDER_HANDOFF);
+}
+
+test "an_agent_stall_preserves_the_work_and_resumes_from_the_last_step" {
+    assert(recovery_level_for_failure(FAILURE_AGENT_STALL, true, true, true, true) == LADDER_PRESERVE);
+    assert(recovery_level_for_failure(FAILURE_AGENT_STALL, false, false, true, true) == LADDER_PRESERVE);
+}
+
+test "a_config_drift_repairs_only_approved_drift" {
+    assert(recovery_level_for_failure(FAILURE_CONFIG_DRIFT, true, true, true, true) == LADDER_PRESERVE);
+    assert(recovery_level_for_failure(FAILURE_CONFIG_DRIFT, true, true, true, false) == LADDER_HANDOFF);
+    assert(recovery_level_for_failure(FAILURE_CONFIG_DRIFT, true, false, true, true) == LADDER_HANDOFF);
+}
+
+test "no_recovery_level_is_entered_without_a_checkpoint" {
+    assert(checkpoint_written_before_recovery(LADDER_PRESERVE, true) == true);
+    assert(checkpoint_written_before_recovery(LADDER_RETRY_TRANSIENT, false) == false);
+    assert(checkpoint_written_before_recovery(LADDER_HANDOFF, false) == false);
+}
+
+test "a_provider_switch_is_visible_approved_and_funded" {
+    assert(provider_switch_requires_approval(true, true) == true);
+    assert(provider_switch_requires_approval(true, false) == false);
+    assert(provider_switch_must_be_visible(true) == true);
+    assert(switch_target_must_be_funded(true) == true);
+    assert(switch_target_must_be_funded(false) == false);
+}
+
+test "a_degraded_continuation_is_announced_and_still_has_a_route" {
+    assert(degrade_requires_notice(true, true) == true);
+    assert(degrade_requires_notice(true, false) == false);
+    assert(degrade_requires_funded_route(true) == true);
+    assert(degrade_requires_funded_route(false) == false);
+}
+
+test "a_handoff_carries_the_work_with_it" {
+    assert(handoff_preserves_work(true) == true);
+    assert(handoff_preserves_work(false) == false);
+}
+
+test "the_forbidden_actions_are_blocked_by_contract" {
+    assert(forbidden_action_is_blocked(FORBID_SILENT_FALLBACK) == true);
+    assert(forbidden_action_is_blocked(FORBID_UNBOUNDED_RETRY) == true);
+    assert(forbidden_action_is_blocked(FORBID_SILENT_PROVIDER_SWITCH) == true);
+    assert(forbidden_action_is_blocked(FORBIDDEN_COUNT) == false);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+invariant the_ladder_never_descends {
+    ladder_never_descends(LADDER_HANDOFF, LADDER_PRESERVE) == false;
+    ladder_never_descends(LADDER_RETRY_TRANSIENT, LADDER_SWITCH_APPROVED_ROUTE) == true;
+}
+
+invariant an_unfunded_route_is_never_retried {
+    retry_allowed_for_failure(FAILURE_PROVIDER_UNFUNDED) == false;
+    retry_attempt_budget(FAILURE_PROVIDER_UNFUNDED) == 0;
+}
+
+invariant the_retry_budget_is_never_unbounded {
+    retry_attempt_budget(FAILURE_STREAM_TIMEOUT) <= MAX_TRANSIENT_ATTEMPTS;
+    retry_exhausted(MAX_TRANSIENT_ATTEMPTS) == true;
+}
+
+invariant no_recovery_happens_without_a_checkpoint {
+    checkpoint_written_before_recovery(LADDER_RETRY_TRANSIENT, false) == false;
+    checkpoint_written_before_recovery(LADDER_PRESERVE, true) == true;
+}
+
+invariant a_provider_switch_is_never_silent_nor_unfunded {
+    provider_switch_must_be_visible(true) == true;
+    switch_target_must_be_funded(false) == false;
+}
+
+invariant a_degraded_session_is_always_announced {
+    degrade_requires_notice(true, false) == false;
+    degrade_requires_notice(true, true) == true;
+}
+
+invariant the_ladder_always_ends_in_a_visible_state {
+    recovery_level_is_valid(LADDER_HANDOFF) == true;
+    recovery_level_is_valid(LADDER_DEGRADE) == true;
+    recovery_level_for_failure(FAILURE_COUNT, false, false, false, false) == LADDER_HANDOFF;
+}

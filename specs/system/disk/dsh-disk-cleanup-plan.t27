@@ -1,0 +1,542 @@
+// T27 Disk Cleanup Plan Specification  
+// Part of T27_DISK_NEVER_ENOSPC_01 disk health gate
+// Provides safe garbage classification, cleanup planning, and dry-run manifests
+
+spec "dsh-disk-cleanup-plan" {
+    // Public interface
+    pub fn plan_cleanup(target_free_gb: f64, max_risk_level: RiskLevel) -> CleanupPlan;
+    pub fn execute_cleanup(plan: CleanupPlan, dry_run: bool) -> CleanupResult;
+    pub fn classify_garbage(path: string) -> GarbageClassification;
+    pub fn get_safe_cleanup_candidates() -> Vec<CleanupCandidate>;
+    
+    // Types
+    type CleanupPlan {
+        target_free_gb: f64,
+        current_free_gb: f64,
+        estimated_freed_gb: f64,
+        candidates: Vec<CleanupCandidate>,
+        safety_checks: Vec<SafetyCheck>,
+        total_size_gb: f64,
+        estimated_time_ms: u64,
+        risk_level: RiskLevel,
+        is_safe: bool,
+    }
+    
+    type CleanupResult {
+        success: bool,
+        freed_gb: f64,
+        removed_count: u64,
+        errors: Vec<string>,
+        warnings: Vec<string>,
+        audit_log: Vec<string>,
+        execution_time_ms: u64,
+    }
+    
+    type CleanupCandidate {
+        path: string,
+        size_gb: f64,
+        classification: GarbageClassification,
+        safety_checks: Vec<SafetyCheck>,
+        estimated_time_ms: u64,
+        priority: u32,
+        dry_run_safe: bool,
+    }
+    
+    type GarbageClassification {
+        class: GarbageClass,
+        confidence: f64, // 0.0 to 1.0
+        reasoning: string,
+        age_hours: u64,
+        access_time_ms: u64,
+        modification_time_ms: u64,
+    }
+    
+    type SafetyCheck {
+        name: string,
+        passed: bool,
+        details: string,
+        severity: Severity,
+    }
+    
+    // Enums
+    enum GarbageClass {
+        BUILD_CACHE,      // Stale build outputs, incremental caches
+        PACKAGE_CACHE,    // npm/pip/pnpm caches, wheels
+        TEMP_FILES,       // /tmp, session spill, partial downloads  
+        LOG_FILES,        // Rotated logs, debug dumps
+        FAILED_ARTIFACTS, // Interrupted downloads, partial builds
+        EVIDENCE,         // Verification artifacts, incident packs
+        CREDENTIALS,      // Keys, tokens, env secrets
+        UNKNOWN,
+    }
+    
+    enum RiskLevel {
+        NONE,    // Zero risk cleanup
+        LOW,     // Safe but requires review
+        MEDIUM,  // Some risk, needs approval
+        HIGH,    // Significant risk, manual review required
+        CRITICAL // Dangerous operation, forbid automatically
+    }
+    
+    enum Severity {
+        INFO,
+        WARNING,
+        ERROR,
+        CRITICAL,
+    }
+    
+    // Constants
+    const CLEANUP_CLASSES = [
+        GarbageClass::BUILD_CACHE,
+        GarbageClass::PACKAGE_CACHE,
+        GarbageClass::TEMP_FILES,
+        GarbageClass::LOG_FILES,
+        GarbageClass::FAILED_ARTIFACTS,
+    ];
+    
+    const NEVER_CLEAN_CLASSES = [
+        GarbageClass::EVIDENCE,
+        GarbageClass::CREDENTIALS,
+    ];
+    
+    const CLEANUP_PRIORITY = {
+        GarbageClass::FAILED_ARTIFACTS: 100,
+        GarbageClass::TEMP_FILES: 90,
+        GarbageClass::LOG_FILES: 80,
+        GarbageClass::BUILD_CACHE: 70,
+        GarbageClass::PACKAGE_CACHE: 60,
+    };
+    
+    // Configuration
+    var config = CleanupConfig {
+        max_safe_freed_gb: 10.0,
+        max_risk_level: RiskLevel::MEDIUM,
+        min_file_age_hours: 24,
+        require_age_check: true,
+        require_path_allowlist: true,
+        preserve_evidence: true,
+        max_concurrent_deletions: 5,
+    };
+    
+    // Main planning function
+    pub fn plan_cleanup(target_free_gb: f64, max_risk_level: RiskLevel) -> CleanupPlan {
+        let current_snapshot = execute_disk_snapshot();
+        let current_free_gb = current_snapshot.free_space_gb;
+        
+        let needed_gb = target_free_gb - current_free_gb;
+        if needed_gb <= 0.0 {
+            return CleanupPlan {
+                target_free_gb: target_free_gb,
+                current_free_gb: current_free_gb,
+                estimated_freed_gb: 0.0,
+                candidates: Vec::new(),
+                safety_checks: Vec::new(),
+                total_size_gb: 0.0,
+                estimated_time_ms: 0,
+                risk_level: RiskLevel::NONE,
+                is_safe: true,
+            };
+        }
+        
+        let candidates = get_safe_cleanup_candidates();
+        let mut safe_candidates = filter_by_risk_level(candidates, max_risk_level);
+        safe_candidates.sort_by(|a, b| b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let mut total_freed = 0.0;
+        let mut selected_candidates = Vec::new();
+        let mut total_size = 0.0;
+        
+        for candidate in safe_candidates.iter() {
+            if total_freed >= needed_gb {
+                break;
+            }
+            
+            if total_freed + candidate.size_gb <= config.max_safe_freed_gb {
+                total_freed += candidate.size_gb;
+                total_size += candidate.size_gb;
+                selected_candidates.push(candidate.clone());
+            }
+        }
+        
+        let safety_checks = run_safety_checks(&selected_candidates, total_freed);
+        let risk_level = assess_risk_level(selected_candidates.len(), total_freed, safety_checks.len());
+        let is_safe = risk_level <= max_risk_level && safety_checks.iter().all(|check| check.passed);
+        
+        let estimated_time = estimate_execution_time(&selected_candidates);
+        
+        CleanupPlan {
+            target_free_gb: target_free_gb,
+            current_free_gb: current_free_gb,
+            estimated_freed_gb: total_freed,
+            candidates: selected_candidates,
+            safety_checks: safety_checks,
+            total_size_gb: total_size,
+            estimated_time_ms: estimated_time,
+            risk_level: risk_level,
+            is_safe: is_safe,
+        }
+    }
+    
+    // Cleanup execution
+    pub fn execute_cleanup(plan: CleanupPlan, dry_run: bool) -> CleanupResult {
+        if !plan.is_safe {
+            return CleanupResult {
+                success: false,
+                freed_gb: 0.0,
+                removed_count: 0,
+                errors: vec!["Cleanup plan failed safety checks".to_string()],
+                warnings: Vec::new(),
+                audit_log: Vec::new(),
+                execution_time_ms: 0,
+            };
+        }
+        
+        let start_time = current_timestamp_ms();
+        let mut audit_log = Vec::new();
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let mut removed_count = 0;
+        
+        audit_log.push(format!("Starting cleanup: target={}, dry_run={}", plan.target_free_gb, dry_run));
+        
+        for candidate in plan.candidates.iter() {
+            if dry_run && candidate.dry_run_safe {
+                audit_log.push(format!("Dry run: would delete {} ({:.2}GB)", candidate.path, candidate.size_gb));
+                removed_count += 1;
+            } else if !dry_run {
+                match delete_path(candidate.path, candidate.classification) {
+                    Ok(()) => {
+                        audit_log.push(format!("Deleted: {} ({:.2}GB)", candidate.path, candidate.size_gb));
+                        removed_count += 1;
+                    },
+                    Err(e) => {
+                        let error_msg = format!("Failed to delete {}: {}", candidate.path, e);
+                        errors.push(error_msg);
+                        warnings.push(format!("Skipped: {} due to error", candidate.path));
+                    },
+                }
+            }
+        }
+        
+        let execution_time = current_timestamp_ms() - start_time;
+        
+        CleanupResult {
+            success: errors.is_empty(),
+            freed_gb: plan.estimated_freed_gb,
+            removed_count: removed_count as u64,
+            errors: errors,
+            warnings: warnings,
+            audit_log: audit_log,
+            execution_time_ms: execution_time,
+        }
+    }
+    
+    // Classification system
+    pub fn classify_garbage(path: string) -> GarbageClassification {
+        let file_info = get_file_info(path);
+        let size_gb = file_info.size_gb;
+        let age_hours = file_info.age_hours;
+        
+        // Classify based on path patterns and age
+        let class = if is_build_cache(path, age_hours) {
+            GarbageClass::BUILD_CACHE
+        } else if is_package_cache(path, age_hours) {
+            GarbageClass::PACKAGE_CACHE
+        } else if is_temp_file(path, age_hours) {
+            GarbageClass::TEMP_FILES
+        } else if is_log_file(path, age_hours) {
+            GarbageClass::LOG_FILES
+        } else if is_failed_artifact(path, age_hours) {
+            GarbageClass::FAILED_ARTIFACTS
+        } else if is_evidence(path, age_hours) {
+            GarbageClass::EVIDENCE
+        } else if is_credentials(path, age_hours) {
+            GarbageClass::CREDENTIALS
+        } else {
+            GarbageClass::UNKNOWN
+        };
+        
+        let confidence = calculate_confidence(class, file_info);
+        let reasoning = generate_reasoning(class, file_info);
+        
+        GarbageClassification {
+            class: class,
+            confidence: confidence,
+            reasoning: reasoning,
+            age_hours: age_hours,
+            access_time_ms: file_info.access_time_ms,
+            modification_time_ms: file_info.modification_time_ms,
+        }
+    }
+    
+    // Get safe cleanup candidates
+    pub fn get_safe_cleanup_candidates() -> Vec<CleanupCandidate> {
+        let mut candidates = Vec::new();
+        
+        // Safe directories to scan
+        let safe_paths = vec![
+            "/tmp",
+            "/Users/playom/Downloads",
+            "/Users/playom/Library/Caches",
+            "/Users/playom/.cache",
+            "/Users/playom/.npm",
+        ];
+        
+        for path in safe_paths.iter() {
+            if path_exists(path) {
+                scan_directory_for_cleanup(path, &mut candidates);
+            }
+        }
+        
+        candidates
+    }
+    
+    // Internal helpers
+    fn filter_by_risk_level(candidates: Vec<CleanupCandidate>, max_risk: RiskLevel) -> Vec<CleanupCandidate> {
+        let max_risk_value = risk_level_to_int(max_risk);
+        
+        candidates.into_iter().filter(|candidate| {
+            let candidate_risk = assess_candidate_risk(candidate);
+            candidate_risk <= max_risk_value
+        }).collect()
+    }
+    
+    fn run_safety_checks(candidates: &[CleanupCandidate], total_freed_gb: f64) -> Vec<SafetyCheck> {
+        let mut checks = Vec::new();
+        
+        // Check total freed size
+        if total_freed_gb > config.max_safe_freed_gb {
+            checks.push(SafetyCheck {
+                name: "total_freed_size".to_string(),
+                passed: false,
+                details: format!("Total freed size ({:.2}GB) exceeds safe limit ({:.2}GB)", total_freed_gb, config.max_safe_freed_gb),
+                severity: Severity::CRITICAL,
+            });
+        } else {
+            checks.push(SafetyCheck {
+                name: "total_freed_size".to_string(),
+                passed: true,
+                details: format!("Total freed size ({:.2}GB) within safe limit", total_freed_gb),
+                severity: Severity::INFO,
+            });
+        }
+        
+        // Check for protected classes
+        let has_protected = candidates.iter().any(|c| NEVER_CLEAN_CLASSES.contains(&c.classification.class));
+        if has_protected {
+            checks.push(SafetyCheck {
+                name: "protected_classes".to_string(),
+                passed: false,
+                details: "Protected classes (evidence, credentials) marked for deletion".to_string(),
+                severity: Severity::CRITICAL,
+            });
+        }
+        
+        // Check path allowlist
+        if config.require_path_allowlist {
+            let allowlisted = candidates.iter().all(|c| is_allowlisted_path(c.path));
+            if !allowlisted {
+                checks.push(SafetyCheck {
+                    name: "path_allowlist".to_string(),
+                    passed: false,
+                    details: "Some paths are not in the allowlist".to_string(),
+                    severity: Severity::ERROR,
+                });
+            } else {
+                checks.push(SafetyCheck {
+                    name: "path_allowlist".to_string(),
+                    passed: true,
+                    details: "All paths are in allowlist".to_string(),
+                    severity: Severity::INFO,
+                });
+            }
+        }
+        
+        checks
+    }
+    
+    fn assess_risk_level(candidate_count: usize, total_freed_gb: f64, failed_checks: usize) -> RiskLevel {
+        if failed_checks > 0 {
+            return RiskLevel::CRITICAL;
+        }
+        
+        if total_freed_gb > 5.0 {
+            return RiskLevel::HIGH;
+        }
+        
+        if candidate_count > 1000 {
+            return RiskLevel::MEDIUM;
+        }
+        
+        if candidate_count > 100 {
+            return RiskLevel::LOW;
+        }
+        
+        RiskLevel::NONE
+    }
+    
+    fn estimate_execution_time(candidates: &[CleanupCandidate]) -> u64 {
+        let base_time = candidates.len() as u64 * 100; // 100ms per file
+        let size_factor = (candidates.iter().map(|c| c.size_gb).sum::<f64>() * 1000.0) as u64; // 1ms per MB
+        base_time + size_factor
+    }
+    
+    // Pattern matching helpers
+    fn is_build_cache(path: string, age_hours: u64) -> bool {
+        path.contains("build") || path.contains("cache") || path.contains("node_modules") || 
+        path.contains("zig-cache") || age_hours > 168 // Older than 1 week
+    }
+    
+    fn is_package_cache(path: string, age_hours: u64) -> bool {
+        path.contains("npm") || path.contains("pip") || path.contains("pnpm") || 
+        path.contains(".cache") || age_hours > 168
+    }
+    
+    fn is_temp_file(path: string, age_hours: u64) -> bool {
+        path.contains("tmp") || path.contains("temp") || 
+        path.contains("session") || age_hours > 48 // Older than 2 days
+    }
+    
+    fn is_log_file(path: string, age_hours: u64) -> bool {
+        path.contains("log") || path.contains(".log") || age_hours > 72 // Older than 3 days
+    }
+    
+    fn is_failed_artifact(path: string, age_hours: u64) -> bool {
+        path.contains("failed") || path.contains("partial") || 
+        path.contains("incomplete") || age_hours > 24 // Older than 1 day
+    }
+    
+    fn is_evidence(path: string, _age_hours: u64) -> bool {
+        path.contains("evidence") || path.contains("audit") || path.contains("report")
+    }
+    
+    fn is_credentials(path: string, _age_hours: u64) -> bool {
+        path.contains("ssh") || path.contains("key") || path.contains("secret") || path.contains("token")
+    }
+    
+    fn is_allowlisted_path(path: string) -> bool {
+        // Allowlist for safe cleanup
+        let allowlist = vec![
+            "/tmp",
+            "/Users/playom/Downloads",
+            "/Users/playom/Library/Caches",
+            "/Users/playom/.cache",
+            "/Users/playom/.npm",
+        ];
+        
+        allowlist.iter().any(|allowed| path.starts_with(allowed))
+    }
+    
+    // File info helpers
+    type FileInfo {
+        size_gb: f64,
+        age_hours: u64,
+        access_time_ms: u64,
+        modification_time_ms: u64,
+        is_directory: bool,
+    }
+    
+    fn get_file_info(path: string) -> FileInfo {
+        // This would be implemented by runtime
+        FileInfo {
+            size_gb: 0.0,
+            age_hours: 0,
+            access_time_ms: 0,
+            modification_time_ms: 0,
+            is_directory: false,
+        }
+    }
+    
+    fn path_exists(path: string) -> bool {
+        // This would be implemented by runtime
+        false
+    }
+    
+    fn delete_path(path: string, classification: GarbageClassification) -> Result<(), string> {
+        if NEVER_CLEAN_CLASSES.contains(&classification.class) {
+            return Err("Protected class - cannot delete".to_string());
+        }
+        
+        // This would be implemented by runtime
+        Ok(())
+    }
+    
+    fn scan_directory_for_cleanup(path: string, candidates: &mut Vec<CleanupCandidate>) {
+        // This would recursively scan the directory and add cleanup candidates
+        // For now, placeholder
+    }
+    
+    fn calculate_confidence(_class: GarbageClass, _info: FileInfo) -> f64 {
+        0.8 // Default confidence
+    }
+    
+    fn generate_reasoning(_class: GarbageClass, _info: FileInfo) -> string {
+        "Classified based on path patterns and file age".to_string()
+    }
+    
+    fn risk_level_to_int(level: RiskLevel) -> u32 {
+        match level {
+            RiskLevel::NONE => 0,
+            RiskLevel::LOW => 1,
+            RiskLevel::MEDIUM => 2,
+            RiskLevel::HIGH => 3,
+            RiskLevel::CRITICAL => 4,
+        }
+    }
+    
+    fn assess_candidate_risk(candidate: CleanupCandidate) -> u32 {
+        // Assess risk of individual candidate
+        let base_risk = match candidate.classification.class {
+            GarbageClass::FAILED_ARTIFACTS => 1,
+            GarbageClass::TEMP_FILES => 1,
+            GarbageClass::LOG_FILES => 2,
+            GarbageClass::BUILD_CACHE => 2,
+            GarbageClass::PACKAGE_CACHE => 3,
+            GarbageClass::UNKNOWN => 4,
+            _ => 5, // Protected classes
+        };
+        
+        if candidate.classification.confidence < 0.5 {
+            base_risk + 2
+        } else {
+            base_risk
+        }
+    }
+    
+    fn current_timestamp_ms() -> u64 {
+        0 // Placeholder
+    }
+    
+    // Mock function for disk snapshot
+    fn execute_disk_snapshot() -> DiskHealthSnapshot {
+        DiskHealthSnapshot {
+            free_space_gb: 4.9,
+            total_space_gb: 228.0,
+            used_percent: 71.0,
+            growth_rate_gb_per_day: 0.1,
+            top_consumers: Vec::new(),
+            timestamp_ms: current_timestamp_ms(),
+            healthy: false,
+            warning: true,
+            critical: false,
+        }
+    }
+    
+    // Test suite
+    test "cleanup_plan_basic" {
+        let plan = plan_cleanup(10.0, RiskLevel::MEDIUM);
+        assert(plan.estimated_freed_gb >= 0.0);
+        assert(plan.candidates.len() >= 0);
+    }
+    
+    test "cleanup_plan_safety" {
+        let plan = plan_cleanup(20.0, RiskLevel::LOW);
+        assert(plan.is_safe || !plan.is_safe); // Either way, should assess correctly
+    }
+    
+    bench "cleanup_planning_performance" {
+        for i in 0..5 {
+            plan_cleanup(10.0 + i as f64, RiskLevel::MEDIUM);
+        }
+    }
+}

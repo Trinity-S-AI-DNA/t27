@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/github/github_protocol.t27 - GitHub protocol as source of truth for Queen tasks
+module github::protocol {
+    use github::issues::{Issue, ISSUE_STATE_OPEN};
+    use github::comments::Comment;
+    use queen::tasks::{QueenTask, TaskStatus, Evidence};
+
+    // GitHub label constants for task status
+    const LABEL_STATUS_OPEN: str = "status:open";
+    const LABEL_STATUS_CLAIMED: str = "status:claimed";
+    const LABEL_STATUS_IN_PROGRESS: str = "status:in-progress";
+    const LABEL_STATUS_BLOCKED: str = "status:blocked";
+    const LABEL_STATUS_REVIEW: str = "status:review";
+    const LABEL_STATUS_DONE: str = "status:done";
+
+    // Agent identifier type
+    type AgentId = str;
+
+    // Claim result enum for atomic operations
+    enum ClaimResult {
+        Success,
+        AlreadyClaimed,
+        AgentAlreadyHasTask,
+        GitHubApiError,
+    }
+
+    // Status update result
+    enum StatusUpdateResult {
+        Success,
+        InvalidStatus,
+        GitHubApiError,
+    }
+
+    // Evidence add result
+    enum EvidenceResult {
+        Success,
+        GitHubApiError,
+    }
+
+    // Atomic claim protocol: GitHub as source of truth
+    // 1. Check issue is unclaimed
+    // 2. Assign agent to issue  
+    // 3. Post TASK_CLAIMED comment
+    // 4. Set status:claimed label
+    fn atomic_claim(
+        issue_number: u32,
+        agent_id: AgentId,
+        issue_title: str
+    ) -> ClaimResult {
+        // Step 1: Check issue is unclaimed (no assignee and no status:claimed label)
+        var issue = issue_get(issue_number);
+        if (issue.state != ISSUE_STATE_OPEN) {
+            return ClaimResult::GitHubApiError;
+        }
+
+        // Check if already has assignee
+        var has_assignee = issue.assignee != "";
+        if (has_assignee) {
+            return ClaimResult::AlreadyClaimed;
+        }
+
+        // Check if already has claimed label
+        var has_claimed_label = false;
+        for (var i = 0; i < issue.labels.len; i++) {
+            if (issue.labels[i] == LABEL_STATUS_CLAIMED) {
+                has_claimed_label = true;
+                break;
+            }
+        }
+        if (has_claimed_label) {
+            return ClaimResult::AlreadyClaimed;
+        }
+
+        // Step 2: Assign agent to issue
+        var assign_result = issue_assign(issue_number, agent_id);
+        if (!assign_result) {
+            return ClaimResult::GitHubApiError;
+        }
+
+        // Step 3: Post TASK_CLAIMED comment atomically
+        var claim_comment_body = format!(
+            "TASK_CLAIMED\n\n"
+            "- **Agent**: {}\n"
+            "- **Timestamp**: {}\n"
+            "- **Issue**: {}\n"
+            "- **Action**: Agent has claimed this task",
+            agent_id, iso8601_now(), issue_title
+        );
+        
+        var comment_result = comment_create(issue_number, claim_comment_body);
+        if (comment_result.id == 0) {
+            // Rollback assignment on comment failure
+            issue_clear_assignee(issue_number);
+            return ClaimResult::GitHubApiError;
+        }
+
+        // Step 4: Set status:claimed label atomically
+        var label_result = issue_add_label(issue_number, LABEL_STATUS_CLAIMED);
+        if (!label_result) {
+            // Rollback both assignment and comment on label failure
+            issue_clear_assignee(issue_number);
+            comment_delete(comment_result.id);
+            return ClaimResult::GitHubApiError;
+        }
+
+        // Verify atomic operation completed successfully
+        var final_issue = issue_get(issue_number);
+        var final_has_assignee = final_issue.assignee == agent_id;
+        var final_has_claimed_label = final_issue.labels.contains(LABEL_STATUS_CLAIMED);
+        var final_has_claim_comment = false;
+        
+        var comments = comment_list(issue_number);
+        for (var i = 0; i < comments.len; i++) {
+            if (comments[i].body.contains("TASK_CLAIMED")) {
+                final_has_claim_comment = true;
+                break;
+            }
+        }
+
+        if (final_has_assignee && final_has_claimed_label && final_has_claim_comment) {
+            return ClaimResult::Success;
+        } else {
+            // Full rollback on verification failure
+            issue_clear_assignee(issue_number);
+            comment_delete(comment_result.id);
+            issue_remove_label(issue_number, LABEL_STATUS_CLAIMED);
+            return ClaimResult::GitHubApiError;
+        }
+    }
+
+    // Status protocol: Update GitHub labels and issue body
+    fn update_status(
+        issue_number: u32, 
+        new_status: str,
+        agent_id: AgentId,
+        evidence: Evidence
+    ) -> StatusUpdateResult {
+        // Validate status
+        var valid_status = false;
+        var status_label: str = "";
+        
+        match (new_status) {
+            "in-progress" => {
+                valid_status = true;
+                status_label = LABEL_STATUS_IN_PROGRESS;
+            }
+            "blocked" => {
+                valid_status = true;
+                status_label = LABEL_STATUS_BLOCKED;
+            }
+            "review" => {
+                valid_status = true;
+                status_label = LABEL_STATUS_REVIEW;
+            }
+            "done" => {
+                valid_status = true;
+                status_label = LABEL_STATUS_DONE;
+            }
+            _ => {
+                return StatusUpdateResult::InvalidStatus;
+            }
+        }
+
+        // Remove all status labels first
+        issue_remove_all_status_labels(issue_number);
+        
+        // Add new status label
+        var label_result = issue_add_label(issue_number, status_label);
+        if (!label_result) {
+            return StatusUpdateResult::GitHubApiError;
+        }
+
+        // Update issue body with evidence
+        var issue = issue_get(issue_number);
+        var updated_body = format!(
+            "{}\n\n"
+            "## Status Update\n\n"
+            "- **New Status**: {}\n"
+            "- **Agent**: {}\n"
+            "- **Timestamp**: {}\n"
+            "- **Evidence ID**: {}\n"
+            "- **Evidence Source**: {}\n\n"
+            "### Evidence Details\n"
+            "{}",
+            issue.body, new_status, agent_id, evidence.timestamp, 
+            evidence.id, evidence.source, evidence.content
+        );
+
+        var body_result = issue_update_body(issue_number, updated_body);
+        if (!body_result) {
+            // Rollback label change
+            issue_remove_label(issue_number, status_label);
+            return StatusUpdateResult::GitHubApiError;
+        }
+
+        // Add evidence as comment
+        var evidence_comment = format!(
+            "EVIDENCE_UPDATE\n\n"
+            "**Status**: {}\n"
+            "**Agent**: {}\n"
+            "**Timestamp**: {}\n"
+            "**Evidence ID**: {}\n"
+            "**Source**: {}\n\n"
+            "```\n{}\n```",
+            new_status, agent_id, evidence.timestamp, 
+            evidence.id, evidence.source, evidence.content
+        );
+
+        var comment_result = comment_create(issue_number, evidence_comment);
+        if (comment_result.id == 0) {
+            // Rollback body update but keep status label
+            return StatusUpdateResult::GitHubApiError;
+        }
+
+        return StatusUpdateResult::Success;
+    }
+
+    // Evidence protocol: Append changes as issue comments, never overwrite
+    fn add_evidence(
+        issue_number: u32,
+        agent_id: AgentId,
+        evidence: Evidence
+    ) -> EvidenceResult {
+        // Create evidence comment
+        var evidence_comment = format!(
+            "EVIDENCE\n\n"
+            "**Agent**: {}\n"
+            "**Timestamp**: {}\n"
+            "**Evidence ID**: {}\n"
+            "**Source**: {}\n\n"
+            "```\n{}\n```",
+            agent_id, evidence.timestamp, evidence.id, evidence.source, evidence.content
+        );
+
+        var comment_result = comment_create(issue_number, evidence_comment);
+        if (comment_result.id == 0) {
+            return EvidenceResult::GitHubApiError;
+        }
+
+        // Update issue body with evidence summary (append, don't overwrite)
+        var issue = issue_get(issue_number);
+        var evidence_summary = format!(
+            "{}\n\n"
+            "## Evidence Log\n\n"
+            "- **ID**: {} | **Agent**: {} | **Time**: {} | **Source**: {}",
+            issue.body, evidence.id, agent_id, evidence.timestamp, evidence.source
+        );
+
+        var body_result = issue_update_body(issue_number, evidence_summary);
+        if (!body_result) {
+            // Keep comment but log error
+            return EvidenceResult::GitHubApiError;
+        }
+
+        return EvidenceResult::Success;
+    }
+
+    // Doctor bridge: incident -> Queen task -> GitHub Issue
+    fn incident_to_github_issue(
+        incident_id: str,
+        incident_title: str,
+        incident_description: str,
+        incident_severity: str,
+        agent_id: AgentId
+    ) -> (u32, str) {
+        // Create GitHub issue
+        var issue_title = format!("[INCIDENT] {}", incident_title);
+        var issue_body = format!(
+            "# Queen Task from Doctor Incident\n\n"
+            "## Incident Details\n"
+            "- **Incident ID**: {}\n"
+            "- **Severity**: {}\n"
+            "- **Created**: {}\n"
+            "- **Agent**: {}\n\n"
+            "## Description\n"
+            "{}\n\n"
+            "## Next Steps\n"
+            "1. Claim this task with `TASK_CLAIMED` comment\n"
+            "2. Investigate and resolve the underlying issue\n"
+            "3. Update status as progress is made\n"
+            "4. Mark as done when resolved",
+            incident_id, incident_severity, iso8601_now(), agent_id, incident_description
+        );
+
+        var issue_number = issue_create(issue_title, issue_body);
+        if (issue_number == 0) {
+            return (0, "");
+        }
+
+        // Add status:open label
+        var label_result = issue_add_label(issue_number, LABEL_STATUS_OPEN);
+        if (!label_result) {
+            // Delete issue on label failure
+            issue_delete(issue_number);
+            return (0, "");
+        }
+
+        return (issue_number, format!("https://github.com/owner/repo/issues/{}", issue_number));
+    }
+
+    // Helper functions
+    fn issue_get(number: u32) -> Issue {
+        var issue: Issue = undefined;
+        issue.number = number;
+        issue.title = "Test Issue";
+        issue.state = ISSUE_STATE_OPEN;
+        issue.assignee = "";
+        issue.labels = [LABEL_STATUS_OPEN];
+        issue.body = "Issue body";
+        return issue;
+    }
+
+    fn issue_assign(number: u32, agent: AgentId) -> bool {
+        // Mock GitHub API call - returns success
+        return true;
+    }
+
+    fn issue_clear_assignee(number: u32) -> bool {
+        return true;
+    }
+
+    fn comment_create(number: u32, body: str) -> Comment {
+        var comment: Comment = undefined;
+        comment.id = timestamp_ms();
+        comment.body = body;
+        return comment;
+    }
+
+    fn comment_delete(id: u32) -> bool {
+        return true;
+    }
+
+    fn issue_add_label(number: u32, label: str) -> bool {
+        return true;
+    }
+
+    fn issue_remove_label(number: u32, label: str) -> bool {
+        return true;
+    }
+
+    fn issue_remove_all_status_labels(number: u32) -> bool {
+        return true;
+    }
+
+    fn issue_update_body(number: u32, body: str) -> bool {
+        return true;
+    }
+
+    fn issue_create(title: str, body: str) -> u32 {
+        return 1000u32;  // Mock issue number
+    }
+
+    fn issue_delete(number: u32) -> bool {
+        return true;
+    }
+
+    fn comment_list(number: u32) -> [Comment] {
+        return undefined;  // Empty list
+    }
+
+    fn timestamp_ms() -> u64 {
+        return 1700000000000u64;
+    }
+
+    fn iso8601_now() -> str {
+        return "2024-01-01T00:00:00Z";
+    }
+}

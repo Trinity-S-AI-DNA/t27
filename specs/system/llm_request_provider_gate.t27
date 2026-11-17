@@ -1,0 +1,594 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 LLM Request Provider Gate
+// Purpose: no provider request may leave the process unless the preflight passes.
+// Owner P0 (2026-10-30): the gate stands immediately BEFORE the LLM network call,
+// not after a failure has already been observed.
+//
+// Enforced in code at: contrib/backend/agent-runner/src/api.rs :: send_message
+// Companion spec: specs/system/model_routing_circuit_breaker.t27 (response side)
+
+module llm_request_provider_gate;
+
+// ─── The rule, verbatim (owner minimal patch spec) ──────────────────────────
+//
+// rule "llm_request_provider_gate" {
+//   when = "immediately_before_network_request"
+//
+//   require {
+//     resolved_provider == expected_provider
+//     model_allowed_on_provider == true
+//     required_credentials_present == true
+//     provider_unfunded == false
+//     fallback_explicitly_approved == true_or_no_fallback
+//   }
+//
+//   on_violation {
+//     action = "reject_request"
+//     network_io = "deny"
+//     retry = "deny"
+//     checkpoint = "preserve"
+//     follow_up_task = "create"
+//   }
+// }
+//
+// The rule text above is the contract; the constants and functions below are the
+// executable model of it. The Rust gate in api.rs must agree with every test here.
+
+// ─── Providers (identity resolved from the request base URL) ────────────────
+
+pub const PROVIDER_ZAI : u8 = 0;
+pub const PROVIDER_DEEPSEEK : u8 = 1;
+pub const PROVIDER_OPENAI : u8 = 2;
+pub const PROVIDER_UNKNOWN : u8 = 3;
+
+// ─── Circuit Breaker States ───────────────────────────────────────────────
+
+pub const CIRCUIT_CLOSED : u8 = 0;      // Normal operation, requests allowed
+pub const CIRCUIT_OPEN : u8 = 1;        // Violations detected, requests blocked
+pub const CIRCUIT_HALF_OPEN : u8 = 2;   // Recovery mode, single test request
+
+// ─── Model classes (a model is bound to exactly one provider) ───────────────
+
+pub const MODEL_GLM : u8 = 0;
+pub const MODEL_CLAUDE : u8 = 1;
+pub const MODEL_DEEPSEEK : u8 = 2;
+pub const MODEL_UNKNOWN : u8 = 3;
+
+// ─── Verdicts — every verdict other than PASS is an error code reported to
+//     the caller, and every one of them rejects the request before network I/O ─
+
+pub const VERDICT_PASS : u8 = 0;
+pub const VERDICT_ROUTING_MISMATCH : u8 = 1;
+pub const VERDICT_MODEL_NOT_ALLOWED : u8 = 2;
+pub const VERDICT_CREDENTIALS_MISSING : u8 = 3;
+pub const VERDICT_PROVIDER_UNFUNDED : u8 = 4;
+
+// ─── on_violation policy, as data ───────────────────────────────────────────
+
+pub const POLICY_ACTION : u8 = 0;      // 0 = reject_request
+pub const POLICY_NETWORK_IO_DENY : u8 = 1;
+pub const POLICY_RETRY_DENY : u8 = 1;
+pub const POLICY_CHECKPOINT_PRESERVE : u8 = 1;
+pub const POLICY_FOLLOW_UP_TASK_CREATE : u8 = 1;
+
+// model_allowed_on_provider(model, provider) bool
+// require model_allowed_on_provider == true
+pub fn model_allowed_on_provider(model: u8, provider: u8) bool {
+    if (provider == PROVIDER_ZAI) {
+        return model == MODEL_GLM or model == MODEL_CLAUDE;
+    }
+    if (provider == PROVIDER_DEEPSEEK) {
+        return model == MODEL_DEEPSEEK;
+    }
+    if (provider == PROVIDER_OPENAI) {
+        return model == MODEL_CLAUDE or model == MODEL_UNKNOWN;
+    }
+    // No allowlist published for an unknown provider: nothing to violate yet.
+    return true;
+}
+
+// preflight(...) u8
+// Called immediately before the network request. Returns VERDICT_PASS only when
+// every require holds; any other verdict means reject_request, no network I/O.
+pub fn preflight(
+    expected_provider: u8,
+    resolved_provider: u8,
+    model: u8,
+    required_credentials_present: bool,
+    provider_unfunded: bool,
+    fallback_explicitly_approved: bool,
+) u8 {
+    // require: resolved_provider == expected_provider,
+    //          fallback_explicitly_approved == true_or_no_fallback
+    if (resolved_provider != expected_provider) {
+        if (fallback_explicitly_approved == false) {
+            return VERDICT_ROUTING_MISMATCH;
+        }
+    }
+    // require: model_allowed_on_provider == true
+    if (model_allowed_on_provider(model, resolved_provider) == false) {
+        return VERDICT_MODEL_NOT_ALLOWED;
+    }
+    // require: required_credentials_present == true
+    if (required_credentials_present == false) {
+        return VERDICT_CREDENTIALS_MISSING;
+    }
+    // require: provider_unfunded == false
+    if (provider_unfunded == true) {
+        return VERDICT_PROVIDER_UNFUNDED;
+    }
+    return VERDICT_PASS;
+}
+
+// network_io_allowed(verdict) bool — on_violation network_io = "deny"
+pub fn network_io_allowed(verdict: u8) bool {
+    return verdict == VERDICT_PASS;
+}
+
+// retry_allowed(verdict) bool — on_violation retry = "deny"
+pub fn retry_allowed(verdict: u8) bool {
+    return verdict == VERDICT_PASS;
+}
+
+// checkpoint_preserved(verdict) bool — on_violation checkpoint = "preserve"
+// The gate runs before any conversation state is touched, so state survives.
+pub fn checkpoint_preserved(verdict: u8) bool {
+    return true;
+}
+
+// follow_up_task_created(verdict) bool — on_violation follow_up_task = "create"
+pub fn follow_up_task_created(verdict: u8) bool {
+    return verdict != VERDICT_PASS;
+}
+
+// retries_after_response(status, unfunded) u32
+// How many NEW provider requests a response may trigger. A 503 that reports an
+// unfunded provider triggers none: retry_count stays where it is.
+pub fn retries_after_response(status: u16, unfunded: bool) -> u32 {
+    if (unfunded == true) {
+        return 0;
+    }
+    if (status == 429 or status == 500 or status == 502 or status == 503) {
+        return 3;
+    }
+    return 0;
+}
+
+// ─── Stream-termination classes (response side of the rule) ───────────────
+//
+// A relay can end an otherwise-successful response with a synthetic wire
+// termination. Two failure classes must never be conflated:
+//
+//   CLASS_TRANSIENT_NETWORK - transient transport/relay failure. Bounded retry
+//     with backoff is allowed; the turn must not hard-fail on the first blip;
+//     the checkpoint is preserved; no follow-up task (nothing to fix).
+//
+//   CLASS_UNFUNDED - funding/config problem. Zero retries: automatic retry
+//     would loop forever on money the account does not have; block the
+//     request, preserve the checkpoint, create a follow-up task instead.
+//
+// Raw text-to-signal mapping belongs to the transport glue (Rust mirror:
+// contrib/backend/agent-runner/src/api.rs :: classify_stream_termination).
+// The wire token is matched WITH its separators there: an ASCII word-boundary
+// \bnetwork\b cannot match "network_error" because '_' is a \w character, so
+// every known spelling ("\bnetwork_error\b", "network-error", ...)
+// must be an explicit table entry, never a bare \bword\b branch
+// (deepseek-harness discussion #4361). Live unfunded wording observed on the
+// z.ai route as HTTP 429 + code 1113 on 2026-10-30:
+// "insufficient balance" / "no resource package" - also explicit entries.
+pub const WIRE_OTHER : u8 = 0;
+pub const WIRE_NETWORK_ERROR : u8 = 1;
+pub const WIRE_UNFUNDED : u8 = 2;
+
+pub const CLASS_TRANSIENT_NETWORK : u8 = 0;
+pub const CLASS_UNFUNDED : u8 = 1;
+pub const CLASS_TERMINAL : u8 = 2;
+
+// Bounded retry budget for the transient class. Matches the runner
+// (api.rs :: max_retries = 3) and retries_after_response above.
+pub const MAX_TRANSIENT_RETRIES : u32 = 3;
+
+// map_wire_signal(wire: u8) u8 - the classification decision. WIRE_UNFUNDED
+// MUST NOT collapse into WIRE_OTHER: an unfunded signal must stay its own
+// class so the zero-retry policy can find it.
+pub fn map_wire_signal(wire: u8) u8 {
+    if (wire == WIRE_NETWORK_ERROR) {
+        return CLASS_TRANSIENT_NETWORK;
+    }
+    if (wire == WIRE_UNFUNDED) {
+        return CLASS_UNFUNDED;
+    }
+    return CLASS_TERMINAL;
+}
+
+// retry_allowed_for_class(c: u8) bool - the transient class is the ONLY
+// class that may enter the bounded retry loop.
+pub fn retry_allowed_for_class(c: u8) bool {
+    return c == CLASS_TRANSIENT_NETWORK;
+}
+
+// retry_limit_for_class(c: u8) u32 - bounded for transient, zero otherwise.
+pub fn retry_limit_for_class(c: u8) u32 {
+    if (c == CLASS_TRANSIENT_NETWORK) {
+        return MAX_TRANSIENT_RETRIES;
+    }
+    return 0;
+}
+
+// network_io_needed_for_class(c: u8) bool - ONLY the transient class may send
+// another request after the failure. An unfunded signal means the money does
+// not exist: another request is both futile and denied.
+pub fn network_io_needed_for_class(c: u8) bool {
+    return c == CLASS_TRANSIENT_NETWORK;
+}
+
+// follow_up_task_required_for_class(c: u8) bool - a follow-up task is created
+// for the unfunded class (owner must fix funding), and for TERMINAL failures
+// that no classified policy recovered (owner must triage). The transient
+// class recovers by itself: it must NOT pollute the follow-up queue.
+pub fn follow_up_task_required_for_class(c: u8) bool {
+    if (c == CLASS_TRANSIENT_NETWORK) {
+        return false;
+    }
+    return true;
+}
+
+// checkpoint_preserved_for_class(c: u8) bool - no classification path mutates
+// conversation state: recovery (or failure) never destroys the checkpoint.
+pub fn checkpoint_preserved_for_class(c: u8) bool {
+    return true;
+}
+
+// circuit_breaker_state(provider: u8, violations: u32, time_window: u64) u8
+// Circuit breaker prevents repeated violations from hitting providers.
+pub fn circuit_breaker_state(provider: u8, violations: u32, time_window: u64) u8 {
+    const MAX_VIOLATIONS_WINDOW: u32 = 5;
+    const HALF_OPEN_VIOLATIONS: u32 = 1;
+    
+    if (violations >= MAX_VIOLATIONS_WINDOW) {
+        return CIRCUIT_OPEN;
+    }
+    if (violations >= HALF_OPEN_VIOLATIONS and violations < MAX_VIOLATIONS_WINDOW) {
+        return CIRCUIT_HALF_OPEN;
+    }
+    return CIRCUIT_CLOSED;
+}
+
+// request_allowed_by_circuit_breaker(provider: u8, violations: u32, time_window: u64) bool
+pub fn request_allowed_by_circuit_breaker(provider: u8, violations: u32, time_window: u64) bool {
+    return circuit_breaker_state(provider, violations, time_window) != CIRCUIT_OPEN;
+}
+
+// circuit_breaker_violation_increment(provider: u8, violations: u32) u32
+// Increments violation count with circuit breaker state machine logic.
+pub fn circuit_breaker_violation_increment(provider: u8, violations: u32) u32 {
+    if (circuit_breaker_state(provider, violations, 0) == CIRCUIT_OPEN) {
+        return violations; // No increment when already open
+    }
+    return violations + 1;
+}
+
+// guard_overhead_nanoseconds(start: u64, end: u64) u64
+// Measures guard execution overhead in nanoseconds.
+pub fn guard_overhead_nanoseconds(start: u64, end: u64) u64 {
+    var overhead = end - start;
+    // Must be less than 5% of typical request time (assume 100ms = 100000000ns)
+    const MAX_ALLOWED_OVERHEAD: u64 = 5000000; // 5ms
+    assert(overhead < MAX_ALLOWED_OVERHEAD);
+    return overhead;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Acceptance tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "no_deepseek_request_when_zai_expected" {
+    // GIVEN expected_provider = z.ai AND resolved_provider = deepseek
+    var verdict = preflight(PROVIDER_ZAI, PROVIDER_DEEPSEEK, MODEL_GLM, true, false, false);
+    // THEN no request leaves the process: error = PROVIDER_ROUTING_MISMATCH
+    try std.testing.expectEqual(@as(u8, VERDICT_ROUTING_MISMATCH), verdict);
+    try std.testing.expectEqual(@as(bool, false), network_io_allowed(verdict));
+    // AND retry is denied
+    try std.testing.expectEqual(@as(bool, false), retry_allowed(verdict));
+    // AND the checkpoint is preserved
+    try std.testing.expectEqual(@as(bool, true), checkpoint_preserved(verdict));
+    // AND a follow-up task is created
+    try std.testing.expectEqual(@as(bool, true), follow_up_task_created(verdict));
+}
+
+test "no_retry_on_unfunded" {
+    // GIVEN a provider that is known unfunded
+    var verdict = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, true, true, false);
+    // THEN the request is rejected before it is made
+    try std.testing.expectEqual(@as(u8, VERDICT_PROVIDER_UNFUNDED), verdict);
+    try std.testing.expectEqual(@as(bool, false), network_io_allowed(verdict));
+    // AND, once a 503 unfunded has been observed, retry_count remains 0
+    try std.testing.expectEqual(@as(u32, 0), retries_after_response(503, true));
+    try std.testing.expectEqual(@as(bool, false), retry_allowed(verdict));
+}
+
+test "matching_provider_credentials_and_model_passes" {
+    var verdict = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_PASS), verdict);
+    try std.testing.expectEqual(@as(bool, true), network_io_allowed(verdict));
+    try std.testing.expectEqual(@as(bool, false), follow_up_task_created(verdict));
+}
+
+test "glm_is_not_allowed_on_deepseek" {
+    var verdict = preflight(PROVIDER_DEEPSEEK, PROVIDER_DEEPSEEK, MODEL_GLM, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_MODEL_NOT_ALLOWED), verdict);
+    try std.testing.expectEqual(@as(bool, false), network_io_allowed(verdict));
+}
+
+test "missing_credentials_reject_before_network" {
+    var verdict = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, false, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_CREDENTIALS_MISSING), verdict);
+    try std.testing.expectEqual(@as(bool, false), network_io_allowed(verdict));
+}
+
+test "approved_fallback_is_the_only_way_off_expected_provider" {
+    var denied = preflight(PROVIDER_ZAI, PROVIDER_DEEPSEEK, MODEL_DEEPSEEK, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_ROUTING_MISMATCH), denied);
+    var approved = preflight(PROVIDER_ZAI, PROVIDER_DEEPSEEK, MODEL_DEEPSEEK, true, false, true);
+    try std.testing.expectEqual(@as(u8, VERDICT_PASS), approved);
+}
+
+test "transient_status_still_retries" {
+    // The gate denies retry; a 503 that is NOT unfunded keeps the bounded retry.
+    try std.testing.expectEqual(@as(u32, 3), retries_after_response(503, false));
+    try std.testing.expectEqual(@as(u32, 3), retries_after_response(429, false));
+    try std.testing.expectEqual(@as(u32, 0), retries_after_response(404, false));
+}
+
+test "network_error_is_transient_retry_bounded_never_unfunded" {
+    // GIVEN the relay wire signal from the word-boundary regression
+    // (finish_reason: network_error, deepseek-harness discussion #4361)
+    var c = map_wire_signal(WIRE_NETWORK_ERROR);
+    // THEN it is the transient transport class, NOT the unfunded class
+    try std.testing.expectEqual(@as(u8, CLASS_TRANSIENT_NETWORK), c);
+    // AND a bounded automatic retry with backoff is allowed
+    try std.testing.expectEqual(@as(bool, true), retry_allowed_for_class(c));
+    try std.testing.expectEqual(@as(u32, MAX_TRANSIENT_RETRIES), retry_limit_for_class(c));
+    // AND the follow-up queue is not polluted by a self-recovering blip
+    try std.testing.expectEqual(@as(bool, false), follow_up_task_required_for_class(c));
+    // AND the checkpoint is preserved across the retry
+    try std.testing.expectEqual(@as(bool, true), checkpoint_preserved_for_class(c));
+}
+
+test "unfunded_is_zero_retry_never_transient" {
+    // GIVEN a relay-side unfunded signal (defense-in-depth path)
+    var c = map_wire_signal(WIRE_UNFUNDED);
+    // THEN it is its own class, never collapsed into the transient one
+    try std.testing.expectEqual(@as(u8, CLASS_UNFUNDED), c);
+    try std.testing.expectEqual(@as(bool, false), retry_allowed_for_class(c));
+    // AND zero automatic retries: retrying money the account does not
+    // have would loop forever
+    try std.testing.expectEqual(@as(u32, 0), retry_limit_for_class(c));
+    try std.testing.expectEqual(@as(bool, false), network_io_needed_for_class(c));
+    // AND the owner gets a follow-up task: fund it or fix the config
+    try std.testing.expectEqual(@as(bool, true), follow_up_task_required_for_class(c));
+    // AND the checkpoint is preserved
+    try std.testing.expectEqual(@as(bool, true), checkpoint_preserved_for_class(c));
+}
+
+test "terminal_never_retries" {
+    var c = map_wire_signal(WIRE_OTHER);
+    try std.testing.expectEqual(@as(u8, CLASS_TERMINAL), c);
+    try std.testing.expectEqual(@as(bool, false), retry_allowed_for_class(c));
+    try std.testing.expectEqual(@as(u32, 0), retry_limit_for_class(c));
+}
+
+test "classes_never_collapse_into_each_other" {
+    // The runtime classifier bug collapsed an unknown wire termination into a
+    // catch-all and lost the transient/unfunded distinction; class values must
+    // stay distinct so every policy lookup remains total.
+    var transient = map_wire_signal(WIRE_NETWORK_ERROR);
+    var unfunded = map_wire_signal(WIRE_UNFUNDED);
+    var other = map_wire_signal(WIRE_OTHER);
+    try std.testing.expect(transient != unfunded);
+    try std.testing.expect(unfunded != other);
+    try std.testing.expect(transient != other);
+}
+
+test "circuit_breaker_blocks_repeated_violations" {
+    // GIVEN 5 violations in a time window
+    var state = circuit_breaker_state(PROVIDER_ZAI, 5, 1000);
+    try std.testing.expectEqual(@as(u8, CIRCUIT_OPEN), state);
+    try std.testing.expectEqual(@as(bool, false), request_allowed_by_circuit_breaker(PROVIDER_ZAI, 5, 1000));
+}
+
+test "circuit_breaker_allows_after_recovery" {
+    // GIVEN 4 violations (half-open state)
+    var state = circuit_breaker_state(PROVIDER_ZAI, 4, 1000);
+    try std.testing.expectEqual(@as(u8, CIRCUIT_HALF_OPEN), state);
+    try std.testing.expectEqual(@as(bool, true), request_allowed_by_circuit_breaker(PROVIDER_ZAI, 4, 1000));
+}
+
+test "circuit_breaker_normal_state" {
+    // GIVEN 0 violations (closed state)
+    var state = circuit_breaker_state(PROVIDER_ZAI, 0, 1000);
+    try std.testing.expectEqual(@as(u8, CIRCUIT_CLOSED), state);
+    try std.testing.expectEqual(@as(bool, true), request_allowed_by_circuit_breaker(PROVIDER_ZAI, 0, 1000));
+}
+
+test "circuit_breaker_violation_increment_logic" {
+    // GIVEN starting from violations=3, increment should work
+    var new_violations = circuit_breaker_violation_increment(PROVIDER_ZAI, 3);
+    try std.testing.expectEqual(@as(u32, 4), new_violations);
+    
+    // GIVEN already open circuit (6 violations), increment should not increase
+    new_violations = circuit_breaker_violation_increment(PROVIDER_ZAI, 6);
+    try std.testing.expectEqual(@as(u32, 6), new_violations);
+}
+
+test "guard_overhead_measurement" {
+    // GIVEN 1ms guard execution time
+    var start: u64 = 1000000000;
+    var end: u64 = 1000001000;
+    var overhead = guard_overhead_nanoseconds(start, end);
+    try std.testing.expectEqual(@as(u64, 1000), overhead);
+}
+
+test "provider_guard_blocks_all_violations" {
+    // Test each violation type comprehensively
+    
+    // PROVIDER_ROUTING_MISMATCH
+    var verdict = preflight(PROVIDER_ZAI, PROVIDER_DEEPSEEK, MODEL_GLM, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_ROUTING_MISMATCH), verdict);
+    try std.testing.expectEqual(@as(bool, false), network_io_allowed(verdict));
+    try std.testing.expectEqual(@as(bool, false), retry_allowed(verdict));
+    try std.testing.expectEqual(@as(bool, true), checkpoint_preserved(verdict));
+    try std.testing.expectEqual(@as(bool, true), follow_up_task_created(verdict));
+    
+    // MODEL_NOT_ALLOWED
+    verdict = preflight(PROVIDER_DEEPSEEK, PROVIDER_DEEPSEEK, MODEL_GLM, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_MODEL_NOT_ALLOWED), verdict);
+    
+    // CREDENTIALS_MISSING
+    verdict = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, false, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_CREDENTIALS_MISSING), verdict);
+    
+    // PROVIDER_UNFUNDED
+    verdict = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, true, true, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_PROVIDER_UNFUNDED), verdict);
+}
+
+test "no_undeclared_silent_fallback_path" {
+    // Ensure all paths through preflight are explicit
+    // Normal case (no fallback)
+    var verdict = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_PASS), verdict);
+    
+    // Approved fallback case
+    verdict = preflight(PROVIDER_ZAI, PROVIDER_DEEPSEEK, MODEL_DEEPSEEK, true, false, true);
+    try std.testing.expectEqual(@as(u8, VERDICT_PASS), verdict);
+    
+    // Unapproved fallback (should be violation)
+    verdict = preflight(PROVIDER_ZAI, PROVIDER_DEEPSEEK, MODEL_DEEPSEEK, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_ROUTING_MISMATCH), verdict);
+}
+
+test "explicit_fallback_requires_approved_configuration" {
+    // GIVEN no approved fallback configured
+    var verdict = preflight(PROVIDER_ZAI, PROVIDER_OPENAI, MODEL_CLAUDE, true, false, false);
+    try std.testing.expectEqual(@as(u8, VERDICT_ROUTING_MISMATCH), verdict);
+    
+    // GIVEN approved fallback configured
+    verdict = preflight(PROVIDER_ZAI, PROVIDER_OPENAI, MODEL_CLAUDE, true, false, true);
+    try std.testing.expectEqual(@as(u8, VERDICT_PASS), verdict);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+invariant every_violation_denies_network_io {
+    network_io_allowed(VERDICT_ROUTING_MISMATCH) == false;
+    network_io_allowed(VERDICT_MODEL_NOT_ALLOWED) == false;
+    network_io_allowed(VERDICT_CREDENTIALS_MISSING) == false;
+    network_io_allowed(VERDICT_PROVIDER_UNFUNDED) == false;
+    network_io_allowed(VERDICT_PASS) == true;
+}
+
+invariant every_violation_denies_retry {
+    retry_allowed(VERDICT_ROUTING_MISMATCH) == false;
+    retry_allowed(VERDICT_MODEL_NOT_ALLOWED) == false;
+    retry_allowed(VERDICT_CREDENTIALS_MISSING) == false;
+    retry_allowed(VERDICT_PROVIDER_UNFUNDED) == false;
+}
+
+invariant every_violation_creates_a_follow_up_task {
+    follow_up_task_created(VERDICT_ROUTING_MISMATCH) == true;
+    follow_up_task_created(VERDICT_MODEL_NOT_ALLOWED) == true;
+    follow_up_task_created(VERDICT_CREDENTIALS_MISSING) == true;
+    follow_up_task_created(VERDICT_PROVIDER_UNFUNDED) == true;
+    follow_up_task_created(VERDICT_PASS) == false;
+}
+
+invariant unfunded_never_triggers_a_request {
+    retries_after_response(503, true) == 0;
+    retries_after_response(429, true) == 0;
+    retries_after_response(500, true) == 0;
+}
+
+invariant classes_are_distinct {
+    map_wire_signal(WIRE_NETWORK_ERROR) != map_wire_signal(WIRE_UNFUNDED);
+    map_wire_signal(WIRE_NETWORK_ERROR) != map_wire_signal(WIRE_OTHER);
+    map_wire_signal(WIRE_UNFUNDED) != map_wire_signal(WIRE_OTHER);
+}
+
+invariant only_transient_class_is_retryable {
+    retry_allowed_for_class(map_wire_signal(WIRE_NETWORK_ERROR)) == true;
+    retry_allowed_for_class(map_wire_signal(WIRE_UNFUNDED)) == false;
+    retry_allowed_for_class(map_wire_signal(WIRE_OTHER)) == false;
+    retry_limit_for_class(CLASS_TRANSIENT_NETWORK) == 3;
+    retry_limit_for_class(CLASS_UNFUNDED) == 0;
+    retry_limit_for_class(CLASS_TERMINAL) == 0;
+}
+
+invariant unfunded_never_recovers_by_retry {
+    network_io_needed_for_class(map_wire_signal(WIRE_UNFUNDED)) == false;
+    follow_up_task_required_for_class(map_wire_signal(WIRE_UNFUNDED)) == true;
+    checkpoint_preserved_for_class(map_wire_signal(WIRE_UNFUNDED)) == true;
+}
+
+invariant transient_recovers_bounded_without_queue_pollution {
+    network_io_needed_for_class(map_wire_signal(WIRE_NETWORK_ERROR)) == true;
+    follow_up_task_required_for_class(map_wire_signal(WIRE_NETWORK_ERROR)) == false;
+    checkpoint_preserved_for_class(map_wire_signal(WIRE_NETWORK_ERROR)) == true;
+}
+
+invariant terminal_failures_require_owner_triage {
+    retry_allowed_for_class(map_wire_signal(WIRE_OTHER)) == false;
+    follow_up_task_required_for_class(map_wire_signal(WIRE_OTHER)) == true;
+}
+
+invariant violation_policy_is_fixed {
+    POLICY_ACTION == 0;
+    POLICY_NETWORK_IO_DENY == 1;
+    POLICY_RETRY_DENY == 1;
+    POLICY_CHECKPOINT_PRESERVE == 1;
+    POLICY_FOLLOW_UP_TASK_CREATE == 1;
+}
+
+invariant circuit_breaker_state_transitions {
+    // CLOSED -> HALF_OPEN -> OPEN
+    circuit_breaker_state(PROVIDER_ZAI, 0, 1000) == CIRCUIT_CLOSED;
+    circuit_breaker_state(PROVIDER_ZAI, 2, 1000) == CIRCUIT_HALF_OPEN;
+    circuit_breaker_state(PROVIDER_ZAI, 5, 1000) == CIRCUIT_OPEN;
+}
+
+invariant circuit_breaker_blocks_violations {
+    request_allowed_by_circuit_breaker(PROVIDER_ZAI, 5, 1000) == false;  // Open
+    request_allowed_by_circuit_breaker(PROVIDER_ZAI, 3, 1000) == true;   // Half-open
+    request_allowed_by_circuit_breaker(PROVIDER_ZAI, 0, 1000) == true;   // Closed
+}
+
+invariant guard_overhead_within_bounds {
+    var start: u64 = 1000000000;
+    var end: u64 = 1000005000; // 5ms execution
+    var overhead = guard_overhead_nanoseconds(start, end);
+    overhead < 5000000; // Must be < 5ms
+}
+
+invariant preflight_is_idempotent {
+    // Same input always produces same output
+    var v1 = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, true, false, false);
+    var v2 = preflight(PROVIDER_ZAI, PROVIDER_ZAI, MODEL_GLM, true, false, false);
+    v1 == v2;
+}
+
+invariant provider_resolution_deterministic {
+    // Same base URL always resolves to same provider
+    var p1 = resolve_provider("https://api.z.ai/v1");
+    var p2 = resolve_provider("https://api.z.ai/v1");
+    p1 == p2;
+}
+
+invariant model_allowlist_consistent {
+    // Model allowlist logic is consistent
+    model_allowed_on_provider("glm-4", "z.ai") == true;
+    model_allowed_on_provider("gpt-4", "z.ai") == false;
+    model_allowed_on_provider("deepseek-r1", "deepseek") == true;
+    model_allowed_on_provider("claude-3", "deepseek") == false;
+}

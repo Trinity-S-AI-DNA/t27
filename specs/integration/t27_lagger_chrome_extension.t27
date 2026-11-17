@@ -1,0 +1,349 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 Lagger Chrome Extension Integration
+// Implements circuit breaker for model routing
+// Author: T27 Extension Specialist
+// Date: 2026-10-29
+
+module T27LaggerChromeExtension {
+    use base::types;
+    use system::model_routing_circuit_breaker;
+
+    // ============================================================================
+    // Chrome Extension Communication Protocol
+    // ============================================================================
+
+    // Message types for extension communication
+    pub const ExtensionMessageType = enum {
+        CONFIG_REQUEST,       // Extension requests T27 configuration
+        CONFIG_RESPONSE,      // T27 responds with configuration
+        PREDICTION_REQUEST,   // Extension requests AI prediction
+        PREDICTION_RESPONSE,  // T27 responds with prediction
+        ERROR_NOTIFICATION,   // Error notification from extension
+        HEARTBEAT,           // Periodic heartbeat
+        CIRCUIT_BREAKER_STATE, // Circuit breaker state notification
+    };
+
+    // Extension message structure
+    pub struct ExtensionMessage {
+        message_type: ExtensionMessageType,
+        session_id: str,
+        timestamp: u64,
+        payload: JsonValue,
+        metadata: JsonValue?,
+    }
+
+    // ============================================================================
+    // T27 Lagger Integration Service
+    // ============================================================================
+
+    // T27LaggerService manages the integration between Chrome extension and T27
+    pub struct T27LaggerService {
+        extension_id: str,
+        active_connections: [str],
+        circuit_breaker: model_routing_circuit_breaker::CircuitBreakerState,
+        config: T27LaggerConfig,
+        message_handlers: MessageHandlerRegistry,
+    }
+
+    // Configuration for T27 Lagger integration
+    pub struct T27LaggerConfig {
+        enabled: bool,
+        model_provider: str,
+        fallback_provider: str?,
+        max_retry_attempts: u32,
+        timeout_ms: u64,
+        enable_circuit_breaker: bool,
+        heartbeat_interval_ms: u64,
+        log_level: str,
+    }
+
+    // Message handler function type
+    pub type MessageHandler = fn(message: ExtensionMessage) -> ExtensionMessage;
+
+    // Registry for message handlers
+    pub struct MessageHandlerRegistry {
+        handlers: map<ExtensionMessageType, MessageHandler>,
+    }
+
+    // ============================================================================
+    // Core Service Methods
+    // ============================================================================
+
+    // create_extension_connection establishes connection with Chrome extension
+    pub fn create_extension_connection(service: T27LaggerService, extension_id: str) -> Result<str, ExtensionError> {
+        // Validate extension ID format
+        if (!validate_extension_id(extension_id)) {
+            return Err(ExtensionError::InvalidExtensionId);
+        }
+
+        // Check if extension is already connected
+        if (service.active_connections.contains(extension_id)) {
+            return Err(ExtensionError::AlreadyConnected);
+        }
+
+        // Establish secure communication channel
+        var channel_id = generate_secure_channel_id(extension_id);
+        
+        // Add to active connections
+        service.active_connections.push(extension_id);
+        
+        // Send initial configuration
+        var config_response = ExtensionMessage {
+            message_type = ExtensionMessageType::CONFIG_RESPONSE,
+            session_id = channel_id,
+            timestamp = current_timestamp_ms(),
+            payload = serialize_config(service.config),
+            metadata = null,
+        };
+        
+        // Send handshake message
+        send_to_extension(extension_id, config_response);
+        
+        return Ok(channel_id);
+    }
+
+    // handle_message processes incoming messages from Chrome extension
+    pub fn handle_message(service: T27LaggerService, message: ExtensionMessage) -> ExtensionMessage {
+        // Find appropriate handler
+        var handler = find_message_handler(service.message_handlers, message.message_type);
+        
+        if (handler == null) {
+            return create_error_response(message, ExtensionError::UnknownMessageType);
+        }
+        
+        // Process message with circuit breaker protection
+        if (service.config.enable_circuit_breaker) {
+            return handle_message_with_circuit_breaker(service, message, handler.unwrap());
+        } else {
+            return handler.unwrap()(message);
+        }
+    }
+
+    // handle_prediction_request processes AI prediction requests
+    pub fn handle_prediction_request(service: T27LaggerService, request: ExtensionMessage) -> ExtensionMessage {
+        // Validate request
+        if (!validate_prediction_request(request.payload)) {
+            return create_error_response(request, ExtensionError::InvalidRequest);
+        }
+
+        // Check circuit breaker state
+        var error_classification = classify_request_error(request);
+        if (!service.circuit_breaker.should_retry(service.circuit_breaker, error_classification)) {
+            return create_circuit_breaker_response(request, service.circuit_breaker.status);
+        }
+
+        // Execute prediction with retry logic
+        var result = execute_prediction_with_retry(service, request);
+        
+        // Update circuit breaker state
+        if (result.success) {
+            model_routing_circuit_breaker::record_success(service.circuit_breaker);
+        } else {
+            model_routing_circuit_breaker::record_failure(service.circuit_breaker, error_classification);
+        }
+        
+        return result.response;
+    }
+
+    // ============================================================================
+    // Circuit Breaker Integration
+    // ============================================================================
+
+    // handle_message_with_circuit_breaker wraps message handling with circuit breaker logic
+    pub fn handle_message_with_circuit_breaker(service: T27LaggerService, message: ExtensionMessage, handler: MessageHandler) -> ExtensionMessage {
+        // Check if circuit breaker is active
+        if (service.circuit_breaker.status == model_routing_circuit_breaker::MODEL_ROUTE_STATUS::BLOCKED) {
+            if (current_timestamp_ms() < service.circuit_breaker.blocked_until) {
+                return create_circuit_breaker_response(message, service.circuit_breaker.status);
+            }
+            // Reset circuit breaker if cooldown has expired
+            service.circuit_breaker.status = model_routing_circuit_breaker::MODEL_ROUTE_STATUS::ACTIVE;
+        }
+
+        // Process message
+        var response = handler(message);
+        
+        // Check for errors that should trigger circuit breaker
+        if (response.message_type == ExtensionMessageType::ERROR_NOTIFICATION) {
+            var error_classification = classify_response_error(response);
+            if (error_classification == model_routing_circuit_breaker::ERROR_CLASSIFICATION::CIRCUIT_BREAKER) {
+                model_routing_circuit_breaker::record_failure(service.circuit_breaker, error_classification);
+                return create_circuit_breaker_response(message, service.circuit_breaker.status);
+            }
+        }
+        
+        return response;
+    }
+
+    // execute_prediction_with_retry executes prediction with retry logic
+    fn execute_prediction_with_retry(service: T27LaggerService, request: ExtensionMessage) -> PredictionResult {
+        var retry_count = 0;
+        var last_error = null;
+        
+        while (retry_count < service.config.max_retry_attempts) {
+            var result = execute_prediction_direct(service, request);
+            
+            if (result.success) {
+                return PredictionResult {
+                    success = true,
+                    response = result.response,
+                    error = null,
+                };
+            }
+            
+            last_error = result.error;
+            
+            // Check if we should retry based on error classification
+            var error_classification = classify_prediction_error(result.error);
+            if (!service.circuit_breaker.should_retry(service.circuit_breaker, error_classification)) {
+                break;
+            }
+            
+            retry_count++;
+            apply_backoff_delay(retry_count);
+        }
+        
+        return PredictionResult {
+            success = false,
+            response = create_error_response(request, last_error),
+            error = last_error,
+        };
+    }
+
+    // ============================================================================
+    // Helper Functions
+    // ============================================================================
+
+    // validate_extension_id validates Chrome extension ID format
+    fn validate_extension_id(extension_id: str) -> bool {
+        // Chrome extension IDs are 32-character hexadecimal strings
+        return extension_id.len == 32 && extension_id.chars().all(is_hex_digit);
+    }
+
+    // generate_secure_channel_id generates secure channel ID
+    fn generate_secure_channel_id(extension_id: str) -> str {
+        // Implementation would use cryptographic random
+        return "channel-" + extension_id + "-" + current_timestamp_ms().to_string();
+    }
+
+    // find_message_handler looks up message handler by type
+    fn find_message_handler(registry: MessageHandlerRegistry, message_type: ExtensionMessageType) -> MessageHandler? {
+        return registry.handlers.get(message_type);
+    }
+
+    // send_to_extension sends message to Chrome extension
+    fn send_to_extension(extension_id: str, message: ExtensionMessage) {
+        // Implementation would use Chrome extension messaging API
+        // For now, store in message queue for delivery
+        store_message_for_delivery(extension_id, message);
+    }
+
+    // ============================================================================
+    // Error Handling
+    // ============================================================================
+
+    // Extension error types
+    pub const ExtensionError = enum {
+        InvalidExtensionId,
+        AlreadyConnected,
+        InvalidRequest,
+        UnknownMessageType,
+        CircuitBreakerActive,
+        ProviderUnavailable,
+        NetworkError,
+        Timeout,
+    };
+
+    // create_error_response creates error response message
+    fn create_error_response(original: ExtensionMessage, error: ExtensionError) -> ExtensionMessage {
+        return ExtensionMessage {
+            message_type = ExtensionMessageType::ERROR_NOTIFICATION,
+            session_id = original.session_id,
+            timestamp = current_timestamp_ms(),
+            payload = serialize_error(error),
+            metadata = null,
+        };
+    }
+
+    // create_circuit_breaker_response creates circuit breaker status response
+    fn create_circuit_breaker_response(original: ExtensionMessage, status: model_routing_circuit_breaker::MODEL_ROUTE_STATUS) -> ExtensionMessage {
+        return ExtensionMessage {
+            message_type = ExtensionMessageType::CIRCUIT_BREAKER_STATE,
+            session_id = original.session_id,
+            timestamp = current_timestamp_ms(),
+            payload = serialize_circuit_breaker_status(status),
+            metadata = null,
+        };
+    }
+
+    // ============================================================================
+    // TDD - Tests
+    // ============================================================================
+
+    test "extension_connection_validation" {
+        var service = create_test_service();
+        var invalid_id = "invalid-id";
+        var valid_id = "12345678901234567890123456789012";
+        
+        var invalid_result = create_extension_connection(service, invalid_id);
+        assert(invalid_result.is_err());
+        
+        var valid_result = create_extension_connection(service, valid_id);
+        assert(valid_result.is_ok());
+    }
+
+    test "prediction_request_with_circuit_breaker" {
+        var service = create_test_service_with_circuit_breaker();
+        var request = create_test_prediction_request();
+        
+        // Set circuit breaker to blocked state
+        service.circuit_breaker.status = model_routing_circuit_breaker::MODEL_ROUTE_STATUS::BLOCKED;
+        service.circuit_breaker.blocked_until = current_timestamp_ms() + 1000;
+        
+        var response = handle_message(service, request);
+        assert(response.message_type == ExtensionMessageType::CIRCUIT_BREAKER_STATE);
+    }
+
+    test "message_handler_registration" {
+        var registry = MessageHandlerRegistry {
+            handlers = map{},
+        };
+        
+        var handler = fn(message: ExtensionMessage) -> ExtensionMessage {
+            return ExtensionMessage {
+                message_type = ExtensionMessageType::CONFIG_RESPONSE,
+                session_id = "test",
+                timestamp = 0,
+                payload = {},
+                metadata = null,
+            };
+        };
+        
+        registry.handlers.put(ExtensionMessageType::CONFIG_REQUEST, handler);
+        
+        var found_handler = find_message_handler(registry, ExtensionMessageType::CONFIG_REQUEST);
+        assert(found_handler != null);
+    }
+
+    // ============================================================================
+    // TDD - Invariants
+    // ============================================================================
+
+    invariant service_state_consistency {
+        // Active connections should not contain duplicates
+        service.active_connections.unique().len() == service.active_connections.len();
+        
+        // Circuit breaker state should be valid
+        service.circuit_breaker.failure_count >= 0;
+        service.circuit_breaker.retry_count >= 0;
+        service.circuit_breaker.blocked_until >= 0;
+    }
+
+    invariant error_classification_consistency {
+        // All error classifications should be valid enum values
+        model_routing_circuit_breaker::ERROR_CLASSIFICATION::RETRYABLE as u32 == 0;
+        model_routing_circuit_breaker::ERROR_CLASSIFICATION::TERMINAL as u32 == 1;
+        model_routing_circuit_breaker::ERROR_CLASSIFICATION::CIRCUIT_BREAKER as u32 == 2;
+        model_routing_circuit_breaker::ERROR_CLASSIFICATION::FALLBACK_REQUIRED as u32 == 3;
+    }
+}
