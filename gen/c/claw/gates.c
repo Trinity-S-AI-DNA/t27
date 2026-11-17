@@ -454,8 +454,8 @@ void test_critical_gates_present_and_blocking(void) {
     assert((is_blocking(c, 12) == true));
 }
 
-void test_class_census_62_3_5(void) {
-    assert((count_class(G_BLOCKING) == 62));
+void test_class_census_63_3_5(void) {
+    assert((count_class(G_BLOCKING) == 63));
     assert((count_class(G_SOFT) == 3));
     assert((count_class(G_REPORTING) == 5));
 }
@@ -587,7 +587,7 @@ void test_coverage_report_carries_every_class(void) {
     assert((buf_has(&out, w, "G_BLOCKING", 10) == true));
     assert((buf_has(&out, w, "G_SOFT", 6) == true));
     assert((buf_has(&out, w, "G_REPORTING", 11) == true));
-    assert((buf_has(&out, w, "n=62", 4) == true));
+    assert((buf_has(&out, w, "n=63", 4) == true));
     assert((buf_has(&out, w, "n=3", 3) == true));
     assert((buf_has(&out, w, "n=5", 3) == true));
     assert((buf_has(&out, w, "n=0", 3) == true));
@@ -627,7 +627,7 @@ void test_audit_tail_line_matches_the_count(void) {
 void test_coverage_report_lines_are_exact(void) {
     uint8_t out[4096] = {0};
     size_t w = claw_coverage_report(&out, 4096);
-    assert((buf_has(&out, w, "G_BLOCKING n=62 blocking=true e.g. agent-runner-docker, bootstrap-tests, build-paper\n", 85) == true));
+    assert((buf_has(&out, w, "G_BLOCKING n=63 blocking=true e.g. agent-runner-docker, bootstrap-tests, build-paper\n", 85) == true));
     assert((buf_has(&out, w, "G_SOFT n=3 blocking=false e.g. oracle-nightly, queen-doctor, rings-rust\n", 72) == true));
     assert((buf_has(&out, w, "G_REPORTING n=5 blocking=false e.g. auto-merge-ready-prs, pr-queue-drain, queen-publish\n", 88) == true));
 }
@@ -705,7 +705,7 @@ int main(void) {
     test_known_classes_only();
     test_no_duplicate_names_pairwise();
     test_critical_gates_present_and_blocking();
-    test_class_census_62_3_5();
+    test_class_census_63_3_5();
     test_rows_stay_aligned_name_class_events();
     test_unknown_name_is_unknown_and_not_blocking();
     test_events_len_of_answers_every_row();
