@@ -21,6 +21,7 @@ use clap::Subcommand;
 use std::process::Command;
 #[path = "../../../gen/rust/tri/loop/tick.rs"] #[allow(dead_code, unused_parens)]
 mod tick; // t27c gen-rust of specs/tri/loop/tick.t27: every rule of `tri loop plan`
+#[path = "../../../gen/rust/tri/loopclaim.rs"] mod lc;
 
 #[derive(Subcommand)]
 pub enum LoopCmd {
@@ -62,7 +63,7 @@ fn git(args: &[&str]) -> Result<(i32, String)> {
 }
 
 fn tag_ref(name: &str) -> String {
-    format!("refs/tags/loop-claim/{name}")
+    format!("{}{name}", lc::TAG_PREFIX)
 }
 
 fn holder(name: &str) -> Option<String> {

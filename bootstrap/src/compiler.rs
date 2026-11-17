@@ -27038,6 +27038,8 @@ pub struct RustCodegen {
     /// needs `unsafe`. Collected in a pre-pass because a function may be
     /// emitted before the declaration it reads.
     static_mut_names: std::collections::HashSet<String>,
+    /// How many times each test name has already been emitted. Deduplicate Rust `#[test]` names within a file.
+    test_name_counts: std::collections::HashMap<String, u32>,
     decl_types: std::collections::HashMap<String, String>,
     /// Field NAMES whose declared type is `[]T` in any struct of the module;
     /// the assign path knows only the name, so the name set is the lookup. #11182.
@@ -27069,6 +27071,7 @@ impl RustCodegen {
             enum_names: std::collections::HashSet::new(),
             type_params: std::collections::HashSet::new(),
             static_mut_names: std::collections::HashSet::new(),
+            test_name_counts: std::collections::HashMap::new(),
             decl_types: std::collections::HashMap::new(),
             slice_fields: std::collections::HashSet::new(),
         }
@@ -27153,22 +27156,6 @@ impl RustCodegen {
         acc
     }
 
-    fn count_unlowered(ast: &Node) -> (usize, usize) {
-        fn walk(n: &Node, t: &mut usize, i: &mut usize) {
-            match n.kind {
-                NodeKind::TestBlock => *t += 1,
-                NodeKind::InvariantBlock => *i += 1,
-                _ => {}
-            }
-            for c in &n.children {
-                walk(c, t, i);
-            }
-        }
-        let (mut t, mut i) = (0, 0);
-        walk(ast, &mut t, &mut i);
-        (t, i)
-    }
-
     pub fn gen_rust(&mut self, ast: &Node) {
         // Pre-pass over the whole tree: functions declared `-> bool` return a
         // real Rust bool, so a call to one must not get a `!= 0` guard added in
@@ -27180,6 +27167,7 @@ impl RustCodegen {
         // Same pre-pass, for the bare math-builtin guard below.
         self.declared_fns.clear();
         collect_declared_fns(ast, &mut self.declared_fns);
+        self.test_name_counts.clear();
 
         // Whole-tree, because the fixpoint below follows calls across functions.
         self.written_slice_params = collect_written_slice_params(ast);
@@ -27245,13 +27233,11 @@ impl RustCodegen {
         // saw a file with no tests and no way to tell "by design" from
         // "dropped". Emitting library code without tests is a defensible
         // policy; emitting it silently is the defect (T44/T48).
-        let (n_tests, n_invariants) = Self::count_unlowered(ast);
         let n_stubs = Self::count_stub_fns(ast);
-        if n_tests > 0 || n_invariants > 0 || n_stubs > 0 {
+        if n_stubs > 0 {
             self.write_line(&format!(
-                "// NOT LOWERED BY THIS BACKEND: {} test(s), {} invariant(s), {} \
-                 function(s) with no body.",
-                n_tests, n_invariants, n_stubs
+                "// NOT LOWERED BY THIS BACKEND: {} function(s) with no body.",
+                n_stubs
             ));
             self.write_line(
                 "// This backend emits declarations only. The spec's checks live in",
@@ -27273,6 +27259,8 @@ impl RustCodegen {
                 NodeKind::EnumDecl => self.gen_enum(child),
                 NodeKind::ConstDecl => self.gen_const(child),
                 NodeKind::FnDecl => self.gen_fn(child),
+                NodeKind::TestBlock => self.gen_test_like_rust(child, "test_"),
+                NodeKind::InvariantBlock => self.gen_test_like_rust(child, "invariant_"),
                 _ => {}
             }
         }
@@ -27288,9 +27276,28 @@ impl RustCodegen {
                 NodeKind::EnumDecl => self.gen_enum(child),
                 NodeKind::ConstDecl => self.gen_const(child),
                 NodeKind::FnDecl => self.gen_fn(child),
+                NodeKind::TestBlock => self.gen_test_like_rust(child, "test_"),
+                NodeKind::InvariantBlock => self.gen_test_like_rust(child, "invariant_"),
                 _ => {}
             }
         }
+    }
+
+    fn gen_test_like_rust(&mut self, node: &Node, prefix: &str) {
+        let name = node.name.replace('-', "_");
+        let seen = self.test_name_counts.entry(name.clone()).or_insert(0);
+        *seen += 1;
+        let unique = if *seen == 1 { name } else { format!("{}__dup{}", name, *seen) };
+        let fn_name = format!("{}{}", prefix, unique);
+        self.write_line("#[test]");
+        self.write_line(&format!("pub fn {}() {{", fn_name));
+        self.indent += 1;
+        for stmt in &node.children {
+            self.gen_rust_stmt(stmt);
+        }
+        self.indent -= 1;
+        self.write_line("}");
+        self.blank_line();
     }
 
     fn gen_struct(&mut self, node: &Node) {
