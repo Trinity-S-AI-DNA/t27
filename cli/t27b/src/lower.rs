@@ -7889,8 +7889,20 @@ fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
             }
             { let ExprKind::Cmp { op: o2, lhs: l2, rhs: r2 } = &cond.kind else { unreachable!() }; // countdown: specs/tri/t27b/countdown_plan.t27 Refs #13421
               let (op2, iv_ty, rhs2) = (*o2 as u8, l2.ty, r2.clone());
-              let cd = op2 == 2 && k == 1 && n == 1 && fixed && !inner && ((writes(body, iv) == 1 && writes(step, iv) == 0 && body.iter().filter(|s| !matches!(s, Stmt::Assign { var, .. } if *var == iv)).all(|s| !stmts_has_var(std::slice::from_ref(s), iv))) || (writes(body, iv) == 0 && !stmts_has_var(body, iv))) && !stmts_has_var(rest, iv) && init0(before, iv) == Some(0);
-              pass_event("countdown", cd, if cd { "loop i to countdown" } else { "countdown gate false (op/k/n/fixed/inner/init)" });
+              // A signed `i < bound` can run zero times (bound <= 0), while `while (i)` with i = bound
+              // runs |bound| times (or near-forever, for a runtime bound): a signed bound must be a
+              // literal >= 1. Unsigned bounds are safe as literals (>= 0 by type) and as loop-invariant
+              // runtime values (>= 0 by type): the countdown from C runs exactly C iterations.
+              let iv_signed = matches!(iv_ty, Ty::I32 | Ty::I64);
+              let bound_ok = match &r2.kind { ExprKind::Const(c) => *c >= if iv_signed { 1 } else { 0 }, ExprKind::Var(_) => !iv_signed, _ => false };
+              // A1 (countdown in wrap mode too): the step write is `iv = iv + 1` in either form. In wrap
+              // mode lowering has already relaxed the checked Add to AddW with site 0, which `konst`
+              // (rightly for the checked-op gates) does not accept; the countdown needs only the shape.
+              // `k` stays as it is: the induction gate above still means a *checked* step.
+              let mut kw = 0u32;
+              for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv && matches!(&e.kind, ExprKind::Arith { op: ArithOp::Add | ArithOp::AddW, lhs: sl, rhs: sr, .. } if matches!(sl.kind, ExprKind::Var(w) if w == iv) && matches!(sr.kind, ExprKind::Const(1))) { kw += 1; }); }
+              let cd = op2 == 2 && kw == 1 && n == 1 && fixed && !inner && bound_ok && ((writes(body, iv) == 1 && writes(step, iv) == 0 && body.iter().filter(|s| !matches!(s, Stmt::Assign { var, .. } if *var == iv)).all(|s| !stmts_has_var(std::slice::from_ref(s), iv))) || (writes(body, iv) == 0 && !stmts_has_var(body, iv))) && !stmts_has_var(rest, iv) && init0(before, iv) == Some(0);
+              pass_event("countdown", cd, if cd { "loop i to countdown" } else { "countdown gate false (op/kw/n/fixed/inner/bound/init)" });
               if cd {
                 for s in before.iter_mut().rev() { match s { Stmt::Assign { var, value } if *var == iv => { *value = *rhs2; break; } Stmt::Assign { .. } => {} _ => break } }
                 for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { if let ExprKind::Arith { op: ref mut ao, .. } = e.kind { if matches!(ao, ArithOp::Add | ArithOp::AddW) { *ao = ArithOp::SubW; } } }); }

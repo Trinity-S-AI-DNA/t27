@@ -432,3 +432,43 @@ fn log_base_e_log1p_inf_and_an_f64_round() {
     let f32_log = src.replace(" + std.math.log1p(x)", "").replace("x: f64) -> f64", "x: f32) -> f32").replace("log(f64,", "log(f32,");
     assert_eq!(names_ok(&run(&f32_log.replace("f(1.0) > 0.69", "f(1.0) == 0.0"))), vec![("t", false, true)]);
 }
+
+// ------------------------------------------------- countdown (Refs #13421)
+/// Countdown (Refs #13421): fires iff the bound is safe and the step is
+/// `i = i + 1` in either checked or wrapping form; the lowered condition is
+/// then the bare counter. `i64 i < -5` kept the original shape -- it ran
+/// ~2^32 iterations instead of zero before the 2026-11-17 guard.
+#[test]
+fn countdown_shapes() {
+    use std::path::Path;
+    use t27b::ir::{ExprKind, OverflowMode, Program, Stmt};
+    let lower_with = |src: &str, mode: OverflowMode| -> Program {
+        let parsed = t27b::front::parse(Path::new("/nonexistent/a.t27"), src).expect("parse");
+        t27b::lower::lower_src(&parsed.ast, mode, Some(src)).expect("lower") };
+    let cond = |p: &Program, name: &str| {
+        let f = p.funcs.iter().find(|f| f.name == name).unwrap();
+        for s in &f.body {
+            if let Stmt::While { cond, .. } = s {
+                return if matches!(cond.kind, ExprKind::Var(_)) { "countdown" } else { "original" };
+            }
+        }
+        panic!("no while in {}", name) };
+    let looper = |name: &str, ty: &str, bound: &str, body: &str| format!(
+        "fn {name}(x: {ty}) -> {ty} {{\n    var acc : {ty} = x;\n    var i : {ty} = 0;\n    while (i < {bound}) {{\n{body}        i = i + 1;\n    }}\n    return acc;\n}}\n");
+    let mul3 = "        acc = acc * 3;\n";
+    let mut src = String::from("module a;\n");
+    src += &looper("u8", "u32", "8", mul3);
+    src += &looper("u0", "u32", "0", mul3);
+    src += &looper("u64", "u64", "1000003", mul3);
+    src += "fn ur(x: u32, n: u32) -> u32 {\n    var acc : u32 = x;\n    var i : u32 = 0;\n    while (i < n) {\n        acc = acc * 3;\n        i = i + 1;\n    }\n    return acc;\n}\n";
+    src += "fn sn5(x: i64) -> i64 {\n    var acc : i64 = x;\n    var i : i64 = 0;\n    while (i < -5) {\n        acc = acc + 1;\n        i = i + 1;\n    }\n    return acc;\n}\n";
+    src += &looper("ki", "u32", "8", "        acc = (acc * 3 + i) ^ (acc >> 2);\n");
+    src += "fn s2(x: u32) -> u32 {\n    var acc : u32 = x;\n    var i : u32 = 0;\n    while (i < 8) {\n        acc = acc * 3;\n        i = i + 2;\n    }\n    return acc;\n}\n";
+    //                                u8           u0           u64          ur           sn5         ki          s2
+    let want = [(&"u8", "countdown"), (&"u0", "countdown"), (&"u64", "countdown"), (&"ur", "countdown"),
+                (&"sn5", "original"), (&"ki", "original"), (&"s2", "original")];
+    for mode in [OverflowMode::Trap, OverflowMode::Wrap] {
+        let p = lower_with(&src, mode);
+        for (n, w) in want.iter() { assert_eq!(cond(&p, n), *w, "{} in {:?}", n, mode); }
+    }
+}
