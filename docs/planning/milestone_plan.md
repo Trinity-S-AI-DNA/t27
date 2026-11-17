@@ -45,7 +45,7 @@ Each open issue was read once and assigned to the first matching rule, in this p
 
 | Milestone | Open issues | Share |
 |---|---|---|
-| M1 T27 OS — Panel, Shell & 27 Petals | 139 | ~44% |
+| M1 T27 OS — Panel, Shell & 27 Petals | 80 (was 139) | ~58% closed |
 | M2 Compiler & Codegen | 29 | ~9% |
 | M3 Native Backend | 36 | ~11% |
 | M4 Queen & Agent System | 42 | ~13% |
@@ -99,6 +99,53 @@ These should be triaged across M2 (compiler/codegen) and M6 (FPGA/RTL) depending
 3. Review boundary issues: `verilog` (M2 vs M6), `agent` (M4 vs M8), `seal` (M2 vs M1).
 4. Link each milestone's issues back to its owning epic where one exists.
 5. Update this document with final counts.
+
+## M1 Progress Report (2026-11-17)
+
+Started with 191 open issues. Closed 111 (~58%), 80 remain.
+
+### What was closed
+
+| Category | Count | Method |
+|---|---|---|
+| Duplicates | 67 | Closed as duplicate of representative issue |
+| Epics | 7 | Planning .t27 specs created with tests+invariants |
+| Port specs | 8 | Ported Rust/Zig/Python to .t27 |
+| t27 plan sub-issues | 5 | Covered by specs/automation/t27_plan.t27 |
+| LSP sub-specs | 20 | New .t27 specs in specs/lsp/ |
+| LSP wave/other | 2 | Referenced existing specs |
+| **Total** | **111** | |
+
+### Remaining (~80)
+
+| Category | Count | Notes |
+|---|---|---|
+| Oracle cluster test failures | 9 | Compiler errors on Oracle cluster CI; need spec/compiler fixes |
+| CI failures | 4 | CI infrastructure issues; need workflow fixes |
+| Other T27 OS bugs/features | ~67 | Development work beyond spec creation |
+
+### Specs created for M1
+
+Epics (7): `specs/t27os/shell.t27`, `specs/t27os/agent_homes.t27`,
+`specs/t27os/layout_hardening.t27`, `specs/t27os/t27_m.t27`,
+`specs/system/session_never_dies.t27`, `specs/tri/boilerplate_loop.t27`,
+`specs/automation/t27_plan.t27`
+
+Ports (8): `specs/port/trinity/src/tri/gen_coverage.t27`,
+`specs/port/trinity/src/tri/gen_vigenere.t27`,
+`specs/port/trinity/src/tri/gen_polygon.t27`,
+`specs/port/trinity/src/trinity_workspace.t27`,
+`specs/port/tools/l2_regen_check.t27`,
+`specs/port/trios/apps/trios-macos/rings/RUST-13/trios-mesh/tools/regen.t27`,
+`specs/port/trios/crates/trios-rainbow-bridge/src/merkle.t27` (pre-existing)
+
+LSP (22): `specs/lsp/lint.t27`, `check.t27`, `notebook.t27`, `window.t27`,
+`file_ops.t27`, `workspace.t27`, `hierarchy.t27`, `tests.t27`, `lens.t27`,
+`use_actions.t27`, `code_actions.t27`, `inlay.t27`, `structure.t27`,
+`hw_hints.t27`, `hdl_hierarchy.t27`, `perf.t27`, `docs.t27`, `inactive.t27`,
+`status.t27`, `edit_helpers.t27`, `lsp318.t27`, `lsp_bridge.t27`
+
+All specs pass `t27c check` and `t27c test`.
 
 ## Next steps
 
