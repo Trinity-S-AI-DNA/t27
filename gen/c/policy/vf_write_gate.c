@@ -216,7 +216,11 @@ uint32_t min_role_for_diff(uint8_t* buf, size_t n, size_t sp) {
 
 uint32_t effective_role(uint8_t* buf, size_t n, size_t sp) {
     if (header_has_landing(buf, n, sp)) {
-        return min_role_for_diff(buf, n, sp);
+        uint32_t need = min_role_for_diff(buf, n, sp);
+        if ((need == GR_OWNER)) {
+            return GR_ENGINE;
+        }
+        return need;
     }
     return parse_role(buf, n, sp);
 }
