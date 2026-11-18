@@ -1,53 +1,35 @@
-# Content calendar (M0-04)
+# Content calendar
 
-Part of `[EPIC] T27_PROMOTION_KERNEL_V5` — Part of #13473.
-M0-04: Content calendar (10-day cycle + weekly cadence). Closes #13477.
+Part of #13473. This card does not publish.
 
-## Goal
+The executable check is `specs/automation/promotion_kernel.t27`
+(`day_claim`, `day_pillar`, `day_publishable`, `weekly_posts`).
 
-Define the 10-day content cycle from the V5 spec plus a weekly cadence calendar.
+## 10-day cycle
 
-## 10-day content cycle
+Each day names a claim id and a pillar tag. `publishable_days` is 0.
+A visual does not make a day publishable.
 
-The 10-day cycle rotates through promotion themes derived from the approved claim patterns in the epic. Each day has one pillar tag, one claim pattern, and one CTA target.
+| Day | Claim | Pillar | Publishable |
+|-----|-------|--------|-------------|
+| 0 | 84 formats (refused) | proof | no |
+| 1 | BF16 21/21 (refused) | proof | no |
+| 2 | FP8 15/16 (refused) | artifact | no |
+| 3 | paper row 11, printed 12 clusters (refused) | artifact | no |
+| 4 | paper row 10, 109 records (fits, still a draft) | course | no |
+| 5 | measured 13 clusters (fits, still a draft) | course | no |
+| 6 | 84 formats (refused) | github | no |
+| 7 | 84 formats (refused) | github | no |
+| 8 | 84 formats (refused) | cta | no |
+| 9 | 84 formats (refused) | cta | no |
 
-| Day | Pillar | Claim pattern | CTA target |
-|-----|--------|---------------|------------|
-| 1 | Numeric catalog | "84 formats in one vendor-neutral catalog." | View arXiv paper |
-| 2 | Conformance packs | "6 bit-exact conformance packs." | Download pack |
-| 3 | SHA-256 fingerprints | "Every pack has a SHA-256 fingerprint." | Verify fingerprint |
-| 4 | GoldenFloat | "BF16: 21/21 vectors match ml_dtypes." | Run comparison |
-| 5 | FP8 E4M3 | "FP8 E4M3: 15/16 vectors match; the difference is documented." | Read abs_error |
-| 6 | Transparency | "We publish abs_error instead of hiding it." | Inspect vectors |
-| 7 | Multi-language | "One catalog generates Markdown, JSON, Python, Rust, C, and TypeScript." | Browse codegen |
-| 8 | Open tools | "No Vivado. Open tools only." | Build with yosys |
-| 9 | Course widgets | "Every course widget is a compiled t27 spec." | Open widget |
-| 10 | Course map | 27 lessons, idea + widget + result | Start lesson 1 |
+Pillar tags: proof, artifact, course, github, cta. Two days each.
+
+Days 0, 1, 2, 6, 7, 8 and 9 stay on refused claims so the cycle does not
+invent a new slogan. Days 4 and 5 name claims the gate marks `fit`, and
+they stay drafts.
 
 ## Weekly cadence
 
-| Day of week | Pillar | Content type | CTA |
-|-------------|--------|--------------|-----|
-| Monday | Numeric catalog | Thread: one format family | View arXiv |
-| Tuesday | Conformance | Thread: one conformance pack | Download pack |
-| Wednesday | GoldenFloat | Thread: one rounding rule | Run comparison |
-| Thursday | FP8 | Thread: one FP8 vector | Read abs_error |
-| Friday | Transparency | Thread: abs_error methodology | Inspect vectors |
-| Saturday | Multi-language | Thread: one codegen output | Browse codegen |
-| Sunday | Rest / engagement | Reply to comments, DMs | None (listen only) |
-
-## Rules
-
-- One CTA per post (per epic rule)
-- No paid-token usage without owner approval
-- No outbound email or X post without owner approval
-- Claims must stay inside approved patterns from the epic
-- On rate limit: mark `WAITING_RATE_LIMIT`, stop, do not switch to paid model
-
-## Linked assets
-
-- `docs/promotion/README.md` — promotion kernel index
-- Epic #13473 — T27_PROMOTION_KERNEL_V5
-- Approved claim patterns (see README)
-
-// phi^2 + 1/phi^2 = 3 | TRINITY
+One review of the ten drafts. `weekly_posts` is 0. Nothing is scheduled
+and nothing is posted.

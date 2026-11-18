@@ -112,9 +112,10 @@ text it belongs to. The gate reads SOURCE position.
 Suggested: exclude `\caption{...}` from the self-reference rule. Not patched
 here — it is your call whether the rule or the captions should move.
 
-## 7. `recompute_ladder_table.SUPERSEDED.py` — a marker, not a change
+## 7. `recompute_ladder_table.py` — deleted 2026-11-09, history in git
 
-`recompute_ladder_table.py` regenerates a table the paper no longer contains: it
+The marker file `recompute_ladder_table.SUPERSEDED.py` was deleted on 2026-11-09;
+its history is in git. `recompute_ladder_table.py` regenerated a table the paper no longer contains: it
 emits decades 8, 26, 80, 242 while the ladder table prints 2, 8, 24, 73, and
 26/80/242 occur ZERO times anywhere in `tnf_paper.tex`. The difference is the
 source — the script reads the SPECIFICATION's field widths, the paper now takes

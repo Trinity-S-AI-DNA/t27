@@ -1,33 +1,24 @@
-# Good-first-issue template
+# Proposed good-first-issue body
 
-Copy this into a new GitHub issue on Trinity-S-AI-DNA/t27. Fill in every section — an issue missing a section is refused by the issue-shape gate (`specs/policy/issue_shape.t27`) and closed as `shape-refused`.
+Part of #13473. Issue #13481. This is a template. It was not filed. Replace every `FILL` from a source you can name. Do not invent a lesson number or a test count.
 
-Part of `[EPIC] T27_PROMOTION_KERNEL_V5` — Part of #13473.
-M0-08: Contributor path. See `docs/promotion/contributor-path.md`.
-
+```text
 ## Boundary
 
-One sentence: which file(s) or directory this issue touches. Must be a real path in the repo (or a clearly proposed new path under `docs/promotion/` or `specs/`). Do not name paths outside the boundary.
+- FILL: one path from docs/promotion/course-map.md
 
-## User scenarios
+## User Scenarios
 
-Given/when/then scenarios describing what a contributor can do after this issue is resolved. At least one scenario.
+**Given** the lesson row named above **when** a new contributor opens the spec **then** FILL: the check they can run.
 
 ## Requirements
 
-Numbered requirements (FR-001, FR-002, …). Each requirement is testable: a reviewer can say yes or no without guessing.
+- FR-001: FILL
+- FR-002: The change must not post to X, LinkedIn, Telegram, Habr, or Instagram.
 
-## Success criteria
+## Success Criteria
 
-Concrete, checkable acceptance: files that exist, sections they contain, commands that exit 0, test counts. Link the closing comment to `DONE` and name the file path(s).
+- FILL: one command and the output it must print.
+```
 
-## Additional fields
-
-- Part of: `[EPIC] T27_PROMOTION_KERNEL_V5` (#13473)
-- Milestone: M0_PROMOTION_KERNEL_SPRINT (when applicable)
-- Labels: `good-first-issue`, `docs`, `P0`
-- Closes: `#N` (the issue this implements, when there is one)
-
----
-
-// phi^2 + 1/phi^2 = 3 | TRINITY
+The four section names are the ones `AGENTS.md` says `specs/policy/issue_shape.t27` requires.

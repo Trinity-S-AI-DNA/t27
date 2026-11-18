@@ -1,64 +1,29 @@
-# Weekly campaign report template
+# Weekly campaign report
 
-Part of `[EPIC] T27_PROMOTION_KERNEL_V5` — Part of #13473.
-M0-07: Metrics tracking + weekly campaign report template.
+Part of #13473. Copy this block, fill a field only from a named source,
+and leave an unknown field blank. Do not write 0 for a metric that was
+not measured.
 
-## Template
-
-Copy this template each week and fill in the values:
+The field list is `WEEKLY_FIELD` in `specs/automation/promotion_kernel.t27`.
 
 ```
-# Weekly Campaign Report — Week of YYYY-MM-DD
-
-## Metrics this week
-
-| Metric | Last week | This week | Change | Target |
-|--------|-----------|-----------|--------|--------|
-| Stars | — | — | — | — |
-| Forks | — | — | — | — |
-| Open issues | — | — | — | — |
-| Contributors | — | — | — | — |
-| X followers | — | — | — | — |
-| X impressions (7d) | — | — | — | — |
-| Course lessons complete | — | — | — | — |
-| Widgets compiled | — | — | — | — |
-| Conformance packs | — | — | — | — |
-
-## Activity
-
-| Day | Pillar | Post published | CTA clicks | Engagement |
-|-----|--------|---------------|------------|------------|
-| Monday | — | — | — | — |
-| Tuesday | — | — | — | — |
-| Wednesday | — | — | — | — |
-| Thursday | — | — | — | — |
-| Friday | — | — | — | — |
-| Saturday | — | — | — | — |
-| Sunday | Rest | — | — | — |
-
-## Claims reviewed
-
-| Claim | Pattern | Approved | Published |
-|-------|---------|----------|-----------|
-| — | — | — | — |
-
-## Blockers
-
-| Blocker | Owner | Due date | Status |
-|---------|-------|----------|--------|
-| — | — | — | — |
-
-## Next week priorities
-
-1. —
-2. —
-3. —
+EPIC_CREATED:
+ISSUES_CREATED:
+BASELINE_CAPTURED:
+COURSE_MAP_CREATED:
+WIDGET_INVENTORY_CREATED:
+CONTENT_CALENDAR_CREATED:
+CONTENT_BANK_CREATED:
+FUNNEL_LIVE:
+METRICS_TRACKED:
+CONTRIBUTOR_PATH_LIVE:
+MONETIZATION_LIVE:
+SELF_IMPROVING_LOOP_LIVE:
+REGRESSION_STATUS:
+ANOMALIES_FOUND:
+BLOCKERS:
+NEXT_ACTION:
 ```
 
-## Linked assets
-
-- `docs/promotion/metrics.md` — full metrics definitions and targets
-- `docs/promotion/README.md` — promotion kernel index
-- Epic #13473 — T27_PROMOTION_KERNEL_V5
-
-// phi^2 + 1/phi^2 = 3 | TRINITY
+Known this week, if the baseline card is still current: impressions 809
+(citation, not a new X read). Clicks, course starts and payments: blank.

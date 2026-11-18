@@ -23,6 +23,12 @@ mod verilog_void_tail;
 #[path = "../gen/rust/compiler/cse_hoist.rs"]
 #[allow(dead_code, unused_parens)]
 mod cse_hoist;
+#[path = "../gen/rust/compiler/rust_num_suffix.rs"]
+#[allow(dead_code, unused_parens, unused_variables, non_snake_case, clippy::all)]
+mod rust_num_suffix;
+#[path = "../gen/rust/compiler/splat_scalar.rs"]
+#[allow(dead_code, unused_parens, unused_variables, non_snake_case, clippy::all)]
+mod splat_scalar;
 // specs/compiler/int_type_names.t27 (t27o port), lowered by `t27c gen-rust`; never hand-edit it.
 #[path = "../gen/rust/compiler/int_type_names.rs"]
 #[allow(dead_code, unused_parens)]
@@ -7474,21 +7480,21 @@ the parser used to read it as `{}` followed by a negation",
 /// The whole host syscall layer (Linux): open/read/write/close on a real fd, return the count or -errno.
 const HOST_IO_ZIG: &str = r#"
 const __t27_posix = @import("std").posix;
-fn __t27_host_ret(r: usize) i32 { return @truncate(@as(isize, @bitCast(r))); }
+fn __t27_host_ret(r: isize) i32 { return @truncate(r); }
 fn __t27_host_open(path: [*:0]const u8, mode: i32) i32 {
     const f: __t27_posix.O = if (mode != 0) .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true } else .{};
-    return __t27_host_ret(__t27_posix.system.open(path, f, 0o644));
+    return __t27_host_ret(@intCast(__t27_posix.system.open(path, f, @as(u32, 0o644))));
 }
-fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(__t27_posix.system.read(fd, b.ptr, b.len)); }
-fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(__t27_posix.system.write(fd, b.ptr, b.len)); }
-fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(__t27_posix.system.close(fd)); }
+fn __t27_host_read(fd: i32, b: []u8) i32 { return __t27_host_ret(@intCast(__t27_posix.system.read(fd, b.ptr, b.len))); }
+fn __t27_host_write(fd: i32, b: []const u8) i32 { return __t27_host_ret(@intCast(__t27_posix.system.write(fd, b.ptr, b.len))); }
+fn __t27_host_close(fd: i32) i32 { return __t27_host_ret(@intCast(__t27_posix.system.close(fd))); }
 "#;
 
 /// #10876: OS threads in 256 numbered slots. thread_spawn(slot, f, arg) runs f(arg) on a new thread
 /// and returns false when the slot is busy or the OS refuses; thread_join(slot) waits for it.
 const THREAD_ZIG: &str = r#"
 const __t27_Thread = @import("std").Thread;
-var __t27_threads: [256]?__t27_Thread = [_]?__t27_Thread{null} ** 256;
+var __t27_threads: [256]?__t27_Thread = @splat(null);
 fn __t27_thread_spawn(slot: usize, comptime f: anytype, arg: usize) bool {
     if (slot >= __t27_threads.len or __t27_threads[slot] != null) return false;
     __t27_threads[slot] = __t27_Thread.spawn(.{}, f, .{arg}) catch return false;
@@ -7815,8 +7821,7 @@ impl Codegen {
 
     /// Emit an array literal's elements as `{ e0, e1 }` -- the braces that
     /// follow an explicit `[_]T` prefix, where `.{ … }` cannot be used.
-    fn gen_array_literal_braces(&mut self, node: &Node) {
-        self.write("{ ");
+    fn gen_array_literal_braces(&mut self, node: &Node) {        self.write("{ ");
         if !node.children.is_empty() {
             for (i, elem) in node.children.iter().enumerate() {
                 if i > 0 {
@@ -7840,12 +7845,10 @@ impl Codegen {
             if !cur.trim().is_empty() {
                 parts.push(cur.trim().to_string());
             }
-            // #6451: the REPEAT form `[v; n]` arrives as the text `v;n`, and
-            // was emitted as `{ v;n }` -- "expected ',' after initializer".
-            // Zig spells it `{ v } ** n`; every caller writes the `[_]T` in
-            // front, so `[_]T{ v } ** n` is the whole value. A Rust width
-            // suffix on the value (`0i32`, `0.0f64`) is not Zig either; the
-            // element type already carries the width.
+            // #6451: the REPEAT form `[v; n]` arrives as the text `v;n` (it was
+            // `{ v;n }`, "expected ',' after initializer"); a Rust width suffix
+            // on the value (`0i32`, `0.0f64`) is not Zig either -- the element
+            // type already carries the width.
             if parts.len() == 1 {
                 let mut d = 0i32;
                 let mut semi = None;
@@ -7859,10 +7862,12 @@ impl Codegen {
                 }
                 if let Some(i) = semi {
                     let v = parts[0][..i].trim().to_string();
-                    let n = parts[0][i + 1..].trim().to_string();
-                    if !v.is_empty() && !n.is_empty() {
-                        self.write(&format!("{} }} ** {}", Self::strip_rust_num_suffix(&v), n));
-                        return;
+                    let _n = parts[0][i + 1..].trim().to_string();
+                    if !v.is_empty() && !_n.is_empty() {
+                        // #13591: Zig has no `**`; @splat, count rides the type.
+                        // The suffix strip is the gen-rust port in specs/compiler/rust_num_suffix.t27.
+                        let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes());
+                        self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));                        return;
                     }
                 }
             }
@@ -7872,26 +7877,6 @@ impl Codegen {
     }
 
     /// `0i32` -> `0`, `1.5f64` -> `1.5`, `7usize` -> `7`; anything that is not
-    /// a numeric literal with a Rust width suffix is returned unchanged.
-    fn strip_rust_num_suffix(v: &str) -> String {
-        for suf in [
-            "usize", "isize", "u128", "i128", "u64", "i64", "u32", "i32", "u16", "i16", "f64",
-            "f32", "u8", "i8",
-        ] {
-            if let Some(num) = v.strip_suffix(suf) {
-                let num = num.strip_suffix('_').unwrap_or(num);
-                let body = num.strip_prefix('-').unwrap_or(num);
-                if !body.is_empty()
-                    && body.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                    && body.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
-                {
-                    return num.to_string();
-                }
-            }
-        }
-        v.to_string()
-    }
-
     /// Locals a block declares with one of the given explicit types.
     fn collect_typed_locals(stmts: &[Node], types: &[&str]) -> Vec<String> {
         let mut out = Vec::new();
@@ -10915,6 +10900,16 @@ impl Codegen {
                     // failing with "cannot compare strings with ==". When either
                     // side is a string literal the comparison is a string
                     // comparison, so lower it to std.mem.eql.
+                    // #13591: Zig has no `**` repeat operator; a single-element
+                    // pattern lowers to @splat, the count rides the target type.
+                    if op == "**" {
+                        let a = &node.children[0];
+                        if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
+                        self.write("@splat(");
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && a.extra_size.trim().contains(';') { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
+                        self.write(")");
+                        return;
+                    }
                     let is_str = |n: &Node| {
                         n.kind == NodeKind::ExprLiteral && n.extra_kind == "string"
                     };
@@ -11142,9 +11137,8 @@ impl Codegen {
                 }
 
                 // Otherwise the parser stored the literal's ELEMENT TEXT in
-                // extra_size ("1,2,3" for a list, "0;4" for a repeat).
-                // Emit Zig anonymous-list forms, which coerce to the typed
-                // array target: `.{ e1, e2, .. }` and `.{ v } ** n`.
+                // extra_size ("1,2,3" for a list, "0;4" for a repeat); emit
+                // Zig anonymous-list forms, which coerce to the typed target.
                 let txt = node.extra_size.trim().to_string();
                 // No children and no element text, or a TYPED literal (whose extra_size is its dimension,
                 // `[_]S{}` -> `.{ _ }`, 17 specs), is the EMPTY literal; else `.{  }` had a phantom element.
@@ -11152,17 +11146,12 @@ impl Codegen {
                     self.write(".{}");
                     return;
                 }
-                if let Some((val, count)) = txt.rsplit_once(';') {
-                    // #6451: `[0i32; 2]` kept the Rust width suffix -- "number
-                    // '0i32' has leading zero"; the target type carries it.
-                    self.write(&format!(
-                        ".{{ {} }} ** {}",
-                        Self::strip_rust_num_suffix(val.trim()),
-                        count.trim()
-                    ));
+                if let Some((val, _count)) = txt.rsplit_once(';') {
+                    // #6451/#13591: @splat the value; `.{ X }` unwraps via specs/compiler/splat_scalar.t27; an EMPTY element text (the parser strips `""`) is the empty string (#13625).
+                    let tv = val.trim(); let sn = splat_scalar::splat_scalar_len(tv.as_bytes()); let n = if sn == 0 { tv.len() } else { rust_num_suffix::rust_num_suffix_len(unsafe { &splat_scalar::ss_out[..sn] }) };
+                    self.write(&format!("@splat({})", String::from_utf8_lossy(if sn == 0 { if tv.is_empty() { b"\"\"" } else { tv.as_bytes() } } else { unsafe { &rust_num_suffix::ns_out[..n] } })));
                 } else {
-                    // Split on TOP-LEVEL commas only -- elements may be calls
-                    // with their own commas.
+                    // Split on TOP-LEVEL commas only -- elements may be calls with their own commas.
                     let mut elems: Vec<String> = Vec::new();
                     let mut depth = 0i32;
                     let mut cur = String::new();
@@ -11225,8 +11214,8 @@ impl Codegen {
                                 // W609: the REPEAT form `[v; n]` is stored as
                                 // element text `v;n` and `gen_array_literal_braces`
                                 // splits on commas only, so it emitted the raw
-                                // `{ 0;21 }`. Zig spells it `[_]T{v} ** n`.
-                                // Caught by the corpus check, not by reasoning.
+                                // `{ 0;21 }`. Caught by the corpus check, not by
+                                // reasoning.
                                 let lit = &field.children[0];
                                 let repeat = if lit.children.is_empty() {
                                     lit.extra_size
@@ -11238,8 +11227,9 @@ impl Codegen {
                                 };
                                 match repeat {
                                     Some((v, n)) => self.write(&format!(
-                                        "@constCast(&[_]{}{{ {} }} ** {})",
-                                        elem, v, n
+                                        // #13591: tile the pattern in a comptime block.
+                                        "@constCast(&(blk: {{ const t = [_]{}{{ {} }}; var r: [{}]{} = undefined; var i: usize = 0; while (i < {}) : (i += 1) {{ r[i] = t[i % t.len]; }} break :blk r; }}))",
+                                        elem, v, n, elem, n
                                     )),
                                     None => {
                                         self.write(&format!("@constCast(&[_]{}", elem));
@@ -25692,35 +25682,13 @@ struct FnEntry {
 /// `resolve_type_str` only matches whole strings, so `[]Trit` and `[3]Trit`
 /// both fall through to `Custom("[]Trit")` -- the wrapper, not the type. A
 /// check that consulted `Custom(..)` directly would therefore compare a name
-/// nothing ever declares and report every array as unresolved.
+/// nothing ever declares and report every array as unresolved. The base-name
+/// resolution itself is the gen-rust port in
+/// specs/compiler/type_base_name.t27 (0 = no base name, result in tb_out).
 fn type_base_name(t: &str) -> Option<String> {
-    let mut t = t.trim();
-    loop {
-        let before = t;
-        t = t.trim_start_matches('*').trim_start_matches('&');
-        t = t.trim_end_matches('?');
-        t = t.trim();
-        if let Some(rest) = t.strip_prefix("const ") {
-            t = rest.trim();
-        }
-        if let Some(rest) = t.strip_prefix('[') {
-            // `[]T` and `[N]T` alike: everything up to the first `]`.
-            if let Some(i) = rest.find(']') {
-                t = rest[i + 1..].trim();
-            }
-        }
-        if t == before {
-            break;
-        }
-    }
-    let ok = !t.is_empty()
-        && t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if ok {
-        Some(t.to_string())
-    } else {
-        None
-    }
+    let n = rust_num_suffix::type_base_name_len(t.as_bytes());
+    if n == 0 { return None; }
+    Some(String::from_utf8_lossy(unsafe { &rust_num_suffix::tb_out[..n] }).to_string())
 }
 
 /// Every type name this tree declares: structs, enums, and the Zig-shaped
@@ -27135,6 +27103,8 @@ pub struct RustCodegen {
     /// needs `unsafe`. Collected in a pre-pass because a function may be
     /// emitted before the declaration it reads.
     static_mut_names: std::collections::HashSet<String>,
+    /// How many times each test name has already been emitted. Deduplicate Rust `#[test]` names within a file.
+    test_name_counts: std::collections::HashMap<String, u32>,
     decl_types: std::collections::HashMap<String, String>,
     /// Field NAMES whose declared type is `[]T` in any struct of the module;
     /// the assign path knows only the name, so the name set is the lookup. #11182.
@@ -27166,6 +27136,7 @@ impl RustCodegen {
             enum_names: std::collections::HashSet::new(),
             type_params: std::collections::HashSet::new(),
             static_mut_names: std::collections::HashSet::new(),
+            test_name_counts: std::collections::HashMap::new(),
             decl_types: std::collections::HashMap::new(),
             slice_fields: std::collections::HashSet::new(),
         }
@@ -27250,22 +27221,6 @@ impl RustCodegen {
         acc
     }
 
-    fn count_unlowered(ast: &Node) -> (usize, usize) {
-        fn walk(n: &Node, t: &mut usize, i: &mut usize) {
-            match n.kind {
-                NodeKind::TestBlock => *t += 1,
-                NodeKind::InvariantBlock => *i += 1,
-                _ => {}
-            }
-            for c in &n.children {
-                walk(c, t, i);
-            }
-        }
-        let (mut t, mut i) = (0, 0);
-        walk(ast, &mut t, &mut i);
-        (t, i)
-    }
-
     pub fn gen_rust(&mut self, ast: &Node) {
         // Pre-pass over the whole tree: functions declared `-> bool` return a
         // real Rust bool, so a call to one must not get a `!= 0` guard added in
@@ -27277,6 +27232,7 @@ impl RustCodegen {
         // Same pre-pass, for the bare math-builtin guard below.
         self.declared_fns.clear();
         collect_declared_fns(ast, &mut self.declared_fns);
+        self.test_name_counts.clear();
 
         // Whole-tree, because the fixpoint below follows calls across functions.
         self.written_slice_params = collect_written_slice_params(ast);
@@ -27342,13 +27298,11 @@ impl RustCodegen {
         // saw a file with no tests and no way to tell "by design" from
         // "dropped". Emitting library code without tests is a defensible
         // policy; emitting it silently is the defect (T44/T48).
-        let (n_tests, n_invariants) = Self::count_unlowered(ast);
         let n_stubs = Self::count_stub_fns(ast);
-        if n_tests > 0 || n_invariants > 0 || n_stubs > 0 {
+        if n_stubs > 0 {
             self.write_line(&format!(
-                "// NOT LOWERED BY THIS BACKEND: {} test(s), {} invariant(s), {} \
-                 function(s) with no body.",
-                n_tests, n_invariants, n_stubs
+                "// NOT LOWERED BY THIS BACKEND: {} function(s) with no body.",
+                n_stubs
             ));
             self.write_line(
                 "// This backend emits declarations only. The spec's checks live in",
@@ -27370,6 +27324,8 @@ impl RustCodegen {
                 NodeKind::EnumDecl => self.gen_enum(child),
                 NodeKind::ConstDecl => self.gen_const(child),
                 NodeKind::FnDecl => self.gen_fn(child),
+                NodeKind::TestBlock => self.gen_test_like_rust(child, "test_"),
+                NodeKind::InvariantBlock => self.gen_test_like_rust(child, "invariant_"),
                 _ => {}
             }
         }
@@ -27385,9 +27341,28 @@ impl RustCodegen {
                 NodeKind::EnumDecl => self.gen_enum(child),
                 NodeKind::ConstDecl => self.gen_const(child),
                 NodeKind::FnDecl => self.gen_fn(child),
+                NodeKind::TestBlock => self.gen_test_like_rust(child, "test_"),
+                NodeKind::InvariantBlock => self.gen_test_like_rust(child, "invariant_"),
                 _ => {}
             }
         }
+    }
+
+    fn gen_test_like_rust(&mut self, node: &Node, prefix: &str) {
+        let name = node.name.replace('-', "_");
+        let seen = self.test_name_counts.entry(name.clone()).or_insert(0);
+        *seen += 1;
+        let unique = if *seen == 1 { name } else { format!("{}__dup{}", name, *seen) };
+        let fn_name = format!("{}{}", prefix, unique);
+        self.write_line("#[test]");
+        self.write_line(&format!("pub fn {}() {{", fn_name));
+        self.indent += 1;
+        for stmt in &node.children {
+            self.gen_rust_stmt(stmt);
+        }
+        self.indent -= 1;
+        self.write_line("}");
+        self.blank_line();
     }
 
     fn gen_struct(&mut self, node: &Node) {

@@ -1,51 +1,41 @@
-# Widget inventory: 16 types → lessons
+# Widget inventory
 
-Part of `[EPIC] T27_PROMOTION_KERNEL_V5` — Part of #13473.
-M0-03: Widget inventory (16 types → lessons). Closes #13476.
+Part of #13473. Issue #13476. Status: DRAFT_UNSENT. Nothing here was posted.
 
-## Goal
+The 16 type names are the list in #13476 FR-003. They are not ids in the live course. The course widget ids are `LESSON_WIDGETS` in the trinity course blob `3b3aa5d21a1dc86876c5b873bf6d6b8cf8d20b21` (see `docs/promotion/course-map.md`).
 
-Inventory the 16 widget types from the V5 spec and map each to lessons. Every widget MUST be a compiled t27 spec with visual output.
+`test -f specs/widgets/gallery.t27` exited 1. This checkout cannot show that a type is a compiled gallery widget.
 
-## Constraints (M0 law)
+`nearest` means a lesson widget or a file in this repo that covers part of the same words. It is not a claim that the V5 type exists under that name.
 
-- Docs/planning only — no X posts, no outbound email, no paid-token usage without owner approval.
-- Free models first; on rate limit mark `WAITING_RATE_LIMIT` and stop (no paid fallback).
-- Claims stay inside the approved patterns from the epic.
-- Boundary: `docs/promotion/widget-inventory.md`, `docs/promotion/widget-inventory.json`, `docs/promotion/README.md`.
+| type | status | nearest source | visual output checked |
+| --- | --- | --- | --- |
+| interactive number | nearest | lesson 4 widget `gf16-calc` | screenshot N/A |
+| bit layout explorer | nearest | lesson 2 widget `idcode` | screenshot N/A |
+| encode/decode | nearest | lesson 2 widget `idcode` | screenshot N/A |
+| rounding | nearest | lesson 4 widget `gf16-calc` | screenshot N/A |
+| overflow | absent | not in `LESSON_WIDGETS` | N/A |
+| NaN | absent | not in `LESSON_WIDGETS` | N/A |
+| block scale | absent | not in `LESSON_WIDGETS`; `conformance/vectors/block_fp_conformance_v0.json` is a vector file, not a widget | N/A |
+| ternary adder | nearest | lesson 15 spec `specs/ternary/ternary_full_adder.t27` (`test -f` present); widget on that lesson is `lut-explain` | screenshot N/A |
+| ternary multiplier | nearest | lesson 8 widget `test-waves` | screenshot N/A |
+| FPGA blink | nearest | lesson 24 widget `bit-autopsy`; the lesson task text in the blob names a `blink_j26` sample | screenshot N/A |
+| neural training loop | absent | not in `LESSON_WIDGETS` | N/A |
+| loss curve | absent | lesson 5 widget `cost-curves` is a LUT-cost chart (`specs/widgets/cost_curves.t27` present), not a training-loss curve | screenshot N/A |
+| before/after | partial | `specs/course/lesson_01_diff_main.t27` present; not a `LESSON_WIDGETS` id | screenshot N/A |
+| live build | nearest | lesson 23 widget `build-receipt` | screenshot N/A |
+| agent swarm view | absent | not a `LESSON_WIDGETS` id; lesson 27 `LESSON_ALSO` includes `race-the-bee` | screenshot N/A |
+| course progress | partial | `specs/course/course_hud_state.t27` present; not a `LESSON_WIDGETS` id | screenshot N/A |
 
-## The 16 widget types
+## Asset fields
 
-| # | Widget type | Maps to lesson(s) | Visual output |
-|---|-------------|-------------------|---------------|
-| 1 | interactive number | 1 | a number the learner adjusts and reads back |
-| 2 | bit layout explorer | 2, 3 | sign / exponent / mantissa fields highlighted |
-| 3 | encode/decode | 3, 10, 22, 24 | source ↔ generated output, round-trip exact |
-| 4 | rounding | 4 | half-to-even tie rounding, digit-by-digit |
-| 5 | overflow | 5 | overflow boundary and documented behavior |
-| 6 | NaN | 6 | NaN value and the reserved special row |
-| 7 | block scale | 7 | one shared exponent across a vector |
-| 8 | ternary adder | 8 | balanced-ternary digit addition |
-| 9 | ternary multiplier | 9 | balanced-ternary digit multiplication |
-| 10 | FPGA blink | 12, 20, 25 | blinking LED on ALINX AX7203, open tools |
-| 11 | neural training loop | 13, 26 | one epoch, loss decreasing |
-| 12 | loss curve | 14, 23 | loss over epochs, abs_error beside each vector |
-| 13 | before/after | 11, 15, 21 | source side-by-side with compiled output |
-| 14 | live build | 15, 16, 19 | widget updates on compile without reload |
-| 15 | agent swarm view | 17 | 27 agent consoles on one panel |
-| 16 | course progress | 18, 27 | progress bar matching completed lessons |
+| Field | Value |
+| --- | --- |
+| claim | N/A for the 16 type names; the approved sentence "Every course widget is a compiled t27 spec." is a content-bank draft, not a result of this inventory |
+| artifact | `docs/promotion/widget-inventory.json` |
+| reproducible path | `test -f` lines above, plus the course blob fetch in `course-map.md` |
+| visual | N/A -- no screenshot |
+| CTA | N/A -- not sent |
+| metric | 16 types listed; gallery membership not measured |
 
-## Rule: every widget is a compiled t27 spec
-
-Each widget above is implemented as a `.t27` spec with `test` blocks, sealed, and generated to visual output. A widget that is not a compiled spec with visual output does not count as inventory.
-
-## Machine-readable inventory
-
-See `docs/promotion/widget-inventory.json` — the same 16 types, one offer each, keyed by widget id.
-
-## Linked assets
-
-- `docs/promotion/course-map.md` — the 27 lessons each widget serves
-- `docs/promotion/README.md` — promotion kernel index
-
-// phi^2 + 1/phi^2 = 3 | TRINITY
+Machine-readable copy: `docs/promotion/widget-inventory.json`.

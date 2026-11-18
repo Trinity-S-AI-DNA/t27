@@ -1,37 +1,20 @@
-# Funnel definition (M0-06)
+# Funnel
 
-Part of `[EPIC] T27_PROMOTION_KERNEL_V5` — Part of #13473.
-M0-06: Funnel definition (one CTA per step). Closes #13479.
+Part of #13473. This card does not publish and does not take a payment.
 
-## Goal
+The executable check is `specs/automation/promotion_kernel.t27`
+(`FUNNEL_NAME`, `funnel_ctas`). Each step has one CTA.
 
-Document the funnel X → arXiv/GitHub → t27.ai course → widget → good first issue → contributor → paid → B2B with one CTA per step.
+| Step | Name | CTA |
+|------|------|-----|
+| 0 | X | read the next link; nothing is posted from this card |
+| 1 | arxiv-github | open the paper or the repository |
+| 2 | course | open the course |
+| 3 | widget | open the lesson widget |
+| 4 | good-first-issue | open one good-first issue |
+| 5 | contributor | follow CONTRIBUTING |
+| 6 | paid-product | not offered; paid checkout is off |
+| 7 | b2b | not offered; paid checkout is off |
 
-## Funnel steps
-
-| Step | Stage | CTA (one per step) | Entry criteria | Exit criteria |
-|------|-------|-------------------|----------------|---------------|
-| 1 | X (Twitter) | View arXiv paper | See demo/post | Click link to arXiv |
-| 2 | arXiv / GitHub | Download conformance pack | Read paper | Download pack |
-| 3 | t27.ai course | Start lesson 1 | Visit course site | Complete lesson 1 |
-| 4 | Widget | Open widget | Complete lesson | Interact with widget |
-| 5 | Good first issue | File good-first-issue | Try widget | Issue filed referencing course |
-| 6 | Contributor | Submit first PR | Issue assigned | PR merged |
-| 7 | Paid product | Purchase paid tier | Contributor track record | Payment received |
-| 8 | B2B | Contact sales / enterprise | Paid product usage | B2B contract signed |
-
-## Rules
-
-- Exactly one primary CTA per step (per epic rule)
-- No paid-token usage without owner approval
-- No outbound email or X post without owner approval
-- Claims must stay inside approved patterns from the epic
-- On rate limit: mark `WAITING_RATE_LIMIT`, stop, do not switch to paid model
-
-## Linked assets
-
-- `docs/promotion/README.md` — promotion kernel index
-- Epic #13473 — T27_PROMOTION_KERNEL_V5
-- Funnel (see README)
-
-// phi^2 + 1/phi^2 = 3 | TRINITY
+Steps 6 and 7 are in the map so the later ladder has a place. They do
+not link to a payment. `PAID_CHECKOUT` is false.

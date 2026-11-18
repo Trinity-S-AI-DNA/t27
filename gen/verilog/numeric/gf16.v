@@ -13,6 +13,10 @@ module triformat_gf16 (
     input  wire        en,
     output wire        ready
 );
+// NO DATA PORTS -- this module cannot move a value across its boundary.
+// Synthesis will optimise it to nothing. Add `fn on_comb(...) -> T` to give
+// it a combinational surface: parameters become inputs, the return becomes
+// `result`. See T81.
 
     // -------------------------------------------------------
     // Parameters (from const declarations)
@@ -20,23 +24,86 @@ module triformat_gf16 (
     parameter [7:0] SIGN_SHIFT = 15;
     parameter [7:0] EXP_SHIFT = 9;
     parameter [7:0] MANT_SHIFT = 0;
-    parameter [15:0] SIGN_MASK = 16'h8000;
-    parameter [15:0] EXP_MASK = 16'h7E00;
-    parameter [15:0] MANT_MASK = 16'h01FF;
-    parameter [7:0] EXP_MAX = 8'h3F;
-    parameter [7:0] EXP_MIN = 8'h00;
+    parameter [15:0] SIGN_MASK = 32768;
+    parameter [15:0] EXP_MASK = 32256;
+    parameter [15:0] MANT_MASK = 511;
+    parameter [7:0] EXP_MAX = 63;
+    parameter [7:0] EXP_MIN = 0;
     parameter signed [7:0] BIAS = 31;
-    parameter [7:0] SPECIAL_EXP = 8'h3F;
+    parameter [7:0] SPECIAL_EXP = 63;
     parameter [15:0] MANT_DIVISOR = 512;
     parameter [7:0] MANT_DIVISOR_SHIFT = 9;
     parameter [15:0] PHI_BIAS = 60;
-    parameter [15:0] GF16_ZERO_POS = 16'h0000;
-    parameter [15:0] GF16_ZERO_NEG = 16'h8000;
-    parameter [15:0] GF16_INF_POS = 16'h7E00;
-    parameter [15:0] GF16_INF_NEG = 16'hFE00;
-    parameter [15:0] GF16_NAN = 16'hFE01;
-    parameter [31:0] GF16 = u16;
-    parameter [31:0] pow2_table = [32]u16{0x3C00,0x3D00,0x3D80,0x3E00,0x3E40,0x3E80,0x3EC0,0x3F00,0x3F40,0x3F80,0x3FC0,0x3FE0,0x3FF0,0x4000,0x4040,0x4080,0x40C0,0x4100,0x4140,0x4180,0x41C0,0x4200,0x4240,0x4280,0x42C0,0x4300,0x4340,0x4380,0x43C0,0x4400,0x4440,0x4480,};
+    parameter [15:0] GF16_ZERO_POS = 0;
+    parameter [15:0] GF16_ZERO_NEG = 32768;
+    parameter [15:0] GF16_INF_POS = 32256;
+    parameter [15:0] GF16_INF_NEG = 65024;
+    parameter [15:0] GF16_NAN = 65025;
+    // type alias: GF16 = u16 (no Verilog typedef)
+    // LUT: pow2_table [32] u16
+    reg [15:0]  pow2_table [0:31];
+    initial begin
+        pow2_table[0] = 15872;
+        pow2_table[1] = 16384;
+        pow2_table[2] = 16896;
+        pow2_table[3] = 17408;
+        pow2_table[4] = 17920;
+        pow2_table[5] = 18432;
+        pow2_table[6] = 18944;
+        pow2_table[7] = 19456;
+        pow2_table[8] = 19968;
+        pow2_table[9] = 20480;
+        pow2_table[10] = 20992;
+        pow2_table[11] = 21504;
+        pow2_table[12] = 22016;
+        pow2_table[13] = 22528;
+        pow2_table[14] = 23040;
+        pow2_table[15] = 23552;
+        pow2_table[16] = 24064;
+        pow2_table[17] = 24576;
+        pow2_table[18] = 25088;
+        pow2_table[19] = 25600;
+        pow2_table[20] = 26112;
+        pow2_table[21] = 26624;
+        pow2_table[22] = 27136;
+        pow2_table[23] = 27648;
+        pow2_table[24] = 28160;
+        pow2_table[25] = 28672;
+        pow2_table[26] = 29184;
+        pow2_table[27] = 29696;
+        pow2_table[28] = 30208;
+        pow2_table[29] = 30720;
+        pow2_table[30] = 31232;
+        pow2_table[31] = 31744;
+    end
+    parameter [7:0] FP8_EFFECTIVE_MANT_BITS = 4;
+    parameter [7:0] GF16_CANONICAL_EXP_BITS = 6;
+    parameter [7:0] GF16_CANONICAL_MANT_BITS = 9;
+    parameter [7:0] ALT_A_EXP_BITS = 7;
+    parameter [7:0] ALT_A_MANT_BITS = 8;
+    parameter [7:0] ALT_B_EXP_BITS = 8;
+    parameter [7:0] ALT_B_MANT_BITS = 7;
+    parameter real GF16_PHI_DIST_REGISTERED = 0.0486326415435630;
+    parameter real ALT_A_PHI_DIST = 0.2569660112501051;
+    parameter real ALT_B_PHI_DIST = 0.5248231541072479;
+    parameter real FP8_ULP = 0.0625;
+
+    // -------------------------------------------------------
+    // R-SI-1: multiplication helper (no `*` operator)
+    // -------------------------------------------------------
+    function [63:0] __mul_noop; // t27#1886: 64-bit, u64 products no longer truncate
+        input [63:0] a;
+        input [63:0] b;
+        integer i;
+        reg [127:0] acc;
+        begin
+            acc = 128'd0;
+            for (i = 0; i < 64; i = i + 1) begin
+                if (b[i]) acc = acc + ({64'd0, a} << i);
+            end
+            __mul_noop = acc[63:0];
+        end
+    endfunction
 
     assign ready = 1'b1;
 
@@ -46,1313 +113,1862 @@ module triformat_gf16 (
 
     // function: gf16_extract_sign
     function signed [7:0] gf16_extract_sign; // -> i8
-        input [31:0] gf16;
-        begin
-            reg [31:0] bit = ((gf16 >> SIGN_SHIFT) && 1);
-            gf16_extract_sign = ((bit != 0)) ? (-1) : (0);
+        input [15:0] gf16;
+        begin : gf16_extract_sign_body
+            reg [31:0] \bit ;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            \bit  = ((gf16 >> SIGN_SHIFT) & 1);
+            gf16_extract_sign = ((\bit  != 0)) ? (-1) : (0);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_extract_exponent
     function signed [7:0] gf16_extract_exponent; // -> i8
-        input [31:0] gf16;
-        begin
-            gf16_extract_exponent = @as(i8, @intCast(((gf16 >> EXP_SHIFT) && EXP_MASK)));
+        input [15:0] gf16;
+        begin : gf16_extract_exponent_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            gf16_extract_exponent = ((gf16 & EXP_MASK) >> EXP_SHIFT);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_extract_mantissa
     function signed [15:0] gf16_extract_mantissa; // -> i16
-        input [31:0] gf16;
-        begin
-            gf16_extract_mantissa = @as(i16, (gf16 && MANT_MASK));
+        input [15:0] gf16;
+        begin : gf16_extract_mantissa_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            gf16_extract_mantissa = (gf16 & MANT_MASK);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_from_components
-    function [31:0] gf16_from_components; // -> GF16
+    function [15:0] gf16_from_components; // -> GF16
         input signed [7:0] sign;
         input signed [7:0] exp;
         input signed [15:0] mant;
-        begin
-            reg [31:0] sign_bit = ((sign < 0)) ? (1) : (0);
-            gf16_from_components = (((@as(GF16, @intCast(sign_bit)) << SIGN_SHIFT) || (@as(GF16, @intCast(exp)) << EXP_SHIFT)) || @as(GF16, @intCast(mant)));
+        begin : gf16_from_components_body
+            reg [15:0] sign_bit;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            sign_bit = (($signed(sign) < $signed(0))) ? (1) : (0);
+            gf16_from_components = (((sign_bit << SIGN_SHIFT) | (exp << EXP_SHIFT)) | mant);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_is_zero
     function gf16_is_zero; // -> bool
-        input [31:0] gf16;
-        begin
+        input [15:0] gf16;
+        begin : gf16_is_zero_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             gf16_is_zero = ((gf16 == GF16_ZERO_POS) || (gf16 == GF16_ZERO_NEG));
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_is_special
     function gf16_is_special; // -> bool
-        input [31:0] gf16;
-        begin
+        input [15:0] gf16;
+        begin : gf16_is_special_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             gf16_is_special = (gf16_extract_exponent(gf16) == EXP_MAX);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_encode_f32
-    function [31:0] gf16_encode_f32; // -> GF16
-        input [31:0] value;
-        begin
-            if ((value == 0.0)) begin
-                gf16_encode_f32 = (std.math.signbit(value)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
-            end
-            reg [31:0] sign = ((value < 0.0)) ? (-1) : (0);
-            reg [31:0] abs_value = ((value < 0.0)) ? (-value) : (value);
-            reg [31:0] f32_bits = @bitCast(abs_value);
-            reg signed [7:0] f32_exp = (@intCast(((f32_bits >> 23) && 8'hFF)) - 127);
-            reg [31:0] f32_mant = (f32_bits && 24'h7FFFFF);
-            reg [31:0] gf16_exp = (f32_exp - 96);
-            if ((gf16_exp < 0)) begin
-                gf16_exp = 0;
-            end else if ((gf16_exp > EXP_MAX)) begin
-                gf16_exp = EXP_MAX;
-            end
-            reg [31:0] mant = @as(u16, @intCast((f32_mant >> 14)));
-            reg [31:0] discarded = (f32_mant && 16'h3FFF);
-            if (((discarded && 16'h2000) != 0)) begin
-                mant = mant + 1;
-                if ((mant > MANT_MASK)) begin
-                    mant = 0;
-                    if ((gf16_exp < EXP_MAX)) begin
-                        gf16_exp = gf16_exp + 1;
+    function [15:0] gf16_encode_f32; // -> GF16
+        input real value;
+        begin : gf16_encode_f32_body
+            reg [31:0] bits;
+            reg [15:0] sign_bits;
+            reg [31:0] fe;
+            reg [31:0] fm;
+            reg [31:0] e;
+            reg [31:0] m;
+            reg [31:0] rem;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            bits = value;
+            sign_bits = ((bits >> 16) & 32768);
+            fe = ((bits >> 23) & 255);
+            fm = (bits & 8388607);
+            if ((fe == 255)) begin
+                if ((fm != 0)) begin
+                    gf16_encode_f32 = GF16_NAN;
+                    __t27_ret = 1'b1;
+                end else begin
+                    gf16_encode_f32 = (sign_bits | GF16_INF_POS);
+                    __t27_ret = 1'b1;
+                end
+            end else begin
+                if (($signed({1'b0, fe}) < $signed(96))) begin
+                    gf16_encode_f32 = sign_bits;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (($signed({1'b0, fe}) > $signed(158))) begin
+                        gf16_encode_f32 = (sign_bits | GF16_INF_POS);
+                        __t27_ret = 1'b1;
+                    end else begin
+                        e = (fe - 96);
+                        m = (fm >> 14);
+                        rem = (fm & 16383);
+                        if (($signed({1'b0, rem}) > $signed(8192))) begin
+                            m = (m + 1);
+                        end
+                        if (($signed({1'b0, m}) > $signed(511))) begin
+                            m = 0;
+                            e = (e + 1);
+                        end
+                        if (($signed({1'b0, e}) > $signed(62))) begin
+                            gf16_encode_f32 = (sign_bits | GF16_INF_POS);
+                            __t27_ret = 1'b1;
+                        end else begin
+                            if (((e == 0) && (m == 0))) begin
+                                gf16_encode_f32 = sign_bits;
+                                __t27_ret = 1'b1;
+                            end else begin
+                                gf16_encode_f32 = (sign_bits | ((e << 9) | m));
+                                __t27_ret = 1'b1;
+                            end
+                        end
                     end
                 end
             end
-            gf16_encode_f32 = gf16_from_components(sign, gf16_exp, mant);
         end
     endfunction
 
     // function: gf16_decode_to_f32
-    function [31:0] gf16_decode_to_f32; // -> f32
-        input [31:0] gf16;
-        begin
-            if (gf16_is_zero(gf16)) begin
-                reg [31:0] sign = gf16_extract_sign(gf16);
-                gf16_decode_to_f32 = ((sign < 0)) ? (-0.0) : (0.0);
-            end
-            if (gf16_is_special(gf16)) begin
-                reg [31:0] mant = gf16_extract_mantissa(gf16);
-                reg [31:0] sign = gf16_extract_sign(gf16);
-                if ((mant == 0)) begin
-                    gf16_decode_to_f32 = ((sign < 0)) ? (-std.math.inf(f32)) : (std.math.inf(f32));
+    function real gf16_decode_to_f32; // -> f32
+        input [15:0] gf16;
+        begin : gf16_decode_to_f32_body
+            reg [31:0] s;
+            reg [31:0] e;
+            reg [31:0] m;
+            reg [31:0] zero_bits;
+            reg signed [31:0] zero;
+            reg [31:0] inf_bits;
+            reg signed [31:0] inf;
+            reg [31:0] out_bits;
+            reg signed [31:0] out;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            s = ((gf16 & SIGN_MASK) << 16);
+            e = ((gf16 & EXP_MASK) >> EXP_SHIFT);
+            m = (gf16 & MANT_MASK);
+            if (((e == 0) && (m == 0))) begin
+                zero_bits = s;
+                zero = zero_bits;
+                gf16_decode_to_f32 = zero;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((e == 63)) begin
+                    if ((m == 0)) begin
+                        inf_bits = (s | 2139095040);
+                        inf = inf_bits;
+                        gf16_decode_to_f32 = inf;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_decode_to_f32 = std.math.nan(f32);
+                        __t27_ret = 1'b1;
+                    end
                 end else begin
-                    gf16_decode_to_f32 = std.math.nan(f32);
+                    out_bits = ((s | ((e + 96) << 23)) | (m << 14));
+                    out = out_bits;
+                    gf16_decode_to_f32 = out;
+                    __t27_ret = 1'b1;
                 end
             end
-            reg [31:0] sign = gf16_extract_sign(gf16);
-            reg [31:0] exp = gf16_extract_exponent(gf16);
-            reg [31:0] mant = gf16_extract_mantissa(gf16);
-            reg [31:0] sign_mult = ((sign < 0)) ? (-1.0) : (1.0);
-            reg [31:0] mant_mult = (1.0 + (@as(f32, @floatFromInt(mant)) / 512.0));
-            reg [31:0] exp_mult = @as(f32, @exp2(f32, @floatFromInt((exp - BIAS))));
-            gf16_decode_to_f32 = ((sign_mult * mant_mult) * exp_mult);
         end
     endfunction
 
     // function: gf16_round_phi
-    function [31:0] gf16_round_phi; // -> GF16
-        input [31:0] value;
-        begin
-            if ((value == 0.0)) begin
-                gf16_round_phi = (std.math.signbit(value)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
-            end
-            reg [31:0] sign = ((value < 0.0)) ? (-1) : (0);
-            reg [31:0] abs_value = ((value < 0.0)) ? (-value) : (value);
-            reg [31:0] f32_bits = @bitCast(abs_value);
-            reg signed [7:0] f32_exp = (@intCast(((f32_bits >> 23) && 8'hFF)) - 127);
-            reg [31:0] f32_mant = (f32_bits && 24'h7FFFFF);
-            reg [31:0] gf16_exp = (f32_exp - 96);
-            if ((gf16_exp < 0)) begin
-                gf16_exp = 0;
-            end else if ((gf16_exp > EXP_MAX)) begin
-                gf16_exp = EXP_MAX;
-            end
-            reg [31:0] normalized_mant = (f32_mant || 32'h00800000);
-            reg [31:0] mant = @as(u16, @intCast(((normalized_mant >> 15) + PHI_BIAS)));
-            if ((mant > MANT_MASK)) begin
-                mant = 0;
-                if ((gf16_exp < EXP_MAX)) begin
-                    gf16_exp = gf16_exp + 1;
+    function [15:0] gf16_round_phi; // -> GF16
+        input real value;
+        begin : gf16_round_phi_body
+            reg [31:0] bits;
+            reg [15:0] sign_bits;
+            reg [31:0] fe;
+            reg [31:0] fm;
+            reg [31:0] e;
+            reg [31:0] m;
+            reg [31:0] rem;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            bits = value;
+            sign_bits = ((bits >> 16) & 32768);
+            fe = ((bits >> 23) & 255);
+            fm = (bits & 8388607);
+            if ((fe == 255)) begin
+                if ((fm != 0)) begin
+                    gf16_round_phi = GF16_NAN;
+                    __t27_ret = 1'b1;
                 end else begin
-                    gf16_exp = EXP_MAX;
+                    gf16_round_phi = (sign_bits | GF16_INF_POS);
+                    __t27_ret = 1'b1;
+                end
+            end else begin
+                if (($signed({1'b0, fe}) < $signed(96))) begin
+                    gf16_round_phi = sign_bits;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (($signed({1'b0, fe}) > $signed(158))) begin
+                        gf16_round_phi = (sign_bits | GF16_INF_POS);
+                        __t27_ret = 1'b1;
+                    end else begin
+                        e = (fe - 96);
+                        m = (fm >> 14);
+                        rem = (fm & 16383);
+                        if (($signed({1'b0, rem}) >= $signed(10125))) begin
+                            m = (m + 1);
+                        end
+                        if (($signed({1'b0, m}) > $signed(511))) begin
+                            m = 0;
+                            e = (e + 1);
+                        end
+                        if (($signed({1'b0, e}) > $signed(62))) begin
+                            gf16_round_phi = (sign_bits | GF16_INF_POS);
+                            __t27_ret = 1'b1;
+                        end else begin
+                            if (((e == 0) && (m == 0))) begin
+                                gf16_round_phi = sign_bits;
+                                __t27_ret = 1'b1;
+                            end else begin
+                                gf16_round_phi = (sign_bits | ((e << 9) | m));
+                                __t27_ret = 1'b1;
+                            end
+                        end
+                    end
                 end
             end
-            gf16_round_phi = gf16_from_components(sign, gf16_exp, mant);
         end
     endfunction
 
     // function: gf16_is_inf
     function gf16_is_inf; // -> bool
-        input [31:0] gf16;
-        begin
-            reg [31:0] exp = gf16_extract_exponent(gf16);
-            reg [31:0] mant = gf16_extract_mantissa(gf16);
+        input [15:0] gf16;
+        begin : gf16_is_inf_body
+            reg [31:0] exp;
+            reg [31:0] mant;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            exp = gf16_extract_exponent(gf16);
+            mant = gf16_extract_mantissa(gf16);
             gf16_is_inf = ((exp == EXP_MAX) && (mant == 0));
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_is_nan
     function gf16_is_nan; // -> bool
-        input [31:0] gf16;
-        begin
-            reg [31:0] exp = gf16_extract_exponent(gf16);
-            reg [31:0] mant = gf16_extract_mantissa(gf16);
+        input [15:0] gf16;
+        begin : gf16_is_nan_body
+            reg [31:0] exp;
+            reg [31:0] mant;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            exp = gf16_extract_exponent(gf16);
+            mant = gf16_extract_mantissa(gf16);
             gf16_is_nan = ((exp == EXP_MAX) && (mant != 0));
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_is_negative
     function gf16_is_negative; // -> bool
-        input [31:0] gf16;
-        begin
-            reg [31:0] sign = gf16_extract_sign(gf16);
-            gf16_is_negative = ((sign < 0) && !gf16_is_zero(gf16));
+        input [15:0] gf16;
+        begin : gf16_is_negative_body
+            reg [31:0] sign;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            sign = gf16_extract_sign(gf16);
+            gf16_is_negative = (($signed(sign) < $signed(0)) && !gf16_is_zero(gf16));
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_is_positive
     function gf16_is_positive; // -> bool
-        input [31:0] gf16;
-        begin
-            reg [31:0] sign = gf16_extract_sign(gf16);
-            gf16_is_positive = ((sign >= 0) && !gf16_is_zero(gf16));
+        input [15:0] gf16;
+        begin : gf16_is_positive_body
+            reg [31:0] sign;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            sign = gf16_extract_sign(gf16);
+            gf16_is_positive = (($signed(sign) >= $signed(0)) && !gf16_is_zero(gf16));
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_negate
-    function [31:0] gf16_negate; // -> GF16
-        input [31:0] gf16;
-        begin
+    function [15:0] gf16_negate; // -> GF16
+        input [15:0] gf16;
+        begin : gf16_negate_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             gf16_negate = (gf16 ^ SIGN_MASK);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_abs
-    function [31:0] gf16_abs; // -> GF16
-        input [31:0] gf16;
-        begin
-            gf16_abs = (gf16 && ~SIGN_MASK);
+    function [15:0] gf16_abs; // -> GF16
+        input [15:0] gf16;
+        begin : gf16_abs_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            gf16_abs = (gf16 & ~SIGN_MASK);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_copy_sign
-    function [31:0] gf16_copy_sign; // -> GF16
-        input [31:0] gf16;
-        input [31:0] sign_source;
-        begin
-            reg [31:0] sign_mask = (sign_source && SIGN_MASK);
-            reg [31:0] value_mask = (gf16 && ~SIGN_MASK);
-            gf16_copy_sign = (value_mask || sign_mask);
+    function [15:0] gf16_copy_sign; // -> GF16
+        input [15:0] gf16;
+        input [15:0] sign_source;
+        begin : gf16_copy_sign_body
+            reg [31:0] sign_mask;
+            reg [31:0] value_mask;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            sign_mask = (sign_source & SIGN_MASK);
+            value_mask = (gf16 & ~SIGN_MASK);
+            gf16_copy_sign = (value_mask | sign_mask);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_max
-    function [31:0] gf16_max; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_max; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_max_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(a)) begin
                 gf16_max = b;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_nan(b)) begin
+                    gf16_max = a;
+                    __t27_ret = 1'b1;
+                end else begin
+                    a_val = gf16_decode_to_f32(a);
+                    b_val = gf16_decode_to_f32(b);
+                    if ((a_val >= b_val)) begin
+                        gf16_max = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_max = b;
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
-            if (gf16_is_nan(b)) begin
-                gf16_max = a;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            if ((a_val >= b_val)) begin
-                gf16_max = a;
-            end
-            gf16_max = b;
         end
     endfunction
 
     // function: gf16_min
-    function [31:0] gf16_min; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_min; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_min_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(a)) begin
                 gf16_min = b;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_nan(b)) begin
+                    gf16_min = a;
+                    __t27_ret = 1'b1;
+                end else begin
+                    a_val = gf16_decode_to_f32(a);
+                    b_val = gf16_decode_to_f32(b);
+                    if ((a_val <= b_val)) begin
+                        gf16_min = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_min = b;
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
-            if (gf16_is_nan(b)) begin
-                gf16_min = a;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            if ((a_val <= b_val)) begin
-                gf16_min = a;
-            end
-            gf16_min = b;
         end
     endfunction
 
     // function: gf16_add
-    function [31:0] gf16_add; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_add; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_add_body
+            reg [31:0] a_sign;
+            reg [31:0] b_sign;
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_add = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((gf16_is_inf(a) && gf16_is_inf(b))) begin
+                    a_sign = gf16_extract_sign(a);
+                    b_sign = gf16_extract_sign(b);
+                    gf16_add = ((a_sign == b_sign)) ? (a) : (GF16_NAN);
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_inf(a)) begin
+                        gf16_add = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if (gf16_is_inf(b)) begin
+                            gf16_add = b;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            a_val = gf16_decode_to_f32(a);
+                            b_val = gf16_decode_to_f32(b);
+                            result = (a_val + b_val);
+                            gf16_add = gf16_encode_f32(result);
+                            __t27_ret = 1'b1;
+                        end
+                    end
+                end
             end
-            if ((gf16_is_inf(a) && gf16_is_inf(b))) begin
-                reg [31:0] a_sign = gf16_extract_sign(a);
-                reg [31:0] b_sign = gf16_extract_sign(b);
-                gf16_add = ((a_sign == b_sign)) ? (a) : (GF16_NAN);
-            end
-            if (gf16_is_inf(a)) begin
-                gf16_add = a;
-            end
-            if (gf16_is_inf(b)) begin
-                gf16_add = b;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] result = (a_val + b_val);
-            gf16_add = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_sub
-    function [31:0] gf16_sub; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_sub; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_sub_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_sub = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((gf16_is_inf(a) && gf16_is_inf(b))) begin
+                    gf16_sub = GF16_NAN;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_inf(a)) begin
+                        gf16_sub = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if (gf16_is_inf(b)) begin
+                            gf16_sub = gf16_negate(b);
+                            __t27_ret = 1'b1;
+                        end else begin
+                            a_val = gf16_decode_to_f32(a);
+                            b_val = gf16_decode_to_f32(b);
+                            result = (a_val - b_val);
+                            gf16_sub = gf16_encode_f32(result);
+                            __t27_ret = 1'b1;
+                        end
+                    end
+                end
             end
-            if ((gf16_is_inf(a) && gf16_is_inf(b))) begin
-                gf16_sub = GF16_NAN;
-            end
-            if (gf16_is_inf(a)) begin
-                gf16_sub = a;
-            end
-            if (gf16_is_inf(b)) begin
-                gf16_sub = gf16_negate(b);
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] result = (a_val - b_val);
-            gf16_sub = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_mul
-    function [31:0] gf16_mul; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_mul; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_mul_body
+            reg [31:0] a_sign;
+            reg [31:0] b_sign;
+            reg [31:0] result_sign;
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_mul = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
+                    a_sign = gf16_extract_sign(a);
+                    b_sign = gf16_extract_sign(b);
+                    result_sign = (a_sign ^ b_sign);
+                    gf16_mul = ((result_sign != 0)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
+                    __t27_ret = 1'b1;
+                end else begin
+                    if ((gf16_is_inf(a) || gf16_is_inf(b))) begin
+                        a_sign = gf16_extract_sign(a);
+                        b_sign = gf16_extract_sign(b);
+                        result_sign = (a_sign ^ b_sign);
+                        gf16_mul = ((result_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
+                        __t27_ret = 1'b1;
+                    end else begin
+                        a_val = gf16_decode_to_f32(a);
+                        b_val = gf16_decode_to_f32(b);
+                        result = (a_val * b_val);
+                        gf16_mul = gf16_encode_f32(result);
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
-            if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
-                reg [31:0] a_sign = gf16_extract_sign(a);
-                reg [31:0] b_sign = gf16_extract_sign(b);
-                reg [31:0] result_sign = (a_sign ^ b_sign);
-                gf16_mul = ((result_sign != 0)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
-            end
-            if ((gf16_is_inf(a) || gf16_is_inf(b))) begin
-                reg [31:0] a_sign = gf16_extract_sign(a);
-                reg [31:0] b_sign = gf16_extract_sign(b);
-                reg [31:0] result_sign = (a_sign ^ b_sign);
-                gf16_mul = ((result_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] result = (a_val * b_val);
-            gf16_mul = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_div
-    function [31:0] gf16_div; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_div; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_div_body
+            reg [31:0] a_sign;
+            reg [31:0] b_sign;
+            reg [31:0] result_sign;
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_div = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_zero(b)) begin
+                    a_sign = gf16_extract_sign(a);
+                    gf16_div = ((a_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_inf(a)) begin
+                        a_sign = gf16_extract_sign(a);
+                        b_sign = gf16_extract_sign(b);
+                        result_sign = (a_sign ^ b_sign);
+                        gf16_div = ((result_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if (gf16_is_inf(b)) begin
+                            a_sign = gf16_extract_sign(a);
+                            b_sign = gf16_extract_sign(b);
+                            result_sign = (a_sign ^ b_sign);
+                            gf16_div = ((result_sign != 0)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
+                            __t27_ret = 1'b1;
+                        end else begin
+                            a_val = gf16_decode_to_f32(a);
+                            b_val = gf16_decode_to_f32(b);
+                            result = (a_val / b_val);
+                            gf16_div = gf16_encode_f32(result);
+                            __t27_ret = 1'b1;
+                        end
+                    end
+                end
             end
-            if (gf16_is_zero(b)) begin
-                reg [31:0] a_sign = gf16_extract_sign(a);
-                gf16_div = ((a_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
-            end
-            if (gf16_is_inf(a)) begin
-                reg [31:0] a_sign = gf16_extract_sign(a);
-                reg [31:0] b_sign = gf16_extract_sign(b);
-                reg [31:0] result_sign = (a_sign ^ b_sign);
-                gf16_div = ((result_sign != 0)) ? (GF16_INF_NEG) : (GF16_INF_POS);
-            end
-            if (gf16_is_inf(b)) begin
-                reg [31:0] a_sign = gf16_extract_sign(a);
-                reg [31:0] b_sign = gf16_extract_sign(b);
-                reg [31:0] result_sign = (a_sign ^ b_sign);
-                gf16_div = ((result_sign != 0)) ? (GF16_ZERO_NEG) : (GF16_ZERO_POS);
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] result = (a_val / b_val);
-            gf16_div = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_fma
-    function [31:0] gf16_fma; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        input [31:0] c;
-        begin
+    function [15:0] gf16_fma; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        input [15:0] c;
+        begin : gf16_fma_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] c_val;
+            reg [31:0] product;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(c))) begin
                 gf16_fma = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                a_val = gf16_decode_to_f32(a);
+                b_val = gf16_decode_to_f32(b);
+                c_val = gf16_decode_to_f32(c);
+                if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
+                    gf16_fma = gf16_add(c, gf16_encode_f32(0.0));
+                    __t27_ret = 1'b1;
+                end else begin
+                    product = (a_val * b_val);
+                    result = (product + c_val);
+                    gf16_fma = gf16_encode_f32(result);
+                    __t27_ret = 1'b1;
+                end
             end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] c_val = gf16_decode_to_f32(c);
-            if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
-                gf16_fma = gf16_add(c, gf16_encode_f32(0.0));
-            end
-            reg [31:0] product = (a_val * b_val);
-            reg [31:0] result = (product + c_val);
-            gf16_fma = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_sqrt
-    function [31:0] gf16_sqrt; // -> GF16
-        input [31:0] a;
-        begin
+    function [15:0] gf16_sqrt; // -> GF16
+        input [15:0] a;
+        begin : gf16_sqrt_body
+            reg [31:0] a_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(a)) begin
                 gf16_sqrt = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((gf16_is_inf(a) && !gf16_is_negative(a))) begin
+                    gf16_sqrt = a;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_inf(a)) begin
+                        gf16_sqrt = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if (gf16_is_zero(a)) begin
+                            gf16_sqrt = a;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            if (gf16_is_negative(a)) begin
+                                gf16_sqrt = GF16_NAN;
+                                __t27_ret = 1'b1;
+                            end else begin
+                                a_val = gf16_decode_to_f32(a);
+                                result = @sqrt(a_val);
+                                gf16_sqrt = gf16_encode_f32(result);
+                                __t27_ret = 1'b1;
+                            end
+                        end
+                    end
+                end
             end
-            if ((gf16_is_inf(a) && !gf16_is_negative(a))) begin
-                gf16_sqrt = a;
-            end
-            if (gf16_is_inf(a)) begin
-                gf16_sqrt = GF16_NAN;
-            end
-            if (gf16_is_zero(a)) begin
-                gf16_sqrt = a;
-            end
-            if (gf16_is_negative(a)) begin
-                gf16_sqrt = GF16_NAN;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] result = @sqrt(a_val);
-            gf16_sqrt = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_square
-    function [31:0] gf16_square; // -> GF16
-        input [31:0] a;
-        begin
+    function [15:0] gf16_square; // -> GF16
+        input [15:0] a;
+        begin : gf16_square_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             gf16_square = gf16_mul(a, a);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_eq
     function gf16_eq; // -> bool
-        input [31:0] a;
-        input [31:0] b;
-        begin
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_eq_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_eq = 1'b0;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((gf16_is_zero(a) && gf16_is_zero(b))) begin
+                    gf16_eq = 1'b1;
+                    __t27_ret = 1'b1;
+                end else begin
+                    gf16_eq = (a == b);
+                    __t27_ret = 1'b1;
+                end
             end
-            if ((gf16_is_zero(a) && gf16_is_zero(b))) begin
-                gf16_eq = 1'b1;
-            end
-            gf16_eq = (a == b);
         end
     endfunction
 
     // function: gf16_ne
     function gf16_ne; // -> bool
-        input [31:0] a;
-        input [31:0] b;
-        begin
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_ne_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             gf16_ne = !gf16_eq(a, b);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_lt
     function gf16_lt; // -> bool
-        input [31:0] a;
-        input [31:0] b;
-        begin
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_lt_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_lt = 1'b0;
+                __t27_ret = 1'b1;
+            end else begin
+                a_val = gf16_decode_to_f32(a);
+                b_val = gf16_decode_to_f32(b);
+                gf16_lt = (a_val < b_val);
+                __t27_ret = 1'b1;
             end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            gf16_lt = (a_val < b_val);
         end
     endfunction
 
     // function: gf16_le
     function gf16_le; // -> bool
-        input [31:0] a;
-        input [31:0] b;
-        begin
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_le_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_le = 1'b0;
+                __t27_ret = 1'b1;
+            end else begin
+                a_val = gf16_decode_to_f32(a);
+                b_val = gf16_decode_to_f32(b);
+                gf16_le = (a_val <= b_val);
+                __t27_ret = 1'b1;
             end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            gf16_le = (a_val <= b_val);
         end
     endfunction
 
     // function: gf16_gt
     function gf16_gt; // -> bool
-        input [31:0] a;
-        input [31:0] b;
-        begin
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_gt_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_gt = 1'b0;
+                __t27_ret = 1'b1;
+            end else begin
+                a_val = gf16_decode_to_f32(a);
+                b_val = gf16_decode_to_f32(b);
+                gf16_gt = (a_val > b_val);
+                __t27_ret = 1'b1;
             end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            gf16_gt = (a_val > b_val);
         end
     endfunction
 
     // function: gf16_ge
     function gf16_ge; // -> bool
-        input [31:0] a;
-        input [31:0] b;
-        begin
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_ge_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_ge = 1'b0;
+                __t27_ret = 1'b1;
+            end else begin
+                a_val = gf16_decode_to_f32(a);
+                b_val = gf16_decode_to_f32(b);
+                gf16_ge = (a_val >= b_val);
+                __t27_ret = 1'b1;
             end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            gf16_ge = (a_val >= b_val);
         end
     endfunction
 
     // function: gf16_floor
-    function [31:0] gf16_floor; // -> GF16
-        input [31:0] a;
-        begin
+    function [15:0] gf16_floor; // -> GF16
+        input [15:0] a;
+        begin : gf16_floor_body
+            reg [31:0] a_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(a)) begin
                 gf16_floor = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(a)) begin
+                    gf16_floor = a;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_zero(a)) begin
+                        gf16_floor = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        a_val = gf16_decode_to_f32(a);
+                        result = @floor(a_val);
+                        gf16_floor = gf16_encode_f32(result);
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
-            if (gf16_is_inf(a)) begin
-                gf16_floor = a;
-            end
-            if (gf16_is_zero(a)) begin
-                gf16_floor = a;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] result = @floor(a_val);
-            gf16_floor = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_ceil
-    function [31:0] gf16_ceil; // -> GF16
-        input [31:0] a;
-        begin
+    function [15:0] gf16_ceil; // -> GF16
+        input [15:0] a;
+        begin : gf16_ceil_body
+            reg [31:0] a_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(a)) begin
                 gf16_ceil = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(a)) begin
+                    gf16_ceil = a;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_zero(a)) begin
+                        gf16_ceil = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        a_val = gf16_decode_to_f32(a);
+                        result = @ceil(a_val);
+                        gf16_ceil = gf16_encode_f32(result);
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
-            if (gf16_is_inf(a)) begin
-                gf16_ceil = a;
-            end
-            if (gf16_is_zero(a)) begin
-                gf16_ceil = a;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] result = @ceil(a_val);
-            gf16_ceil = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_round
-    function [31:0] gf16_round; // -> GF16
-        input [31:0] a;
-        begin
+    function [15:0] gf16_round; // -> GF16
+        input [15:0] a;
+        begin : gf16_round_body
+            reg [31:0] a_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(a)) begin
                 gf16_round = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(a)) begin
+                    gf16_round = a;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_zero(a)) begin
+                        gf16_round = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        a_val = gf16_decode_to_f32(a);
+                        result = @round(a_val);
+                        gf16_round = gf16_encode_f32(result);
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
-            if (gf16_is_inf(a)) begin
-                gf16_round = a;
-            end
-            if (gf16_is_zero(a)) begin
-                gf16_round = a;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] result = @round(a_val);
-            gf16_round = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_trunc
-    function [31:0] gf16_trunc; // -> GF16
-        input [31:0] a;
-        begin
+    function [15:0] gf16_trunc; // -> GF16
+        input [15:0] a;
+        begin : gf16_trunc_body
+            reg [31:0] a_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(a)) begin
                 gf16_trunc = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(a)) begin
+                    gf16_trunc = a;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_zero(a)) begin
+                        gf16_trunc = a;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        a_val = gf16_decode_to_f32(a);
+                        result = @trunc(a_val);
+                        gf16_trunc = gf16_encode_f32(result);
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
-            if (gf16_is_inf(a)) begin
-                gf16_trunc = a;
-            end
-            if (gf16_is_zero(a)) begin
-                gf16_trunc = a;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] result = @trunc(a_val);
-            gf16_trunc = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_fms
-    function [31:0] gf16_fms; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        input [31:0] c;
-        begin
+    function [15:0] gf16_fms; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        input [15:0] c;
+        begin : gf16_fms_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] c_val;
+            reg [31:0] product;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(c))) begin
                 gf16_fms = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                a_val = gf16_decode_to_f32(a);
+                b_val = gf16_decode_to_f32(b);
+                c_val = gf16_decode_to_f32(c);
+                if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
+                    gf16_fms = gf16_sub(gf16_encode_f32(0.0), c);
+                    __t27_ret = 1'b1;
+                end else begin
+                    product = (a_val * b_val);
+                    result = (product - c_val);
+                    gf16_fms = gf16_encode_f32(result);
+                    __t27_ret = 1'b1;
+                end
             end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] c_val = gf16_decode_to_f32(c);
-            if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
-                gf16_fms = gf16_sub(gf16_encode_f32(0.0), c);
-            end
-            reg [31:0] product = (a_val * b_val);
-            reg [31:0] result = (product - c_val);
-            gf16_fms = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_hypot
-    function [31:0] gf16_hypot; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_hypot; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_hypot_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] abs_a;
+            reg [31:0] abs_b;
+            reg [31:0] max_val;
+            reg [31:0] min_val;
+            reg [31:0] ratio;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_hypot = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((gf16_is_inf(a) || gf16_is_inf(b))) begin
+                    gf16_hypot = GF16_INF_POS;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if ((gf16_is_zero(a) && gf16_is_zero(b))) begin
+                        gf16_hypot = GF16_ZERO_POS;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        a_val = gf16_decode_to_f32(a);
+                        b_val = gf16_decode_to_f32(b);
+                        abs_a = @abs(a_val);
+                        abs_b = @abs(b_val);
+                        max_val = @max(abs_a, abs_b);
+                        min_val = @min(abs_a, abs_b);
+                        if ((max_val == 0.0)) begin
+                            gf16_hypot = GF16_ZERO_POS;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            ratio = (min_val / max_val);
+                            result = __mul_noop(max_val, @sqrt((1.0 + __mul_noop(ratio, ratio))));
+                            gf16_hypot = gf16_encode_f32(result);
+                            __t27_ret = 1'b1;
+                        end
+                    end
+                end
             end
-            if ((gf16_is_inf(a) || gf16_is_inf(b))) begin
-                gf16_hypot = GF16_INF_POS;
-            end
-            if ((gf16_is_zero(a) && gf16_is_zero(b))) begin
-                gf16_hypot = GF16_ZERO_POS;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] abs_a = @abs(a_val);
-            reg [31:0] abs_b = @abs(b_val);
-            reg [31:0] max_val = @max(abs_a, abs_b);
-            reg [31:0] min_val = @min(abs_a, abs_b);
-            if ((max_val == 0.0)) begin
-                gf16_hypot = GF16_ZERO_POS;
-            end
-            reg [31:0] ratio = (min_val / max_val);
-            reg [31:0] result = (max_val * @sqrt((1.0 + (ratio * ratio))));
-            gf16_hypot = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_fmod
-    function [31:0] gf16_fmod; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        begin
+    function [15:0] gf16_fmod; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        begin : gf16_fmod_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(a) || gf16_is_nan(b))) begin
                 gf16_fmod = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_zero(b)) begin
+                    gf16_fmod = GF16_NAN;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_is_inf(a)) begin
+                        gf16_fmod = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if (gf16_is_inf(b)) begin
+                            gf16_fmod = a;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            a_val = gf16_decode_to_f32(a);
+                            b_val = gf16_decode_to_f32(b);
+                            if ((a_val == 0.0)) begin
+                                gf16_fmod = a;
+                                __t27_ret = 1'b1;
+                            end else begin
+                                result = @rem(a_val, b_val);
+                                gf16_fmod = gf16_encode_f32(result);
+                                __t27_ret = 1'b1;
+                            end
+                        end
+                    end
+                end
             end
-            if (gf16_is_zero(b)) begin
-                gf16_fmod = GF16_NAN;
-            end
-            if (gf16_is_inf(a)) begin
-                gf16_fmod = GF16_NAN;
-            end
-            if (gf16_is_inf(b)) begin
-                gf16_fmod = a;
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            if ((a_val == 0.0)) begin
-                gf16_fmod = a;
-            end
-            reg [31:0] result = @mod(a_val, b_val);
-            gf16_fmod = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_is_finite
     function gf16_is_finite; // -> bool
-        input [31:0] gf16;
-        begin
+        input [15:0] gf16;
+        begin : gf16_is_finite_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             gf16_is_finite = (!gf16_is_nan(gf16) && !gf16_is_inf(gf16));
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_is_normal
     function gf16_is_normal; // -> bool
-        input [31:0] gf16;
-        begin
+        input [15:0] gf16;
+        begin : gf16_is_normal_body
+            reg [31:0] exp;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (((gf16_is_zero(gf16) || gf16_is_nan(gf16)) || gf16_is_inf(gf16))) begin
                 gf16_is_normal = 1'b0;
+                __t27_ret = 1'b1;
+            end else begin
+                exp = gf16_extract_exponent(gf16);
+                gf16_is_normal = (($signed(exp) >= $signed(0)) && ($signed(exp) < $signed({1'b0, EXP_MAX})));
+                __t27_ret = 1'b1;
             end
-            reg [31:0] exp = gf16_extract_exponent(gf16);
-            gf16_is_normal = ((exp > 0) && (exp < GF16_EXP_MAX));
         end
     endfunction
 
     // function: gf16_is_subnormal
     function gf16_is_subnormal; // -> bool
-        input [31:0] gf16;
-        begin
-            if (((gf16_is_zero(gf16) || gf16_is_nan(gf16)) || gf16_is_inf(gf16))) begin
-                gf16_is_subnormal = 1'b0;
-            end
-            reg [31:0] exp = gf16_extract_exponent(gf16);
-            reg [31:0] mant = gf16_extract_mantissa(gf16);
-            gf16_is_subnormal = ((exp == 0) && (mant != 0));
+        input [15:0] gf16;
+        begin : gf16_is_subnormal_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            gf16_is_subnormal = ((gf16_is_finite(gf16) && !gf16_is_zero(gf16)) && !gf16_is_normal(gf16));
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_signbit
     function gf16_signbit; // -> bool
-        input [31:0] gf16;
-        begin
-            gf16_signbit = ((gf16 && GF16_SIGN_MASK) != 0);
+        input [15:0] gf16;
+        begin : gf16_signbit_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
+            gf16_signbit = ((gf16 & SIGN_MASK) != 0);
+            __t27_ret = 1'b1;
         end
     endfunction
 
     // function: gf16_sign
     function signed [7:0] gf16_sign; // -> i8
-        input [31:0] gf16;
-        begin
+        input [15:0] gf16;
+        begin : gf16_sign_body
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(gf16)) begin
                 gf16_sign = 0;
-            end
-            if (gf16_is_zero(gf16)) begin
-                gf16_sign = 0;
-            end
-            if (gf16_signbit(gf16)) begin
-                gf16_sign = -1;
+                __t27_ret = 1'b1;
             end else begin
-                gf16_sign = 1;
+                if (gf16_is_zero(gf16)) begin
+                    gf16_sign = 0;
+                    __t27_ret = 1'b1;
+                end else begin
+                    if (gf16_signbit(gf16)) begin
+                        gf16_sign = -1;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_sign = 1;
+                        __t27_ret = 1'b1;
+                    end
+                end
             end
         end
     endfunction
 
     // function: gf16_clamp
-    function [31:0] gf16_clamp; // -> GF16
-        input [31:0] x;
-        input [31:0] min_val;
-        input [31:0] max_val;
-        begin
+    function [15:0] gf16_clamp; // -> GF16
+        input [15:0] x;
+        input [15:0] min_val;
+        input [15:0] max_val;
+        begin : gf16_clamp_body
+            reg [31:0] x_decoded;
+            reg [31:0] min_decoded;
+            reg [31:0] max_decoded;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (((gf16_is_nan(x) || gf16_is_nan(min_val)) || gf16_is_nan(max_val))) begin
                 gf16_clamp = GF16_NAN;
-            end
-            reg [31:0] x_decoded = gf16_decode_to_f32(x);
-            reg [31:0] min_decoded = gf16_decode_to_f32(min_val);
-            reg [31:0] max_decoded = gf16_decode_to_f32(max_val);
-            if ((x_decoded < min_decoded)) begin
-                gf16_clamp = min_val;
-            end else if ((x_decoded > max_decoded)) begin
-                gf16_clamp = max_val;
+                __t27_ret = 1'b1;
             end else begin
-                gf16_clamp = x;
+                x_decoded = gf16_decode_to_f32(x);
+                min_decoded = gf16_decode_to_f32(min_val);
+                max_decoded = gf16_decode_to_f32(max_val);
+                if ((x_decoded < min_decoded)) begin
+                    gf16_clamp = min_val;
+                    __t27_ret = 1'b1;
+                end else if ((x_decoded > max_decoded)) begin
+                    gf16_clamp = max_val;
+                    __t27_ret = 1'b1;
+                end else begin
+                    gf16_clamp = x;
+                    __t27_ret = 1'b1;
+                end
             end
         end
     endfunction
 
     // function: gf16_lerp
-    function [31:0] gf16_lerp; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        input [31:0] t;
-        begin
+    function [15:0] gf16_lerp; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        input [15:0] t;
+        begin : gf16_lerp_body
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] t_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(t))) begin
                 gf16_lerp = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                a_val = gf16_decode_to_f32(a);
+                b_val = gf16_decode_to_f32(b);
+                t_val = gf16_decode_to_f32(t);
+                result = (a_val + (t_val * (b_val - a_val)));
+                gf16_lerp = gf16_encode_f32(result);
+                __t27_ret = 1'b1;
             end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] t_val = gf16_decode_to_f32(t);
-            reg [31:0] result = (a_val + (t_val * (b_val - a_val)));
-            gf16_lerp = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_fnma
-    function [31:0] gf16_fnma; // -> GF16
-        input [31:0] a;
-        input [31:0] b;
-        input [31:0] c;
-        begin
+    function [15:0] gf16_fnma; // -> GF16
+        input [15:0] a;
+        input [15:0] b;
+        input [15:0] c;
+        begin : gf16_fnma_body
+            reg [31:0] sign_a;
+            reg [31:0] sign_b;
+            reg [31:0] result_sign;
+            reg [31:0] a_val;
+            reg [31:0] b_val;
+            reg [31:0] neg_product;
+            reg [31:0] c_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (((gf16_is_nan(a) || gf16_is_nan(b)) || gf16_is_nan(c))) begin
                 gf16_fnma = GF16_NAN;
-            end
-            if ((gf16_is_inf(a) || gf16_is_inf(b))) begin
-                if (gf16_is_inf(c)) begin
-                    gf16_fnma = GF16_NAN;
-                end
+                __t27_ret = 1'b1;
+            end else begin
                 if ((gf16_is_inf(a) || gf16_is_inf(b))) begin
-                    reg [31:0] sign_a = gf16_signbit(a);
-                    reg [31:0] sign_b = gf16_signbit(b);
-                    reg [31:0] result_sign = (sign_a != sign_b);
-                    gf16_fnma = (result_sign) ? (GF16_INF_NEG) : (GF16_INF_POS);
+                    if (gf16_is_inf(c)) begin
+                        gf16_fnma = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end
+                    if ((gf16_is_inf(a) || gf16_is_inf(b))) begin
+                        sign_a = gf16_signbit(a);
+                        sign_b = gf16_signbit(b);
+                        result_sign = (sign_a != sign_b);
+                        gf16_fnma = (result_sign) ? (GF16_INF_NEG) : (GF16_INF_POS);
+                        __t27_ret = 1'b1;
+                    end
+                end
+                if (!__t27_ret) begin
+                    if (gf16_is_inf(c)) begin
+                        gf16_fnma = c;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
+                            gf16_fnma = c;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            if (gf16_is_zero(c)) begin
+                                a_val = gf16_decode_to_f32(a);
+                                b_val = gf16_decode_to_f32(b);
+                                neg_product = -(a_val * b_val);
+                                gf16_fnma = gf16_encode_f32(neg_product);
+                                __t27_ret = 1'b1;
+                            end else begin
+                                a_val = gf16_decode_to_f32(a);
+                                b_val = gf16_decode_to_f32(b);
+                                c_val = gf16_decode_to_f32(c);
+                                result = (-(a_val * b_val) + c_val);
+                                gf16_fnma = gf16_encode_f32(result);
+                                __t27_ret = 1'b1;
+                            end
+                        end
+                    end
                 end
             end
-            if (gf16_is_inf(c)) begin
-                gf16_fnma = c;
-            end
-            if ((gf16_is_zero(a) || gf16_is_zero(b))) begin
-                gf16_fnma = c;
-            end
-            if (gf16_is_zero(c)) begin
-                reg [31:0] a_val = gf16_decode_to_f32(a);
-                reg [31:0] b_val = gf16_decode_to_f32(b);
-                reg [31:0] neg_product = -(a_val * b_val);
-                gf16_fnma = gf16_encode_f32(neg_product);
-            end
-            reg [31:0] a_val = gf16_decode_to_f32(a);
-            reg [31:0] b_val = gf16_decode_to_f32(b);
-            reg [31:0] c_val = gf16_decode_to_f32(c);
-            reg [31:0] result = (-(a_val * b_val) + c_val);
-            gf16_fnma = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_exp
-    function [31:0] gf16_exp; // -> GF16
-        input [31:0] x;
-        begin
+    function [15:0] gf16_exp; // -> GF16
+        input [15:0] x;
+        begin : gf16_exp_body
+            reg [31:0] x_val;
+            reg signed [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(x)) begin
                 gf16_exp = GF16_NAN;
-            end
-            if (gf16_is_inf(x)) begin
-                if (gf16_is_negative(x)) begin
-                    gf16_exp = GF16_ZERO_POS;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(x)) begin
+                    if (gf16_is_negative(x)) begin
+                        gf16_exp = GF16_ZERO_POS;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_exp = GF16_INF_POS;
+                        __t27_ret = 1'b1;
+                    end
+                end else begin
+                    x_val = gf16_decode_to_f32(x);
+                    if ((x_val > 88.0)) begin
+                        gf16_exp = GF16_INF_POS;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if ((x_val < -88.0)) begin
+                            gf16_exp = GF16_ZERO_POS;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            result = @exp(x_val);
+                            gf16_exp = gf16_encode_f32(result);
+                            __t27_ret = 1'b1;
+                        end
+                    end
                 end
-                gf16_exp = GF16_INF_POS;
             end
-            reg [31:0] x_val = gf16_decode_to_f32(x);
-            if ((x_val > 88.0)) begin
-                gf16_exp = GF16_INF_POS;
-            end
-            if ((x_val < -88.0)) begin
-                gf16_exp = GF16_ZERO_POS;
-            end
-            reg [31:0] result = 1.0;
-            reg [31:0] term = 1.0;
-            reg [31:0] num_terms = 5;
-            // for-each over iterable
-            for (__i = 0; __i < (0 .. num_terms); __i = __i + 1) begin
-                if ((i > 0)) begin
-                    result = result + term;
-                end
-            end
-            gf16_exp = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_log
-    function [31:0] gf16_log; // -> GF16
-        input [31:0] x;
-        begin
+    function [15:0] gf16_log; // -> GF16
+        input [15:0] x;
+        begin : gf16_log_body
+            reg [31:0] x_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(x)) begin
                 gf16_log = GF16_NAN;
-            end
-            if (gf16_is_inf(x)) begin
-                if (gf16_is_negative(x)) begin
-                    gf16_log = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(x)) begin
+                    if (gf16_is_negative(x)) begin
+                        gf16_log = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_log = GF16_INF_POS;
+                        __t27_ret = 1'b1;
+                    end
+                end else begin
+                    if ((gf16_is_zero(x) || gf16_is_negative(x))) begin
+                        gf16_log = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        x_val = gf16_decode_to_f32(x);
+                        if ((x_val > 1.0e38)) begin
+                            gf16_log = GF16_INF_POS;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            result = @log(x_val);
+                            gf16_log = gf16_encode_f32(result);
+                            __t27_ret = 1'b1;
+                        end
+                    end
                 end
-                gf16_log = GF16_INF_POS;
             end
-            if ((gf16_is_zero(x) || gf16_is_negative(x))) begin
-                gf16_log = GF16_NAN;
-            end
-            reg [31:0] x_val = gf16_decode_to_f32(x);
-            gf16_log = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_log2
-    function [31:0] gf16_log2; // -> GF16
-        input [31:0] x;
-        begin
+    function [15:0] gf16_log2; // -> GF16
+        input [15:0] x;
+        begin : gf16_log2_body
+            reg [31:0] x_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(x)) begin
                 gf16_log2 = GF16_NAN;
-            end
-            if (gf16_is_inf(x)) begin
-                if (gf16_is_negative(x)) begin
-                    gf16_log2 = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(x)) begin
+                    if (gf16_is_negative(x)) begin
+                        gf16_log2 = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_log2 = GF16_INF_POS;
+                        __t27_ret = 1'b1;
+                    end
+                end else begin
+                    if ((gf16_is_zero(x) || gf16_is_negative(x))) begin
+                        gf16_log2 = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        x_val = gf16_decode_to_f32(x);
+                        result = @log2(x_val);
+                        gf16_log2 = gf16_encode_f32(result);
+                        __t27_ret = 1'b1;
+                    end
                 end
-                gf16_log2 = GF16_INF_POS;
             end
-            if ((gf16_is_zero(x) || gf16_is_negative(x))) begin
-                gf16_log2 = GF16_NAN;
-            end
-            reg [31:0] x_val = gf16_decode_to_f32(x);
-            reg [31:0] result = @log2(x_val);
-            gf16_log2 = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_log10
-    function [31:0] gf16_log10; // -> GF16
-        input [31:0] x;
-        begin
+    function [15:0] gf16_log10; // -> GF16
+        input [15:0] x;
+        begin : gf16_log10_body
+            reg [31:0] x_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(x)) begin
                 gf16_log10 = GF16_NAN;
-            end
-            if (gf16_is_inf(x)) begin
-                if (gf16_is_negative(x)) begin
-                    gf16_log10 = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(x)) begin
+                    if (gf16_is_negative(x)) begin
+                        gf16_log10 = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        gf16_log10 = GF16_INF_POS;
+                        __t27_ret = 1'b1;
+                    end
+                end else begin
+                    if ((gf16_is_zero(x) || gf16_is_negative(x))) begin
+                        gf16_log10 = GF16_NAN;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        x_val = gf16_decode_to_f32(x);
+                        result = @log10(x_val);
+                        gf16_log10 = gf16_encode_f32(result);
+                        __t27_ret = 1'b1;
+                    end
                 end
-                gf16_log10 = GF16_INF_POS;
             end
-            if ((gf16_is_zero(x) || gf16_is_negative(x))) begin
-                gf16_log10 = GF16_NAN;
-            end
-            reg [31:0] x_val = gf16_decode_to_f32(x);
-            reg [31:0] result = @log10(x_val);
-            gf16_log10 = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_pow
-    function [31:0] gf16_pow; // -> GF16
-        input [31:0] base;
-        input [31:0] exponent;
-        begin
+    function [15:0] gf16_pow; // -> GF16
+        input [15:0] base;
+        input [15:0] exponent;
+        begin : gf16_pow_body
+            reg [31:0] base_val;
+            reg [31:0] exp_val;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if ((gf16_is_nan(base) || gf16_is_nan(exponent))) begin
                 gf16_pow = GF16_NAN;
-            end
-            if ((gf16_is_zero(base) && gf16_is_zero(exponent))) begin
-                gf16_pow = gf16_encode_f32(1.0);
-            end
-            if ((gf16_is_zero(base) && gf16_is_positive(exponent))) begin
-                gf16_pow = GF16_ZERO_POS;
-            end
-            if ((gf16_is_zero(base) && gf16_is_negative(exponent))) begin
-                gf16_pow = GF16_INF_POS;
-            end
-            reg [31:0] base_val = gf16_decode_to_f32(base);
-            if (((base_val == 1.0) && !gf16_is_inf(exponent))) begin
-                gf16_pow = gf16_encode_f32(1.0);
-            end
-            if (gf16_is_zero(exponent)) begin
-                if (gf16_is_zero(base)) begin
-                    gf16_pow = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if ((gf16_is_zero(base) && gf16_is_zero(exponent))) begin
+                    gf16_pow = gf16_encode_f32(1.0);
+                    __t27_ret = 1'b1;
+                end else begin
+                    if ((gf16_is_zero(base) && gf16_is_positive(exponent))) begin
+                        gf16_pow = GF16_ZERO_POS;
+                        __t27_ret = 1'b1;
+                    end else begin
+                        if ((gf16_is_zero(base) && gf16_is_negative(exponent))) begin
+                            gf16_pow = GF16_INF_POS;
+                            __t27_ret = 1'b1;
+                        end else begin
+                            base_val = gf16_decode_to_f32(base);
+                            if (((base_val == 1.0) && !gf16_is_inf(exponent))) begin
+                                gf16_pow = gf16_encode_f32(1.0);
+                                __t27_ret = 1'b1;
+                            end else begin
+                                if (gf16_is_zero(exponent)) begin
+                                    if (gf16_is_zero(base)) begin
+                                        gf16_pow = GF16_NAN;
+                                        __t27_ret = 1'b1;
+                                    end else begin
+                                        gf16_pow = gf16_encode_f32(1.0);
+                                        __t27_ret = 1'b1;
+                                    end
+                                end else begin
+                                    exp_val = gf16_decode_to_f32(exponent);
+                                    if ((exp_val == 1.0)) begin
+                                        gf16_pow = base;
+                                        __t27_ret = 1'b1;
+                                    end else begin
+                                        result = std.math.pow(f32, base_val, exp_val);
+                                        gf16_pow = gf16_encode_f32(result);
+                                        __t27_ret = 1'b1;
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
-                gf16_pow = gf16_encode_f32(1.0);
             end
-            reg [31:0] exp_val = gf16_decode_to_f32(exponent);
-            if ((exp_val == 1.0)) begin
-                gf16_pow = base;
-            end
-            reg [31:0] result = @pow(base_val, exp_val);
-            gf16_pow = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_sin
-    function [31:0] gf16_sin; // -> GF16
-        input [31:0] x;
-        begin
+    function [15:0] gf16_sin; // -> GF16
+        input [15:0] x;
+        begin : gf16_sin_body
+            reg [31:0] x_val;
+            reg [31:0] x_sq;
+            reg [31:0] x_cub;
+            reg [31:0] x_5;
+            reg [31:0] x_7;
+            reg [31:0] term1;
+            reg [31:0] term2;
+            reg [31:0] term3;
+            reg [31:0] term4;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(x)) begin
                 gf16_sin = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(x)) begin
+                    gf16_sin = GF16_NAN;
+                    __t27_ret = 1'b1;
+                end else begin
+                    x_val = gf16_decode_to_f32(x);
+                    x_sq = (x_val * x_val);
+                    x_cub = (x_sq * x_val);
+                    x_5 = __mul_noop(x_cub, x_sq);
+                    x_7 = __mul_noop(x_5, x_sq);
+                    term1 = x_val;
+                    term2 = (-x_cub / 6.0);
+                    term3 = (x_5 / 120.0);
+                    term4 = (-x_7 / 5040.0);
+                    result = (((x_val + term2) + term3) + term4);
+                    gf16_sin = gf16_encode_f32(result);
+                    __t27_ret = 1'b1;
+                end
             end
-            if (gf16_is_inf(x)) begin
-                gf16_sin = GF16_NAN;
-            end
-            reg [31:0] x_val = gf16_decode_to_f32(x);
-            reg [31:0] x_sq = (x_val * x_val);
-            reg [31:0] x_cub = (x_sq * x_val);
-            reg [31:0] x_5 = (x_cub * x_sq);
-            reg [31:0] x_7 = (x_5 * x_sq);
-            reg [31:0] term1 = x_val;
-            reg [31:0] term2 = (-x_cub / 6.0);
-            reg [31:0] term3 = (x_5 / 120.0);
-            reg [31:0] term4 = (-x_7 / 5040.0);
-            reg [31:0] result = (((term1 + term2) + term3) + term4);
-            gf16_sin = gf16_encode_f32(result);
         end
     endfunction
 
     // function: gf16_cos
-    function [31:0] gf16_cos; // -> GF16
-        input [31:0] x;
-        begin
+    function [15:0] gf16_cos; // -> GF16
+        input [15:0] x;
+        begin : gf16_cos_body
+            reg [31:0] x_val;
+            reg [31:0] x_sq;
+            reg [31:0] x_4;
+            reg [31:0] x_6;
+            reg [31:0] term0;
+            reg [31:0] term1;
+            reg [31:0] term2;
+            reg [31:0] term3;
+            reg [31:0] result;
+            reg __t27_ret;
+            __t27_ret = 1'b0;
             if (gf16_is_nan(x)) begin
                 gf16_cos = GF16_NAN;
+                __t27_ret = 1'b1;
+            end else begin
+                if (gf16_is_inf(x)) begin
+                    gf16_cos = GF16_NAN;
+                    __t27_ret = 1'b1;
+                end else begin
+                    x_val = gf16_decode_to_f32(x);
+                    x_sq = (x_val * x_val);
+                    x_4 = __mul_noop(x_sq, x_sq);
+                    x_6 = __mul_noop(x_4, x_sq);
+                    term0 = 1.0;
+                    term1 = (-x_sq / 2.0);
+                    term2 = (x_4 / 24.0);
+                    term3 = (-x_6 / 720.0);
+                    result = (((term0 + term1) + term2) + term3);
+                    gf16_cos = gf16_encode_f32(result);
+                    __t27_ret = 1'b1;
+                end
             end
-            if (gf16_is_inf(x)) begin
-                gf16_cos = GF16_NAN;
-            end
-            reg [31:0] x_val = gf16_decode_to_f32(x);
-            reg [31:0] x_sq = (x_val * x_val);
-            reg [31:0] x_4 = (x_sq * x_sq);
-            reg [31:0] x_6 = (x_4 * x_sq);
-            reg [31:0] term0 = 1.0;
-            reg [31:0] term1 = (-x_sq / 2.0);
-            reg [31:0] term2 = (x_4 / 24.0);
-            reg [31:0] term3 = (-x_6 / 720.0);
-            reg [31:0] result = (((term0 + term1) + term2) + term3);
-            gf16_cos = gf16_encode_f32(result);
         end
     endfunction
     // -------------------------------------------------------
-    // Test assertions (from test blocks)
+    // NOT LOWERED BY THIS BACKEND
+    //
+    // `gen-verilog` emits synthesizable RTL. A test, an invariant and a
+    // bench are simulation constructs -- yosys turns each `$display` into a
+    // `$print` cell and nextpnr has no BEL to place one. They are carried by
+    // `gen-verilog-for-simulation`, which lowers every declaration below.
+    //
+    // test      gf16_roundtrip_phi
+    // test      gf16_zero_encoding
+    // test      gf16_phi_roundtrip_high_precision
+    // test      gf16_inf_encoding
+    // test      gf16_sign_extraction
+    // test      gf16_exponent_extraction
+    // test      gf16_mantissa_extraction
+    // test      gf16_zero_detection
+    // test      gf16_special_detection
+    // test      gf16_from_components
+    // test      gf16_nan_encoding
+    // test      gf16_6940_ties_toward_zero
+    // test      gf16_6940_ties_at_overflow
+    // test      gf16_6940_no_subnormals
+    // test      gf16_6940_canonical_nan
+    // test      gf16_6940_decode_exact
+    // test      gf16_round_phi_preserves_phi
+    // test      gf16_round_phi_zero
+    // test      gf16_round_phi_positive
+    // test      gf16_round_phi_negative
+    // test      gf16_pow2_table_consistency
+    // test      gf16_exp_bias_identity
+    // test      gf16_identity_encoding
+    // test      gf16_special_exp_all_ones
+    // test      gf16_is_inf_positive
+    // test      gf16_is_inf_negative
+    // test      gf16_is_nan_detection
+    // test      gf16_is_negative_detection
+    // test      gf16_is_positive_detection
+    // test      gf16_negate_sign_flip
+    // test      gf16_negate_zero_stays_zero
+    // test      gf16_negate_double_negate
+    // test      gf16_abs_clears_sign
+    // test      gf16_abs_positive_unchanged
+    // test      gf16_abs_zero_unchanged
+    // test      gf16_copy_sign_from_negative
+    // test      gf16_copy_sign_from_positive
+    // test      gf16_max_returns_greater
+    // test      gf16_max_equal_values
+    // test      gf16_max_with_nan
+    // test      gf16_min_returns_smaller
+    // test      gf16_min_equal_values
+    // test      gf16_min_with_nan
+    // test      negative_control_refutes_nan_is_inf
+    // test      gf16_add_positive_values
+    // test      gf16_add_negative_values
+    // test      gf16_add_opposite_values
+    // test      gf16_add_with_zero
+    // test      gf16_sub_positive_values
+    // test      gf16_sub_negative_result
+    // test      gf16_sub_with_zero
+    // test      gf16_mul_positive_values
+    // test      gf16_mul_negative_positive
+    // test      gf16_mul_with_zero
+    // test      gf16_mul_by_one
+    // test      gf16_div_positive_values
+    // test      gf16_div_negative_result
+    // test      gf16_div_by_one
+    // test      gf16_div_zero_by_value
+    // test      gf16_div_value_by_zero
+    // test      gf16_div_inf_by_finite
+    // test      gf16_fma_basic
+    // test      gf16_fma_with_zero
+    // test      gf16_sqrt_positive
+    // test      gf16_sqrt_of_one
+    // test      gf16_sqrt_of_zero
+    // test      gf16_sqrt_negative_nan
+    // test      gf16_square_of_two
+    // test      gf16_square_of_zero
+    // test      gf16_square_of_negative
+    // test      gf16_add_commutative
+    // test      gf16_mul_commutative
+    // test      gf16_sqrt_square_roundtrip
+    // test      gf16_eq_equal_values
+    // test      gf16_eq_different_values
+    // test      gf16_eq_pos_zero_eq_neg_zero
+    // test      gf16_eq_nan_not_equal_nan
+    // test      gf16_eq_nan_not_equal_value
+    // test      gf16_ne_different_values
+    // test      gf16_ne_equal_values
+    // test      gf16_ne_nan_not_equal_nan
+    // test      gf16_ne_nan_not_equal_value
+    // test      gf16_lt_less_than
+    // test      gf16_lt_equal_values
+    // test      gf16_lt_greater_than
+    // test      gf16_lt_negative_positive
+    // test      gf16_lt_with_nan
+    // test      gf16_le_less_than_or_equal
+    // test      gf16_le_equal_values
+    // test      gf16_le_greater_than
+    // test      gf16_le_with_nan
+    // test      gf16_gt_greater_than
+    // test      gf16_gt_equal_values
+    // test      gf16_gt_less_than
+    // test      gf16_gt_with_nan
+    // test      gf16_ge_greater_than_or_equal
+    // test      gf16_ge_equal_values
+    // test      gf16_ge_less_than
+    // test      gf16_ge_with_nan
+    // test      gf16_comparison_consistency
+    // test      gf16_floor_positive_value
+    // test      gf16_floor_negative_value
+    // test      gf16_floor_integer
+    // test      gf16_floor_zero
+    // test      gf16_floor_inf_unchanged
+    // test      gf16_floor_nan_returns_nan
+    // test      gf16_ceil_positive_value
+    // test      gf16_ceil_negative_value
+    // test      gf16_ceil_integer
+    // test      gf16_ceil_inf_unchanged
+    // test      gf16_ceil_nan_returns_nan
+    // test      gf16_round_half_up
+    // test      gf16_round_positive_value
+    // test      gf16_round_negative_value
+    // test      gf16_round_fractional_down
+    // test      gf16_round_inf_unchanged
+    // test      gf16_round_nan_returns_nan
+    // test      gf16_trunc_positive_value
+    // test      gf16_trunc_negative_value
+    // test      gf16_trunc_zero
+    // test      gf16_trunc_inf_unchanged
+    // test      gf16_trunc_nan_returns_nan
+    // test      gf16_rounding_floor_vs_trunc_negative
+    // test      gf16_rounding_ceil_vs_trunc_positive
+    // test      gf16_fms_basic
+    // test      gf16_fms_with_zero_c
+    // test      gf16_fms_negative_result
+    // test      gf16_fms_with_nan
+    // test      gf16_fms_zero_a
+    // test      gf16_hypot_pythagorean_triple
+    // test      gf16_hypot_both_zero
+    // test      gf16_hypot_one_zero
+    // test      gf16_hypot_negative_inputs
+    // test      gf16_hypot_with_nan
+    // test      gf16_hypot_with_inf
+    // test      gf16_fmod_basic
+    // test      gf16_fmod_exact_division
+    // test      gf16_fmod_negative_dividend
+    // test      gf16_fmod_fractional
+    // test      gf16_fmod_zero_divisor
+    // test      gf16_fmod_with_nan
+    // test      gf16_is_finite_normal_numbers
+    // test      gf16_is_finite_zero
+    // test      gf16_is_finite_false_for_inf
+    // test      gf16_is_finite_false_for_nan
+    // test      gf16_is_normal_true_for_normal
+    // test      gf16_is_normal_false_for_zero
+    // test      gf16_is_normal_false_for_inf
+    // test      gf16_is_normal_false_for_nan
+    // test      gf16_is_subnormal_false_for_tiny_values
+    // test      gf16_is_subnormal_false_for_normal
+    // test      gf16_is_subnormal_false_for_zero
+    // test      gf16_is_subnormal_false_for_special
+    // test      gf16_classification_complete_coverage
+    // test      gf16_signbit_positive
+    // test      gf16_signbit_negative
+    // test      gf16_signbit_positive_zero
+    // test      gf16_signbit_negative_zero
+    // test      gf16_signbit_infinity
+    // test      gf16_signbit_nan
+    // test      gf16_sign_positive
+    // test      gf16_sign_negative
+    // test      gf16_sign_zero
+    // test      gf16_sign_nan
+    // test      gf16_sign_infinity
+    // test      gf16_sign_matches_signbit
+    // test      gf16_clamp_in_range
+    // test      gf16_clamp_below_min
+    // test      gf16_clamp_above_max
+    // test      gf16_clamp_with_nan
+    // test      gf16_lerp_t_zero
+    // test      gf16_lerp_t_one
+    // test      gf16_lerp_t_half
+    // test      gf16_lerp_with_nan
+    // test      gf16_fnma_basic
+    // test      gf16_fnma_zero_multiplier
+    // test      gf16_fnma_zero_addend
+    // test      gf16_fnma_with_nan
+    // test      gf16_exp_zero
+    // test      gf16_exp_one
+    // test      gf16_exp_negative
+    // test      gf16_exp_large_positive
+    // test      gf16_log_one
+    // test      gf16_log_e
+    // test      gf16_log_zero_or_negative
+    // test      gf16_log2_eight
+    // test      gf16_log10_ten
+    // test      gf16_pow_two_cubed
+    // test      gf16_pow_zero_to_zero
+    // test      gf16_pow_any_to_zero
+    // test      gf16_pow_zero_to_positive
+    // test      gf16_pow_one_to_any
+    // test      gf16_sin_zero
+    // test      gf16_sin_small_angle
+    // test      gf16_cos_zero
+    // test      gf16_cos_small_angle
+    // test      gf16_trig_identity
+    // test      gf16_lp_ssot_split_constants
+    // test      gf16_lp_phi_dist_registered
+    // test      gf16_lp_alternate_split_phi_dist_larger
+    // test      gf16_lp_fp8_effective_precision
+    // test      gf16_lp_fp8_canonical_vs_alt_error_comparison
+    // invariant gf16_identity_encoding
+    // invariant gf16_sign_mask_bit_position
+    // invariant gf16_exp_mask_range
+    // invariant gf16_mant_mask_range
+    // invariant gf16_exp_bias_identity
+    // invariant gf16_roundtrip_symmetry
+    // invariant gf16_zero_uniqueness
+    // invariant gf16_special_exp_all_ones
+    // invariant gf16_pow2_table_consistency
+    // invariant gf16_mantissa_implicit_one
+    // invariant gf16_phi_bias_positive
+    // invariant gf16_phi_bias_less_than_mantissa_scale
+    // invariant gf16_round_phi_preserves_sign
+    // invariant gf16_inf_exp_all_ones_mant_zero
+    // invariant gf16_nan_exp_all_ones_mant_nonzero
+    // invariant gf16_negate_flips_sign_bit
+    // invariant gf16_negate_involutive
+    // invariant gf16_abs_clears_sign_bit
+    // invariant gf16_abs_non_negative
+    // invariant gf16_copy_sign_preserves_sign_source
+    // invariant gf16_copy_sign_preserves_magnitude
+    // invariant gf16_max_idempotent
+    // invariant gf16_min_idempotent
+    // invariant gf16_max_commutative
+    // invariant gf16_min_commutative
+    // invariant gf16_is_inf_and_is_nan_exclusive
+    // invariant gf16_add_zero_identity
+    // invariant gf16_mul_zero_annihilates
+    // invariant gf16_mul_one_identity
+    // invariant gf16_negate_involutive
+    // invariant gf16_add_commutative
+    // invariant gf16_mul_commutative
+    // invariant gf16_div_by_one_identity
+    // invariant gf16_sqrt_non_negative
+    // invariant gf16_sqrt_of_square_less_than_or_equal
+    // invariant gf16_fma_distributive_approximation
+    // invariant gf16_square_positive
+    // invariant gf16_eq_reflexive_for_non_nan
+    // invariant gf16_ne_irreflexive_for_non_nan
+    // invariant gf16_lt_and_gt_mutually_exclusive
+    // invariant gf16_le_and_ge_mutually_inclusive
+    // invariant gf16_lt_implies_le
+    // invariant gf16_gt_implies_ge
+    // invariant gf16_eq_implies_le_and_ge
+    // invariant gf16_ne_nan_is_true
+    // invariant gf16_lt_nan_is_false
+    // invariant gf16_gt_nan_is_false
+    // invariant gf16_floor_yields_integer
+    // invariant gf16_ceil_yields_integer
+    // invariant gf16_round_yields_integer
+    // invariant gf16_trunc_yields_integer
+    // invariant gf16_floor_le_value
+    // invariant gf16_ceil_ge_value
+    // invariant gf16_round_closest_integer
+    // invariant gf16_trunc_magnitude_less_or_equal
+    // invariant gf16_trunc_positive_equals_floor
+    // invariant gf16_trunc_negative_equals_ceil
+    // invariant gf16_fms_related_to_fma
+    // invariant gf16_fms_with_zero_subtractand
+    // invariant gf16_hypot_non_negative
+    // invariant gf16_hypot_symmetric
+    // invariant gf16_hypot_pythagorean_identity
+    // invariant gf16_hypot_ge_max_input
+    // invariant gf16_hypot_zero_with_zeros
+    // invariant gf16_fmod_result_sign_matches_dividend
+    // invariant gf16_fmod_less_than_divisor
+    // invariant gf16_fmod_with_divisible_values
+    // invariant gf16_is_finite_excludes_inf_nan
+    // invariant gf16_is_normal_implies_finite
+    // invariant gf16_is_subnormal_implies_finite
+    // invariant gf16_is_normal_and_subnormal_mutually_exclusive
+    // invariant gf16_zero_neither_normal_nor_subnormal
+    // invariant gf16_classification_exhaustive
+    // invariant gf16_signbit_positive_no_signbit
+    // invariant gf16_signbit_negative_has_signbit
+    // invariant gf16_sign_positive_returns_one
+    // invariant gf16_sign_negative_returns_minus_one
+    // invariant gf16_sign_zero_returns_zero
+    // invariant gf16_sign_nan_returns_zero
+    // invariant gf16_clamp_in_range_returns_value
+    // invariant gf16_clamp_below_min_returns_min
+    // invariant gf16_clamp_above_max_returns_max
+    // invariant gf16_lerp_t_zero_returns_a
+    // invariant gf16_lerp_t_one_returns_b
+    // invariant gf16_lerp_monotonic
+    // invariant gf16_fnma_equals_neg_mul_plus_c
+    // invariant gf16_fnma_zero_multiplier_returns_c
+    // invariant gf16_exp_zero_returns_one
+    // invariant gf16_exp_positive_greater_than_one
+    // invariant gf16_exp_negative_between_zero_and_one
+    // invariant gf16_log_one_returns_zero
+    // invariant gf16_log_zero_or_negative_nan
+    // invariant gf16_pow_zero_to_zero_returns_one
+    // invariant gf16_pow_any_to_zero_returns_one
+    // invariant gf16_pow_one_to_any_returns_one
+    // invariant gf16_sin_zero_returns_zero
+    // invariant gf16_cos_zero_returns_one
+    // invariant gf16_trig_identity_approx
+    // invariant gf16_lp_ssot_split_unchanged
+    // invariant gf16_lp_phi_dist_registered_positive
+    // invariant gf16_lp_fp8_depth_less_than_canonical
+    // invariant gf16_lp_alt_splits_not_registered
+    // invariant gf16_lp_canonical_minimises_phi_dist
+    // bench     gf16_encode_throughput
+    // bench     gf16_decode_throughput
+    // bench     gf16_roundtrip_latency
+    // bench     gf16_round_phi_latency
+    // bench     gf16_extract_sign_latency
+    // bench     gf16_extract_exponent_latency
+    // bench     gf16_is_inf_latency
+    // bench     gf16_is_nan_latency
+    // bench     gf16_negate_latency
+    // bench     gf16_abs_latency
+    // bench     gf16_max_latency
+    // bench     gf16_min_latency
+    // bench     gf16_add_latency
+    // bench     gf16_sub_latency
+    // bench     gf16_mul_latency
+    // bench     gf16_div_latency
+    // bench     gf16_sqrt_latency
+    // bench     gf16_fma_latency
+    // bench     gf16_square_latency
+    // bench     gf16_eq_latency
+    // bench     gf16_ne_latency
+    // bench     gf16_lt_latency
+    // bench     gf16_le_latency
+    // bench     gf16_gt_latency
+    // bench     gf16_ge_latency
+    // bench     gf16_floor_latency
+    // bench     gf16_ceil_latency
+    // bench     gf16_round_latency
+    // bench     gf16_trunc_latency
+    // bench     gf16_fms_latency
+    // bench     gf16_hypot_latency
+    // bench     gf16_fmod_latency
+    // bench     gf16_is_finite_latency
+    // bench     gf16_is_normal_latency
+    // bench     gf16_is_subnormal_latency
+    // bench     gf16_signbit_latency
+    // bench     gf16_sign_latency
+    // bench     gf16_clamp_latency
+    // bench     gf16_lerp_latency
+    // bench     gf16_fnma_latency
+    // bench     gf16_exp_latency
+    // bench     gf16_log_latency
+    // bench     gf16_pow_latency
+    // bench     gf16_sin_latency
+    // bench     gf16_cos_latency
+    // bench     bench_gf16_lp_encode_fp8_projection
+    // bench     bench_gf16_lp_roundtrip_baseline
     // -------------------------------------------------------
-    // synthesis translate_off
-    // test: gf16_roundtrip_phi
-    // test: gf16_zero_encoding
-    // test: gf16_phi_roundtrip_high_precision
-    // test: gf16_inf_encoding
-    // test: gf16_sign_extraction
-    // test: gf16_exponent_extraction
-    // test: gf16_mantissa_extraction
-    // test: gf16_zero_detection
-    // test: gf16_special_detection
-    // test: gf16_from_components
-    // test: gf16_nan_encoding
-    // test: gf16_round_phi_preserves_phi
-    // test: gf16_round_phi_zero
-    // test: gf16_round_phi_positive
-    // test: gf16_round_phi_negative
-    // test: gf16_pow2_table_consistency
-    // test: gf16_exp_bias_identity
-    // test: gf16_identity_encoding
-    // test: gf16_special_exp_all_ones
-    // test: gf16_is_inf_positive
-    // test: gf16_is_inf_negative
-    // test: gf16_is_nan_detection
-    // test: gf16_is_negative_detection
-    // test: gf16_is_positive_detection
-    // test: gf16_negate_sign_flip
-    // test: gf16_negate_zero_stays_zero
-    // test: gf16_negate_double_negate
-    // test: gf16_abs_clears_sign
-    // test: gf16_abs_positive_unchanged
-    // test: gf16_abs_zero_unchanged
-    // test: gf16_copy_sign_from_negative
-    // test: gf16_copy_sign_from_positive
-    // test: gf16_max_returns_greater
-    // test: gf16_max_equal_values
-    // test: gf16_max_with_nan
-    // test: gf16_min_returns_smaller
-    // test: gf16_min_equal_values
-    // test: gf16_min_with_nan
-    // test: gf16_add_positive_values
-    // test: gf16_add_negative_values
-    // test: gf16_add_opposite_values
-    // test: gf16_add_with_zero
-    // test: gf16_sub_positive_values
-    // test: gf16_sub_negative_result
-    // test: gf16_sub_with_zero
-    // test: gf16_mul_positive_values
-    // test: gf16_mul_negative_positive
-    // test: gf16_mul_with_zero
-    // test: gf16_mul_by_one
-    // test: gf16_div_positive_values
-    // test: gf16_div_negative_result
-    // test: gf16_div_by_one
-    // test: gf16_div_zero_by_value
-    // test: gf16_div_value_by_zero
-    // test: gf16_div_inf_by_finite
-    // test: gf16_fma_basic
-    // test: gf16_fma_with_zero
-    // test: gf16_sqrt_positive
-    // test: gf16_sqrt_of_one
-    // test: gf16_sqrt_of_zero
-    // test: gf16_sqrt_negative_nan
-    // test: gf16_square_of_two
-    // test: gf16_square_of_zero
-    // test: gf16_square_of_negative
-    // test: gf16_add_commutative
-    // test: gf16_mul_commutative
-    // test: gf16_sqrt_square_roundtrip
-    // test: gf16_eq_equal_values
-    // test: gf16_eq_different_values
-    // test: gf16_eq_pos_zero_eq_neg_zero
-    // test: gf16_eq_nan_not_equal_nan
-    // test: gf16_eq_nan_not_equal_value
-    // test: gf16_ne_different_values
-    // test: gf16_ne_equal_values
-    // test: gf16_ne_nan_not_equal_nan
-    // test: gf16_ne_nan_not_equal_value
-    // test: gf16_lt_less_than
-    // test: gf16_lt_equal_values
-    // test: gf16_lt_greater_than
-    // test: gf16_lt_negative_positive
-    // test: gf16_lt_with_nan
-    // test: gf16_le_less_than_or_equal
-    // test: gf16_le_equal_values
-    // test: gf16_le_greater_than
-    // test: gf16_le_with_nan
-    // test: gf16_gt_greater_than
-    // test: gf16_gt_equal_values
-    // test: gf16_gt_less_than
-    // test: gf16_gt_with_nan
-    // test: gf16_ge_greater_than_or_equal
-    // test: gf16_ge_equal_values
-    // test: gf16_ge_less_than
-    // test: gf16_ge_with_nan
-    // test: gf16_comparison_consistency
-    // test: gf16_floor_positive_value
-    // test: gf16_floor_negative_value
-    // test: gf16_floor_integer
-    // test: gf16_floor_zero
-    // test: gf16_floor_inf_unchanged
-    // test: gf16_floor_nan_returns_nan
-    // test: gf16_ceil_positive_value
-    // test: gf16_ceil_negative_value
-    // test: gf16_ceil_integer
-    // test: gf16_ceil_inf_unchanged
-    // test: gf16_ceil_nan_returns_nan
-    // test: gf16_round_half_up
-    // test: gf16_round_positive_value
-    // test: gf16_round_negative_value
-    // test: gf16_round_fractional_down
-    // test: gf16_round_inf_unchanged
-    // test: gf16_round_nan_returns_nan
-    // test: gf16_trunc_positive_value
-    // test: gf16_trunc_negative_value
-    // test: gf16_trunc_zero
-    // test: gf16_trunc_inf_unchanged
-    // test: gf16_trunc_nan_returns_nan
-    // test: gf16_rounding_floor_vs_trunc_negative
-    // test: gf16_rounding_ceil_vs_trunc_positive
-    // test: gf16_fms_basic
-    // test: gf16_fms_with_zero_c
-    // test: gf16_fms_negative_result
-    // test: gf16_fms_with_nan
-    // test: gf16_fms_zero_a
-    // test: gf16_hypot_pythagorean_triple
-    // test: gf16_hypot_both_zero
-    // test: gf16_hypot_one_zero
-    // test: gf16_hypot_negative_inputs
-    // test: gf16_hypot_with_nan
-    // test: gf16_hypot_with_inf
-    // test: gf16_fmod_basic
-    // test: gf16_fmod_exact_division
-    // test: gf16_fmod_negative_dividend
-    // test: gf16_fmod_fractional
-    // test: gf16_fmod_zero_divisor
-    // test: gf16_fmod_with_nan
-    // test: gf16_is_finite_normal_numbers
-    // test: gf16_is_finite_zero
-    // test: gf16_is_finite_false_for_inf
-    // test: gf16_is_finite_false_for_nan
-    // test: gf16_is_normal_true_for_normal
-    // test: gf16_is_normal_false_for_zero
-    // test: gf16_is_normal_false_for_inf
-    // test: gf16_is_normal_false_for_nan
-    // test: gf16_is_subnormal_true_for_subnormal
-    // test: gf16_is_subnormal_false_for_normal
-    // test: gf16_is_subnormal_false_for_zero
-    // test: gf16_is_subnormal_false_for_special
-    // test: gf16_classification_complete_coverage
-    // test: gf16_signbit_positive
-    // test: gf16_signbit_negative
-    // test: gf16_signbit_positive_zero
-    // test: gf16_signbit_negative_zero
-    // test: gf16_signbit_infinity
-    // test: gf16_signbit_nan
-    // test: gf16_sign_positive
-    // test: gf16_sign_negative
-    // test: gf16_sign_zero
-    // test: gf16_sign_nan
-    // test: gf16_sign_infinity
-    // test: gf16_sign_matches_signbit
-    // test: gf16_clamp_in_range
-    // test: gf16_clamp_below_min
-    // test: gf16_clamp_above_max
-    // test: gf16_clamp_with_nan
-    // test: gf16_lerp_t_zero
-    // test: gf16_lerp_t_one
-    // test: gf16_lerp_t_half
-    // test: gf16_lerp_with_nan
-    // test: gf16_fnma_basic
-    // test: gf16_fnma_zero_multiplier
-    // test: gf16_fnma_zero_addend
-    // test: gf16_fnma_with_nan
-    // test: gf16_exp_zero
-    // test: gf16_exp_one
-    // test: gf16_exp_negative
-    // test: gf16_exp_large_positive
-    // test: gf16_log_one
-    // test: gf16_log_e
-    // test: gf16_log_zero_or_negative
-    // test: gf16_log2_eight
-    // test: gf16_log10_ten
-    // test: gf16_pow_two_cubed
-    // test: gf16_pow_zero_to_zero
-    // test: gf16_pow_any_to_zero
-    // test: gf16_pow_zero_to_positive
-    // test: gf16_pow_one_to_any
-    // test: gf16_sin_zero
-    // test: gf16_sin_small_angle
-    // test: gf16_cos_zero
-    // test: gf16_cos_small_angle
-    // test: gf16_trig_identity
-    // synthesis translate_on
-
-    // -------------------------------------------------------
-    // Invariant checks (compile-time assertions)
-    // -------------------------------------------------------
-    // invariant: gf16_identity_encoding
-    // invariant: gf16_sign_mask_bit_position
-    // invariant: gf16_exp_mask_range
-    // invariant: gf16_mant_mask_range
-    // invariant: gf16_exp_bias_identity
-    // invariant: gf16_roundtrip_symmetry
-    // invariant: gf16_zero_uniqueness
-    // invariant: gf16_special_exp_all_ones
-    // invariant: gf16_pow2_table_consistency
-    // invariant: gf16_mantissa_implicit_one
-    // invariant: gf16_phi_bias_positive
-    // invariant: gf16_phi_bias_less_than_mantissa_scale
-    // invariant: gf16_round_phi_preserves_sign
-    // invariant: gf16_inf_exp_all_ones_mant_zero
-    // invariant: gf16_nan_exp_all_ones_mant_nonzero
-    // invariant: gf16_negate_flips_sign_bit
-    // invariant: gf16_negate_involutive
-    // invariant: gf16_abs_clears_sign_bit
-    // invariant: gf16_abs_non_negative
-    // invariant: gf16_copy_sign_preserves_sign_source
-    // invariant: gf16_copy_sign_preserves_magnitude
-    // invariant: gf16_max_idempotent
-    // invariant: gf16_min_idempotent
-    // invariant: gf16_max_commutative
-    // invariant: gf16_min_commutative
-    // invariant: gf16_is_inf_and_is_nan_exclusive
-    // invariant: gf16_add_zero_identity
-    // invariant: gf16_mul_zero_annihilates
-    // invariant: gf16_mul_one_identity
-    // invariant: gf16_negate_involutive
-    // invariant: gf16_add_commutative
-    // invariant: gf16_mul_commutative
-    // invariant: gf16_div_by_one_identity
-    // invariant: gf16_sqrt_non_negative
-    // invariant: gf16_sqrt_of_square_less_than_or_equal
-    // invariant: gf16_fma_distributive_approximation
-    // invariant: gf16_square_positive
-    // invariant: gf16_eq_reflexive_for_non_nan
-    // invariant: gf16_ne_irreflexive_for_non_nan
-    // invariant: gf16_lt_and_gt_mutually_exclusive
-    // invariant: gf16_le_and_ge_mutually_inclusive
-    // invariant: gf16_lt_implies_le
-    // invariant: gf16_gt_implies_ge
-    // invariant: gf16_eq_implies_le_and_ge
-    // invariant: gf16_ne_nan_is_true
-    // invariant: gf16_lt_nan_is_false
-    // invariant: gf16_gt_nan_is_false
-    // invariant: gf16_floor_yields_integer
-    // invariant: gf16_ceil_yields_integer
-    // invariant: gf16_round_yields_integer
-    // invariant: gf16_trunc_yields_integer
-    // invariant: gf16_floor_le_value
-    // invariant: gf16_ceil_ge_value
-    // invariant: gf16_round_closest_integer
-    // invariant: gf16_trunc_magnitude_less_or_equal
-    // invariant: gf16_trunc_positive_equals_floor
-    // invariant: gf16_trunc_negative_equals_ceil
-    // invariant: gf16_fms_related_to_fma
-    // invariant: gf16_fms_with_zero_subtractand
-    // invariant: gf16_hypot_non_negative
-    // invariant: gf16_hypot_symmetric
-    // invariant: gf16_hypot_pythagorean_identity
-    // invariant: gf16_hypot_ge_max_input
-    // invariant: gf16_hypot_zero_with_zeros
-    // invariant: gf16_fmod_result_sign_matches_dividend
-    // invariant: gf16_fmod_less_than_divisor
-    // invariant: gf16_fmod_with_divisible_values
-    // invariant: gf16_is_finite_excludes_inf_nan
-    // invariant: gf16_is_normal_implies_finite
-    // invariant: gf16_is_subnormal_implies_finite
-    // invariant: gf16_is_normal_and_subnormal_mutually_exclusive
-    // invariant: gf16_zero_neither_normal_nor_subnormal
-    // invariant: gf16_classification_exhaustive
-    // invariant: gf16_signbit_positive_no_signbit
-    // invariant: gf16_signbit_negative_has_signbit
-    // invariant: gf16_sign_positive_returns_one
-    // invariant: gf16_sign_negative_returns_minus_one
-    // invariant: gf16_sign_zero_returns_zero
-    // invariant: gf16_sign_nan_returns_zero
-    // invariant: gf16_clamp_in_range_returns_value
-    // invariant: gf16_clamp_below_min_returns_min
-    // invariant: gf16_clamp_above_max_returns_max
-    // invariant: gf16_lerp_t_zero_returns_a
-    // invariant: gf16_lerp_t_one_returns_b
-    // invariant: gf16_lerp_monotonic
-    // invariant: gf16_fnma_equals_neg_mul_plus_c
-    // invariant: gf16_fnma_zero_multiplier_returns_c
-    // invariant: gf16_exp_zero_returns_one
-    // invariant: gf16_exp_positive_greater_than_one
-    // invariant: gf16_exp_negative_between_zero_and_one
-    // invariant: gf16_log_one_returns_zero
-    // invariant: gf16_log_zero_or_negative_nan
-    // invariant: gf16_pow_zero_to_zero_returns_one
-    // invariant: gf16_pow_any_to_zero_returns_one
-    // invariant: gf16_pow_one_to_any_returns_one
-    // invariant: gf16_sin_zero_returns_zero
-    // invariant: gf16_cos_zero_returns_one
-    // invariant: gf16_trig_identity_approx
-
-    // -------------------------------------------------------
-    // Benchmark placeholders
-    // -------------------------------------------------------
-    // bench: gf16_encode_throughput
-    // bench: gf16_decode_throughput
-    // bench: gf16_roundtrip_latency
-    // bench: gf16_round_phi_latency
-    // bench: gf16_extract_sign_latency
-    // bench: gf16_extract_exponent_latency
-    // bench: gf16_is_inf_latency
-    // bench: gf16_is_nan_latency
-    // bench: gf16_negate_latency
-    // bench: gf16_abs_latency
-    // bench: gf16_max_latency
-    // bench: gf16_min_latency
-    // bench: gf16_add_latency
-    // bench: gf16_sub_latency
-    // bench: gf16_mul_latency
-    // bench: gf16_div_latency
-    // bench: gf16_sqrt_latency
-    // bench: gf16_fma_latency
-    // bench: gf16_square_latency
-    // bench: gf16_eq_latency
-    // bench: gf16_ne_latency
-    // bench: gf16_lt_latency
-    // bench: gf16_le_latency
-    // bench: gf16_gt_latency
-    // bench: gf16_ge_latency
-    // bench: gf16_floor_latency
-    // bench: gf16_ceil_latency
-    // bench: gf16_round_latency
-    // bench: gf16_trunc_latency
-    // bench: gf16_fms_latency
-    // bench: gf16_hypot_latency
-    // bench: gf16_fmod_latency
-    // bench: gf16_is_finite_latency
-    // bench: gf16_is_normal_latency
-    // bench: gf16_is_subnormal_latency
-    // bench: gf16_signbit_latency
-    // bench: gf16_sign_latency
-    // bench: gf16_clamp_latency
-    // bench: gf16_lerp_latency
-    // bench: gf16_fnma_latency
-    // bench: gf16_exp_latency
-    // bench: gf16_log_latency
-    // bench: gf16_pow_latency
-    // bench: gf16_sin_latency
-    // bench: gf16_cos_latency
 
 endmodule
 

@@ -1,69 +1,43 @@
-# Promotion baseline (M0-01)
+# Promotion baseline
 
-Part of `[EPIC] T27_PROMOTION_KERNEL_V5` — Part of #13473.
-M0-01: Capture promotion baseline (X + GitHub + course). Closes #13474.
+Part of #13473. This card does not publish and does not send mail.
 
-## Goal
+The executable check is `specs/automation/promotion_kernel.t27`.
+The same figures are in `docs/promotion/baseline.json`.
 
-Capture a dated baseline of current reach and repo state for the promotion kernel: X followers/impressions if available, GitHub stars/forks/open issues/contributors, and course status.
+Captured 2026-11-10 Asia/Bangkok (2026-11-09 UTC).
 
-## Baseline snapshot
+## GitHub
 
-**Date:** 2026-11-18
+Commands run that day:
 
-### X (Twitter) — @t27_dev
+- `gh api repos/Trinity-S-AI-DNA/t27` fields `stargazers_count` and `forks_count`
+- `gh api search/issues?q=repo:Trinity-S-AI-DNA/t27+is:issue+is:open` field `total_count` (issues only; the repo `open_issues_count` also counts pull requests and was not used)
+- `gh api repos/Trinity-S-AI-DNA/t27/contributors?per_page=100` length, and the same call with `anon=1`
 
-| Metric | Value | Source |
-|--------|-------|--------|
-| Followers | 231 | Epic #13473, captured 2026-11-09 |
-| Impressions (7-day) | 809 | Epic #13473, captured 2026-11-09 |
-| Profile visits (7-day) | 2 | Epic #13473, captured 2026-11-09 |
+| Field | Value |
+|-------|-------|
+| stars | 5 |
+| forks | 4 |
+| open issues | 2041 |
+| named contributors | 6 |
+| contributors including anonymous | 31 |
 
-*Note: X data was captured in epic #13473 on 2026-11-09 and has not been re-measured. M0 law prohibits paid-token usage and outbound posting without owner approval.*
+## X
 
-### GitHub repository — Trinity-S-AI-DNA/t27
+Not re-measured. This agent has no X sign-in. The figures below are the citation in issue #13465 for @t27_dev, 7-day view, 2026-11-09.
 
-| Metric | Value | Source |
-|--------|-------|--------|
-| Stars | 5 | gh api repos/Trinity-S-AI-DNA/t27, 2026-11-18 |
-| Forks | 4 | gh api repos/Trinity-S-AI-DNA/t27, 2026-11-18 |
-| Watchers | 5 | gh api repos/Trinity-S-AI-DNA/t27, 2026-11-18 |
-| Open issues | 1845 | gh api repos/Trinity-S-AI-DNA/t27, 2026-11-18 |
-| Repo size | 548,892 KB | gh api repos/Trinity-S-AI-DNA/t27, 2026-11-18 |
-| Created | 2026-04-03 | gh api repos/Trinity-S-AI-DNA/t27, 2026-11-18 |
-| Last updated | 2026-11-11 | gh api repos/Trinity-S-AI-DNA/t27, 2026-11-18 |
+| Field | Value | Known as a tracked metric |
+|-------|-------|---------------------------|
+| impressions | 809 | yes |
+| profile visits | 2 | no, citation only |
+| followers | 231 | no, citation only |
+| clicks | not measured | no |
+| course starts | not measured | no |
+| payments | not measured | no |
 
-### Contributors
+Clicks are not stored as 0. `metric_known` is true only for impressions. Paid checkout is off.
 
-| Contributor | Contributions |
-|-------------|---------------|
-| gHashTag | 6,693 |
-| claude | 814 |
-| dmitrii-f-t27 | 360 |
-| github-actions[bot] | 76 |
-| dependabot[bot] | 51 |
-| cursoragent | 21 |
-| Karim13014 | 9 |
-| cursor[bot] | 1 |
+## Course
 
-**Total contributors:** 8
-
-### Course status
-
-| Item | Status | Evidence |
-|------|--------|----------|
-| Course map (27 lessons) | Complete | `docs/promotion/course-map.md` (#13475) |
-| Widget inventory (16 types) | Complete | `docs/promotion/widget-inventory.md` + `.json` (#13476) |
-| Course widgets built | Not yet | No compiled widget specs with visual output |
-| FPGA demo | Not yet | No FPGA artifacts |
-
-## Machine-readable baseline
-
-See `docs/promotion/baseline.json` — same data in JSON format.
-
-## Linked assets
-
-- `docs/promotion/README.md` — promotion kernel index
-- Epic #13473 — T27_PROMOTION_KERNEL_V5
-
-// phi^2 + 1/phi^2 = 3 | TRINITY
+`specs/course/lesson_frames.t27` `LESSON_COUNT` is 27. That is the planned frame count. A ready-lesson count is not measured (`COURSE_READY_KNOWN` is false).

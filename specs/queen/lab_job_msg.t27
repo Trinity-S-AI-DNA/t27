@@ -97,8 +97,9 @@ pub fn lj_next_state(state : u8, tag : u64, intensity_gone : bool) -> u8 {
 
 ; --- 4. Admission -----------------------------------------------------------------------------------
 
-/// The four answers to a JOB. OK: the lab takes it. QUEUE_FULL: too many jobs wait already. LOAD: the
-/// host load is too high for a heavy step. DISK: too little free disk for a build.
+/// The answers to a JOB. OK: the lab takes it. QUEUE_FULL: too many jobs wait already. LOAD: the
+/// host load is too high for a heavy step. DISK: too little free disk for a build. The fifth, SWAP, is
+/// below with lj_admit_host.
 pub const LJ_ADMIT_OK : u8 = 0;
 pub const LJ_ADMIT_QUEUE_FULL : u8 = 1;
 pub const LJ_ADMIT_LOAD : u8 = 2;
@@ -123,6 +124,51 @@ pub fn lj_admit(queued : u32, load : u32, free_gb : u64) -> u8 {
     if (load >= LJ_MAX_LOAD) { return LJ_ADMIT_LOAD; }
     if (free_gb < LJ_MIN_FREE_GB) { return LJ_ADMIT_DISK; }
     return LJ_ADMIT_OK;
+}
+
+/// SWAP: the host has paged out so much that a test suite or a pane job would push it into the watchdog
+/// panics of 2026-10-09. Owner, 2026-11-08 (SWAP_GUARD_RULE): before any test suite, pane job or cron
+/// cycle, check swap; above 6 GB the job does not start. It is a hard gate, not a warning.
+pub const LJ_ADMIT_SWAP : u8 = 4;
+
+/// Swap in use, in MiB, from which the host refuses a job: refuse at swap_mb >= 6144. The owner's rule is
+/// "block above 6 GB, retry only below 6 GB"; refusing at exactly 6144 makes both halves one line.
+pub const LJ_MAX_SWAP_MB : u64 = 6144;
+
+/// The host admission answer: the swap gate first, then lj_admit unchanged. Swap is reported first
+/// because it is the owner's hard gate and the cause the host must name. The function takes no override,
+/// no force flag and no caller kind, so no test, pane job or cron cycle can ask its way past the gate;
+/// a refused job is retried only by asking again with a fresh swap reading.
+pub fn lj_admit_host(queued : u32, load : u32, free_gb : u64, swap_mb : u64) -> u8 {
+    if (swap_mb >= LJ_MAX_SWAP_MB) { return LJ_ADMIT_SWAP; }
+    return lj_admit(queued, load, free_gb);
+}
+
+/// Swap in use, in MiB, below which a closed gate opens again. Owner, 2026-11-08: hysteresis is mandatory,
+/// the gate opens only under 5000 MB, not at 6144, so a reading that wobbles around 6144 cannot flap it.
+pub const LJ_SWAP_REOPEN_MB : u64 = 5000;
+
+/// The swap gate with memory (a Schmitt trigger): it closes at swap_mb >= LJ_MAX_SWAP_MB, opens only at
+/// swap_mb < LJ_SWAP_REOPEN_MB, and between the two keeps prev_open. A host that starts with no memory
+/// passes prev_open = false, so it waits for a reading under 5000 MB before its first job.
+pub fn lj_swap_gate_next(prev_open : bool, swap_mb : u64) -> bool {
+    if (swap_mb >= LJ_MAX_SWAP_MB) { return false; }
+    if (swap_mb < LJ_SWAP_REOPEN_MB) { return true; }
+    return prev_open;
+}
+
+/// lj_admit_host for a host that keeps the gate's memory: gate_open is lj_swap_gate_next of this reading.
+/// The swap cause still comes first and still takes no override.
+pub fn lj_admit_gated(gate_open : bool, queued : u32, load : u32, free_gb : u64) -> u8 {
+    if (!gate_open) { return LJ_ADMIT_SWAP; }
+    return lj_admit(queued, load, free_gb);
+}
+
+/// Whether an admission answer must be recorded as a T27L line with surface "system", action
+/// "resource_guard_triggered", level warn or above (specs/t27os/t27l.t27 refuses that action below warn),
+/// and sent to the owner. Every refusal is recorded, never only the swap one.
+pub fn lj_guard_event(admit : u8) -> bool {
+    return admit != LJ_ADMIT_OK;
 }
 
 ; --- 5. Order of the job kinds ----------------------------------------------------------------------
@@ -282,6 +328,85 @@ test combined_causes_report_the_first_in_priority_order {
     assert lj_admit(8, 0, 3) == LJ_ADMIT_QUEUE_FULL;
     assert lj_admit(0, 40, 3) == LJ_ADMIT_LOAD;
     assert lj_admit(7, 40, 3) == LJ_ADMIT_LOAD;
+}
+
+test the_swap_gate_blocks_from_six_gib {
+    assert lj_admit_host(0, 0, 100, 0) == LJ_ADMIT_OK;
+    assert lj_admit_host(0, 0, 100, 6143) == LJ_ADMIT_OK;
+    assert lj_admit_host(0, 0, 100, 6144) == LJ_ADMIT_SWAP;
+    assert lj_admit_host(0, 0, 100, 14886) == LJ_ADMIT_SWAP;
+}
+
+test the_swap_gate_comes_before_every_other_cause {
+    assert lj_admit_host(8, 40, 3, 6144) == LJ_ADMIT_SWAP;
+    assert lj_admit_host(0, 40, 100, 7000) == LJ_ADMIT_SWAP;
+    assert lj_admit_host(8, 40, 3, 0) == LJ_ADMIT_QUEUE_FULL;
+    assert lj_admit_host(0, 40, 3, 6143) == LJ_ADMIT_LOAD;
+    assert lj_admit_host(0, 0, 3, 100) == LJ_ADMIT_DISK;
+}
+
+test the_host_answer_matches_lj_admit_below_the_swap_line {
+    var q : u32 = 0;
+    while (q < 10) {
+        var l : u32 = 35;
+        while (l < 45) {
+            assert lj_admit_host(q, l, 2, 6143) == lj_admit(q, l, 2);
+            assert lj_admit_host(q, l, 50, 0) == lj_admit(q, l, 50);
+            l = l + 1;
+        }
+        q = q + 1;
+    }
+}
+
+test the_swap_gate_opens_only_under_five_thousand {
+    assert !lj_swap_gate_next(false, 7000);
+    assert !lj_swap_gate_next(false, 6000);
+    assert !lj_swap_gate_next(false, 5000);
+    assert lj_swap_gate_next(false, 4999);
+    assert lj_swap_gate_next(true, 5500);
+    assert lj_swap_gate_next(true, 6143);
+    assert !lj_swap_gate_next(true, 6144);
+    assert !lj_swap_gate_next(true, 14668);
+    assert lj_swap_gate_next(true, 0);
+}
+
+test a_wobble_around_six_gib_does_not_flap_the_gate {
+    var open : bool = false;
+    open = lj_swap_gate_next(open, 6200);
+    assert !open;
+    open = lj_swap_gate_next(open, 6100);
+    assert !open;
+    open = lj_swap_gate_next(open, 6150);
+    assert !open;
+    open = lj_swap_gate_next(open, 6050);
+    assert !open;
+    open = lj_swap_gate_next(open, 4900);
+    assert open;
+    open = lj_swap_gate_next(open, 6000);
+    assert open;
+    open = lj_swap_gate_next(open, 5100);
+    assert open;
+    open = lj_swap_gate_next(open, 6144);
+    assert !open;
+}
+
+test the_gated_admit_agrees_with_the_host_admit_outside_the_band {
+    assert lj_admit_gated(false, 0, 0, 100) == LJ_ADMIT_SWAP;
+    assert lj_admit_gated(false, 8, 40, 3) == LJ_ADMIT_SWAP;
+    assert lj_admit_gated(true, 8, 40, 3) == LJ_ADMIT_QUEUE_FULL;
+    assert lj_admit_gated(true, 0, 40, 100) == LJ_ADMIT_LOAD;
+    assert lj_admit_gated(true, 0, 0, 3) == LJ_ADMIT_DISK;
+    assert lj_admit_gated(lj_swap_gate_next(false, 4000), 0, 0, 100) == lj_admit_host(0, 0, 100, 4000);
+    assert lj_admit_gated(lj_swap_gate_next(true, 7000), 0, 0, 100) == lj_admit_host(0, 0, 100, 7000);
+}
+
+test every_refusal_is_a_guard_event {
+    assert !lj_guard_event(LJ_ADMIT_OK);
+    assert lj_guard_event(LJ_ADMIT_QUEUE_FULL);
+    assert lj_guard_event(LJ_ADMIT_LOAD);
+    assert lj_guard_event(LJ_ADMIT_DISK);
+    assert lj_guard_event(LJ_ADMIT_SWAP);
+    assert lj_guard_event(lj_admit_host(0, 0, 100, 14886));
 }
 
 test the_next_kind_after_a_pass_runs_build_then_test_then_seal {

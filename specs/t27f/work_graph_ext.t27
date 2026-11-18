@@ -1,0 +1,415 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27f/work_graph_ext.t27 -- the extension kinds of the ONE work graph: roots, trunk, epics,
+// issues, meshes, releases, and the structural edges between them.
+// Refs gHashTag/t27#12779 (live work graph), see #10034 (T27F), #11385 (trigit board refs).
+//
+// WHY: two orders need more node and edge kinds than work_graph.t27 names. The Lukomorye graph
+// terminal (t27f/lukomorye_graph_terminal.t27) draws epics as branches, issues as twigs and
+// verified artifacts as leaves; the trigit roadmap sync (tri/trigit/roadmap_dashboard_sync.t27)
+// and issue hygiene (tri/trigit/issue_hygiene_engine.t27) read membership, duplicates and
+// supersession off the same graph. Both read ONE graph: work_graph.t27's WorkGraph. Its
+// ensure_node and add_edge store any kind byte, so the extension kinds live in that same struct;
+// this file is the one home of the extra kind numbers, the shape rule, and the checked add.
+// A second graph, a second kind table, or a HAS_CHILD edge would each be a second source of truth.
+//
+// THE PIECES:
+//   node kinds  5 ROOT (a t27 language level), 6 TRUNK (a t27b pipeline stage), 7 EPIC, 8 ISSUE,
+//               9 MESH (a rendered artifact), 10 RELEASE. 0..4 stay work_graph.t27's.
+//   edge kinds  6 BELONGS_TO (child -> parent; THE canonical tree edge), 7 DEPENDS_ON,
+//               8 COMMUNICATES_WITH, 9 DUPLICATES (duplicate -> original), 10 SUPERSEDES (new -> old).
+//               0..5 stay work_graph.t27's. There is no HAS_CHILD kind: children are DERIVED by
+//               reading BELONGS_TO backwards (wx_child_count / wx_child_at), never stored.
+//   shape       wx_edge_shape_ok(kind, from_kind, to_kind): which node kinds an edge may join.
+//               Base kinds keep the shapes apply_event writes; VERIFIES also joins ARTIFACT/MESH ->
+//               ISSUE (the bridge's verified-artifact edge); BLOCKS also joins ISSUE/TASK -> ISSUE/TASK.
+//   checked add wx_add_edge refuses an out-of-range node, a bad shape, a self loop of BELONGS_TO,
+//               DUPLICATES or SUPERSEDES; it never refuses a second parent or a cycle -- a shared
+//               parent and a DEPENDS_ON cycle are facts of the work and stay stored (cycles and DAG
+//               edges are preserved; a layout picks the FIRST BELONGS_TO as its tree parent).
+//               wx_ensure_edge adds nothing when the same (kind, from, to) is already stored: the
+//               replay-safe form every sync uses.
+//   verified    an ARTIFACT or MESH node is a verified artifact iff its node label is EXACT and an
+//               EXACT VERIFIES edge leaves it for an ISSUE. Nothing else makes a leaf.
+//
+// DIGEST: work_graph.t27's graph_digest hashes every node and edge slot's raw kind byte, so the
+// extension kinds 5..10 are inside the digest with no change there (the digest tests below pin it).
+// NOT CLAIMED: work_graph.t27's NK_COUNT (5) and EK_COUNT (6) stay the base counts: five sealed
+// specs import them (gnn_work_graph_viz, live_graph_export, glass_window, graph_k_hop,
+// queen_graph_plane) as sentinels, loop bounds and cross-checks, so raising them is their edit
+// and reseal (follow-up). NX_COUNT and EX_COUNT here are the extended totals. Node
+// lifecycle (open, closed, archived) is not a graph fact: it comes from the event log, and the
+// specs that read this graph say which inputs carry it.
+// phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27fWorkGraphExt;
+
+use t27f::work_graph::WorkGraph;
+use t27f::work_graph::new_graph;
+use t27f::work_graph::ensure_node;
+use t27f::work_graph::add_edge;
+use t27f::work_graph::nodes;
+use t27f::work_graph::edges;
+use t27f::work_graph::node_kind_at_pub;
+use t27f::work_graph::node_label_at;
+use t27f::work_graph::edge_kind_at;
+use t27f::work_graph::edge_label_at;
+use t27f::work_graph::edge_from_at;
+use t27f::work_graph::edge_to_at;
+use t27f::work_graph::graph_digest;
+use t27f::work_graph::NK_SPEC;
+use t27f::work_graph::NK_AGENT;
+use t27f::work_graph::NK_TASK;
+use t27f::work_graph::NK_ACTION;
+use t27f::work_graph::NK_ARTIFACT;
+use t27f::work_graph::NK_COUNT;
+use t27f::work_graph::EK_READS;
+use t27f::work_graph::EK_ASSIGNED;
+use t27f::work_graph::EK_PERFORMS;
+use t27f::work_graph::EK_PRODUCES;
+use t27f::work_graph::EK_VERIFIES;
+use t27f::work_graph::EK_BLOCKS;
+use t27f::work_graph::EK_COUNT;
+use t27f::work_graph::WG_OK;
+use t27f::work_graph::NODE_CAP;
+use t27f::spec_graph::LABEL_EXACT;
+use t27f::spec_graph::LABEL_DERIVED;
+use t27f::spec_graph::LABEL_SUGGESTED;
+
+// ---- extension node kinds (0..4 are work_graph.t27's) ----
+
+pub const NX_ROOT : u8 = 5;
+pub const NX_TRUNK : u8 = 6;
+pub const NX_EPIC : u8 = 7;
+pub const NX_ISSUE : u8 = 8;
+pub const NX_MESH : u8 = 9;
+pub const NX_RELEASE : u8 = 10;
+pub const NX_COUNT : u8 = 11;
+
+// ---- extension edge kinds (0..5 are work_graph.t27's) ----
+
+pub const EX_BELONGS_TO : u8 = 6;
+pub const EX_DEPENDS_ON : u8 = 7;
+pub const EX_COMMUNICATES_WITH : u8 = 8;
+pub const EX_DUPLICATES : u8 = 9;
+pub const EX_SUPERSEDES : u8 = 10;
+pub const EX_COUNT : u8 = 11;
+
+// ---- results of the checked add (WG_OK = 0 is success) ----
+
+pub const WX_E_INDEX : u8 = 20;
+pub const WX_E_KIND : u8 = 21;
+pub const WX_E_SHAPE : u8 = 22;
+pub const WX_E_SELF : u8 = 23;
+pub const WX_E_CAP : u8 = 24;
+
+/// An ARTIFACT or a MESH: the two kinds that can become a leaf.
+pub fn wx_is_artifact(kind: u8) -> bool {
+    return kind == NK_ARTIFACT || kind == NX_MESH;
+}
+
+/// Which node kinds an edge kind may join, from -> to. Base shapes are the ones apply_event writes.
+pub fn wx_edge_shape_ok(kind: u8, fk: u8, tk: u8) -> bool {
+    if (fk >= NX_COUNT || tk >= NX_COUNT) { return false; }
+    if (kind == EK_READS) { return fk == NK_AGENT && tk == NK_SPEC; }
+    if (kind == EK_ASSIGNED) { return fk == NK_AGENT && tk == NK_TASK; }
+    if (kind == EK_PERFORMS) { return fk == NK_AGENT && tk == NK_ACTION; }
+    if (kind == EK_PRODUCES) { return fk == NK_AGENT && (tk == NK_TASK || wx_is_artifact(tk)); }
+    if (kind == EK_VERIFIES) {
+        if (fk == NK_AGENT && tk == NK_TASK) { return true; }
+        return wx_is_artifact(fk) && tk == NX_ISSUE;
+    }
+    if (kind == EK_BLOCKS) {
+        if (fk == NK_AGENT && tk == NK_TASK) { return true; }
+        return (fk == NX_ISSUE || fk == NK_TASK) && (tk == NX_ISSUE || tk == NK_TASK);
+    }
+    if (kind == EX_BELONGS_TO) {
+        if (fk == NX_TRUNK) { return tk == NX_ROOT; }
+        if (fk == NK_SPEC) { return tk == NX_ROOT; }
+        if (fk == NX_EPIC) { return tk == NX_TRUNK || tk == NX_EPIC; }
+        if (fk == NX_ISSUE) { return tk == NX_EPIC || tk == NX_ISSUE; }
+        if (fk == NK_TASK || wx_is_artifact(fk)) { return tk == NX_ISSUE; }
+        return false;
+    }
+    if (kind == EX_DEPENDS_ON) {
+        var f_ok = fk == NK_TASK || fk == NX_ISSUE || fk == NX_EPIC || fk == NX_RELEASE;
+        var t_ok = tk == NK_TASK || tk == NX_ISSUE || tk == NX_EPIC;
+        return f_ok && t_ok;
+    }
+    if (kind == EX_COMMUNICATES_WITH) { return fk == NK_AGENT && tk == NK_AGENT; }
+    if (kind == EX_DUPLICATES) { return fk == NX_ISSUE && tk == NX_ISSUE; }
+    if (kind == EX_SUPERSEDES) {
+        if (fk != tk) { return false; }
+        return fk == NX_ISSUE || fk == NX_EPIC || fk == NK_SPEC || wx_is_artifact(fk);
+    }
+    return false;
+}
+
+/// Self loops that mean nothing: a node does not belong to, duplicate or supersede itself.
+pub fn wx_self_refused(kind: u8) -> bool {
+    return kind == EX_BELONGS_TO || kind == EX_DUPLICATES || kind == EX_SUPERSEDES;
+}
+
+/// ensure_node with the kind checked against the extended table; NODE_CAP on a bad kind or a full graph.
+pub fn wx_ensure_node(g: *WorkGraph, kind: u8, id: u64, label: u8) -> u32 {
+    if (kind >= NX_COUNT) { return NODE_CAP; }
+    return ensure_node(g, kind, id, label);
+}
+
+/// add_edge with indices, kind, shape and self loops checked. A second parent or a cycle is stored.
+pub fn wx_add_edge(g: *WorkGraph, kind: u8, from: u32, to: u32, label: u8) -> u8 {
+    if (from >= nodes(g) || to >= nodes(g)) { return WX_E_INDEX; }
+    if (kind >= EX_COUNT) { return WX_E_KIND; }
+    if (!wx_edge_shape_ok(kind, node_kind_at_pub(g, from), node_kind_at_pub(g, to))) { return WX_E_SHAPE; }
+    if (from == to && wx_self_refused(kind)) { return WX_E_SELF; }
+    if (add_edge(g, kind, from, to, label) != WG_OK) { return WX_E_CAP; }
+    return WG_OK;
+}
+
+/// Is (kind, from, to) already stored, with any label?
+pub fn wx_has_edge(g: *WorkGraph, kind: u8, from: u32, to: u32) -> bool {
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == kind && edge_from_at(g, e) == from && edge_to_at(g, e) == to) { return true; }
+        e = e + 1;
+    }
+    return false;
+}
+
+/// The replay-safe add: nothing is added when the same (kind, from, to) is already stored.
+pub fn wx_ensure_edge(g: *WorkGraph, kind: u8, from: u32, to: u32, label: u8) -> u8 {
+    if (from < nodes(g) && to < nodes(g) && wx_has_edge(g, kind, from, to)) { return WG_OK; }
+    return wx_add_edge(g, kind, from, to, label);
+}
+
+/// The canonical tree parent: the target of the FIRST BELONGS_TO edge out of n; NODE_CAP for none.
+pub fn wx_parent(g: *WorkGraph, n: u32) -> u32 {
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == EX_BELONGS_TO && edge_from_at(g, e) == n) { return edge_to_at(g, e); }
+        e = e + 1;
+    }
+    return NODE_CAP;
+}
+
+/// Derived HAS_CHILD: how many BELONGS_TO edges point at n (a shared child counts under each parent).
+pub fn wx_child_count(g: *WorkGraph, n: u32) -> u32 {
+    var c : u32 = 0;
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == EX_BELONGS_TO && edge_to_at(g, e) == n) { c = c + 1; }
+        e = e + 1;
+    }
+    return c;
+}
+
+/// Derived HAS_CHILD: the k-th child of n in edge order; NODE_CAP past the last.
+pub fn wx_child_at(g: *WorkGraph, n: u32, k: u32) -> u32 {
+    var c : u32 = 0;
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == EX_BELONGS_TO && edge_to_at(g, e) == n) {
+            if (c == k) { return edge_from_at(g, e); }
+            c = c + 1;
+        }
+        e = e + 1;
+    }
+    return NODE_CAP;
+}
+
+/// Does an edge of this kind leave n? Of this kind enter n?
+pub fn wx_has_out(g: *WorkGraph, n: u32, kind: u8) -> bool {
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == kind && edge_from_at(g, e) == n) { return true; }
+        e = e + 1;
+    }
+    return false;
+}
+
+pub fn wx_has_in(g: *WorkGraph, n: u32, kind: u8) -> bool {
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == kind && edge_to_at(g, e) == n) { return true; }
+        e = e + 1;
+    }
+    return false;
+}
+
+/// A verified artifact: ARTIFACT or MESH, node label EXACT, and an EXACT VERIFIES edge to an ISSUE.
+pub fn wx_artifact_verified(g: *WorkGraph, n: u32) -> bool {
+    if (n >= nodes(g)) { return false; }
+    if (!wx_is_artifact(node_kind_at_pub(g, n))) { return false; }
+    if (node_label_at(g, n) != LABEL_EXACT) { return false; }
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == EK_VERIFIES && edge_from_at(g, e) == n && edge_label_at(g, e) == LABEL_EXACT) {
+            if (node_kind_at_pub(g, edge_to_at(g, e)) == NX_ISSUE) { return true; }
+        }
+        e = e + 1;
+    }
+    return false;
+}
+
+/// Does a verified artifact verify this issue?
+pub fn wx_issue_has_verified_artifact(g: *WorkGraph, issue: u32) -> bool {
+    var e : u32 = 0;
+    while (e < edges(g)) {
+        if (edge_kind_at(g, e) == EK_VERIFIES && edge_to_at(g, e) == issue) {
+            if (wx_artifact_verified(g, edge_from_at(g, e))) { return true; }
+        }
+        e = e + 1;
+    }
+    return false;
+}
+
+// ---- tests ----
+
+test "the extension kinds continue the base kinds without a gap and name no HAS_CHILD" {
+    assert(NX_ROOT == NK_COUNT);
+    assert(EX_BELONGS_TO == EK_COUNT);
+    assert(NX_COUNT == 11);
+    assert(EX_COUNT == 11);
+    assert(EX_SUPERSEDES == EX_COUNT - 1);
+}
+
+test "the digest covers the extension node kinds: same id, different kind hashes apart; same inserts hash equal" {
+    var a = new_graph();
+    var b = new_graph();
+    var c = new_graph();
+    var na = wx_ensure_node(&a, NX_EPIC, 13260, LABEL_EXACT);
+    var nb = wx_ensure_node(&b, NX_ISSUE, 13260, LABEL_EXACT);
+    var nc = wx_ensure_node(&c, NX_EPIC, 13260, LABEL_EXACT);
+    assert(na == 0 && nb == 0 && nc == 0);
+    var da = graph_digest(&a);
+    var db = graph_digest(&b);
+    var dc = graph_digest(&c);
+    var same_ab : u32 = 0;
+    var same_ac : u32 = 0;
+    var k : u32 = 0;
+    while (k < 32) {
+        if (da[k] == db[k]) { same_ab = same_ab + 1; }
+        if (da[k] == dc[k]) { same_ac = same_ac + 1; }
+        k = k + 1;
+    }
+    assert(same_ab < 32);
+    assert(same_ac == 32);
+}
+
+test "the digest covers the extension edge kinds: BELONGS_TO and DEPENDS_ON on the same pair hash apart" {
+    var a = new_graph();
+    var b = new_graph();
+    var ia = wx_ensure_node(&a, NX_ISSUE, 7, LABEL_EXACT);
+    var ea = wx_ensure_node(&a, NX_EPIC, 12779, LABEL_EXACT);
+    var ib = wx_ensure_node(&b, NX_ISSUE, 7, LABEL_EXACT);
+    var eb = wx_ensure_node(&b, NX_EPIC, 12779, LABEL_EXACT);
+    assert(wx_add_edge(&a, EX_BELONGS_TO, ia, ea, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&b, EX_DEPENDS_ON, ib, eb, LABEL_EXACT) == WG_OK);
+    assert(edges(&a) == 1 && edges(&b) == 1);
+    var da = graph_digest(&a);
+    var db = graph_digest(&b);
+    var same : u32 = 0;
+    var k : u32 = 0;
+    while (k < 32) {
+        if (da[k] == db[k]) { same = same + 1; }
+        k = k + 1;
+    }
+    assert(same < 32);
+}
+
+test "shapes: the base edges keep apply_event's shapes and the tree edges climb" {
+    assert(wx_edge_shape_ok(EK_READS, NK_AGENT, NK_SPEC));
+    assert(!wx_edge_shape_ok(EK_READS, NK_SPEC, NK_AGENT));
+    assert(wx_edge_shape_ok(EK_PRODUCES, NK_AGENT, NK_ARTIFACT));
+    assert(wx_edge_shape_ok(EK_VERIFIES, NK_AGENT, NK_TASK));
+    assert(wx_edge_shape_ok(EK_VERIFIES, NK_ARTIFACT, NX_ISSUE));
+    assert(wx_edge_shape_ok(EK_VERIFIES, NX_MESH, NX_ISSUE));
+    assert(!wx_edge_shape_ok(EK_VERIFIES, NX_ISSUE, NK_ARTIFACT));
+    assert(wx_edge_shape_ok(EX_BELONGS_TO, NX_TRUNK, NX_ROOT));
+    assert(wx_edge_shape_ok(EX_BELONGS_TO, NX_EPIC, NX_TRUNK));
+    assert(wx_edge_shape_ok(EX_BELONGS_TO, NX_ISSUE, NX_EPIC));
+    assert(wx_edge_shape_ok(EX_BELONGS_TO, NK_ARTIFACT, NX_ISSUE));
+    assert(!wx_edge_shape_ok(EX_BELONGS_TO, NX_EPIC, NX_ISSUE));
+    assert(!wx_edge_shape_ok(EX_BELONGS_TO, NX_ROOT, NX_TRUNK));
+    assert(wx_edge_shape_ok(EX_DUPLICATES, NX_ISSUE, NX_ISSUE));
+    assert(!wx_edge_shape_ok(EX_DUPLICATES, NX_EPIC, NX_ISSUE));
+    assert(wx_edge_shape_ok(EX_SUPERSEDES, NX_EPIC, NX_EPIC));
+    assert(!wx_edge_shape_ok(EX_SUPERSEDES, NX_EPIC, NX_ISSUE));
+    assert(wx_edge_shape_ok(EX_DEPENDS_ON, NX_RELEASE, NX_ISSUE));
+    assert(!wx_edge_shape_ok(EX_DEPENDS_ON, NX_ISSUE, NX_RELEASE));
+    assert(!wx_edge_shape_ok(EX_COUNT, NX_ISSUE, NX_ISSUE));
+    assert(!wx_edge_shape_ok(EX_BELONGS_TO, NX_COUNT, NX_ROOT));
+}
+
+test "the checked add refuses a bad index, kind, shape and self loop, and keeps the graph as it was" {
+    var g = new_graph();
+    var ep = wx_ensure_node(&g, NX_EPIC, 11385, LABEL_EXACT);
+    var is = wx_ensure_node(&g, NX_ISSUE, 12779, LABEL_EXACT);
+    assert(ep < NODE_CAP && is < NODE_CAP);
+    assert(wx_ensure_node(&g, NX_COUNT, 1, LABEL_EXACT) == NODE_CAP);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, is, 9, LABEL_EXACT) == WX_E_INDEX);
+    assert(wx_add_edge(&g, EX_COUNT, is, ep, LABEL_EXACT) == WX_E_KIND);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, ep, is, LABEL_EXACT) == WX_E_SHAPE);
+    assert(wx_add_edge(&g, EX_DUPLICATES, is, is, LABEL_EXACT) == WX_E_SELF);
+    assert(edges(&g) == 0);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, is, ep, LABEL_EXACT) == WG_OK);
+    assert(edges(&g) == 1);
+}
+
+test "a shared parent and a cycle are stored, never discarded to force a tree" {
+    var g = new_graph();
+    var e1 = wx_ensure_node(&g, NX_EPIC, 1, LABEL_EXACT);
+    var e2 = wx_ensure_node(&g, NX_EPIC, 2, LABEL_EXACT);
+    var is = wx_ensure_node(&g, NX_ISSUE, 3, LABEL_EXACT);
+    var i4 = wx_ensure_node(&g, NX_ISSUE, 4, LABEL_EXACT);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, is, e1, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, is, e2, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&g, EX_DEPENDS_ON, is, i4, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&g, EX_DEPENDS_ON, i4, is, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, e1, e2, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, e2, e1, LABEL_EXACT) == WG_OK);
+    assert(edges(&g) == 6);
+    assert(wx_parent(&g, is) == e1);
+    assert(wx_child_count(&g, e1) == 2);
+    assert(wx_child_count(&g, e2) == 2);
+    assert(wx_child_at(&g, e2, 0) == is);
+    assert(wx_child_at(&g, e2, 1) == e1);
+    assert(wx_child_at(&g, e2, 2) == NODE_CAP);
+    assert(wx_parent(&g, i4) == NODE_CAP);
+}
+
+test "the replay-safe add stores a pair once however often it is applied" {
+    var g = new_graph();
+    var a = wx_ensure_node(&g, NX_ISSUE, 7, LABEL_EXACT);
+    var b = wx_ensure_node(&g, NX_ISSUE, 8, LABEL_EXACT);
+    assert(wx_ensure_edge(&g, EX_DUPLICATES, a, b, LABEL_EXACT) == WG_OK);
+    assert(wx_ensure_edge(&g, EX_DUPLICATES, a, b, LABEL_EXACT) == WG_OK);
+    assert(wx_ensure_edge(&g, EX_DUPLICATES, a, b, LABEL_DERIVED) == WG_OK);
+    assert(edges(&g) == 1);
+    assert(wx_has_out(&g, a, EX_DUPLICATES));
+    assert(wx_has_in(&g, b, EX_DUPLICATES));
+    assert(!wx_has_in(&g, a, EX_DUPLICATES));
+}
+
+test "only an EXACT artifact with an EXACT VERIFIES edge to an issue is a verified artifact" {
+    var g = new_graph();
+    var is = wx_ensure_node(&g, NX_ISSUE, 12779, LABEL_EXACT);
+    var a1 = wx_ensure_node(&g, NK_ARTIFACT, 1, LABEL_EXACT);
+    var a2 = wx_ensure_node(&g, NK_ARTIFACT, 2, LABEL_SUGGESTED);
+    var a3 = wx_ensure_node(&g, NX_MESH, 3, LABEL_EXACT);
+    var a4 = wx_ensure_node(&g, NK_ARTIFACT, 4, LABEL_EXACT);
+    assert(wx_add_edge(&g, EK_VERIFIES, a1, is, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&g, EK_VERIFIES, a2, is, LABEL_EXACT) == WG_OK);
+    assert(wx_add_edge(&g, EK_VERIFIES, a3, is, LABEL_SUGGESTED) == WG_OK);
+    assert(wx_add_edge(&g, EX_BELONGS_TO, a4, is, LABEL_EXACT) == WG_OK);
+    assert(wx_artifact_verified(&g, a1));
+    assert(!wx_artifact_verified(&g, a2));
+    assert(!wx_artifact_verified(&g, a3));
+    assert(!wx_artifact_verified(&g, a4));
+    assert(!wx_artifact_verified(&g, is));
+    assert(wx_issue_has_verified_artifact(&g, is));
+}
+
+invariant extension_kinds_follow_base_kinds {
+    assert(NX_ROOT == NK_COUNT);
+    assert(EX_BELONGS_TO == EK_COUNT);
+}

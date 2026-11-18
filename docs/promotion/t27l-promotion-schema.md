@@ -1,68 +1,48 @@
-# T27L audit event schema for promotion_kernel
+# T27L promotion schema
 
-Part of `[EPIC] T27_PROMOTION_KERNEL_V5` — Part of #13473.
-M0-10: T27L audit event schema for promotion_kernel. Closes #13483.
+Part of #13473. Issue #13483. Status: DRAFT_UNSENT. The spec does not emit a live event and does not post.
 
-## Goal
+## Surface
 
-Define the T27L audit event schema for the promotion_kernel surface: events for draft, gate check, publish-approved, rate-limit wait.
+Name: `promotion_kernel`.
 
-## Constraints (M0 law)
+Constant: `SURFACE` in `specs/promotion/t27l_promotion.t27`.
 
-- Docs/planning only — no X posts, no outbound email, no paid-token usage without owner approval.
-- Free models first; on rate limit mark `WAITING_RATE_LIMIT` and stop (no paid fallback).
-- Claims stay inside the approved patterns from the epic.
-- Boundary: `docs/promotion/t27l-promotion-schema.md`, `docs/promotion/README.md`, `specs/promotion/t27l_promotion.t27`.
+`REGISTERED_IN_T27L` is false. `specs/t27os/t27l.t27` on master `116178f1d` sets `TL_SURFACE_LAST` to 19. `tl_surface_name` returns `course_hud`, `dev_view`, `pane`, `viewer`, `neko`, `menu_l`, `browser`, `other`, `cost`, `system`, `agent`, `security`, `research`, `memory`, `time`, `ci`, `migration`, `visual`, `roadmap`. None of those strings is `promotion_kernel`. This pack does not edit `t27l.t27`.
 
-## Schema: t27l/v1 on surface promotion_kernel
+## Actions
 
-Every promotion_kernel action emits exactly one `t27l/v1` line with these fields:
+| constant | text |
+| --- | --- |
+| ACTION_DRAFT | draft |
+| ACTION_GATE_CHECK | gate_check |
+| ACTION_PUBLISH_APPROVED | publish_approved |
+| ACTION_WAITING_RATE_LIMIT | WAITING_RATE_LIMIT |
+| ACTION_REFUSED | refused |
 
-| Field | Type | Meaning |
-|-------|------|---------|
-| `v` | str | schema version, always `"t27l/v1"` |
-| `surface` | str | always `"promotion_kernel"` |
-| `event` | str | one of `draft`, `gate_check`, `publish_approved`, `rate_limit_wait` |
-| `asset` | str | the promotional asset id being audited |
-| `claim` | str | the measurable claim being made |
-| `artifact` | str | link to the artifact |
-| `path` | str | reproducible path |
-| `visual` | str | visual proof |
-| `cta` | str | call to action |
-| `metric` | str | metric to track |
-| `decision` | str | `approve` or `refuse` — the publish gate verdict |
-| `reason` | str | why, when `decision == "refuse"` |
-| `ts` | str | ISO-8601 UTC timestamp |
+`on_rate_limit(false)` returns `WAITING_RATE_LIMIT`. `on_rate_limit(true)` returns `refused`. A paid model is not a fallback.
 
-## Event reference
+## Gates
 
-- `draft` — an asset is drafted; all six fields (claim/artifact/path/visual/cta/metric) are recorded, decision defaults to pending.
-- `gate_check` — the publish gate runs: every listed promotional item must have claim/artifact/visual/CTA/metric fields or an explicit N/A with reason. Missing element → refuse.
-- `publish_approved` — the gate passed and the asset is approved for the owner to publish (owner approval still required before any actual post).
-- `rate_limit_wait` — a free-model rate limit was hit; mark `WAITING_RATE_LIMIT`, save artifacts, do **not** switch to a paid model.
+`asset_ready` is true only when claim, artifact, path, visual, CTA, and metric are all present.
 
-## Publishable-asset rule (the gate)
+`proof_ready` is true only when widget, screenshot, test pass, and human yes are all present (#13485).
 
-Every draft promoted to `publish_approved` must contain all six:
+`may_publish` is true only when both gates are true.
 
-1. one measurable claim
-2. one artifact link
-3. one reproducible path
-4. one visual proof
-5. one CTA
-6. one metric to track
+## Check
 
-If any element is missing, the asset is **not publishable** and the gate emits `gate_check` with `decision == "refuse"`.
+`./target/debug/t27c test-report specs/promotion/t27l_promotion.t27` on this run: tests 6, pass 6, FAIL 0, vacuous passes 0 of 6.
 
-## What this schema does NOT do
+Seal: `.trinity/seals/promotion_promotion_t27l.json`, saved with `./target/debug/t27c seal specs/promotion/t27l_promotion.t27 --save`, then `--verify` printed `all hashes MATCH`.
 
-- It does not post or transmit (the module is audit-only, see `specs/promotion/t27l_promotion.t27`).
-- It holds no address and no secret in the payload.
-- It does not switch to a paid model on rate limit.
+## Asset fields
 
-## Linked assets
-
-- `docs/promotion/README.md` — promotion kernel index
-- `specs/promotion/t27l_promotion.t27` — the .t27 module that types this schema
-
-// phi^2 + 1/phi^2 = 3 | TRINITY
+| Field | Value |
+| --- | --- |
+| claim | N/A |
+| artifact | `specs/promotion/t27l_promotion.t27` |
+| reproducible path | the test-report command above |
+| visual | N/A |
+| CTA | N/A -- not sent |
+| metric | 6 tests, 0 failures, 0 vacuous |

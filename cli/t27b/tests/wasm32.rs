@@ -189,14 +189,14 @@ fn the_front_end_refusal_reaches_the_wasm_path() {
 
 #[test]
 fn parameterized_exports_lower_to_the_floor_five_ops() {
-    // The M-B cut, byte for byte: `pub fn latency(a: u32, e: u32) -> u32
-    // { return (a - e + 1) * 16; }` and `pub fn frame(t: u32) -> u32
-    // { return t / 16 + 1; }`. The functype carries each fn's own parameters;
-    // the code bodies are the postfix walks over the floor-5 law's opcodes
-    // (local.get 0x20, i32.const 0x41, sub 0x6b, add 0x6a, mul 0x6c,
+    // The M-B cut, byte for byte: `latency(a, e) = (a - e + 1) * 10` and
+    // `frame(t) = t / 10 + 1` (u32; 10 is not a power of 2, which lower.rs
+    // would strength-reduce to a shift). The functype carries each fn's own
+    // parameters; the code bodies are the postfix walks over the floor-5 law's
+    // opcodes (local.get 0x20, i32.const 0x41, sub 0x6b, add 0x6a, mul 0x6c,
     // div_u 0x6e).
-    let src = "pub fn latency(a: u32, e: u32) -> u32 { return (a - e + 1) * 16; }\n\
-               pub fn frame(t: u32) -> u32 { return t / 16 + 1; }\n";
+    let src = "pub fn latency(a: u32, e: u32) -> u32 { return (a - e + 1) * 10; }\n\
+               pub fn frame(t: u32) -> u32 { return t / 10 + 1; }\n";
     let m = wasm32_emitter::emit(&lower_src(src)).expect("emit");
     let mut want = Vec::new();
     want.extend_from_slice(b"\0asm\x01\x00\x00\x00"); // magic, version 1
@@ -209,21 +209,21 @@ fn parameterized_exports_lower_to_the_floor_five_ops() {
     want.extend_from_slice(b"\x05frame\x00\x01"); // "frame", kind func, index 1
     want.extend_from_slice(&[0x0a, 0x1a, 0x02]); // code: 2 bodies, 26 bytes
     // latency: locals 0, local.get 0, local.get 1, i32.sub, i32.const 1,
-    // i32.add, i32.const 16, i32.mul, end -- ((a - e) + 1) * 16.
+    // i32.add, i32.const 10, i32.mul, end -- ((a - e) + 1) * 10.
     want.extend_from_slice(&[
-        0x0d, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6b, 0x41, 0x01, 0x6a, 0x41, 0x10, 0x6c, 0x0b,
+        0x0d, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6b, 0x41, 0x01, 0x6a, 0x41, 0x0a, 0x6c, 0x0b,
     ]);
-    // frame: locals 0, local.get 0, i32.const 16, i32.div_u, i32.const 1,
-    // i32.add, end -- (t / 16) + 1.
-    want.extend_from_slice(&[0x0a, 0x00, 0x20, 0x00, 0x41, 0x10, 0x6e, 0x41, 0x01, 0x6a, 0x0b]);
+    // frame: locals 0, local.get 0, i32.const 10, i32.div_u, i32.const 1,
+    // i32.add, end -- (t / 10) + 1.
+    want.extend_from_slice(&[0x0a, 0x00, 0x20, 0x00, 0x41, 0x0a, 0x6e, 0x41, 0x01, 0x6a, 0x0b]);
     assert_eq!(m, want);
     assert_eq!(m.len(), 76);
 }
 
 #[test]
 fn node_calls_parameterized_exports_through_webassembly() {
-    // The M-B module instantiates in a standard runtime: latency(7, 2) = 96
-    // and frame(33) = 3, called through WebAssembly with arguments.
+    // The shifted M-B module (lower.rs turns `* 16`, `/ 16` into shl, shr_u)
+    // runs in a standard runtime: latency(7, 2) = 96 and frame(33) = 3.
     let src = "pub fn latency(a: u32, e: u32) -> u32 { return (a - e + 1) * 16; }\n\
                pub fn frame(t: u32) -> u32 { return t / 16 + 1; }\n";
     let m = wasm32_emitter::emit(&lower_src(src)).expect("emit");
@@ -267,8 +267,8 @@ fn parameterized_beyond_the_cut_is_refused_by_name() {
     let e = wasm32_emitter::emit(&prog(vec![f])).expect_err("refused");
     assert_eq!(e.construct, "fn body");
     // `&` is on the floor now (M-D, floor 13 -- its own test below); `%` is
-    // the refusing example
-    let src = "pub fn remf(a: u32) -> u32 { return a % 16; }\n";
+    // the refusing example (by 10: lower.rs turns `% 16` into `& 15`)
+    let src = "pub fn remf(a: u32) -> u32 { return a % 10; }\n";
     let e = wasm32_emitter::emit(&lower_src(src)).expect_err("refused");
     assert_eq!(e.construct, "arithmetic op");
     assert_eq!(e.func, "remf");

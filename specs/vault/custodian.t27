@@ -1,0 +1,1286 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/vault/custodian.t27 -- T27S, the human-first custodian of passwords and secrets: what the owner's
+; secrets are, what an agent may be given (a scoped, time-limited, audited capability, never the value),
+; and the checks that keep a value out of every sink an agent can read.
+; DECIDED HERE (pure functions and tests, no host I/O):
+;   1. the seven secret types, the agent access per type and the TTL cap per type;
+;   2. the vault parameters the host must meet (Argon2id, AES-256-GCM, export, backup, crypto-shred);
+;   3. metadata hygiene: a field that looks like a secret is refused; a T27L payload carries the alias only;
+;   4. the generator over host-supplied random bytes (rejection sampling, classes, passphrase index, entropy);
+;   5. strength and audit flags (age is information, never a forced rotation);
+;   6. the breach query rule (a hash prefix of at most 5 hex chars, or a local database);
+;   7. the access request policy order, the grant state machine and the capability check at use;
+;   8. the injection boundary: allowed modes, forbidden sinks, the reference format, the leak detector;
+;   9. the browser profile isolation check a browser pod must pass;
+;  10. the incident rule (revoke every live grant, mark compromised, guidance code, no autonomous rotation);
+;  11. the `tri t27s` command table and its argument rules;
+;  12. the T27L security events (surface 12, actions 47..57).
+; REUSED, not restated (a second spec where one exists is forbidden): vault::policy for the result codes, the
+; lease clock (lease_live), the token alphabet (token_char) and the owner-only rule (DENY_NOT_OWNER);
+; queen::agent_registry for the agent name check (ar_name_ok); t27os::t27l for the event line and the
+; argument check (tl_event_line, tl_validate_line, tl_arg_ok); std::mem for byte comparison.
+; WHAT THE EXISTING VAULT DID NOT HAVE (this file): human secret types, per-type agent access, KDF and AEAD
+; floors, a generator, a strength audit, the breach rule, a request/approval state machine, the injection
+; and leak rules, the browser pod gate, the incident rule and the command table.
+; ONE CHANGE THE OTHER SPEC NEEDS (not made here): vault::policy rotation_due forces rotation by age for
+; machine secrets (90..365 days). That is right for a provider key and wrong for a human password; this spec
+; never forces rotation by age (NIST SP 800-63B rev 4), so the human path must not call rotation_due.
+; THE HOST DOES: all I/O, the Argon2id and AES-256-GCM calls, the CSPRNG, the OS keychain, the stdin or TTY
+; prompt, the hash of a value for the breach prefix, the fingerprints used to find a reused value, the
+; word list (EFF large list, 7776 words, is host data) and the dispatch of the commands.
+; NOT BUILT: every host part above, the `tri t27s` binary, the secret reference resolver, the browser fill
+; bridge. T27L surface 12 and actions 47..57 are added to specs/t27os/t27l.t27 by the orchestrator; the
+; event tests below pass only once those ids exist there.
+; Sources: RFC 9106 (Argon2); NIST SP 800-63B rev 4 (memorized secrets: 15 character minimum for a single
+; factor, no forced periodic rotation); NIST SP 800-38D (GCM: 96-bit IV, at most 2^32 invocations per key
+; with random IVs); 1Password secret references (op://vault/item/field, the model for the t27s:// form).
+module VaultCustodian;
+
+use vault::policy::CODE_OK;
+use vault::policy::DENY_NOT_IN_SCOPE;
+use vault::policy::DENY_LEASE_EXPIRED;
+use vault::policy::DENY_LEASE_REVOKED;
+use vault::policy::DENY_NOT_HOLDER;
+use vault::policy::DENY_NOT_OWNER;
+use vault::policy::lease_live;
+use queen::agent_registry::ar_name_ok;
+use t27os::t27l::tl_event_line;
+use t27os::t27l::tl_validate_line;
+use t27os::t27l::tl_arg_ok;
+use t27os::t27l::TL_OK;
+use t27os::t27l::tl_hexval;
+use lab::paths::lab_is_alnum;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+use std::mem::bytes_eq;
+use std::mem::bytes_contains;
+
+// ---- result codes: the policy codes are 0..33, these start at 40 ----
+
+pub const CU_DENY_IDENTITY : u8 = 40;
+pub const CU_DENY_COMPROMISED : u8 = 41;
+pub const CU_DENY_OWNER_ONLY : u8 = 42;
+pub const CU_DENY_PURPOSE : u8 = 43;
+pub const CU_DENY_TTL : u8 = 44;
+pub const CU_DENY_RATE : u8 = 45;
+pub const CU_DENY_STATE : u8 = 46;
+pub const CU_DENY_USED : u8 = 47;
+pub const CU_DENY_ALIAS : u8 = 48;
+pub const CU_DENY_UNLOCK_STALE : u8 = 49;
+pub const CU_WEAK_MEMORY : u8 = 50;
+pub const CU_WEAK_PASSES : u8 = 51;
+pub const CU_WEAK_PARALLEL : u8 = 52;
+pub const CU_WEAK_SALT : u8 = 53;
+pub const CU_WEAK_KEY : u8 = 54;
+pub const CU_WEAK_NONCE : u8 = 55;
+pub const CU_REKEY_DUE : u8 = 56;
+pub const CU_DENY_PLAIN_EXPORT : u8 = 57;
+pub const CU_DENY_NO_CONSENT : u8 = 58;
+pub const CU_DENY_BACKUP_PLAIN : u8 = 59;
+pub const CU_DENY_BREACH_LONG : u8 = 60;
+pub const CU_DENY_BREACH_HEX : u8 = 61;
+pub const CU_DENY_BREACH_EMPTY : u8 = 62;
+pub const CU_DENY_LEAK : u8 = 63;
+pub const CU_DENY_SINK : u8 = 64;
+pub const CU_DENY_MODE : u8 = 65;
+pub const CU_DENY_REF : u8 = 66;
+pub const CU_DENY_CMD : u8 = 67;
+pub const CU_DENY_NO_CONFIRM : u8 = 68;
+pub const CU_DENY_ARG : u8 = 69;
+pub const CU_DENY_META : u8 = 70;
+pub const CU_B_BIND : u8 = 71;
+pub const CU_B_CDP_PUBLISHED : u8 = 72;
+pub const CU_B_CDP_BIND : u8 = 73;
+pub const CU_B_PORT_BIND : u8 = 74;
+pub const CU_B_OWNER_PROFILE : u8 = 75;
+pub const CU_B_NOT_DISPOSABLE : u8 = 76;
+pub const CU_B_NO_REDACTION : u8 = 77;
+pub const CU_DENY_BREACH_UNPADDED : u8 = 78;
+/// A request that passed every gate: held for the owner, or covered by a standing grant.
+pub const CU_REQ_PENDING : u8 = 1;
+pub const CU_REQ_STANDING : u8 = 2;
+
+// ---- 1. secret types, agent access, TTL caps ----
+
+pub const CU_T_PASSWORD : u8 = 0;
+pub const CU_T_API_KEY : u8 = 1;
+pub const CU_T_OAUTH_TOKEN : u8 = 2;
+pub const CU_T_SSH_KEY : u8 = 3;
+pub const CU_T_RECOVERY_PHRASE : u8 = 4;
+pub const CU_T_PRIVATE_KEY : u8 = 5;
+pub const CU_T_COOKIE_SESSION : u8 = 6;
+pub const CU_TYPES : u8 = 7;
+
+/// Agent access modes: 0 inject on an approved action, 1 scoped runtime grant, 2 explicit approval and no
+/// export, 3 owner only (no agent, under any grant), 4 short-lived only.
+pub const CU_AC_INJECT : u8 = 0;
+pub const CU_AC_SCOPED : u8 = 1;
+pub const CU_AC_APPROVAL : u8 = 2;
+pub const CU_AC_OWNER : u8 = 3;
+pub const CU_AC_SHORT : u8 = 4;
+pub const CU_TYPE_ACCESS : [7]u8 = [0, 1, 1, 2, 3, 2, 4];
+/// Longest grant per type, seconds. Cookie and ssh 15 minutes, the others 60 minutes, the phrase none.
+pub const CU_TYPE_TTL_CAP : [7]u64 = [3600, 3600, 3600, 900, 0, 3600, 900];
+
+pub fn cu_type_access(t: u8) -> u8 {
+    if (t >= CU_TYPES) { return CU_AC_OWNER; }
+    return CU_TYPE_ACCESS[t];
+}
+
+pub fn cu_type_ttl_cap(t: u8) -> u64 {
+    if (t >= CU_TYPES) { return 0; }
+    return CU_TYPE_TTL_CAP[t];
+}
+
+/// False for the owner-only access (the recovery phrase) and for an unknown type.
+pub fn cu_agent_reachable(t: u8) -> bool {
+    return cu_type_access(t) != CU_AC_OWNER;
+}
+
+/// No type is ever exported to an agent: an agent gets a use, not a copy.
+pub fn cu_agent_may_export(t: u8) -> bool {
+    return false;
+}
+
+// ---- 2. vault parameters the host must meet ----
+
+pub const CU_ARGON_MEM_KIB_MIN : u32 = 65536;
+pub const CU_ARGON_PASSES_MIN : u32 = 3;
+pub const CU_ARGON_PARALLEL_MIN : u32 = 1;
+pub const CU_ARGON_SALT_MIN : u32 = 16;
+pub const CU_AEAD_KEY_BITS : u32 = 256;
+pub const CU_AEAD_NONCE_BITS : u32 = 96;
+pub const CU_AEAD_INVOCATIONS_MAX : u64 = 4294967296;
+
+/// Argon2id floor: memory >= 65536 KiB, t >= 3, p >= 1, salt >= 16 bytes. RFC 9106 second recommended option
+/// is m=64 MiB, t=3, p=4; anything weaker is refused.
+pub fn cu_kdf_code(mem_kib: u32, passes: u32, parallel: u32, salt_bytes: u32) -> u8 {
+    if (mem_kib < CU_ARGON_MEM_KIB_MIN) { return CU_WEAK_MEMORY; }
+    if (passes < CU_ARGON_PASSES_MIN) { return CU_WEAK_PASSES; }
+    if (parallel < CU_ARGON_PARALLEL_MIN) { return CU_WEAK_PARALLEL; }
+    if (salt_bytes < CU_ARGON_SALT_MIN) { return CU_WEAK_SALT; }
+    return CODE_OK;
+}
+
+/// AES-256-GCM with a 96-bit nonce; a key that has already seen 2^32 invocations must be replaced first.
+pub fn cu_aead_code(key_bits: u32, nonce_bits: u32, invocations: u64) -> u8 {
+    if (key_bits != CU_AEAD_KEY_BITS) { return CU_WEAK_KEY; }
+    if (nonce_bits != CU_AEAD_NONCE_BITS) { return CU_WEAK_NONCE; }
+    if (invocations >= CU_AEAD_INVOCATIONS_MAX) { return CU_REKEY_DUE; }
+    return CODE_OK;
+}
+
+/// Export: plaintext is never allowed by default (the owner's per-item reveal is cu_reveal_code, not an export);
+/// a backup must be encrypted and the owner must have consented.
+pub fn cu_export_code(plaintext: bool, encrypted: bool, owner_consent: bool) -> u8 {
+    if (plaintext) { return CU_DENY_PLAIN_EXPORT; }
+    if (encrypted == false) { return CU_DENY_BACKUP_PLAIN; }
+    if (owner_consent == false) { return CU_DENY_NO_CONSENT; }
+    return CODE_OK;
+}
+
+pub const CU_DEL_SHRED : u8 = 0;
+pub const CU_DEL_OVERWRITE : u8 = 1;
+
+/// Delete is a crypto-shred (drop the item key) where the item has its own key; otherwise overwrite.
+pub fn cu_delete_mode(item_has_own_key: bool) -> u8 {
+    if (item_has_own_key) { return CU_DEL_SHRED; }
+    return CU_DEL_OVERWRITE;
+}
+
+// ---- 3. metadata hygiene and the T27L payload ----
+
+pub const CU_META_MAX : usize = 128;
+pub const CU_ALIAS_MAX : usize = 48;
+pub const CU_RUN_LIMIT : u32 = 20;
+
+/// The longest run of letters and digits (a `-`, `_`, `.` or space ends a run).
+pub fn cu_longest_run(s: []const u8) -> u32 {
+    var best : u32 = 0;
+    var cur : u32 = 0;
+    var i : usize = 0;
+    while (i < s.len) {
+        if (lab_is_alnum(s[i])) {
+            cur = cur + 1;
+            if (cur > best) { best = cur; }
+        } else {
+            cur = 0;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// True when the text looks like a secret: the T27L argument check refuses it, or it holds a run of 20 or more
+/// letters and digits (a key, a hash or a token has no separators). A heuristic; it can refuse a long word.
+pub fn cu_looks_secret(s: []const u8) -> bool {
+    if (tl_arg_ok(s) == false) { return true; }
+    return cu_longest_run(s) >= CU_RUN_LIMIT;
+}
+
+/// Title, service, username, tags: short and not secret-like.
+pub fn cu_meta_ok(field: []const u8) -> bool {
+    if (field.len == 0 or field.len > CU_META_MAX) { return false; }
+    return cu_looks_secret(field) == false;
+}
+
+/// A url carries no userinfo (`@`), no query (`?`) and no fragment (`#`): those are where secrets hide.
+pub fn cu_url_ok(url: []const u8) -> bool {
+    if (cu_meta_ok(url) == false) { return false; }
+    var i : usize = 0;
+    while (i < url.len) {
+        if (url[i] == 64 or url[i] == 63 or url[i] == 35) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// An alias is 1..48 characters of a-z, 0-9, `_`, `.`, `-`, the first a letter, and not secret-like.
+pub fn cu_alias_ok(alias: []const u8) -> bool {
+    if (alias.len == 0 or alias.len > CU_ALIAS_MAX) { return false; }
+    if (alias[0] < 97 or alias[0] > 122) { return false; }
+    var i : usize = 0;
+    while (i < alias.len) {
+        const c : u8 = alias[i];
+        const ok : bool = (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95 or c == 46 or c == 45;
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return cu_looks_secret(alias) == false;
+}
+
+/// A payload may not name a username, a url or a value, and may not hold a secret-like run.
+pub fn cu_payload_ok(payload: []const u8) -> bool {
+    if (bytes_contains(payload, "username=")) { return false; }
+    if (bytes_contains(payload, "url=")) { return false; }
+    if (bytes_contains(payload, "value=")) { return false; }
+    if (bytes_contains(payload, "secret=")) { return false; }
+    return cu_longest_run(payload) < CU_RUN_LIMIT;
+}
+
+/// "alias=NAME" and nothing else; 0 when the alias is refused.
+pub fn cu_payload_alias(out: []u8, alias: []const u8) -> usize {
+    if (cu_alias_ok(alias) == false) { return 0; }
+    var o : usize = put_bytes(out, 0, "alias=");
+    o = put_bytes(out, o, alias);
+    return o;
+}
+
+/// "agent=A alias=B scope=S ttl=N code=C"; 0 when the agent, alias or scope is refused.
+pub fn cu_payload_access(out: []u8, agent: []const u8, alias: []const u8, scope: []const u8, ttl: u64, code: u8) -> usize {
+    if (ar_name_ok(agent) == false) { return 0; }
+    if (cu_alias_ok(alias) == false) { return 0; }
+    if (cu_scope_ok(scope) == false) { return 0; }
+    var o : usize = put_bytes(out, 0, "agent=");
+    o = put_bytes(out, o, agent);
+    o = put_bytes(out, o, " alias=");
+    o = put_bytes(out, o, alias);
+    o = put_bytes(out, o, " scope=");
+    o = put_bytes(out, o, scope);
+    o = put_bytes(out, o, " ttl=");
+    o = put_dec(out, o, ttl);
+    o = put_bytes(out, o, " code=");
+    o = put_dec(out, o, @as(u64, code));
+    return o;
+}
+
+// ---- 4. generator over host-supplied random bytes ----
+
+pub const CU_CLASS_ALNUM : u8 = 0;
+pub const CU_CLASS_ALNUM_SYM : u8 = 1;
+pub const CU_LEN_DEFAULT : u32 = 24;
+pub const CU_LEN_MIN : u32 = 15;
+pub const CU_LEN_MAX : u32 = 128;
+pub const CU_WORD_COUNT : u32 = 7776;
+pub const CU_WORD_LIMIT : u32 = 62208;
+pub const CU_SYMBOLS : [16]u8 = [33, 35, 36, 37, 38, 42, 43, 45, 46, 58, 61, 63, 64, 94, 95, 126];
+
+/// Unbiased mapping: accept byte b for an alphabet of n symbols only if b < 256 - (256 % n).
+pub fn cu_accept(b: u8, n: u32) -> bool {
+    if (n == 0 or n > 256) { return false; }
+    const lim : u32 = 256 - (256 % n);
+    return @as(u32, b) < lim;
+}
+
+/// 0 asks for the default (24); under 15 or over 128 is refused (0 is returned for "refused" as well: test with cu_len_ok).
+pub fn cu_gen_len(asked: u32) -> u32 {
+    if (asked == 0) { return CU_LEN_DEFAULT; }
+    return asked;
+}
+
+pub fn cu_len_ok(len: u32) -> bool {
+    return len >= CU_LEN_MIN and len <= CU_LEN_MAX;
+}
+
+/// Ambiguous characters dropped by exclude-ambiguous: 0 O 1 l I |.
+pub fn cu_ambiguous(c: u8) -> bool {
+    return c == 48 or c == 79 or c == 49 or c == 108 or c == 73 or c == 124;
+}
+
+fn cu_push(out: []u8, n: usize, c: u8, no_ambig: bool) -> usize {
+    if (no_ambig and cu_ambiguous(c)) { return n; }
+    if (n >= out.len) { return n; }
+    out[n] = c;
+    return n + 1;
+}
+
+/// The alphabet of a class, in a fixed order (digits, upper, lower, then symbols); returns its size.
+pub fn cu_alphabet(out: []u8, class: u8, no_ambig: bool) -> usize {
+    var n : usize = 0;
+    var c : u32 = 48;
+    while (c <= 122) {
+        if (c <= 57 or (c >= 65 and c <= 90) or c >= 97) {
+            n = cu_push(out, n, @intCast(c), no_ambig);
+        }
+        c = c + 1;
+    }
+    if (class == CU_CLASS_ALNUM_SYM) {
+        var k : usize = 0;
+        while (k < 16) {
+            n = cu_push(out, n, CU_SYMBOLS[k], no_ambig);
+            k = k + 1;
+        }
+    }
+    return n;
+}
+
+/// Write up to len characters from the host's random bytes, skipping rejected bytes. Returns the number written:
+/// len on success, fewer when the bytes ran out (the host supplies more), 0 when len is refused.
+pub fn cu_generate(out: []u8, rnd: []const u8, len: u32, class: u8, no_ambig: bool) -> usize {
+    if (cu_len_ok(len) == false) { return 0; }
+    if (@as(usize, len) > out.len) { return 0; }
+    var alpha : [128]u8 = undefined;
+    const an : usize = cu_alphabet(alpha[0..128], class, no_ambig);
+    if (an == 0) { return 0; }
+    var w : usize = 0;
+    var i : usize = 0;
+    while (i < rnd.len and w < @as(usize, len)) {
+        const b : u8 = rnd[i];
+        if (cu_accept(b, @intCast(an))) {
+            out[w] = alpha[@as(usize, b) % an];
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    return w;
+}
+
+/// Passphrase word index from two bytes: accept the 16-bit value only below 7776 * 8 = 62208, then v mod 7776;
+/// -1 when rejected (the host draws two more bytes).
+pub fn cu_word_index(b0: u8, b1: u8) -> i64 {
+    const v : u32 = @as(u32, b0) * 256 + @as(u32, b1);
+    if (v >= CU_WORD_LIMIT) { return -1; }
+    return @as(i64, v % CU_WORD_COUNT);
+}
+
+/// floor(1024 * log2 n) by integer squaring, no floating log. A slight underestimate, which is the safe side.
+pub fn cu_log2_x1024(n: u32) -> u32 {
+    if (n < 2) { return 0; }
+    var k : u32 = 0;
+    var t : u32 = n;
+    while (t >= 2) {
+        t = t / 2;
+        k = k + 1;
+    }
+    var m : u64 = @as(u64, n) * 65536;
+    var j : u32 = 0;
+    while (j < k) {
+        m = m / 2;
+        j = j + 1;
+    }
+    var frac : u32 = 0;
+    var s : u32 = 0;
+    while (s < 10) {
+        m = (m * m) / 65536;
+        frac = frac * 2;
+        if (m >= 131072) {
+            m = m / 2;
+            frac = frac + 1;
+        }
+        s = s + 1;
+    }
+    return k * 1024 + frac;
+}
+
+/// Whole bits of entropy of len characters drawn uniformly from an alphabet of n symbols.
+pub fn cu_entropy_bits(len: u32, n: u32) -> u32 {
+    return (len * cu_log2_x1024(n)) / 1024;
+}
+
+/// Whole bits of a passphrase of w words from the 7776-word list (12.92 bits a word, rounded down).
+pub fn cu_passphrase_bits(words: u32) -> u32 {
+    return (words * 12924) / 1000;
+}
+
+// ---- 5. strength and audit flags ----
+
+pub const CU_F_SHORT : u32 = 1;
+pub const CU_F_REUSED : u32 = 2;
+pub const CU_F_BREACHED : u32 = 4;
+pub const CU_F_NO_MFA : u32 = 8;
+pub const CU_F_SHARED : u32 = 16;
+pub const CU_F_SERVICE_BREACH : u32 = 32;
+
+/// Reused: the host compares fingerprints, never values; the spec only compares the two fingerprints.
+pub fn cu_reused(fp_a: u64, fp_b: u64) -> bool {
+    return fp_a == fp_b;
+}
+
+/// The audit flag set for one item. `breached` is the host's answer to the breach query.
+pub fn cu_flags(len: u32, reused: bool, breached: bool, mfa_missing: bool, shared: bool, service_breach: bool) -> u32 {
+    var f : u32 = 0;
+    if (len < CU_LEN_MIN) { f = f + CU_F_SHORT; }
+    if (reused) { f = f + CU_F_REUSED; }
+    if (breached) { f = f + CU_F_BREACHED; }
+    if (mfa_missing) { f = f + CU_F_NO_MFA; }
+    if (shared) { f = f + CU_F_SHARED; }
+    if (service_breach) { f = f + CU_F_SERVICE_BREACH; }
+    return f;
+}
+
+/// Age is reported as information only.
+pub fn cu_age_report(age_days: u32) -> u32 {
+    return age_days;
+}
+
+/// Rotation is forced by compromise or a breach answer, never by age (NIST SP 800-63B rev 4).
+pub fn cu_rotation_forced(age_days: u32, compromised: bool, breached: bool) -> bool {
+    return compromised or breached;
+}
+
+// ---- 6. breach query rule ----
+
+pub const CU_BREACH_PREFIX_MAX : usize = 5;
+
+/// What may leave the machine: a hash prefix of 1..5 hex characters, asked as a padded range query (the response is
+/// padded with zero-count entries, the Add-Padding request of the k-anonymity range API), so that the response size
+/// does not tell an observer the prefix. A prefix still leaks some guessing advantage (research item 5, up to 12x),
+/// which is why the check is opt-in. A longer string (a full hash), anything else, or an unpadded remote query is
+/// refused. With a local database (remote false) nothing leaves, so any query is fine.
+pub fn cu_breach_query_code(remote: bool, padded: bool, query: []const u8) -> u8 {
+    if (remote == false) { return CODE_OK; }
+    if (padded == false) { return CU_DENY_BREACH_UNPADDED; }
+    if (query.len == 0) { return CU_DENY_BREACH_EMPTY; }
+    if (query.len > CU_BREACH_PREFIX_MAX) { return CU_DENY_BREACH_LONG; }
+    var i : usize = 0;
+    while (i < query.len) {
+        if (tl_hexval(query[i]) >= 16) { return CU_DENY_BREACH_HEX; }
+        i = i + 1;
+    }
+    return CODE_OK;
+}
+
+// ---- 7. access requests, grants, states ----
+
+pub const CU_ST_PENDING : u8 = 0;
+pub const CU_ST_APPROVED : u8 = 1;
+pub const CU_ST_DENIED : u8 = 2;
+pub const CU_ST_USED : u8 = 3;
+pub const CU_ST_EXPIRED : u8 = 4;
+pub const CU_ST_REVOKED : u8 = 5;
+pub const CU_ST_BAD : u8 = 255;
+pub const CU_EV_APPROVE : u8 = 0;
+pub const CU_EV_DENY : u8 = 1;
+pub const CU_EV_USE : u8 = 2;
+pub const CU_EV_EXPIRE : u8 = 3;
+pub const CU_EV_REVOKE : u8 = 4;
+pub const CU_UNLOCK_FRESH_SECONDS : u64 = 60;
+pub const CU_PURPOSE_MAX : usize = 48;
+pub const CU_SCOPE_MAX : usize = 96;
+
+/// PENDING_OWNER -> APPROVED | DENIED; APPROVED -> USED | EXPIRED | REVOKED; nothing leaves the rest.
+pub fn cu_step(state: u8, ev: u8) -> u8 {
+    if (state == CU_ST_PENDING) {
+        if (ev == CU_EV_APPROVE) { return CU_ST_APPROVED; }
+        if (ev == CU_EV_DENY) { return CU_ST_DENIED; }
+        return CU_ST_BAD;
+    }
+    if (state == CU_ST_APPROVED) {
+        if (ev == CU_EV_USE) { return CU_ST_USED; }
+        if (ev == CU_EV_EXPIRE) { return CU_ST_EXPIRED; }
+        if (ev == CU_EV_REVOKE) { return CU_ST_REVOKED; }
+        return CU_ST_BAD;
+    }
+    return CU_ST_BAD;
+}
+
+pub fn cu_is_live(state: u8) -> bool {
+    return state == CU_ST_PENDING or state == CU_ST_APPROVED;
+}
+
+/// An approved grant whose time has come is due to move to EXPIRED.
+pub fn cu_expire_due(state: u8, now: u64, expires: u64) -> bool {
+    return state == CU_ST_APPROVED and lease_live(now, expires) == false;
+}
+
+/// A scope is KIND:path, for example repo:owner/name: letters, digits, `_`, `.`, `-`, `/`, exactly one `:`
+/// after a non-empty kind, no `*` and no space. A scope can only be matched exactly, never widened.
+pub fn cu_scope_ok(scope: []const u8) -> bool {
+    if (scope.len < 3 or scope.len > CU_SCOPE_MAX) { return false; }
+    var colon : usize = 0;
+    var colons : u32 = 0;
+    var i : usize = 0;
+    while (i < scope.len) {
+        const c : u8 = scope[i];
+        if (c == 58) {
+            colons = colons + 1;
+            colon = i;
+        } else {
+            const ok : bool = lab_is_alnum(c) or c == 95 or c == 46 or c == 45 or c == 47;
+            if (ok == false) { return false; }
+        }
+        i = i + 1;
+    }
+    if (colons != 1) { return false; }
+    return colon > 0 and colon + 1 < scope.len;
+}
+
+/// A purpose is one word or short kebab text (a-z, 0-9, `-`), not secret-like.
+pub fn cu_purpose_ok(purpose: []const u8) -> bool {
+    if (purpose.len == 0 or purpose.len > CU_PURPOSE_MAX) { return false; }
+    var i : usize = 0;
+    while (i < purpose.len) {
+        const c : u8 = purpose[i];
+        const ok : bool = (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 45;
+        if (ok == false) { return false; }
+        i = i + 1;
+    }
+    return cu_looks_secret(purpose) == false;
+}
+
+/// The gates, in order: identity verified, alias not compromised, type allows agents, scope allowed, purpose
+/// ok, ttl within the type cap, rate limit. Returns CODE_OK or the first refusal.
+pub fn cu_request_gate(identity_ok: bool, agent: []const u8, alias_compromised: bool, secret_type: u8,
+                       scope: []const u8, scope_allowed: bool, purpose: []const u8, ttl: u64, rate_ok: bool) -> u8 {
+    if (identity_ok == false or ar_name_ok(agent) == false) { return CU_DENY_IDENTITY; }
+    if (alias_compromised) { return CU_DENY_COMPROMISED; }
+    if (cu_agent_reachable(secret_type) == false) { return CU_DENY_OWNER_ONLY; }
+    if (scope_allowed == false or cu_scope_ok(scope) == false) { return DENY_NOT_IN_SCOPE; }
+    if (cu_purpose_ok(purpose) == false) { return CU_DENY_PURPOSE; }
+    if (ttl == 0 or ttl > cu_type_ttl_cap(secret_type)) { return CU_DENY_TTL; }
+    if (rate_ok == false) { return CU_DENY_RATE; }
+    return CODE_OK;
+}
+
+/// A standing grant names the exact agent, alias and scope, caps the ttl, and itself expires.
+pub fn cu_standing_ok(g_agent: []const u8, g_alias: []const u8, g_scope: []const u8, g_ttl_cap: u64, g_expires: u64,
+                      agent: []const u8, alias: []const u8, scope: []const u8, ttl: u64, now: u64) -> bool {
+    if (lease_live(now, g_expires) == false) { return false; }
+    if (bytes_eq(g_agent, agent) == false) { return false; }
+    if (bytes_eq(g_alias, alias) == false) { return false; }
+    if (bytes_eq(g_scope, scope) == false) { return false; }
+    return ttl <= g_ttl_cap;
+}
+
+/// After the gate: a refusal stays a refusal; otherwise a standing grant approves, else the owner is asked.
+pub fn cu_request_route(gate: u8, standing: bool) -> u8 {
+    if (gate != CODE_OK) { return gate; }
+    if (standing) { return CU_REQ_STANDING; }
+    return CU_REQ_PENDING;
+}
+
+/// Capability check at use: same agent, same alias, same scope, now < expires, not used, not revoked.
+pub fn cu_use_code(state: u8, single_use: bool, used: bool, g_agent: []const u8, g_alias: []const u8, g_scope: []const u8,
+                   agent: []const u8, alias: []const u8, scope: []const u8, now: u64, expires: u64) -> u8 {
+    if (state == CU_ST_REVOKED) { return DENY_LEASE_REVOKED; }
+    if (state == CU_ST_EXPIRED) { return DENY_LEASE_EXPIRED; }
+    if (state == CU_ST_USED or (single_use and used)) { return CU_DENY_USED; }
+    if (state != CU_ST_APPROVED) { return CU_DENY_STATE; }
+    if (bytes_eq(g_agent, agent) == false) { return DENY_NOT_HOLDER; }
+    if (bytes_eq(g_alias, alias) == false) { return CU_DENY_ALIAS; }
+    if (bytes_eq(g_scope, scope) == false) { return DENY_NOT_IN_SCOPE; }
+    if (lease_live(now, expires) == false) { return DENY_LEASE_EXPIRED; }
+    return CODE_OK;
+}
+
+/// Only the owner, after a fresh unlock, may see a value. An agent never does (event secret_revealed_to_owner).
+pub fn cu_reveal_code(actor_is_owner: bool, unlock_age_seconds: u64) -> u8 {
+    if (actor_is_owner == false) { return DENY_NOT_OWNER; }
+    if (unlock_age_seconds > CU_UNLOCK_FRESH_SECONDS) { return CU_DENY_UNLOCK_STALE; }
+    return CODE_OK;
+}
+
+/// reveal_value: true only when the code says the owner may; always false for an agent.
+pub fn cu_reveal_value(actor_is_owner: bool, unlock_age_seconds: u64) -> bool {
+    return cu_reveal_code(actor_is_owner, unlock_age_seconds) == CODE_OK;
+}
+
+// ---- 8. injection boundary ----
+
+pub const CU_MODE_EXECUTOR : u8 = 0;
+pub const CU_MODE_ENV_ONESHOT : u8 = 1;
+pub const CU_MODE_KEYCHAIN : u8 = 2;
+pub const CU_MODE_TOKEN_EXCHANGE : u8 = 3;
+pub const CU_MODE_BROWSER_FILL : u8 = 4;
+pub const CU_MODES : u8 = 5;
+pub const CU_SINK_ARGV : u8 = 0;
+pub const CU_SINK_ENV_DUMP : u8 = 1;
+pub const CU_SINK_PROMPT : u8 = 2;
+pub const CU_SINK_LOG : u8 = 3;
+pub const CU_SINK_SCREENSHOT : u8 = 4;
+pub const CU_SINK_ISSUE_PR : u8 = 5;
+pub const CU_SINK_PLAINTEXT_FILE : u8 = 6;
+pub const CU_SINK_AGENT_CHAT : u8 = 7;
+/// The stdout and stderr of the command the executor ran, on their way back to the agent: the leak path the research
+/// names first (a value echoed by the tool lands in the model's context). Scrubbed by cu_scrub before it returns.
+pub const CU_SINK_EXEC_OUTPUT : u8 = 8;
+pub const CU_SINKS : u8 = 9;
+pub const CU_SCRUB_MARK : str = "[t27s]";
+pub const CU_REF_PREFIX : str = "t27s://";
+
+pub fn cu_mode_name(m: u8) -> []const u8 {
+    if (m == CU_MODE_EXECUTOR) { return "trusted-local-executor"; }
+    if (m == CU_MODE_ENV_ONESHOT) { return "one-shot-subprocess-env"; }
+    if (m == CU_MODE_KEYCHAIN) { return "os-keychain"; }
+    if (m == CU_MODE_TOKEN_EXCHANGE) { return "short-lived-token-exchange"; }
+    if (m == CU_MODE_BROWSER_FILL) { return "local-browser-fill-bridge"; }
+    return "";
+}
+
+pub fn cu_sink_name(s: u8) -> []const u8 {
+    if (s == CU_SINK_ARGV) { return "argv"; }
+    if (s == CU_SINK_ENV_DUMP) { return "env-dump"; }
+    if (s == CU_SINK_PROMPT) { return "prompt"; }
+    if (s == CU_SINK_LOG) { return "log"; }
+    if (s == CU_SINK_SCREENSHOT) { return "screenshot"; }
+    if (s == CU_SINK_ISSUE_PR) { return "issue-or-pr"; }
+    if (s == CU_SINK_PLAINTEXT_FILE) { return "plaintext-file"; }
+    if (s == CU_SINK_AGENT_CHAT) { return "agent-chat"; }
+    if (s == CU_SINK_EXEC_OUTPUT) { return "executor-output"; }
+    return "";
+}
+
+/// The five allowed ways a value reaches the thing that uses it.
+pub fn cu_mode_code(mode: u8) -> u8 {
+    if (mode < CU_MODES) { return CODE_OK; }
+    return CU_DENY_MODE;
+}
+
+/// Delivery of a value to any of the eight sinks is refused, whatever the text. An unknown sink is refused too.
+pub fn cu_deliver_code(sink: u8) -> u8 {
+    return CU_DENY_SINK;
+}
+
+/// The leak detector: the value, as exact bytes, occurs in the text. An empty value never matches.
+pub fn cu_leaks(text: []const u8, value: []const u8) -> bool {
+    if (value.len == 0) { return false; }
+    return bytes_contains(text, value);
+}
+
+/// A text bound for a sink: refused if the value is in it, and an unknown sink is refused.
+pub fn cu_sink_check(sink: u8, text: []const u8, value: []const u8) -> u8 {
+    if (sink >= CU_SINKS) { return CU_DENY_SINK; }
+    if (cu_leaks(text, value)) { return CU_DENY_LEAK; }
+    return CODE_OK;
+}
+
+/// Copy text into out with every exact occurrence of value replaced by CU_SCRUB_MARK. Returns the length written,
+/// 0 when value is empty or out is too small (the executor then returns nothing, never the raw text).
+pub fn cu_scrub(out: []u8, text: []const u8, value: []const u8) -> usize {
+    if (value.len == 0) { return 0; }
+    var o : usize = 0;
+    var i : usize = 0;
+    while (i < text.len) {
+        var hit : bool = false;
+        if (i + value.len <= text.len) { hit = bytes_eq(text[i..i + value.len], value); }
+        if (hit) {
+            if (o + 6 > out.len) { return 0; }
+            o = put_bytes(out, o, CU_SCRUB_MARK);
+            i = i + value.len;
+        } else {
+            if (o + 1 > out.len) { return 0; }
+            out[o] = text[i];
+            o = o + 1;
+            i = i + 1;
+        }
+    }
+    return o;
+}
+
+fn cu_ref_token(s: []const u8) -> bool {
+    if (s.len == 0 or s.len > CU_ALIAS_MAX) { return false; }
+    var i : usize = 0;
+    while (i < s.len) {
+        const c : u8 = s[i];
+        if (lab_is_alnum(c) == false and c != 95 and c != 46 and c != 45) { return false; }
+        i = i + 1;
+    }
+    return cu_longest_run(s) < CU_RUN_LIMIT;
+}
+
+fn cu_ref_field(s: []const u8) -> bool {
+    return bytes_eq(s, "value") or bytes_eq(s, "username") or bytes_eq(s, "url") or bytes_eq(s, "totp");
+}
+
+/// t27s://<vault>/<alias>/<field>: three tokens, the field one of value, username, url, totp. A reference
+/// names a place and holds no value.
+pub fn cu_ref_ok(ref: []const u8) -> bool {
+    const p : usize = CU_REF_PREFIX.len;
+    if (ref.len <= p) { return false; }
+    if (bytes_eq(ref[0..p], CU_REF_PREFIX) == false) { return false; }
+    var cuts : [2]usize = undefined;
+    var n : usize = 0;
+    var i : usize = p;
+    while (i < ref.len) {
+        if (ref[i] == 47) {
+            if (n >= 2) { return false; }
+            cuts[n] = i;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if (n != 2) { return false; }
+    return cu_ref_token(ref[p..cuts[0]]) and cu_ref_token(ref[cuts[0] + 1..cuts[1]]) and cu_ref_field(ref[cuts[1] + 1..ref.len]);
+}
+
+/// No value can be a reference: a value that parses as one is refused at storage, so a reference never
+/// resolves to another reference and a resolver is never fed a value.
+pub fn cu_value_storable(value: []const u8) -> bool {
+    return value.len > 0 and cu_ref_ok(value) == false;
+}
+
+// ---- 9. browser profile isolation ----
+
+fn cu_loopback(bind: []const u8) -> bool {
+    return bytes_eq(bind, "127.0.0.1");
+}
+
+/// A browser pod is unblocked only if: the pod binds 127.0.0.1, CDP is not published, CDP binds 127.0.0.1,
+/// port 8080 binds 127.0.0.1, the profile is not the owner's, it is disposable, screenshot redaction is on.
+pub fn cu_browser_code(bind: []const u8, cdp_published: bool, cdp_bind: []const u8, port8080_bind: []const u8,
+                       owner_profile: bool, disposable: bool, redaction: bool) -> u8 {
+    if (cu_loopback(bind) == false) { return CU_B_BIND; }
+    if (cdp_published) { return CU_B_CDP_PUBLISHED; }
+    if (cu_loopback(cdp_bind) == false) { return CU_B_CDP_BIND; }
+    if (cu_loopback(port8080_bind) == false) { return CU_B_PORT_BIND; }
+    if (owner_profile) { return CU_B_OWNER_PROFILE; }
+    if (disposable == false) { return CU_B_NOT_DISPOSABLE; }
+    if (redaction == false) { return CU_B_NO_REDACTION; }
+    return CODE_OK;
+}
+
+// ---- 10. incident ----
+
+/// What an incident does to one grant: a live approved grant is revoked, a pending request is denied, the rest stay.
+pub fn cu_incident_state(state: u8) -> u8 {
+    if (state == CU_ST_APPROVED) { return CU_ST_REVOKED; }
+    if (state == CU_ST_PENDING) { return CU_ST_DENIED; }
+    return state;
+}
+
+/// Rotation guidance for the owner, as a code: 1 + the secret type. The owner rotates.
+pub fn cu_guidance_code(t: u8) -> u8 {
+    if (t >= CU_TYPES) { return 0; }
+    return t + 1;
+}
+
+pub fn cu_guidance_name(code: u8) -> []const u8 {
+    if (code == 1) { return "change-password-at-service"; }
+    if (code == 2) { return "revoke-and-reissue-key"; }
+    if (code == 3) { return "revoke-at-provider-and-reauthorize"; }
+    if (code == 4) { return "replace-authorized-keys"; }
+    if (code == 5) { return "move-assets-and-make-new-phrase"; }
+    if (code == 6) { return "revoke-certificate-and-reissue"; }
+    if (code == 7) { return "sign-out-all-sessions"; }
+    return "";
+}
+
+/// There is no autonomous rotation: the host never rotates a secret on its own.
+pub fn cu_autonomous_rotation_allowed() -> bool {
+    return false;
+}
+
+// ---- 11. the `tri t27s` command table (dispatch is host code, NOT BUILT) ----
+
+pub const CU_CMDS : u8 = 17;
+pub const CU_CMD_ROTATE : u8 = 9;
+pub const CU_CMD_REVOKE : u8 = 14;
+pub const CU_CMD_ADD : u8 = 6;
+pub const CU_CMD_STRENGTH : u8 = 10;
+
+pub fn cu_cmd_noun(id: u8) -> []const u8 {
+    if (id >= 1 and id <= 4) { return "vault"; }
+    if (id >= 5 and id <= 10) { return "password"; }
+    if (id >= 11 and id <= 15) { return "access"; }
+    if (id == 16) { return "audit"; }
+    if (id == 17) { return "incident"; }
+    return "";
+}
+
+pub fn cu_cmd_verb(id: u8) -> []const u8 {
+    if (id == 1) { return "init"; }
+    if (id == 2) { return "unlock"; }
+    if (id == 3) { return "lock"; }
+    if (id == 4) { return "status"; }
+    if (id == 5) { return "generate"; }
+    if (id == 6) { return "add"; }
+    if (id == 7) { return "list"; }
+    if (id == 8) { return "audit"; }
+    if (id == 9) { return "rotate"; }
+    if (id == 10) { return "strength"; }
+    if (id == 11) { return "request"; }
+    if (id == 12) { return "approve"; }
+    if (id == 13) { return "deny"; }
+    if (id == 14) { return "revoke"; }
+    if (id == 15) { return "list"; }
+    if (id == 16) { return "tail"; }
+    if (id == 17) { return "open"; }
+    return "";
+}
+
+/// The command id (1..17) of a noun and verb, or 0.
+pub fn cu_cmd_id(noun: []const u8, verb: []const u8) -> u8 {
+    var k : u8 = 1;
+    while (k <= CU_CMDS) {
+        if (bytes_eq(cu_cmd_noun(k), noun) and bytes_eq(cu_cmd_verb(k), verb)) { return k; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+/// rotate and revoke need --confirm.
+pub fn cu_cmd_needs_confirm(id: u8) -> bool {
+    return id == CU_CMD_ROTATE or id == CU_CMD_REVOKE;
+}
+
+/// add takes the alias only; strength takes nothing (the value arrives on stdin or a TTY prompt, never as an
+/// argument); the others take up to four.
+pub fn cu_cmd_args_max(id: u8) -> u32 {
+    if (id == CU_CMD_STRENGTH) { return 0; }
+    if (id == CU_CMD_ADD) { return 1; }
+    return 4;
+}
+
+/// The first refusal for a command line, given how many arguments it has and whether --confirm is present.
+pub fn cu_cmd_code(id: u8, confirm: bool, nargs: u32) -> u8 {
+    if (id == 0 or id > CU_CMDS) { return CU_DENY_CMD; }
+    if (nargs > cu_cmd_args_max(id)) { return CU_DENY_ARG; }
+    if (cu_cmd_needs_confirm(id) and confirm == false) { return CU_DENY_NO_CONFIRM; }
+    return CODE_OK;
+}
+
+/// Each argument passes tl_arg_ok and does not look like a secret.
+pub fn cu_arg_code(arg: []const u8) -> u8 {
+    if (tl_arg_ok(arg) == false) { return CU_DENY_ARG; }
+    if (cu_longest_run(arg) >= CU_RUN_LIMIT) { return CU_DENY_ARG; }
+    return CODE_OK;
+}
+
+// ---- 12. T27L security events ----
+
+pub const CU_SURFACE : u8 = 12;
+pub const CU_ACT_SECRET_CREATED : u8 = 47;
+pub const CU_ACT_SECRET_UPDATED : u8 = 48;
+pub const CU_ACT_SECRET_ROTATED : u8 = 49;
+pub const CU_ACT_SECRET_REVOKED : u8 = 50;
+pub const CU_ACT_ACCESS_REQUESTED : u8 = 51;
+pub const CU_ACT_ACCESS_APPROVED : u8 = 52;
+pub const CU_ACT_ACCESS_DENIED : u8 = 53;
+pub const CU_ACT_ACCESS_USED : u8 = 54;
+pub const CU_ACT_ACCESS_EXPIRED : u8 = 55;
+pub const CU_ACT_SECRET_REVEALED : u8 = 56;
+pub const CU_ACT_INCIDENT_OPENED : u8 = 57;
+
+/// One canonical T27L line on surface "security". actor 1 user, 2 agent, 3 system. 0 when the action is not
+/// 47..57, the payload names a username, url or value, or the envelope refuses the line.
+pub fn cu_event(out: []u8, event_id: []const u8, ts: []const u8, device_id: []const u8, session_id: []const u8,
+                actor: u8, action: u8, level: u8, payload: []const u8) -> usize {
+    if (action < CU_ACT_SECRET_CREATED or action > CU_ACT_INCIDENT_OPENED) { return 0; }
+    if (cu_payload_ok(payload) == false) { return 0; }
+    return tl_event_line(out, event_id, ts, device_id, session_id, actor, CU_SURFACE, action, level, "", "", "", payload, "");
+}
+
+// ---- test fixtures ----
+
+pub const CU_T_EV : str = "33333333-4444-4555-8666-777777777777";
+pub const CU_T_TS : str = "2026-11-08T12:34:56Z";
+pub const CU_T_VAL : str = "Zq7-fixture-77";
+
+fn cu_t_seq(buf: []u8, n: usize) -> usize {
+    var i : usize = 0;
+    while (i < n) {
+        buf[i] = @intCast(i % 256);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn cu_t_plant(out: []u8, value: []const u8) -> usize {
+    var o : usize = put_bytes(out, 0, "before ");
+    o = put_bytes(out, o, value);
+    o = put_bytes(out, o, " after");
+    return o;
+}
+
+// ---- tests ----
+
+test types_access_and_ttl_caps {
+    assert cu_type_access(CU_T_PASSWORD) == CU_AC_INJECT;
+    assert cu_type_access(CU_T_API_KEY) == CU_AC_SCOPED;
+    assert cu_type_access(CU_T_OAUTH_TOKEN) == CU_AC_SCOPED;
+    assert cu_type_access(CU_T_SSH_KEY) == CU_AC_APPROVAL;
+    assert cu_type_access(CU_T_PRIVATE_KEY) == CU_AC_APPROVAL;
+    assert cu_type_access(CU_T_RECOVERY_PHRASE) == CU_AC_OWNER;
+    assert cu_type_access(CU_T_COOKIE_SESSION) == CU_AC_SHORT;
+    assert cu_type_ttl_cap(CU_T_COOKIE_SESSION) == 900;
+    assert cu_type_ttl_cap(CU_T_SSH_KEY) == 900;
+    assert cu_type_ttl_cap(CU_T_PASSWORD) == 3600;
+    assert cu_type_ttl_cap(CU_T_RECOVERY_PHRASE) == 0;
+    assert cu_type_ttl_cap(9) == 0;
+    var t : u8 = 0;
+    while (t < CU_TYPES) {
+        assert cu_agent_may_export(t) == false;
+        t = t + 1;
+    }
+}
+
+test recovery_phrase_is_unreachable_under_any_grant {
+    assert cu_agent_reachable(CU_T_RECOVERY_PHRASE) == false;
+    assert cu_agent_reachable(9) == false;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_RECOVERY_PHRASE, "repo:acme/app", true, "deploy", 60, true) == CU_DENY_OWNER_ONLY;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_RECOVERY_PHRASE, "repo:acme/app", true, "deploy", 0, true) == CU_DENY_OWNER_ONLY;
+    assert cu_agent_reachable(CU_T_PASSWORD) == true;
+}
+
+test vault_parameters_refuse_weak {
+    assert cu_kdf_code(65536, 3, 4, 16) == CODE_OK;
+    assert cu_kdf_code(65536, 3, 1, 16) == CODE_OK;
+    assert cu_kdf_code(65535, 3, 4, 16) == CU_WEAK_MEMORY;
+    assert cu_kdf_code(19456, 2, 1, 16) == CU_WEAK_MEMORY;
+    assert cu_kdf_code(65536, 2, 4, 16) == CU_WEAK_PASSES;
+    assert cu_kdf_code(65536, 3, 0, 16) == CU_WEAK_PARALLEL;
+    assert cu_kdf_code(65536, 3, 4, 8) == CU_WEAK_SALT;
+    assert cu_aead_code(256, 96, 0) == CODE_OK;
+    assert cu_aead_code(128, 96, 0) == CU_WEAK_KEY;
+    assert cu_aead_code(256, 128, 0) == CU_WEAK_NONCE;
+    assert cu_aead_code(256, 96, 4294967295) == CODE_OK;
+    assert cu_aead_code(256, 96, 4294967296) == CU_REKEY_DUE;
+}
+
+test export_backup_and_delete {
+    assert cu_export_code(true, true, true) == CU_DENY_PLAIN_EXPORT;
+    assert cu_export_code(false, false, true) == CU_DENY_BACKUP_PLAIN;
+    assert cu_export_code(false, true, false) == CU_DENY_NO_CONSENT;
+    assert cu_export_code(false, true, true) == CODE_OK;
+    assert cu_delete_mode(true) == CU_DEL_SHRED;
+    assert cu_delete_mode(false) == CU_DEL_OVERWRITE;
+}
+
+test metadata_refuses_secret_like_fields {
+    assert cu_meta_ok("GitHub") == true;
+    assert cu_meta_ok("work, ci") == true;
+    assert cu_meta_ok("") == false;
+    assert cu_meta_ok("my password is hunter2") == false;
+    assert cu_meta_ok("abcdefghijklmnopqrstuvwxyz0123456789") == false;
+    assert cu_meta_ok("owner@example.com") == false;
+    assert cu_url_ok("https://github.com/login") == true;
+    assert cu_url_ok("https://github.com/login?next=1") == false;
+    assert cu_url_ok("https://user@github.com/") == false;
+    assert cu_alias_ok("deploy_ref") == true;
+    assert cu_alias_ok("Deploy") == false;
+    assert cu_alias_ok("9lives") == false;
+    assert cu_alias_ok("a@b") == false;
+    assert cu_alias_ok("abcdefghijklmnopqrstuvwxyz") == false;
+}
+
+test t27l_payload_carries_the_alias_only {
+    var p : [256]u8 = undefined;
+    var n : usize = cu_payload_alias(p[0..256], "deploy_ref");
+    assert bytes_eq(p[0..n], "alias=deploy_ref");
+    assert cu_payload_alias(p[0..256], "owner@example.com") == 0;
+    n = cu_payload_access(p[0..256], "0xALPHA", "deploy_ref", "repo:acme/app", 900, 0);
+    assert bytes_eq(p[0..n], "agent=0xALPHA alias=deploy_ref scope=repo:acme/app ttl=900 code=0");
+    assert cu_payload_access(p[0..256], "alpha", "deploy_ref", "repo:acme/app", 900, 0) == 0;
+    assert cu_payload_ok("alias=deploy_ref username=owner") == false;
+    assert cu_payload_ok("alias=deploy_ref url=https://github.com") == false;
+    assert cu_payload_ok("alias=deploy_ref value=Zq7") == false;
+    assert cu_payload_ok("alias=deploy_ref") == true;
+}
+
+test generator_rejection_sampling_is_unbiased {
+    assert cu_accept(247, 62) == true;
+    assert cu_accept(248, 62) == false;
+    assert cu_accept(255, 62) == false;
+    assert cu_accept(255, 256) == true;
+    assert cu_accept(0, 0) == false;
+    assert cu_accept(227, 57) == true;
+    assert cu_accept(228, 57) == false;
+    var a : [128]u8 = undefined;
+    assert cu_alphabet(a[0..128], CU_CLASS_ALNUM, false) == 62;
+    assert cu_alphabet(a[0..128], CU_CLASS_ALNUM_SYM, false) == 78;
+    assert cu_alphabet(a[0..128], CU_CLASS_ALNUM, true) == 57;
+    assert cu_alphabet(a[0..128], CU_CLASS_ALNUM_SYM, true) == 73;
+}
+
+test generator_output_and_length_rules {
+    var r : [256]u8 = undefined;
+    var o : [128]u8 = undefined;
+    assert cu_t_seq(r[0..256], 256) == 256;
+    assert cu_gen_len(0) == 24;
+    assert cu_len_ok(14) == false;
+    assert cu_len_ok(15) == true;
+    assert cu_len_ok(129) == false;
+    assert cu_generate(o[0..128], r[0..256], 14, CU_CLASS_ALNUM, false) == 0;
+    assert cu_generate(o[0..128], r[0..256], 24, CU_CLASS_ALNUM, false) == 24;
+    assert o[0] == 48;
+    assert o[10] == 65;
+    r[0] = 255;
+    assert cu_generate(o[0..128], r[0..256], 24, CU_CLASS_ALNUM, false) == 24;
+    assert o[0] == 49;
+    var short : [4]u8 = undefined;
+    short[0] = 255;
+    short[1] = 250;
+    short[2] = 249;
+    short[3] = 248;
+    assert cu_generate(o[0..128], short[0..4], 24, CU_CLASS_ALNUM, false) == 0;
+    assert cu_t_seq(r[0..256], 256) == 256;
+    assert cu_generate(o[0..128], r[0..256], 24, CU_CLASS_ALNUM_SYM, true) == 24;
+    var i : usize = 0;
+    while (i < 24) {
+        assert cu_ambiguous(o[i]) == false;
+        i = i + 1;
+    }
+}
+
+test passphrase_word_index_rejection {
+    assert cu_word_index(0, 0) == 0;
+    assert cu_word_index(242, 255) == 7775;
+    assert cu_word_index(243, 0) == -1;
+    assert cu_word_index(255, 255) == -1;
+    assert cu_word_index(0, 255) == 255;
+}
+
+test entropy_without_floating_log {
+    assert cu_log2_x1024(1) == 0;
+    assert cu_log2_x1024(2) == 1024;
+    assert cu_log2_x1024(64) == 6144;
+    assert cu_log2_x1024(256) == 8192;
+    assert cu_entropy_bits(24, 2) == 24;
+    assert cu_entropy_bits(10, 64) == 60;
+    assert cu_entropy_bits(24, 62) >= 141;
+    assert cu_entropy_bits(24, 62) <= 143;
+    assert cu_passphrase_bits(6) == 77;
+    assert cu_passphrase_bits(0) == 0;
+}
+
+test strength_and_audit_flags {
+    assert cu_flags(14, false, false, false, false, false) == CU_F_SHORT;
+    assert cu_flags(15, false, false, false, false, false) == 0;
+    assert cu_flags(24, true, true, true, true, true) == 2 + 4 + 8 + 16 + 32;
+    assert cu_reused(7, 7) == true;
+    assert cu_reused(7, 8) == false;
+    assert cu_age_report(4000) == 4000;
+    assert cu_rotation_forced(4000, false, false) == false;
+    assert cu_rotation_forced(1, true, false) == true;
+    assert cu_rotation_forced(1, false, true) == true;
+}
+
+test breach_query_leaves_only_a_short_prefix {
+    assert cu_breach_query_code(true, true, "0A1B2") == CODE_OK;
+    assert cu_breach_query_code(true, true, "0a1b") == CODE_OK;
+    assert cu_breach_query_code(true, false, "0A1B2") == CU_DENY_BREACH_UNPADDED;
+    assert cu_breach_query_code(true, true, "0A1B2C") == CU_DENY_BREACH_LONG;
+    assert cu_breach_query_code(true, true, "0123456789ABCDEF0123456789ABCDEF01234567") == CU_DENY_BREACH_LONG;
+    assert cu_breach_query_code(true, true, "ZZZZZ") == CU_DENY_BREACH_HEX;
+    assert cu_breach_query_code(true, true, "") == CU_DENY_BREACH_EMPTY;
+    assert cu_breach_query_code(false, false, "0123456789ABCDEF0123456789ABCDEF01234567") == CODE_OK;
+}
+
+test grant_state_machine {
+    assert cu_step(CU_ST_PENDING, CU_EV_APPROVE) == CU_ST_APPROVED;
+    assert cu_step(CU_ST_PENDING, CU_EV_DENY) == CU_ST_DENIED;
+    assert cu_step(CU_ST_PENDING, CU_EV_USE) == CU_ST_BAD;
+    assert cu_step(CU_ST_APPROVED, CU_EV_USE) == CU_ST_USED;
+    assert cu_step(CU_ST_APPROVED, CU_EV_EXPIRE) == CU_ST_EXPIRED;
+    assert cu_step(CU_ST_APPROVED, CU_EV_REVOKE) == CU_ST_REVOKED;
+    assert cu_step(CU_ST_APPROVED, CU_EV_APPROVE) == CU_ST_BAD;
+    var s : u8 = CU_ST_DENIED;
+    while (s <= CU_ST_REVOKED) {
+        var e : u8 = 0;
+        while (e <= CU_EV_REVOKE) {
+            assert cu_step(s, e) == CU_ST_BAD;
+            e = e + 1;
+        }
+        s = s + 1;
+        if (s == CU_ST_APPROVED) { s = CU_ST_DENIED; }
+        if (s == CU_ST_DENIED and e > 0) { s = CU_ST_REVOKED + 1; }
+    }
+    assert cu_expire_due(CU_ST_APPROVED, 100, 100) == true;
+    assert cu_expire_due(CU_ST_APPROVED, 99, 100) == false;
+    assert cu_expire_due(CU_ST_USED, 100, 100) == false;
+}
+
+test request_policy_order {
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_API_KEY, "repo:acme/app", true, "deploy", 900, true) == CODE_OK;
+    assert cu_request_gate(false, "0xALPHA", true, CU_T_API_KEY, "bad", false, "x y", 0, false) == CU_DENY_IDENTITY;
+    assert cu_request_gate(true, "alpha", false, CU_T_API_KEY, "repo:acme/app", true, "deploy", 900, true) == CU_DENY_IDENTITY;
+    assert cu_request_gate(true, "0xALPHA", true, CU_T_RECOVERY_PHRASE, "bad", false, "x y", 0, false) == CU_DENY_COMPROMISED;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_RECOVERY_PHRASE, "bad", false, "x y", 0, false) == CU_DENY_OWNER_ONLY;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_API_KEY, "repo:*", true, "x y", 0, false) == DENY_NOT_IN_SCOPE;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_API_KEY, "repo:acme/app", false, "deploy", 900, true) == DENY_NOT_IN_SCOPE;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_API_KEY, "repo:acme/app", true, "x y", 0, false) == CU_DENY_PURPOSE;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_API_KEY, "repo:acme/app", true, "deploy", 3601, false) == CU_DENY_TTL;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_COOKIE_SESSION, "repo:acme/app", true, "deploy", 901, true) == CU_DENY_TTL;
+    assert cu_request_gate(true, "0xALPHA", false, CU_T_API_KEY, "repo:acme/app", true, "deploy", 900, false) == CU_DENY_RATE;
+    assert cu_request_route(CODE_OK, false) == CU_REQ_PENDING;
+    assert cu_request_route(CODE_OK, true) == CU_REQ_STANDING;
+    assert cu_request_route(CU_DENY_RATE, true) == CU_DENY_RATE;
+    assert cu_scope_ok("repo:acme/app") == true;
+    assert cu_scope_ok("repo:") == false;
+    assert cu_scope_ok(":x") == false;
+    assert cu_scope_ok("repo:a:b") == false;
+    assert cu_scope_ok("repo:acme/*") == false;
+    assert cu_purpose_ok("deploy-release") == true;
+    assert cu_purpose_ok("Deploy") == false;
+    assert cu_purpose_ok("abcdefghijklmnopqrstuvwxyz") == false;
+}
+
+test standing_grant_names_exact_agent_alias_scope {
+    assert cu_standing_ok("0xALPHA", "deploy_ref", "repo:acme/app", 900, 2000, "0xALPHA", "deploy_ref", "repo:acme/app", 900, 1000) == true;
+    assert cu_standing_ok("0xALPHA", "deploy_ref", "repo:acme/app", 900, 2000, "0xBETA", "deploy_ref", "repo:acme/app", 900, 1000) == false;
+    assert cu_standing_ok("0xALPHA", "deploy_ref", "repo:acme/app", 900, 2000, "0xALPHA", "other_ref", "repo:acme/app", 900, 1000) == false;
+    assert cu_standing_ok("0xALPHA", "deploy_ref", "repo:acme/app", 900, 2000, "0xALPHA", "deploy_ref", "repo:acme/app2", 900, 1000) == false;
+    assert cu_standing_ok("0xALPHA", "deploy_ref", "repo:acme/app", 900, 2000, "0xALPHA", "deploy_ref", "repo:acme/app", 901, 1000) == false;
+    assert cu_standing_ok("0xALPHA", "deploy_ref", "repo:acme/app", 900, 2000, "0xALPHA", "deploy_ref", "repo:acme/app", 900, 2000) == false;
+}
+
+test capability_check_at_use {
+    assert cu_use_code(CU_ST_APPROVED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/app", 100, 200) == CODE_OK;
+    assert cu_use_code(CU_ST_APPROVED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xBETA", "deploy_ref", "repo:acme/app", 100, 200) == DENY_NOT_HOLDER;
+    assert cu_use_code(CU_ST_APPROVED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "other_ref", "repo:acme/app", 100, 200) == CU_DENY_ALIAS;
+    assert cu_use_code(CU_ST_APPROVED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/other", 100, 200) == DENY_NOT_IN_SCOPE;
+    assert cu_use_code(CU_ST_APPROVED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/app", 200, 200) == DENY_LEASE_EXPIRED;
+    assert cu_use_code(CU_ST_APPROVED, true, true, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/app", 100, 200) == CU_DENY_USED;
+    assert cu_use_code(CU_ST_USED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/app", 100, 200) == CU_DENY_USED;
+    assert cu_use_code(CU_ST_REVOKED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/app", 100, 200) == DENY_LEASE_REVOKED;
+    assert cu_use_code(CU_ST_PENDING, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/app", 100, 200) == CU_DENY_STATE;
+    assert cu_use_code(CU_ST_DENIED, true, false, "0xALPHA", "deploy_ref", "repo:acme/app", "0xALPHA", "deploy_ref", "repo:acme/app", 100, 200) == CU_DENY_STATE;
+}
+
+test only_the_owner_after_a_fresh_unlock_may_reveal {
+    assert cu_reveal_code(false, 0) == DENY_NOT_OWNER;
+    assert cu_reveal_code(true, 61) == CU_DENY_UNLOCK_STALE;
+    assert cu_reveal_code(true, 60) == CODE_OK;
+    assert cu_reveal_value(false, 0) == false;
+    assert cu_reveal_value(true, 5) == true;
+    assert cu_reveal_value(true, 600) == false;
+}
+
+test references_name_a_place_and_hold_no_value {
+    assert cu_ref_ok("t27s://personal/deploy_ref/value") == true;
+    assert cu_ref_ok("t27s://personal/deploy_ref/username") == true;
+    assert cu_ref_ok("t27s://personal/deploy_ref/other") == false;
+    assert cu_ref_ok("t27s://personal/deploy_ref") == false;
+    assert cu_ref_ok("t27s://personal/deploy_ref/value/x") == false;
+    assert cu_ref_ok("t27s:///deploy_ref/value") == false;
+    assert cu_ref_ok("op://personal/deploy_ref/value") == false;
+    assert cu_ref_ok("t27s://") == false;
+    assert cu_value_storable("t27s://personal/deploy_ref/value") == false;
+    assert cu_value_storable("") == false;
+    assert cu_value_storable("Zq7-fixture-77") == true;
+}
+
+test leak_detector_negative_controls_for_every_sink {
+    var buf : [256]u8 = undefined;
+    const n : usize = cu_t_plant(buf[0..256], CU_T_VAL);
+    var s : u8 = 0;
+    while (s < CU_SINKS) {
+        assert cu_sink_check(s, buf[0..n], CU_T_VAL) == CU_DENY_LEAK;
+        assert cu_sink_check(s, "nothing secret here", CU_T_VAL) == CODE_OK;
+        assert cu_deliver_code(s) == CU_DENY_SINK;
+        assert bytes_eq(cu_sink_name(s), "") == false;
+        s = s + 1;
+    }
+    assert cu_sink_check(CU_SINKS, "x", CU_T_VAL) == CU_DENY_SINK;
+    assert cu_leaks("Zq7-fixture-7", CU_T_VAL) == false;
+    assert cu_leaks("anything", "") == false;
+    var sc : [512]u8 = undefined;
+    const sn : usize = cu_scrub(sc[0..512], buf[0..n], CU_T_VAL);
+    assert sn > 0;
+    assert cu_sink_check(CU_SINK_EXEC_OUTPUT, sc[0..sn], CU_T_VAL) == CODE_OK;
+    assert bytes_contains(sc[0..sn], CU_SCRUB_MARK);
+    const pn : usize = cu_scrub(sc[0..512], "ok done", CU_T_VAL);
+    assert bytes_eq(sc[0..pn], "ok done");
+    assert cu_scrub(sc[0..512], "ok", "") == 0;
+    assert cu_scrub(sc[0..4], buf[0..n], CU_T_VAL) == 0;
+    var m : u8 = 0;
+    while (m < CU_MODES) {
+        assert cu_mode_code(m) == CODE_OK;
+        assert bytes_eq(cu_mode_name(m), "") == false;
+        m = m + 1;
+    }
+    assert cu_mode_code(CU_MODES) == CU_DENY_MODE;
+}
+
+test browser_pod_gate {
+    assert cu_browser_code("127.0.0.1", false, "127.0.0.1", "127.0.0.1", false, true, true) == CODE_OK;
+    assert cu_browser_code("0.0.0.0", false, "127.0.0.1", "127.0.0.1", false, true, true) == CU_B_BIND;
+    assert cu_browser_code("127.0.0.1", true, "127.0.0.1", "127.0.0.1", false, true, true) == CU_B_CDP_PUBLISHED;
+    assert cu_browser_code("127.0.0.1", false, "0.0.0.0", "127.0.0.1", false, true, true) == CU_B_CDP_BIND;
+    assert cu_browser_code("127.0.0.1", false, "127.0.0.1", "0.0.0.0", false, true, true) == CU_B_PORT_BIND;
+    assert cu_browser_code("127.0.0.1", false, "127.0.0.1", "127.0.0.1", true, true, true) == CU_B_OWNER_PROFILE;
+    assert cu_browser_code("127.0.0.1", false, "127.0.0.1", "127.0.0.1", false, false, true) == CU_B_NOT_DISPOSABLE;
+    assert cu_browser_code("127.0.0.1", false, "127.0.0.1", "127.0.0.1", false, true, false) == CU_B_NO_REDACTION;
+    assert cu_browser_code("", false, "127.0.0.1", "127.0.0.1", false, true, true) == CU_B_BIND;
+}
+
+test incident_revokes_marks_and_guides {
+    assert cu_incident_state(CU_ST_APPROVED) == CU_ST_REVOKED;
+    assert cu_incident_state(CU_ST_PENDING) == CU_ST_DENIED;
+    assert cu_incident_state(CU_ST_USED) == CU_ST_USED;
+    assert cu_incident_state(CU_ST_EXPIRED) == CU_ST_EXPIRED;
+    assert cu_is_live(cu_incident_state(CU_ST_APPROVED)) == false;
+    assert cu_is_live(cu_incident_state(CU_ST_PENDING)) == false;
+    assert cu_guidance_code(CU_T_PASSWORD) == 1;
+    assert cu_guidance_code(CU_T_COOKIE_SESSION) == 7;
+    assert cu_guidance_code(9) == 0;
+    assert bytes_eq(cu_guidance_name(cu_guidance_code(CU_T_SSH_KEY)), "replace-authorized-keys");
+    assert cu_autonomous_rotation_allowed() == false;
+    assert cu_request_gate(true, "0xALPHA", true, CU_T_API_KEY, "repo:acme/app", true, "deploy", 900, true) == CU_DENY_COMPROMISED;
+}
+
+test command_table {
+    assert cu_cmd_id("vault", "init") == 1;
+    assert cu_cmd_id("password", "generate") == 5;
+    assert cu_cmd_id("password", "rotate") == CU_CMD_ROTATE;
+    assert cu_cmd_id("access", "revoke") == CU_CMD_REVOKE;
+    assert cu_cmd_id("audit", "tail") == 16;
+    assert cu_cmd_id("incident", "open") == 17;
+    assert cu_cmd_id("vault", "rotate") == 0;
+    assert cu_cmd_id("password", "show") == 0;
+    assert cu_cmd_code(CU_CMD_ROTATE, false, 1) == CU_DENY_NO_CONFIRM;
+    assert cu_cmd_code(CU_CMD_ROTATE, true, 1) == CODE_OK;
+    assert cu_cmd_code(CU_CMD_REVOKE, false, 1) == CU_DENY_NO_CONFIRM;
+    assert cu_cmd_code(CU_CMD_STRENGTH, false, 1) == CU_DENY_ARG;
+    assert cu_cmd_code(CU_CMD_STRENGTH, false, 0) == CODE_OK;
+    assert cu_cmd_code(CU_CMD_ADD, false, 2) == CU_DENY_ARG;
+    assert cu_cmd_code(CU_CMD_ADD, false, 1) == CODE_OK;
+    assert cu_cmd_code(0, false, 0) == CU_DENY_CMD;
+    assert cu_arg_code("deploy_ref") == CODE_OK;
+    assert cu_arg_code("abcdefghijklmnopqrstuvwxyz0123") == CU_DENY_ARG;
+    assert cu_arg_code("password=hunter2") == CU_DENY_ARG;
+}
+
+test security_events_are_valid_t27l_lines {
+    var p : [256]u8 = undefined;
+    var ln : [2048]u8 = undefined;
+    var pn : usize = cu_payload_alias(p[0..256], "deploy_ref");
+    var n : usize = cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 1, CU_ACT_SECRET_CREATED, 2, p[0..pn]);
+    assert n > 0;
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    pn = cu_payload_access(p[0..256], "0xALPHA", "deploy_ref", "repo:acme/app", 900, 0);
+    n = cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 2, CU_ACT_ACCESS_USED, 2, p[0..pn]);
+    assert n > 0;
+    assert tl_validate_line(ln[0..n]) == TL_OK;
+    assert cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 1, 46, 2, "alias=deploy_ref") == 0;
+    assert cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 1, 58, 2, "alias=deploy_ref") == 0;
+}
+
+test an_event_payload_carrying_a_value_is_refused {
+    var ln : [2048]u8 = undefined;
+    assert cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 1, CU_ACT_SECRET_UPDATED, 2, "alias=deploy_ref value=Zq7-fixture-77") == 0;
+    assert cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 1, CU_ACT_SECRET_UPDATED, 2, "alias=deploy_ref username=owner") == 0;
+    assert cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 1, CU_ACT_SECRET_UPDATED, 2, "alias=abcdefghijklmnopqrstuvwxyz0123456789") == 0;
+    const n : usize = cu_event(ln[0..2048], CU_T_EV, CU_T_TS, "mac-1", "sess-1", 1, CU_ACT_SECRET_UPDATED, 2, "alias=deploy_ref password=hunter2");
+    assert n == 0 or tl_validate_line(ln[0..n]) != TL_OK;
+}

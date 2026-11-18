@@ -71,7 +71,6 @@
 //! named struct literal is an empty slice. `[*]T` and the map `[K:V]` are
 //! refused by name.
 //! `for (s) |x|` reads the slice's address and length once, before the loop.
-
 mod arraylit;
 mod floatas;
 mod formulti;
@@ -81,7 +80,6 @@ mod formulti;
 mod lencall;
 mod stdmem;
 mod unanalyzed;
-
 use crate::codegen;
 use crate::compiler::{Node, NodeKind};
 use crate::ir::*;
@@ -125,6 +123,8 @@ mod oc; // t27c gen-rust of specs/tri/t27b/optional_compare_plan.t27: `?T == v`,
 mod dv; // t27c gen-rust of specs/tri/t27b/const_div_plan.t27: `/` and `%` of two integer constants, folded
 #[path = "../../../gen/rust/tri/t27b/bit_cast_plan.rs"] #[allow(dead_code, unused_parens)]
 mod bc; // t27c gen-rust of specs/tri/t27b/bit_cast_plan.t27: `@bitCast` of a scalar, `@intFromBool`
+#[path = "../../../gen/rust/tri/t27b/middle_end.rs"] #[allow(dead_code, unused_parens)]
+pub(crate) mod me; // t27c gen-rust of specs/tri/t27b/middle_end.t27: identities, strength reduction, LICM_CONST
 #[path = "../../../gen/rust/tri/t27b/literal_plan.rs"] #[allow(dead_code, unused_parens)]
 mod lp; // t27c gen-rust of specs/tri/t27b/literal_plan.t27: a literal's text as the t27c parser keeps it
 #[path = "../../../gen/rust/tri/t27b/ref_var_plan.rs"] #[allow(dead_code, unused_parens)]
@@ -858,6 +858,9 @@ fn lower_mode<'a>(
         return Err(l.errors);
     }
     l.synthesized(&mut funcs);
+    let rets: Vec<_> = funcs.iter().map(|f| if f.is_test || f.ret.is_none() { None } else { ret_max(&f.body) }).collect();
+    for f in &mut funcs { elide_checks(&mut f.body, &rets); } // specs/tri/t27b/check_elide_plan.t27
+    for f in &mut funcs { peel_clamped(&mut f.body); } // specs/tri/t27b/loop_peel_first_iter_plan.t27 (Refs #13453)
     // More than 8 parameters of a class: the rest are passed on the stack
     // in t27b's own convention (`Program::stack_args`), never exported.
     for (id, f) in funcs.iter().enumerate() {
@@ -4181,6 +4184,20 @@ impl<'a> Lower<'a> {
             let b = op.as_bytes();
             // `/` and `%` fold where specs/tri/t27b/const_div_plan.t27 says so, as Zig folds them at compile time.
             if let Some(r) = r.filter(|r| cp::folds(b[0], b.get(1).copied().unwrap_or(0), b.len(), ty.fits(*r)) || dv::div_folds(b[0], b.len(), ty.signed(), *q == 0, ty.fits(*r))) { return Ok(Val::E(Expr { ty, kind: ExprKind::Const(ty.wrap(r)) })); }
+        }
+        // Identities and strength reduction by a constant right operand (specs/tri/t27b/middle_end.t27).
+        if let (true, ExprKind::Const(k)) = (ty.is_int(), &y.kind) {
+            let k = *k;
+            if k >= 0 && k <= u64::MAX as i128 {
+                let id = me::identity(aop as u8, k as u64, ty.bits());
+                if id == me::ID_LHS { return Ok(Val::E(x)); }
+                if id == me::ID_ZERO && matches!(x.kind, ExprKind::Var(_) | ExprKind::Const(_)) { return Ok(Val::E(Expr { ty, kind: ExprKind::Const(0) })); }
+                let sr = me::strength(aop as u8, k as u64, ty.signed());
+                let sh = me::log2_exact(k as u64);
+                if sr == me::SR_SHL && sh < ty.bits() { return self.shift(ArithOp::ShlW, Val::E(x), Val::Ct(sh as i128)); }
+                if sr == me::SR_LSR && sh < ty.bits() { return self.shift(ArithOp::ShrW, Val::E(x), Val::Ct(sh as i128)); }
+                if sr == me::SR_AND { return Ok(Val::E(Expr { ty, kind: ExprKind::Arith { op: ArithOp::And, lhs: Box::new(x), rhs: Box::new(Expr { ty, kind: ExprKind::Const(k - 1) }), site: 0 } })); }
+            }
         }
         let site = match aop {
             ArithOp::Add | ArithOp::Sub | ArithOp::Mul => {
@@ -7876,11 +7893,9 @@ fn shadow_names(body: &[Node], mod_vars: &HashMap<String, Place>) -> HashSet<Str
 fn mutated(ns: &[Node], name: &str) -> bool {
     let (a, t) = flat(ns); aw::mutated(&a, &t, name.as_bytes())
 }
-
 fn count_assigns(ns: &[Node], counts: &mut HashMap<String, u32>) {
     marked(ns, ax::assign_targets).for_each(|n| *counts.entry(n.name.clone()).or_insert(0) += 1);
 }
-
 /// A clause the front-end kept only as verbatim text: a childless StmtExpr
 /// named `<word>:` (`measure:`, `target:`), its text in `value`.
 fn is_prose_clause(n: &Node) -> bool {
@@ -7901,28 +7916,24 @@ fn undeclared_field_type(ty: &str, declared: &HashSet<&str>) -> Option<String> {
     let base = (r >= 0).then(|| &ty[(r / tt::HALF) as usize..(r % tt::HALF) as usize])?;
     tt::undeclared(base.as_bytes(), declared.contains(base)).then(|| base.to_string())
 }
-
 /// t27c's Zig backend writes every `_cse*` temporary the optimizer made at
 /// the very top of the fn body. One that reads a local of the body then
 /// names it before its declaration: "use of undeclared identifier".
 fn cse_hoist_defect(f: &Node) -> Option<String> {
     marked(&f.children, ax::cse_reads).find(|n| !f.params.iter().any(|(p, _)| *p == n.name)).map(|n| n.name.clone())
 }
-
 /// The reference's `collect_mutable_names`, exactly: assignment targets that
 /// are a name, or whose immediate base (index or field) is one, looking into
 /// `if`/`while`/`for` bodies and nowhere else.
 fn ref_mutable_names(ns: &[Node], out: &mut HashSet<String>) {
     out.extend(marked(ns, ax::mutable_names).map(|n| n.name.clone()));
 }
-
 /// Does Zig count `var name` as mutated anywhere in `ns`? An assignment whose
 /// target reaches `name` through fields and indexes but no `.*`, `&` of such
 /// a path, or a method call on it. Errs toward yes: a yes refuses nothing.
 fn zig_mutates(ns: &[Node], name: &str) -> bool {
     let (a, t) = flat(ns); aw::zig_mutates(&a, &t, name.as_bytes())
 }
-
 /// `x.len()` and `len(x)` lower as the length FIELD, as t27c's Zig backend
 /// prints both (W570; Zig has no `len` method on a slice or an array). Which
 /// call stands for which receiver is decided by the `lencall` module above;
@@ -7946,4 +7957,168 @@ impl<'a> Lower<'a> {
         let field = Node { kind: NodeKind::ExprFieldAccess, name: "len".into(), line: c.line, children: vec![recv], ..Node::default() };
         self.expr(&field).map(Some)
     }
+}
+#[path = "../../../gen/rust/tri/t27b/check_elide_plan.rs"] #[allow(dead_code, unused_parens)]
+mod ce; // t27c gen-rust of specs/tri/t27b/check_elide_plan.t27
+#[path = "../../../gen/rust/tri/t27b/loop_peel_first_iter_plan.rs"] #[allow(dead_code, unused_parens)]
+mod peel; // t27c gen-rust of specs/tri/t27b/loop_peel_first_iter_plan.t27 (Refs #13453)
+
+// Per-pass optimizer telemetry, gated by T27B_TRACE_PASSES=1 (golden_spec_roadmap.t27 R1, Refs #12871 #13453):
+// for each merged pass, one line saying FIRED or the exact BAIL reason, so
+// "100% activation" is never claimed without evidence. Zero cost when unset.
+pub fn pass_event(pass: &str, fired: bool, reason: &str) {
+    if std::env::var("T27B_TRACE_PASSES").is_ok_and(|v| v == "1") {
+        eprintln!("pass={} verdict={} reason={}", pass, if fired { "FIRED" } else { "BAIL" }, reason);
+    }
+}
+
+// --- first-iteration peel of a clamped counter (specs/tri/t27b/loop_peel_first_iter_plan.t27) ---
+// The checked `x = x + c` whose clamp `if (x > B) { x = LOW }` bounds every
+// iteration but the first: the peeled copy keeps the check, the in-loop add relaxes.
+fn clamp_facts(body: &[Stmt]) -> Option<(VarId, u64, u64, u64, usize)> { // (x, c, B, LOW, increment index)
+    let (mut ix, mut ic) = (usize::MAX, 0u64);
+    for (i, s) in body.iter().enumerate() {
+        if let Stmt::Assign { var, value } = s { if let Some(c) = konst(ArithOp::Add, *var, value) { ix = i; ic = c; break; } }
+    }
+    if ix == usize::MAX { return None; }
+    let x = match &body[ix] { Stmt::Assign { var, .. } => *var, _ => unreachable!() };
+    for s in body {
+        if let Stmt::If { cond, then, .. } = s { // an else arm is fine: bench_audit's reset has one
+            if let ExprKind::Cmp { op, lhs, rhs } = &cond.kind {
+                if *op != CmpOp::Gt || !matches!(lhs.kind, ExprKind::Var(v) if v == x) { continue; }
+                let ExprKind::Const(b) = rhs.kind else { continue };
+                for t in then {
+                    if let Stmt::Assign { var, value } = t {
+                        if *var == x { if let ExprKind::Const(low) = value.kind {
+                            if let (Ok(b), Ok(low)) = (u64::try_from(b), u64::try_from(low)) { return Some((x, ic, b, low, ix)); }
+                        } }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+fn has_break(ss: &[Stmt]) -> bool { ss.iter().any(|s| match s { Stmt::Break => true, Stmt::If { then, els, .. } => has_break(then) || has_break(els), Stmt::While { body, step, .. } => has_break(body) || has_break(step), _ => false }) }
+fn peel_clamped(ss: &mut Vec<Stmt>) {
+    let mut i = 0;
+    while i < ss.len() {
+        // Phase 1 (shared borrow): decide whether ss[i] peels; (x, peeled copy).
+        let peel = match &ss[i] {
+            Stmt::While { cond, body, step } => match clamp_facts(body) {
+                Some((x, c, b, low, ix)) => {
+                    let checked = match &body[ix] { Stmt::Assign { value, .. } => matches!(&value.kind, ExprKind::Arith { op: ArithOp::Add, site, .. } if *site != 0), _ => false };
+                    let (mut assigns, mut inner) = (0u32, false);
+                    let mut probe = body.clone(); // stmt_each needs &mut; the probe is read-only in spirit
+                    stmt_each(&mut probe, false, &mut |v, _, nest| if v == x { assigns += 1; inner |= nest; });
+                    let jump = has_cont(body) || has_break(body) || has_cont(step) || has_break(step);
+                    // escapes: a VarId is never addressed (elide_checks, rule a's comment)
+                    if peel::peel_ok(assigns, checked, c, true, true, peel::bounds_fit(c, b, low), inner, false, jump) {
+                        let mut peeled = body.clone();
+                        peeled.extend(step.iter().cloned());
+                        Some((x, Stmt::If { cond: cond.clone(), then: peeled, els: Vec::new() }))
+                    } else { None }
+                }
+                None => None,
+            }
+            _ => None,
+        };
+        // Phase 2 (exclusive borrow): relax the in-loop increment, insert the peel.
+        if let Some((x, peeled)) = peel {
+            if let Stmt::While { body, .. } = &mut ss[i] {
+                stmt_each(body, false, &mut |v, e, _| if v == x { if let ExprKind::Arith { op: ArithOp::Add, site, .. } = &mut e.kind { if *site != 0 { relax(e, ArithOp::AddW); } } });
+            }
+            ss.insert(i, peeled);
+            i += 2; // the peeled If, then the relaxed While
+        } else {
+            if let Stmt::If { then, els, .. } = &mut ss[i] { peel_clamped(then); peel_clamped(els); }
+            i += 1;
+        }
+    }
+}
+// --- end peel ---
+fn stmt_each(ss: &mut [Stmt], nest: bool, f: &mut dyn FnMut(VarId, &mut Expr, bool)) { // nest: the write sits in an inner while
+    for s in ss { match s {
+        Stmt::Assign { var, value } => f(*var, value, nest),
+        Stmt::If { then, els, .. } => { stmt_each(then, nest, f); stmt_each(els, nest, f); }
+        Stmt::While { body, step, .. } => { stmt_each(body, true, f); stmt_each(step, true, f); }
+        _ => {} } }
+}
+fn writes(ss: &mut [Stmt], x: VarId) -> u32 { let mut n = 0; stmt_each(ss, false, &mut |v, _, _| n += (v == x) as u32); n }
+fn konst(op: ArithOp, x: VarId, e: &Expr) -> Option<u64> { // `x op c`, trapping, c as the law reads it
+    match &e.kind { ExprKind::Arith { op: o, lhs, rhs: r, site } if *o == op && *site != 0 && matches!(lhs.kind, ExprKind::Var(v) if v == x) => match r.kind { ExprKind::Const(c) => u64::try_from(c).ok(), _ => None }, _ => None }
+}
+fn relax(e: &mut Expr, w: ArithOp) { if let ExprKind::Arith { op, site, .. } = &mut e.kind { *op = w; *site = 0; } }
+fn has_cont(ss: &[Stmt]) -> bool { ss.iter().any(|s| match s { Stmt::Continue => true, Stmt::If { then, els, .. } => has_cont(then) || has_cont(els), Stmt::While { body, step, .. } => has_cont(body) || has_cont(step), _ => false }) }
+fn max_of(e: &Expr, rets: &[Option<u64>]) -> Option<u64> { // the largest value e can take, when it is a constant, a call returning constants or a select of those
+    match &e.kind { ExprKind::Const(c) => u64::try_from(*c).ok(), ExprKind::Call { func, .. } => rets[*func as usize], ExprKind::Select { then, els, .. } => Some(max_of(then, rets)?.max(max_of(els, rets)?)), _ => None }
+}
+fn ret_max(ss: &[Stmt]) -> Option<u64> { // the largest value a fn can return, when every `return` yields a constant
+    let mut m = Some(0);
+    for s in ss { let r = match s { Stmt::Return(Some(Expr { kind: ExprKind::Const(c), .. })) => u64::try_from(*c).ok(), Stmt::Return(Some(_)) => None, Stmt::If { then, els, .. } => ret_max(then).zip(ret_max(els)).map(|(a, b)| a.max(b)), Stmt::While { body, step, .. } => ret_max(body).zip(ret_max(step)).map(|(a, b)| a.max(b)), _ => Some(0) }; m = m.zip(r).map(|(a, b)| a.max(b)); }
+    m
+}
+fn init0(before: &[Stmt], x: VarId) -> Option<u64> { // the constant x holds when the loop starts: the last write in the run of assigns just before it
+    for s in before.iter().rev() { match s { Stmt::Assign { var, value } if *var == x => return match value.kind { ExprKind::Const(c) => u64::try_from(c).ok(), _ => None }, Stmt::Assign { .. } => {} _ => return None } }
+    None
+}
+fn expr_has_var(e: &Expr, x: VarId) -> bool { match &e.kind { ExprKind::Var(v) => *v == x, ExprKind::Arith { lhs, rhs, .. } | ExprKind::FArith { lhs, rhs, .. } | ExprKind::Cmp { lhs, rhs, .. } => expr_has_var(lhs, x) || expr_has_var(rhs, x), ExprKind::And(a, b) | ExprKind::Or(a, b) => expr_has_var(a, x) || expr_has_var(b, x), ExprKind::Not(a) | ExprKind::BitNot(a) | ExprKind::FNeg(a) | ExprKind::FSqrt(a) | ExprKind::IntToFloat(a) | ExprKind::FloatCast(a) | ExprKind::Widen(a) => expr_has_var(a, x), ExprKind::FloatToInt { arg, .. } | ExprKind::Cast { arg, .. } => expr_has_var(arg, x), ExprKind::Call { args, .. } => args.iter().any(|a| expr_has_var(a, x)), ExprKind::Load { addr, .. } => expr_has_var(addr, x), ExprKind::Offset { base, idx, .. } => expr_has_var(base, x) || expr_has_var(idx, x), ExprKind::Bounds { idx, len, .. } => expr_has_var(idx, x) || expr_has_var(len, x), ExprKind::Select { cond, then, els } => expr_has_var(cond, x) || expr_has_var(then, x) || expr_has_var(els, x), ExprKind::Seq { stmts, value } => stmts_has_var(stmts, x) || expr_has_var(value, x), _ => false } }
+fn stmts_has_var(ss: &[Stmt], x: VarId) -> bool { ss.iter().any(|s| match s { Stmt::Assign { value, .. } => expr_has_var(value, x), Stmt::If { cond, then, els } => expr_has_var(cond, x) || stmts_has_var(then, x) || stmts_has_var(els, x), Stmt::While { cond, body, step } => expr_has_var(cond, x) || stmts_has_var(body, x) || stmts_has_var(step, x), Stmt::Return(Some(e)) => expr_has_var(e, x), Stmt::Eval(e) => expr_has_var(e, x), Stmt::Assert { cond, .. } => expr_has_var(cond, x), Stmt::AssertEq { lhs, rhs, .. } => expr_has_var(lhs, x) || expr_has_var(rhs, x), Stmt::Store { addr, value, .. } => expr_has_var(addr, x) || expr_has_var(value, x), Stmt::Copy { dst, src, .. } => expr_has_var(dst, x) || expr_has_var(src, x), _ => false }) }
+fn after_inc(rest: &mut [Stmt], x: VarId, c: u64, pos: u8) { // (b) uses of x after `x = x + c`, until a statement that could assign x
+    for (j, s) in rest.iter_mut().enumerate() { match s {
+        Stmt::Assign { var, value } => { let dec = konst(ArithOp::Sub, x, value).map_or(false, |k| ce::decrement_elides(c, k, pos, false)); pass_event("check_elide_b", dec, if dec { "decrement after inc" } else { "decrement_elides false or x+x-c absent" }); if dec { relax(value, ArithOp::SubW); } if *var == x { return; } }
+        Stmt::If { then, els, .. } if j == 0 && pos == ce::POS_SAME_LIST => { after_inc(then, x, c, ce::POS_IF_ARM); after_inc(els, x, c, ce::POS_IF_ARM); return; }
+        Stmt::While { .. } => return,
+        _ => if writes(std::slice::from_mut(s), x) > 0 { return; } } }
+}
+fn elide_checks(ss: &mut [Stmt], rets: &[Option<u64>]) {
+    for i in 0..ss.len() { let (before, tail) = ss.split_at_mut(i); let (cur, rest) = tail.split_first_mut().unwrap(); match cur {
+        Stmt::Assign { var, value } => if let Some(c) = konst(ArithOp::Add, *var, value) { after_inc(rest, *var, c, ce::POS_SAME_LIST); },
+        Stmt::If { then, els, .. } => { elide_checks(then, rets); elide_checks(els, rets); }
+        Stmt::While { cond, body, step } => { // (a) `while (i < n)` with the single `i = i + 1`
+            elide_checks(body, rets); elide_checks(step, rets);
+            let ExprKind::Cmp { op, lhs, rhs } = &cond.kind else { continue };
+            let ExprKind::Var(iv) = lhs.kind else { continue };
+            let fixed = match rhs.kind { ExprKind::Const(_) => true, ExprKind::Var(n) => n != iv && writes(body, n) + writes(step, n) == 0, _ => false };
+            let (mut k, mut n, mut inner) = (0, 0, false);
+            for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, nest| if v == iv { n += 1; inner |= nest; k = konst(ArithOp::Add, iv, e).unwrap_or(0); }); }
+            let ind = ce::induction_elides(*op as u8, lhs.ty == rhs.ty, fixed, n, k, false, inner); // a VarId is never addressed: address-taken locals live in slots
+            pass_event("check_elide_a", ind, if ind { "loop induction i" } else { "predicate induction_elides false" });
+            if ind {
+                let top = |l: &[Stmt]| l.iter().any(|s| matches!(s, Stmt::Assign { var, .. } if *var == iv));
+                let every = top(step) || (top(body) && !has_cont(body));
+                let mut accs = vec![]; // (c) `a = a + e` writes in the loop
+                for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { relax(e, ArithOp::AddW); } else if matches!(&e.kind, ExprKind::Arith { op: ArithOp::Add, lhs, site, .. } if *site != 0 && matches!(lhs.kind, ExprKind::Var(a) if a == v)) { accs.push(v); }); }
+                accs.dedup();
+                for a in accs {
+                    let (mut n, mut m, mut inner, mut same) = (0, u64::MAX, false, true);
+                    for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, nest| if v == a { n += 1; inner |= nest; same &= e.ty == lhs.ty; m = match &e.kind { ExprKind::Arith { rhs, .. } => max_of(rhs, rets).unwrap_or(u64::MAX), _ => u64::MAX }; }); }
+                    let le = matches!((init0(before, a), init0(before, iv)), (Some(a0), Some(i0)) if a0 <= i0);
+                    let acc = ce::accumulator_elides(true, every, le, n, m, k, same, false, inner);
+                    pass_event("check_elide_c", acc, if acc { "loop accumulator" } else { "predicate accumulator_elides false" });
+                    if acc { for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == a { relax(e, ArithOp::AddW); }); } }
+                }
+            }
+            { let ExprKind::Cmp { op: o2, lhs: l2, rhs: r2 } = &cond.kind else { unreachable!() }; // countdown: specs/tri/t27b/countdown_plan.t27 Refs #13421
+              let (op2, iv_ty, rhs2) = (*o2 as u8, l2.ty, r2.clone());
+              // A signed `i < bound` can run zero times (bound <= 0), while `while (i)` with i = bound
+              // runs |bound| times (or near-forever, for a runtime bound): a signed bound must be a
+              // literal >= 1. Unsigned bounds are safe as literals (>= 0 by type) and as loop-invariant
+              // runtime values (>= 0 by type): the countdown from C runs exactly C iterations.
+              let iv_signed = matches!(iv_ty, Ty::I32 | Ty::I64);
+              let bound_ok = match &r2.kind { ExprKind::Const(c) => *c >= if iv_signed { 1 } else { 0 }, ExprKind::Var(_) => !iv_signed, _ => false };
+              // A1 (countdown in wrap mode too): the step write is `iv = iv + 1` in either form. In wrap
+              // mode lowering has already relaxed the checked Add to AddW with site 0, which `konst`
+              // (rightly for the checked-op gates) does not accept; the countdown needs only the shape.
+              // `k` stays as it is: the induction gate above still means a *checked* step.
+              let mut kw = 0u32;
+              for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv && matches!(&e.kind, ExprKind::Arith { op: ArithOp::Add | ArithOp::AddW, lhs: sl, rhs: sr, .. } if matches!(sl.kind, ExprKind::Var(w) if w == iv) && matches!(sr.kind, ExprKind::Const(1))) { kw += 1; }); }
+              let cd = op2 == 2 && kw == 1 && n == 1 && fixed && !inner && bound_ok && ((writes(body, iv) == 1 && writes(step, iv) == 0 && body.iter().filter(|s| !matches!(s, Stmt::Assign { var, .. } if *var == iv)).all(|s| !stmts_has_var(std::slice::from_ref(s), iv))) || (writes(body, iv) == 0 && !stmts_has_var(body, iv))) && !stmts_has_var(rest, iv) && init0(before, iv) == Some(0);
+              pass_event("countdown", cd, if cd { "loop i to countdown" } else { "countdown gate false (op/kw/n/fixed/inner/bound/init)" });
+              if cd {
+                for s in before.iter_mut().rev() { match s { Stmt::Assign { var, value } if *var == iv => { *value = *rhs2; break; } Stmt::Assign { .. } => {} _ => break } }
+                for l in [&mut *body, &mut *step] { stmt_each(l, false, &mut |v, e, _| if v == iv { if let ExprKind::Arith { op: ref mut ao, .. } = e.kind { if matches!(ao, ArithOp::Add | ArithOp::AddW) { *ao = ArithOp::SubW; } } }); }
+                cond.kind = ExprKind::Var(iv); cond.ty = iv_ty; } }
+        }
+        _ => {} } }
 }

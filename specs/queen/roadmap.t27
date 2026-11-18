@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/queen/roadmap.t27 -- the Pareto roadmap rule: which issue earns the roadmap label, how it is scored,
+; what priority it gets and which one an autonomous cycle takes next (owner rule, 2026-11-08). This file is
+; the ONE home of the rule; AGENTS.md and CONTRIBUTING.md only point here. It extends specs/queen/priority.t27
+; (levels P0..P3, aging, outranks) and the claim protocol of specs/queen/claim_msg.t27 and
+; specs/queen/holds.t27, and restates none of them. QueenPriority's CRITICAL_CAP still orders the run (at
+; most 3 run as critical); this rule decides the label, not the cap.
+; 1. The roadmap label. An issue gets it only if at least one scope holds -- it affects more than one
+;    module, agent or workflow; it changes a shared contract, schema, policy or user-facing surface; it
+;    needs sequencing across several PRs; it creates reusable infrastructure -- AND it has measurable
+;    acceptance criteria AND explicit non-goals AND risks. Never on: a one-line fix; a vague "improve X"; a duplicate; a task with no
+;    measurable outcome or no way to verify it (test, artifact, screenshot, log, metric); an issue with no
+;    owner_agent field or no acceptance criteria; an undecided architecture; anything touching security,
+;    credentials or protected contracts without owner approval.
+; 2. The score. pareto_score = impact x confidence / effort, each an integer 1..5, so the valid range is 0.2
+;    to 25.0 (stored here in tenths: 2..250). The score never overrides a hard gate: a task is never P0
+;    because its score is high.
+; 3. The priority. Security, privacy, data loss or correctness risk -> P0. Required for a working end-to-end
+;    flow -> P0. Unblocks multiple future tasks -> P0. Prevents repeated agent failure -> P0. A reusable
+;    contract or capability -> P1 (P0 only with a hard gate or a recorded promotion). High value and safely
+;    parallelizable -> P1. A useful improvement -> P2. Speculative, low value, or gated on an owner-approved
+;    policy -> P3 (owner approval required).
+; 4. The tie-breaker at equal priority: higher score; then unblocks more dependent work; then lower
+;    implementation risk; then clearer measurable acceptance (more machine-checkable criteria); then GitHub
+;    listing order (QueenPriority.outranks).
+; 5. Required issue fields: title, labels (roadmap + pareto), pareto_score, impact, confidence, effort,
+;    priority P0-P3, owner_agent (an agent id or "unassigned"), status BACKLOG | IN_PROGRESS | BLOCKED |
+;    DONE, depends_on, acceptance_criteria, non_goals, risk, evidence.
+; 6. The cycle, each autonomous run: rescore the open roadmap issues; demote the stale or low-value; promote
+;    new blockers; select the highest safe unblocked task; claim exactly one (claim_msg.t27); make the
+;    smallest safe increment; add tests and evidence; update the issue and the epic map; record a learning
+;    only after evidence confirms it. One task, one owner; one file, one active writer (holds.t27).
+;    The claim comment long form is STATUS / OWNER / SCOPE / ALREADY_DONE / NEXT, and the completion
+;    comment is STATUS / RESULT / TESTS / ARTIFACTS / LEARNINGS. That is the owner's PROPOSED long form of
+;    the comment in claim_msg.t27; the claim_msg.t27 comment stays the protocol until claim_msg.t27 itself
+;    is changed.
+; 7. Cron. It may update pareto_score. It must never change a priority without a recorded reason and
+;    evidence (priority_change_ok). It never bypasses the security review, the protected-branch policy, a
+;    contract freeze, the regression suite, or owner approval for architecture, external dependencies or
+;    merge.
+; 8. Proposed commands, NOT BUILT: tri roadmap rescore | top --limit 1 --safe-only | validate --issue N |
+;    promote N --reason R | demote N --reason R; tri issue claim N | release N (check whether `tri loop
+;    claim` already does CLAIM before building one); tri evidence attach N --artifact P | verify N. None
+;    takes a secret value as an argument. The functions below are their decision tables.
+; Every function is pure, on u8, u32 and bool. ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module QueenRoadmap;
+
+use queen::priority::LEVEL_CRITICAL;
+use queen::priority::LEVEL_HIGH;
+use queen::priority::LEVEL_NORMAL;
+use queen::priority::LEVEL_LOW;
+
+; --- 1. The score ------------------------------------------------------------------------------------
+
+/// Impact, confidence and effort are integers in SCALE_MIN..SCALE_MAX. The score in tenths runs
+/// SCORE_X10_MIN..SCORE_X10_MAX (0.2 to 25.0). HIGH_VALUE_IMPACT is the impact that counts as high value.
+pub const SCALE_MIN : u32 = 1;
+pub const SCALE_MAX : u32 = 5;
+pub const SCORE_X10_MIN : u32 = 2;
+pub const SCORE_X10_MAX : u32 = 250;
+pub const HIGH_VALUE_IMPACT : u32 = 4;
+
+/// Whether one scale value is in range.
+pub fn scale_ok(v: u32) -> bool {
+    if (v < SCALE_MIN) { return false; }
+    if (v > SCALE_MAX) { return false; }
+    return true;
+}
+
+fn rm_scales_ok(impact: u32, confidence: u32, effort: u32) -> bool {
+    if (scale_ok(impact) == false) { return false; }
+    if (scale_ok(confidence) == false) { return false; }
+    if (scale_ok(effort) == false) { return false; }
+    return true;
+}
+
+/// impact x confidence / effort in tenths, rounded half up: (i*c*20 + e) / (2*e). 0 when an input is out of range.
+pub fn score_x10(impact: u32, confidence: u32, effort: u32) -> u32 {
+    if (rm_scales_ok(impact, confidence, effort) == false) { return 0; }
+    return (impact * confidence * 20 + effort) / (2 * effort);
+}
+
+/// Whether a claimed score (in tenths) is the one the three inputs give.
+pub fn score_matches(claimed_x10: u32, impact: u32, confidence: u32, effort: u32) -> bool {
+    return claimed_x10 == score_x10(impact, confidence, effort);
+}
+
+pub const CMP_LESS : u8 = 0;
+pub const CMP_EQUAL : u8 = 1;
+pub const CMP_GREATER : u8 = 2;
+
+/// Exact comparison of two scores by cross-multiplication (ia*ca/ea against ib*cb/eb), no rounding.
+pub fn score_cmp(ia: u32, ca: u32, ea: u32, ib: u32, cb: u32, eb: u32) -> u8 {
+    const left : u32 = ia * ca * eb;
+    const right : u32 = ib * cb * ea;
+    if (left < right) { return CMP_LESS; }
+    if (left > right) { return CMP_GREATER; }
+    return CMP_EQUAL;
+}
+
+; --- 2. The priority ---------------------------------------------------------------------------------
+
+/// Hard gates (any one makes the task P0) and soft flags.
+pub const G_SAFETY : u32 = 1;
+pub const G_E2E : u32 = 2;
+pub const G_UNBLOCKS : u32 = 4;
+pub const G_REPEAT_FAILURE : u32 = 8;
+pub const HARD_GATES : u32 = 15;
+pub const F_REUSABLE : u32 = 16;
+pub const F_PARALLEL_SAFE : u32 = 32;
+pub const F_OWNER_GATED : u32 = 64;
+/// A recorded promotion to P0 (a reason and evidence on the issue, priority_change_ok). decide_priority
+/// never sets it; only a promote step does.
+pub const F_PROMOTED : u32 = 128;
+
+/// The level the rule gives: a hard gate beats everything, the score never lifts a task to P0.
+pub fn decide_priority(flags: u32, impact: u32, confidence: u32, effort: u32) -> u8 {
+    if ((flags & HARD_GATES) != 0) { return LEVEL_CRITICAL; }
+    if ((flags & F_OWNER_GATED) != 0) { return LEVEL_LOW; }
+    if (impact <= 1) { return LEVEL_LOW; }
+    if ((flags & F_REUSABLE) != 0) { return LEVEL_HIGH; }
+    if ((flags & F_PARALLEL_SAFE) != 0) {
+        if (impact >= HIGH_VALUE_IMPACT) { return LEVEL_HIGH; }
+    }
+    return LEVEL_NORMAL;
+}
+
+/// P0 stands only on a hard gate or a recorded promotion (F_PROMOTED), never on the score.
+pub fn p0_justified(level: u8, flags: u32) -> bool {
+    if (level != LEVEL_CRITICAL) { return true; }
+    return (flags & (HARD_GATES | F_PROMOTED)) != 0;
+}
+
+/// A priority may change only with a recorded reason and at least one piece of evidence, for cron and agents alike.
+pub fn priority_change_ok(old_level: u8, new_level: u8, has_reason: bool, evidence_count: u32) -> bool {
+    if (old_level == new_level) { return true; }
+    if (has_reason == false) { return false; }
+    return evidence_count >= 1;
+}
+
+; --- 3. Eligibility for the label --------------------------------------------------------------------
+
+pub const S_MULTI_MODULE : u32 = 1;
+pub const S_SHARED_CONTRACT : u32 = 2;
+pub const S_MULTI_PR : u32 = 4;
+pub const S_REUSABLE_INFRA : u32 = 8;
+
+pub const X_ONE_LINE : u32 = 1;
+pub const X_NO_OUTCOME : u32 = 2;
+pub const X_UNVERIFIABLE : u32 = 4;
+pub const X_DUPLICATE : u32 = 8;
+pub const X_NO_OWNER_FIELD : u32 = 16;
+pub const X_VAGUE : u32 = 32;
+pub const X_UNDECIDED_ARCH : u32 = 64;
+pub const X_PROTECTED_NO_APPROVAL : u32 = 128;
+
+/// Whether an issue may carry the roadmap label: some scope flag, acceptance, non-goals and risks, no anti flag.
+pub fn roadmap_eligible(scope: u32, has_acceptance: bool, has_non_goals: bool, has_risks: bool, anti: u32) -> bool {
+    if (scope == 0) { return false; }
+    if (anti != 0) { return false; }
+    if (has_acceptance == false) { return false; }
+    if (has_non_goals == false) { return false; }
+    return has_risks;
+}
+
+; --- 4. Status and validation ------------------------------------------------------------------------
+
+pub const ST_BACKLOG : u8 = 0;
+pub const ST_IN_PROGRESS : u8 = 1;
+pub const ST_BLOCKED : u8 = 2;
+pub const ST_DONE : u8 = 3;
+
+pub fn status_ok(s: u8) -> bool {
+    return s <= ST_DONE;
+}
+
+pub const RV_OK : u8 = 0;
+pub const RV_SCALE : u8 = 1;
+pub const RV_SCORE : u8 = 2;
+pub const RV_P0_NO_GATE : u8 = 3;
+pub const RV_NO_ACCEPTANCE : u8 = 4;
+pub const RV_NO_EVIDENCE_PLAN : u8 = 5;
+pub const RV_OPEN_DEPENDS : u8 = 6;
+pub const RV_STATUS : u8 = 7;
+pub const RV_NO_OWNER : u8 = 8;
+
+/// The first failure in code order, RV_OK when none. An issue may wait in BACKLOG or BLOCKED on open
+/// dependencies; it may not be IN_PROGRESS or DONE with any open.
+pub fn validate(impact: u32, confidence: u32, effort: u32, claimed_x10: u32, level: u8, flags: u32, acceptance_count: u32, evidence_count: u32, open_depends: u32, status: u8, owner_set: bool) -> u8 {
+    if (rm_scales_ok(impact, confidence, effort) == false) { return RV_SCALE; }
+    if (score_matches(claimed_x10, impact, confidence, effort) == false) { return RV_SCORE; }
+    if (p0_justified(level, flags) == false) { return RV_P0_NO_GATE; }
+    if (acceptance_count == 0) { return RV_NO_ACCEPTANCE; }
+    if (evidence_count == 0) { return RV_NO_EVIDENCE_PLAN; }
+    if (open_depends > 0) {
+        if (status == ST_IN_PROGRESS) { return RV_OPEN_DEPENDS; }
+        if (status == ST_DONE) { return RV_OPEN_DEPENDS; }
+    }
+    if (status_ok(status) == false) { return RV_STATUS; }
+    if (status == ST_IN_PROGRESS) {
+        if (owner_set == false) { return RV_NO_OWNER; }
+    }
+    return RV_OK;
+}
+
+; --- 5. Selection ------------------------------------------------------------------------------------
+
+/// A task the cycle may claim: BACKLOG, no open dependency, safe, and nobody else holds it.
+pub fn selectable(status: u8, open_depends: u32, safe: bool, claimed_by_other: bool) -> bool {
+    if (status != ST_BACKLOG) { return false; }
+    if (open_depends > 0) { return false; }
+    if (safe == false) { return false; }
+    return claimed_by_other == false;
+}
+
+/// Whether a is taken before b: lower level, then higher score, then more unblocked work, then lower
+/// risk, then more criteria. A full tie is false: the caller falls back to QueenPriority.outranks.
+pub fn picks_first(level_a: u8, ia: u32, ca: u32, ea: u32, unblocks_a: u32, risk_a: u32, criteria_a: u32, level_b: u8, ib: u32, cb: u32, eb: u32, unblocks_b: u32, risk_b: u32, criteria_b: u32) -> bool {
+    if (level_a < level_b) { return true; }
+    if (level_a > level_b) { return false; }
+    const cmp : u8 = score_cmp(ia, ca, ea, ib, cb, eb);
+    if (cmp == CMP_GREATER) { return true; }
+    if (cmp == CMP_LESS) { return false; }
+    if (unblocks_a > unblocks_b) { return true; }
+    if (unblocks_a < unblocks_b) { return false; }
+    if (risk_a < risk_b) { return true; }
+    if (risk_a > risk_b) { return false; }
+    return criteria_a > criteria_b;
+}
+
+; --- 6. Tests ----------------------------------------------------------------------------------------
+
+test t27l_table_p0_rows {
+    assert score_x10(5, 5, 2) == 125;
+    assert decide_priority(G_SAFETY | G_UNBLOCKS, 5, 5, 2) == LEVEL_CRITICAL;
+    assert decide_priority(G_SAFETY, 5, 5, 2) == LEVEL_CRITICAL;
+    assert decide_priority(G_REPEAT_FAILURE, 5, 5, 2) == LEVEL_CRITICAL;
+    assert score_x10(5, 4, 3) == 67;
+    assert decide_priority(G_E2E, 5, 4, 3) == LEVEL_CRITICAL;
+}
+
+test t27l_table_lower_rows {
+    assert score_x10(4, 4, 3) == 53;
+    assert decide_priority(F_REUSABLE, 4, 4, 3) == LEVEL_HIGH;
+    assert score_x10(3, 5, 2) == 75;
+    assert decide_priority(F_REUSABLE | F_PARALLEL_SAFE, 3, 5, 2) == LEVEL_HIGH;
+    assert score_x10(4, 3, 4) == 30;
+    assert decide_priority(0, 4, 3, 4) == LEVEL_NORMAL;
+    assert score_x10(3, 2, 5) == 12;
+    assert decide_priority(F_OWNER_GATED, 3, 2, 5) == LEVEL_LOW;
+}
+
+test score_range_ends {
+    assert score_x10(1, 1, 5) == SCORE_X10_MIN;
+    assert score_x10(5, 5, 1) == SCORE_X10_MAX;
+}
+
+test high_score_without_a_gate_is_not_p0 {
+    assert decide_priority(0, 5, 5, 1) != LEVEL_CRITICAL;
+    assert decide_priority(0, 5, 5, 1) == LEVEL_NORMAL;
+    assert decide_priority(F_PARALLEL_SAFE, 5, 5, 1) == LEVEL_HIGH;
+}
+
+test low_score_with_a_gate_is_p0 {
+    assert decide_priority(G_SAFETY, 1, 1, 5) == LEVEL_CRITICAL;
+    assert decide_priority(0, 1, 5, 1) == LEVEL_LOW;
+}
+
+test score_rejects_out_of_range {
+    assert score_x10(0, 3, 3) == 0;
+    assert score_x10(3, 0, 3) == 0;
+    assert score_x10(3, 3, 0) == 0;
+    assert score_x10(6, 3, 3) == 0;
+    assert score_x10(3, 6, 3) == 0;
+    assert score_x10(3, 3, 6) == 0;
+    assert scale_ok(1);
+    assert scale_ok(5);
+    assert scale_ok(0) == false;
+    assert scale_ok(6) == false;
+}
+
+test score_matches_is_exact {
+    assert score_matches(67, 5, 4, 3);
+    assert score_matches(66, 5, 4, 3) == false;
+    assert score_matches(68, 5, 4, 3) == false;
+}
+
+test score_cmp_is_exact_where_tenths_round_equal {
+    // 1/3 and 1/4 both round to 3 tenths, yet 1/3 is the greater score
+    assert score_x10(1, 1, 3) == 3;
+    assert score_x10(1, 1, 4) == 3;
+    assert score_cmp(1, 1, 3, 1, 1, 4) == CMP_GREATER;
+    assert score_cmp(1, 1, 4, 1, 1, 3) == CMP_LESS;
+    assert score_cmp(5, 4, 3, 4, 5, 3) == CMP_EQUAL;
+    assert score_cmp(5, 4, 3, 4, 4, 3) == CMP_GREATER;
+    assert score_cmp(4, 4, 3, 5, 4, 3) == CMP_LESS;
+    assert score_cmp(5, 5, 4, 5, 5, 3) == CMP_LESS;
+}
+
+test p0_needs_a_hard_gate {
+    assert p0_justified(LEVEL_CRITICAL, G_E2E);
+    assert p0_justified(LEVEL_CRITICAL, F_REUSABLE) == false;
+    assert p0_justified(LEVEL_CRITICAL, F_REUSABLE | F_PROMOTED);
+    assert decide_priority(F_REUSABLE | F_PROMOTED, 4, 4, 3) == LEVEL_HIGH;
+    assert p0_justified(LEVEL_CRITICAL, 0) == false;
+    assert p0_justified(LEVEL_HIGH, 0);
+}
+
+test priority_change_needs_reason_and_evidence {
+    assert priority_change_ok(LEVEL_NORMAL, LEVEL_NORMAL, false, 0);
+    assert priority_change_ok(LEVEL_NORMAL, LEVEL_HIGH, true, 1);
+    assert priority_change_ok(LEVEL_NORMAL, LEVEL_HIGH, false, 3) == false;
+    assert priority_change_ok(LEVEL_NORMAL, LEVEL_HIGH, true, 0) == false;
+}
+
+test eligibility_for_the_label {
+    assert roadmap_eligible(S_MULTI_MODULE, true, true, true, 0);
+    assert roadmap_eligible(S_SHARED_CONTRACT | S_MULTI_PR, true, true, true, 0);
+    assert roadmap_eligible(S_REUSABLE_INFRA, true, true, true, 0);
+    assert roadmap_eligible(S_MULTI_MODULE, true, true, true, X_ONE_LINE) == false;
+    assert roadmap_eligible(S_MULTI_MODULE, true, true, true, X_PROTECTED_NO_APPROVAL) == false;
+    assert roadmap_eligible(0, true, true, true, 0) == false;
+    assert roadmap_eligible(S_MULTI_PR, false, true, true, 0) == false;
+    assert roadmap_eligible(S_MULTI_PR, true, false, true, 0) == false;
+    assert roadmap_eligible(S_MULTI_PR, true, true, false, 0) == false;
+}
+
+test status_values {
+    assert status_ok(ST_BACKLOG);
+    assert status_ok(ST_DONE);
+    assert status_ok(4) == false;
+}
+
+test validate_each_code_from_a_valid_base {
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 0, ST_BACKLOG, false) == RV_OK;
+    assert validate(6, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 0, ST_BACKLOG, false) == RV_SCALE;
+    assert validate(5, 4, 3, 66, LEVEL_CRITICAL, G_E2E, 2, 1, 0, ST_BACKLOG, false) == RV_SCORE;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, F_REUSABLE, 2, 1, 0, ST_BACKLOG, false) == RV_P0_NO_GATE;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 0, 1, 0, ST_BACKLOG, false) == RV_NO_ACCEPTANCE;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 0, 0, ST_BACKLOG, false) == RV_NO_EVIDENCE_PLAN;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 1, ST_IN_PROGRESS, true) == RV_OPEN_DEPENDS;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 1, ST_DONE, true) == RV_OPEN_DEPENDS;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 0, 4, true) == RV_STATUS;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 0, ST_IN_PROGRESS, false) == RV_NO_OWNER;
+}
+
+test validate_allows_waiting_on_dependencies {
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 2, ST_BACKLOG, false) == RV_OK;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 2, ST_BLOCKED, false) == RV_OK;
+    assert validate(5, 4, 3, 67, LEVEL_CRITICAL, G_E2E, 2, 1, 0, ST_IN_PROGRESS, true) == RV_OK;
+}
+
+test selectable_backlog_only {
+    assert selectable(ST_BACKLOG, 0, true, false);
+    assert selectable(ST_BACKLOG, 1, true, false) == false;
+    assert selectable(ST_BACKLOG, 0, true, true) == false;
+    assert selectable(ST_BACKLOG, 0, false, false) == false;
+    assert selectable(ST_BLOCKED, 0, true, false) == false;
+    assert selectable(ST_IN_PROGRESS, 0, true, false) == false;
+}
+
+test picks_first_walks_the_tie_breaker {
+    // level
+    assert picks_first(LEVEL_CRITICAL, 1, 1, 5, 0, 9, 0, LEVEL_HIGH, 5, 5, 1, 9, 0, 9);
+    assert picks_first(LEVEL_HIGH, 5, 5, 1, 9, 0, 9, LEVEL_CRITICAL, 1, 1, 5, 0, 9, 0) == false;
+    // score
+    assert picks_first(LEVEL_HIGH, 5, 4, 3, 0, 9, 0, LEVEL_HIGH, 4, 4, 3, 9, 0, 9);
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 9, 0, 9, LEVEL_HIGH, 5, 4, 3, 0, 9, 0) == false;
+    // unblocks
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 3, 9, 0, LEVEL_HIGH, 4, 4, 3, 2, 0, 9);
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 2, 0, 9, LEVEL_HIGH, 4, 4, 3, 3, 9, 0) == false;
+    // risk
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 2, 1, 0, LEVEL_HIGH, 4, 4, 3, 2, 2, 9);
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 2, 2, 9, LEVEL_HIGH, 4, 4, 3, 2, 1, 0) == false;
+    // criteria
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 2, 1, 5, LEVEL_HIGH, 4, 4, 3, 2, 1, 4);
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 2, 1, 4, LEVEL_HIGH, 4, 4, 3, 2, 1, 5) == false;
+    // full tie
+    assert picks_first(LEVEL_HIGH, 4, 4, 3, 2, 1, 4, LEVEL_HIGH, 4, 4, 3, 2, 1, 4) == false;
+}

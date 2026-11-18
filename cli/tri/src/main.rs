@@ -33,7 +33,7 @@ mod night;
 mod oneaway;
 mod payout;
 mod window;
-mod modreach;
+#[path = "../../../gen/rust/tri/modreach/modreach.rs"] #[allow(dead_code, unused_parens)] mod modreach_rules; mod modreach; // t27c gen-rust of specs/tools/tri/modreach.t27
 mod mutate;
 mod nownote;
 mod orphaned;
@@ -80,7 +80,7 @@ mod pf; // t27c gen-rust of specs/tri/preflight/preflight.t27: the push prefligh
 mod renum;
 mod reseal;
 mod rtl;
-mod scratch;
+#[path = "../../../gen/rust/tri/scratch/scratch.rs"] #[allow(dead_code, unused_parens)] mod scratch_rules; mod scratch; // t27c gen-rust of specs/tools/tri/scratch.t27
 mod seals;
 mod skillnum;
 mod sweep;
@@ -95,6 +95,7 @@ mod vsim;
 #[path = "../../../gen/rust/tri/search_cmd.rs"] #[allow(dead_code)] mod search_cmd; // t27c gen-rust of specs/tri/search_cmd/search_cmd.t27: `tri search`
 #[path = "../../../gen/rust/tri/math_verify.rs"] #[allow(dead_code)] mod math_verify; // t27c gen-rust of specs/tri/math_verify/math_verify.t27: `tri math-verify`
 #[path = "../../../gen/rust/tri/issue_cmd.rs"] #[allow(dead_code)] mod issue_cmd; // t27c gen-rust of specs/tri/issue_cmd/issue_cmd.t27: `tri issue`
+#[path = "../../../gen/rust/tri/uikit_shots.rs"] #[allow(dead_code)] mod uikit_shots; // t27c gen-rust of specs/tri/uikit_shots.t27: `tri uikit`
 #[path = "../../../gen/rust/tri/sync_cmd.rs"] #[allow(dead_code)] mod sync_cmd; // t27c gen-rust of specs/tri/sync_cmd/sync_cmd.t27: `tri sync`
 
 #[derive(Parser)]
@@ -489,6 +490,8 @@ enum Commands {
     MathVerify { #[arg(long, default_value = "all")] suite: String },
     /// Create a GitHub issue (rules: specs/tri/issue_cmd/issue_cmd.t27).
     Issue { #[command(subcommand)] action: IssueAction },
+    /// UI Kit screenshot plan (rules: specs/tri/uikit_shots.t27).
+    Uikit { #[command(subcommand)] action: UikitAction },
     /// Sync GitHub entities to NotebookLM (rules: specs/tri/sync_cmd/sync_cmd.t27).
     Sync { #[command(subcommand)] action: SyncAction },
 }
@@ -497,6 +500,12 @@ enum Commands {
 enum IssueAction {
     /// Create a GitHub issue.
     Create { title: String, #[arg(default_value = "")] desc: String },
+}
+
+#[derive(Subcommand)]
+enum UikitAction {
+    /// Print the shot plan.
+    Shots,
 }
 
 #[derive(Subcommand)]
@@ -1474,6 +1483,16 @@ fn main() -> Result<()> {
                     println!("issue: {title}");
                 } else {
                     bail!("issue title must not be empty")
+                }
+            }
+        },
+        Commands::Uikit { action } => match action {
+            UikitAction::Shots => {
+                if uikit_shots::plan_ok(3, 3, 3, 3) != 0 {
+                    bail!("uikit shot plan invalid")
+                }
+                for i in 0..uikit_shots::shot_count(uikit_shots::SCREEN_COUNT) {
+                    println!("{i}\t{}\t{}\t{}", uikit_shots::shot_name(i), uikit_shots::baseline_path(i), uikit_shots::diff_path(i));
                 }
             }
         },

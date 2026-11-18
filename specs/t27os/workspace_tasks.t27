@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: Apache-2.0
+; dmitrii-f-t27/t27#19 -- project workspaces, task tabs and PTY panes.
+; Keep the six workspace bindings and discovery rules. Keep at most seven tasks.
+; Each task has one or two panes, each with its own grid, focus target and scrollback.
+; The daemon owns at most sixteen panes. A window can detach without stopping them.
+; Stable task/pane IDs, binding, task order, selection and focus survive reopening.
+; Closing an earlier task changes visible order without changing surviving identities.
+; Migration can inspect legacy panes without spawning or assigning them by agent order.
+; Workspace rebinding requires resolving panes associated with the prior binding.
+; An identity-aware listing identifies the workspace and stable slot of each pane.
+; Explicit launch is idempotent for the same workspace, slot, agent and cwd.
+; A conflicting tuple is rejected. Attach and lookup never launch or restart a process.
+; An exited pane requires explicit restart. A legacy daemon cannot resolve stable IDs.
+; Keep the legacy four-byte listing and SPAWN request compatible.
+; Native acceptance: bind two fixture projects; open tabs, split a task and type separately
+; in its two panes; switch projects and reopen the window; compare server and pane process
+; IDs and count; close an earlier task and verify the survivor; exercise the PATH fix
+; with an installed CLI in a fixture project without submitting a prompt.
+
+module T27osWorkspaceTasks;
+
+use t27os::agents::AGENT_COUNT;
+use t27os::agents::AGENT_QUEEN;
+use t27os::session_store::SHELL_CELL;
+use t27os::agents::S_DONE;
+use t27os::agents::S_STOPPED;
+use t27os::keys::shown_state_of;
+use t27os::windows::SPACE_COUNT;
+use t27os::windows::SESSION_MAX;
+use t27os::windows::session_count;
+use t27os::windows::session_space;
+use t27os::windows::add_session;
+use t27os::windows::remove_session;
+use t27os::windows::after_remove;
+use t27os::pty_proto::MAX_PANES;
+use t27os::pty_proto::TASK_SLOT_FIRST;
+use t27os::pty_proto::IDENTITY_ENTRY;
+use t27os::pty_proto::RE_IDENTITIES;
+use t27os::pty_proto::RE_LISTING;
+use t27os::pty_proto::HEADER;
+use t27os::pty_proto::frame_need;
+
+pub const TASK_PANES : u32 = 2;
+
+test workspace_task_and_daemon_capacity {
+    assert SPACE_COUNT == 6;
+    assert SESSION_MAX == 7;
+    assert TASK_PANES == 2;
+    assert SESSION_MAX * TASK_PANES <= MAX_PANES;
+}
+
+/// Two wire slots per task. The base slot is an even byte in the reserved range.
+/// A layout word stores those bytes in display order, independently of chat metadata.
+pub const TASK_LAYOUT_VERSION : u32 = 1;
+pub const TASK_SLOT_END : u32 = 256;
+
+fn task_factor(index: u32) -> u64 {
+    var n : u32 = 0;
+    var factor : u64 = 1;
+    while (n < index) {
+        factor = factor * 256;
+        n = n + 1;
+    }
+    return factor;
+}
+
+pub fn task_id(layout: u64, index: u32) -> u32 {
+    if (index >= SESSION_MAX) { return 0; }
+    return @as(u32, @intCast(layout / task_factor(index) % 256));
+}
+
+pub fn task_write(layout: u64, index: u32, id: u32) -> u64 {
+    if (index >= SESSION_MAX or id >= TASK_SLOT_END) { return layout; }
+    const factor : u64 = task_factor(index);
+    return layout - @as(u64, task_id(layout, index)) * factor + @as(u64, id) * factor;
+}
+
+pub fn task_remove(layout: u64, index: u32) -> u64 {
+    var result : u64 = layout;
+    var at : u32 = index;
+    while (at < SESSION_MAX) {
+        result = task_write(result, at, task_id(layout, at + 1));
+        at = at + 1;
+    }
+    return result;
+}
+
+pub fn task_find(layout: u64, id: u32) -> u32 {
+    var index : u32 = 0;
+    while (id != 0 and index < SESSION_MAX) {
+        if (task_id(layout, index) == id) { return index; }
+        index = index + 1;
+    }
+    return SESSION_MAX;
+}
+
+pub fn task_layout_ok(sessions: u64, layout: u64) -> bool {
+    if (layout >> 56 != 0) { return false; }
+    var index : u32 = 0;
+    while (index < SESSION_MAX) {
+        const id : u32 = task_id(layout, index);
+        if (index < session_count(sessions)) {
+            if (id < TASK_SLOT_FIRST or id % TASK_PANES != 0 or task_find(layout, id) != index or session_space(sessions, index) >= SPACE_COUNT) { return false; }
+        } else if (id != 0) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+pub fn task_listing_ok(listing: []const u8) -> bool {
+    if (listing.len < HEADER or listing[0] != RE_IDENTITIES or listing[1] != 0 or frame_need(listing) != listing.len) { return false; }
+    if ((listing.len - HEADER) % IDENTITY_ENTRY != 0 or (listing.len - HEADER) / IDENTITY_ENTRY > @as(usize, MAX_PANES)) { return false; }
+    var at : usize = HEADER;
+    while (at < listing.len) {
+        if (@as(u32, listing[at]) >= MAX_PANES) { return false; }
+        var before : usize = HEADER;
+        while (before < at) {
+            if (listing[at] == listing[before]) { return false; }
+            before = before + IDENTITY_ENTRY;
+        }
+        at = at + IDENTITY_ENTRY;
+    }
+    return true;
+}
+
+/// A tab with a live or exited pane must release it explicitly before deletion.
+pub fn task_close_ok(listing: []const u8, space: u32, id: u32) -> bool {
+    if (id == 0) { return true; }
+    if (!task_listing_ok(listing)) { return false; }
+    var at : usize = HEADER;
+    while (at < listing.len) {
+        const slot : u32 = @as(u32, listing[at + 5]);
+        if (@as(u32, listing[at + 4]) == space and (slot == id or slot == id + 1)) { return false; }
+        at = at + IDENTITY_ENTRY;
+    }
+    return true;
+}
+
+/// Reserve both slots even if only the secondary pane of an orphan is still present.
+/// An unsupported, truncated or malformed identity listing cannot allocate an ID.
+pub fn task_allocate(layout: u64, listing: []const u8) -> u32 {
+    if (!task_listing_ok(listing)) { return 0; }
+    var id : u32 = TASK_SLOT_FIRST;
+    while (id < TASK_SLOT_END) {
+        var free : bool = task_find(layout, id) == SESSION_MAX;
+        var at : usize = HEADER;
+        while (at < listing.len) {
+            const slot : u32 = @as(u32, listing[at + 5]);
+            if (slot == id or slot == id + 1) { free = false; }
+            at = at + IDENTITY_ENTRY;
+        }
+        if (free) { return id; }
+        id = id + TASK_PANES;
+    }
+    return 0;
+}
+
+test closing_earlier_task_preserves_other_workspace_and_pane_ids {
+    var sessions : u64 = add_session(add_session(0, 1, 0), 1, 1);
+    var layout : u64 = task_write(task_write(0, 0, 128), 1, 130);
+    assert task_layout_ok(sessions, layout);
+    sessions = remove_session(sessions, 0);
+    layout = task_remove(layout, 0);
+    assert task_layout_ok(sessions, layout);
+    assert task_find(layout, 130) == after_remove(1, 0);
+    assert task_id(layout, 0) + 1 == 131;
+    assert session_space(sessions, 0) == 1;
+}
+
+test allocation_skips_orphan_and_local_slots_and_refuses_legacy_listing {
+    var listing : [10]u8 = [132, 0, 6, 0, 0, 1, 3, 1, 0, 129];
+    const layout : u64 = task_write(0, 0, 130);
+    assert task_allocate(layout, listing[0..10]) == 132;
+    assert task_allocate(layout, listing[0..9]) == 0;
+    listing[0] = 131;
+    assert task_allocate(layout, listing[0..10]) == 0;
+}
+
+pub fn task_drop_space(sessions: u64, layout: u64, space: u32) -> u64 {
+    var next : u64 = layout;
+    var index : u32 = session_count(sessions);
+    while (index > 0) {
+        index = index - 1;
+        if (session_space(sessions, index) == space) { next = task_remove(next, index); }
+    }
+    return next;
+}
+
+/// One bit per stable task, shared by the split and focus maps.
+fn task_bit(id: u32) -> u64 {
+    if (id < TASK_SLOT_FIRST or id >= TASK_SLOT_END) { return 0; }
+    var index : u32 = (id - TASK_SLOT_FIRST) / TASK_PANES;
+    var bit : u64 = 1;
+    while (index > 0) { bit = bit * 2; index = index - 1; }
+    return bit;
+}
+
+pub fn task_flag(flags: u64, id: u32) -> bool {
+    const bit : u64 = task_bit(id);
+    return bit > 0 and flags / bit % 2 != 0;
+}
+
+pub fn task_set_flag(flags: u64, id: u32, enabled: bool) -> u64 {
+    if (task_flag(flags, id) == enabled) { return flags; }
+    const bit : u64 = task_bit(id);
+    if (enabled) { return flags + bit; }
+    return flags - bit;
+}
+
+/// Existing workspace bindings may change only after a supported daemon confirms
+/// there are no panes in the slot, including legacy or detached panes.
+pub fn task_space_clear(listing: []const u8, space: u32) -> bool {
+    if (!task_listing_ok(listing)) { return false; }
+    var at : usize = HEADER;
+    while (at < listing.len) {
+        if (@as(u32, listing[at]) >= MAX_PANES or @as(u32, listing[at + 4]) == space) { return false; }
+        at = at + IDENTITY_ENTRY;
+    }
+    return true;
+}
+
+test split_focus_and_workspace_selection_remain_independent {
+    const layout : u64 = task_write(task_write(0, 0, 128), 1, 254);
+    const chosen : u64 = task_write(task_write(0, 0, 128), 1, 254);
+    const focus : u64 = task_set_flag(0, 254, true);
+    assert task_find(layout, task_id(chosen, 0)) == 0;
+    assert task_find(layout, task_id(chosen, 1)) == 1;
+    assert task_flag(focus, 254);
+    assert !task_flag(focus, 128);
+    assert task_set_flag(focus, 254, false) == 0;
+}
+
+pub const TASK_TAB_H : f64 = 28.0;
+pub const TASK_TOOL_H : f64 = 26.0;
+pub const TASK_GAP : f64 = 4.0;
+pub const TASK_NO_HIT : u32 = 4294967295;
+
+pub fn task_rect(x: f64, y: f64, w: f64, h: f64, split: bool, pane: u32, rect: []f64) -> bool {
+    if (pane >= TASK_PANES or (pane == 1 and !split) or w < 1.0 or h <= TASK_TAB_H + TASK_TOOL_H) { return false; }
+    var width : f64 = w;
+    if (split) { width = (w - TASK_GAP) / 2.0; }
+    if (width < 1.0) { return false; }
+    rect[0] = x + @as(f64, pane) * (width + TASK_GAP);
+    rect[1] = y + TASK_TAB_H;
+    rect[2] = width;
+    rect[3] = h - TASK_TAB_H;
+    return true;
+}
+
+pub fn task_contains(x: f64, y: f64, rect: []const f64) -> bool {
+    return x >= rect[0] and y >= rect[1] and x < rect[0] + rect[2] and y < rect[1] + rect[3];
+}
+
+pub fn task_tab_at(x: f64, y: f64, left: f64, top: f64, width: f64, count: u32) -> u32 {
+    if (count == 0 or width <= 0.0 or x < left or x >= left + width or y < top or y >= top + TASK_TAB_H) { return TASK_NO_HIT; }
+    return @as(u32, @intFromFloat((x - left) * @as(f64, count) / width));
+}
+
+test split_geometry_has_two_nonoverlapping_input_targets {
+    var a : [4]f64 = undefined;
+    var b : [4]f64 = undefined;
+    assert task_rect(40.0, 60.0, 604.0, 400.0, true, 0, a[0..4]);
+    assert task_rect(40.0, 60.0, 604.0, 400.0, true, 1, b[0..4]);
+    assert a[2] == 300.0 and b[0] == 344.0;
+    assert task_contains(80.0, 118.0, a[0..4]);
+    assert !task_contains(341.0, 118.0, a[0..4]);
+    assert !task_contains(341.0, 118.0, b[0..4]);
+    assert !task_rect(40.0, 60.0, 604.0, 400.0, false, 1, b[0..4]);
+    assert task_tab_at(340.0, 70.0, 40.0, 60.0, 600.0, 2) == 1;
+}
+
+/// Count live processes from the daemon's legacy four-byte entries, including
+/// detached workspaces and the editor. Exited records do not contribute.
+pub fn task_live_count(listing: []const u8) -> u32 {
+    if (listing.len < HEADER or listing[0] != RE_LISTING or frame_need(listing) != listing.len) { return 0; }
+    if ((listing.len - HEADER) % 4 != 0 or (listing.len - HEADER) / 4 > @as(usize, MAX_PANES)) { return 0; }
+    var n : u32 = 0;
+    var at : usize = HEADER;
+    while (at < listing.len) {
+        if (listing[at + 3] % 2 != 0) { n = n + 1; }
+        at = at + 4;
+    }
+    return n;
+}
+
+/// Exact workspace and slot, ignoring nonmatching entries and rejecting duplicates.
+pub fn task_entry(listing: []const u8, space: u32, slot: u32) -> usize {
+    var found : usize = 0;
+    var at : usize = HEADER;
+    while (at + IDENTITY_ENTRY <= listing.len) {
+        if (@as(u32, listing[at + 4]) == space and @as(u32, listing[at + 5]) == slot) {
+            if (found != 0) { return 0; }
+            found = at;
+        }
+        at = at + IDENTITY_ENTRY;
+    }
+    return found;
+}
+
+test closing_task_refuses_occupied_or_unknown_daemon {
+    var listing : [10]u8 = [132, 0, 6, 0, 0, 1, 3, 0, 1, 129];
+    assert !task_close_ok(listing[0..10], 1, 128);
+    assert task_close_ok(listing[0..10], 0, 128);
+    assert task_close_ok(listing[0..10], 1, 130);
+    assert !task_close_ok(listing[0..9], 1, 130);
+    listing[0] = 131;
+    assert !task_close_ok(listing[0..10], 1, 130);
+}
+
+test server_count_includes_secondary_and_detached_live_panes {
+    const listing : [16]u8 = [131, 0, 12, 0, 0, 1, 0, 0, 1, 9, 3, 1, 2, 9, 3, 1];
+    assert task_live_count(listing[0..16]) == 2;
+    assert task_live_count(listing[0..15]) == 0;
+}
+
+/// LIST carries key-light bits alongside the presentation state, even for
+/// live clients. The sidebar can index only the five agent state labels.
+pub fn task_shown(packed: u8) -> u32 {
+    const state : u32 = shown_state_of(@as(u32, packed));
+    if (state > S_DONE) { return S_STOPPED; }
+    return state;
+}
+
+test live_client_light_bits_never_index_sidebar_labels {
+    assert task_shown(192) == S_STOPPED;
+    assert task_shown(193) == 1;
+    assert task_shown(195) == 3;
+    assert task_shown(3) == 3;
+    assert task_shown(255) == S_STOPPED;
+}
+
+pub const TASK_CLIENT_ROW : f64 = 26.0;
+
+pub fn task_client_choice(index: u32) -> u32 {
+    if (index >= AGENT_COUNT) { return TASK_NO_HIT; }
+    if (index == AGENT_QUEEN) { return SHELL_CELL; }
+    return index;
+}
+
+/// Use exactly the same two-column rectangles for drawing and choosing.
+pub fn task_client_at(x: f64, y: f64, left: f64, top: f64, width: f64) -> u32 {
+    if (width <= 0.0 or x < left or x >= left + width or y < top + TASK_TAB_H or y >= top + TASK_TAB_H + TASK_CLIENT_ROW * 5.0) { return TASK_NO_HIT; }
+    const row : u32 = @as(u32, @intFromFloat((y - top - TASK_TAB_H) / TASK_CLIENT_ROW));
+    var column : u32 = 0;
+    if (x >= left + width / 2.0) { column = 1; }
+    return task_client_choice(row * 2 + column);
+}
+
+test client_picker_distinguishes_shell_and_outside_and_uses_two_columns {
+    assert task_client_at(20.0, 100.0, 10.0, 20.0, 200.0) == SHELL_CELL;
+    assert task_client_at(120.0, 78.0, 10.0, 20.0, 200.0) == 3;
+    assert task_client_at(120.0, 170.0, 10.0, 20.0, 200.0) == TASK_NO_HIT;
+    assert task_client_at(20.0, 46.0, 10.0, 20.0, 200.0) == TASK_NO_HIT;
+}

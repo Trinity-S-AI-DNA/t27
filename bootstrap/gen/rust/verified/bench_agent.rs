@@ -108,8 +108,6 @@ pub fn agent_health(seconds_since_heartbeat: u32) -> u8 {
     return AG_OFFLINE;
 }
 
-pub const REUSE: u8 = 0;
-
 pub fn bench_may_run(owner_approved: bool, writes_nonvolatile: bool) -> bool {
     if writes_nonvolatile {
         return false;

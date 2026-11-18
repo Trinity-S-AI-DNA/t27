@@ -1,0 +1,673 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/browser_loopback_runner.t27 -- 0.3.2 loopback listener host plumbing for
+; 127.0.0.1:47131. One AF_INET accept at a time (pty_server router pattern, backlog 1).
+; Every HTTP/view/input decision delegates to browser_loopback_host.t27; request-line
+; parsing reuses router_serve.t27. Bind bytes stay in browser_loopback_sock.t27.
+; Accept/read/respond: pty_server router_accept + router_serve_conn (poll 0 ms, one step per
+; glass_window tick via bridge_poll_tick). The T27OS binary calls bridge_listen once then
+; bridge_poll_tick each frame while br_bridge_fd >= 0. bridge_poll keeps the slice form for
+; unit tests; t27b does not export it (9 params + slices, #8972).
+; Specs with @extern do not typecheck under t27c corpus tests; pure steps and the listen
+; fn are tested here, full socket I/O belongs in t27b accept group when wired.
+; ASCII only (L3). English only (LANG-EN). phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27OsBrowserLoopbackRunner;
+
+use t27os::browser_native_bridge::ROUTE_VIEW;
+use t27os::browser_native_bridge::ROUTE_INPUT;
+use t27os::browser_native_bridge::ROUTE_NONE;
+use t27os::browser_native_bridge::route_of;
+use t27os::browser_native_bridge::put_head;
+use t27os::browser_native_bridge::text_body;
+use t27os::browser_native_bridge::PIXEL_NONE;
+use t27os::browser_native_bridge::has_bytes;
+use t27os::browser_loopback_host::view_kind;
+use t27os::browser_loopback_host::view_serve_code;
+use t27os::browser_loopback_host::view_streams_file;
+use t27os::browser_loopback_host::view_wire_source;
+use t27os::browser_loopback_host::view_disk_path;
+use t27os::browser_native_bridge::PIXEL_JPEG;
+use t27os::browser_native_bridge::PIXEL_NATIVE;
+use t27os::browser_loopback_host::input_http_code;
+use t27os::browser_loopback_host::route_http_code;
+use t27os::browser_loopback_host::listener_bind_len;
+use t27os::browser_loopback_host::R_NOT_FOUND;
+use t27os::browser_loopback_sock::bridge_bind_refusal;
+use t27os::browser_loopback_sock::bridge_bind_bytes;
+use t27os::browser_loopback_host::inbox_path;
+use t27os::session_store::put_bytes;
+use t27os::browser_native_bridge::R_OK;
+use t27os::browser_native_framebuffer::export_enabled;
+use t27os::router_sock::AF_INET;
+use t27os::router_sock::SOCKADDR_IN_LEN;
+use t27os::router_serve::request_method;
+use t27os::router_serve::request_path;
+use t27os::pty_client::SOCK_STREAM;
+use t27os::pty_logic::put_pollfd;
+use t27os::pty_logic::poll_revents;
+use t27os::pty_sys::sys_socket;
+use t27os::pty_sys::sys_bind;
+use t27os::pty_sys::sys_listen;
+use t27os::pty_sys::sys_close;
+use t27os::pty_sys::sys_accept;
+use t27os::pty_sys::sys_read;
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_poll;
+use t27os::pty_sys::sys_open_ro;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_exe_path;
+
+/// One pending connection on the bridge port (no router-style mailbox).
+pub const LISTEN_BACKLOG : u32 = 1;
+
+/// Request buffer for one bridge connection (same scale as pty_server RT_CAP).
+pub const BRIDGE_REQ_CAP : usize = 2048;
+
+/// Head + small plain body for input / non-stream view.
+pub const BRIDGE_WR_CAP : usize = 1024;
+
+pub const BRIDGE_SOCK_CHUNK : usize = 65536;
+
+/// st[BR_ST_CFD]: accepted conn fd + 1 (0 = none). st[BR_ST_GOT]: bytes read so far.
+pub const BR_ST_CFD : u32 = 0;
+pub const BR_ST_GOT : u32 = 1;
+
+/// Fixed home buffer (bridge_home_buf). Callers do not pass a home slice.
+/// Dev suffix is glass_window GW_DEV_HOME ("/.t27os-dev"); live home is HOME alone.
+/// The "/.t27os/..." picture law stays in view_disk_path (EXPORT_DIR_SUFFIX).
+pub const BRIDGE_HOME_CAP : usize = 320;
+
+/// bridge_poll_tick word: bit 63 busy, bits 32..62 st_got, bits 0..31 st_cfd.
+pub const BR_WORD_BUSY : u64 = 0x8000000000000000;
+
+/// open(2) for inbox append: O_WRONLY | O_APPEND, no O_CREAT (glass_window BR_INBOX_FLAGS).
+pub const INBOX_APPEND_FLAGS : i32 = 9;
+
+pub const SEEK_END : i32 = 2;
+
+fn sys_lseek(fd : i32, off : i64, whence : i32) -> i64 { return @extern("lseek"); }
+
+/// The index just past the first empty line of an HTTP/1.x head (CR LF CR LF). 0 while incomplete.
+pub fn http_head_end(buf : []const u8) -> usize {
+    var i : usize = 0;
+    while (i + 3 < buf.len) {
+        if (buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10) {
+            return i + 4;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// Bytes of the body after a complete head; 0 when the head is incomplete.
+pub fn http_body_off(head_end : usize) -> usize {
+    if (head_end == 0) { return 0; }
+    return head_end;
+}
+
+/// Route id from one request line, or ROUTE_NONE when the line does not parse.
+pub fn route_from_line(line : []const u8, mbuf : []u8, pbuf : []u8) -> u32 {
+    const mn : usize = request_method(line, mbuf);
+    const pn : usize = request_path(line, pbuf);
+    if (mn == 0 or pn == 0) { return ROUTE_NONE; }
+    return route_of(mbuf[0..mn], pbuf[0..pn]);
+}
+
+pub struct ViewPlan {
+    http_code : u32,
+    kind : u32,
+    stream : bool,
+}
+
+/// GET /live/native: status, pixel kind, and whether the host streams a whitelisted file after the head.
+pub fn plan_view(pump_alive : bool, file_size : usize, b0 : u8, b1 : u8, b2 : u8, b3 : u8) -> ViewPlan {
+    const kind : u32 = view_kind(pump_alive, b0, b1, b2, b3);
+    const code : u32 = view_serve_code(pump_alive, file_size, b0, b1, b2, b3);
+    const stream : bool = view_streams_file(code, kind);
+    return ViewPlan { http_code: code, kind: kind, stream: stream };
+}
+
+pub struct InputPlan {
+    http_code : u32,
+    body_len : usize,
+}
+
+/// POST /live/native/input: map inbox line to HTTP status and plain body length (text_body law).
+pub fn plan_input(line : []const u8, pump_alive : bool) -> InputPlan {
+    const code : u32 = input_http_code(line, pump_alive);
+    const bl : usize = text_body(code).len;
+    return InputPlan { http_code: code, body_len: bl };
+}
+
+/// Unknown route: 404 with bodyless head (browser_loopback_host route_http_code).
+pub fn plan_route(route : u32) -> u32 {
+    const code : u32 = route_http_code(route);
+    if (code == 0) { return 0; }
+    return code;
+}
+
+/// Write the HTTP head for a view response into out; 0 when out is too small or code is not set.
+pub fn emit_view_head(plan : ViewPlan, out : []u8) -> usize {
+    if (plan.http_code == 0) { return 0; }
+    if (plan.stream) {
+        return put_head(out, plan.http_code, plan.kind);
+    }
+    const body : string = text_body(plan.http_code);
+    var n : usize = put_head(out, plan.http_code, PIXEL_NONE);
+    if (n == 0 or n + body.len > out.len) { return 0; }
+    var i : usize = 0;
+    while (i < body.len) {
+        out[n + i] = body[i];
+        i = i + 1;
+    }
+    return n + body.len;
+}
+
+/// Write the HTTP head plus plain body for POST input.
+pub fn emit_input_response(plan : InputPlan, out : []u8) -> usize {
+    if (plan.http_code == 0) { return 0; }
+    const body : string = text_body(plan.http_code);
+    var n : usize = put_head(out, plan.http_code, PIXEL_NONE);
+    if (n == 0 or n + body.len > out.len) { return 0; }
+    var i : usize = 0;
+    while (i < body.len) {
+        out[n + i] = body[i];
+        i = i + 1;
+    }
+    return n + body.len;
+}
+
+/// Bodyless 404 for unknown paths.
+pub fn emit_not_found(out : []u8) -> usize {
+    return put_head(out, R_NOT_FOUND, PIXEL_NONE);
+}
+
+/// The path the host may open for a streaming GET (zero when plan.stream is false).
+pub fn view_open_path(home : []const u8, plan : ViewPlan, pb : []u8) -> usize {
+    if (!plan.stream) { return 0; }
+    return view_disk_path(home, plan.kind, pb);
+}
+
+/// The length of the buffer's first line, CR or LF stripped; the whole buffer when no end.
+pub fn request_line_len(buf : []const u8) -> usize {
+    var i : usize = 0;
+    while (i < buf.len) {
+        if (buf[i] == 13 or buf[i] == 10) { return i; }
+        i = i + 1;
+    }
+    return buf.len;
+}
+
+/// First line of the POST body after a complete head (trim CR/LF).
+pub fn post_body_line(buf : []const u8, head_end : usize, have : usize, out : []u8) -> usize {
+    if (head_end == 0 or have <= head_end) { return 0; }
+    var i : usize = head_end;
+    var n : usize = 0;
+    while (i < have and n < out.len) {
+        if (buf[i] == 13 or buf[i] == 10) { break; }
+        out[n] = buf[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// True when poll(0) sees the listener ready (non-blocking accept gate).
+pub fn bridge_listen_ready(listen_fd : i32, pf : []u8) -> bool {
+    if (listen_fd < 0) { return false; }
+    put_pollfd(pf[0..8], 0, @as(u32, @intCast(listen_fd)));
+    if (sys_poll(pf[0..8], 1, 0) <= 0) { return false; }
+    return poll_revents(pf[0..8], 0) != 0;
+}
+
+fn bridge_close_conn(st : []u32) -> void {
+    if (st[BR_ST_CFD] != 0) {
+        _ = sys_close(@as(i32, @intCast(st[BR_ST_CFD] - 1)));
+        st[BR_ST_CFD] = 0;
+        st[BR_ST_GOT] = 0;
+    }
+}
+
+fn bridge_write_all(fd : i32, data : []const u8) -> bool {
+    var off : usize = 0;
+    while (off < data.len) {
+        var chunk : usize = data.len - off;
+        if (chunk > BRIDGE_SOCK_CHUNK) { chunk = BRIDGE_SOCK_CHUNK; }
+        const w : i64 = sys_write(fd, data[off .. off + chunk], @as(u64, chunk));
+        if (w <= 0) { return false; }
+        off = off + @as(usize, @intCast(w));
+    }
+    return true;
+}
+
+fn bridge_stream_file(fd : i32, path : []const u8) -> bool {
+    if (path.len == 0) { return false; }
+    var z : [320]u8 = undefined;
+    var i : usize = 0;
+    while (i < path.len and i < 319) {
+        z[i] = path[i];
+        i = i + 1;
+    }
+    z[i] = 0;
+    const src : i32 = sys_open_ro(z[0..320], 0);
+    if (src < 0) { return false; }
+    var chunk : [BRIDGE_SOCK_CHUNK]u8 = undefined;
+    var ok : bool = true;
+    var live : bool = true;
+    while (live) {
+        const r : i64 = sys_read(src, chunk[0..BRIDGE_SOCK_CHUNK], @as(u64, BRIDGE_SOCK_CHUNK));
+        if (r <= 0) {
+            live = false;
+        } else {
+            if (!bridge_write_all(fd, chunk[0..@as(usize, @intCast(r))])) {
+                ok = false;
+                live = false;
+            }
+        }
+    }
+    _ = sys_close(src);
+    return ok;
+}
+
+fn bridge_inbox_append(home : []const u8, line : []const u8) -> bool {
+    var pb : [320]u8 = undefined;
+    const pn : usize = inbox_path(home, pb[0..320]);
+    if (pn == 0) { return false; }
+    pb[pn] = 0;
+    const fd : i32 = sys_open_ro(pb[0..320], INBOX_APPEND_FLAGS);
+    if (fd < 0) { return false; }
+    var w : i64 = sys_write(fd, line, @as(u64, line.len));
+    if (line.len > 0 and line[line.len - 1] != 10) {
+        var nl : [1]u8 = undefined;
+        nl[0] = 10;
+        w = w + sys_write(fd, nl[0..1], 1);
+    }
+    _ = sys_close(fd);
+    return w >= @as(i64, @intCast(line.len));
+}
+
+/// Size and first four bytes of the view body file on disk (0 when missing).
+pub fn bridge_view_file_size(home : []const u8, pump_alive : bool, mag : []u8) -> usize {
+    var pb : [320]u8 = undefined;
+    var kind : u32 = PIXEL_JPEG;
+    if (export_enabled()) { kind = PIXEL_NATIVE; }
+    const pn : usize = view_disk_path(home, kind, pb[0..320]);
+    if (pn == 0) { return 0; }
+    pb[pn] = 0;
+    const fd : i32 = sys_open_ro(pb[0..320], 0);
+    if (fd < 0) { return 0; }
+    const r : i64 = sys_read(fd, mag, 4);
+    if (r < 4) {
+        _ = sys_close(fd);
+        return 0;
+    }
+    const sz : i64 = sys_lseek(fd, 0, SEEK_END);
+    _ = sys_close(fd);
+    if (sz <= 0) { return 0; }
+    return @as(usize, @intCast(sz));
+}
+
+fn bridge_serve_conn(fd : i32, home : []const u8, pump_alive : bool, file_size : usize, b0 : u8, b1 : u8, b2 : u8, b3 : u8, req : []const u8, head_end : usize) -> void {
+    const llen : usize = request_line_len(req[0..head_end]);
+    var mbuf : [12]u8 = undefined;
+    var pbuf : [64]u8 = undefined;
+    const route : u32 = route_from_line(req[0..llen], mbuf[0..12], pbuf[0..64]);
+    var wr : [BRIDGE_WR_CAP]u8 = undefined;
+    if (route == ROUTE_VIEW) {
+        const plan : ViewPlan = plan_view(pump_alive, file_size, b0, b1, b2, b3);
+        const wn : usize = emit_view_head(plan, wr[0..BRIDGE_WR_CAP]);
+        if (wn > 0) { _ = bridge_write_all(fd, wr[0..wn]); }
+        if (plan.stream) {
+            var pb : [320]u8 = undefined;
+            const plen : usize = view_open_path(home, plan, pb[0..320]);
+            if (plen > 0) { _ = bridge_stream_file(fd, pb[0..plen]); }
+        }
+        return;
+    }
+    if (route == ROUTE_INPUT) {
+        var line : [400]u8 = undefined;
+        const ln : usize = post_body_line(req, head_end, req.len, line[0..400]);
+        const plan : InputPlan = plan_input(line[0..ln], pump_alive);
+        if (plan.http_code == 200) { _ = bridge_inbox_append(home, line[0..ln]); }
+        const wn : usize = emit_input_response(plan, wr[0..BRIDGE_WR_CAP]);
+        if (wn > 0) { _ = bridge_write_all(fd, wr[0..wn]); }
+        return;
+    }
+    const code : u32 = plan_route(route);
+    if (code != 0) {
+        const wn : usize = emit_not_found(wr[0..BRIDGE_WR_CAP]);
+        if (wn > 0) { _ = bridge_write_all(fd, wr[0..wn]); }
+    }
+}
+
+/// Copy `home`, then `suffix` (empty for the live channel, "/.t27os-dev" for dev). 0 when it does not fit.
+/// A trailing NUL inside a slice's length is not copied (some consts count it).
+pub fn bridge_home_join(out : []u8, home : []const u8, suffix : []const u8) -> usize {
+    var i : usize = 0;
+    while (i < home.len and i < out.len and home[i] != 0) {
+        out[i] = home[i];
+        i = i + 1;
+    }
+    var j : usize = 0;
+    while (j < suffix.len and i < out.len and suffix[j] != 0) {
+        out[i] = suffix[j];
+        i = i + 1;
+        j = j + 1;
+    }
+    if (j < suffix.len and suffix[j] != 0) { return 0; }
+    return i;
+}
+
+fn cstr_len(b : []const u8) -> usize {
+    var i : usize = 0;
+    while (i < b.len and b[i] != 0) { i = i + 1; }
+    return i;
+}
+
+/// 1 when this executable's Info.plist names the dev bundle id. 0 otherwise.
+fn bridge_channel_dev() -> u32 {
+    var exe : [300]u8 = [0] ** 300;
+    var sz : [2]u32 = undefined;
+    sz[0] = 300;
+    sz[1] = 0;
+    if (sys_exe_path(exe[0..300], sz) != 0) { return 0; }
+    var n : usize = cstr_len(exe[0..300]);
+    if (n < 16) { return 0; }
+    var count : u32 = 0;
+    var slash : usize = 0;
+    var i : usize = n;
+    while (i > 0) {
+        i = i - 1;
+        if (exe[i] == 47) {
+            count = count + 1;
+            if (count == 2) { slash = i; }
+        }
+    }
+    if (count < 2 or slash + 11 >= 320) { return 0; }
+    var pb : [320]u8 = [0] ** 320;
+    var k : usize = put_bytes(pb[0..320], 0, exe[0..slash]);
+    k = put_bytes(pb[0..320], k, "/Info.plist");
+    if (k >= 320) { return 0; }
+    pb[k] = 0;
+    const fd : i32 = sys_open_ro(pb[0..320], 0);
+    if (fd < 0) { return 0; }
+    var buf : [2048]u8 = undefined;
+    const r : i64 = sys_read(fd, buf[0..2048], 2048);
+    _ = sys_close(fd);
+    if (r <= 13) { return 0; }
+    if (has_bytes(buf[0..@as(usize, @intCast(r))], "ai.t27.os.dev")) { return 1; }
+    return 0;
+}
+
+/// Write getenv("HOME") plus the dev suffix into `out`. Length, or 0 when HOME is unset or it does not fit.
+fn bridge_home_fill(out : []u8) -> usize {
+    var raw : [256]u8 = [0] ** 256;
+    const p : u64 = sys_getenv("HOME");
+    if (p == 0) { return 0; }
+    var n : u64 = sys_strlen(p);
+    if (n == 0) { return 0; }
+    if (n > 240) { n = 240; }
+    sys_peek(raw[0..256], p, n);
+    if (bridge_channel_dev() != 0) {
+        return bridge_home_join(out, raw[0..@as(usize, @intCast(n))], "/.t27os-dev");
+    }
+    return bridge_home_join(out, raw[0..@as(usize, @intCast(n))], "");
+}
+
+/// Fixed 320-byte home. Scalars only: returns the length (the bytes are resolved again by the tick).
+pub fn bridge_home_buf() -> u32 {
+    var tmp : [320]u8 = [0] ** 320;
+    return @as(u32, @intCast(bridge_home_fill(tmp[0..320])));
+}
+
+/// Four magic bytes, little-endian, for the scalar bridge_poll_tick argument.
+pub fn bridge_mag_pack(b0 : u8, b1 : u8, b2 : u8, b3 : u8) -> u32 {
+    return @as(u32, b0) + (@as(u32, b1) * 256) + (@as(u32, b2) * 65536) + (@as(u32, b3) * 16777216);
+}
+
+/// Pack busy and the updated state slots. See BR_WORD_BUSY.
+pub fn bridge_state_word(st_cfd : u32, st_got : u32, busy : bool) -> u64 {
+    var g : u64 = @as(u64, st_got);
+    if (g > 2147483647) { g = 2147483647; }
+    var w : u64 = @as(u64, st_cfd) + (g * 4294967296);
+    if (busy) { w = w + BR_WORD_BUSY; }
+    return w;
+}
+
+pub fn bridge_word_cfd(w : u64) -> u32 {
+    return @as(u32, @intCast(w % 4294967296));
+}
+
+pub fn bridge_word_got(w : u64) -> u32 {
+    return @as(u32, @intCast((w / 4294967296) % 2147483648));
+}
+
+pub fn bridge_word_busy(w : u64) -> bool {
+    return w >= BR_WORD_BUSY;
+}
+
+/// One main-loop tick (poll 0 ms): accept when ready, read until head, serve, close. true while a partial request waits.
+pub fn bridge_poll(listen_fd : i32, st : []u32, home : []const u8, pump_alive : bool, file_size : usize, b0 : u8, b1 : u8, b2 : u8, b3 : u8) -> bool {
+    if (listen_fd < 0) { return false; }
+    var req : [BRIDGE_REQ_CAP]u8 = undefined;
+    var pf : [8]u8 = undefined;
+    if (st[BR_ST_CFD] == 0) {
+        if (!bridge_listen_ready(listen_fd, pf[0..8])) { return false; }
+        const cfd : i32 = sys_accept(listen_fd, 0, 0);
+        if (cfd < 0) { return false; }
+        st[BR_ST_CFD] = @as(u32, @intCast(cfd)) + 1;
+        st[BR_ST_GOT] = 0;
+    }
+    const fd : i32 = @as(i32, @intCast(st[BR_ST_CFD] - 1));
+    var got : usize = @as(usize, @intCast(st[BR_ST_GOT]));
+    if (got >= BRIDGE_REQ_CAP) {
+        bridge_close_conn(st);
+        return false;
+    }
+    put_pollfd(pf[0..8], 0, @as(u32, @intCast(fd)));
+    if (sys_poll(pf[0..8], 1, 0) <= 0) { return true; }
+    const n : i64 = sys_read(fd, req[got .. BRIDGE_REQ_CAP], @as(u64, BRIDGE_REQ_CAP - got));
+    if (n <= 0) {
+        bridge_close_conn(st);
+        return false;
+    }
+    got = got + @as(usize, @intCast(n));
+    st[BR_ST_GOT] = @as(u32, @intCast(got));
+    const head_end : usize = http_head_end(req[0..got]);
+    if (head_end == 0) {
+        if (got >= BRIDGE_REQ_CAP) {
+            bridge_close_conn(st);
+            return false;
+        }
+        return true;
+    }
+    bridge_serve_conn(fd, home, pump_alive, file_size, b0, b1, b2, b3, req[0..got], head_end);
+    bridge_close_conn(st);
+    return false;
+}
+
+/// Exportable tick (#8972): six scalars, one u64. Home is resolved inside (bridge_home_buf).
+/// Return bits: 0..31 updated st_cfd, 32..62 updated st_got, 63 busy (1 while a partial request waits).
+pub fn bridge_poll_tick(listen_fd : i32, st_cfd : u32, st_got : u32, pump_alive : u32, file_size : usize, mag_pack : u32) -> u64 {
+    if (listen_fd < 0) { return bridge_state_word(st_cfd, st_got, false); }
+    var st : [2]u32 = undefined;
+    st[BR_ST_CFD] = st_cfd;
+    st[BR_ST_GOT] = st_got;
+    var home : [320]u8 = [0] ** 320;
+    const hn : usize = bridge_home_fill(home[0..320]);
+    var alive : bool = false;
+    if (pump_alive != 0) { alive = true; }
+    const b0 : u8 = @as(u8, @intCast(mag_pack % 256));
+    const b1 : u8 = @as(u8, @intCast((mag_pack / 256) % 256));
+    const b2 : u8 = @as(u8, @intCast((mag_pack / 65536) % 256));
+    const b3 : u8 = @as(u8, @intCast((mag_pack / 16777216) % 256));
+    const busy : bool = bridge_poll(listen_fd, st[0..2], home[0..hn], alive, file_size, b0, b1, b2, b3);
+    return bridge_state_word(st[BR_ST_CFD], st[BR_ST_GOT], busy);
+}
+
+/// Fresh st each call: one poll step (used when no cross-tick state is kept).
+pub fn bridge_serve_once(listen_fd : i32, home : []const u8, pump_alive : bool, file_size : usize, b0 : u8, b1 : u8, b2 : u8, b3 : u8) -> bool {
+    var st : [2]u32 = undefined;
+    st[BR_ST_CFD] = 0;
+    st[BR_ST_GOT] = 0;
+    var had : bool = false;
+    var busy : bool = bridge_poll(listen_fd, st[0..2], home, pump_alive, file_size, b0, b1, b2, b3);
+    if (st[BR_ST_CFD] != 0) { had = true; }
+    while (busy) {
+        busy = bridge_poll(listen_fd, st[0..2], home, pump_alive, file_size, b0, b1, b2, b3);
+    }
+    return had;
+}
+
+/// One AF_INET listener on 127.0.0.1:47131, backlog LISTEN_BACKLOG. -1 on any refusal.
+pub fn bridge_listen() -> i32 {
+    if (bridge_bind_refusal(false) != R_OK) { return -1; }
+    const fd : i32 = sys_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return -1; }
+    var sa : [SOCKADDR_IN_LEN]u8 = undefined;
+    const sn : usize = bridge_bind_bytes(sa[0..SOCKADDR_IN_LEN]);
+    if (sn != SOCKADDR_IN_LEN) { _ = sys_close(fd); return -1; }
+    if (sys_bind(fd, sa[0..SOCKADDR_IN_LEN], @as(u32, @intCast(sn))) != 0) { _ = sys_close(fd); return -1; }
+    if (sys_listen(fd, LISTEN_BACKLOG) != 0) { _ = sys_close(fd); return -1; }
+    return fd;
+}
+
+test http_head_finds_crlf_crlf {
+    const buf : []const u8 = "GET /live/native HTTP/1.1\x0D\x0AHost: x\x0D\x0A\x0D\x0Abody";
+    const h : usize = http_head_end(buf);
+    assert h > 0;
+    assert http_body_off(h) == h;
+    assert buf[h] == 98;
+}
+
+test route_from_line_matches_bridge {
+    var m : [8]u8 = undefined;
+    var p : [32]u8 = undefined;
+    const line : []const u8 = "GET /live/native HTTP/1.1";
+    assert route_from_line(line, m[0..8], p[0..32]) == ROUTE_VIEW;
+    const post : []const u8 = "POST /live/native/input HTTP/1.1";
+    assert route_from_line(post, m[0..8], p[0..32]) == ROUTE_INPUT;
+    const bad : []const u8 = "GET /live/s1 HTTP/1.1";
+    assert route_from_line(bad, m[0..8], p[0..32]) == ROUTE_NONE;
+}
+
+test plan_view_streams_jpeg_when_pump_alive {
+    const plan : ViewPlan = plan_view(true, 4096, 255, 216, 0, 0);
+    assert plan.http_code == 200;
+    assert plan.stream;
+    var out : [512]u8 = undefined;
+    const n : usize = emit_view_head(plan, out[0..512]);
+    assert n > 0;
+    assert has_bytes(out[0..n], "HTTP/1.1 200");
+    assert has_bytes(out[0..n], view_wire_source(plan.kind));
+}
+
+test plan_view_503_without_pump {
+    const plan : ViewPlan = plan_view(false, 0, 0, 0, 0, 0);
+    assert plan.http_code == 503;
+    assert !plan.stream;
+    var out : [256]u8 = undefined;
+    const n : usize = emit_view_head(plan, out[0..256]);
+    assert has_bytes(out[0..n], "503");
+    assert has_bytes(out[0..n], text_body(503));
+}
+
+test plan_input_and_emit {
+    const plan : InputPlan = plan_input("click 1 2 1", true);
+    assert plan.http_code == 200;
+    var out : [256]u8 = undefined;
+    const n : usize = emit_input_response(plan, out[0..256]);
+    assert has_bytes(out[0..n], "inbox");
+}
+
+test unknown_route_emits_404 {
+    assert plan_route(ROUTE_NONE) == R_NOT_FOUND;
+    var out : [256]u8 = undefined;
+    const n : usize = emit_not_found(out[0..256]);
+    assert has_bytes(out[0..n], "404");
+}
+
+test view_open_path_under_home_browser {
+    const plan : ViewPlan = plan_view(true, 100, 255, 216, 0, 0);
+    var pb : [64]u8 = undefined;
+    const n : usize = view_open_path("/h", plan, pb[0..64]);
+    assert n > 0;
+    assert has_bytes(pb[0..n], "frame.jpg");
+}
+
+test listener_bind_len_matches_sock {
+    var sa : [16]u8 = undefined;
+    assert listener_bind_len(sa[0..16]) == SOCKADDR_IN_LEN;
+    assert bridge_bind_bytes(sa[0..16]) == SOCKADDR_IN_LEN;
+}
+
+test request_line_len_strips_crlf {
+    const line : []const u8 = "GET /live/native HTTP/1.1";
+    assert request_line_len(line) == 25;
+    assert request_line_len("POST") == 4;
+}
+
+test post_body_line_after_head {
+    const buf : []const u8 = "POST /live/native/input HTTP/1.1\x0D\x0A\x0D\x0Aclick 1 2 1\x0A";
+    const he : usize = http_head_end(buf);
+    var out : [64]u8 = undefined;
+    const n : usize = post_body_line(buf, he, buf.len, out[0..64]);
+    assert n > 0;
+    assert has_bytes(out[0..n], "click");
+}
+
+test bridge_listen_ready_false_without_extern {
+    var pf : [8]u8 = undefined;
+    assert bridge_listen_ready(-1, pf[0..8]) == false;
+}
+
+test bridge_serve_once_state_slots {
+    assert BR_ST_CFD == 0;
+    assert BR_ST_GOT == 1;
+    assert BRIDGE_REQ_CAP >= 512;
+}
+
+test bridge_state_word_packs_busy_and_slots {
+    const w : u64 = bridge_state_word(7, 40, true);
+    assert bridge_word_cfd(w) == 7;
+    assert bridge_word_got(w) == 40;
+    assert bridge_word_busy(w);
+    const z : u64 = bridge_state_word(0, 0, false);
+    assert z == 0;
+    assert bridge_word_busy(z) == false;
+    const big : u64 = bridge_state_word(1, 4294967295, false);
+    assert bridge_word_cfd(big) == 1;
+    assert bridge_word_got(big) == 2147483647;
+    assert bridge_word_busy(big) == false;
+}
+
+test bridge_mag_pack_is_little_endian {
+    assert bridge_mag_pack(255, 216, 1, 2) == 255 + 216 * 256 + 1 * 65536 + 2 * 16777216;
+    assert bridge_mag_pack(0, 0, 0, 0) == 0;
+}
+
+test bridge_home_join_follows_dev_suffix {
+    var o : [64]u8 = undefined;
+    const n : usize = bridge_home_join(o[0..64], "/Users/u", "/.t27os-dev");
+    assert n == 19;
+    assert has_bytes(o[0..n], "/.t27os-dev");
+    const m : usize = bridge_home_join(o[0..64], "/Users/u", "");
+    assert m == 8;
+    assert has_bytes(o[0..m], "/Users/u");
+    var s : [8]u8 = undefined;
+    assert bridge_home_join(s[0..8], "/Users/u", "/.t27os-dev") == 0;
+}
+
+test bridge_poll_tick_bad_fd_keeps_slots {
+    const w : u64 = bridge_poll_tick(-1, 3, 9, 1, 0, 0);
+    assert bridge_word_cfd(w) == 3;
+    assert bridge_word_got(w) == 9;
+    assert bridge_word_busy(w) == false;
+}
+
+invariant bridge_listen_refuses_publish {
+    assert bridge_bind_refusal(true) != R_OK;
+    assert bridge_bind_refusal(false) == R_OK;
+}

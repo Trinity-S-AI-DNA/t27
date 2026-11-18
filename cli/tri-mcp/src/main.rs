@@ -2,6 +2,8 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -9,6 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+// M1 gateway law: generated .t27 (V2); this adapter frames only.
+#[path = "../../../gen/rust/tri/gateway_policy.rs"]
+mod gateway_policy;
+#[path = "../../../gen/rust/tri/gateway_log_contract.rs"]
+mod gateway_log_contract;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveSkill {
@@ -54,6 +62,206 @@ struct AkashicEvent {
     result: String,
     error: Option<String>,
     metadata: Value,
+}
+
+fn gateway_observation_call(name: &str, args: &Value, root: &Path) -> Result<Value> {
+    static WINDOW: AtomicU32 = AtomicU32::new(0);
+    static DENIED: AtomicU32 = AtomicU32::new(0);
+    // The generated law takes &'static str; interning here is framing only.
+    let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let h2: String = args.get("host").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let host: &'static str = Box::leak(h2.into_boxed_str());
+    let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let scope: &'static str = Box::leak(format!("{}:{}", host, port).into_boxed_str());
+    let count = WINDOW.fetch_add(1, Ordering::Relaxed) + 1;
+    let idx = gateway_policy::tool_index(name, name.len());
+    let d = gateway_policy::gateway_gate(gateway_policy::MCP_CALL, idx, host, host.len(), port, count);
+    if d != gateway_policy::ALLOW { DENIED.fetch_add(1, Ordering::Relaxed); }
+    let h = gateway_policy::request_hash(name, name.len());
+    // Audit sink (host plumbing): one law-encoded line per call, appended to
+    // the gateway's OWN audit log under .trinity/ -- no arbitrary file access.
+    let mut abuf = [0u8; 256];
+    let an = gateway_policy::audit_encode(&mut abuf, 256,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|x| x.as_secs()).unwrap_or(0),
+        "dsh-session", 11, name, name.len(), scope, scope.len(),
+        d, if d == gateway_policy::DENY_RATE { 2 } else { 0 }, h);
+    let log_path = root.join(".trinity/gateway-audit.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = std::io::Write::write_all(&mut f, &abuf[..an]);
+    }
+    let mut buf = [0u8; 128];
+    let n = gateway_policy::response_decision(&mut buf, 128, d,
+        if d == gateway_policy::DENY_RATE { 2 } else { 0 }, h);
+    let decision = String::from_utf8_lossy(&buf[..n]).to_string();
+    if d != gateway_policy::ALLOW {
+        anyhow::bail!("gateway policy denied: {}", decision);
+    }
+    // V7 read-only observation: only cdp.observe contacts a live endpoint, and
+    // only GET /json/list -- no input events, no navigation, no storage reads.
+    if name == "cdp.observe" {
+        return cdp_observe_live(host, port, &decision);
+    }
+    // V12 introspection tools (all read-only, law-gated).
+    if idx == 3 {
+        return Ok(serde_json::json!({"tool": name,
+            "requests": count, "denied": DENIED.load(Ordering::Relaxed),
+            "decision": serde_json::from_str::<Value>(&decision)?}));
+    }
+    if idx == 4 {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let ok = std::net::TcpStream::connect_timeout(&addr,
+            std::time::Duration::from_millis(800)).is_ok();
+        return Ok(serde_json::json!({"tool": name, "reachable": ok,
+            "host": host, "port": port}));
+    }
+    if idx == 5 || idx == 9 {
+        // E2: local ingestion through the generated log-contract law.
+        // E3 (T27_LOG_OBSERVABILITY_V1): host=="vps" ingests the VPS
+        // journal via EXACTLY ONE allowlisted read-only journalctl command
+        // over the existing ssh alias -- no shell, no writes; every MESSAGE
+        // passes the law's mandatory redaction; malformed lines are dropped.
+        let log_path = root.join(".trinity/gateway-audit.log");
+        if host == "vps" {
+            let data = vps_journal_bytes();
+            let events = vps_events(&data, if idx == 5 { 20 } else { 10 });
+            return Ok(serde_json::json!({"tool": name, "host": "vps",
+                "events": events, "count": events.len(),
+                "decision": serde_json::from_str::<Value>(&decision)?}));
+        }
+        let data = std::fs::read(&log_path).unwrap_or_default();
+        let events = audit_events(&data, if idx == 5 { 20 } else { 10 }, idx == 9);
+        return Ok(serde_json::json!({"tool": name, "host": "local",
+            "events": events, "count": events.len(),
+            "decision": serde_json::from_str::<Value>(&decision)?}));
+    }
+    let mut ob = [0u8; 256];
+    let on = gateway_policy::observation_response(idx, &mut ob, 256);
+    Ok(serde_json::json!({"tool": name,
+        "observation": serde_json::from_str::<Value>(std::str::from_utf8(&ob[..on])?)?,
+        "decision": serde_json::from_str::<Value>(&decision)?}))
+}
+
+// V7: one read-only HTTP/1.0 GET of the CDP target list. Anything beyond the
+// law's OBSERVABLE outputs (url, title, a DOM type summary) is never fetched.
+fn cdp_observe_live(host: &str, port: u16, decision: &str) -> Result<Value> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let envelope = |connected: bool, extra: Value| -> Result<Value> {
+        Ok(serde_json::json!({
+            "tool": "cdp.observe",
+            "policy_version": gateway_policy::POLICY_VERSION,
+            "connected": connected,
+            "outputs": ["url", "title", "domSummary"],
+            "actions": "none: navigation, click, input, form submit and credential or storage export are DENY rows in policy.t27",
+            "decision": serde_json::from_str::<Value>(decision)?,
+            "observed": extra,
+        }))
+    };
+    let ok = (|| -> anyhow::Result<Value> {
+        let mut s = TcpStream::connect((host, port))?;
+        s.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+        s.write_all(format!("GET /json/list HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n").as_bytes())?;
+        let mut raw = String::new();
+        // Chrome keeps the socket alive past Connection: close; the timeout
+        // bounds the read once the full body is in.
+        let _ = s.read_to_string(&mut raw);
+        let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let pages: Vec<Value> = serde_json::from_str::<Vec<Value>>(body)
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| t["type"] == "page")
+            .map(|t| serde_json::json!({"url": t["url"], "title": t["title"],
+                "domSummary": {"targetType": t["type"]}}))
+            .collect();
+        envelope(true, serde_json::json!({"pages": pages, "count": pages.len()}))
+    })()
+    .or_else(|e| envelope(false, serde_json::json!({"error": e.to_string()})))?;
+    Ok(ok)
+}
+
+/// E3 (T27_LOG_OBSERVABILITY_V1): read-only VPS journal ingestion. The
+/// spawned command is a PINNED constant -- read-only journalctl over the
+/// existing ssh alias, no shell interpretation, no writes, bounded -n 60.
+/// Output: one JSON object per line (journald --output=json).
+fn vps_journal_bytes() -> Vec<u8> {
+    const VPS_SSH_ALIAS: &str = "givel-vps";
+    const VPS_JOURNALCTL_ARGS: [&str; 7] = ["journalctl", "--output=json", "-n", "60",
+        "--unit=dsh.service", "--unit=dsh-ladder.service", "--unit=caddy"];
+    let out = std::process::Command::new("ssh").arg(VPS_SSH_ALIAS)
+        .args(VPS_JOURNALCTL_ARGS).output();
+    match out {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => Vec::new(),
+    }
+}
+
+/// Map one journald JSON line to a law event: ts (micros->secs), unit->source
+/// mapping, PRIORITY->level, MESSAGE redacted by the law. Host label "vps".
+fn vps_line_to_event(line: &[u8], out: &mut [u8], cap: usize) -> usize {
+    let v: Value = match serde_json::from_slice(line) { Ok(v) => v, Err(_) => return 0 };
+    let unit = v.get("_SYSTEMD_UNIT").and_then(|x| x.as_str()).unwrap_or_default().as_bytes().to_vec();
+    let unit_str = String::from_utf8_lossy(&unit).to_string();
+    let source: &'static str = if unit_str.contains("ladder") { "dsh-ladder" }
+        else if unit_str.contains("caddy") { "caddy" }
+        else { "dsh-web" };
+    let prio = v.get("PRIORITY").and_then(|x| x.as_str())
+        .and_then(|p| p.parse::<u8>().ok()).unwrap_or(6);
+    let level = if prio <= 2 { 3u8 } else if prio <= 4 { 2 } else { 1 };
+    let msg = v.get("MESSAGE").and_then(|x| x.as_str()).unwrap_or_default();
+    let ts_us = v.get("__REALTIME_TIMESTAMP").and_then(|x| x.as_str())
+        .and_then(|t| t.parse::<u64>().ok()).unwrap_or(0) / 1_000_000;
+    let mut rbuf = [0u8; 1024];
+    let msg_bytes = msg.as_bytes();
+    let rn = gateway_log_contract::redact_line(msg_bytes, msg.len(), &mut rbuf, 1024);
+    let mut w = 0usize;
+    w = gateway_log_contract::put_lit(out, cap, w, "{\"timestamp\":", 13);
+    w = gateway_log_contract::put_u64(out, cap, w, ts_us);
+    w = gateway_log_contract::put_lit(out, cap, w, ",\"host\":\"vps\",\"source\":\"", 24);
+    w = gateway_log_contract::put_lit(out, cap, w, source, source.len());
+    w = gateway_log_contract::put_lit(out, cap, w, "\",\"component\":\"", 15);
+    w = gateway_log_contract::put_span(out, cap, w, &unit, 0, unit.len());
+    w = gateway_log_contract::put_lit(out, cap, w, "\",\"level\":", 10);
+    w = gateway_log_contract::put_u64(out, cap, w, level as u64);
+    w = gateway_log_contract::put_lit(out, cap, w, ",\"message\":\"", 12);
+    w = gateway_log_contract::put_span(out, cap, w, &rbuf[..rn], 0, rn);
+    gateway_log_contract::put_lit(out, cap, w, "\"}", 2)
+}
+
+/// E3: parse journald JSON lines (bounded count) into law events.
+fn vps_events(raw: &[u8], max_lines: usize) -> Vec<Value> {
+    let mut events = Vec::new();
+    for line in raw.split(|b: &u8| *b == b'\n') {
+        if line.is_empty() { continue; }
+        if events.len() >= max_lines { break; }
+        let mut ebuf = [0u8; 2048];
+        let en = vps_line_to_event(line, &mut ebuf, 2048);
+        if en > 0 {
+            events.push(Value::String(String::from_utf8_lossy(&ebuf[..en]).to_string()));
+        }
+    }
+    events
+}
+
+/// EPIC 2: turn raw audit bytes into redacted schema events via the
+/// generated log-contract law. max_lines bounds the result; head selects
+/// the FIRST max_lines (logs.head) instead of the LAST (policy.audit).
+fn audit_events(data: &[u8], max_lines: usize, head: bool) -> Vec<Value> {
+    let lines: Vec<&[u8]> = data.split(|b: &u8| *b == b'\n')
+        .filter(|l: &&[u8]| !l.is_empty())
+        .collect();
+    let start = if head { 0 } else { lines.len().saturating_sub(max_lines) };
+    let end = if head { max_lines.min(lines.len()) } else { lines.len() };
+    let mut events = Vec::new();
+    for line in &lines[start..end] {
+        let mut rbuf = [0u8; 1024];
+        let rn = gateway_log_contract::redact_line(line, line.len(), &mut rbuf, 1024);
+        let mut ebuf = [0u8; 1024];
+        let en = gateway_log_contract::audit_line_to_event(&rbuf[..rn], rn, &mut ebuf, 1024);
+        if en > 0 {
+            events.push(Value::String(String::from_utf8_lossy(&ebuf[..en]).to_string()));
+        }
+    }
+    events
 }
 
 fn find_repo_root() -> Option<PathBuf> {
@@ -278,12 +486,42 @@ fn build_tools_list() -> Vec<Value> {
                 "required": []
             }
         }),
+        serde_json::json!({"name": "gateway.status", "description": "Gateway policy version and counters (observation-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "dsh.status", "description": "DSH health read via loopback 127.0.0.1:3081 only; V1 makes no live connection.", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "cdp.observe", "description": "CDP observation on loopback 127.0.0.1:9222..9332 only; observe-only.", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.metrics", "description": "Gateway call counters: requests served, denials (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.health", "description": "Loopback TCP reachability probe of the requested endpoint (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.policy.audit", "description": "Tail of the gateway audit log (law-encoded lines, hashes only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.config.get", "description": "Effective gateway policy summary (version, tools, routes; no secrets).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.routes.list", "description": "Configured loopback routes: DSH 3081, CDP 9222..9332 (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.version", "description": "Gateway policy version and tool count (read-only).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
+        serde_json::json!({"name": "gateway.logs.head", "description": "Head of the gateway audit log (same source as policy.audit).", "inputSchema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}}, "required": []}}),
     ]
 }
 
+// JSON-RPC error code for an adapter error: -32601 for the unknown
+// method/tool family (owner-approved 2026-11-11), -32603 otherwise.
+fn jsonrpc_error_code(msg: &str) -> i32 {
+    if msg.starts_with("Unknown") {
+        -32601
+    } else {
+        -32603
+    }
+}
+
 fn handle_tools_list() -> Result<Value> {
+    // D1 (owner-approved 2026-11-11): expose only the three observation-only
+    // gateway tools; legacy tri_* handlers stay transport-only, unlisted.
+    let gw = ["gateway.status", "dsh.status", "cdp.observe", "gateway.metrics",
+        "gateway.health", "gateway.policy.audit", "gateway.config.get",
+        "gateway.routes.list", "gateway.version", "gateway.logs.head"];
+    let tools: Vec<Value> = build_tools_list()
+        .into_iter()
+        .filter(|t| t.get("name").and_then(|n| n.as_str())
+            .map_or(false, |n| gw.contains(&n)))
+        .collect();
     Ok(serde_json::json!({
-        "tools": build_tools_list()
+        "tools": tools
     }))
 }
 
@@ -292,7 +530,7 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
         .get("params")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default();
     let arguments = params
         .get("arguments")
         .cloned()
@@ -309,11 +547,21 @@ fn handle_tools_call(request: Value, root: &Path) -> Result<Value> {
         "tri_verdict" => cmd_verdict(root),
         "tri_experience_save" => cmd_experience_save(root, &arguments),
         "tri_health" => cmd_health(root),
+        n if n == "gateway.status" || n == "dsh.status" || n == "cdp.observe"
+            || n == "gateway.metrics" || n == "gateway.health"
+            || n == "gateway.policy.audit" || n == "gateway.config.get"
+            || n == "gateway.routes.list" || n == "gateway.version"
+            || n == "gateway.logs.head" => {
+            gateway_observation_call(n, &arguments, root)
+        }
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
     };
 
     match result {
         Ok(v) => Ok(v),
+        // D2 (owner-approved 2026-11-11): unknown tool surfaces as a JSON-RPC
+        // -32601 error, not a text result; other failures stay text results.
+        Err(e) if jsonrpc_error_code(&e.to_string()) == -32601 => Err(e),
         Err(e) => Ok(tool_error_text(&e.to_string())),
     }
 }
@@ -966,7 +1214,7 @@ fn main() -> Result<()> {
         };
 
         let id = request.get("id").cloned();
-        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or_default();
 
         let result = match method {
             "initialize" => handle_initialize(),
@@ -984,7 +1232,7 @@ fn main() -> Result<()> {
                 Err(e) => serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": {"code": -32603, "message": e.to_string()}
+                    "error": {"code": jsonrpc_error_code(&e.to_string()), "message": e.to_string()}
                 }),
             };
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
@@ -993,4 +1241,105 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod gateway_adapter_tests {
+    use super::*;
+    // D1: exactly the three gateway tools; D2: -32601 for the unknown family.
+    #[test]
+    fn adapter_d1_d2() {
+        let names: Vec<String> = handle_tools_list().unwrap()["tools"]
+            .as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, vec![
+            "gateway.status", "dsh.status", "cdp.observe", "gateway.metrics",
+            "gateway.health", "gateway.policy.audit", "gateway.config.get",
+            "gateway.routes.list", "gateway.version", "gateway.logs.head"]);
+        assert_eq!(jsonrpc_error_code("Unknown tool: shell.run"), -32601);
+        assert_eq!(jsonrpc_error_code("Unknown method: bogus"), -32601);
+        assert_eq!(jsonrpc_error_code("gateway policy denied"), -32603);
+    }
+}
+
+#[cfg(test)]
+mod gateway_contract_tests {
+    use super::*;
+
+    /// EPIC 2 acceptance: ingestion applies the law -- redaction is
+    /// mandatory, malformed lines fail closed, events carry schema fields.
+    #[test]
+    fn audit_events_redacts_and_parses() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(b"1794336737\tdsh-session\tdsh.status\t127.0.0.1:3081\t0\t0\t111\n");
+        data.extend_from_slice(b"1794336738\tdsh-session\tgateway.metrics\t127.0.0.1:3081\t0\t0 --token=secretvalue\t222\n");
+        let ev = audit_events(&data, 20, false);
+        assert_eq!(ev.len(), 2, "both well-formed lines become events");
+        let joined: String = ev.iter()
+            .map(|v| v.as_str().unwrap_or_default())
+            .collect();
+        assert!(joined.contains("\"tool\":\"dsh.status\""));
+        assert!(joined.contains("\"tool\":\"gateway.metrics\""));
+        assert!(joined.contains("[REDACTED]"), "token value must be redacted");
+        assert!(!joined.contains("secretvalue"), "the secret must not survive");
+    }
+
+    #[test]
+    fn audit_events_head_vs_tail() {
+        let mut data: Vec<u8> = Vec::new();
+        for i in 0..15 {
+            data.extend_from_slice(format!("100{}\tbee\ttri-mcp\t127.0.0.1:3081\t0\t0\t{}\n", i, 900 + i).as_bytes());
+        }
+        assert_eq!(audit_events(&data, 10, true).len(), 10);
+        let tail = audit_events(&data, 10, false);
+        assert_eq!(tail.len(), 10);
+        assert!(tail[9].as_str().unwrap().contains("\"timestamp\":10014"), "tail keeps the LAST lines");
+    }
+
+    #[test]
+    fn audit_events_malformed_lines_fail_closed() {
+        let data = b"garbage line with no tabs\nanother\n".to_vec();
+        assert_eq!(audit_events(&data, 20, false).len(), 0, "malformed lines produce no events");
+    }
+}
+
+#[cfg(test)]
+mod vps_ingestion_tests {
+    use super::*;
+
+    /// E3 acceptance: a journald JSON line becomes a vps-labelled law event
+    /// with the MESSAGE redacted (token value consumed by [REDACTED]).
+    #[test]
+    fn vps_line_maps_unit_priority_and_redacts_message() {
+        let raw = format!("{{\"__REALTIME_TIMESTAMP\":\"1794337015000000\",\"_SYSTEMD_UNIT\":\"dsh.service\",\"PRIORITY\":\"6\",\"MESSAGE\":\"dsh web answered token=secretvalue\"}}");
+        let mut out = [0u8; 512];
+        let n = vps_line_to_event(raw.as_bytes(), &mut out, 512);
+        assert!(n > 80, "event emitted, n={n}");
+        let s = String::from_utf8_lossy(&out[..n]).to_string();
+        assert!(s.contains("\"host\":\"vps\""), "{}", s);
+        assert!(s.contains("\"source\":\"dsh-web\""), "{}", s);
+        assert!(s.contains("\"level\":1"), "{}", s);
+        assert!(s.contains("[REDACTED]"), "{}", s);
+        assert!(!s.contains("secretvalue"), "{}", s);
+    }
+
+    /// A malformed journald line fails closed (no event).
+    #[test]
+    fn vps_malformed_line_dropped() {
+        let raw = b"not json at all";
+        let mut out = [0u8; 128];
+        assert_eq!(vps_line_to_event(raw, &mut out, 128), 0);
+    }
+
+    /// Level mapping: PRIORITY 0-2 -> error(3), 3-4 -> warn(2), 5+ -> info(1).
+    #[test]
+    fn vps_priority_maps_to_contract_levels() {
+        for (prio, want) in [("0", 3u8), ("3", 2u8), ("6", 1u8)] {
+            let raw = format!("{{\"__REALTIME_TIMESTAMP\":\"1\",\"PRIORITY\":\"{prio}\",\"MESSAGE\":\"m\"}}");
+            let mut out = [0u8; 256];
+            vps_line_to_event(raw.as_bytes(), &mut out, 256);
+            let s = String::from_utf8_lossy(&out[..]).to_string();
+            assert!(s.contains(&format!("\"level\":{want}")), "prio={prio}: {s}");
+        }
+    }
 }
