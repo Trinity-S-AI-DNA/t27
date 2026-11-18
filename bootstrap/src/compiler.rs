@@ -19100,6 +19100,28 @@ impl VerilogCodegen {
                         let flat_name = format!("{}_{}", base_name, node.name);
                         self.write(&Self::verilog_safe_identifier(&flat_name));
                     } else if child.kind == NodeKind::ExprIdentifier {
+                        // W672: `.len` on a slice parameter has no fixed length
+                        // in Verilog. Emit a diagnostic instead of `s_len` which
+                        // would reference an undeclared identifier.
+                        if node.name == "len" {
+                            if let Some(ty) = self
+                                .local_types
+                                .get(&child.name)
+                                .or_else(|| self.param_types.get(&child.name))
+                                .or_else(|| self.module_types.get(&child.name))
+                            {
+                                let is_slice = ty.trim().starts_with("[]");
+                                if Self::parse_array_type(ty).is_some() || is_slice {
+                                    let recv_safe =
+                                        Self::verilog_safe_identifier(&child.name);
+                                    self.write(&format!(
+                                        "// ERROR: .len on slice parameter `{}` has no fixed length; declare `{}` as a port",
+                                        child.name, recv_safe
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
                         let flat_name = format!("{}_{}", child.name, node.name);
                         self.write(&Self::verilog_safe_identifier(&flat_name));
                         // (escape applied to the flattened name; see comment above)
