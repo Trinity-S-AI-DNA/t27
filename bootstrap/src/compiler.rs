@@ -1,5 +1,5 @@
 // bootstrap/src/compiler.rs
-// T27 → Zig Compiler Core (Lexer + Parser + Codege.map(|n| !self.nonstring_params.contains(&n) && self.string_names.contains(&n)))
+// T27 → Zig Compiler Core (Lexer + Parser + Codegen)
 //
 // This module contains the core compiler logic extracted for reusability.
 // It can be used by both CLI and HTTP server contexts.
@@ -8029,7 +8029,7 @@ impl Codegen {
                 .unwrap_or(false);
         }
         Self::trailing_name(node)
-            .map(|n| self.string_names.contains(&n))
+            .map(|n| !self.nonstring_params.contains(&n) && self.string_names.contains(&n))
             .unwrap_or(false)
     }
 
