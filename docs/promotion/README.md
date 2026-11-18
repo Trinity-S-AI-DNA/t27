@@ -39,18 +39,18 @@ If any element is missing, the asset is **not publishable**.
 
 | # | Issue | Deliverable | Status |
 |---|-------|-------------|--------|
-| M0-01 | #13474 | Capture promotion baseline (X + GitHub + course) | not in this milestone |
+| M0-01 | #13474 | `docs/promotion/baseline.md` + `baseline.json` | [done](#promotion-baseline) |
 | M0-02 | #13475 | `docs/promotion/course-map.md` | [done](#course-map) |
 | M0-03 | #13476 | `docs/promotion/widget-inventory.md` + `widget-inventory.json` | [done](#widget-inventory) |
-| M0-04 | #13477 | Content calendar (10-day cycle + weekly cadence) | not in this milestone |
-| M0-05 | #13478 | Content bank drafts (approved claims only) | not in this milestone |
-| M0-06 | #13479 | Funnel definition (one CTA per step) | not in this milestone |
-| M0-07 | #13480 | Metrics tracking + weekly campaign report template | not in this milestone |
+| M0-04 | #13477 | `docs/promotion/content-calendar.md` | [done](#content-calendar) |
+| M0-05 | #13478 | `docs/promotion/content-bank.md` + `content-bank.json` | [done](#content-bank) |
+| M0-06 | #13479 | `docs/promotion/funnel.md` | [done](#funnel) |
+| M0-07 | #13480 | `docs/promotion/metrics.md` + `weekly-report-template.md` | [done](#metrics) |
 | M0-08 | #13481 | `docs/promotion/contributor-path.md` + `good-first-issue-template.md` | [done](#contributor-path) |
 | M0-09 | #13482 | `docs/promotion/monetization-ladder.md` | [done](#monetization-ladder) |
 | M0-10 | #13483 | `docs/promotion/t27l-promotion-schema.md` + `specs/promotion/t27l_promotion.t27` | [done](#t27l-audit-schema) |
 | M0-11 | #13484 | `docs/promotion/self-improving-loop.md` | [done](#self-improving-loop) |
-| M0-12 | #13485 | Publish gate (widget + screenshot + test + human approval) | not in this milestone |
+| M0-12 | #13485 | `docs/promotion/publish-gate.md` | [done](#publish-gate) |
 
 The two contract specs live under `specs/`:
 
@@ -76,7 +76,14 @@ X → arXiv/GitHub → t27.ai course → widget → good first issue → contrib
 <details>
 <summary>Index anchors</summary>
 
+- [Promotion baseline](#promotion-baseline): `docs/promotion/baseline.md`
+- [Content calendar](#content-calendar): `docs/promotion/content-calendar.md`
+- [Content bank](#content-bank): `docs/promotion/content-bank.md`
 - [Course map](#course-map): `docs/promotion/course-map.md`
+- [Funnel](#funnel): `docs/promotion/funnel.md`
+- [Metrics tracking](#metrics): `docs/promotion/metrics.md`
+- [Weekly report template](#weekly-report-template): `docs/promotion/weekly-report-template.md`
+- [Publish gate](#publish-gate): `docs/promotion/publish-gate.md`
 - [Widget inventory](#widget-inventory): `docs/promotion/widget-inventory.md`
 - [Contributor path](#contributor-path): `docs/promotion/contributor-path.md`
 - [Monetization ladder](#monetization-ladder): `docs/promotion/monetization-ladder.md`
