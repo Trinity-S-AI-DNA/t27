@@ -1,0 +1,385 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/runtime/session_continuity_contract.t27
+// T27 Session Continuity Contract — the versioned checkpoint payload, the
+// meaningful step boundaries, the durable and failed checkpoint states, and
+// the last-known-good resume selection.
+//
+// Owner: T27_SESSION_NEVER_DIES_01 (issue #12895), 2026-10-30.
+//
+// OWNS:
+//   - the versioned checkpoint payload and its required fields
+//   - the meaningful step boundaries at which a durable checkpoint is required
+//   - the durable, failed and pending checkpoint states
+//   - the failed-write rule: the last known-good checkpoint survives
+//   - the last-known-good resume selection and the no-fall-back-to-zero rule
+//
+// DOES NOT OWN (never restate these facts here):
+//   - when a checkpoint is mandatory, the checkpoint states, the resume
+//     decision per state and degraded mode:
+//     specs/system/session-continuity.t27
+//   - the Doctor lifecycle states and the user-visible status bar:
+//     specs/system/session-doctor.t27
+//   - the recovery ladder levels and the per-failure policy:
+//     specs/system/session-recovery-ladder.t27
+//   - the bounded retry budget and the idempotency execution:
+//     specs/agents/session-bounded-retry.t27
+//   - failure-class taxonomy and the transient retry budget of the wire:
+//     specs/system/llm_request_provider_gate.t27
+//   - the checkpoint write mechanics of the save skill:
+//     specs/runtime/session_checkpoint_save.t27
+//
+// Live evidence (2026-10-30):
+//   - a session that dies mid-task keeps only its last coarse checkpoint, and
+//     a resuming instance cannot reconstruct goal, plan, decisions, tool
+//     results or evidence: the payload below carries all of them, so another
+//     instance can continue without asking the user anything.
+
+module session_continuity_contract;
+
+// ─── The versioned checkpoint payload ──────────────────────────────────────
+//
+// The payload is what another instance of the agent reads. Every field is
+// required: a checkpoint that only the instance that died could understand is
+// a log, not a checkpoint.
+
+pub const PAYLOAD_GOAL : u8 = 0;
+pub const PAYLOAD_PLAN : u8 = 1;
+pub const PAYLOAD_COMPLETED_STEPS : u8 = 2;
+pub const PAYLOAD_TOOL_RESULTS : u8 = 3;
+pub const PAYLOAD_DECISIONS : u8 = 4;
+pub const PAYLOAD_PROVIDER_ROUTE : u8 = 5;
+pub const PAYLOAD_EVIDENCE_LINKS : u8 = 6;
+pub const PAYLOAD_IDEMPOTENCY_REFERENCES : u8 = 7;
+pub const PAYLOAD_FORMAT_VERSION : u8 = 8;
+pub const PAYLOAD_COUNT : u32 = 9;
+
+// The format version travels with the payload so a reader can tell whether it
+// understands what it is reading before it trusts it.
+pub const FORMAT_VERSION : u8 = 1;
+
+// ─── The meaningful step boundaries ────────────────────────────────────────
+//
+// A durable checkpoint is required after every meaningful step. The four are
+// enumerated so no implementation can quietly narrow the rule.
+
+pub const BOUNDARY_TOOL_CALL_COMPLETED : u8 = 0;
+pub const BOUNDARY_SUBTASK_FINISHED : u8 = 1;
+pub const BOUNDARY_ARTIFACT_WRITTEN : u8 = 2;
+pub const BOUNDARY_PROVIDER_RESPONSE_COMMITTED : u8 = 3;
+pub const BOUNDARY_COUNT : u32 = 4;
+
+// ─── The checkpoint states ─────────────────────────────────────────────────
+
+pub const CHECKPOINT_PENDING : u8 = 0;
+pub const CHECKPOINT_DURABLE : u8 = 1;
+pub const CHECKPOINT_FAILED : u8 = 2;
+pub const CHECKPOINT_STATE_COUNT : u32 = 3;
+
+// ─── The resume selection ──────────────────────────────────────────────────
+
+pub const RESUME_LATEST_VALID : u8 = 0;
+pub const RESUME_LAST_KNOWN_GOOD : u8 = 1;
+pub const RESUME_BLOCKED : u8 = 2;
+pub const RESUME_COUNT : u32 = 3;
+
+// ─── Functions ─────────────────────────────────────────────────────────────
+
+// payload_has_required_fields(has_goal, has_plan, has_completed_steps,
+// has_tool_results, has_decisions, has_provider_route, has_evidence_links,
+// has_idempotency_references) -> bool
+//
+// The eight payload fields are all required: the goal, the plan, the steps
+// already done, the tool results, the decisions, the route that served the
+// work, the evidence links and the idempotency references.
+pub fn payload_has_required_fields(has_goal: bool, has_plan: bool, has_completed_steps: bool, has_tool_results: bool, has_decisions: bool, has_provider_route: bool, has_evidence_links: bool, has_idempotency_references: bool) -> bool {
+    if (has_goal == false) {
+        return false;
+    }
+    if (has_plan == false) {
+        return false;
+    }
+    if (has_completed_steps == false) {
+        return false;
+    }
+    if (has_tool_results == false) {
+        return false;
+    }
+    if (has_decisions == false) {
+        return false;
+    }
+    if (has_provider_route == false) {
+        return false;
+    }
+    if (has_evidence_links == false) {
+        return false;
+    }
+    if (has_idempotency_references == false) {
+        return false;
+    }
+    return true;
+}
+
+// format_version_is_known(version) -> bool
+// A reader that does not understand the format does not trust the payload.
+pub fn format_version_is_known(version: u8) -> bool {
+    if (version == FORMAT_VERSION) {
+        return true;
+    }
+    return false;
+}
+
+// payload_is_readable_by_another_instance(has_goal, has_plan,
+// has_completed_steps, has_tool_results, has_decisions, has_provider_route,
+// has_evidence_links, has_idempotency_references, version) -> bool
+//
+// Readable means: every field present AND a version this reader knows.
+pub fn payload_is_readable_by_another_instance(has_goal: bool, has_plan: bool, has_completed_steps: bool, has_tool_results: bool, has_decisions: bool, has_provider_route: bool, has_evidence_links: bool, has_idempotency_references: bool, version: u8) -> bool {
+    if (payload_has_required_fields(has_goal, has_plan, has_completed_steps, has_tool_results, has_decisions, has_provider_route, has_evidence_links, has_idempotency_references) == false) {
+        return false;
+    }
+    return format_version_is_known(version);
+}
+
+// idempotency_reference_present(has_reference) -> bool
+// The payload names the idempotency keys of the external actions it records,
+// so a replay knows which actions are safe to repeat.
+pub fn idempotency_reference_present(has_reference: bool) -> bool {
+    return has_reference;
+}
+
+// boundary_requires_durable_checkpoint(boundary) -> bool
+pub fn boundary_requires_durable_checkpoint(boundary: u8) -> bool {
+    if (boundary < BOUNDARY_COUNT) {
+        return true;
+    }
+    return false;
+}
+
+// meaningful_boundary_count() - how many save points the contract declares.
+pub fn meaningful_boundary_count() -> u32 {
+    return BOUNDARY_COUNT;
+}
+
+// checkpoint_is_durable(state) -> bool
+pub fn checkpoint_is_durable(state: u8) -> bool {
+    if (state == CHECKPOINT_DURABLE) {
+        return true;
+    }
+    return false;
+}
+
+// failed_write_preserves_last_known_good(new_state, previous_was_durable) -> bool
+//
+// A failed write does not destroy what was already durable: the previous
+// known-good checkpoint is still there after the failure.
+pub fn failed_write_preserves_last_known_good(new_state: u8, previous_was_durable: bool) -> bool {
+    if (new_state != CHECKPOINT_FAILED) {
+        return true;
+    }
+    return previous_was_durable;
+}
+
+// failed_write_is_visible(visible) -> bool
+// A failed write is announced. The user must learn that the work is no
+// longer protected.
+pub fn failed_write_is_visible(visible: bool) -> bool {
+    return visible;
+}
+
+// failed_write_must_not_report_the_new_step_durable(state) -> bool
+// The step whose write failed is NOT durable, whatever else is true.
+pub fn failed_write_must_not_report_the_new_step_durable(state: u8) -> bool {
+    if (state == CHECKPOINT_FAILED) {
+        return false;
+    }
+    return true;
+}
+
+// resume_selects_latest_valid(candidate_step, latest_valid_step) -> bool
+// The resume picks the latest valid completed checkpoint.
+pub fn resume_selects_latest_valid(candidate_step: u32, latest_valid_step: u32) -> bool {
+    if (candidate_step != latest_valid_step) {
+        return false;
+    }
+    return true;
+}
+
+// resume_must_not_fall_back_to_zero(has_valid_earlier, selected_step) -> bool
+// When a valid earlier checkpoint exists, the resume does not land on zero.
+pub fn resume_must_not_fall_back_to_zero(has_valid_earlier: bool, selected_step: u32) -> bool {
+    if (has_valid_earlier == false) {
+        return true;
+    }
+    if (selected_step == 0) {
+        return false;
+    }
+    return true;
+}
+
+// resume_must_not_restart_from_zero(completed_steps, selected_step) -> bool
+// A restart replays step zero; a resume does not.
+pub fn resume_must_not_restart_from_zero(completed_steps: u32, selected_step: u32) -> bool {
+    if (completed_steps > 0 and selected_step == 0) {
+        return false;
+    }
+    return true;
+}
+
+// resume_selection(has_valid_candidate, candidate_step, known_good_step) -> u8
+//
+// Three outcomes: the latest valid checkpoint, the last known-good one, or
+// blocked. "Blocked" is the honest answer when nothing survived: the session
+// says so instead of pretending it can continue.
+pub fn resume_selection(has_valid_candidate: bool, candidate_step: u32, known_good_step: u32) -> u8 {
+    if (has_valid_candidate == true) {
+        return RESUME_LATEST_VALID;
+    }
+    if (known_good_step > 0) {
+        return RESUME_LAST_KNOWN_GOOD;
+    }
+    return RESUME_BLOCKED;
+}
+
+// resume_is_blocked_only_when_nothing_survived(selection, known_good_step) -> bool
+pub fn resume_is_blocked_only_when_nothing_survived(selection: u8, known_good_step: u32) -> bool {
+    if (selection == RESUME_BLOCKED) {
+        if (known_good_step > 0) {
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "the_payload_carries_the_eight_fields_another_instance_needs" {
+    assert(payload_has_required_fields(true, true, true, true, true, true, true, true) == true);
+    assert(payload_has_required_fields(false, true, true, true, true, true, true, true) == false);
+    assert(payload_has_required_fields(true, false, true, true, true, true, true, true) == false);
+    assert(payload_has_required_fields(true, true, false, true, true, true, true, true) == false);
+    assert(payload_has_required_fields(true, true, true, false, true, true, true, true) == false);
+    assert(payload_has_required_fields(true, true, true, true, false, true, true, true) == false);
+    assert(payload_has_required_fields(true, true, true, true, true, false, true, true) == false);
+    assert(payload_has_required_fields(true, true, true, true, true, true, false, true) == false);
+    assert(payload_has_required_fields(true, true, true, true, true, true, true, false) == false);
+}
+
+test "the_payload_declares_its_format_version" {
+    assert(PAYLOAD_COUNT == 9);
+    assert(format_version_is_known(FORMAT_VERSION) == true);
+    assert(format_version_is_known(FORMAT_VERSION + 1) == false);
+    assert(payload_is_readable_by_another_instance(true, true, true, true, true, true, true, true, FORMAT_VERSION) == true);
+    assert(payload_is_readable_by_another_instance(true, true, true, true, true, true, true, true, FORMAT_VERSION + 1) == false);
+    assert(payload_is_readable_by_another_instance(false, true, true, true, true, true, true, true, FORMAT_VERSION) == false);
+}
+
+test "the_payload_names_the_idempotency_references" {
+    assert(idempotency_reference_present(true) == true);
+    assert(idempotency_reference_present(false) == false);
+}
+
+test "every_meaningful_boundary_requires_a_durable_checkpoint" {
+    assert(meaningful_boundary_count() == 4);
+    assert(boundary_requires_durable_checkpoint(BOUNDARY_TOOL_CALL_COMPLETED) == true);
+    assert(boundary_requires_durable_checkpoint(BOUNDARY_SUBTASK_FINISHED) == true);
+    assert(boundary_requires_durable_checkpoint(BOUNDARY_ARTIFACT_WRITTEN) == true);
+    assert(boundary_requires_durable_checkpoint(BOUNDARY_PROVIDER_RESPONSE_COMMITTED) == true);
+    assert(boundary_requires_durable_checkpoint(BOUNDARY_COUNT) == false);
+}
+
+test "a_failed_write_keeps_the_last_known_good_checkpoint" {
+    assert(failed_write_preserves_last_known_good(CHECKPOINT_FAILED, true) == true);
+    assert(failed_write_preserves_last_known_good(CHECKPOINT_FAILED, false) == false);
+    assert(failed_write_preserves_last_known_good(CHECKPOINT_DURABLE, false) == true);
+}
+
+test "a_failed_write_is_visible_and_never_reports_the_step_durable" {
+    assert(failed_write_is_visible(true) == true);
+    assert(failed_write_is_visible(false) == false);
+    assert(failed_write_must_not_report_the_new_step_durable(CHECKPOINT_FAILED) == false);
+    assert(failed_write_must_not_report_the_new_step_durable(CHECKPOINT_DURABLE) == true);
+    assert(checkpoint_is_durable(CHECKPOINT_DURABLE) == true);
+    assert(checkpoint_is_durable(CHECKPOINT_FAILED) == false);
+}
+
+test "the_resume_takes_the_latest_valid_checkpoint" {
+    assert(resume_selects_latest_valid(12, 12) == true);
+    assert(resume_selects_latest_valid(11, 12) == false);
+    assert(resume_selection(true, 12, 7) == RESUME_LATEST_VALID);
+    assert(resume_selection(false, 0, 7) == RESUME_LAST_KNOWN_GOOD);
+    assert(resume_selection(false, 0, 0) == RESUME_BLOCKED);
+}
+
+test "the_resume_never_falls_back_to_zero_when_a_checkpoint_survived" {
+    assert(resume_must_not_fall_back_to_zero(true, 0) == false);
+    assert(resume_must_not_fall_back_to_zero(true, 7) == true);
+    assert(resume_must_not_fall_back_to_zero(false, 0) == true);
+    assert(resume_must_not_restart_from_zero(12, 0) == false);
+    assert(resume_must_not_restart_from_zero(12, 12) == true);
+    assert(resume_must_not_restart_from_zero(0, 0) == true);
+}
+
+test "a_blocked_resume_means_nothing_survived" {
+    assert(resume_is_blocked_only_when_nothing_survived(RESUME_BLOCKED, 0) == true);
+    assert(resume_is_blocked_only_when_nothing_survived(RESUME_BLOCKED, 7) == false);
+    assert(resume_is_blocked_only_when_nothing_survived(RESUME_LATEST_VALID, 0) == true);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+invariant a_checkpoint_always_carries_the_resumable_payload {
+    payload_has_required_fields(false, true, true, true, true, true, true, true) == false;
+    payload_has_required_fields(true, true, true, true, true, true, true, true) == true;
+}
+
+invariant every_meaningful_boundary_is_a_save_point {
+    boundary_requires_durable_checkpoint(BOUNDARY_TOOL_CALL_COMPLETED) == true;
+    boundary_requires_durable_checkpoint(BOUNDARY_ARTIFACT_WRITTEN) == true;
+    boundary_requires_durable_checkpoint(BOUNDARY_COUNT) == false;
+}
+
+invariant a_failed_write_never_destroys_the_last_known_good {
+    failed_write_preserves_last_known_good(CHECKPOINT_FAILED, false) == false;
+    failed_write_preserves_last_known_good(CHECKPOINT_FAILED, true) == true;
+}
+
+invariant a_failed_write_is_never_reported_as_durable {
+    failed_write_must_not_report_the_new_step_durable(CHECKPOINT_FAILED) == false;
+    failed_write_must_not_report_the_new_step_durable(CHECKPOINT_DURABLE) == true;
+}
+
+invariant a_resume_never_rewinds_to_zero {
+    resume_must_not_fall_back_to_zero(true, 0) == false;
+    resume_must_not_restart_from_zero(12, 0) == false;
+    resume_must_not_restart_from_zero(12, 12) == true;
+}
+
+invariant a_blocked_resume_means_nothing_survived {
+    resume_is_blocked_only_when_nothing_survived(RESUME_BLOCKED, 7) == false;
+    resume_is_blocked_only_when_nothing_survived(RESUME_BLOCKED, 0) == true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Benchmarks
+// ═══════════════════════════════════════════════════════════════════════════
+
+bench payload_completeness_check {
+    ; Measure: the cost of deciding whether a payload is resumable
+    target: < 10ms on typical hardware
+    iterations: 1000
+    setup: create_test_payload()
+    measure: payload_has_required_fields(setup.goal, setup.plan, setup.completed_steps, setup.tool_results, setup.decisions, setup.provider_route, setup.evidence_links, setup.idempotency_references)
+}
+
+bench resume_selection_cost {
+    ; Measure: the cost of choosing the checkpoint to resume from
+    target: < 10ms on typical hardware
+    iterations: 1000
+    setup: create_test_checkpoints()
+    measure: resume_selection(setup.has_valid_candidate, setup.candidate_step, setup.known_good_step)
+}

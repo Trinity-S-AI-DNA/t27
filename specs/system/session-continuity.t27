@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 Session Continuity SSOT
+// Purpose: the contract that keeps a long task resumable - what a checkpoint
+//          is, when one is mandatory, what a resume may do, and what happens
+//          when no funded route is left.
+//
+// Owner: T27_ORDER_RESTORE_01 (issue #12897), 2026-10-30.
+// Extended: T27_SESSION_NEVER_DIES_01 (epic #12899, item #12900), 2026-10-30 -
+//           durable checkpoint after every meaningful step; checkpoint content
+//           that lets a fresh agent instance resume without starting from zero.
+//
+// OWNS:
+//   - when a checkpoint is mandatory (the long-task rule)
+//   - the required content of a checkpoint
+//   - the checkpoint states and the resume decision per state
+//   - degraded mode: when it is allowed, and that it stays visible
+//   - the no-work-loss and no-silent-crash rules
+//
+// DOES NOT OWN (never restate these facts here):
+//   - failure-class taxonomy, per-class checkpoint preservation, follow-up
+//     creation: specs/system/llm_request_provider_gate.t27
+//   - provider funding and quarantine state: specs/system/providers.t27
+//   - rung order and switch rules: specs/system/model-ladder.t27
+//   - disk preflight and reserves: specs/system/disk-health.t27
+//   - release evidence and rollback: specs/system/release-gates.t27
+//   - the session protocol and the timeout ladder:
+//       specs/server/session.t27, specs/sandbox/session_timeout.t27
+//   - the recovery verification skill:
+//       specs/agents/dsh-session-recovery-verify.t27
+//   - the versioned checkpoint payload, the meaningful step boundaries, the
+//     durable and failed checkpoint states and the last-known-good resume
+//     selection: specs/runtime/session_continuity_contract.t27
+//   - the Doctor lifecycle states and the user-visible status bar:
+//       specs/system/session-doctor.t27
+//   - the recovery ladder levels and the per-failure policy:
+//       specs/system/session-recovery-ladder.t27
+//
+// Live evidence (2026-10-30):
+//   - a provider that is out of quota must not end a long task with its work
+//     gone: the checkpoint survives, the turn is blocked, a follow-up is
+//     created, and the task resumes when a funded route exists
+
+module session_continuity;
+
+// ─── Work classes ──────────────────────────────────────────────────────────
+
+pub const WORK_CLASS_SHORT : u8 = 0;
+pub const WORK_CLASS_LONG : u8 = 1;
+
+// ─── Checkpoint states ─────────────────────────────────────────────────────
+
+pub const CP_VALID : u8 = 0;
+pub const CP_MISSING : u8 = 1;
+pub const CP_STALE : u8 = 2;
+pub const CP_CORRUPT : u8 = 3;
+
+// ─── Resume decisions ──────────────────────────────────────────────────────
+
+pub const RESUME_ALLOWED : u8 = 0;
+pub const RESUME_AFTER_REPAIR : u8 = 1;
+pub const RESUME_RESTART : u8 = 2;
+pub const RESUME_BLOCKED : u8 = 3;
+
+// ─── Degraded mode ─────────────────────────────────────────────────────────
+
+pub const DEGRADED_DISABLED : u8 = 0;
+pub const DEGRADED_ALLOWED : u8 = 1;
+
+// ─── Required checkpoint fields ────────────────────────────────────────────
+
+pub const CP_FIELD_TASK_ID : u8 = 0;
+pub const CP_FIELD_STEP : u8 = 1;
+pub const CP_FIELD_TIMESTAMP : u8 = 2;
+pub const CP_FIELD_DIGEST : u8 = 3;
+pub const CP_FIELD_COUNT : u32 = 4;
+
+// ─── Functions ─────────────────────────────────────────────────────────────
+
+// task_requires_checkpoint(work_class) - a long task without a checkpoint is
+// a task that can lose its work.
+pub fn task_requires_checkpoint(work_class: u8) -> bool {
+    if (work_class == WORK_CLASS_LONG) {
+        return true;
+    }
+    return false;
+}
+
+// checkpoint_has_required_fields(has_task_id, has_step, has_timestamp, has_digest) -> bool
+pub fn checkpoint_has_required_fields(has_task_id: bool, has_step: bool, has_timestamp: bool, has_digest: bool) -> bool {
+    if (has_task_id == false) {
+        return false;
+    }
+    if (has_step == false) {
+        return false;
+    }
+    if (has_timestamp == false) {
+        return false;
+    }
+    if (has_digest == false) {
+        return false;
+    }
+    return true;
+}
+
+// checkpoint_state_is_valid(state) -> bool
+pub fn checkpoint_state_is_valid(state: u8) -> bool {
+    if (state == CP_VALID) {
+        return true;
+    }
+    return false;
+}
+
+// resume_decision(cp_state, funded_route_available) -> u8
+//
+// A checkpoint decides whether the work can continue. A missing funded route
+// decides whether it may continue at all: without one, the turn is blocked
+// and escalated, never silently continued on a route that cannot pay.
+pub fn resume_decision(cp_state: u8, funded_route_available: bool) -> u8 {
+    if (funded_route_available == false) {
+        return RESUME_BLOCKED;
+    }
+    if (cp_state == CP_VALID) {
+        return RESUME_ALLOWED;
+    }
+    if (cp_state == CP_STALE) {
+        return RESUME_AFTER_REPAIR;
+    }
+    if (cp_state == CP_MISSING) {
+        return RESUME_RESTART;
+    }
+    return RESUME_BLOCKED;
+}
+
+// degraded_mode_allowed(funded_route_available, fallback_is_limited) -> u8
+//
+// Degraded mode means running on a lower rung (a local limited model) while
+// the preferred route is unavailable. It requires a funded route to exist,
+// and it must stay visible to the caller.
+pub fn degraded_mode_allowed(funded_route_available: bool, fallback_is_limited: bool) -> u8 {
+    if (funded_route_available == false) {
+        return DEGRADED_DISABLED;
+    }
+    if (fallback_is_limited) {
+        return DEGRADED_ALLOWED;
+    }
+    return DEGRADED_ALLOWED;
+}
+
+// degraded_mode_must_be_visible() -> bool - a downgrade is always reported.
+pub fn degraded_mode_must_be_visible() -> bool {
+    return true;
+}
+
+// checkpoint_written_before_mutation(checkpoint_written, mutation_started) -> bool
+pub fn checkpoint_written_before_mutation(checkpoint_written: bool, mutation_started: bool) -> bool {
+    if (mutation_started == false) {
+        return true;
+    }
+    return checkpoint_written;
+}
+
+// work_lost(checkpoint_present, artifacts_present) -> bool
+pub fn work_lost(checkpoint_present: bool, artifacts_present: bool) -> bool {
+    if (checkpoint_present == true and artifacts_present == true) {
+        return false;
+    }
+    return true;
+}
+
+// silent_crash_forbidden(task_interrupted, checkpoint_present, escalation_raised) -> bool
+//
+// An interrupted task without a checkpoint must still raise an escalation:
+// silence is never an acceptable outcome.
+pub fn silent_crash_forbidden(task_interrupted: bool, checkpoint_present: bool, escalation_raised: bool) -> bool {
+    if (task_interrupted == false) {
+        return true;
+    }
+    if (checkpoint_present == true) {
+        return true;
+    }
+    return escalation_raised;
+}
+
+// resume_targets_funded_route(funded_route_available) -> bool
+pub fn resume_targets_funded_route(funded_route_available: bool) -> bool {
+    return funded_route_available;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "long_task_requires_a_checkpoint_short_task_does_not" {
+    assert(task_requires_checkpoint(WORK_CLASS_LONG) == true);
+    assert(task_requires_checkpoint(WORK_CLASS_SHORT) == false);
+}
+
+test "checkpoint_needs_task_step_timestamp_and_digest" {
+    assert(checkpoint_has_required_fields(true, true, true, true) == true);
+    assert(checkpoint_has_required_fields(false, true, true, true) == false);
+    assert(checkpoint_has_required_fields(true, false, true, true) == false);
+    assert(checkpoint_has_required_fields(true, true, false, true) == false);
+    assert(checkpoint_has_required_fields(true, true, true, false) == false);
+}
+
+test "valid_checkpoint_allows_resume" {
+    assert(checkpoint_state_is_valid(CP_VALID) == true);
+    assert(checkpoint_state_is_valid(CP_STALE) == false);
+    assert(resume_decision(CP_VALID, true) == RESUME_ALLOWED);
+}
+
+test "stale_checkpoint_resumes_only_after_repair" {
+    assert(resume_decision(CP_STALE, true) == RESUME_AFTER_REPAIR);
+}
+
+test "missing_checkpoint_restarts_explicitly" {
+    assert(resume_decision(CP_MISSING, true) == RESUME_RESTART);
+}
+
+test "corrupt_checkpoint_blocks_and_escalates" {
+    assert(resume_decision(CP_CORRUPT, true) == RESUME_BLOCKED);
+}
+
+test "without_a_funded_route_the_turn_is_blocked_even_with_a_valid_checkpoint" {
+    assert(resume_decision(CP_VALID, false) == RESUME_BLOCKED);
+    assert(resume_targets_funded_route(false) == false);
+    assert(resume_targets_funded_route(true) == true);
+}
+
+test "degraded_mode_needs_a_funded_route_and_stays_visible" {
+    assert(degraded_mode_allowed(false, true) == DEGRADED_DISABLED);
+    assert(degraded_mode_allowed(true, true) == DEGRADED_ALLOWED);
+    assert(degraded_mode_allowed(true, false) == DEGRADED_ALLOWED);
+    assert(degraded_mode_must_be_visible() == true);
+}
+
+test "the_checkpoint_is_written_before_any_mutation" {
+    assert(checkpoint_written_before_mutation(true, true) == true);
+    assert(checkpoint_written_before_mutation(false, true) == false);
+    assert(checkpoint_written_before_mutation(false, false) == true);
+}
+
+test "work_is_not_lost_when_a_checkpoint_and_artifacts_exist" {
+    assert(work_lost(true, true) == false);
+    assert(work_lost(true, false) == true);
+    assert(work_lost(false, true) == true);
+}
+
+test "an_interrupted_task_without_a_checkpoint_still_escalates" {
+    assert(silent_crash_forbidden(true, false, true) == true);
+    assert(silent_crash_forbidden(true, false, false) == false);
+    assert(silent_crash_forbidden(true, true, false) == true);
+    assert(silent_crash_forbidden(false, false, false) == true);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+invariant a_long_task_always_has_a_checkpoint {
+    task_requires_checkpoint(WORK_CLASS_LONG) == true;
+    task_requires_checkpoint(WORK_CLASS_SHORT) == false;
+}
+
+invariant resume_never_happens_without_a_valid_checkpoint {
+    resume_decision(CP_MISSING, true) != RESUME_ALLOWED;
+    resume_decision(CP_STALE, true) != RESUME_ALLOWED;
+    resume_decision(CP_CORRUPT, true) != RESUME_ALLOWED;
+    resume_decision(CP_VALID, true) == RESUME_ALLOWED;
+}
+
+invariant resume_never_targets_an_unfunded_route {
+    resume_decision(CP_VALID, false) != RESUME_ALLOWED;
+    resume_decision(CP_STALE, false) != RESUME_ALLOWED;
+    resume_targets_funded_route(false) == false;
+}
+
+invariant degraded_mode_is_never_silent {
+    degraded_mode_must_be_visible() == true;
+    degraded_mode_allowed(false, true) == DEGRADED_DISABLED;
+}
+
+invariant work_is_never_lost_silently {
+    work_lost(true, true) == false;
+    silent_crash_forbidden(true, false, false) == false;
+}
+
+invariant no_mutation_starts_without_a_checkpoint {
+    checkpoint_written_before_mutation(false, true) == false;
+    checkpoint_written_before_mutation(true, true) == true;
+}

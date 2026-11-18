@@ -66,29 +66,31 @@ pub const L_TYPES: u8 = 21;
 
 pub const L_DUPES: u8 = 22;
 
-pub const L_STAGE: u8 = 23;
+pub const L_CENSUS: u8 = 23;
 
-pub const L_PENDING: u8 = 24;
+pub const L_STAGE: u8 = 24;
 
-pub const L_TITLE: u8 = 25;
+pub const L_PENDING: u8 = 25;
 
-pub const L_COMMIT: u8 = 26;
+pub const L_TITLE: u8 = 26;
 
-pub const L_HEAD: u8 = 27;
+pub const L_COMMIT: u8 = 27;
 
-pub const L_PUSH: u8 = 28;
+pub const L_HEAD: u8 = 28;
 
-pub const L_REMOTE_HEAD: u8 = 29;
+pub const L_PUSH: u8 = 29;
 
-pub const L_PR: u8 = 30;
+pub const L_REMOTE_HEAD: u8 = 30;
 
-pub const L_AUTO: u8 = 31;
+pub const L_PR: u8 = 31;
 
-pub const L_AUTO_CHECK: u8 = 32;
+pub const L_AUTO: u8 = 32;
 
-pub const L_CLEAN: u8 = 33;
+pub const L_AUTO_CHECK: u8 = 33;
 
-pub const LAND_STEPS: u8 = 34;
+pub const L_CLEAN: u8 = 34;
+
+pub const LAND_STEPS: u8 = 35;
 
 pub const L_OK: u8 = 0;
 
@@ -672,6 +674,9 @@ pub fn step_name(k: u8) -> &'static str {
     if (k == L_DUPES) {
         return "dupes";
     }
+    if (k == L_CENSUS) {
+        return "census";
+    }
     if (k == L_STAGE) {
         return "stage";
     }
@@ -710,7 +715,7 @@ pub fn step_name(k: u8) -> &'static str {
 
 pub fn judge(r: TriLandReq, ev: &'static str, k: u8, n: u64) -> u8 {
     let x: u64 = exit_of(ev, k, n);
-    if (((((k == L_FETCH) || (k == L_WORKTREE)) || (k == L_CHECKOUT)) || (k == L_STAGE)) || (k == L_COMMIT)) {
+    if (((((k == L_FETCH) || (k == L_WORKTREE)) || (k == L_CHECKOUT)) || (k == L_CENSUS)) || (k == L_STAGE)) || (k == L_COMMIT) {
         if (x != 0) {
             return L_STEP;
         }
@@ -1210,6 +1215,10 @@ pub fn step_argv(r: TriLandReq, ev: &'static str, k: u8, n: u64, out: &mut [u8])
     if (k == L_TYPES) {
         w = emit_str(out, w, r.tri);
         w = emit_str(out, w, "\ntypes\nratchet\n");
+    }
+    if (k == L_CENSUS) {
+        w = emit_str(out, w, r.tri);
+        w = emit_str(out, w, "\ncensus\npin\n--bless\n");
     }
     if (k == L_STAGE) {
         w = emit_str(out, w, "git\nadd\n.trinity/seals\n");

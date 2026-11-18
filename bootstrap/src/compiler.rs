@@ -1821,6 +1821,32 @@ the parser used to read it as `{}` followed by a negation",
         {
             self.reject_unterminated_string()?;
 
+            // Skip `;` comments inside `spec {}` blocks (indented `;` comments
+            // are not at column 1, so the lexer does not treat them as comments;
+            // here at module level they are statement separators, not
+            // declarations, so skip them as no-ops, consuming the rest of the line).
+            if self.current.kind == TokenKind::Semicolon {
+                let line = self.current.line;
+                self.advance();
+                while self.current.kind != TokenKind::Eof && self.current.line == line {
+                    self.advance();
+                }
+                continue;
+            }
+            // Skip lines starting with a non-ASCII character (e.g. `→`)
+            // inside `spec {}` blocks. These are visual comment markers that
+            // the lexer does not recognize as comments.
+            if !self.current.lexeme.is_empty()
+                && self.current.lexeme.chars().next().map_or(false, |c| !c.is_ascii())
+            {
+                let line = self.current.line;
+                self.advance();
+                while self.current.kind != TokenKind::Eof && self.current.line == line {
+                    self.advance();
+                }
+                continue;
+            }
+
             // W579: a Rust-style ATTRIBUTE, `#[test]` / `#[derive(...)]`.
             // Three specs carry Rust source verbatim; the attribute parsed as
             // an expression statement and the `fn` after it was then
@@ -1869,6 +1895,26 @@ the parser used to read it as `{}` followed by a negation",
                     continue;
                 }
                 self.restore_state(checkpoint);
+            }
+
+            // W581: `identifier { ... }` inside `spec Name { ... }` where
+            // `spec` keyword was omitted (e.g. `goal_progress_tracker { ... }`
+            // inside `spec goal_progress_tracking { ... }`). Treat it as a
+            // nested spec body so that `;` comments inside it are skipped
+            // (indented `;` comments are not at column 1, so the lexer does
+            // not treat them as comments).
+            if self.current.kind == TokenKind::Ident
+                && self.peek.kind == TokenKind::LBrace
+            {
+                let checkpoint = self.save_state();
+                let name = self.current.lexeme.clone();
+                self.advance(); // consume identifier
+                self.advance(); // consume {
+                self.parse_module_body(module)?;
+                if self.current.kind == TokenKind::RBrace {
+                    self.advance();
+                }
+                continue;
             }
 
             // W577: a file may declare SEVERAL modules.
@@ -8379,18 +8425,26 @@ impl Codegen {
         }
 
         // Emit @import for UseDecl nodes with resolved paths
+        // Split "t27f::frame_render::ppm_len" into module path "t27f::frame_render"
+        // and symbol "ppm_len", so we import the module and reference the symbol
         let mut has_imports = false;
         for decl in &ast.children {
             if decl.kind == NodeKind::UseDecl {
+                // Split off the last :: segment (the symbol name) from the module path
+                let value_str = decl.value.as_str();
+                let (module_path, symbol_name) = match value_str.rfind("::") {
+                    Some(pos) => (&value_str[..pos], &value_str[pos + 2..]),
+                    None => (value_str, decl.name.as_str()),
+                };
                 let import_path = resolve_import_path(
-                    &decl.value, // e.g. "base::types"
-                    &decl.name,  // e.g. "types"
+                    module_path,
+                    decl.name.as_str(),
                     current_rel_path,
                     module_map,
                 );
                 self.write_line(&format!(
-                    "const {} = @import(\"{}\");",
-                    decl.name, import_path
+                    "const {} = @import(\"{}\").{};",
+                    decl.name, import_path, symbol_name
                 ));
                 has_imports = true;
             }
@@ -9869,8 +9923,7 @@ impl Codegen {
         }
 
         if node.children.is_empty() {
-            self.write_indent();
-            self.write_line("// TODO: implement benchmark");
+            // An empty body is valid Zig -- just an empty block.
         }
 
         self.dedent();
@@ -10813,7 +10866,10 @@ impl Codegen {
                                 self.write(")");
                             }
                             None if by_ref => {
-                                self.write("&");
+                                // Slice/array parameters are already pointers in C
+                                // (uint8_t *out), so &out would be uint8_t (**)
+                                // which does not match uint8_t *. Just emit the
+                                // identifier; it decays to a pointer on call.
                                 self.gen_expr(arg);
                             }
                             None => {
@@ -18474,6 +18530,15 @@ impl VerilogCodegen {
                             return;
                         }
                     }
+                    // W672: `.len()` on a slice parameter has no fixed length
+                    // in Verilog. Declare `s_len` as a port or refuse with a
+                    // diagnostic naming the line.
+                    let recv_safe = Self::verilog_safe_identifier(&recv);
+                    self.write(&format!(
+                        "// ERROR: .len() on slice parameter `{}` has no fixed length; declare `{}` as a port",
+                        recv, recv_safe
+                    ));
+                    return;
                 }
 
 

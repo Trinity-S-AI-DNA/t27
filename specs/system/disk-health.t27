@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 Disk Health SSOT
+// Purpose: the disk policy layer - which work needs a preflight, how much
+//          free space must remain, what may be cleaned, and when a task is
+//          blocked before it can cause ENOSPC.
+//
+// Owner: T27_ORDER_RESTORE_01 (issue #12897), 2026-10-30.
+//
+// OWNS:
+//   - which work classes require a disk preflight before they start
+//   - the reserve rule: a task may start only when the reserve is satisfied
+//   - the decision between allow, cleanup-first and block
+//   - the rule that a never-clean class is never cleaned automatically
+//   - the ENOSPC prevention invariant
+//
+// DOES NOT OWN (never restate these facts here):
+//   - the measured snapshot and the warning/critical thresholds:
+//       specs/system/disk/dsh-disk-health-snapshot.t27
+//   - the reservation arithmetic (task weights, criticality multipliers,
+//     minimum safe free space, overhead): specs/system/disk/dsh-write-heavy-preflight.t27
+//   - the cleanup classes, the never-clean list and the cleanup priority:
+//       specs/system/disk/dsh-disk-cleanup-plan.t27
+//   - checkpoint and resume rules: specs/system/session-continuity.t27
+//   - release evidence rules: specs/system/release-gates.t27
+//
+// Live evidence (2026-10-30):
+//   - the host ran out of disk during a fan-out on this machine and a lane
+//     died; the disk policy must therefore be a gate, not an observation
+
+module disk_health;
+
+// ─── Work classes ──────────────────────────────────────────────────────────
+
+pub const WORK_CLASS_LIGHT : u8 = 0;
+pub const WORK_CLASS_HEAVY : u8 = 1;
+
+// ─── Decisions ─────────────────────────────────────────────────────────────
+
+pub const DECISION_ALLOW : u8 = 0;
+pub const DECISION_CLEANUP_FIRST : u8 = 1;
+pub const DECISION_BLOCK : u8 = 2;
+pub const DECISION_COUNT : u32 = 3;
+
+// ─── Functions ─────────────────────────────────────────────────────────────
+
+// work_requires_disk_preflight(work_class) - heavy work always starts with a
+// preflight; light work does not pay for one.
+pub fn work_requires_disk_preflight(work_class: u8) -> bool {
+    if (work_class == WORK_CLASS_HEAVY) {
+        return true;
+    }
+    return false;
+}
+
+// reserve_satisfied(free_gb, required_gb) - the comparison only. The number
+// of required gigabytes is owned by
+// specs/system/disk/dsh-write-heavy-preflight.t27.
+pub fn reserve_satisfied(free_gb: f64, required_gb: f64) -> bool {
+    return free_gb >= required_gb;
+}
+
+// cleanup_is_automatic(class_is_never_clean) - a never-clean class is never
+// cleaned automatically. The list itself is owned by
+// specs/system/disk/dsh-disk-cleanup-plan.t27.
+pub fn cleanup_is_automatic(class_is_never_clean: bool) -> bool {
+    if (class_is_never_clean) {
+        return false;
+    }
+    return true;
+}
+
+// cleanup_needs_owner_decision(class_is_never_clean, owner_approved) -> bool
+pub fn cleanup_needs_owner_decision(class_is_never_clean: bool, owner_approved: bool) -> bool {
+    if (class_is_never_clean == false) {
+        return false;
+    }
+    if (owner_approved) {
+        return false;
+    }
+    return true;
+}
+
+// decision_for(work_class, free_gb, required_gb, projected_free_gb,
+//              cleanup_available) -> u8
+//
+// The decision order is fixed:
+//   1  the reserve is already satisfied            -> allow
+//   2  a cleanup exists and its projection covers
+//      the reserve                                    -> cleanup first
+//   3  otherwise                                      -> block
+pub fn decision_for(work_class: u8, free_gb: f64, required_gb: f64, projected_free_gb: f64, cleanup_available: bool) -> u8 {
+    if (work_requires_disk_preflight(work_class) == false) {
+        return DECISION_ALLOW;
+    }
+    if (reserve_satisfied(free_gb, required_gb) == true) {
+        return DECISION_ALLOW;
+    }
+    if (cleanup_available == true and reserve_satisfied(projected_free_gb, required_gb) == true) {
+        return DECISION_CLEANUP_FIRST;
+    }
+    return DECISION_BLOCK;
+}
+
+// enospc_prevented(decision, free_gb, required_gb) -> bool - a blocked task
+// never starts, so the disk cannot fill up under it.
+pub fn enospc_prevented(decision: u8, free_gb: f64, required_gb: f64) -> bool {
+    if (decision == DECISION_BLOCK) {
+        return true;
+    }
+    if (decision == DECISION_ALLOW) {
+        return reserve_satisfied(free_gb, required_gb);
+    }
+    return true;
+}
+
+// preflight_satisfied(has_record, work_class) -> bool - heavy work without a
+// preflight record is not satisfied.
+pub fn preflight_satisfied(has_record: bool, work_class: u8) -> bool {
+    if (work_requires_disk_preflight(work_class) == false) {
+        return true;
+    }
+    return has_record;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "heavy_work_needs_a_preflight_light_work_does_not" {
+    assert(work_requires_disk_preflight(WORK_CLASS_HEAVY) == true);
+    assert(work_requires_disk_preflight(WORK_CLASS_LIGHT) == false);
+    assert(preflight_satisfied(true, WORK_CLASS_HEAVY) == true);
+    assert(preflight_satisfied(false, WORK_CLASS_HEAVY) == false);
+    assert(preflight_satisfied(false, WORK_CLASS_LIGHT) == true);
+}
+
+test "reserve_comparison_is_the_only_space_arithmetic_here" {
+    assert(reserve_satisfied(10.0, 5.0) == true);
+    assert(reserve_satisfied(5.0, 5.0) == true);
+    assert(reserve_satisfied(4.9, 5.0) == false);
+}
+
+test "light_work_is_allowed_without_a_preflight" {
+    assert(decision_for(WORK_CLASS_LIGHT, 1.0, 50.0, 1.0, false) == DECISION_ALLOW);
+}
+
+test "heavy_work_with_a_satisfied_reserve_is_allowed" {
+    assert(decision_for(WORK_CLASS_HEAVY, 40.0, 20.0, 40.0, false) == DECISION_ALLOW);
+}
+
+test "heavy_work_without_reserve_cleans_first_when_the_projection_covers_it" {
+    assert(decision_for(WORK_CLASS_HEAVY, 4.0, 20.0, 30.0, true) == DECISION_CLEANUP_FIRST);
+}
+
+test "heavy_work_without_reserve_and_without_a_usable_cleanup_is_blocked" {
+    assert(decision_for(WORK_CLASS_HEAVY, 4.0, 20.0, 6.0, true) == DECISION_BLOCK);
+    assert(decision_for(WORK_CLASS_HEAVY, 4.0, 20.0, 30.0, false) == DECISION_BLOCK);
+}
+
+test "a_never_clean_class_is_never_cleaned_automatically" {
+    assert(cleanup_is_automatic(true) == false);
+    assert(cleanup_is_automatic(false) == true);
+    assert(cleanup_needs_owner_decision(true, false) == true);
+    assert(cleanup_needs_owner_decision(true, true) == false);
+    assert(cleanup_needs_owner_decision(false, false) == false);
+}
+
+test "a_blocked_task_prevents_enospc" {
+    assert(enospc_prevented(DECISION_BLOCK, 1.0, 20.0) == true);
+    assert(enospc_prevented(DECISION_ALLOW, 40.0, 20.0) == true);
+    assert(enospc_prevented(DECISION_ALLOW, 4.0, 20.0) == false);
+    assert(enospc_prevented(DECISION_CLEANUP_FIRST, 4.0, 20.0) == true);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+invariant heavy_work_never_starts_without_a_preflight_record {
+    preflight_satisfied(false, WORK_CLASS_HEAVY) == false;
+    work_requires_disk_preflight(WORK_CLASS_HEAVY) == true;
+}
+
+invariant allow_implies_the_reserve_is_satisfied {
+    enospc_prevented(DECISION_ALLOW, 40.0, 20.0) == true;
+    enospc_prevented(DECISION_ALLOW, 4.0, 20.0) == false;
+}
+
+invariant cleanup_first_implies_the_projection_covers_the_reserve {
+    decision_for(WORK_CLASS_HEAVY, 4.0, 20.0, 30.0, true) == DECISION_CLEANUP_FIRST;
+    decision_for(WORK_CLASS_HEAVY, 4.0, 20.0, 6.0, true) == DECISION_BLOCK;
+}
+
+invariant a_blocked_task_never_starts {
+    enospc_prevented(DECISION_BLOCK, 1.0, 20.0) == true;
+}
+
+invariant never_clean_classes_are_never_automatic {
+    cleanup_is_automatic(true) == false;
+    cleanup_needs_owner_decision(true, false) == true;
+}
+
+invariant every_decision_is_one_of_the_three {
+    DECISION_COUNT == 3;
+    DECISION_ALLOW != DECISION_CLEANUP_FIRST;
+    DECISION_CLEANUP_FIRST != DECISION_BLOCK;
+    DECISION_ALLOW != DECISION_BLOCK;
+}

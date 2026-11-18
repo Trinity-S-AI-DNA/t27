@@ -73,7 +73,14 @@ fn use_path_expr(line: &str) -> Option<&str> {
         Some(i) => &rest[..i],
         None => rest,
     };
-    let path_expr = rest.trim().trim_end_matches(';').trim();
+    // W587: also strip ; comments (old t27 comment style: ; at column 1
+    // followed by space). In use lines, ; is a statement terminator, so
+    // everything after ; is a comment and must be discarded.
+    let rest = match rest.find(';') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let path_expr = rest.trim();
     if path_expr.is_empty() || !path_expr.contains("::") && path_expr.contains(' ') {
         return None;
     }
@@ -1159,6 +1166,8 @@ mod missing_use_tests {
         assert_eq!(use_path_expr("use ;"), None);
         assert_eq!(use_path_expr("// use a::b;"), None);
         assert_eq!(use_path_expr("user::x;"), None);
+        // W587: ; comments are stripped, so `use foo::bar; some comment` parses as foo::bar
+        assert_eq!(use_path_expr("use foo::bar; some comment"), Some("foo::bar"));
     }
 
     #[test]

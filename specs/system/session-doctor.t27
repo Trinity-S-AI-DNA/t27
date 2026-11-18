@@ -1,0 +1,560 @@
+// SPDX-License-Identifier: Apache-2.0
+// T27 Session Doctor SSOT
+// Purpose: the Doctor is a VISIBLE participant of a session. This spec owns
+//          the Doctor lifecycle states, the legal transitions between them,
+//          and the user-visible status bar that always answers three
+//          questions: what broke, what is preserved, what the Doctor is doing.
+//
+// Owner: T27_SESSION_NEVER_DIES (issue #1409), 2026-10-30.
+//
+// OWNS:
+//   - the Doctor lifecycle states (IDLE .. UNRECOVERABLE)
+//   - the legal transitions between Doctor states
+//   - the rule that a repair is never entered before an explanation
+//   - the user-visible status bar: its required fields and its event messages
+//   - the no-silent-death rule: every Doctor state is observable
+//
+// DOES NOT OWN (never restate these facts here):
+//   - when a checkpoint is mandatory, its content, its states and the resume
+//     decision per state: specs/system/session-continuity.t27
+//   - the recovery ladder levels and the per-failure policy:
+//     specs/system/session-recovery-ladder.t27
+//   - failure-class taxonomy, preflight verdicts, transient retry budget:
+//     specs/system/llm_request_provider_gate.t27
+//   - provider identity, funding and quarantine state:
+//     specs/system/providers.t27
+//   - rung order and rung-switch rules: specs/system/model-ladder.t27
+//   - the fact-ownership map of the system layer:
+//     specs/system/language-boundary.t27
+//   - the Doctor skills themselves: specs/agents/session-*.t27
+//
+// Live evidence (2026-10-30):
+//   - a provider that is out of quota must not end a long task with its work
+//     gone: the Doctor appears, explains, preserves the checkpoint and asks
+//     for a funded route instead of dying silently
+
+module session_doctor;
+
+// ─── Doctor lifecycle states ───────────────────────────────────────────────
+
+pub const DOCTOR_IDLE : u8 = 0;          // system healthy
+pub const DOCTOR_WATCHING : u8 = 1;      // heartbeat, provider, tool, stall
+pub const DOCTOR_DIAGNOSING : u8 = 2;    // failure detected; evidence gathered
+pub const DOCTOR_REPAIRING : u8 = 3;     // safe bounded action in progress
+pub const DOCTOR_WAITING_OWNER : u8 = 4; // sensitive action requires approval
+pub const DOCTOR_RECOVERED : u8 = 5;     // session resumed from checkpoint
+pub const DOCTOR_DEGRADED : u8 = 6;      // reduced capability; user informed
+pub const DOCTOR_UNRECOVERABLE : u8 = 7; // work preserved; handoff created
+pub const DOCTOR_STATE_COUNT : u32 = 8;
+
+// ─── Status events ─────────────────────────────────────────────────────────
+//
+// One event per user-visible transition. The event is the unit the status
+// bar renders; the Doctor state is the unit the machine reasons about.
+
+pub const EVENT_SESSION_ACTIVE : u8 = 0;
+pub const EVENT_DOCTOR_RETRYING : u8 = 1;
+pub const EVENT_ROUTE_UNFUNDED : u8 = 2;
+pub const EVENT_ROUTE_SWITCHED : u8 = 3;
+pub const EVENT_DEGRADED_MODE : u8 = 4;
+pub const EVENT_WORK_PRESERVED : u8 = 5;
+pub const EVENT_COUNT : u32 = 6;
+
+// ─── Status bar fields ─────────────────────────────────────────────────────
+//
+// The bar is the contract with the user. It always carries the provider, the
+// last saved checkpoint and the state of the work, so "your work is preserved"
+// is a fact on screen, not a promise in a log.
+
+pub const BAR_SESSION_STATE : u8 = 0;
+pub const BAR_PROVIDER : u8 = 1;
+pub const BAR_CHECKPOINT_STEP : u8 = 2;
+pub const BAR_ISSUE : u8 = 3;
+pub const BAR_ACTION : u8 = 4;
+pub const BAR_ATTEMPT : u8 = 5;
+pub const BAR_WORK_STATE : u8 = 6;
+pub const BAR_FIELD_COUNT : u32 = 7;
+
+// ─── Doctor skill autonomy ─────────────────────────────────────────────────
+//
+// The Doctor's participants each declare how much they may do on their own.
+// The vocabulary lives here, once: a skill names its level, and this table
+// says what that level permits.
+
+pub const AUTONOMY_READ_ONLY : u8 = 0;
+pub const AUTONOMY_EVIDENCE : u8 = 1;
+pub const AUTONOMY_BOUNDED : u8 = 2;
+pub const AUTONOMY_WRITE : u8 = 3;
+pub const AUTONOMY_APPROVAL_GATED : u8 = 4;
+pub const AUTONOMY_COUNT : u32 = 5;
+
+// ─── Work state shown to the user ──────────────────────────────────────────
+
+pub const WORK_PRESERVED : u8 = 0;
+pub const WORK_AT_RISK : u8 = 1;
+pub const WORK_STATE_COUNT : u32 = 2;
+
+// ─── Severity of a status event ────────────────────────────────────────────
+
+pub const SEVERITY_INFO : u8 = 0;
+pub const SEVERITY_NOTICE : u8 = 1;
+pub const SEVERITY_WARNING : u8 = 2;
+pub const SEVERITY_ALERT : u8 = 3;
+
+// ─── Functions ─────────────────────────────────────────────────────────────
+
+// doctor_state_is_valid(state) - only the eight declared states exist.
+pub fn doctor_state_is_valid(state: u8) -> bool {
+    if (state < DOCTOR_STATE_COUNT) {
+        return true;
+    }
+    return false;
+}
+
+// doctor_state_is_visible(state) - every state has a user-visible form.
+// There is no silent state: a session that is watched, repaired, degraded or
+// handed off always says so.
+pub fn doctor_state_is_visible(state: u8) -> bool {
+    if (doctor_state_is_valid(state) == false) {
+        return false;
+    }
+    return true;
+}
+
+// doctor_transition_allowed(from, to) - the legal edges of the lifecycle.
+//
+// The shape is: watch -> diagnose -> (repair | wait | degrade | handoff) ->
+// (recovered | degraded | unrecoverable) -> watch. A repair is never entered
+// directly from watching: the Doctor explains before it touches anything.
+pub fn doctor_transition_allowed(from: u8, to: u8) -> bool {
+    if (doctor_state_is_valid(from) == false) {
+        return false;
+    }
+    if (doctor_state_is_valid(to) == false) {
+        return false;
+    }
+    // A state may always repeat itself (a second identical observation).
+    if (from == to) {
+        return true;
+    }
+    if (from == DOCTOR_IDLE) {
+        if (to == DOCTOR_WATCHING) {
+            return true;
+        }
+        return false;
+    }
+    if (from == DOCTOR_WATCHING) {
+        if (to == DOCTOR_IDLE) {
+            return true;
+        }
+        if (to == DOCTOR_DIAGNOSING) {
+            return true;
+        }
+        return false;
+    }
+    if (from == DOCTOR_DIAGNOSING) {
+        if (to == DOCTOR_REPAIRING) {
+            return true;
+        }
+        if (to == DOCTOR_WAITING_OWNER) {
+            return true;
+        }
+        if (to == DOCTOR_DEGRADED) {
+            return true;
+        }
+        if (to == DOCTOR_UNRECOVERABLE) {
+            return true;
+        }
+        return false;
+    }
+    if (from == DOCTOR_REPAIRING) {
+        if (to == DOCTOR_RECOVERED) {
+            return true;
+        }
+        if (to == DOCTOR_DEGRADED) {
+            return true;
+        }
+        if (to == DOCTOR_WAITING_OWNER) {
+            return true;
+        }
+        if (to == DOCTOR_UNRECOVERABLE) {
+            return true;
+        }
+        return false;
+    }
+    if (from == DOCTOR_WAITING_OWNER) {
+        if (to == DOCTOR_REPAIRING) {
+            return true;
+        }
+        if (to == DOCTOR_UNRECOVERABLE) {
+            return true;
+        }
+        return false;
+    }
+    if (from == DOCTOR_RECOVERED) {
+        if (to == DOCTOR_WATCHING) {
+            return true;
+        }
+        return false;
+    }
+    if (from == DOCTOR_DEGRADED) {
+        if (to == DOCTOR_WATCHING) {
+            return true;
+        }
+        return false;
+    }
+    if (from == DOCTOR_UNRECOVERABLE) {
+        if (to == DOCTOR_WATCHING) {
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// doctor_explains_before_repairing(from, to) - a repair is only reachable
+// from a diagnosis, so the user always hears what happened first.
+pub fn doctor_explains_before_repairing(from: u8, to: u8) -> bool {
+    if (to != DOCTOR_REPAIRING) {
+        return true;
+    }
+    if (from == DOCTOR_DIAGNOSING) {
+        return true;
+    }
+    if (from == DOCTOR_WAITING_OWNER) {
+        return true;
+    }
+    return false;
+}
+
+// doctor_status_event(state) - the event the status bar renders for a state.
+pub fn doctor_status_event(state: u8) -> u8 {
+    if (state == DOCTOR_IDLE) {
+        return EVENT_SESSION_ACTIVE;
+    }
+    if (state == DOCTOR_WATCHING) {
+        return EVENT_SESSION_ACTIVE;
+    }
+    if (state == DOCTOR_DIAGNOSING) {
+        return EVENT_DOCTOR_RETRYING;
+    }
+    if (state == DOCTOR_REPAIRING) {
+        return EVENT_DOCTOR_RETRYING;
+    }
+    if (state == DOCTOR_WAITING_OWNER) {
+        return EVENT_ROUTE_UNFUNDED;
+    }
+    if (state == DOCTOR_RECOVERED) {
+        return EVENT_WORK_PRESERVED;
+    }
+    if (state == DOCTOR_DEGRADED) {
+        return EVENT_DEGRADED_MODE;
+    }
+    if (state == DOCTOR_UNRECOVERABLE) {
+        return EVENT_WORK_PRESERVED;
+    }
+    return EVENT_SESSION_ACTIVE;
+}
+
+// status_event_severity(event) - how loudly the event is shown.
+pub fn status_event_severity(event: u8) -> u8 {
+    if (event == EVENT_SESSION_ACTIVE) {
+        return SEVERITY_INFO;
+    }
+    if (event == EVENT_WORK_PRESERVED) {
+        return SEVERITY_NOTICE;
+    }
+    if (event == EVENT_DOCTOR_RETRYING) {
+        return SEVERITY_WARNING;
+    }
+    if (event == EVENT_DEGRADED_MODE) {
+        return SEVERITY_WARNING;
+    }
+    if (event == EVENT_ROUTE_UNFUNDED) {
+        return SEVERITY_ALERT;
+    }
+    if (event == EVENT_ROUTE_SWITCHED) {
+        return SEVERITY_NOTICE;
+    }
+    return SEVERITY_INFO;
+}
+
+// status_event_is_visible(event) - every event reaches the user.
+pub fn status_event_is_visible(event: u8) -> bool {
+    if (event < EVENT_COUNT) {
+        return true;
+    }
+    return false;
+}
+
+// status_bar_has_required_fields(has_session_state, has_provider,
+// has_checkpoint_step, has_work_state) -> bool
+//
+// The bar always carries who is active, which route serves it, where the last
+// checkpoint is and whether the work is safe. An issue/action/attempt triple
+// is mandatory only while something is wrong.
+pub fn status_bar_has_required_fields(has_session_state: bool, has_provider: bool, has_checkpoint_step: bool, has_work_state: bool) -> bool {
+    if (has_session_state == false) {
+        return false;
+    }
+    if (has_provider == false) {
+        return false;
+    }
+    if (has_checkpoint_step == false) {
+        return false;
+    }
+    if (has_work_state == false) {
+        return false;
+    }
+    return true;
+}
+
+// status_bar_needs_issue_fields(state) - while the Doctor is not healthy the
+// bar explains the issue, the action and the attempt counter.
+pub fn status_bar_needs_issue_fields(state: u8) -> bool {
+    if (state == DOCTOR_IDLE) {
+        return false;
+    }
+    if (state == DOCTOR_WATCHING) {
+        return false;
+    }
+    if (state == DOCTOR_RECOVERED) {
+        return false;
+    }
+    return true;
+}
+
+// status_bar_shows_work_preserved(work_state) - the user is told, on screen,
+// whether the work survived.
+pub fn status_bar_shows_work_preserved(work_state: u8) -> bool {
+    if (work_state == WORK_PRESERVED) {
+        return true;
+    }
+    return false;
+}
+
+// silent_death_forbidden(silent, work_lost) -> bool
+//
+// A session that ends without a word is forbidden. If the work was lost the
+// event is mandatory; if the work survived, the event is still mandatory
+// because the user must know the session stopped.
+pub fn silent_death_forbidden(silent: bool, work_lost: bool) -> bool {
+    if (silent == true) {
+        return false;
+    }
+    return true;
+}
+
+// doctor_event_required(state_changed, event_emitted) -> bool
+//
+// Every change of the Doctor state produces exactly one user-visible event.
+pub fn doctor_event_required(state_changed: bool, event_emitted: bool) -> bool {
+    if (state_changed == false) {
+        return true;
+    }
+    return event_emitted;
+}
+
+// waiting_owner_blocks_autonomous_action(action_taken_without_approval) -> bool
+//
+// A sensitive action (a provider switch, a credential change) waits for the
+// owner. The Doctor never takes it on its own.
+pub fn waiting_owner_blocks_autonomous_action(action_taken_without_approval: bool) -> bool {
+    if (action_taken_without_approval == true) {
+        return false;
+    }
+    return true;
+}
+
+// sensitive_action_requires_owner_approval(sensitive, approved) -> bool
+pub fn sensitive_action_requires_owner_approval(sensitive: bool, approved: bool) -> bool {
+    if (sensitive == false) {
+        return true;
+    }
+    return approved;
+}
+
+// degraded_mode_requires_user_notice(degraded, notice_emitted) -> bool
+//
+// A degraded continuation is honest or it does not happen.
+pub fn degraded_mode_requires_user_notice(degraded: bool, notice_emitted: bool) -> bool {
+    if (degraded == false) {
+        return true;
+    }
+    return notice_emitted;
+}
+
+// work_preserved_on_unrecoverable(work_state) - an unrecoverable session
+// still hands the work over intact.
+pub fn work_preserved_on_unrecoverable(work_state: u8) -> bool {
+    if (work_state == WORK_PRESERVED) {
+        return true;
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "the_doctor_has_exactly_the_eight_declared_states" {
+    assert(DOCTOR_STATE_COUNT == 8);
+    assert(doctor_state_is_valid(DOCTOR_IDLE) == true);
+    assert(doctor_state_is_valid(DOCTOR_WATCHING) == true);
+    assert(doctor_state_is_valid(DOCTOR_DIAGNOSING) == true);
+    assert(doctor_state_is_valid(DOCTOR_REPAIRING) == true);
+    assert(doctor_state_is_valid(DOCTOR_WAITING_OWNER) == true);
+    assert(doctor_state_is_valid(DOCTOR_RECOVERED) == true);
+    assert(doctor_state_is_valid(DOCTOR_DEGRADED) == true);
+    assert(doctor_state_is_valid(DOCTOR_UNRECOVERABLE) == true);
+    assert(doctor_state_is_valid(DOCTOR_STATE_COUNT) == false);
+}
+
+test "every_doctor_state_is_visible_to_the_user" {
+    var s : u8 = 0;
+    while (s < DOCTOR_STATE_COUNT) {
+        assert(doctor_state_is_visible(s) == true);
+        s = s + 1;
+    }
+}
+
+test "the_lifecycle_runs_watch_diagnose_repair_recover_watch" {
+    assert(doctor_transition_allowed(DOCTOR_IDLE, DOCTOR_WATCHING) == true);
+    assert(doctor_transition_allowed(DOCTOR_WATCHING, DOCTOR_DIAGNOSING) == true);
+    assert(doctor_transition_allowed(DOCTOR_DIAGNOSING, DOCTOR_REPAIRING) == true);
+    assert(doctor_transition_allowed(DOCTOR_REPAIRING, DOCTOR_RECOVERED) == true);
+    assert(doctor_transition_allowed(DOCTOR_RECOVERED, DOCTOR_WATCHING) == true);
+}
+
+test "a_repair_is_never_entered_without_a_diagnosis_first" {
+    assert(doctor_transition_allowed(DOCTOR_WATCHING, DOCTOR_REPAIRING) == false);
+    assert(doctor_explains_before_repairing(DOCTOR_WATCHING, DOCTOR_REPAIRING) == false);
+    assert(doctor_explains_before_repairing(DOCTOR_DIAGNOSING, DOCTOR_REPAIRING) == true);
+    assert(doctor_explains_before_repairing(DOCTOR_WAITING_OWNER, DOCTOR_REPAIRING) == true);
+}
+
+test "an_unexplained_state_jump_is_forbidden" {
+    assert(doctor_transition_allowed(DOCTOR_IDLE, DOCTOR_REPAIRING) == false);
+    assert(doctor_transition_allowed(DOCTOR_IDLE, DOCTOR_DEGRADED) == false);
+    assert(doctor_transition_allowed(DOCTOR_IDLE, DOCTOR_UNRECOVERABLE) == false);
+    assert(doctor_transition_allowed(DOCTOR_DIAGNOSING, DOCTOR_RECOVERED) == false);
+}
+
+test "every_failure_path_ends_in_a_visible_terminal_state" {
+    assert(doctor_transition_allowed(DOCTOR_DIAGNOSING, DOCTOR_DEGRADED) == true);
+    assert(doctor_transition_allowed(DOCTOR_DIAGNOSING, DOCTOR_UNRECOVERABLE) == true);
+    assert(doctor_transition_allowed(DOCTOR_DIAGNOSING, DOCTOR_WAITING_OWNER) == true);
+    assert(doctor_transition_allowed(DOCTOR_REPAIRING, DOCTOR_UNRECOVERABLE) == true);
+    assert(doctor_transition_allowed(DOCTOR_WAITING_OWNER, DOCTOR_UNRECOVERABLE) == true);
+}
+
+test "the_status_bar_always_carries_provider_checkpoint_and_work_state" {
+    assert(status_bar_has_required_fields(true, true, true, true) == true);
+    assert(status_bar_has_required_fields(false, true, true, true) == false);
+    assert(status_bar_has_required_fields(true, false, true, true) == false);
+    assert(status_bar_has_required_fields(true, true, false, true) == false);
+    assert(status_bar_has_required_fields(true, true, true, false) == false);
+}
+
+test "the_bar_explains_the_issue_only_while_something_is_wrong" {
+    assert(status_bar_needs_issue_fields(DOCTOR_IDLE) == false);
+    assert(status_bar_needs_issue_fields(DOCTOR_WATCHING) == false);
+    assert(status_bar_needs_issue_fields(DOCTOR_RECOVERED) == false);
+    assert(status_bar_needs_issue_fields(DOCTOR_DIAGNOSING) == true);
+    assert(status_bar_needs_issue_fields(DOCTOR_REPAIRING) == true);
+    assert(status_bar_needs_issue_fields(DOCTOR_WAITING_OWNER) == true);
+    assert(status_bar_needs_issue_fields(DOCTOR_DEGRADED) == true);
+    assert(status_bar_needs_issue_fields(DOCTOR_UNRECOVERABLE) == true);
+}
+
+test "every_doctor_state_maps_to_a_user_visible_event" {
+    assert(doctor_status_event(DOCTOR_IDLE) == EVENT_SESSION_ACTIVE);
+    assert(doctor_status_event(DOCTOR_DIAGNOSING) == EVENT_DOCTOR_RETRYING);
+    assert(doctor_status_event(DOCTOR_REPAIRING) == EVENT_DOCTOR_RETRYING);
+    assert(doctor_status_event(DOCTOR_WAITING_OWNER) == EVENT_ROUTE_UNFUNDED);
+    assert(doctor_status_event(DOCTOR_RECOVERED) == EVENT_WORK_PRESERVED);
+    assert(doctor_status_event(DOCTOR_DEGRADED) == EVENT_DEGRADED_MODE);
+    assert(doctor_status_event(DOCTOR_UNRECOVERABLE) == EVENT_WORK_PRESERVED);
+}
+
+test "an_unfunded_route_is_alerted_not_a_notice" {
+    assert(status_event_severity(EVENT_ROUTE_UNFUNDED) == SEVERITY_ALERT);
+    assert(status_event_severity(EVENT_DOCTOR_RETRYING) == SEVERITY_WARNING);
+    assert(status_event_severity(EVENT_DEGRADED_MODE) == SEVERITY_WARNING);
+    assert(status_event_severity(EVENT_SESSION_ACTIVE) == SEVERITY_INFO);
+}
+
+test "a_silent_death_is_forbidden_even_when_the_work_survived" {
+    assert(silent_death_forbidden(true, false) == false);
+    assert(silent_death_forbidden(true, true) == false);
+    assert(silent_death_forbidden(false, true) == true);
+    assert(silent_death_forbidden(false, false) == true);
+}
+
+test "every_state_change_emits_exactly_one_event" {
+    assert(doctor_event_required(true, true) == true);
+    assert(doctor_event_required(true, false) == false);
+    assert(doctor_event_required(false, false) == true);
+}
+
+test "a_sensitive_action_waits_for_the_owner" {
+    assert(sensitive_action_requires_owner_approval(true, false) == false);
+    assert(sensitive_action_requires_owner_approval(true, true) == true);
+    assert(sensitive_action_requires_owner_approval(false, false) == true);
+    assert(waiting_owner_blocks_autonomous_action(true) == false);
+    assert(waiting_owner_blocks_autonomous_action(false) == true);
+}
+
+test "degraded_mode_is_never_silent" {
+    assert(degraded_mode_requires_user_notice(true, true) == true);
+    assert(degraded_mode_requires_user_notice(true, false) == false);
+    assert(degraded_mode_requires_user_notice(false, false) == true);
+}
+
+test "an_unrecoverable_session_still_preserves_the_work" {
+    assert(work_preserved_on_unrecoverable(WORK_PRESERVED) == true);
+    assert(work_preserved_on_unrecoverable(WORK_AT_RISK) == false);
+    assert(status_bar_shows_work_preserved(WORK_PRESERVED) == true);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+invariant no_doctor_state_is_invisible {
+    doctor_state_is_visible(DOCTOR_IDLE) == true;
+    doctor_state_is_visible(DOCTOR_DIAGNOSING) == true;
+    doctor_state_is_visible(DOCTOR_REPAIRING) == true;
+    doctor_state_is_visible(DOCTOR_DEGRADED) == true;
+    doctor_state_is_visible(DOCTOR_UNRECOVERABLE) == true;
+}
+
+invariant a_repair_always_follows_an_explanation {
+    doctor_explains_before_repairing(DOCTOR_WATCHING, DOCTOR_REPAIRING) == false;
+    doctor_explains_before_repairing(DOCTOR_DIAGNOSING, DOCTOR_REPAIRING) == true;
+}
+
+invariant the_status_bar_always_shows_the_work_state {
+    status_bar_has_required_fields(true, true, true, false) == false;
+    status_bar_has_required_fields(true, true, true, true) == true;
+}
+
+invariant the_session_never_dies_silently {
+    silent_death_forbidden(true, true) == false;
+    silent_death_forbidden(false, true) == true;
+}
+
+invariant a_degraded_session_always_notifies_the_user {
+    degraded_mode_requires_user_notice(true, false) == false;
+    degraded_mode_requires_user_notice(true, true) == true;
+}
+
+invariant a_sensitive_action_never_runs_without_the_owner {
+    sensitive_action_requires_owner_approval(true, false) == false;
+    waiting_owner_blocks_autonomous_action(true) == false;
+}
+
+invariant every_state_change_produces_an_event {
+    doctor_event_required(true, false) == false;
+    doctor_event_required(true, true) == true;
+}

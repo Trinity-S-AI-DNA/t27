@@ -4590,10 +4590,15 @@ fn run_check_calls(specs_dir: &str, include_scratch: bool) -> anyhow::Result<()>
 /// neither parses: that is a parse error, and the backend reports it in its own
 /// words.
 fn typecheck_input_ast(path: &Path, raw: &str) -> Option<(compiler::Node, bool)> {
-    let spliced = use_resolve::resolve(path, raw);
+    // Replace `→` (Unicode rightward arrow used as a visual comment marker in
+    // some specs, e.g. "→ Phase 2: Spec") with `;` so the parser treats it as
+    // a comment. The lexer silently skips non-ASCII bytes like `→`, leaving
+    // the rest of the line (e.g. "Phase 2: Spec") as unexpected tokens.
+    let raw = raw.replace('→', ";");
+    let spliced = use_resolve::resolve(path, &raw);
     match compiler::Compiler::parse_ast(&spliced) {
         Ok(ast) => Some((ast, false)),
-        Err(_) => compiler::Compiler::parse_ast(raw).ok().map(|ast| (ast, true)),
+        Err(_) => compiler::Compiler::parse_ast(&raw).ok().map(|ast| (ast, true)),
     }
 }
 
