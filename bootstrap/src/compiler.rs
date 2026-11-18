@@ -8488,6 +8488,9 @@ impl Codegen {
             {
                 self.module_decl_names.insert(d.name.clone());
             }
+            if d.kind == NodeKind::UseDecl && !d.name.is_empty() {
+                self.module_decl_names.insert(d.name.clone());
+            }
         }
     }
 
