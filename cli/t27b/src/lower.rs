@@ -1524,6 +1524,7 @@ impl<'a> Lower<'a> {
         scan_addr_taken(body, &mut self.addr_taken);
         self.collect_ref_vars(body);
         self.slice_locals.clear();
+        eprintln!("DEBUG begin_body: slice_locals cleared, size={}", self.slice_locals.len());
         self.tuple_locals.clear();
         self.tuple_names.clear();
         self.dead_lits.clear();
@@ -2310,6 +2311,7 @@ impl<'a> Lower<'a> {
                         );
                     };
                     eprintln!("DEBUG slice_local: called for name={}, extra_size={:?}", name, init.extra_size);
+        eprintln!("DEBUG slice_local: name={}, extra_size={:?}, children={:?}", name, init.extra_size, init.children.len());
         self.bind(&name, Binding::Mem(arr_place.clone()));
                     eprintln!("DEBUG slice_local: bound {} to slice arr_place={:?}", name, arr_place.addr);
                     return Ok(());

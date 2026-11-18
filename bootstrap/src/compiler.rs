@@ -9930,8 +9930,7 @@ impl Codegen {
         }
 
         if node.children.is_empty() {
-            self.write_indent();
-            self.write_line("// TODO: implement benchmark");
+            // An empty body is valid Zig -- just an empty block.
         }
 
         self.dedent();
