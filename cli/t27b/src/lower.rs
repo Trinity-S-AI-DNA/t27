@@ -2309,7 +2309,8 @@ impl<'a> Lower<'a> {
                             format!("`{}` = `[{}]` is passed where a slice is declared", name, init.extra_size.trim()),
                         );
                     };
-                    self.bind(&name, Binding::Mem(arr_place.clone()));
+                    eprintln!("DEBUG slice_local: called for name={}, extra_size={:?}", name, init.extra_size);
+        self.bind(&name, Binding::Mem(arr_place.clone()));
                     eprintln!("DEBUG slice_local: bound {} to slice arr_place={:?}", name, arr_place.addr);
                     return Ok(());
                 }
@@ -6739,7 +6740,8 @@ impl<'a> Lower<'a> {
                 let checked = Expr { ty: Ty::U64, kind: ExprKind::Bounds { idx: Box::new(e), len: Box::new(len), site } };
                 let ptr = Expr { ty: Ty::Ptr, kind: ExprKind::Load { addr: Box::new(hdr.clone()), off: 0 } };
                 let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Offset { base: Box::new(ptr), idx: Box::new(checked), scale: esize } };
-                return Ok(Ok(Place { addr, off: 0, ty: (*elem).clone(), mutable: true, temp: None }));
+                eprintln!("DEBUG index: returning place addr={:?}, elem={:?}, temp=None", addr, (*elem).clone());
+        return Ok(Ok(Place { addr, off: 0, ty: (*elem).clone(), mutable: true, temp: None }));
             }
         }
         let base = match self.tuple_index(base, &idx)? {
