@@ -7614,6 +7614,12 @@ pub struct Codegen {
     /// declaration that states its type. The type was in hand two lines above
     /// the expression that had to guess it.
     zig_decl_int_ty: Option<String>,
+    /// Element type of the array whose initializer is being emitted, e.g.
+    /// "u8" from `[256]u8 = [0] ** 256`. Used to emit `[_]u8{0} ** 256`
+    /// instead of `@splat(0) ** 256` which Zig refuses because `0` is
+    /// `comptime_int` with ambiguous type. Set by gen_const_decl around the
+    /// initializer emission, cleared afterwards.
+    current_array_elem_type: Option<String>,
 }
 
 impl Codegen {
@@ -7642,6 +7648,7 @@ impl Codegen {
             current_return_type: String::new(),
             zig_var_types: std::collections::HashMap::new(),
             zig_decl_int_ty: None,
+            current_array_elem_type: None,
         }
     }
 
@@ -8571,7 +8578,12 @@ impl Codegen {
 
         if !node.children.is_empty() {
             self.write(" = ");
+            // Set the element type so ExprBinary '**' codegen can emit
+            // [_]ELEMENT_TYPE{VALUE} ** COUNT instead of @splat(VALUE) ** COUNT
+            // which Zig refuses because the value's type is ambiguous.
+            self.current_array_elem_type = Self::array_elem_type(&node.extra_type);
             self.gen_expr(&node.children[0]);
+            self.current_array_elem_type = None;
         }
 
         self.write_line(";");
@@ -8826,6 +8838,19 @@ impl Codegen {
             "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize"
         )
         .then(|| t.to_string())
+    }
+
+    /// Extract the element type from an array type like `[256]u8` → `Some("u8")`.
+    /// Returns None for non-array types like `u8` or `bool`.
+    fn array_elem_type(t27_type: &str) -> Option<String> {
+        let t = t27_type.trim();
+        let end = t.rfind(']')?;
+        let after = t[end + 1..].trim();
+        if after.is_empty() {
+            None
+        } else {
+            Some(after.to_string())
+        }
     }
 
     fn zig_int_literal_default_type(init: &Node) -> Option<&'static str> {
@@ -10905,8 +10930,29 @@ impl Codegen {
                     if op == "**" {
                         let a = &node.children[0];
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
+                        if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() {
+                            // Emit [_]TYPE{VALUE} ** COUNT so Zig knows the result
+                            // type of @splat without @as. Falls back to @splat(VALUE)
+                            // when the element type is unknown.
+                            if let Some(elem_ty) = &self.current_array_elem_type {
+                                let elem_ty = elem_ty.clone();
+                                self.write("[_]");
+                                self.write(&elem_ty);
+                                self.write("{");
+                                let t = a.extra_size.trim();
+                                if t.contains(';') {
+                                    let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t);
+                                    self.write(v);
+                                } else {
+                                    self.write(t);
+                                }
+                                self.write("} ** ");
+                                self.gen_expr_maybe_paren(&node.children[1]);
+                                return;
+                            }
+                        }
                         self.write("@splat(");
-                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && a.extra_size.trim().contains(';') { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() { let t = a.extra_size.trim(); if t.contains(';') { let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.write(&t); } } else { self.gen_expr_maybe_paren(a); }
                         self.write(") ** ");
                         self.gen_expr_maybe_paren(&node.children[1]);
                         return;
