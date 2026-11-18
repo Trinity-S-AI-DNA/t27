@@ -200,3 +200,31 @@ fn test_report_runs_the_string_tests() {
     assert_eq!(count("pass"), Some(6), "{text}");
     assert_eq!(count("FAIL"), Some(0), "{text}");
 }
+
+fn write_tree(base: &std::path::Path, rel: &str, src: &str) {
+    let p = base.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).expect("tree");
+    std::fs::write(&p, src).expect("write");
+}
+
+// D-1: a `id: str` in an imported module must not turn `id: u16` into a slice.
+#[test]
+fn imported_string_name_does_not_poison_a_numeric_parameter() {
+    let dir = std::env::temp_dir().join(format!("t27-d1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_tree(&dir, "specs/repro/a.t27", r#"module d1_a;
+pub const ARR : [3]u16 = [1,2,3];
+pub fn contains(id: u16) -> bool {
+ var i : usize = 0;
+ while (i < 3) { if (ARR[i] == id) { return true; } i = i + 1; }
+ return false; }"#);
+    write_tree(&dir, "specs/repro/c.t27", "module d1_c;\npub const id : str = \"s\";\n");
+    let consumer = dir.join("specs/repro/b.t27");
+    write_tree(&dir, "specs/repro/b.t27", "module d1_b;\nuse repro::a;\nuse repro::c;\ntest \"imported\" { assert a::contains(2) == true; }\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_t27c")).arg("gen").arg(&consumer).output().expect("gen");
+    let z = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "gen failed:\n{z}");
+    assert!(!z.contains("std.mem.eql(u8, ARR[i]"), "D-1 slice comparison:\n{z}");
+    assert!(z.contains("ARR[i] == id"), "D-1 integer == lost:\n{z}");
+}

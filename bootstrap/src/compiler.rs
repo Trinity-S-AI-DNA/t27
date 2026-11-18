@@ -7586,6 +7586,8 @@ pub struct Codegen {
     /// no `==` for slices, and the literal-operand test cannot see
     /// `a.name == b.name`, where BOTH sides are `[]const u8` expressions.
     string_names: std::collections::HashSet<String>,
+    /// D-1 (#14102): params of the current fn declared with a non-string type; they win over a cross-module string name.
+    nonstring_params: std::collections::HashSet<String>,
     /// Field and parameter names the spec declares with a float type, so a cast
     /// can pick `@floatCast` over `@floatFromInt` (W592).
     float_names: std::collections::HashSet<String>,
@@ -7637,6 +7639,7 @@ impl Codegen {
             declared_enums: std::collections::HashSet::new(),
             struct_field_types: std::collections::HashMap::new(),
             string_names: std::collections::HashSet::new(),
+            nonstring_params: std::collections::HashSet::new(),
             float_names: std::collections::HashSet::new(),
             signed_names: std::collections::HashSet::new(),
             current_return_type: String::new(),
@@ -8046,7 +8049,7 @@ impl Codegen {
                 .unwrap_or(false);
         }
         Self::trailing_name(node)
-            .map(|n| self.string_names.contains(&n))
+            .map(|n| !self.nonstring_params.contains(&n) && self.string_names.contains(&n))
             .unwrap_or(false)
     }
 
@@ -9353,8 +9356,12 @@ impl Codegen {
                 param_string.push(n);
             }
         }
+        self.nonstring_params.clear();
         for (pname, pty) in &node.params {
             let t = pty.trim();
+            if Self::t27_array_type_to_zig(pty) != "[]const u8" && pty.trim() != "type" {
+                self.nonstring_params.insert(pname.clone());
+            }
             if Self::t27_array_type_to_zig(pty) == "[]const u8" {
                 if self.string_names.insert(pname.clone()) {
                     param_string.push(pname.clone());
@@ -9467,6 +9474,7 @@ impl Codegen {
         for n in &param_string {
             self.string_names.remove(n);
         }
+        self.nonstring_params.clear();
         self.zig_value_names.clear();
     }
 
