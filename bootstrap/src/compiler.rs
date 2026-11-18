@@ -8440,18 +8440,26 @@ impl Codegen {
         }
 
         // Emit @import for UseDecl nodes with resolved paths
+        // Split "t27f::frame_render::ppm_len" into module path "t27f::frame_render"
+        // and symbol "ppm_len", so we import the module and reference the symbol
         let mut has_imports = false;
         for decl in &ast.children {
             if decl.kind == NodeKind::UseDecl {
+                // Split off the last :: segment (the symbol name) from the module path
+                let value_str = decl.value.as_str();
+                let (module_path, symbol_name) = match value_str.rfind("::") {
+                    Some(pos) => (&value_str[..pos], &value_str[pos + 2..]),
+                    None => (value_str, decl.name.as_str()),
+                };
                 let import_path = resolve_import_path(
-                    &decl.value, // e.g. "base::types"
-                    &decl.name,  // e.g. "types"
+                    module_path,
+                    decl.name.as_str(),
                     current_rel_path,
                     module_map,
                 );
                 self.write_line(&format!(
-                    "const {} = @import(\"{}\");",
-                    decl.name, import_path
+                    "const {} = @import(\"{}\").{};",
+                    decl.name, import_path, symbol_name
                 ));
                 has_imports = true;
             }
