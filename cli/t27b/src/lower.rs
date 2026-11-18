@@ -2309,7 +2309,7 @@ impl<'a> Lower<'a> {
                             format!("`{}` = `[{}]` is passed where a slice is declared", name, init.extra_size.trim()),
                         );
                     };
-                    self.bind(&name, Binding::Mem(arr_place));
+                    self.bind(&name, Binding::Mem(arr_place.clone()));
                     eprintln!("DEBUG slice_local: bound {} to slice arr_place={:?}", name, arr_place.addr);
                     return Ok(());
                 }
@@ -5900,18 +5900,19 @@ impl<'a> Lower<'a> {
         let n = Expr { ty: Ty::U64, kind: ExprKind::Const(len as i128) };
         // Evaluate ptr first if it has side effects (a Seq), storing the
         // evaluated pointer value so re-reading the slice header does not
-        // re-run them.
+        // re-run them. The side-effect stmts are kept separate from the
+        // address so they execute only once during slice setup.
         let ptr_value = match &ptr.kind {
             ExprKind::Seq { stmts, value } => value.clone(),
             _ => Box::new(ptr.clone()),
         };
-        let mut all_stmts = match &ptr.kind {
-            ExprKind::Seq { stmts, .. } => stmts.clone(),
-            _ => vec![],
-        };
+        let mut all_stmts: Vec<Stmt> = vec![];
+        // Store the pointer value and length into the new slot.
         all_stmts.push(Stmt::Store { addr: slot_expr(k), off: 0, value: *ptr_value });
         all_stmts.push(Stmt::Store { addr: slot_expr(k), off: 8, value: n });
-        let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Seq { stmts: all_stmts, value: Box::new(slot_expr(k)) } };
+        // The address is just the slot header; stmts are sequenced separately
+        // so they do not re-run on every slice read.
+        let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Slot(k) };
         Ok(Val::M(Place { addr, off: 0, ty: t.clone(), mutable: matches!(&t, LTy::Slice(_, m) if *m), temp: Some(k) }))
     }
 
