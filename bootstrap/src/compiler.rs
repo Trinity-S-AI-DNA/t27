@@ -10878,27 +10878,18 @@ impl Codegen {
             NodeKind::ExprBinary => {
                 if node.children.len() >= 2 {
                     let op = node.extra_op.as_str();
-                    // Zig has no `==` for slices. Once W562 started emitting
-                    // string literals with their quotes, `name == "clk"` began
-                    // failing with "cannot compare strings with ==". When either
-                    // side is a string literal the comparison is a string
-                    // comparison, so lower it to std.mem.eql.
-                    // #13591: Zig has no `**` repeat operator; a single-element
-                    // pattern lowers to @splat, the count rides the target type.
+                    // Zig has no `==` for slices: a string comparison lowers to std.mem.eql.
+                    // #13591: Zig has no `**`; a single-element pattern lowers to @splat.
                     if op == "**" {
                         let a = &node.children[0];
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         self.write("@splat(");
-                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && a.extra_size.trim().contains(';') { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
+                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() && !a.extra_size.trim().is_empty() { let t = a.extra_size.trim(); let v = t.rsplit_once(';').map_or(t, |(v, _)| v.trim()); let sn = splat_scalar::splat_scalar_len(v.as_bytes()); let n = if sn == 0 { rust_num_suffix::rust_num_suffix_len(v.as_bytes()) } else { rust_num_suffix::rust_num_suffix_len(unsafe { &splat_scalar::ss_out[..sn] }) }; self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr_maybe_paren(a); }
                         self.write(")");
                         return;
                     }
-                    let is_str = |n: &Node| {
-                        n.kind == NodeKind::ExprLiteral && n.extra_kind == "string"
-                    };
-                    // ... and when neither side is a literal but one names a
-                    // field the spec DECLARED as a string (`a.name == b.name`),
-                    // which the literal test alone could not see.
+                    let is_str = |n: &Node| n.kind == NodeKind::ExprLiteral && n.extra_kind == "string";
+                    // ... or a side names a field/const the spec DECLARED as a string.
                     if matches!(op, "==" | "!=")
                         && (is_str(&node.children[0])
                             || is_str(&node.children[1])
