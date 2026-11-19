@@ -25,16 +25,17 @@
 static const const char* GATE_BOOTSTRAP[2] = { "specs/policy/vf_write_gate.t27", "specs/t27f/vf_guard.t27" };
 #define GATE_BOOTSTRAP_COUNT 2
 static const size_t GATE_BOOTSTRAP_LENS[2] = { 30, 23 };
-#define GD_LAYERS 8
-static const const char* GD_LAYER_NAMES[8] = { "graph", "meaning", "layout", "theme", "render", "other", "contract", "check" };
-static const const char* GD_PATHS[51] = { "specs/t27f/visual_factory_contract.t27", "specs/t27f/vf_guard.t27", "specs/t27f/vf_ring1.t27", "specs/t27f/stories/task_card.t27", "specs/t27f/ui_kit.t27", "specs/t27f/vf_meaning.t27", "specs/t27f/vf_snapshot.t27", "specs/t27f/vf_layout.t27", "specs/t27f/vf_extent.t27", "specs/t27f/vf_theme.t27", "specs/t27f/outfit_r_data.t27", "specs/t27f/outfit_b_data.t27", "specs/t27f/outfit_atlas.t27", "specs/t27f/vf_brand.t27", "specs/t27f/vf_pixel.t27", "specs/t27f/vf_render.t27", "specs/t27f/vf_scale.t27", "specs/t27f/vf_type.t27", "specs/t27f/vf_card.t27", "specs/t27f/vf_diff.t27", "specs/t27f/vf_storybook.t27", "specs/t27os/vf_frame_main.t27", "specs/t27os/vf_type_main.t27", "specs/uikit/avatar.t27", "specs/uikit/badge.t27", "specs/uikit/bracket_frame.t27", "specs/uikit/button.t27", "specs/uikit/card.t27", "specs/uikit/catalog.t27", "specs/uikit/container.t27", "specs/uikit/control_center.t27", "specs/uikit/control_center_view.t27", "specs/uikit/design_tokens.t27", "specs/uikit/god_mode_toggle.t27", "specs/uikit/header_button.t27", "specs/uikit/hero_card.t27", "specs/uikit/input_model.t27", "specs/uikit/lamp.t27", "specs/uikit/light_dot.t27", "specs/uikit/native_tokens.t27", "specs/uikit/netlist_renderer.t27", "specs/uikit/object_registry.t27", "specs/uikit/plate.t27", "specs/uikit/stories.t27", "specs/uikit/stories_badge.t27", "specs/uikit/stories_bracket_frame.t27", "specs/uikit/stories_netlist.t27", "specs/uikit/stories_plate.t27", "specs/uikit/text.t27", "specs/uikit/theme_pill.t27", "specs/policy/vf_write_gate.t27" };
-#define GD_PATH_COUNT 51
-static const uint32_t GD_PATH_LAYER[51] = { 6, 7, 7, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 7, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 7 };
-static const size_t GD_PATH_LENS[51] = { 38, 23, 23, 32, 21, 25, 26, 24, 24, 23, 28, 28, 27, 23, 23, 24, 23, 22, 22, 22, 27, 29, 28, 22, 21, 29, 22, 20, 23, 25, 30, 35, 29, 31, 29, 25, 27, 20, 25, 29, 32, 31, 21, 23, 29, 37, 31, 29, 20, 26, 30 };
+#define GD_LAYERS 9
+static const const char* GD_LAYER_NAMES[9] = { "graph", "meaning", "layout", "theme", "render", "other", "contract", "check", "host" };
+static const const char* GD_PATHS[53] = { "specs/t27f/visual_factory_contract.t27", "specs/t27f/vf_guard.t27", "specs/t27f/vf_ring1.t27", "specs/t27f/stories/task_card.t27", "specs/t27f/ui_kit.t27", "specs/t27f/vf_meaning.t27", "specs/t27f/vf_snapshot.t27", "specs/t27f/vf_layout.t27", "specs/t27f/vf_extent.t27", "specs/t27f/vf_theme.t27", "specs/t27f/outfit_r_data.t27", "specs/t27f/outfit_b_data.t27", "specs/t27f/outfit_atlas.t27", "specs/t27f/vf_brand.t27", "specs/t27f/vf_pixel.t27", "specs/t27f/vf_render.t27", "specs/t27f/vf_scale.t27", "specs/t27f/vf_type.t27", "specs/t27f/vf_card.t27", "specs/t27f/vf_diff.t27", "specs/t27f/vf_storybook.t27", "specs/t27os/vf_frame_main.t27", "specs/t27os/vf_type_main.t27", "specs/uikit/avatar.t27", "specs/uikit/badge.t27", "specs/uikit/bracket_frame.t27", "specs/uikit/button.t27", "specs/uikit/card.t27", "specs/uikit/catalog.t27", "specs/uikit/container.t27", "specs/uikit/control_center.t27", "specs/uikit/control_center_view.t27", "specs/uikit/design_tokens.t27", "specs/uikit/god_mode_toggle.t27", "specs/uikit/header_button.t27", "specs/uikit/hero_card.t27", "specs/uikit/input_model.t27", "specs/uikit/lamp.t27", "specs/uikit/light_dot.t27", "specs/uikit/native_tokens.t27", "specs/uikit/netlist_renderer.t27", "specs/uikit/object_registry.t27", "specs/uikit/plate.t27", "specs/uikit/stories.t27", "specs/uikit/stories_badge.t27", "specs/uikit/stories_bracket_frame.t27", "specs/uikit/stories_netlist.t27", "specs/uikit/stories_plate.t27", "specs/uikit/text.t27", "specs/uikit/theme_pill.t27", "specs/policy/vf_write_gate.t27", "specs/t27os/glass_window.t27", "specs/t27os/tool_page_chrome.t27" };
+#define GD_PATH_COUNT 53
+static const uint32_t GD_PATH_LAYER[53] = { 6, 7, 7, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 7, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 7, 8, 8 };
+static const size_t GD_PATH_LENS[53] = { 38, 23, 23, 32, 21, 25, 26, 24, 24, 23, 28, 28, 27, 23, 23, 24, 23, 22, 22, 22, 27, 29, 28, 22, 21, 29, 22, 20, 23, 25, 30, 35, 29, 31, 29, 25, 27, 20, 25, 29, 32, 31, 21, 23, 29, 37, 31, 29, 20, 26, 30, 28, 32 };
 #define GD_ROLES 3
 #define GL_CHECK 7
 #define GL_CONTRACT 6
 #define GL_GRAPH 0
+#define GL_HOST 8
 #define GL_LAYOUT 2
 #define GL_MEANING 1
 #define GL_OTHER 5
@@ -298,6 +299,9 @@ uint32_t check_vf_writes(uint8_t* buf, size_t n, uint8_t* out, size_t cap) {
                         if ((layer == 7)) {
                             llen = 5;
                         }
+                        if ((layer == 8)) {
+                            llen = 4;
+                        }
                         w = put_str(out, cap, w, lname, llen);
                         w = put(out, w, cap, '\n');
                     }
@@ -379,6 +383,9 @@ bool gd_allows(uint32_t role, uint32_t layer) {
     }
     if ((layer == GL_CHECK)) {
         return false;
+    }
+    if ((layer == GL_HOST)) {
+        return true;
     }
     if ((role == GR_ENGINE)) {
         return true;
