@@ -115,7 +115,7 @@ All evidence files are located in `audit-output/chimera/shadow-mvp/`:
 3. **shadow-mvp-input.json** - Input validation and constraints
 4. **shadow-mvp-output.json** - Output data and validation
 5. **shadow-mvp-invariants.json** - Invariant validation results
-6. **shadow-mvp-trace.json** - Complete execution trace
+6. **shadow-mvp-trace.jsonc** - Complete execution trace
 7. **SHADOW_MVP_REPORT.md** - This completion report
 
 ## Verification Checklist
