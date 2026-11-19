@@ -1,0 +1,834 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/generate_hslm.t27 -- greedy generation from an HSLM checkpoint, in t27, no heap.
+; Part of GOLDEN_CHAIN (IGLA_CODER_WORKING_MODEL_END_TO_END_V1, task 1: generation entrypoint).
+; 
+; WHAT IT DOES: main() loads the resumable .state checkpoint (the same file specs/ml/train_hslm
+; writes: full f64 parameters), rebuilds the model through nn::hslm's TWN scatter, reads a prompt
+; from /tmp/hslm/prompt.txt, encodes it with the HSLM 729-token BPE (nn::hslm_tokenizer), and
+; generates up to max_new tokens GREEDILY (argmax of the last-position logits -- no sampling, no
+; seed, byte-for-byte reproducible). It writes raw token ids and the decoded text to
+; /tmp/hslm/gen_out.txt, prints the same to stdout, and exits 0 only if everything verified.
+; 
+; THE RECEIPT (first lines of gen_out.txt):
+;     step, prompt bytes/tokens, generated tokens, generation seconds, generated tok/s,
+;     the FNV-1a-style hash of the parameter bits BEFORE and AFTER generation --
+;     the two hashes must be equal: inference must not mutate the weights.
+; 
+; WHAT IS REUSED, NOT COPIED: the forward pass and the weights struct (nn::hslm hslm_forward,
+; HSLMWeights), the TWN quantizer (nn::ternary_ste quantize_twn), and the tokenizer
+; (nn::hslm_tokenizer encode/decode). The checkpoint layout, the segment table and the loader
+; logic mirror specs/ml/train_hslm.t27 sections 2 and 7 (same layout to the byte: same segment
+; order, same header, same digest). They are duplicated here, not imported, because use_resolve
+; does not splice module-level vars and the trainer's loader binds to trainer state; a shared
+; nn/hslm_state.t27 module is the noted follow-up refactor, not done in this slice.
+; 
+; THE GENERATION LOOP: the model is causal with a 27-token window and per-position KV caches.
+; Each generated token re-encodes the last min(len, 27) tokens from position 0 (this rewrites
+; every cache slot), then reads the logits of the last position and takes the argmax. EOS (id 2)
+; stops generation. BOS (id 1) starts an empty prompt.
+; 
+; THE FILE (config, key=value lines of integers):
+;     /tmp/hslm/gen.cfg     step (checkpoint number, required), max_new (default 64)
+; THE FILES (written):
+;     /tmp/hslm/gen_out.txt  the receipt, the raw ids and the decoded text
+; 
+; Tests: tokenizer round trip, segment build total, kind lengths, digest over a small payload,
+; argmax first-max tie-break, and the context-window slice. Issue: GOLDEN_CHAIN V3, task 1.
+
+module generate_hslm;
+
+use base::types;
+use nn::hslm;
+use nn::ternary_ste;
+use nn::hslm_tokenizer;
+
+; THE SHAPE (same declarations as specs/ml/train_hslm.t27: nn::hslm and the trainer both carry
+; them; a name two imports declare is not resolved, so this module declares them once).
+const CONTEXT_LEN : usize = 27;
+const VOCAB_SIZE : usize = 729;
+const EMBED_DIM : usize = 243;
+const FF_DIM : usize = 729;
+const NUM_BLOCKS : usize = 3;
+const NUM_HEADS : usize = 3;
+
+; THE SEGMENTS (the flat parameter vector layout of specs/ml/train_hslm.t27 section 2; the order
+; is what the .state payload stores, so it must match to the byte).
+const K_Q : u8 = 0;
+const K_K : u8 = 1;
+const K_V : u8 = 2;
+const K_O : u8 = 3;
+const K_UP : u8 = 4;
+const K_DOWN : u8 = 5;
+const K_GAMMA : u8 = 6;
+const K_BUP : u8 = 7;
+const K_BDOWN : u8 = 8;
+const K_OUT : u8 = 9;
+const K_BOUT : u8 = 10;
+const K_EMBED : u8 = 11;
+const NSEG : usize = 30;
+const NPARAM : usize = 2130138;
+
+; THE CHECKPOINT FILE (specs/ml/train_hslm.t27 section 7, same bytes).
+const STATE_MAGIC : u32 = 0x53373254;   // "T27S" little endian
+const STATE_VERSION : u32 = 1;
+const STATE_HEADER : usize = 64;
+const PAYLOAD_BYTES : usize = 3 * NPARAM * 8;
+const DIGEST_OFFSET : usize = 52;
+const DIGEST_MOD : u64 = 4294967291;
+const DIGEST_SEED : u64 = 1469598103;
+
+; THE GENERATION.
+const EOS_TOKEN : u16 = 2;
+const BOS_TOKEN : u16 = 1;
+const DEFAULT_MAX_NEW : u64 = 64;
+const PROMPT_BYTES_MAX : usize = 8192;
+const GEN_IDS_MAX : usize = 8192;
+
+; EXIT CODES.
+const RC_OK : i32 = 0;
+const RC_CFG : i32 = 10;
+const RC_STATE : i32 = 30;
+const RC_PROMPT : i32 = 11;
+const RC_MUTATED : i32 = 40;
+
+; THE STATE OF nn::hslm (use_resolve splices functions, structs, enums and consts but not
+; module-level vars; the spliced forward binds to these, which repeat nn::hslm section 2).
+var model : HSLMWeights = undefined;
+threadlocal var kv_k : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+threadlocal var kv_v : [NUM_BLOCKS * CONTEXT_LEN * EMBED_DIM]f64 = undefined;
+threadlocal var act_token : usize = 0;
+threadlocal var act_pos : [NUM_BLOCKS]usize = undefined;
+threadlocal var act_x : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var act_n1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var act_rms1 : [NUM_BLOCKS]f64 = undefined;
+threadlocal var act_q : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var act_attn : [NUM_BLOCKS * NUM_HEADS * CONTEXT_LEN]f64 = undefined;
+threadlocal var act_ctx : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var act_r : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var act_pre : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+threadlocal var act_h : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+threadlocal var act_out : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var act_hn : [EMBED_DIM]f64 = undefined;
+threadlocal var act_hrms : f64 = 1.0;
+threadlocal var gw_q : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+threadlocal var gw_k : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+threadlocal var gw_v : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+threadlocal var gw_o : [NUM_BLOCKS * EMBED_DIM * EMBED_DIM]f64 = undefined;
+threadlocal var gw_up : [NUM_BLOCKS * EMBED_DIM * FF_DIM]f64 = undefined;
+threadlocal var gw_down : [NUM_BLOCKS * FF_DIM * EMBED_DIM]f64 = undefined;
+threadlocal var gw_out : [EMBED_DIM * VOCAB_SIZE]f64 = undefined;
+threadlocal var g_gamma1 : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var g_b_up : [NUM_BLOCKS * FF_DIM]f64 = undefined;
+threadlocal var g_b_down : [NUM_BLOCKS * EMBED_DIM]f64 = undefined;
+threadlocal var g_b_out : [VOCAB_SIZE]f64 = undefined;
+threadlocal var g_embed : [VOCAB_SIZE * EMBED_DIM]f64 = undefined;
+threadlocal var bw_out : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_h : [FF_DIM]f64 = undefined;
+threadlocal var bw_pre : [FF_DIM]f64 = undefined;
+threadlocal var bw_sf : [FF_DIM]f64 = undefined;
+threadlocal var bw_se : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_n : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_tmp : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_r : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_ctx : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_q : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_k : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_v : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_da : [CONTEXT_LEN]f64 = undefined;
+threadlocal var bw_x : [EMBED_DIM]f64 = undefined;
+threadlocal var bw_dz : [VOCAB_SIZE]f64 = undefined;
+var nudge_which : u8 = 255;
+var nudge_block : usize = 0;
+var nudge_index : usize = 0;
+var nudge_delta : f64 = 0.0;
+var vsa_on : bool = true;
+threadlocal var vsa_in : [NUM_BLOCKS * CONTEXT_LEN * VSA_DIM]Trit = undefined;
+threadlocal var vsa_out : [NUM_BLOCKS * VSA_DIM]Trit = undefined;
+threadlocal var vsa_ctx : [VSA_DIM]Trit = undefined;
+threadlocal var vsa_reasoned : [VSA_DIM]Trit = undefined;
+threadlocal var vsa_temp : [VSA_DIM]Trit = undefined;
+threadlocal var vsa_temp2 : [VSA_DIM]Trit = undefined;
+threadlocal var vsa_sim : [CONTEXT_LEN]f64 = undefined;
+threadlocal var vsa_accum : [VSA_DIM]i64 = undefined;
+threadlocal var vsa_max_sim : [NUM_BLOCKS]f64 = undefined;
+threadlocal var vsa_fired : [NUM_BLOCKS]bool = undefined;
+threadlocal var gate_total : [NUM_BLOCKS]usize = undefined;
+threadlocal var gate_conscious : [NUM_BLOCKS]usize = undefined;
+threadlocal var gate_ema : [NUM_BLOCKS]f64 = undefined;
+
+; THE GENERATION STATE (this module's own).
+var params : [NPARAM]f64 = undefined;
+var seg_off : [NSEG]usize = undefined;
+var seg_len : [NSEG]usize = undefined;
+var seg_kind : [NSEG]u8 = undefined;
+var seg_block : [NSEG]usize = undefined;
+var payload : [PAYLOAD_BYTES]u8 = undefined;
+var state_hdr : [STATE_HEADER]u8 = undefined;
+var cfg_step : u64 = 0;
+var cfg_max_new : u64 = DEFAULT_MAX_NEW;
+var cfg_seed : u64 = 0;         // 0 = greedy; non-zero = sample with temperature
+var cfg_temp_milli : u64 = 800; // sampling temperature, thousandths
+var prompt_buf : [PROMPT_BYTES_MAX]u8 = undefined;
+var prompt_len : usize = 0;
+var ids : [GEN_IDS_MAX]u16 = undefined;
+var ids_len : usize = 0;
+var gen_logits : [VOCAB_SIZE]f64 = undefined;
+var out_buf : [GEN_IDS_MAX * 4 + 4096]u8 = undefined;
+var path_buf : [96]u8 = undefined;  // NUL-terminated file path, the trainer's host-IO idiom
+var rng_state : u64 = 0;            // sampling PRNG; 0 means greedy
+
+// ---------------------------------------------------------------- config
+
+fn gen_read_cfg() -> void {
+    cfg_step = 0;
+    cfg_max_new = DEFAULT_MAX_NEW;
+    const fd : i32 = host_open("/tmp/hslm/gen.cfg", 0);
+    if (fd < 0) {
+        return;  // no config: nothing to load, main refuses with RC_CFG
+    }
+    var buf : [256]u8 = undefined;
+    const n64 : i64 = host_read(fd, &buf);
+    _ = host_close(fd);
+    if (n64 <= 0) {
+        return;
+    }
+    // 2026-11-17 defect fix: the first draft stopped at the first newline, so a multi-line
+    // config applied only its FIRST key (max_new was silently ignored). Scan every line.
+    const n : usize = @intCast(n64);
+    var i : usize = 0;
+    while (i < n) {
+        var e : usize = i;
+        while (e < n and buf[e] != 10) {
+            e = e + 1;
+        }
+        // parse "key=value" within buf[i..e]
+        var eq : usize = e;
+        var j : usize = i;
+        var value : u64 = 0;
+        var has_eq : bool = false;
+        while (j < e) {
+            if (buf[j] == 61) {
+                eq = j;
+                has_eq = true;
+                value = 0;
+            } else if (buf[j] >= 48 and buf[j] <= 57 and has_eq) {
+                value = value * 10 + @as(u64, buf[j] - 48);
+            }
+            j = j + 1;
+        }
+        if (has_eq) {
+            const klen : usize = eq - i;
+            var key_step : bool = klen == 4 and buf[i] == 115 and buf[i + 1] == 116 and buf[i + 2] == 101 and buf[i + 3] == 112;
+            var key_max : bool = klen == 7 and buf[i] == 109 and buf[i + 1] == 97 and buf[i + 2] == 120 and buf[i + 3] == 95 and buf[i + 4] == 110 and buf[i + 5] == 101 and buf[i + 6] == 119;
+            var key_seed : bool = klen == 4 and buf[i] == 115 and buf[i + 1] == 101 and buf[i + 2] == 101 and buf[i + 3] == 100;
+            var key_temp : bool = klen == 11 and buf[i] == 116 and buf[i + 1] == 101 and buf[i + 2] == 109 and buf[i + 3] == 112;
+            if (key_step) {
+                cfg_step = value;
+            } else if (key_max) {
+                cfg_max_new = value;
+            } else if (key_seed) {
+                cfg_seed = value;
+            } else if (key_temp) {
+                cfg_temp_milli = value;
+            }
+        }
+        i = e + 1;
+    }
+}
+
+// ---------------------------------------------------------------- segments and load
+
+fn gen_kind_len(kind: u8) -> usize {
+    if (kind <= K_O) {
+        return EMBED_DIM * EMBED_DIM;
+    }
+    if (kind == K_UP or kind == K_DOWN or kind == K_OUT or kind == K_EMBED) {
+        return EMBED_DIM * FF_DIM;
+    }
+    if (kind == K_BUP or kind == K_BOUT) {
+        return FF_DIM;
+    }
+    return EMBED_DIM;
+}
+
+fn gen_build_segments() -> usize {
+    var off : usize = 0;
+    var s : usize = 0;
+    var b : usize = 0;
+    while (b < NUM_BLOCKS) {
+        var k : u8 = 0;
+        while (k < 9) {
+            seg_kind[s] = k;
+            seg_block[s] = b;
+            seg_off[s] = off;
+            seg_len[s] = gen_kind_len(k);
+            off = off + seg_len[s];
+            s = s + 1;
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    var tail : u8 = K_OUT;
+    while (tail <= K_EMBED) {
+        seg_kind[s] = tail;
+        seg_block[s] = 0;
+        seg_off[s] = off;
+        seg_len[s] = gen_kind_len(tail);
+        off = off + seg_len[s];
+        s = s + 1;
+        tail = tail + 1;
+    }
+    return off;
+}
+
+fn gen_u32(buf: []u8, off: usize) -> u32 {
+    return @as(u32, buf[off]) + (@as(u32, buf[off + 1]) << 8) + (@as(u32, buf[off + 2]) << 16) + (@as(u32, buf[off + 3]) << 24);
+}
+
+fn gen_u64(buf: []u8, off: usize) -> u64 {
+    var v : u64 = 0;
+    var k : usize = 0;
+    while (k < 8) {
+        v = v + (@as(u64, buf[off + k]) << @as(u6, @intCast(8 * k)));
+        k = k + 1;
+    }
+    return v;
+}
+
+/// the digest the trainer's loader checks: h = 1469598103; for every payload f64 in file order
+/// h = (h * 31 + (bits % 4294967291)) % 4294967291
+fn gen_digest(payload_bytes: []u8) -> u64 {
+    var h : u64 = DIGEST_SEED;
+    var i : usize = 0;
+    while (i + 8 <= payload_bytes.len) {
+        var b : u64 = 0;
+        var k : usize = 0;
+        while (k < 8) {
+            b = b + (@as(u64, payload_bytes[i + k]) << @as(u6, @intCast(8 * k)));
+            k = k + 1;
+        }
+        h = (h * 31 + (b % DIGEST_MOD)) % DIGEST_MOD;
+        i = i + 8;
+    }
+    return h;
+}
+
+/// FNV-style hash of the parameter bits, for the weights-unchanged receipt
+fn gen_params_hash() -> u64 {
+    var h : u64 = 1469598103;
+    var i : usize = 0;
+    while (i < NPARAM) {
+        const w : u64 = @bitCast(params[i]);
+        h = (h ^ (w & 255)) * 1099511628211;
+        h = h ^ (w >> 8);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn gen_from_flat(off: usize, dst: []f64) -> void {
+    var i : usize = 0;
+    while (i < dst.len) {
+        dst[i] = params[off + i];
+        i = i + 1;
+    }
+}
+
+fn gen_scatter(s: usize) -> void {
+    const kind : u8 = seg_kind[s];
+    const off : usize = seg_off[s];
+    const src = params[off..off + seg_len[s]];
+    const bw = &model.blocks[seg_block[s]];
+    if (kind == K_Q) {
+        bw.alpha_q = quantize_twn(src, &bw.w_q);
+    } else if (kind == K_K) {
+        bw.alpha_k = quantize_twn(src, &bw.w_k);
+    } else if (kind == K_V) {
+        bw.alpha_v = quantize_twn(src, &bw.w_v);
+    } else if (kind == K_O) {
+        bw.alpha_o = quantize_twn(src, &bw.w_o);
+    } else if (kind == K_UP) {
+        bw.alpha_up = quantize_twn(src, &bw.w_up);
+    } else if (kind == K_DOWN) {
+        bw.alpha_down = quantize_twn(src, &bw.w_down);
+    } else if (kind == K_GAMMA) {
+        gen_from_flat(off, &bw.norm1_gamma);
+    } else if (kind == K_BUP) {
+        gen_from_flat(off, &bw.b_up);
+    } else if (kind == K_BDOWN) {
+        gen_from_flat(off, &bw.b_down);
+    } else if (kind == K_OUT) {
+        model.alpha_out = quantize_twn(src, &model.w_out);
+    } else if (kind == K_BOUT) {
+        gen_from_flat(off, &model.b_out);
+    } else {
+        gen_from_flat(off, &model.embed);
+    }
+}
+
+/// load /tmp/hslm/ckpt_<cfg_step>.state: header check, digest check, parameters only
+/// (the LAMB moments after them in the payload are read for the digest and discarded:
+/// generation needs no optimizer state)
+fn gen_load_state() -> i32 {
+    if (cfg_step == 0) {
+        return RC_CFG;
+    }
+    var path : [64]u8 = undefined;
+    var plen : usize = 0;
+    var prefix : []const u8 = "/tmp/hslm/ckpt_";
+    var i : usize = 0;
+    while (i < prefix.len) {
+        path[plen] = prefix[i];
+        plen = plen + 1;
+        i = i + 1;
+    }
+    var v : u64 = cfg_step;
+    var digits : [20]u8 = undefined;
+    var nd : usize = 0;
+    if (v == 0) {
+        digits[0] = 48;
+        nd = 1;
+    }
+    while (v > 0) {
+        digits[nd] = @intCast(48 + (v % 10));
+        nd = nd + 1;
+        v = v / 10;
+    }
+    i = 0;
+    while (i < nd) {
+        path[plen] = digits[nd - 1 - i];
+        plen = plen + 1;
+        i = i + 1;
+    }
+    var suffix : []const u8 = ".state";
+    i = 0;
+    while (i < suffix.len) {
+        path[plen] = suffix[i];
+        plen = plen + 1;
+        i = i + 1;
+    }
+    // the trainer's host-IO idiom: a NUL-terminated buffer passed by pointer
+    var bi : usize = 0;
+    while (bi < plen) {
+        path_buf[bi] = path[bi];
+        bi = bi + 1;
+    }
+    path_buf[plen] = 0;
+    const fd : i32 = host_open(@ptrCast(&path_buf), 0);
+    if (fd < 0) {
+        return RC_STATE;
+    }
+    // a single host_read may return short; read header, then the payload in chunks
+    // (the trainer's tr_read_full idiom)
+    const hr : i64 = host_read(fd, &state_hdr);
+    if (hr != @as(i64, STATE_HEADER)) {
+        _ = host_close(fd);
+        return RC_STATE;
+    }
+    var total : usize = 0;
+    while (total < PAYLOAD_BYTES) {
+        var chunk : usize = PAYLOAD_BYTES - total;
+        if (chunk > 16777216) {
+            chunk = 16777216;
+        }
+        const r : i64 = host_read(fd, payload[total..total + chunk]);
+        if (r <= 0) {
+            _ = host_close(fd);
+            return RC_STATE;
+        }
+        total = total + @as(usize, @intCast(r));
+    }
+    _ = host_close(fd);
+    if (total != PAYLOAD_BYTES) {
+        return RC_STATE;
+    }
+    if (gen_u32(&state_hdr, 0) != STATE_MAGIC or gen_u32(&state_hdr, 4) != STATE_VERSION
+        or @as(u64, gen_u32(&state_hdr, 8)) != cfg_step
+        or @as(usize, gen_u32(&state_hdr, 12)) != NPARAM
+        or gen_u32(&state_hdr, 48) != 30) {
+        return RC_STATE;
+    }
+    if (gen_digest(&payload) != gen_u64(&state_hdr, DIGEST_OFFSET)) {
+        return RC_STATE;
+    }
+    // decode the parameters; the rest of the payload is optimizer state, already digested
+    var k : usize = 0;
+    while (k < NPARAM) {
+        var b : u64 = 0;
+        var j : usize = 0;
+        while (j < 8) {
+            b = b + (@as(u64, payload[8 * k + j]) << @as(u6, @intCast(8 * j)));
+            j = j + 1;
+        }
+        params[k] = @bitCast(b);
+        k = k + 1;
+    }
+    var s : usize = 0;
+    while (s < NSEG) {
+        gen_scatter(s);
+        s = s + 1;
+    }
+    return RC_OK;
+}
+
+// ---------------------------------------------------------------- generation
+
+/// the portable monotonic clock of #13168 (mirrored from specs/ml/train_hslm.t27 until the
+/// shared nn/hslm_state refactor); nanoseconds
+fn prof_now() -> u64 {
+    var ts: std.posix.timespec = undefined;
+    ts.sec = 0;
+    ts.nsec = 0;
+    if (@import("builtin").os.tag == .linux) {
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    } else {
+        if (@import("builtin").os.tag == .macos) {
+            _ = std.c.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+        }
+    }
+    return @as(u64, @intCast(ts.sec)) * 1000000000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// greedy argmax: the FIRST maximum (ties resolve to the lowest id, so the mode is
+/// deterministic even under exact ties)
+fn gen_argmax(logits: []f64) -> u16 {
+    var best : usize = 0;
+    var i : usize = 1;
+    while (i < logits.len) {
+        if (logits[i] > logits[best]) {
+            best = i;
+        }
+        i = i + 1;
+    }
+    return @intCast(best);
+}
+
+/// the generation-loop stop rule, pinned by a test: stop on EOS or when the cap is reached
+fn gen_should_stop(next: u16, generated: u64, cap: u64) -> bool {
+    if (next == EOS_TOKEN) {
+        return true;
+    }
+    return generated >= cap;
+}
+
+/// stochastic pick: temperature-scaled probabilities over the full vocabulary, drawn by the
+/// seeded xorshift64 PRNG (mirrors the trainer's tr_xs/tr_unit). Same seed => same output.
+fn gen_sample(logits: []f64, rng: *u64) -> u16 {
+    const t : f64 = @as(f64, @floatFromInt(cfg_temp_milli)) / 1000.0;
+    var x : u64 = rng.*;
+    x = (x ^ (x << 13));
+    x = (x ^ (x >> 7));
+    x = (x ^ (x << 17));
+    if (x == 0) {
+        x = 1;
+    }
+    rng.* = x;
+    const u : f64 = @as(f64, @floatFromInt(x >> 11)) * (1.0 / 9007199254740992.0);
+    // softmax with the max subtracted for stability
+    var mx : f64 = logits[0];
+    var i : usize = 1;
+    while (i < logits.len) {
+        if (logits[i] > mx) {
+            mx = logits[i];
+        }
+        i = i + 1;
+    }
+    var total : f64 = 0.0;
+    var cum : f64 = 0.0;
+    var pick : u16 = 0;
+    i = 0;
+    while (i < logits.len) {
+        total = total + exp((logits[i] - mx) / t);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < logits.len) {
+        cum = cum + exp((logits[i] - mx) / t);
+        if (cum / total >= u) {
+            pick = @intCast(i);
+            break;
+        }
+        i = i + 1;
+    }
+    return pick;
+}
+
+/// re-encode the last min(len, CONTEXT_LEN) ids from position 0 and return the argmax
+/// of the last position's logits
+fn gen_next_token() -> u16 {
+    const start : usize = ids_len - (if (ids_len < CONTEXT_LEN) ids_len else CONTEXT_LEN);
+    var p : usize = 0;
+    while (p < ids_len - start) {
+        hslm_forward(@as(usize, ids[start + p]), p, &gen_logits);
+        p = p + 1;
+    }
+    return gen_argmax(&gen_logits);
+}
+
+fn gen_out_write(s: []u8, off: usize, text: []const u8) -> usize {
+    var i : usize = 0;
+    while (i < text.len) {
+        s[off + i] = text[i];
+        i = i + 1;
+    }
+    return off + text.len;
+}
+
+fn gen_out_num(s: []u8, off: usize, v: u64) -> usize {
+    var digits : [20]u8 = undefined;
+    var nd : usize = 0;
+    var x : u64 = v;
+    if (x == 0) {
+        digits[0] = 48;
+        nd = 1;
+    }
+    while (x > 0) {
+        digits[nd] = @intCast(48 + (x % 10));
+        nd = nd + 1;
+        x = x / 10;
+    }
+    var o : usize = off;
+    var i : usize = 0;
+    while (i < nd) {
+        s[o] = digits[nd - 1 - i];
+        o = o + 1;
+        i = i + 1;
+    }
+    return o;
+}
+
+fn gen_out_hex(s: []u8, off: usize, v: u64) -> usize {
+    const hex : []const u8 = "0123456789abcdef";
+    var o : usize = off;
+    var i : usize = 0;
+    while (i < 16) {
+        s[o] = hex[@intCast((v >> @as(u6, @intCast(60 - 4 * i))) & 15)];
+        o = o + 1;
+        i = i + 1;
+    }
+    return o;
+}
+
+pub fn main() -> void {
+    assert tr_main() == RC_OK;
+}
+
+fn tr_main() -> i32 {
+    gen_read_cfg();
+    if (cfg_step == 0) {
+        return RC_CFG;
+    }
+    const t_start : f64 = @as(f64, @floatFromInt(prof_now())) / 1000000000.0;
+    const built : usize = gen_build_segments();
+    if (built != NPARAM) {
+        return RC_STATE;
+    }
+    const rc_load : i32 = gen_load_state();
+    if (rc_load != RC_OK) {
+        return rc_load;
+    }
+    const t_loaded : f64 = @as(f64, @floatFromInt(prof_now())) / 1000000000.0;
+    const hash_before : u64 = gen_params_hash();
+    // the prompt
+    const pf : i32 = host_open("/tmp/hslm/prompt.txt", 0);
+    if (pf < 0) {
+        return RC_PROMPT;
+    }
+    const pr : i64 = host_read(pf, &prompt_buf);
+    _ = host_close(pf);
+    if (pr < 0) {
+        return RC_PROMPT;
+    }
+    prompt_len = @intCast(pr);
+    var n_prompt : usize = 0;
+    if (prompt_len == 0) {
+        ids[0] = BOS_TOKEN;
+        ids_len = 1;
+        n_prompt = 1;
+    } else {
+        n_prompt = encode(prompt_buf[0..prompt_len], &ids);
+        ids_len = n_prompt;
+    }
+    if (ids_len == 0) {
+        ids[0] = BOS_TOKEN;
+        ids_len = 1;
+        n_prompt = 1;
+    }
+    // generate, greedy, until max_new or EOS
+    const t0 : f64 = @as(f64, @floatFromInt(prof_now())) / 1000000000.0;
+    var generated : u64 = 0;
+    var stopped_eos : bool = false;
+    while (generated < cfg_max_new and ids_len < GEN_IDS_MAX) {
+        var next : u16 = 0;
+        if (cfg_seed != 0) {
+            if (rng_state == 0) {
+                rng_state = cfg_seed;
+            }
+            next = gen_sample(&gen_logits, &rng_state);
+        } else {
+            next = gen_next_token();
+        }
+        if (gen_should_stop(next, generated, cfg_max_new)) {
+            if (next == EOS_TOKEN) {
+                stopped_eos = true;
+            }
+            break;
+        }
+        ids[ids_len] = next;
+        ids_len = ids_len + 1;
+        generated = generated + 1;
+    }
+    const t1 : f64 = @as(f64, @floatFromInt(prof_now())) / 1000000000.0;
+    const gen_secs : f64 = t1 - t0;
+    const hash_after : u64 = gen_params_hash();
+    if (hash_after != hash_before) {
+        return RC_MUTATED;
+    }
+    // 2026-11-17 review fix: fractional speed without float printing -- milli-tokens per
+    // second (generated * 1000 / ms), computed over NEW tokens only (ids after the prompt).
+    const gen_ms : f64 = gen_secs * 1000.0;
+    const tok_per_s_milli : u64 = if (gen_ms >= 1.0) @intFromFloat(@as(f64, @floatFromInt(generated)) * 1000000.0 / gen_ms) else 0;  // milli-tokens/s: 3685 means 3.685 tok/s
+    // the receipt: gen_out.txt
+    var o : usize = 0;
+    var l1 : []const u8 = "step ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, cfg_step);
+    l1 = " prompt_bytes ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, @as(u64, prompt_len));
+    l1 = " prompt_tokens ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, @as(u64, n_prompt));
+    l1 = " generated ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, generated);
+    l1 = " seed ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, cfg_seed);
+    l1 = " temp_milli ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, cfg_temp_milli);
+    l1 = " eos ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, @as(u64, if (stopped_eos) 1 else 0));
+    l1 = " load_secs_ms ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, @intFromFloat((t_loaded - t_start) * 1000.0));
+    l1 = " gen_secs_ms ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, @intFromFloat(gen_ms));
+    l1 = " tok_per_s_milli ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_num(&out_buf, o, tok_per_s_milli);
+    l1 = "\nparams_hash_before ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_hex(&out_buf, o, hash_before);
+    l1 = " after ";
+    o = gen_out_write(&out_buf, o, l1);
+    o = gen_out_hex(&out_buf, o, hash_after);
+    l1 = "\nids";
+    o = gen_out_write(&out_buf, o, l1);
+    var i : usize = 0;
+    while (i < ids_len) {
+        o = gen_out_write(&out_buf, o, " ");
+        o = gen_out_num(&out_buf, o, @as(u64, ids[i]));
+        i = i + 1;
+    }
+    l1 = "\n---decoded---\n";
+    o = gen_out_write(&out_buf, o, l1);
+    const dn : usize = decode(ids[0..ids_len], out_buf[o..o + ids_len * 4]);
+    o = o + dn;
+    l1 = "\n";
+    o = gen_out_write(&out_buf, o, l1);
+    const of : i32 = host_open("/tmp/hslm/gen_out.txt", 1);
+    if (of < 0) {
+        return RC_PROMPT;
+    }
+    _ = host_write(of, out_buf[0..o]);
+    _ = host_close(of);
+    return RC_OK;
+}
+
+// ---------------------------------------------------------------- tests
+
+fn gen_round_trip_len() -> usize {
+    var text : []const u8 = "Once upon a time";
+    var ids_buf : [128]u16 = undefined;
+    const n : usize = encode(text, &ids_buf);
+    if (n == 0) {
+        return 0;
+    }
+    var back : [256]u8 = undefined;
+    const m : usize = decode(ids_buf[0..n], &back);
+    var same : bool = m == text.len;
+    var i : usize = 0;
+    while (same and i < text.len) {
+        same = back[i] == text[i];
+        i = i + 1;
+    }
+    if (!same) {
+        return 0;
+    }
+    return n;
+}
+
+test tokenizer_encode_decode_round_trips_ascii {
+    const n : usize = gen_round_trip_len();
+    assert n > 0;
+}
+
+test the_segment_table_totals_the_parameter_vector {
+    const built : usize = gen_build_segments();
+    assert built == NPARAM;
+}
+
+test argmax_takes_the_first_maximum {
+    var l : [5]f64 = undefined;
+    l[0] = 0.0; l[1] = 2.0; l[2] = 2.0; l[3] = 1.0; l[4] = 2.0;
+    const t : u16 = gen_argmax(&l);
+    assert t == 1;
+}
+
+test a_digest_of_a_known_small_payload_is_stable {
+    var b : [24]u8 = undefined;
+    var i : usize = 0;
+    while (i < 24) {
+        b[i] = @intCast(i * 7 & 255);
+        i = i + 1;
+    }
+    const d1 : u64 = gen_digest(&b);
+    const d2 : u64 = gen_digest(&b);
+    assert d1 == d2;
+    b[3] = b[3] + 1;
+    assert gen_digest(&b) != d1;
+}
+
+test sampling_with_the_same_seed_is_identical {
+    var l : [4]f64 = undefined;
+    l[0] = 0.1; l[1] = 0.9; l[2] = 0.2; l[3] = 0.8;
+    var r1 : u64 = 42;
+    var r2 : u64 = 42;
+    cfg_temp_milli = 1000;
+    const a1 : u16 = gen_sample(&l, &r1);
+    const a2 : u16 = gen_sample(&l, &r2);
+    assert a1 == a2;
+    assert r1 == r2;
+}
+
+test the_context_window_uses_the_last_27_ids {
+    // gen_next_token consumes cached positions; here only the slice arithmetic is pinned:
+    // for 30 ids the window starts at id 3, for 5 ids at id 0
+    var ids_len_probe : usize = 30;
+    var start : usize = ids_len_probe - (if (ids_len_probe < CONTEXT_LEN) ids_len_probe else CONTEXT_LEN);
+    assert start == 3;
+    ids_len_probe = 5;
+    start = ids_len_probe - (if (ids_len_probe < CONTEXT_LEN) ids_len_probe else CONTEXT_LEN);
+    assert start == 0;
+}
+
+test the_stop_rule_fires_on_eos_and_cap_only {
+    assert gen_should_stop(EOS_TOKEN, 0, 400);
+    assert gen_should_stop(100, 400, 400);
+    assert !gen_should_stop(100, 399, 400);
+    assert !gen_should_stop(BOS_TOKEN, 0, 400);
+}

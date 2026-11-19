@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/ml/state_digest_migration.t27 -- migrate a legacy trainer .state checkpoint to the
+; digest header the #13168 loader requires, in t27, no heap.
+; 
+; THE DEFECT THIS MIGRATES (found 2026-11-16, GOLDEN_CHAIN_CPU_RESUME_V1): checkpoints written by
+; the pre-#13168 writer store digest 0 at header byte 52; the #13168 loader recomputes the digest
+; over the payload and refuses any mismatch with RC_RESUME=30, so every legacy checkpoint is
+; refused on resume. The migration recomputes the digest from the payload and writes it into a NEW
+; output file; the original is never modified.
+; 
+; WHAT THIS IS NOT: not a repair. A checkpoint whose stored digest is nonzero and does not match
+; its payload is corrupt (a flipped byte somewhere); recomputing the digest would MASK the damage,
+; so migrate() refuses it. Only the exact legacy marker -- stored digest 0 with a valid header --
+; is migrated, and the caller must verify the trusted source hash of the input file first; this
+; spec cannot do that, so it is a precondition named in the receipt, not a check here.
+; 
+; THE DIGEST (specs/ml/train_hslm.t27 tr_state_digest_chunk, kept to the bit):
+;     h = 1469598103; for every payload f64 in file order:
+;     h = (h * 31 + (bits(w) % 4294967291)) % 4294967291
+; The digest covers parameters, LAMB m and LAMB v: 3 * nparam f64.
+; 
+; THE HEADER (64 bytes, specs/ml/train_hslm.t27 section 7): magic "T27S" (0x53373254 LE), version 1,
+; u32 step, u32 nparam, u64 rng, f64 beta1^t, f64 beta2^t, f64 loss, u32 nseg, u64 digest at byte 52,
+; 4 zero bytes at 60..63.
+; 
+; Tests: the positive legacy case, and the three refusals -- corrupt payload under a nonzero
+; digest, truncated payload, wrong magic/version. Issue: gHashTag/t27 resume slice 2026-11-16.
+
+module state_digest_migration;
+
+const STATE_MAGIC : u32 = 0x53373254;
+const STATE_VERSION : u32 = 1;
+const STATE_HEADER : usize = 64;
+const DIGEST_OFFSET : usize = 52;
+const DIGEST_MOD : u64 = 4294967291;
+const DIGEST_SEED : u64 = 1469598103;
+
+pub const MIGRATE_OK : i32 = 0;
+pub const MIGRATE_BAD_HEADER : i32 = 10;
+pub const MIGRATE_TRUNCATED : i32 = 11;
+pub const MIGRATE_CORRUPT : i32 = 12;
+pub const MIGRATE_NOT_LEGACY : i32 = 13;
+
+/// The digest of a payload of little-endian f64s, in file order, to the bit of the trainer.
+fn digest_payload(payload: []u8) -> u64 {
+    var h : u64 = DIGEST_SEED;
+    var i : usize = 0;
+    while (i + 8 <= payload.len) {
+        var b : u64 = 0;
+        var k : usize = 0;
+        while (k < 8) {
+            b = b + (@as(u64, payload[i + k]) << @as(u6, @intCast(8 * k)));
+            k = k + 1;
+        }
+        h = (h * 31 + (b % DIGEST_MOD)) % DIGEST_MOD;
+        i = i + 8;
+    }
+    return h;
+}
+
+fn header_magic(buf: []u8) -> u32 {
+    return @as(u32, buf[0]) + (@as(u32, buf[1]) << 8) + (@as(u32, buf[2]) << 16) + (@as(u32, buf[3]) << 24);
+}
+
+fn header_u32(buf: []u8, off: usize) -> u32 {
+    return @as(u32, buf[off]) + (@as(u32, buf[off + 1]) << 8) + (@as(u32, buf[off + 2]) << 16) + (@as(u32, buf[off + 3]) << 24);
+}
+
+fn header_u64(buf: []u8, off: usize) -> u64 {
+    var v : u64 = 0;
+    var k : usize = 0;
+    while (k < 8) {
+        v = v + (@as(u64, buf[off + k]) << @as(u6, @intCast(8 * k)));
+        k = k + 1;
+    }
+    return v;
+}
+
+fn put_u64(buf: []u8, off: usize, v: u64) -> void {
+    var k : usize = 0;
+    while (k < 8) {
+        buf[off + k] = @as(u8, @intCast((v >> @as(u6, @intCast(8 * k))) & 255));
+        k = k + 1;
+    }
+}
+
+/// Migrate one legacy .state image held in memory.
+/// src is the whole file (header + payload); out receives the migrated image (same length):
+/// only the 8 digest bytes at 52..59 are written; every other byte is copied unchanged.
+/// Returns MIGRATE_OK or the refusal code above; out is written only on MIGRATE_OK.
+pub fn migrate(src: []u8, nparam: u32, out: []u8) -> i32 {
+    if (src.len < STATE_HEADER or header_magic(src) != STATE_MAGIC or header_u32(src, 4) != STATE_VERSION or header_u32(src, 12) != nparam) {
+        return MIGRATE_BAD_HEADER;
+    }
+    const total : usize = 3 * @as(usize, nparam) * 8;
+    if (src.len != STATE_HEADER + total) {
+        return MIGRATE_TRUNCATED;
+    }
+    const stored : u64 = header_u64(src, DIGEST_OFFSET);
+    const actual : u64 = digest_payload(src[STATE_HEADER..]);
+    if (stored == actual) {
+        return MIGRATE_NOT_LEGACY;  // already current format: nothing to migrate, copy is a caller choice
+    }
+    if (stored != 0) {
+        return MIGRATE_CORRUPT;     // nonzero digest that does not match: refuse, do not mask damage
+    }
+    var i : usize = 0;
+    while (i < src.len) {
+        out[i] = src[i];
+        i = i + 1;
+    }
+    put_u64(out, DIGEST_OFFSET, actual);
+    return MIGRATE_OK;
+}
+
+// ---------------------------------------------------------------- test helpers
+// each helper runs one scenario in memory and returns the number its test checks
+// (the tiny_before idiom of specs/ml/train_hslm.t27); 1 is pass, 0 is fail, unless
+// the name says what the number is.
+
+const IMG_LEN : usize = 128;
+const IMG_USED : usize = 112;
+
+/// build one 112-byte image in buf; stored_digest 9999 means "the correct digest
+/// of this payload"; flip_payload flips one payload bit AFTER digesting
+/// NOTE: buf stays 128 bytes; the caller must pass buf[0..IMG_USED] to migrate,
+/// which is what a file image of exactly 112 bytes looks like
+fn tr_build(buf: []u8, stored_digest: u64, flip_payload: bool) -> usize {
+    var z : usize = 0;
+    while (z < IMG_LEN) {
+        buf[z] = 0;
+        z = z + 1;
+    }
+    buf[0] = 0x54; buf[1] = 0x32; buf[2] = 0x37; buf[3] = 0x53;
+    put_u64(buf, 4, STATE_VERSION);
+    put_u64(buf, 8, 8000);
+    put_u64(buf, 12, 2);                 // nparam 2: payload 3*2*8 = 48 bytes, image 112
+    put_u64(buf, 16, 12345);             // rng
+    put_u64(buf, 48, 30);                // nseg
+    var k : usize = 0;
+    while (k < 6) {
+        var j : usize = 0;
+        while (j < 8) {
+            buf[64 + 8 * k + j] = @as(u8, @intCast((k * 16 + j) & 255));
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    const dig : u64 = digest_payload(buf[64..IMG_USED]);
+    var chosen : u64 = stored_digest;
+    if (chosen == 9999) {
+        chosen = dig;
+    }
+    put_u64(buf, DIGEST_OFFSET, chosen);
+    if (flip_payload) {
+        buf[70] = buf[70] + 1;
+    }
+    return IMG_USED;
+}
+
+/// migrate the legacy case and check: rc OK, bytes outside 52..59 unchanged, digest now matches
+fn tr_legacy_case() -> u64 {
+    var src : [IMG_LEN]u8 = undefined;
+    const n : usize = tr_build(&src, 0, false);
+    var out : [IMG_LEN]u8 = undefined;
+    const rc : i32 = migrate(src[0..IMG_USED], 2, &out);
+    if (rc != MIGRATE_OK) {
+        return 0;
+    }
+    var i : usize = 0;
+    while (i < n) {
+        if ((i < DIGEST_OFFSET or i >= DIGEST_OFFSET + 8) and out[i] != src[i]) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if (header_u64(&out, DIGEST_OFFSET) != digest_payload(out[64..IMG_USED])) {
+        return 0;
+    }
+    return 1;
+}
+
+fn tr_current_format_refused() -> u64 {
+    var src : [IMG_LEN]u8 = undefined;
+    const n : usize = tr_build(&src, 9999, false);
+    var out : [IMG_LEN]u8 = undefined;
+    if (n != IMG_USED) {
+        return 0;
+    }
+    if (migrate(src[0..IMG_USED], 2, &out) != MIGRATE_NOT_LEGACY) {
+        return 0;
+    }
+    return 1;
+}
+
+/// the corrupt case: stored digest correct for the ORIGINAL payload, one byte flipped after;
+/// migrate must refuse with MIGRATE_CORRUPT and must not write output
+fn tr_corrupt_refused() -> u64 {
+    var img : [IMG_LEN]u8 = undefined;
+    const n : usize = tr_build(&img, 9999, true);
+    var out : [IMG_LEN]u8 = undefined;
+    if (n != IMG_USED) {
+        return 0;
+    }
+    if (migrate(img[0..IMG_USED], 2, &out) != MIGRATE_CORRUPT) {
+        return 0;
+    }
+    return 1;
+}
+
+fn tr_truncated_refused() -> u64 {
+    var src : [IMG_LEN]u8 = undefined;
+    const n : usize = tr_build(&src, 0, false);
+    var out : [IMG_LEN]u8 = undefined;
+    if (n != IMG_USED) {
+        return 0;
+    }
+    if (migrate(src[0..IMG_USED], 2, &out) != MIGRATE_OK) {
+        return 0;  // sanity: the whole image migrates
+    }
+    if (migrate(src[0..100], 2, &out) != MIGRATE_TRUNCATED) {
+        return 0;
+    }
+    return 1;
+}
+
+fn tr_bad_header_refused() -> u64 {
+    var src : [IMG_LEN]u8 = undefined;
+    const n : usize = tr_build(&src, 0, false);
+    var out : [IMG_LEN]u8 = undefined;
+    if (n != IMG_USED) {
+        return 0;
+    }
+    src[0] = 0x00;
+    if (migrate(src[0..IMG_USED], 2, &out) != MIGRATE_BAD_HEADER) {
+        return 0;
+    }
+    src[0] = 0x54;
+    src[4] = 9;                          // wrong version
+    if (migrate(src[0..IMG_USED], 2, &out) != MIGRATE_BAD_HEADER) {
+        return 0;
+    }
+    src[4] = 1;
+    if (migrate(src[0..IMG_USED], 3, &out) != MIGRATE_BAD_HEADER) {  // header says nparam 3,
+        return 0;                                     // the image carries 2: refused as bad header
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------- tests
+
+test the_legacy_case_migrates_and_changes_only_the_digest_bytes {
+    const changed : u64 = tr_legacy_case();
+    assert changed == 1;
+}
+
+test the_current_format_is_refused_as_not_legacy {
+    const refused : u64 = tr_current_format_refused();
+    assert refused == 1;
+}
+
+test a_corrupt_payload_under_a_nonzero_digest_is_refused_not_masked {
+    const refused : u64 = tr_corrupt_refused();
+    assert refused == 1;
+}
+
+test a_truncated_image_is_refused_and_a_whole_one_migrates {
+    const refused : u64 = tr_truncated_refused();
+    assert refused == 1;
+}
+
+test a_wrong_magic_or_version_or_nparam_is_refused {
+    const refused : u64 = tr_bad_header_refused();
+    assert refused == 1;
+}
