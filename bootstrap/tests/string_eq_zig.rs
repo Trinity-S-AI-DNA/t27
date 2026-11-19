@@ -215,3 +215,8 @@ fn imported_string_name_does_not_poison_a_numeric_parameter() {
     let _ = std::fs::remove_dir_all(d.parent().unwrap().parent().unwrap());
     assert!(o.status.success() && !z.contains("std.mem.eql(u8, ARR[i]") && z.contains("ARR[i] == id"), "D-1:\n{z}");
 }
+#[test]
+fn integer_single_element_repeat_lowers_to_scalar_splat() { // #14110
+    let z = gen_zig("module s {\n struct P { a: [5]u8 }\n fn f() -> u8 {\n var b : [8]u8 = [0] ** 8;\n var p : P = P { a = [0] ** 5 };\n var x : [4]f64 = [0.0] ** 4;\n return 0;\n }\n}\n");
+    assert!(z.contains("@splat(0)") && z.contains("@splat(0.0)") && !z.contains("@splat(.{ 0"), "{z}");
+}
