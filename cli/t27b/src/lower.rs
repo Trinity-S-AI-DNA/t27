@@ -6759,8 +6759,8 @@ impl<'a> Lower<'a> {
                 let checked = Expr { ty: Ty::U64, kind: ExprKind::Bounds { idx: Box::new(e), len: Box::new(len), site } };
                 let ptr = Expr { ty: Ty::Ptr, kind: ExprKind::Load { addr: Box::new(hdr.clone()), off: 0 } };
                 let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Offset { base: Box::new(ptr), idx: Box::new(checked), scale: esize } };
-                eprintln!("DEBUG index: returning place addr={:?}, elem={:?}, temp=None", addr, (*elem).clone());
-        return Ok(Ok(Place { addr, off: 0, ty: (*elem).clone(), mutable: true, temp: None }));
+                eprintln!("DEBUG index: returning place addr={:?}, elem={:?}, temp=Some(k)", addr, (*elem).clone());
+        return Ok(Ok(Place { addr, off: 0, ty: (*elem).clone(), mutable: true, temp: Some(k) }));
             }
         }
         let base = match self.tuple_index(base, &idx)? {
