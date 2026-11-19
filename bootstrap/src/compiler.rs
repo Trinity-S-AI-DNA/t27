@@ -7543,49 +7543,31 @@ pub struct Codegen {
     /// to Zig builtins ONLY when absent from this set, so a spec that defines
     /// its own `fn max(...)` still calls its own.
     declared_fns: std::collections::HashSet<String>,
-    /// How many times each test name has already been emitted. Zig requires
-    /// test names to be unique within a file and rejects the whole file
-    /// otherwise; four IGLA RACE specs accumulated colliding names across
-    /// waves (`cordic_fixed_sin_zero_angle` appears seven times). Suffixing
-    /// repeats keeps every test runnable instead of losing the file.
+    /// Emit count per test name; repeats get a suffix (Zig rejects duplicates).
     test_name_counts: std::collections::HashMap<String, u32>,
-    /// Declared parameter types, by function name. An anonymous list `.{ … }`
-    /// coerces to `[N]T` but NOT to `[]T`, so an array-literal argument passed
-    /// where the callee declares a slice needs `&[_]T{ … }` -- and the element
-    /// type is only knowable from the callee's signature.
+    /// Declared parameter types by function name (slice params need `&[_]T{..}` literals).
     declared_fn_params: std::collections::HashMap<String, Vec<String>>,
     /// Declared return type by function name, so a positional destructure of a
     /// NAMED-tuple return can be lowered to field accesses (W596).
     declared_fn_returns: std::collections::HashMap<String, String>,
-    /// Locals bound to an array literal and later passed where a callee
-    /// declares a SLICE, mapped to the element type the callee requires. Such a
-    /// local must be a real `[_]T{ … }` array and be passed by reference; an
-    /// anonymous `.{ … }` cannot coerce to `[]T`.
+    /// Array-literal locals passed where a callee declares a slice -> required element type.
     slice_locals: std::collections::HashMap<String, String>,
     /// Locals bound to the undefined scaffold helpers `default_input()` /
     /// `valid_input()`, mapped to the Zig type their consumer declares.
     scaffold_locals: std::collections::HashMap<String, String>,
-    /// W625: UNTYPED locals whose initializer is `.len`-tainted, so the binding
-    /// is `usize` in Zig. Found by forcing analysis of the 14% of generated
-    /// bodies nothing referenced (T21): `estimate_10k_size` in `coder/dataset`
-    /// carries a length through FOUR untyped `const`s before returning it under
-    /// `-> u32`, and W624's expression-local taint could not see it. A local
-    /// with a DECLARED type never enters this set -- the W624 `let` rule
-    /// already casts at the binding, so the name really is that type. See T23.
+    /// W625: untyped locals whose initializer is `.len`-tainted (`usize` in Zig).
     len_locals: std::collections::HashSet<String>,
     /// Enum types the spec declares. Used to lower `<`/`>` on enum variants to
     /// a tag comparison -- Zig has no ordering on enums.
     declared_enums: std::collections::HashSet<String>,
-    /// W609: `(struct, field) -> declared type`. The Zig backend collected
-    /// struct field NAMES (for `string_names` / `float_names` / `signed_names`)
-    /// but never their types, so a slice-typed field receiving an array literal
-    /// got `.{ a, b }` -- which Zig rejects with "type '[]T' does not support
-    /// array initialization syntax". 589 sites across 20 specs.
+    /// W609: `(struct, field) -> declared type`, so a slice-typed field gets
+    /// `&.{..}` not `.{..}` (589 sites across 20 specs).
     struct_field_types: std::collections::HashMap<(String, String), String>,
     /// Field and parameter names the spec declares with a string type. Zig has
     /// no `==` for slices, and the literal-operand test cannot see
     /// `a.name == b.name`, where BOTH sides are `[]const u8` expressions.
     string_names: std::collections::HashSet<String>,
+    nonstring_params: std::collections::HashSet<String>,
     /// Field and parameter names the spec declares with a float type, so a cast
     /// can pick `@floatCast` over `@floatFromInt` (W592).
     float_names: std::collections::HashSet<String>,
@@ -7643,6 +7625,7 @@ impl Codegen {
             declared_enums: std::collections::HashSet::new(),
             struct_field_types: std::collections::HashMap::new(),
             string_names: std::collections::HashSet::new(),
+            nonstring_params: std::collections::HashSet::new(),
             float_names: std::collections::HashSet::new(),
             signed_names: std::collections::HashSet::new(),
             current_return_type: String::new(),
@@ -8053,7 +8036,7 @@ impl Codegen {
                 .unwrap_or(false);
         }
         Self::trailing_name(node)
-            .map(|n| self.string_names.contains(&n))
+            .map(|n| !self.nonstring_params.contains(&n) && self.string_names.contains(&n))
             .unwrap_or(false)
     }
 
@@ -9372,10 +9355,9 @@ impl Codegen {
         let mut param_float = Vec::new();
         let mut param_signed = Vec::new();
         let mut param_string = Vec::new();
-        // #5162: string LOCALS, the same way -- `let field: str = ...` then
-        // `field == other`. Recorded in `param_string` so they leave with the
-        // function; a name already known (a field, a module const) is left
-        // alone so its removal on exit cannot erase the outer fact.
+        self.nonstring_params.clear(); // D-1 #14102
+        // #5162: string LOCALS (`let field: str = ...`); only names not already
+        // known are recorded, so exit cannot erase an outer fact.
         for n in Self::collect_string_locals(&node.children) {
             if self.string_names.insert(n.clone()) {
                 param_string.push(n);
@@ -9387,7 +9369,7 @@ impl Codegen {
                 if self.string_names.insert(pname.clone()) {
                     param_string.push(pname.clone());
                 }
-            }
+            } else { self.nonstring_params.insert(pname.clone()); }
             if matches!(t, "f16" | "f32" | "f64" | "float" | "double") {
                 if self.float_names.insert(pname.clone()) {
                     param_float.push(pname.clone());
@@ -9495,6 +9477,7 @@ impl Codegen {
         for n in &param_string {
             self.string_names.remove(n);
         }
+        self.nonstring_params.clear();
         self.zig_value_names.clear();
     }
 
