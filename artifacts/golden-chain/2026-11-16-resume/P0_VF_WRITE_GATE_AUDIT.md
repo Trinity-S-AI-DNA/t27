@@ -27,7 +27,7 @@ QUESTIONS FROM THE OWNER, ANSWERED WITH EVIDENCE:
    owner-only ones. "landing" is a self-granted owner bypass.
    The branch's own tests encode the correct policy and FAIL on the branch
    (measured locally, t27c test-report, zig 0.16.0, review worktree at
-   /Users/playra/t27/.claude/worktrees/vf-gate-review):
+   <t27>/.claude/worktrees/vf-gate-review):
        vf_write_gate.t27: 12/13 -- FAIL landing_denies_contract_without_owner
          (expects check_vf_writes("landing\n--\nM\t<contract>") == 1, got allow)
        vf_guard.t27:      16/17 -- FAIL contract_is_owner_only
@@ -45,7 +45,7 @@ QUESTIONS FROM THE OWNER, ANSWERED WITH EVIDENCE:
       (base a1f4791d has no gen/ awareness for this file) -- a gate-bootstrap catch-22
       that needs a master-side gate update or an owner decision, not a lane edit.
    b) scan: runs/ref_complete.txt committed on the branch contains literal
-      /Users/playra/ home paths (lines 88, 510). Removing that lab log from the PR
+      home-folder paths (lines 88, 510). Removing that lab log from the PR
       fixes the scan check.
    c) #14080: every pull_request_target workflow startup_failure since 2026-11-16
       16:01 UTC; org Actions policy not readable with a member token (403).
