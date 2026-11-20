@@ -423,7 +423,7 @@ impl Lexer {
             }
 
             // Skip ; line comments (old t27 comment style: ; at column 1 followed by space)
-            if self.pos < self.source.len() && self.peek() == b';' && self.col == 1 {
+            if self.pos < self.source.len() && self.peek() == b';' && self.col >= 1 {
                 let next = self.peek_offset(1);
                 if next == b' ' || next == b'\t' {
                     while self.pos < self.source.len() && self.peek() != b'\n' {
