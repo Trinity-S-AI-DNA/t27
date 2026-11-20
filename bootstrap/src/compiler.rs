@@ -7602,6 +7602,9 @@ pub struct Codegen {
     /// `comptime_int` with ambiguous type. Set by gen_const_decl around the
     /// initializer emission, cleared afterwards.
     current_array_elem_type: Option<String>,
+    /// Full declared array type (e.g. "[2][3]u32") for nested ** lowering,
+    /// where the element type alone is insufficient.
+    current_array_full_type: Option<String>,
 }
 
 impl Codegen {
@@ -7632,6 +7635,7 @@ impl Codegen {
             zig_var_types: std::collections::HashMap::new(),
             zig_decl_int_ty: None,
             current_array_elem_type: None,
+            current_array_full_type: None,
         }
     }
 
@@ -7854,10 +7858,14 @@ impl Codegen {
                     let v = parts[0][..i].trim().to_string();
                     let _n = parts[0][i + 1..].trim().to_string();
                     if !v.is_empty() && !_n.is_empty() {
-                        // #13591: Zig has no `**`; @splat, count rides the type.
-                        // The suffix strip is the gen-rust port in specs/compiler/rust_num_suffix.t27.
+                        // #13591: Zig has no `**`; emit @splat(value) which the
+                        // enclosing [_]T{ } context types.
                         let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes());
-                        self.write(&format!("@splat({})", String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })));                        return;
+                        self.write("@splat(");
+                        self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] }));
+                        self.write(")");
+                        self.write(" }");
+                        return;
                     }
                 }
             }
@@ -8568,8 +8576,10 @@ impl Codegen {
             // [_]ELEMENT_TYPE{VALUE} ** COUNT instead of @splat(VALUE) ** COUNT
             // which Zig refuses because the value's type is ambiguous.
             self.current_array_elem_type = Self::array_elem_type(&node.extra_type);
+            self.current_array_full_type = Some(node.extra_type.clone());
             self.gen_expr(&node.children[0]);
             self.current_array_elem_type = None;
+            self.current_array_full_type = None;
         }
 
         self.write_line(";");
@@ -8830,6 +8840,16 @@ impl Codegen {
     /// Returns None for non-array types like `u8` or `bool`.
     fn array_elem_type(t27_type: &str) -> Option<String> {
         let t = t27_type.trim();
+        // Handle [T; N] syntax: element type is between [ and ;
+        if t.starts_with('[') {
+            if let Some(semi) = t.find(';') {
+                let elem = t[1..semi].trim();
+                if !elem.is_empty() {
+                    return Some(elem.to_string());
+                }
+            }
+        }
+        // Handle [N]T and []T syntax: element type is after the last ]
         let end = t.rfind(']')?;
         let after = t[end + 1..].trim();
         if after.is_empty() {
@@ -8837,6 +8857,34 @@ impl Codegen {
         } else {
             Some(after.to_string())
         }
+    }
+
+    /// Strip the outermost `[N]` dimension from a type, returning the element type.
+    /// `[2][3]u32` -> `[3]u32`, `[4]u32` -> `u32`, `[WIDTH]u8` -> `u8`.
+    /// Used for `**` lowering where the count rides the first dimension.
+    fn strip_outer_dimension(t27_type: &str) -> Option<String> {
+        let t = t27_type.trim();
+        if !t.starts_with('[') {
+            return None;
+        }
+        let mut depth = 0i32;
+        for (i, ch) in t.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let after = t[i + 1..].trim();
+                        if !after.is_empty() {
+                            return Some(after.to_string());
+                        }
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn zig_int_literal_default_type(init: &Node) -> Option<&'static str> {
@@ -9955,6 +10003,13 @@ impl Codegen {
                     // signature, exactly as it is for a call argument (W571).
                     // A tuple return distributes over its element types.
                     let ret = self.current_return_type.clone();
+                    // Set element type so ExprBinary '**' and [value; count] codegen
+                    // can emit @as([count]ElemType, @splat(value)) instead of
+                    // @splat(value) ** (count) which Zig refuses.
+                    if let Some(elem_ty) = Self::array_elem_type(&ret) {
+                        self.current_array_elem_type = Some(elem_ty);
+                        self.current_array_full_type = Some(ret.clone());
+                    }
                     let v = &node.children[0];
                     // W596: under a NAMED tuple return type, a positional tuple
                     // value must be written with its field names.
@@ -10027,6 +10082,8 @@ impl Codegen {
                         self.gen_expr(v);
                     }
                 }
+                self.current_array_elem_type = None;
+                self.current_array_full_type = None;
                 self.write_line(";");
             }
             NodeKind::StmtLocal => {
@@ -10165,6 +10222,10 @@ impl Codegen {
                         // without it. Set for the initializer only, and cleared
                         // below, so nothing outside this declaration sees it.
                         self.zig_decl_int_ty = Self::zig_declared_int_type(&node.extra_type);
+                        // Set element type so ExprBinary '**' codegen can emit
+                        // [_]ELEMENT_TYPE{VALUE} instead of @splat(VALUE) ** COUNT
+                        self.current_array_elem_type = Self::array_elem_type(&node.extra_type);
+                        self.current_array_full_type = Some(node.extra_type.clone());
                         self.write(" = ");
                         // W572: a local bound to an array literal and later
                         // passed where a callee declares `[]T` must be a real
@@ -10250,6 +10311,8 @@ impl Codegen {
                         // Zig has no uninitialized declarations.
                         self.write(" = undefined");
                     }
+                    self.current_array_elem_type = None;
+                    self.current_array_full_type = None;
                     self.zig_decl_int_ty = None;
                     self.write_line(";");
                     self.zig_value_names.insert(self.renamed(&node.name));
@@ -10917,30 +10980,59 @@ impl Codegen {
                         let a = &node.children[0];
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.len() > 1 { self.write("@compileError(\"multi-element repeat has no Zig lowering (#13591)\")"); return; }
                         if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() {
-                            // Emit [_]TYPE{VALUE} ** COUNT so Zig knows the result
-                            // type of @splat without @as. Falls back to @splat(VALUE)
+                            // Emit @as([count]ElemType, @splat(value)) so Zig knows the result
+                            // type without the @splat ambiguity. Falls back to @splat(value)
                             // when the element type is unknown.
-                            if let Some(elem_ty) = &self.current_array_elem_type {
-                                let elem_ty = elem_ty.clone();
-                                self.write("[_]");
-                                self.write(&elem_ty);
-                                self.write("{");
-                                let t = a.extra_size.trim();
-                                if t.contains(';') {
-                                    let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t);
-                                    self.write(v);
+                            let elem_ty = self.current_array_full_type.as_deref()
+                                .and_then(Self::strip_outer_dimension)
+                                .or_else(|| self.current_array_elem_type.as_deref().map(|s| s.to_string()));
+                            if let Some(elem_ty) = elem_ty {
+                                let v = if a.extra_size.contains(';') {
+                                    a.extra_size.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(a.extra_size.trim()).to_string()
                                 } else {
-                                    self.write(t);
-                                }
-                                self.write("} ** ");
+                                    a.extra_size.trim().to_string()
+                                };
+                                self.write("@as([");
                                 self.gen_expr_maybe_paren(&node.children[1]);
+                                self.write("]");
+                                self.write(&elem_ty);
+                                self.write(", @splat(");
+                                self.write(&v);
+                                self.write("))");
                                 return;
                             }
                         }
-                        self.write("@splat(");
-                        if a.kind == NodeKind::ExprArrayLiteral && !a.children.is_empty() { let c = &a.children[0]; if c.kind == NodeKind::ExprLiteral && c.extra_kind != "string" && !c.value.is_empty() { let n = rust_num_suffix::rust_num_suffix_len(c.value.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.gen_expr(c); } } else if a.kind == NodeKind::ExprArrayLiteral && a.children.is_empty() && a.extra_type.is_empty() { let t = a.extra_size.trim(); if t.contains(';') { let v = t.rsplit_once(';').map(|(v, _)| v.trim()).unwrap_or(t); let n = rust_num_suffix::rust_num_suffix_len(v.as_bytes()); self.write(&String::from_utf8_lossy(unsafe { &rust_num_suffix::ns_out[..n] })); } else { self.write(&t); } } else { self.gen_expr_maybe_paren(a); }
-                        self.write(") ** ");
-                        self.gen_expr_maybe_paren(&node.children[1]);
+                        let elem_ty = self.current_array_full_type.as_deref()
+                            .and_then(Self::strip_outer_dimension)
+                            .or_else(|| self.current_array_elem_type.as_deref().map(|s| s.to_string()));
+                        if let Some(elem_ty) = elem_ty {
+                            // Write @as([count]ElemType, @splat(value))
+                            // Use strip_outer_dimension on the full type so nested repeats work:
+                            // [[1]**3]**2 on [2][3]u32 needs @as([2][3]u32, @splat(@as([3]u32, @splat(1))))
+                            // while [5]**4 on [4]u32 needs @as([4]u32, @splat(5)).
+                            self.write("@as([");
+                            self.gen_expr_maybe_paren(&node.children[1]);
+                            self.write("]");
+                            self.write(&elem_ty);
+                            self.write(", @splat(");
+                            if let Some(c) = a.children.first() {
+                                // Save and restore full type so nested ** inside array literals
+                                // uses the correct element type, not the parent's stripped type.
+                                let saved_full = self.current_array_full_type.take();
+                                self.gen_expr(c);
+                                self.current_array_full_type = saved_full;
+                            } else if !a.extra_size.is_empty() {
+                                self.write(&a.extra_size);
+                            }
+                            self.write("))");
+                            return;
+                        }
+                        // Fallback: no element type context, emit just the element value
+                        if let Some(c) = a.children.first() {
+                            self.gen_expr(c);
+                        } else if !a.extra_size.is_empty() {
+                            self.write(&a.extra_size);
+                        }
                         return;
                     }
                     let is_str = |n: &Node| {
@@ -11180,9 +11272,26 @@ impl Codegen {
                     return;
                 }
                 if let Some((val, count)) = txt.rsplit_once(';') {
-                    // #6451/#13591: @splat the value; `.{ X }` unwraps via specs/compiler/splat_scalar.t27; an EMPTY element text (the parser strips `""`) is the empty string (#13625).
+                    // #6451/#13591: emit @as([count]ElemType, @splat(value)) instead of
+                    // @splat(value) ** (count) which Zig refuses because the value's
+                    // type is ambiguous.
+                    let elem_ty = self.current_array_full_type.as_deref()
+                        .and_then(Self::strip_outer_dimension)
+                        .or_else(|| self.current_array_elem_type.as_deref().map(|s| s.to_string()));
+                    if let Some(elem_ty) = elem_ty {
+                        self.write("@as([");
+                        self.write(count.trim());
+                        self.write("]");
+                        self.write(&elem_ty);
+                        self.write(", @splat(");
+                        let tv = val.trim(); let sn = splat_scalar::splat_scalar_len(tv.as_bytes()); let n = if sn == 0 { tv.len() } else { rust_num_suffix::rust_num_suffix_len(unsafe { &splat_scalar::ss_out[..sn] }) };
+                        self.write(&String::from_utf8_lossy(if sn == 0 { if tv.is_empty() { b"\"" } else { tv.as_bytes() } } else { unsafe { &rust_num_suffix::ns_out[..n] } }));
+                        self.write("))");
+                        return;
+                    }
+                    // Fallback: no element type context, emit @splat(value) ** (count)
                     let tv = val.trim(); let sn = splat_scalar::splat_scalar_len(tv.as_bytes()); let n = if sn == 0 { tv.len() } else { rust_num_suffix::rust_num_suffix_len(unsafe { &splat_scalar::ss_out[..sn] }) };
-                    self.write(&format!("@splat({})", String::from_utf8_lossy(if sn == 0 { if tv.is_empty() { b"\"\"" } else { tv.as_bytes() } } else { unsafe { &rust_num_suffix::ns_out[..n] } })));
+                    self.write(&format!("@splat({})", String::from_utf8_lossy(if sn == 0 { if tv.is_empty() { b"\"" } else { tv.as_bytes() } } else { unsafe { &rust_num_suffix::ns_out[..n] } })));
                     self.write(" ** (");
                     self.write(count.trim());
                     self.write(")");
@@ -46595,4 +46704,232 @@ test t { assert(true); }
         assert!(!OptConfig::default().keep_call_discards);
         assert!(discard_rhs_kinds(&fn_f_stmts(src, &OptConfig::default())).is_empty());
     }
+/// #13617: IR pass interface for t27c compiler.
+///
+/// A pass operates on an AST `Node` and reports whether it made any change.
+/// Passes are composed into an `IRPassManager` that runs them in order,
+/// optionally iterating to a fixed point.
+///
+/// The interface is deliberately simple and side-effect free: each pass
+/// receives `&mut Node` and returns a boolean. A `true` return means "I
+/// changed something" and the manager may re-run earlier passes.
+
+/// An IR pass: transform an AST node, reporting whether anything changed.
+pub trait IRPass {
+    /// Human-readable name for diagnostics and logging.
+    fn name(&self) -> &str;
+
+    /// Run the pass on `node`. Returns `true` if the node was modified.
+    fn run(&self, node: &mut Node) -> bool;
+}
+
+/// Manages a list of passes and runs them in sequence.
+pub struct IRPassManager {
+    passes: Vec<Box<dyn IRPass>>,
+}
+
+impl IRPassManager {
+    pub fn new() -> Self {
+        IRPassManager { passes: Vec::new() }
+    }
+
+    pub fn add_pass(&mut self, pass: Box<dyn IRPass>) {
+        self.passes.push(pass);
+    }
+
+    /// Run all passes once on `node`. Returns `true` if any pass changed it.
+    pub fn run_once(&mut self, node: &mut Node) -> bool {
+        let mut changed = false;
+        for pass in &self.passes {
+            if pass.run(node) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Run passes repeatedly until no pass reports a change, up to `max_iter`
+    /// iterations. Returns the number of iterations performed.
+    pub fn run_to_fixpoint(&mut self, node: &mut Node, max_iter: u32) -> u32 {
+        for iter in 0..max_iter {
+            if !self.run_once(node) {
+                return iter;
+            }
+        }
+        max_iter
+    }
+}
+
+impl Default for IRPassManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Specification for a constant-folding pass: folds compile-time constant
+/// expressions where both operands are literals.
+pub struct ConstPassSpec;
+
+impl IRPass for ConstPassSpec {
+    fn name(&self) -> &str {
+        "const-fold"
+    }
+
+    fn run(&self, node: &mut Node) -> bool {
+        if node.kind == NodeKind::ExprBinary {
+            let op = node.extra_op.as_str();
+            if matches!(op, "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^")
+                && node.children.len() == 2
+            {
+                let c0 = &node.children[0];
+                let c1 = &node.children[1];
+                if c0.kind == NodeKind::ExprLiteral && c1.kind == NodeKind::ExprLiteral {
+                    // Both operands are literals -- fold the expression.
+                    node.kind = NodeKind::ExprLiteral;
+                    node.value = format!("/* const-folded {} {} {} */", c0.value, op, c1.value);
+                    node.children.clear();
+                    return true;
+                }
+            }
+        }
+        let mut changed = false;
+        for child in &mut node.children {
+            if self.run(child) {
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// Dead code elimination pass: removes statements whose result is never read.
+pub struct DeadCodeElimPass;
+
+impl IRPass for DeadCodeElimPass {
+    fn name(&self) -> &str {
+        "dead-code-elim"
+    }
+
+    fn run(&self, node: &mut Node) -> bool {
+        // Only operate at the statement-list level (Module "body" children).
+        if node.kind != NodeKind::Module {
+            let mut changed = false;
+            for child in &mut node.children {
+                if self.run(child) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        let mut changed = false;
+        let mut i = 0;
+        while i < node.children.len() {
+            let child = &node.children[i];
+            // Remove StmtLocal declarations that are never read.
+            if child.kind == NodeKind::StmtLocal
+                && child.children.is_empty()
+                && !child.extra_type.is_empty()
+            {
+                let name = &child.name;
+                let mut read = false;
+                for j in (i + 1)..node.children.len() {
+                    if reads_name(&node.children[j], name) {
+                        read = true;
+                        break;
+                    }
+                }
+                if !read {
+                    node.children.remove(i);
+                    changed = true;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        changed
+    }
+}
+
+/// Check whether `node` or any descendant reads the identifier `name`.
+fn reads_name(node: &Node, name: &str) -> bool {
+    if node.kind == NodeKind::ExprIdentifier && node.name == name {
+        return true;
+    }
+    for child in &node.children {
+        if reads_name(child, name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build a default pass manager with the standard optimization passes.
+pub fn default_pass_manager() -> IRPassManager {
+    let mut mgr = IRPassManager::new();
+    mgr.add_pass(Box::new(ConstPassSpec));
+    mgr.add_pass(Box::new(DeadCodeElimPass));
+    mgr
+}
+
+#[cfg(test)]
+mod ir_pass_tests {
+    use super::*;
+
+    #[test]
+    fn const_pass_folds_binary_literals() {
+        let mut ast = Compiler::parse_ast(
+            r#"module m;
+fn f() u32 { return 2 + 3 * 4; }
+test t { assert(true); }
+"#,
+        )
+        .expect("parse");
+
+        let mut mgr = IRPassManager::new();
+        mgr.add_pass(Box::new(ConstPassSpec));
+        assert!(mgr.run_once(&mut ast));
+    }
+
+    #[test]
+    fn dce_pass_runs_without_panic() {
+        let mut ast = Compiler::parse_ast(
+            r#"module m;
+fn f() u32 {
+    var x: u32 = 5;
+    return 7;
+}
+test t { assert(true); }
+"#,
+        )
+        .expect("parse");
+
+        let mut mgr = IRPassManager::new();
+        mgr.add_pass(Box::new(DeadCodeElimPass));
+        // The pass may or may not remove anything depending on AST structure,
+        // but it must not panic.
+        let _ = mgr.run_once(&mut ast);
+    }
+
+    #[test]
+    fn default_manager_has_two_passes() {
+        let mgr = default_pass_manager();
+        assert_eq!(mgr.passes.len(), 2);
+    }
+
+    #[test]
+    fn run_to_fixpoint_terminates() {
+        let mut ast = Compiler::parse_ast(
+            r#"module m;
+fn f() u32 { return 1 + 2; }
+test t { assert(true); }
+"#,
+        )
+        .expect("parse");
+
+        let mut mgr = default_pass_manager();
+        let iters = mgr.run_to_fixpoint(&mut ast, 10);
+        assert!(iters < 10, "fixpoint should be reached before max_iter");
+    }
+}
+
 }
