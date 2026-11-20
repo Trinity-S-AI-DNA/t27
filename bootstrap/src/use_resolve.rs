@@ -427,7 +427,13 @@ fn identifiers(text: &str) -> HashSet<String> {
         let (mut code, mut in_str) = (String::new(), false);
         for (i, c) in line.char_indices() {
             if c == '"' { in_str = !in_str; }
-            if !in_str && (c == ';' || (c == '/' && line[i..].starts_with("//"))) { break; }
+            // FR-001 (#14013): a `;` that ends a statement inside a `{ ... }`
+            // body does NOT end the scan of that line; only a `;` that starts
+            // a comment does. A `;` at line start (after optional whitespace)
+            // is a comment; a `;` mid-statement (e.g. `return 0; } return ...`)
+            // is a statement terminator and scanning continues past it.
+            if !in_str && (c == '/' && line[i..].starts_with("//")) { break; }
+            if !in_str && c == ';' && code.trim().is_empty() { break; }
             code.push(c);
         }
         let mut cur = String::new();
@@ -1051,6 +1057,16 @@ mod tests {
 
     /// #7292: a builtin is not a name. `x@pow` cannot occur, so only the
     /// token that starts right after `@` is dropped, and its arguments stay.
+    #[test]
+    fn identifiers_scans_past_semicolon_inside_brace_block() {
+        // #14013: a ; inside { ... } does not end the line scan;
+        // names after it (KEY_OFF) must still be found.
+        let line = "pub fn key_n(o: u32) -> u32 { if (o < 1 or o > 27) { return 0; } return KEY_OFF[o] - KEY_OFF[o - 1]; }";
+        let ids = identifiers(line);
+        assert!(ids.contains("KEY_OFF"), "KEY_OFF must be found after ; inside brace block, got: {:?}", ids);
+        assert!(ids.contains("key_n"), "key_n must be found");
+    }
+
     #[test]
     fn identifiers_skips_a_builtin_but_keeps_its_arguments() {
         let ids = identifiers("return @pow(base, @as(f64, exp)) + pow(a, b);\n");
