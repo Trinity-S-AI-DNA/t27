@@ -8320,14 +8320,18 @@ impl Codegen {
         // noise for the Zig backend, and an import of a file that is never
         // shipped alongside the gen (types.zig) made every generated file fail
         // `zig test` with FileNotFound before a single test ran.
-        fn module_referenced(nodes: &[Node], module: &str) -> bool {
+        fn module_referenced(nodes: &[Node], name: &str) -> bool {
             nodes.iter().any(|n| {
+                // Qualified reference: module.align_up() or module::align_up()
                 (n.kind == NodeKind::ExprFieldAccess
                     && n.children
                         .first()
-                        .is_some_and(|b| b.kind == NodeKind::ExprIdentifier && b.name == module))
-                    || (n.kind == NodeKind::ExprCall && n.name.starts_with(&format!("{}.", module)))
-                    || module_referenced(&n.children, module)
+                        .is_some_and(|b| b.kind == NodeKind::ExprIdentifier && b.name == name))
+                    || (n.kind == NodeKind::ExprCall && n.name.starts_with(&format!("{}.", name)))
+                    // Direct reference: align_up() -- imported function called directly
+                    // (e.g. `use tri::t27b::macho::align_up;` then `align_up(...)`)
+                    || (n.kind == NodeKind::ExprCall && n.name == name)
+                    || module_referenced(&n.children, name)
             })
         }
         // #5978: `s.status` where `s` is a parameter or a local is a field
@@ -8349,10 +8353,27 @@ impl Codegen {
                 if module_referenced(&ast.children, &decl.name)
                     && !locally_bound(&ast.children, &decl.name)
                 {
-                    self.write_line(&format!(
-                        "const {} = @import(\"{}.zig\");",
-                        decl.name, decl.name
-                    ));
+                    // Qualified import: `use tri::t27b::macho::align_up;` → decl.value = "tri::t27b::macho::align_up"
+                    // Generate: const align_up = @import("t27b/macho.zig").align_up;
+                    if let Some(pos) = decl.value.rfind("::") {
+                        let module_path = &decl.value[..pos];
+                        let symbol = &decl.value[pos + 2..];
+                        // Convert tri::t27b::macho → t27b/macho (drop "tri" root, :: → /)
+                        let zig_path: String = module_path
+                            .strip_prefix("tri::")
+                            .unwrap_or(module_path)
+                            .replace("::", "/");
+                        self.write_line(&format!(
+                            "const {} = @import(\"{}.zig\").{};",
+                            decl.name, zig_path, symbol
+                        ));
+                    } else {
+                        // Simple import: `use macho;` → const macho = @import("macho.zig");
+                        self.write_line(&format!(
+                            "const {} = @import(\"{}.zig\");",
+                            decl.name, decl.name
+                        ));
+                    }
                     has_imports = true;
                 } else {
                     self.write_line(&format!("// use {}: no references in this module", decl.name));

@@ -11048,6 +11048,32 @@ fn run_eval(expr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fix @import paths inside generated Zig code: replace paths like
+/// "../../../tri/t27b/macho.zig" with flat names like "tri_t27b_macho.zig"
+/// so zig can find them within the module path.
+fn fix_import_paths(code: &str) -> String {
+    let mut result = code.to_string();
+    let mut pos = 0;
+    while let Some(start) = result[pos..].find("@import(\"") {
+        let abs_start = pos + start;
+        // "@import(" is 9 chars; abs_start+9 points right after the opening quote.
+        if let Some(end) = result[abs_start + 9..].find('"') {
+            let abs_end = abs_start + 9 + end;
+            let old_path = &result[abs_start + 9..abs_end];
+            // Convert "../../../tri/t27b/macho.zig" → "tri_t27b_macho.zig"
+            let flat = old_path
+                .replace("../", "")
+                .replace("/", "_")
+                .replace('\\', "_");
+            result.replace_range(abs_start + 9..abs_end, &flat);
+            pos = abs_start + 9 + flat.len();
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
     let source = fs::read_to_string(input_path)?;
     let ast = compiler::Compiler::parse_ast(&source).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -11093,19 +11119,100 @@ fn run_test(input_path: &str, verbose: bool) -> anyhow::Result<()> {
 
     // Execute the assertions (t27#11730): generate Zig and run `zig test` when it
     // compiles; specs that do not compile keep the legacy declaration-only result.
-    let src = fs::read_to_string(input_path).unwrap_or_default();
-    if let Ok(ast) = compiler::Compiler::parse_ast(&src) {
-        let mut codegen = compiler::Codegen::new();
-        codegen.gen_zig(&ast);
-        let tmp = std::env::temp_dir().join("t27_test.zig");
-        if fs::write(&tmp, codegen.into_string()).is_ok() {
-            let zig = |flags: &[&str]| std::process::Command::new("zig")
-                .args(flags).arg(tmp.to_str().unwrap_or("")).status()
-                .map(|s| s.success()).unwrap_or(false);
-            if zig(&["test", "--test-no-exec"]) && !zig(&["test"]) {
-                anyhow::bail!("zig test failed");
+    // We also generate any imported modules alongside the main spec so that
+    // `zig test` can resolve `@import(...)` references.
+    let tmp_dir = std::env::temp_dir().join("t27_test");
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir)?;
+
+    // Build a module map from the specs directory for import resolution.
+    // Maps "tri::t27b::macho" → "t27b/macho" (relative path without extension).
+    let mut module_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let specs_dir = std::fs::canonicalize("specs").unwrap_or_else(|_| std::path::Path::new("specs").to_path_buf());
+    if specs_dir.exists() {
+        for entry in walkdir::WalkDir::new(&specs_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("t27") {
+                continue;
+            }
+            let rel = p.strip_prefix(&specs_dir).unwrap_or(p);
+            let rel_no_ext = rel.with_extension("");
+            let rel_str = rel_no_ext.to_string_lossy().replace('\\', "/");
+            let key = rel_str.replace('/', "::");
+            // Strip leading "tri::" so lookups like "t27b::macho" match "tri::t27b::macho"
+            let key = key.strip_prefix("tri::").unwrap_or(&key).to_string();
+            module_map.insert(key, rel_str.clone());
+            if let Ok(src2) = fs::read_to_string(p) {
+                if let Ok(ast2) = compiler::Compiler::parse_ast(&src2) {
+                    if !ast2.name.is_empty() {
+                        let last = rel_str.rsplit('/').next().unwrap_or(&rel_str);
+                        module_map.entry(last.to_string()).or_insert_with(|| rel_str.clone());
+                        module_map
+                            .entry(ast2.name.to_lowercase().replace('-', "_"))
+                            .or_insert_with(|| rel_str.clone());
+                    }
+                }
             }
         }
+    }
+
+    // Generate the main spec using gen_zig_project for proper import resolution.
+    let input_rel = input_path.replace('\\', "/");
+    let input_rel_no_ext = std::path::Path::new(&input_rel)
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut main_code = compiler::Compiler::compile_project_file(&source, &input_rel_no_ext, &module_map)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // Rewrite import paths to use flat names within the temp dir.
+    // gen_zig_project emits "@import("../../../tri/t27b/macho.zig").symbol" which zig rejects
+    // (import outside module path). We write all files to the temp dir root, so replace
+    // with "@import("macho.zig").symbol".
+    let mut dep_files: Vec<(String, String)> = Vec::new(); // (zig_path, code)
+    for decl in &ast.children {
+        if decl.kind == compiler::NodeKind::UseDecl && !decl.value.is_empty() {
+            if let Some(pos) = decl.value.rfind("::") {
+                let module_path = decl.value[..pos].strip_prefix("tri::").unwrap_or(&decl.value[..pos]);
+                if let Some(rel_path) = module_map.get(module_path) {
+                    let dep_source_path = std::path::Path::new("specs").join(rel_path).with_extension("t27");
+                    if let Ok(dep_source) = fs::read_to_string(&dep_source_path) {
+                        if let Ok(dep_ast) = compiler::Compiler::parse_ast(&dep_source) {
+                            let mut dep_codegen = compiler::Codegen::new();
+                            let dep_code = compiler::Compiler::compile_project_file(
+                                &dep_source,
+                                rel_path,
+                                &module_map,
+                            )
+                            .map_err(|e| anyhow::anyhow!("{}", e))?;
+                            let flat_name = format!("{}.zig", rel_path.replace('/', "_"));
+                            // Fix import paths inside dep_code too.
+                            let dep_code_fixed = fix_import_paths(&dep_code);
+                            dep_files.push((flat_name.clone(), dep_code_fixed));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fix import paths in main_code too.
+    main_code = fix_import_paths(&main_code);
+
+    // Write all files to the temp dir root (flat structure).
+    let main_tmp = tmp_dir.join("t27_test.zig");
+    fs::write(&main_tmp, &main_code)?;
+    for (name, code) in &dep_files {
+        fs::write(tmp_dir.join(name), code)?;
+    }
+
+    let zig = |flags: &[&str]| std::process::Command::new("zig")
+        .args(flags).arg(main_tmp.to_str().unwrap_or("")).status()
+        .map(|s| s.success()).unwrap_or(false);
+    if zig(&["test", "--test-no-exec"]) && !zig(&["test"]) {
+        anyhow::bail!("zig test failed");
     }
     Ok(())
 }
