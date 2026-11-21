@@ -1,0 +1,1817 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/callback_probe.t27 -- can the OS call back into a t27b fn? Evidence for the in-OS call audio
+// (owner, 2026-10-21: avatar calls inside T27 OS, no servers). Every streaming audio API on macOS (AudioQueue,
+// AudioUnit, AVAudioEngine) hands its buffers to a C callback, and the language cannot take a fn's address.
+// t27b does export every all-scalar fn as the global `_<name>` (cli/t27b/README.md, "exported"), and the window
+// is linked with no export list, so dlsym(RTLD_DEFAULT, "<name>") may return that fn's address. This program
+// checks exactly that, three ways, and prints one line per check. Not part of the app.
+//   1. libc qsort sorts 8 bytes with cbp_cmp, reached only through its dlsym address (a synchronous callback).
+//   2. A CFRunLoop timer calls cbp_tick on this thread while CFRunLoopRunInMode runs: the shape an AudioQueue
+//      created with the main run loop would use, so a callback never runs on another thread.
+//   3. An AudioQueue output queue with cbp_out as its callback, run on this run loop for 0.3 s. It never decides
+//      the exit code and prints AUDIO VERIFIED, AUDIO UNVERIFIED or AUDIO SKIP. Exit 0 says nothing about
+//      audio: playback, capture and duplex audio need their own acceptance on a Mac with devices.
+// Build (Apple silicon):
+//   t27b build specs/t27os/callback_probe.t27 -o probe.o --macho
+//   ld -arch arm64 -platform_version macos 11.0 $(xcrun --show-sdk-version) -syslibroot $(xcrun --show-sdk-path) \
+//      -e _main -lSystem -framework CoreFoundation -framework AudioToolbox -o probe probe.o
+// Step 4 (ABI probe): part A is a 10 ms timer for 10 s with first/last time marks; part B is a 440 Hz tone, 10 ms
+// buffers (960 bytes, 48 kHz mono 16 bit), 4 buffers, 60 s, callbacks counted. Exits 0 only when the direct calls and checks 1 and 2 pass. ASCII only (L3).
+// Part C (capture): an AudioQueue INPUT queue, same format and buffers, cbp_in on this run loop for 10 s; prints
+// the NewInput and Start statuses, callbacks, nonzero samples, mean |sample| and the first 4 bytes. It never
+// decides the exit code of the full run. On macOS a microphone denied by TCC usually does not fail NewInput or
+// Start: the queue runs and delivers zero samples, so the verdict comes from the samples, not the statuses.
+// CBP_ONLY_C=1 skips A and B (no 60 s tone); then the exit code is 0 only when C ran with callbacks.
+// Part D (foreign thread): an AudioQueue OUTPUT queue created with inCallbackRunLoop = NULL, so the system calls
+// cbp_outd on a thread of its own while main sleeps. Same 440 Hz format and buffers, 10 s. The state block holds a
+// magic and its own address; every call checks both, counts calls and integrity errors, and compares pthread_self
+// with the main thread's. CBP_ONLY_D=1 runs only D, and then the exit code is 0 only when D ran clean on another
+// thread. This is the precondition for VoiceProcessingIO, whose render callback runs on a realtime thread.
+// Part E (duplex loop): an input and an output queue at once, both on this run loop, joined by a ring of 8 slots
+// of 960 bytes in one preallocated block (no allocation in a callback). cbp_ein copies each captured buffer into
+// the next slot or counts an overrun; cbp_eout plays the oldest slot or zeros and counts an underrun. The output
+// volume is set to 0.05 and read back before the output starts (no start otherwise), against acoustic feedback.
+// Both queues start together; the output plays warm-up silence (counted apart from underruns) until the ring
+// holds 2 slots, keeps 3 buffers in flight, and runs exactly 20 s. It prints
+// statuses, callbacks, underruns, overruns, bytes, checksums, time marks, ring residence and a latency estimate.
+// CBP_ONLY_E=1 runs only E; the exit code is 0 only for a clean loop.
+// Part F (network loop on 127.0.0.1): E with a UDP hop in the middle, no encryption yet. cbp_fin puts each captured
+// 10 ms frame into a tx ring; the main loop (CFRunLoopRunInMode 2 ms at a time) sends every ready frame from one
+// socket to a second socket bound to 127.0.0.1:47727, then reads that socket until EAGAIN (O_NONBLOCK set through
+// __fcntl, the non-variadic stub: fcntl itself is variadic and its third argument would go on the stack on arm64).
+// Packet: seq u32, length u16 (960), flags u16, 960 bytes PCM; with flag 1 the previous frame follows as a
+// redundant copy (CBP_NO_FEC=1 turns it off). The receiver keeps 64 slots by seq % 64; cbp_fout plays them in seq
+// order once 6 frames are buffered: a missing frame is taken from the redundant copy, else concealed (the last
+// frame at half amplitude); an empty buffer is silence and an underrun; more than 12 frames ahead is an overrun
+// and playback skips back to 6 frames, so latency cannot build up. Storm: every 20th packet is dropped, packets 50
+// and 51 of every 100 are sent swapped, and every 2 s the socket is not read for 40 ms. 20 s, volume 0.05.
+// CBP_ONLY_F=1 runs only F; the exit code is 0 only for a run with no underrun, no concealed frame, balanced
+// counters and no latency growth.
+// Part G (two hosts): F between two Macs on one LAN. CBP_PEER=a.b.c.d turns it on; CBP_BIND (default 0.0.0.0) and
+// CBP_PORT (default 47727) set the local address. One socket bound to CBP_BIND:CBP_PORT both sends to
+// CBP_PEER:CBP_PORT and receives, so the peer's packets answer our own flow. No storm (the LAN is the storm).
+// CBP_SECONDS (default 25) is the run; CBP_START_AT (unix seconds) makes both sides start the output together.
+// CBP_JB_TARGET / CBP_JB_MAX (default 6 / 12 frames) size the jitter buffer for Wi-Fi bursts. A sendto that answers
+// EAGAIN keeps its frame in the tx ring and is tried again on the next pass (a full ring is a counted tx overrun).
+// The run ends early when the peer has been silent for 300 ms after sending, and underruns are counted only up to
+// the last packet the peer sent, so a peer that stops first does not count as an underrun. Clocks are not shared,
+// so one-way latency is not measured; the report gives the jitter-buffer depth and a software latency estimate.
+// It counts nonzero samples in received frames (the other side's microphone). CBP_ONLY_F=1 is still required.
+// Verdict: received >= 2000, lost <= 10 %, underruns <= 5, nonzero received samples > 0.
+
+module T27osCallbackProbe;
+
+use t27os::pty_sys::sys_write;
+use t27os::pty_sys::sys_exit;
+use t27os::pty_sys::sys_peek;
+use t27os::pty_sys::sys_addr;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::pty_sys::sys_getenv;
+use t27os::pty_sys::sys_strlen;
+
+const CBP_RTLD_DEFAULT : u64 = 18446744073709551614;
+/// kAudioFormatLinearPCM, 'lpcm'.
+const CBP_LPCM : u32 = 1819304813;
+/// kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked.
+const CBP_PCM_FLAGS : u32 = 12;
+
+fn cbp_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+/// memmove with a raw destination address: copy n bytes of src to memory at dst.
+fn cbp_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn cbp_qsort(base: []u8, n: u64, width: u64, cmp: u64) -> void { @extern("qsort"); }
+fn cbp_rl_current() -> u64 { return @extern("CFRunLoopGetCurrent"); }
+fn cbp_now() -> f64 { return @extern("CFAbsoluteTimeGetCurrent"); }
+fn cbp_timer_create(alloc: u64, fire: f64, every: f64, flags: u64, order: i64, callout: u64, ctx: []const u8) -> u64 { return @extern("CFRunLoopTimerCreate"); }
+fn cbp_add_timer(rl: u64, timer: u64, mode: u64) -> void { @extern("CFRunLoopAddTimer"); }
+fn cbp_run(mode: u64, seconds: f64, after_one: bool) -> i32 { return @extern("CFRunLoopRunInMode"); }
+fn cbp_timer_invalidate(timer: u64) -> void { @extern("CFRunLoopTimerInvalidate"); }
+fn cbp_release(x: u64) -> void { @extern("CFRelease"); }
+fn cbp_aq_new_output(fmt: []const u8, cb: u64, user: u64, rl: u64, mode: u64, flags: u32, out_aq: []u8) -> i32 { return @extern("AudioQueueNewOutput"); }
+fn cbp_aq_new_input(fmt: []const u8, cb: u64, user: u64, rl: u64, mode: u64, flags: u32, out_aq: []u8) -> i32 { return @extern("AudioQueueNewInput"); }
+fn cbp_aq_alloc(aq: u64, size: u32, out_buf: []u8) -> i32 { return @extern("AudioQueueAllocateBuffer"); }
+fn cbp_aq_enqueue(aq: u64, buf: u64, n: u32, descs: u64) -> i32 { return @extern("AudioQueueEnqueueBuffer"); }
+fn cbp_aq_start(aq: u64, at: u64) -> i32 { return @extern("AudioQueueStart"); }
+fn cbp_sin(x: f64) -> f64 { return @extern("sin"); }
+fn cbp_aq_dispose(aq: u64, now: bool) -> i32 { return @extern("AudioQueueDispose"); }
+fn cbp_thread() -> u64 { return @extern("pthread_self"); }
+fn cbp_is_main() -> i32 { return @extern("pthread_main_np"); }
+fn cbp_usleep(us: u32) -> i32 { return @extern("usleep"); }
+fn cbp_aq_set_param(aq: u64, id: u32, v: f32) -> i32 { return @extern("AudioQueueSetParameter"); }
+fn cbp_aq_get_param(aq: u64, id: u32, out: []u8) -> i32 { return @extern("AudioQueueGetParameter"); }
+/// memcpy and bzero between raw addresses (the ring and the AudioQueue buffers); no allocation.
+fn cbp_copy(dst: u64, src: u64, n: u64) -> u64 { return @extern("memcpy"); }
+fn cbp_zero(dst: u64, n: u64) -> void { @extern("bzero"); }
+
+/// Part D magic, 0x5432374400000D27 ("T27D" over 0x0D27).
+const CBP_D_MAGIC : u64 = 6066972413218786599;
+
+fn cbp_get(at: u64) -> u64 {
+    var c : [8]u8 = undefined;
+    sys_peek(c[0..8], at, 8);
+    return get_u64(c[0..8], 0);
+}
+
+fn cbp_put(at: u64, v: u64) -> void {
+    var c : [8]u8 = undefined;
+    put_u64(c[0..8], 0, v);
+    cbp_poke(at, c[0..8], 8);
+}
+
+/// Microseconds on the CF absolute clock.
+fn cbp_us() -> u64 { return @as(u64, @intFromFloat(cbp_now() * 1000000.0)); }
+
+/// qsort comparator. a and b are the addresses of two 1-byte elements.
+pub fn cbp_cmp(a: u64, b: u64) -> i32 {
+    var x : [1]u8 = undefined;
+    var y : [1]u8 = undefined;
+    sys_peek(x[0..1], a, 1);
+    sys_peek(y[0..1], b, 1);
+    return @as(i32, @intCast(x[0])) - @as(i32, @intCast(y[0]));
+}
+
+/// State block at `st` (u64 slots): 0 count, 1 info as received, 2 magic, 3 first us, 4 last us, 5 sample index.
+/// CFRunLoopTimer callout (timer, info): info is the address of the state block.
+pub fn cbp_tick(timer: u64, info: u64) -> u64 {
+    const n : u64 = cbp_get(info) + 1;
+    cbp_put(info, n);
+    cbp_put(info + 8, info);
+    const t : u64 = cbp_us();
+    if (n == 1) { cbp_put(info + 24, t); }
+    cbp_put(info + 32, t);
+    return n;
+}
+
+/// Fill the AudioQueue buffer with 480 samples (10 ms) of 440 Hz and enqueue it.
+fn cbp_fill(st: u64, aq: u64, buf: u64) -> i32 {
+    var pcm : [960]u8 = undefined;
+    const base : u64 = cbp_get(st + 40);
+    var i : usize = 0;
+    while (i < 480) {
+        const ph : f64 = 6.283185307179586 * 440.0 * @as(f64, @floatFromInt(base + @as(u64, i))) / 48000.0;
+        const v : i32 = @as(i32, @intFromFloat(cbp_sin(ph) * 8000.0)) + 32768;
+        pcm[i * 2] = @as(u8, @intCast(v & 255));
+        pcm[i * 2 + 1] = @as(u8, @intCast((v >> 8) & 255)) ^ 128;
+        i = i + 1;
+    }
+    cbp_put(st + 40, base + 480);
+    cbp_poke(cbp_get(buf + 8), pcm[0..960], 960);
+    var sz : [4]u8 = undefined;
+    sz[0] = 192; sz[1] = 3; sz[2] = 0; sz[3] = 0;
+    cbp_poke(buf + 16, sz[0..4], 4);
+    return cbp_aq_enqueue(aq, buf, 0, 0);
+}
+
+/// AudioQueue output callback (user, queue, buffer): user is the address of the state block.
+pub fn cbp_out(user: u64, aq: u64, buf: u64) -> u64 {
+    const n : u64 = cbp_get(user) + 1;
+    cbp_put(user, n);
+    const t : u64 = cbp_us();
+    if (n == 1) { cbp_put(user + 24, t); }
+    cbp_put(user + 32, t);
+    cbp_fill(user, aq, buf);
+    return n;
+}
+
+/// Part D state block (u64 slots): 0 calls, 1 own address, 2 magic, 3 first us, 4 last us, 5 sample index,
+/// 6 integrity errors, 7 main pthread, 8 first callback pthread, 9 calls on the main pthread,
+/// 10 calls where pthread_main_np != 0, 11 failed enqueues.
+/// AudioQueue output callback for a queue with no run loop: runs on a system thread.
+pub fn cbp_outd(user: u64, aq: u64, buf: u64) -> u64 {
+    if (cbp_get(user + 16) != CBP_D_MAGIC or cbp_get(user + 8) != user) {
+        cbp_put(user + 48, cbp_get(user + 48) + 1);
+        return 0;
+    }
+    const n : u64 = cbp_get(user) + 1;
+    cbp_put(user, n);
+    const t : u64 = cbp_us();
+    const th : u64 = cbp_thread();
+    if (n == 1) { cbp_put(user + 24, t); cbp_put(user + 64, th); }
+    cbp_put(user + 32, t);
+    if (th == cbp_get(user + 56)) { cbp_put(user + 72, cbp_get(user + 72) + 1); }
+    if (cbp_is_main() != 0) { cbp_put(user + 80, cbp_get(user + 80) + 1); }
+    if (cbp_fill(user, aq, buf) != 0) { cbp_put(user + 88, cbp_get(user + 88) + 1); }
+    return n;
+}
+
+/// Capture state block (u64 slots): 0 callbacks, 1 first 4 bytes, 2 first-buffer flag, 3 first us, 4 last us,
+/// 5 samples, 6 nonzero samples, 7 sum of |sample|, 8 bytes, 9 failed re-enqueues, 10 max |sample|.
+/// AudioQueue input callback (user, queue, buffer, start time, packet count, packet descs).
+pub fn cbp_in(user: u64, aq: u64, buf: u64, ts: u64, npk: u32, pd: u64) -> u64 {
+    const n : u64 = cbp_get(user) + 1;
+    cbp_put(user, n);
+    const t : u64 = cbp_us();
+    if (n == 1) { cbp_put(user + 24, t); }
+    cbp_put(user + 32, t);
+    var hd : [4]u8 = undefined;
+    sys_peek(hd[0..4], buf + 16, 4);
+    var sz : u64 = @as(u64, @intCast(hd[0])) | (@as(u64, @intCast(hd[1])) << 8) | (@as(u64, @intCast(hd[2])) << 16) | (@as(u64, @intCast(hd[3])) << 24);
+    if (sz > 960) { sz = 960; }
+    var pcm : [960]u8 = undefined;
+    const data : u64 = cbp_get(buf + 8);
+    if (data == 0) { sz = 0; }
+    if (sz > 0) { sys_peek(pcm[0..960], data, sz); }
+    if (n == 1 and sz >= 4) {
+        cbp_put(user + 8, @as(u64, @intCast(pcm[0])) | (@as(u64, @intCast(pcm[1])) << 8) | (@as(u64, @intCast(pcm[2])) << 16) | (@as(u64, @intCast(pcm[3])) << 24));
+        cbp_put(user + 16, 1);
+    }
+    var nz : u64 = 0;
+    var sum : u64 = 0;
+    var mx : u64 = cbp_get(user + 80);
+    var i : u64 = 0;
+    while (i < sz / 2) {
+        var v : i64 = @as(i64, @intCast(pcm[i * 2])) | (@as(i64, @intCast(pcm[i * 2 + 1])) << 8);
+        if (v >= 32768) { v = v - 65536; }
+        if (v < 0) { v = 0 - v; }
+        const a : u64 = @as(u64, @intCast(v));
+        if (a != 0) { nz = nz + 1; }
+        if (a > mx) { mx = a; }
+        sum = sum + a;
+        i = i + 1;
+    }
+    cbp_put(user + 40, cbp_get(user + 40) + sz / 2);
+    cbp_put(user + 48, cbp_get(user + 48) + nz);
+    cbp_put(user + 56, cbp_get(user + 56) + sum);
+    cbp_put(user + 64, cbp_get(user + 64) + sz);
+    cbp_put(user + 80, mx);
+    if (cbp_aq_enqueue(aq, buf, 0, 0) != 0) { cbp_put(user + 72, cbp_get(user + 72) + 1); }
+    return n;
+}
+
+/// Part E ring: 8 slots of 960 bytes after a 448-byte header of u64 slots:
+/// 0 in calls, 1 out calls, 2 slots written, 3 slots read, 4 underruns, 5 overruns, 6 bytes into the ring,
+/// 7 bytes out of the ring, 8 first in us, 9 last in us, 10 first out us, 11 last out us, 12 ring base,
+/// 13 sum of fill at out calls, 14 max fill, 15 failed in enqueues, 16 failed out enqueues, 17 bytes dropped,
+/// 18 bytes received by input, 19 age sum us, 20 age max us, 21 age min us, 22 checksum mismatches,
+/// 23 checksum sum in, 24 checksum sum out, 25 nonzero samples out, 26 magic, 27 stopping, 28 zero bytes out,
+/// 29 min fill at out calls, 30 max out interval us, 31 max in interval us,
+/// 32..39 slot sizes, 40..47 slot write us, 48..55 slot checksums, 56 warming, 57 warm-up silent buffers,
+/// 58 warm-up end us.
+const CBP_E_SLOTS : u64 = 8;
+const CBP_E_HDR : u64 = 472;
+const CBP_E_BYTES : usize = 8152;
+/// While warming, the output plays silence (not an underrun) until the ring holds this many slots; output buffers in flight.
+const CBP_E_PRE : u64 = 2;
+const CBP_E_OUTBUFS : u32 = 3;
+/// kAudioQueueParam_Volume, and the bits of 0.04f / 0.06f (the accepted read-back range of 0.05f).
+const CBP_VOLUME : u32 = 1;
+const CBP_VOL_LO : u64 = 1025758986;
+const CBP_VOL_HI : u64 = 1031127695;
+
+fn cbp_inc(at: u64, by: u64) -> void { cbp_put(at, cbp_get(at) + by); }
+fn cbp_emax(at: u64, v: u64) -> void { if (v > cbp_get(at)) { cbp_put(at, v); } }
+fn cbp_emin(at: u64, v: u64) -> void { if (v < cbp_get(at)) { cbp_put(at, v); } }
+
+/// Position-weighted byte checksum of n bytes at addr (n <= 960).
+fn cbp_sum(addr: u64, n: u64) -> u64 {
+    var b : [960]u8 = undefined;
+    if (n == 0) { return 0; }
+    sys_peek(b[0..960], addr, n);
+    var s : u64 = 0;
+    var i : u64 = 0;
+    while (i < n) { s = s + (@as(u64, @intCast(b[i])) + 1) * (i + 1); i = i + 1; }
+    return s;
+}
+
+/// Nonzero 16-bit samples in n bytes at addr.
+fn cbp_nz(addr: u64, n: u64) -> u64 {
+    var b : [960]u8 = undefined;
+    if (n == 0) { return 0; }
+    sys_peek(b[0..960], addr, n);
+    var c : u64 = 0;
+    var i : u64 = 0;
+    while (i + 1 < n) { if (b[i] != 0 or b[i + 1] != 0) { c = c + 1; } i = i + 2; }
+    return c;
+}
+
+/// Ring and its slot tables are the block itself; the header geometry must fit the declared size.
+fn cbp_e_size() -> u64 { return CBP_E_HDR + CBP_E_SLOTS * 960; }
+
+/// Part E input callback: copy the captured buffer into the next ring slot, or count an overrun and drop it.
+pub fn cbp_ein(user: u64, aq: u64, buf: u64, ts: u64, npk: u32, pd: u64) -> u64 {
+    if (cbp_get(user + 216) != 0) { return 0; }
+    const n : u64 = cbp_get(user) + 1;
+    cbp_put(user, n);
+    const t : u64 = cbp_us();
+    if (n == 1) { cbp_put(user + 64, t); } else { cbp_emax(user + 248, t - cbp_get(user + 72)); }
+    cbp_put(user + 72, t);
+    var hd : [4]u8 = undefined;
+    sys_peek(hd[0..4], buf + 16, 4);
+    var sz : u64 = @as(u64, @intCast(hd[0])) | (@as(u64, @intCast(hd[1])) << 8) | (@as(u64, @intCast(hd[2])) << 16) | (@as(u64, @intCast(hd[3])) << 24);
+    if (sz > 960) { sz = 960; }
+    const data : u64 = cbp_get(buf + 8);
+    if (data == 0) { sz = 0; }
+    cbp_inc(user + 144, sz);
+    const w : u64 = cbp_get(user + 16);
+    const r : u64 = cbp_get(user + 24);
+    if (w - r >= CBP_E_SLOTS) {
+        cbp_inc(user + 40, 1);
+        cbp_inc(user + 136, sz);
+    } else {
+        const slot : u64 = w % CBP_E_SLOTS;
+        const dst : u64 = cbp_get(user + 96) + slot * 960;
+        if (sz > 0) { cbp_copy(dst, data, sz); }
+        const cs : u64 = cbp_sum(dst, sz);
+        cbp_put(user + 256 + slot * 8, sz);
+        cbp_put(user + 320 + slot * 8, t);
+        cbp_put(user + 384 + slot * 8, cs);
+        cbp_put(user + 16, w + 1);
+        cbp_inc(user + 48, sz);
+        cbp_inc(user + 184, cs);
+        cbp_emax(user + 112, w + 1 - r);
+    }
+    if (cbp_aq_enqueue(aq, buf, 0, 0) != 0) { cbp_inc(user + 120, 1); }
+    return n;
+}
+
+/// Fill one output buffer from the ring (zeros and an underrun when it is empty) and enqueue it.
+fn cbp_epull(user: u64, aq: u64, buf: u64) -> i32 {
+    const data : u64 = cbp_get(buf + 8);
+    if (data == 0) { return -1; }
+    const w : u64 = cbp_get(user + 16);
+    const r : u64 = cbp_get(user + 24);
+    if (cbp_get(user + 448) != 0 and w - r >= CBP_E_PRE) {
+        cbp_put(user + 448, 0);
+        cbp_put(user + 464, cbp_us());
+    }
+    if (cbp_get(user + 448) != 0) {
+        cbp_zero(data, 960);
+        cbp_inc(user + 456, 1);
+    } else if (w == r) {
+        cbp_zero(data, 960);
+        cbp_inc(user + 32, 1);
+        cbp_inc(user + 224, 960);
+    } else {
+        const slot : u64 = r % CBP_E_SLOTS;
+        const sz : u64 = cbp_get(user + 256 + slot * 8);
+        if (sz > 0) { cbp_copy(data, cbp_get(user + 96) + slot * 960, sz); }
+        if (sz < 960) { cbp_zero(data + sz, 960 - sz); }
+        const cs : u64 = cbp_sum(data, sz);
+        if (cs != cbp_get(user + 384 + slot * 8)) { cbp_inc(user + 176, 1); }
+        cbp_inc(user + 192, cs);
+        cbp_inc(user + 200, cbp_nz(data, sz));
+        const age : u64 = cbp_us() - cbp_get(user + 320 + slot * 8);
+        cbp_inc(user + 152, age);
+        cbp_emax(user + 160, age);
+        cbp_emin(user + 168, age);
+        cbp_inc(user + 56, sz);
+        cbp_put(user + 24, r + 1);
+    }
+    var sz4 : [4]u8 = undefined;
+    sz4[0] = 192; sz4[1] = 3; sz4[2] = 0; sz4[3] = 0;
+    cbp_poke(buf + 16, sz4[0..4], 4);
+    return cbp_aq_enqueue(aq, buf, 0, 0);
+}
+
+/// Part E output callback (user, queue, buffer).
+pub fn cbp_eout(user: u64, aq: u64, buf: u64) -> u64 {
+    if (cbp_get(user + 216) != 0) { return 0; }
+    const n : u64 = cbp_get(user + 8) + 1;
+    cbp_put(user + 8, n);
+    const t : u64 = cbp_us();
+    if (n == 1) { cbp_put(user + 80, t); } else { cbp_emax(user + 240, t - cbp_get(user + 88)); }
+    cbp_put(user + 88, t);
+    const fill : u64 = cbp_get(user + 16) - cbp_get(user + 24);
+    cbp_inc(user + 104, fill);
+    cbp_emin(user + 232, fill);
+    if (cbp_epull(user, aq, buf) != 0) { cbp_inc(user + 128, 1); }
+    return n;
+}
+
+/// Part F sockets: libc calls with fixed arities only (sendto/recvfrom/setsockopt/close and the __fcntl stub).
+fn cbp_sendto(fd: i32, b: []const u8, n: u64, flags: i32, to: []const u8, tolen: u32) -> i64 { return @extern("sendto"); }
+fn cbp_recvfrom(fd: i32, b: []u8, n: u64, flags: i32, from: u64, fromlen: u64) -> i64 { return @extern("recvfrom"); }
+fn cbp_setsockopt(fd: i32, level: i32, name: i32, v: []const u8, n: u32) -> i32 { return @extern("setsockopt"); }
+fn cbp_fcntl(fd: i32, cmd: i32, arg: u64) -> i32 { return @extern("__fcntl"); }
+fn cbp_errloc() -> u64 { return @extern("__error"); }
+fn cbp_socket(domain: i32, kind: i32, proto: i32) -> i32 { return @extern("socket"); }
+fn cbp_bind(fd: i32, addr: []const u8, n: u32) -> i32 { return @extern("bind"); }
+fn cbp_close(fd: i32) -> i32 { return @extern("close"); }
+
+const CBP_F_PORT : u64 = 47727;
+const CBP_EAGAIN : u64 = 35;
+const CBP_F_TX : u64 = 24;
+const CBP_F_JB : u64 = 64;
+/// Playback starts at, and is trimmed back to, this many buffered frames; more than CBP_F_MAX is an overrun.
+const CBP_F_TARGET : u64 = 6;
+const CBP_F_MAX : u64 = 12;
+const CBP_F_GROW : u64 = 2;
+const CBP_F_CAP : u64 = 30;
+/// A call starts with this many buffered frames (180 ms) and this jitter max; the probes keep CBP_F_TARGET / CBP_F_MAX.
+pub const CBP_F_PRE : u64 = 18;
+pub const CBP_F_PREMAX : u64 = 26;
+/// A call keeps this many buffers in each AudioQueue (input 4 -> CBP_F_INQ, output 3 -> CBP_F_OUTQ), so a stall of the
+/// main loop shorter than that many 10 ms frames costs the device nothing; the tx ring holds the burst that follows.
+pub const CBP_F_INQ : u32 = 16;
+pub const CBP_F_OUTQ : u32 = 8;
+/// Concealment of a refill: one silent buffer in every CBP_F_STRETCH callbacks, never the whole refill at once.
+const CBP_F_STRETCH : u64 = 4;
+const CBP_F_SLACK : u64 = 8;
+const CBP_F_QUIET : u64 = 5000000;
+/// Part F block: 64 u64 header slots (512 bytes), tx ring 24 x 960, rx seq+1 per slot, rx kind per slot
+/// (1 primary, 2 redundant copy), capture us per seq % 64, rx data 64 x 960, last played frame 960.
+/// Header: 0 in calls, 1 out calls, 2 frames captured, 3 frames handled by the sender, 4 underruns, 5 overruns,
+/// 6 frames skipped by overruns, 7 tx ring overruns, 8 stopping, 9 magic, 10 tx fd, 11 rx fd, 12 next seq to play,
+/// 13 highest seq received + 1, 14 warming, 15 warm-up silent buffers, 16 packets sent, 17 dropped by the storm,
+/// 18 swaps, 19 send errors, 20 last send errno, 21 packets received, 22 unique primaries, 23 duplicates,
+/// 24 late, 25 reordered, 26 redundant copies stored, 27 played primary, 28 played from a redundant copy,
+/// 29 concealed, 30 bad packets, 31 recv errors, 32 last recv errno, 33 reads ended by EAGAIN, 34 read stalls,
+/// 35 no read until us, 36 next stall us, 37 max packets in one read, 38 checksum sum sent, 39 checksum sum
+/// received, 40 age sum us, 41 age max, 42 age min, 43 ages, 44 age sum first 10 s, 45 ages first 10 s,
+/// 46 age sum last 10 s, 47 ages last 10 s, 48 depth sum, 49 depth max, 50 depth min, 51 nonzero samples played,
+/// 52 failed in enqueues, 53 failed out enqueues, 54 output start us, 55 redundancy on, 56 warm-up end us,
+/// 57 max out interval us, 58 max in interval us, 59 bytes sent, 60 bytes received, 61 first in us, 62 last in us,
+/// 63 last out us.
+const CBP_F_TXD : u64 = 512;
+const CBP_F_RXS : u64 = 23552;
+const CBP_F_KIND : u64 = 24064;
+const CBP_F_CAPT : u64 = 24576;
+const CBP_F_RXD : u64 = 25088;
+const CBP_F_LAST : u64 = 86528;
+/// Extension (part G), 16 u64 slots after the last frame: 0 two hosts, 1 peer IPv4 (a<<24|b<<16|c<<8|d), 2 port,
+/// 3 nonzero samples in received primary frames, 4 received frames with a nonzero sample, 5 run us,
+/// 6 first seq received + 1, 7 underruns at the last packet received, 8 last packet received us,
+/// 9 ended because the peer went silent, 10 max gap between received packets us, 11 bind IPv4,
+/// 12 jitter target frames, 13 jitter max frames, 14 sendto EAGAIN retries (the frame stays queued),
+/// 15 discard captured frames (the queues run before the shared start time).
+/// Adaptive jitter buffer (calls only, 8 more u64 slots 16..23): 16 adaptive on, 17 floor target frames (the target
+/// the call started with), 18 time us of the last underrun event or shrink, 19 grow events, 20 shrink events,
+/// 21 highest target reached, 22 gap buffers (silence played to conceal a missing frame or to refill, apart from
+/// underruns and from the start warm-up in slot 15 of the header), 23 refill debt in frames. A call never stops
+/// playing: an empty buffer plays one silent buffer (an underrun and a gap), the target rises by CBP_F_GROW up to
+/// CBP_F_CAP, and that many silent buffers are spread over later callbacks (one in CBP_F_STRETCH) so the buffer
+/// refills without a pause; CBP_F_QUIET us without an event lower the target by one frame down to the floor. The overrun limit follows the target: target + CBP_F_SLACK, at most CBP_F_CAP + CBP_F_SLACK.
+const CBP_F_EXT : u64 = 87488;
+const CBP_F_BYTES : usize = 87680;
+const CBP_LOOPBACK : u64 = 2130706433;
+
+fn cbp_f_size() -> u64 { return CBP_F_EXT + 192; }
+
+/// What the storm does with packet seq: 0 send, 1 drop (every 20th), 2 send seq+1 first, then seq (every 100).
+pub fn cbp_storm(seq: u64) -> u64 {
+    if (seq % 20 == 19) { return 1; }
+    if (seq % 100 == 50) { return 2; }
+    return 0;
+}
+
+/// struct sockaddr_in for ip:port, ip as a<<24|b<<16|c<<8|d (BSD layout: length, family, port and address big-endian).
+fn cbp_sockaddr(out: []u8, ip: u64, port: u64) -> void {
+    var i : usize = 0;
+    while (i < 16) { out[i] = 0; i = i + 1; }
+    out[0] = 16;
+    out[1] = 2;
+    out[2] = @as(u8, @intCast((port >> 8) & 255));
+    out[3] = @as(u8, @intCast(port & 255));
+    out[4] = @as(u8, @intCast((ip >> 24) & 255));
+    out[5] = @as(u8, @intCast((ip >> 16) & 255));
+    out[6] = @as(u8, @intCast((ip >> 8) & 255));
+    out[7] = @as(u8, @intCast(ip & 255));
+}
+
+/// struct sockaddr_in for 127.0.0.1:port.
+fn cbp_inaddr(out: []u8, port: u64) -> void { cbp_sockaddr(out, CBP_LOOPBACK, port); }
+
+/// Dotted quad in the first n bytes of s, as a<<24|b<<16|c<<8|d; 2^32 when it is not four numbers 0..255.
+fn cbp_parse_ip(s: []const u8, n: usize) -> u64 {
+    var ip : u64 = 0;
+    var part : u64 = 0;
+    var digits : u64 = 0;
+    var dots : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        const c : u8 = s[i];
+        if (c >= 48 and c <= 57) {
+            part = part * 10 + @as(u64, @intCast(c - 48));
+            digits = digits + 1;
+            if (part > 255 or digits > 3) { return 4294967296; }
+        } else if (c == 46) {
+            if (digits == 0 or dots == 3) { return 4294967296; }
+            ip = (ip << 8) | part;
+            part = 0;
+            digits = 0;
+            dots = dots + 1;
+        } else {
+            return 4294967296;
+        }
+        i = i + 1;
+    }
+    if (digits == 0 or dots != 3) { return 4294967296; }
+    return (ip << 8) | part;
+}
+
+/// Decimal number in the first n bytes of s; 2^32 when empty, not a number or above 2^32 - 1.
+fn cbp_parse_u(s: []const u8, n: usize) -> u64 {
+    if (n == 0 or n > 10) { return 4294967296; }
+    var v : u64 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        const c : u8 = s[i];
+        if (c < 48 or c > 57) { return 4294967296; }
+        v = v * 10 + @as(u64, @intCast(c - 48));
+        i = i + 1;
+    }
+    if (v > 4294967295) { return 4294967296; }
+    return v;
+}
+
+/// Environment variable `name` copied into out (at most 32 bytes); its length, or 0 when it is unset.
+fn cbp_env(name: []const u8, out: []u8) -> usize {
+    const a : u64 = sys_getenv(name);
+    if (a == 0) { return 0; }
+    var n : u64 = sys_strlen(a);
+    if (n > 32) { n = 32; }
+    sys_peek(out[0..32], a, n);
+    return @as(usize, @intCast(n));
+}
+
+/// IPv4 from the environment: dflt when unset, 2^32 when malformed.
+fn cbp_env_ip(name: []const u8, dflt: u64) -> u64 {
+    var b : [32]u8 = undefined;
+    const n : usize = cbp_env(name, b[0..32]);
+    if (n == 0) { return dflt; }
+    return cbp_parse_ip(b[0..32], n);
+}
+
+/// Number from the environment: dflt when unset, 2^32 when malformed.
+fn cbp_env_u(name: []const u8, dflt: u64) -> u64 {
+    var b : [32]u8 = undefined;
+    const n : usize = cbp_env(name, b[0..32]);
+    if (n == 0) { return dflt; }
+    return cbp_parse_u(b[0..32], n);
+}
+
+fn cbp_errno() -> u64 {
+    var c : [4]u8 = undefined;
+    sys_peek(c[0..4], cbp_errloc(), 4);
+    return @as(u64, @intCast(c[0])) | (@as(u64, @intCast(c[1])) << 8) | (@as(u64, @intCast(c[2])) << 16) | (@as(u64, @intCast(c[3])) << 24);
+}
+
+/// Halve every 16-bit sample of the 960 bytes at addr, in place (concealment fades a repeated frame).
+fn cbp_half(addr: u64) -> void {
+    var b : [960]u8 = undefined;
+    sys_peek(b[0..960], addr, 960);
+    var i : usize = 0;
+    while (i < 960) {
+        var v : i64 = @as(i64, @intCast(b[i])) | (@as(i64, @intCast(b[i + 1])) << 8);
+        if (v >= 32768) { v = v - 65536; }
+        if (v < 0) { v = 0 - ((0 - v) / 2); } else { v = v / 2; }
+        if (v < 0) { v = v + 65536; }
+        b[i] = @as(u8, @intCast(v & 255));
+        b[i + 1] = @as(u8, @intCast((v >> 8) & 255));
+        i = i + 2;
+    }
+    cbp_poke(addr, b[0..960], 960);
+}
+
+/// Part F input callback: the captured buffer becomes frame `seq` in the tx ring (one slot is kept for the
+/// redundant copy), or a tx overrun.
+pub fn cbp_fin(user: u64, aq: u64, buf: u64, ts: u64, npk: u32, pd: u64) -> u64 {
+    if (cbp_get(user + 64) != 0) { return 0; }
+    if (cbp_get(user + CBP_F_EXT + 120) != 0) {
+        if (cbp_aq_enqueue(aq, buf, 0, 0) != 0) { cbp_inc(user + 416, 1); }
+        return 0;
+    }
+    const n : u64 = cbp_get(user) + 1;
+    cbp_put(user, n);
+    const t : u64 = cbp_us();
+    if (n == 1) { cbp_put(user + 488, t); } else { cbp_emax(user + 464, t - cbp_get(user + 496)); }
+    cbp_put(user + 496, t);
+    var hd : [4]u8 = undefined;
+    sys_peek(hd[0..4], buf + 16, 4);
+    var sz : u64 = @as(u64, @intCast(hd[0])) | (@as(u64, @intCast(hd[1])) << 8) | (@as(u64, @intCast(hd[2])) << 16) | (@as(u64, @intCast(hd[3])) << 24);
+    if (sz > 960) { sz = 960; }
+    const data : u64 = cbp_get(buf + 8);
+    if (data == 0) { sz = 0; }
+    const w : u64 = cbp_get(user + 16);
+    if (w - cbp_get(user + 24) >= CBP_F_TX - 1) {
+        cbp_inc(user + 56, 1);
+    } else {
+        const dst : u64 = user + CBP_F_TXD + (w % CBP_F_TX) * 960;
+        if (sz > 0) { cbp_copy(dst, data, sz); }
+        if (sz < 960) { cbp_zero(dst + sz, 960 - sz); }
+        cbp_put(user + CBP_F_CAPT + (w % CBP_F_JB) * 8, t);
+        cbp_put(user + 16, w + 1);
+    }
+    if (cbp_aq_enqueue(aq, buf, 0, 0) != 0) { cbp_inc(user + 416, 1); }
+    return n;
+}
+
+/// Send frame k from the tx ring as one packet, with frame k-1 as a redundant copy when redundancy is on.
+/// 0 sent, 1 EAGAIN (send buffer full: try the same frame again later), 2 any other error.
+fn cbp_fsend1(p: u64, k: u64) -> u64 {
+    var pkt : [1928]u8 = undefined;
+    var to : [16]u8 = undefined;
+    cbp_sockaddr(to[0..16], cbp_get(p + CBP_F_EXT + 8), cbp_get(p + CBP_F_EXT + 16));
+    pkt[0] = @as(u8, @intCast(k & 255));
+    pkt[1] = @as(u8, @intCast((k >> 8) & 255));
+    pkt[2] = @as(u8, @intCast((k >> 16) & 255));
+    pkt[3] = @as(u8, @intCast((k >> 24) & 255));
+    pkt[4] = 192;
+    pkt[5] = 3;
+    pkt[6] = 0;
+    pkt[7] = 0;
+    const src : u64 = p + CBP_F_TXD + (k % CBP_F_TX) * 960;
+    sys_peek(pkt[8..968], src, 960);
+    var n : u64 = 968;
+    if (cbp_get(p + 440) != 0 and k >= 1) {
+        sys_peek(pkt[968..1928], p + CBP_F_TXD + ((k - 1) % CBP_F_TX) * 960, 960);
+        pkt[6] = 1;
+        n = 1928;
+    }
+    const r : i64 = cbp_sendto(@as(i32, @intCast(cbp_get(p + 80))), pkt[0..1928], n, 0, to[0..16], 16);
+    if (r == @as(i64, @intCast(n))) {
+        cbp_inc(p + 128, 1);
+        cbp_inc(p + 472, n);
+        cbp_inc(p + 304, cbp_sum(src, 960));
+        return 0;
+    }
+    const e : u64 = cbp_errno();
+    if (e == CBP_EAGAIN) {
+        cbp_inc(p + CBP_F_EXT + 112, 1);
+        return 1;
+    }
+    cbp_inc(p + 152, 1);
+    cbp_put(p + 160, e);
+    return 2;
+}
+
+/// Sender: every captured frame not yet handled goes out, through the storm.
+fn cbp_fsend(p: u64) -> void {
+    var s : u64 = cbp_get(p + 24);
+    const w : u64 = cbp_get(p + 16);
+    const two : bool = cbp_get(p + CBP_F_EXT) != 0;
+    while (s < w) {
+        var what : u64 = 0;
+        if (!two) { what = cbp_storm(s); }
+        if (what == 1) {
+            cbp_inc(p + 136, 1);
+            s = s + 1;
+        } else if (what == 2) {
+            if (s + 1 >= w) { break; }
+            const r1 : u64 = cbp_fsend1(p, s + 1);
+            const r2 : u64 = cbp_fsend1(p, s);
+            // A swapped pair is not retried: an EAGAIN there counts as a send error (storm runs on loopback only).
+            if (r1 == 1) { cbp_inc(p + 152, 1); cbp_put(p + 160, CBP_EAGAIN); }
+            if (r2 == 1) { cbp_inc(p + 152, 1); cbp_put(p + 160, CBP_EAGAIN); }
+            cbp_inc(p + 144, 1);
+            s = s + 2;
+        } else {
+            if (cbp_fsend1(p, s) == 1) { break; }
+            s = s + 1;
+        }
+    }
+    cbp_put(p + 24, s);
+}
+
+/// Store frame q (960 bytes at src) in its jitter slot unless it is late, too far ahead or already there.
+fn cbp_fstore(p: u64, q: u64, src: []const u8, kind: u64) -> u64 {
+    const play : u64 = cbp_get(p + 96);
+    if (q < play or q >= play + CBP_F_JB) { return 0; }
+    const slot : u64 = q % CBP_F_JB;
+    if (cbp_get(p + CBP_F_RXS + slot * 8) == q + 1) {
+        if (kind == 2 or cbp_get(p + CBP_F_KIND + slot * 8) == 1) { return 2; }
+    }
+    cbp_poke(p + CBP_F_RXD + slot * 960, src, 960);
+    cbp_put(p + CBP_F_RXS + slot * 8, q + 1);
+    cbp_put(p + CBP_F_KIND + slot * 8, kind);
+    return 1;
+}
+
+/// Receiver: read the socket until EAGAIN (at most 64 packets), unless a storm stall is on; `force` ignores it.
+fn cbp_frecv(p: u64, force: bool) -> void {
+    const now : u64 = cbp_us();
+    const ext : u64 = p + CBP_F_EXT;
+    if (!force and cbp_get(ext) == 0) {
+        if (now < cbp_get(p + 280)) { return; }
+        if (now >= cbp_get(p + 288)) {
+            cbp_put(p + 280, now + 40000);
+            cbp_put(p + 288, cbp_get(p + 288) + 2000000);
+            cbp_inc(p + 272, 1);
+            return;
+        }
+    }
+    var pkt : [2048]u8 = undefined;
+    var got : u64 = 0;
+    while (got < 64) {
+        const r : i64 = cbp_recvfrom(@as(i32, @intCast(cbp_get(p + 88))), pkt[0..2048], 2048, 0, 0, 0);
+        if (r < 0) {
+            const e : u64 = cbp_errno();
+            if (e == CBP_EAGAIN) { cbp_inc(p + 264, 1); } else { cbp_inc(p + 248, 1); cbp_put(p + 256, e); }
+            break;
+        }
+        got = got + 1;
+        cbp_inc(p + 168, 1);
+        cbp_inc(p + 480, @as(u64, @intCast(r)));
+        const q : u64 = @as(u64, @intCast(pkt[0])) | (@as(u64, @intCast(pkt[1])) << 8) | (@as(u64, @intCast(pkt[2])) << 16) | (@as(u64, @intCast(pkt[3])) << 24);
+        const len : u64 = @as(u64, @intCast(pkt[4])) | (@as(u64, @intCast(pkt[5])) << 8);
+        if (len != 960 or r < 968) {
+            cbp_inc(p + 240, 1);
+        } else {
+            const t : u64 = cbp_us();
+            if (cbp_get(ext + 48) == 0) { cbp_put(ext + 48, q + 1); } else { cbp_emax(ext + 80, t - cbp_get(ext + 64)); }
+            cbp_put(ext + 64, t);
+            if (!force) { cbp_put(ext + 56, cbp_get(p + 32)); }
+            const nz : u64 = cbp_nz(sys_addr(pkt[8..968], pkt[8..968], 0), 960);
+            cbp_inc(ext + 24, nz);
+            if (nz > 0) { cbp_inc(ext + 32, 1); }
+            const hi : u64 = cbp_get(p + 104);
+            if (q + 1 < hi) { cbp_inc(p + 200, 1); }
+            if (q + 1 > hi) { cbp_put(p + 104, q + 1); }
+            const st : u64 = cbp_fstore(p, q, pkt[8..968], 1);
+            if (st == 2) {
+                cbp_inc(p + 184, 1);
+            } else {
+                if (st == 0) { cbp_inc(p + 192, 1); } else { cbp_inc(p + 176, 1); }
+                cbp_inc(p + 312, cbp_sum(sys_addr(pkt[8..968], pkt[8..968], 0), 960));
+            }
+            if ((pkt[6] & 1) != 0 and r >= 1928 and q >= 1) {
+                if (cbp_fstore(p, q - 1, pkt[968..1928], 2) == 1) { cbp_inc(p + 208, 1); }
+            }
+        }
+    }
+    cbp_emax(p + 296, got);
+}
+
+/// Fill one output buffer from the jitter buffer and enqueue it.
+fn cbp_fpull(p: u64, aq: u64, buf: u64) -> i32 {
+    const data : u64 = cbp_get(buf + 8);
+    if (data == 0) { return -1; }
+    cbp_fmix(p, data);
+    var sz4 : [4]u8 = undefined;
+    sz4[0] = 192; sz4[1] = 3; sz4[2] = 0; sz4[3] = 0;
+    cbp_poke(buf + 16, sz4[0..4], 4);
+    return cbp_aq_enqueue(aq, buf, 0, 0);
+}
+
+/// One 10 ms frame (960 bytes) out of the jitter buffer of block p into the memory at `data`: the next frame, a
+/// redundant copy, a concealed repeat or silence, with every counter of the block. A group call pulls one such frame
+/// from each member's block and adds them; a one to one call enqueues it as it is (cbp_fpull).
+fn cbp_fmix(p: u64, data: u64) -> void {
+    var play : u64 = cbp_get(p + 96);
+    const hi : u64 = cbp_get(p + 104);
+    var depth : u64 = 0;
+    if (hi > play) { depth = hi - play; }
+    const now : u64 = cbp_us();
+    const ext : u64 = p + CBP_F_EXT;
+    var target : u64 = cbp_get(ext + 96);
+    var most : u64 = cbp_get(ext + 104);
+    const adapt : bool = cbp_get(ext + 128) != 0;
+    if (adapt and cbp_get(p + 112) == 0) {
+        // Quiet for CBP_F_QUIET: one frame less, never below the floor.
+        const lastev : u64 = cbp_get(ext + 144);
+        if (lastev == 0) { cbp_put(ext + 144, now); }
+        if (lastev != 0 and now - lastev >= CBP_F_QUIET) {
+            cbp_put(ext + 144, now);
+            if (target > cbp_get(ext + 136)) {
+                target = target - 1;
+                most = target + CBP_F_SLACK;
+                cbp_put(ext + 96, target);
+                cbp_put(ext + 104, most);
+                cbp_inc(ext + 160, 1);
+            }
+        }
+    }
+    if (cbp_get(p + 112) != 0 and depth >= target) {
+        cbp_put(p + 112, 0);
+        cbp_put(p + 448, now);
+    }
+    if (cbp_get(p + 112) != 0) {
+        cbp_zero(data, 960);
+        cbp_inc(p + 120, 1);
+    } else {
+        if (depth > most) {
+            cbp_inc(p + 40, 1);
+            cbp_inc(p + 48, depth - target);
+            play = hi - target;
+            depth = target;
+        }
+        cbp_inc(p + 384, depth);
+        cbp_emax(p + 392, depth);
+        cbp_emin(p + 400, depth);
+        if (depth == 0) {
+            cbp_zero(data, 960);
+            cbp_inc(p + 32, 1);
+            if (adapt) {
+                // An underrun event: one silent buffer, a longer target, and the refill is spread over later callbacks.
+                const before : u64 = target;
+                if (target + CBP_F_GROW <= CBP_F_CAP) { target = target + CBP_F_GROW; } else { target = CBP_F_CAP; }
+                most = target + CBP_F_SLACK;
+                cbp_put(ext + 96, target);
+                cbp_put(ext + 104, most);
+                cbp_put(ext + 144, now);
+                cbp_inc(ext + 152, 1);
+                cbp_emax(ext + 168, target);
+                cbp_inc(ext + 176, 1);
+                cbp_inc(ext + 184, target - before);
+            }
+        } else if (adapt and cbp_get(ext + 184) > 0 and cbp_get(p + 8) % CBP_F_STRETCH == 0) {
+            // Refill after an underrun: this buffer is silence and the frame stays queued.
+            cbp_zero(data, 960);
+            cbp_inc(ext + 176, 1);
+            cbp_put(ext + 184, cbp_get(ext + 184) - 1);
+        } else {
+            const slot : u64 = play % CBP_F_JB;
+            const last : u64 = p + CBP_F_LAST;
+            if (cbp_get(p + CBP_F_RXS + slot * 8) == play + 1) {
+                cbp_copy(last, p + CBP_F_RXD + slot * 960, 960);
+                if (cbp_get(p + CBP_F_KIND + slot * 8) == 1) { cbp_inc(p + 216, 1); } else { cbp_inc(p + 224, 1); }
+                // The capture time of seq is this host's; with two hosts it belongs to the other clock, so no age.
+                if (cbp_get(p + CBP_F_EXT) == 0) {
+                    const age : u64 = now - cbp_get(p + CBP_F_CAPT + slot * 8);
+                    cbp_inc(p + 320, age);
+                    cbp_emax(p + 328, age);
+                    cbp_emin(p + 336, age);
+                    cbp_inc(p + 344, 1);
+                    if (now - cbp_get(p + 432) < 10000000) { cbp_inc(p + 352, age); cbp_inc(p + 360, 1); } else { cbp_inc(p + 368, age); cbp_inc(p + 376, 1); }
+                }
+                cbp_put(p + CBP_F_RXS + slot * 8, 0);
+            } else {
+                cbp_half(last);
+                cbp_inc(p + 232, 1);
+            }
+            cbp_copy(data, last, 960);
+            cbp_inc(p + 408, cbp_nz(data, 960));
+            play = play + 1;
+        }
+        cbp_put(p + 96, play);
+    }
+}
+
+/// Part F output callback (user, queue, buffer).
+pub fn cbp_fout(user: u64, aq: u64, buf: u64) -> u64 {
+    if (cbp_get(user + 64) != 0) { return 0; }
+    const n : u64 = cbp_get(user + 8) + 1;
+    cbp_put(user + 8, n);
+    const t : u64 = cbp_us();
+    if (n > 1) { cbp_emax(user + 456, t - cbp_get(user + 504)); }
+    cbp_put(user + 504, t);
+    if (cbp_fpull(user, aq, buf) != 0) { cbp_inc(user + 424, 1); }
+    return n;
+}
+
+/// Part F: microphone -> tx ring -> UDP 127.0.0.1:47727 under the storm -> jitter buffer -> speakers, 20 s.
+/// Part G (CBP_PEER set): the same loop between two hosts, one socket, no storm, CBP_SECONDS (default 25).
+fn cbp_part_f(mode: u64, fmt: []const u8) -> bool {
+    var blk : [87680]u8 = undefined;
+    var z : usize = 0;
+    while (z < CBP_F_BYTES) { blk[z] = 0; z = z + 1; }
+    const p : u64 = sys_addr(blk[0..87680], blk[0..87680], 0);
+    const ext : u64 = p + CBP_F_EXT;
+    cbp_put(p + 72, CBP_D_MAGIC);
+    cbp_put(p + 112, 1);
+    cbp_put(p + 336, 18446744073709551615);
+    cbp_put(p + 400, 18446744073709551615);
+    if (sys_getenv("CBP_NO_FEC") == 0) { cbp_put(p + 440, 1); }
+    say_u("F redundant copy of the previous frame (0 = CBP_NO_FEC): ", cbp_get(p + 440));
+    const two : bool = sys_getenv("CBP_PEER") != 0;
+    var peer : u64 = CBP_LOOPBACK;
+    var bind_ip : u64 = CBP_LOOPBACK;
+    var port : u64 = CBP_F_PORT;
+    var secs : u64 = 20;
+    var start_at : u64 = 0;
+    var target : u64 = CBP_F_TARGET;
+    var most : u64 = CBP_F_MAX;
+    if (two) {
+        peer = cbp_env_ip("CBP_PEER", 0);
+        bind_ip = cbp_env_ip("CBP_BIND", 0);
+        port = cbp_env_u("CBP_PORT", CBP_F_PORT);
+        secs = cbp_env_u("CBP_SECONDS", 25);
+        start_at = cbp_env_u("CBP_START_AT", 0);
+        target = cbp_env_u("CBP_JB_TARGET", CBP_F_TARGET);
+        most = cbp_env_u("CBP_JB_MAX", CBP_F_MAX);
+        say_u("G jitter target frames: ", target);
+        say_u("G jitter max frames: ", most);
+        say_u("G two hosts: peer IPv4 (a<<24|b<<16|c<<8|d): ", peer);
+        say_u("G bind IPv4: ", bind_ip);
+        say_u("G port: ", port);
+        say_u("G seconds: ", secs);
+        say_u("G start at (unix s, 0 = now): ", start_at);
+        if (peer == 0 or peer > 4294967295 or bind_ip > 4294967295 or port == 0 or port > 65535 or secs == 0 or secs > 600 or start_at > 4294967295 or target == 0 or target >= most or most + CBP_F_TX >= CBP_F_JB) {
+            say_line("G NOT RUN: CBP_PEER, CBP_BIND, CBP_PORT, CBP_SECONDS, CBP_START_AT or CBP_JB_* is malformed\n");
+            return false;
+        }
+    }
+    cbp_put(ext, 0);
+    if (two) { cbp_put(ext, 1); }
+    cbp_put(ext + 8, peer);
+    cbp_put(ext + 16, port);
+    cbp_put(ext + 88, bind_ip);
+    cbp_put(ext + 96, target);
+    cbp_put(ext + 104, most);
+    // Sockets, both non-blocking. F: rx bound to 127.0.0.1:47727, tx bound to 127.0.0.1 on any port.
+    // G: one socket bound to CBP_BIND:CBP_PORT sends and receives.
+    var rxa : [16]u8 = undefined;
+    var txa : [16]u8 = undefined;
+    cbp_sockaddr(rxa[0..16], bind_ip, port);
+    cbp_inaddr(txa[0..16], 0);
+    const frx : i32 = cbp_socket(2, 2, 0);
+    var ftx : i32 = frx;
+    if (!two) { ftx = cbp_socket(2, 2, 0); }
+    say_num("F socket(AF_INET, SOCK_DGRAM) rx fd: ", @as(i64, frx));
+    say_num("F socket(AF_INET, SOCK_DGRAM) tx fd: ", @as(i64, ftx));
+    if (frx < 0 or ftx < 0) { say_line("F NET NOT RUN: socket failed\n"); return false; }
+    const b_rx : i32 = cbp_bind(frx, rxa[0..16], 16);
+    say_num("F bind rx status: ", @as(i64, b_rx));
+    if (b_rx != 0) { say_u("F bind errno: ", cbp_errno()); }
+    var b_tx : i32 = 0;
+    if (!two) { b_tx = cbp_bind(ftx, txa[0..16], 16); }
+    say_num("F bind tx 127.0.0.1:0 status (G: same socket, 0): ", @as(i64, b_tx));
+    var rcv : [4]u8 = undefined;
+    rcv[0] = 0; rcv[1] = 0; rcv[2] = 1; rcv[3] = 0;
+    const so : i32 = cbp_setsockopt(frx, 65535, 4098, rcv[0..4], 4);
+    say_num("F setsockopt(SOL_SOCKET, SO_RCVBUF, 65536) status: ", @as(i64, so));
+    if (two) { say_num("G setsockopt(SOL_SOCKET, SO_SNDBUF, 65536) status: ", @as(i64, cbp_setsockopt(frx, 65535, 4097, rcv[0..4], 4))); }
+    var nb_ok : bool = true;
+    var fds : [2]i32 = undefined;
+    fds[0] = frx;
+    fds[1] = ftx;
+    var fi : usize = 0;
+    while (fi < 2) {
+        const g0 : i32 = cbp_fcntl(fds[fi], 3, 0);
+        const s1 : i32 = cbp_fcntl(fds[fi], 4, @as(u64, @intCast(g0 | 4)));
+        const g1 : i32 = cbp_fcntl(fds[fi], 3, 0);
+        say_num("F __fcntl F_GETFL before: ", @as(i64, g0));
+        say_num("F __fcntl F_SETFL O_NONBLOCK status: ", @as(i64, s1));
+        say_num("F __fcntl F_GETFL after: ", @as(i64, g1));
+        if (g0 < 0 or s1 != 0 or g1 < 0 or (g1 & 4) == 0) { nb_ok = false; }
+        fi = fi + 1;
+    }
+    say("F both sockets bound and O_NONBLOCK reads back", b_rx == 0 and b_tx == 0 and nb_ok);
+    cbp_put(p + 80, @as(u64, @intCast(ftx)));
+    cbp_put(p + 88, @as(u64, @intCast(frx)));
+    // An empty socket must answer EAGAIN at once, never block.
+    var probe : [16]u8 = undefined;
+    const r0 : i64 = cbp_recvfrom(frx, probe[0..16], 16, 0, 0, 0);
+    const e0 : u64 = cbp_errno();
+    say_num("F recvfrom on the empty socket: ", r0);
+    say_u("F errno (EAGAIN = 35): ", e0);
+    const net_ok : bool = b_rx == 0 and b_tx == 0 and nb_ok and r0 < 0 and e0 == CBP_EAGAIN;
+    const fin : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_fin");
+    const fout : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_fout");
+    say("dlsym finds cbp_fin and cbp_fout", fin != 0 and fout != 0);
+    var aqi : [8]u8 = undefined;
+    var aqo : [8]u8 = undefined;
+    put_u64(aqi[0..8], 0, 0);
+    put_u64(aqo[0..8], 0, 0);
+    var s_in : i32 = -1;
+    var s_out : i32 = -1;
+    if (net_ok and fin != 0 and fout != 0 and mode != 0) {
+        s_in = cbp_aq_new_input(fmt, fin, p, cbp_rl_current(), mode, 0, aqi[0..8]);
+        s_out = cbp_aq_new_output(fmt, fout, p, cbp_rl_current(), mode, 0, aqo[0..8]);
+    }
+    say_num("F AudioQueueNewInput status: ", @as(i64, s_in));
+    say_num("F AudioQueueNewOutput status: ", @as(i64, s_out));
+    const qi : u64 = get_u64(aqi[0..8], 0);
+    const qo : u64 = get_u64(aqo[0..8], 0);
+    var vol_ok : bool = false;
+    if (s_out == 0 and qo != 0) {
+        const s_vol : i32 = cbp_aq_set_param(qo, CBP_VOLUME, 0.05);
+        var vb : [4]u8 = undefined;
+        vb[0] = 0; vb[1] = 0; vb[2] = 0; vb[3] = 0;
+        const s_get : i32 = cbp_aq_get_param(qo, CBP_VOLUME, vb[0..4]);
+        const bits : u64 = @as(u64, @intCast(vb[0])) | (@as(u64, @intCast(vb[1])) << 8) | (@as(u64, @intCast(vb[2])) << 16) | (@as(u64, @intCast(vb[3])) << 24);
+        say_num("F AudioQueueSetParameter(Volume, 0.05) status: ", @as(i64, s_vol));
+        say_u("F volume read back, f32 bits (0.05f = 1028443341): ", bits);
+        vol_ok = s_vol == 0 and s_get == 0 and bits >= CBP_VOL_LO and bits <= CBP_VOL_HI;
+    }
+    say("F output volume reads back within 0.04..0.06", vol_ok);
+    // Output first, then input: AudioQueueStart spins this run loop while the device wakes, and an input started
+    // first would fill the tx ring before the sender runs (run 1: 10 tx overruns). The output plays warm-up silence.
+    var started_in : bool = false;
+    var started_out : bool = false;
+    var in_q : u32 = 0;
+    if (s_in == 0 and qi != 0 and vol_ok) {
+        var m : u32 = 0;
+        while (m < 4) {
+            var b : [8]u8 = undefined;
+            put_u64(b[0..8], 0, 0);
+            if (cbp_aq_alloc(qi, 960, b[0..8]) == 0) {
+                if (cbp_aq_enqueue(qi, get_u64(b[0..8], 0), 0, 0) == 0) { in_q = in_q + 1; }
+            }
+            m = m + 1;
+        }
+        say_num("F input buffers enqueued: ", @as(i64, @intCast(in_q)));
+        var k : u32 = 0;
+        var out_q : u32 = 0;
+        while (k < CBP_E_OUTBUFS) {
+            var b : [8]u8 = undefined;
+            put_u64(b[0..8], 0, 0);
+            if (cbp_aq_alloc(qo, 960, b[0..8]) == 0) {
+                if (cbp_fpull(p, qo, get_u64(b[0..8], 0)) == 0) { out_q = out_q + 1; }
+            }
+            k = k + 1;
+        }
+        say_num("F output buffers primed (warm-up silence): ", @as(i64, @intCast(out_q)));
+        if (two) { cbp_put(ext + 120, 1); }
+        cbp_put(p + 432, cbp_us());
+        cbp_put(p + 288, cbp_us() + 2000000);
+        const s_so : i32 = cbp_aq_start(qo, 0);
+        say_num("F output AudioQueueStart status: ", @as(i64, s_so));
+        started_out = s_so == 0 and out_q == CBP_E_OUTBUFS;
+    }
+    if (started_out and in_q == 4) {
+        const s_si : i32 = cbp_aq_start(qi, 0);
+        say_num("F input AudioQueueStart status: ", @as(i64, s_si));
+        say_u("F input AudioQueueStart returned +us (from output start): ", cbp_us() - cbp_get(p + 432));
+        started_in = s_si == 0;
+    }
+    // G: both queues already run (a microphone start took 3.46 s on the M1, with the socket unread); captured
+    // frames are discarded and the run loop keeps reading until the shared wall-clock second (CFAbsoluteTime
+    // counts from 2001). Then seq 0 is captured on both sides at about the same moment.
+    if (started_in and two) {
+        if (start_at > 978307200) {
+            const at : f64 = @as(f64, @floatFromInt(start_at - 978307200));
+            const late_us : f64 = (cbp_now() - at) * 1000000.0;
+            if (late_us > 0.0) { say_u("G start was already past by us: ", @as(u64, @intFromFloat(late_us))); }
+            while (cbp_now() < at) { cbp_run(mode, 0.002, false); cbp_frecv(p, false); }
+        }
+        say_u("G captured frames before the start (discarded, not sent): ", cbp_get(p));
+        cbp_put(ext + 120, 0);
+        cbp_put(p + 432, cbp_us());
+        say_line("G start time reached\n");
+    }
+    if (started_in) {
+        var sec : u64 = 1;
+        while (cbp_us() - cbp_get(p + 432) < secs * 1000000) {
+            cbp_run(mode, 0.002, false);
+            cbp_fsend(p);
+            cbp_frecv(p, false);
+            // G: the peer has stopped (silent 300 ms after the warm-up ended): end now, do not count the silence.
+            if (two and cbp_get(p + 112) == 0 and cbp_get(ext + 64) != 0 and cbp_us() - cbp_get(ext + 64) > 300000) {
+                cbp_put(ext + 72, 1);
+                break;
+            }
+            if (cbp_us() - cbp_get(p + 432) >= sec * 1000000) {
+                sys_write(1, "F t+", 4);
+                say_num("s ", @as(i64, @intCast(sec)));
+                say_u("  in/out/sent/recv: ", cbp_get(p));
+                say_u("                    ", cbp_get(p + 8));
+                say_u("                    ", cbp_get(p + 128));
+                say_u("                    ", cbp_get(p + 168));
+                say_u("  under/over/concealed/depth: ", cbp_get(p + 32));
+                say_u("                              ", cbp_get(p + 40));
+                say_u("                              ", cbp_get(p + 232));
+                var dep : u64 = 0;
+                if (cbp_get(p + 104) > cbp_get(p + 96)) { dep = cbp_get(p + 104) - cbp_get(p + 96); }
+                say_u("                              ", dep);
+                if (two) { say_u("  nonzero samples received: ", cbp_get(ext + 24)); }
+                sec = sec + 1;
+            }
+        }
+    }
+    const t_end : u64 = cbp_us();
+    // Snapshot the playout, stop the callbacks, then drain the socket so every sent packet is counted.
+    cbp_put(p + 64, 1);
+    const play_end : u64 = cbp_get(p + 96);
+    cbp_frecv(p, true);
+    var d_out : i32 = -1;
+    var d_in : i32 = -1;
+    if (s_out == 0 and qo != 0) { d_out = cbp_aq_dispose(qo, true); }
+    if (s_in == 0 and qi != 0) { d_in = cbp_aq_dispose(qi, true); }
+    say_num("F output AudioQueueDispose status: ", @as(i64, d_out));
+    say_num("F input AudioQueueDispose status: ", @as(i64, d_in));
+    say_num("F close rx status: ", @as(i64, cbp_close(frx)));
+    if (ftx != frx) { say_num("F close tx status: ", @as(i64, cbp_close(ftx))); }
+    if (!started_in) { say_line("F NET NOT RUN: a status above is nonzero or the volume did not read back\n"); return false; }
+    const cap : u64 = cbp_get(p + 16);
+    const handled : u64 = cbp_get(p + 24);
+    const sent : u64 = cbp_get(p + 128);
+    const dropped : u64 = cbp_get(p + 136);
+    const recv : u64 = cbp_get(p + 168);
+    say_u("F output run us: ", t_end - cbp_get(p + 432));
+    say_u("F warm-up silent output buffers (not underruns): ", cbp_get(p + 120));
+    if (cbp_get(p + 112) == 0) { say_u("F warm-up ended +us (from output start): ", cbp_get(p + 448) - cbp_get(p + 432)); }
+    say_u("F input callbacks: ", cbp_get(p));
+    if (cbp_get(p) > 0) { say_u("F first input callback +us (from output start): ", cbp_get(p + 488) - cbp_get(p + 432)); }
+    say_u("F output callbacks: ", cbp_get(p + 8));
+    say_u("F max interval between input callbacks us: ", cbp_get(p + 464));
+    say_u("F max interval between output callbacks us: ", cbp_get(p + 456));
+    say_u("F frames captured: ", cap);
+    say_u("F tx ring overruns (frame lost before the network): ", cbp_get(p + 56));
+    say_u("F packets sent: ", sent);
+    say_u("F packets dropped by the storm (every 20th): ", dropped);
+    say_u("F swaps by the storm (51 before 50): ", cbp_get(p + 144));
+    say_u("F frames waiting in the tx ring at stop: ", cap - handled);
+    say_u("F sendto errors: ", cbp_get(p + 152));
+    if (cbp_get(p + 152) > 0) { say_u("F last sendto errno: ", cbp_get(p + 160)); }
+    say_u("F bytes sent: ", cbp_get(p + 472));
+    say_u("F packets received: ", recv);
+    say_u("F bytes received: ", cbp_get(p + 480));
+    if (two) { return cbp_part_g_report(p, net_ok and d_out == 0 and d_in == 0, t_end); }
+    say_u("F lost on the wire (sent - received): ", sent - recv);
+    say_u("F unique frames received in time: ", cbp_get(p + 176));
+    say_u("F reordered (arrived after a higher seq): ", cbp_get(p + 200));
+    say_u("F late (arrived after its playout): ", cbp_get(p + 192));
+    say_u("F duplicates: ", cbp_get(p + 184));
+    say_u("F bad packets: ", cbp_get(p + 240));
+    say_u("F recvfrom errors other than EAGAIN: ", cbp_get(p + 248));
+    if (cbp_get(p + 248) > 0) { say_u("F last recvfrom errno: ", cbp_get(p + 256)); }
+    say_u("F reads ended by EAGAIN: ", cbp_get(p + 264));
+    say_u("F read stalls of 40 ms: ", cbp_get(p + 272));
+    say_u("F max packets in one read: ", cbp_get(p + 296));
+    say_u("F missing frames filled from the redundant copy: ", cbp_get(p + 208));
+    say_u("F played: primary frames: ", cbp_get(p + 216));
+    say_u("F played: recovered from the redundant copy: ", cbp_get(p + 224));
+    say_u("F played: concealed (last frame at half amplitude): ", cbp_get(p + 232));
+    say_u("F underruns (silence, jitter buffer empty): ", cbp_get(p + 32));
+    say_u("F overruns (more than 12 frames ahead): ", cbp_get(p + 40));
+    say_u("F frames skipped by overruns: ", cbp_get(p + 48));
+    say_u("F failed input re-enqueues: ", cbp_get(p + 416));
+    say_u("F failed output enqueues: ", cbp_get(p + 424));
+    say_u("F nonzero samples played: ", cbp_get(p + 408));
+    const n_out : u64 = cbp_get(p + 8) - cbp_get(p + 120);
+    var dmean : u64 = 0;
+    if (n_out > 0) { dmean = cbp_get(p + 384) * 100 / n_out; }
+    say_u("F jitter depth frames: mean x100 ", dmean);
+    say_u("F jitter depth frames: min ", cbp_get(p + 400));
+    say_u("F jitter depth frames: max ", cbp_get(p + 392));
+    var left : u64 = 0;
+    var j : u64 = 0;
+    while (j < CBP_F_JB) {
+        const sq : u64 = cbp_get(p + CBP_F_RXS + j * 8);
+        if (sq > play_end) { left = left + 1; }
+        j = j + 1;
+    }
+    say_u("F frames left in the jitter buffer at stop: ", left);
+    say_u("F next seq to play at stop: ", play_end);
+    say_u("F highest seq received + 1: ", cbp_get(p + 104));
+    var a_all : u64 = 0;
+    var a_1 : u64 = 0;
+    var a_2 : u64 = 0;
+    if (cbp_get(p + 344) > 0) { a_all = cbp_get(p + 320) / cbp_get(p + 344); }
+    if (cbp_get(p + 360) > 0) { a_1 = cbp_get(p + 352) / cbp_get(p + 360); }
+    if (cbp_get(p + 376) > 0) { a_2 = cbp_get(p + 368) / cbp_get(p + 376); }
+    say_u("F capture-to-playout us: mean ", a_all);
+    say_u("F capture-to-playout us: min ", cbp_get(p + 336));
+    say_u("F capture-to-playout us: max ", cbp_get(p + 328));
+    say_u("F capture-to-playout us: mean, first 10 s ", a_1);
+    say_u("F capture-to-playout us: mean, last 10 s ", a_2);
+    const lat : u64 = 10000 + a_all + @as(u64, @intCast(CBP_E_OUTBUFS - 1)) * 10000;
+    say_u("F estimated software latency us (10 ms in + capture-to-playout + 20 ms out queue, no device latency): ", lat);
+    const acct : bool = sent + dropped + cbp_get(p + 152) == handled and recv == sent and cbp_get(p + 176) + cbp_get(p + 192) + cbp_get(p + 184) + cbp_get(p + 240) == recv;
+    say("F counters: sent + dropped = handled, received = sent, received = unique + late + dup + bad", acct);
+    const cs_ok : bool = cbp_get(p + 184) == 0 and cbp_get(p + 240) == 0 and cbp_get(p + 304) == cbp_get(p + 312);
+    say("F checksums: sum over sent frames = sum over received frames", cs_ok);
+    const no_growth : bool = a_1 > 0 and a_2 > 0 and a_2 < a_1 + 10000 and cbp_get(p + 392) <= CBP_F_MAX;
+    say("F latency does not grow: last 10 s mean < first 10 s mean + 10 ms, depth <= 12", no_growth);
+    const clean : bool = net_ok and acct and cs_ok and no_growth and cbp_get(p + 32) == 0 and cbp_get(p + 232) == 0 and cbp_get(p + 192) == 0 and cbp_get(p + 56) == 0 and cbp_get(p + 152) == 0 and cbp_get(p + 248) == 0 and cbp_get(p + 416) == 0 and cbp_get(p + 424) == 0 and d_out == 0 and d_in == 0 and cbp_get(p + 216) + cbp_get(p + 224) >= 1900;
+    if (clean and cbp_get(p + 408) > 0) {
+        say_line("NET CLEAN: 20 s over UDP under the storm, every lost frame recovered, no underrun, latency flat\n");
+    } else if (clean) {
+        say_line("NET CLEAN BUT SILENT: counters balance, every played sample is zero (TCC or muted input)\n");
+    } else {
+        say_line("NET NOT CLEAN: see the counters above\n");
+    }
+    return clean;
+}
+
+/// Part G report: what this host received from the peer. Lost = frames the peer numbered from its first packet
+/// seen here to its highest, minus the distinct primaries that arrived (in time or late).
+fn cbp_part_g_report(p: u64, sys_ok: bool, t_end: u64) -> bool {
+    const ext : u64 = p + CBP_F_EXT;
+    const recv : u64 = cbp_get(p + 168);
+    const hi : u64 = cbp_get(p + 104);
+    var first : u64 = 0;
+    if (cbp_get(ext + 48) > 0) { first = cbp_get(ext + 48) - 1; }
+    var expected : u64 = 0;
+    if (hi > first) { expected = hi - first; }
+    const got : u64 = cbp_get(p + 176) + cbp_get(p + 192);
+    var lost : u64 = 0;
+    if (expected > got) { lost = expected - got; }
+    const under_live : u64 = cbp_get(ext + 56);
+    say_u("G ended because the peer went silent for 300 ms (1 yes): ", cbp_get(ext + 72));
+    if (cbp_get(ext + 64) > 0) { say_u("G last packet received +us (from output start): ", cbp_get(ext + 64) - cbp_get(p + 432)); }
+    say_u("G peer first seq seen: ", first);
+    say_u("G peer highest seq + 1: ", hi);
+    say_u("G peer frames expected (highest + 1 - first): ", expected);
+    say_u("G distinct primaries received (in time + late): ", got);
+    say_u("G in time: ", cbp_get(p + 176));
+    say_u("G late or too far ahead: ", cbp_get(p + 192));
+    say_u("G duplicates: ", cbp_get(p + 184));
+    say_u("G reordered: ", cbp_get(p + 200));
+    say_u("G bad packets: ", cbp_get(p + 240));
+    say_u("G lost frames (expected - received): ", lost);
+    var lost_pm : u64 = 0;
+    if (expected > 0) { lost_pm = lost * 1000 / expected; }
+    say_u("G lost per mille: ", lost_pm);
+    say_u("G missing frames filled from the redundant copy: ", cbp_get(p + 208));
+    say_u("G played: primary frames: ", cbp_get(p + 216));
+    say_u("G played: recovered from the redundant copy: ", cbp_get(p + 224));
+    say_u("G played: concealed: ", cbp_get(p + 232));
+    say_u("G underruns while the peer was sending: ", under_live);
+    say_u("G underruns in total (incl. after the peer stopped): ", cbp_get(p + 32));
+    say_u("G overruns (more than 12 frames ahead): ", cbp_get(p + 40));
+    say_u("G frames skipped by overruns: ", cbp_get(p + 48));
+    say_u("G tx ring overruns: ", cbp_get(p + 56));
+    say_u("G sendto EAGAIN retries (frame kept, sent later): ", cbp_get(ext + 112));
+    say_u("G sendto errors: ", cbp_get(p + 152));
+    if (cbp_get(p + 152) > 0) { say_u("G last sendto errno: ", cbp_get(p + 160)); }
+    say_u("G recvfrom errors other than EAGAIN: ", cbp_get(p + 248));
+    if (cbp_get(p + 248) > 0) { say_u("G last recvfrom errno: ", cbp_get(p + 256)); }
+    say_u("G max gap between received packets us: ", cbp_get(ext + 80));
+    say_u("G max packets in one read: ", cbp_get(p + 296));
+    say_u("G nonzero samples in received frames (peer microphone): ", cbp_get(ext + 24));
+    say_u("G received frames with a nonzero sample: ", cbp_get(ext + 32));
+    say_u("G nonzero samples played: ", cbp_get(p + 408));
+    const n_out : u64 = cbp_get(p + 8) - cbp_get(p + 120);
+    var dmean : u64 = 0;
+    if (n_out > 0) { dmean = cbp_get(p + 384) * 100 / n_out; }
+    say_u("G jitter depth frames: mean x100 ", dmean);
+    say_u("G jitter depth frames: min ", cbp_get(p + 400));
+    say_u("G jitter depth frames: max ", cbp_get(p + 392));
+    say_u("G jitter target / max frames: ", cbp_get(ext + 96));
+    say_u("                              ", cbp_get(ext + 104));
+    const lat : u64 = 10000 + dmean * 100 + @as(u64, @intCast(CBP_E_OUTBUFS - 1)) * 10000;
+    say_u("G estimated software latency us (10 ms in + mean depth x 10 ms + 20 ms out, no network or device): ", lat);
+    say_u("G run us: ", t_end - cbp_get(p + 432));
+    const ok : bool = sys_ok and recv >= 2000 and lost * 10 <= expected and under_live <= 5 and cbp_get(ext + 24) > 0 and cbp_get(p + 152) == 0;
+    say("G received >= 2000, lost <= 10 %, underruns <= 5, sendto clean", sys_ok and recv >= 2000 and lost * 10 <= expected and under_live <= 5 and cbp_get(p + 152) == 0);
+    say("G received frames carry nonzero samples (the peer microphone)", cbp_get(ext + 24) > 0);
+    if (ok) {
+        say_line("CALL OK: this side hears the peer\n");
+    } else {
+        say_line("CALL NOT OK: see the counters above\n");
+    }
+    return ok;
+}
+
+fn say_line(s: []const u8) -> void { sys_write(1, s, @as(u64, s.len)); }
+
+fn say_u(label: []const u8, v: u64) -> void { say_num(label, @as(i64, @intCast(v))); }
+
+/// Part E: microphone -> ring -> speakers, both queues on this run loop, output volume 0.05, 20 s.
+fn cbp_part_e(mode: u64, fmt: []const u8) -> bool {
+    var blk : [8152]u8 = undefined;
+    var z : usize = 0;
+    while (z < CBP_E_BYTES) { blk[z] = 0; z = z + 1; }
+    const pe : u64 = sys_addr(blk[0..8152], blk[0..8152], 0);
+    cbp_put(pe + 96, pe + CBP_E_HDR);
+    cbp_put(pe + 168, 18446744073709551615);
+    cbp_put(pe + 232, 18446744073709551615);
+    cbp_put(pe + 208, CBP_D_MAGIC);
+    cbp_put(pe + 448, 1);
+    const fin : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_ein");
+    const fout : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_eout");
+    say("dlsym finds cbp_ein and cbp_eout", fin != 0 and fout != 0);
+    if (fin == 0 or fout == 0 or mode == 0) { return false; }
+    var aqi : [8]u8 = undefined;
+    var aqo : [8]u8 = undefined;
+    put_u64(aqi[0..8], 0, 0);
+    put_u64(aqo[0..8], 0, 0);
+    const s_in : i32 = cbp_aq_new_input(fmt, fin, pe, cbp_rl_current(), mode, 0, aqi[0..8]);
+    say_num("E AudioQueueNewInput status: ", @as(i64, s_in));
+    const s_out : i32 = cbp_aq_new_output(fmt, fout, pe, cbp_rl_current(), mode, 0, aqo[0..8]);
+    say_num("E AudioQueueNewOutput status: ", @as(i64, s_out));
+    const qi : u64 = get_u64(aqi[0..8], 0);
+    const qo : u64 = get_u64(aqo[0..8], 0);
+    var vol_ok : bool = false;
+    if (s_out == 0 and qo != 0) {
+        const s_vol : i32 = cbp_aq_set_param(qo, CBP_VOLUME, 0.05);
+        say_num("E AudioQueueSetParameter(Volume, 0.05) status: ", @as(i64, s_vol));
+        var vb : [4]u8 = undefined;
+        vb[0] = 0; vb[1] = 0; vb[2] = 0; vb[3] = 0;
+        const s_get : i32 = cbp_aq_get_param(qo, CBP_VOLUME, vb[0..4]);
+        const bits : u64 = @as(u64, @intCast(vb[0])) | (@as(u64, @intCast(vb[1])) << 8) | (@as(u64, @intCast(vb[2])) << 16) | (@as(u64, @intCast(vb[3])) << 24);
+        say_num("E AudioQueueGetParameter(Volume) status: ", @as(i64, s_get));
+        say_u("E volume read back, f32 bits (0.05f = 1028443341): ", bits);
+        vol_ok = s_vol == 0 and s_get == 0 and bits >= CBP_VOL_LO and bits <= CBP_VOL_HI;
+    }
+    say("E output volume reads back within 0.04..0.06", vol_ok);
+    var started_in : bool = false;
+    var started_out : bool = false;
+    var in_q : u32 = 0;
+    var out_q : u32 = 0;
+    var t0 : u64 = 0;
+    var t_out : u64 = 0;
+    if (s_in == 0 and qi != 0 and vol_ok) {
+        var m : u32 = 0;
+        while (m < 4) {
+            var b : [8]u8 = undefined;
+            put_u64(b[0..8], 0, 0);
+            if (cbp_aq_alloc(qi, 960, b[0..8]) == 0) {
+                if (cbp_aq_enqueue(qi, get_u64(b[0..8], 0), 0, 0) == 0) { in_q = in_q + 1; }
+            }
+            m = m + 1;
+        }
+        say_num("E input buffers enqueued: ", @as(i64, @intCast(in_q)));
+        t0 = cbp_us();
+        const s_si : i32 = cbp_aq_start(qi, 0);
+        say_num("E input AudioQueueStart status: ", @as(i64, s_si));
+        started_in = s_si == 0;
+    }
+    if (started_in) {
+        var k : u32 = 0;
+        while (k < CBP_E_OUTBUFS) {
+            var b : [8]u8 = undefined;
+            put_u64(b[0..8], 0, 0);
+            if (cbp_aq_alloc(qo, 960, b[0..8]) == 0) {
+                if (cbp_epull(pe, qo, get_u64(b[0..8], 0)) == 0) { out_q = out_q + 1; }
+            }
+            k = k + 1;
+        }
+        say_num("E output buffers primed (warm-up silence): ", @as(i64, @intCast(out_q)));
+        t_out = cbp_us();
+        const s_so : i32 = cbp_aq_start(qo, 0);
+        say_num("E output AudioQueueStart status: ", @as(i64, s_so));
+        started_out = s_so == 0;
+    }
+    if (started_out) {
+        var sec : u32 = 0;
+        while (sec < 20) {
+            cbp_run(mode, 1.0, false);
+            sys_write(1, "E t+", 4);
+            say_num("s ", @as(i64, @intCast(sec + 1)));
+            say_u("  in/out/under/over/fill: ", cbp_get(pe));
+            say_u("                          ", cbp_get(pe + 8));
+            say_u("                          ", cbp_get(pe + 32));
+            say_u("                          ", cbp_get(pe + 40));
+            say_u("                          ", cbp_get(pe + 16) - cbp_get(pe + 24));
+            sec = sec + 1;
+        }
+    }
+    const t_end : u64 = cbp_us();
+    // Snapshot first, then stop: Dispose hands buffers back through the callbacks, which now return at once.
+    cbp_put(pe + 216, 1);
+    const n_in : u64 = cbp_get(pe);
+    const n_out : u64 = cbp_get(pe + 8);
+    const w : u64 = cbp_get(pe + 16);
+    const r : u64 = cbp_get(pe + 24);
+    const under : u64 = cbp_get(pe + 32);
+    const over : u64 = cbp_get(pe + 40);
+    var d_out : i32 = -1;
+    var d_in : i32 = -1;
+    if (s_out == 0 and qo != 0) { d_out = cbp_aq_dispose(qo, true); }
+    if (s_in == 0 and qi != 0) { d_in = cbp_aq_dispose(qi, true); }
+    say_num("E output AudioQueueDispose status: ", @as(i64, d_out));
+    say_num("E input AudioQueueDispose status: ", @as(i64, d_in));
+    if (!started_out) { say_line("E LOOP NOT RUN: a status above is nonzero or the volume did not read back\n"); return false; }
+    say_u("E output run us (start to stop): ", t_end - t_out);
+    say_u("E warm-up silent output buffers (not underruns): ", cbp_get(pe + 456));
+    if (cbp_get(pe + 448) == 0) { say_num("E warm-up ended +us (from input start): ", @as(i64, @intCast(cbp_get(pe + 464) - t0))); }
+    say_u("E input callbacks: ", n_in);
+    say_u("E output callbacks: ", n_out);
+    say_u("E underruns: ", under);
+    say_u("E overruns: ", over);
+    say_u("E failed input re-enqueues: ", cbp_get(pe + 120));
+    say_u("E failed output enqueues: ", cbp_get(pe + 128));
+    say_u("E bytes received by input: ", cbp_get(pe + 144));
+    say_u("E bytes dropped on overrun: ", cbp_get(pe + 136));
+    say_u("E bytes written into the ring: ", cbp_get(pe + 48));
+    say_u("E bytes read out of the ring: ", cbp_get(pe + 56));
+    say_u("E zero bytes played on underrun: ", cbp_get(pe + 224));
+    var resid_b : u64 = 0;
+    var resid_c : u64 = 0;
+    var j : u64 = r;
+    while (j < w) {
+        resid_b = resid_b + cbp_get(pe + 256 + (j % CBP_E_SLOTS) * 8);
+        resid_c = resid_c + cbp_get(pe + 384 + (j % CBP_E_SLOTS) * 8);
+        j = j + 1;
+    }
+    say_u("E slots left in the ring at stop: ", w - r);
+    say_u("E bytes left in the ring at stop: ", resid_b);
+    const bytes_ok : bool = cbp_get(pe + 48) == cbp_get(pe + 56) + resid_b and cbp_get(pe + 144) == cbp_get(pe + 48) + cbp_get(pe + 136) and resid_b <= CBP_E_SLOTS * 960;
+    say("E bytes: written = read + left in ring, received = written + dropped, left <= 7680", bytes_ok);
+    say_u("E checksum mismatches (ring slot vs played buffer): ", cbp_get(pe + 176));
+    const sum_ok : bool = cbp_get(pe + 176) == 0 and cbp_get(pe + 184) == cbp_get(pe + 192) + resid_c;
+    say("E checksums: sum in = sum out + sum left in ring, no mismatch", sum_ok);
+    say_u("E nonzero samples played from the ring: ", cbp_get(pe + 200));
+    say_num("E first input callback +us (from input start): ", @as(i64, @intCast(cbp_get(pe + 64) - t0)));
+    say_num("E last input callback +us: ", @as(i64, @intCast(cbp_get(pe + 72) - t0)));
+    say_num("E first output callback +us (from input start): ", @as(i64, @intCast(cbp_get(pe + 80) - t0)));
+    say_num("E last output callback +us: ", @as(i64, @intCast(cbp_get(pe + 88) - t0)));
+    say_u("E max interval between input callbacks us: ", cbp_get(pe + 248));
+    say_u("E max interval between output callbacks us: ", cbp_get(pe + 240));
+    say_u("E ring fill: max slots: ", cbp_get(pe + 112));
+    say_u("E ring fill: min slots at output callbacks: ", cbp_get(pe + 232));
+    var fill100 : u64 = 0;
+    if (n_out > 0) { fill100 = cbp_get(pe + 104) * 100 / n_out; }
+    say_u("E ring fill: mean slots at output callbacks x100: ", fill100);
+    var age_avg : u64 = 0;
+    if (r > 0) { age_avg = cbp_get(pe + 152) / r; }
+    say_u("E ring residence us: mean ", age_avg);
+    say_u("E ring residence us: min ", cbp_get(pe + 168));
+    say_u("E ring residence us: max ", cbp_get(pe + 160));
+    // First sample: captured one buffer (10 ms) before the input callback, sits in the ring, then waits behind
+    // the other output buffers in flight. Device input/output latency is not included.
+    const lat : u64 = 10000 + age_avg + @as(u64, @intCast(CBP_E_OUTBUFS - 1)) * 10000;
+    say_u("E estimated software latency us (10 ms in + ring mean + 20 ms out queue, no device latency): ", lat);
+    const clean : bool = n_in >= 1900 and n_out >= 1900 and under == 0 and over == 0 and bytes_ok and sum_ok and cbp_get(pe + 120) == 0 and cbp_get(pe + 128) == 0 and d_out == 0 and d_in == 0;
+    if (clean and cbp_get(pe + 200) > 0) {
+        say_line("LOOP CLEAN: 20 s, no underrun, no overrun, bytes and checksums balance, microphone data played\n");
+    } else if (clean) {
+        say_line("LOOP CLEAN BUT SILENT: the ring balanced, every played sample is zero (TCC or muted input)\n");
+    } else {
+        say_line("LOOP NOT CLEAN: see the counters above\n");
+    }
+    return clean;
+}
+
+fn say(s: []const u8, ok: bool) -> bool {
+    if (ok) { sys_write(1, "ok   ", 5); } else { sys_write(1, "FAIL ", 5); }
+    sys_write(1, s, @as(u64, s.len));
+    sys_write(1, "\n", 1);
+    return ok;
+}
+
+/// One decimal line, "<label><n>".
+fn say_num(label: []const u8, n: i64) -> void {
+    var b : [24]u8 = undefined;
+    var v : u64 = 0;
+    var neg : bool = false;
+    if (n < 0) { neg = true; v = @as(u64, @intCast(0 - n)); } else { v = @as(u64, @intCast(n)); }
+    var i : usize = 24;
+    if (v == 0) { i = i - 1; b[i] = 48; }
+    while (v > 0) {
+        i = i - 1;
+        b[i] = @as(u8, @intCast(48 + v % 10));
+        v = v / 10;
+    }
+    if (neg) { i = i - 1; b[i] = 45; }
+    sys_write(1, label, @as(u64, label.len));
+    sys_write(1, b[i..24], @as(u64, 24 - i));
+    sys_write(1, "\n", 1);
+}
+
+/// The CFStringRef a CF constant holds, read through its dlsym address; 0 when the symbol is absent.
+fn cbp_konst(name: []const u8) -> u64 {
+    const a : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, name);
+    if (a == 0) { return 0; }
+    var c : [8]u8 = undefined;
+    sys_peek(c[0..8], a, 8);
+    return get_u64(c[0..8], 0);
+}
+
+/// The 40-byte AudioStreamBasicDescription of 16-bit mono PCM at 48 kHz.
+fn cbp_pcm48k(out: []u8) -> void {
+    var i : usize = 0;
+    while (i < 40) { out[i] = 0; i = i + 1; }
+    // mSampleRate 48000.0 as IEEE-754 binary64 = 0x40E7700000000000.
+    put_u64(out, 0, 4676829883349860352);
+    out[8] = @as(u8, @intCast(CBP_LPCM & 255));
+    out[9] = @as(u8, @intCast((CBP_LPCM >> 8) & 255));
+    out[10] = @as(u8, @intCast((CBP_LPCM >> 16) & 255));
+    out[11] = @as(u8, @intCast((CBP_LPCM >> 24) & 255));
+    out[12] = @as(u8, @intCast(CBP_PCM_FLAGS));
+    out[16] = 2;
+    out[20] = 1;
+    out[24] = 2;
+    out[28] = 1;
+    out[32] = 16;
+}
+
+pub fn main() -> void {
+    var st : [64]u8 = undefined;
+    var z : usize = 0;
+    while (z < 64) { st[z] = 0; z = z + 1; }
+    const ps : u64 = sys_addr(st[0..64], st[0..64], 0);
+    cbp_put(ps + 16, 1511506142);
+    cbp_tick(0, ps);
+    // Never true (count is 1): only makes sure cbp_out is emitted and so exported.
+    if (cbp_get(ps) == 99) { cbp_out(ps, 0, 0); cbp_in(ps, 0, 0, 0, 0, 0); cbp_outd(ps, 0, 0); cbp_ein(ps, 0, 0, 0, 0, 0); cbp_eout(ps, 0, 0); cbp_fin(ps, 0, 0, 0, 0, 0); cbp_fout(ps, 0, 0); }
+    const only_d : bool = sys_getenv("CBP_ONLY_D") != 0;
+    const only_c : bool = sys_getenv("CBP_ONLY_C") != 0 or only_d;
+    const direct : bool = say("direct call: tick counts 1", cbp_get(ps) == 1);
+    cbp_put(ps, 0);
+    cbp_put(ps + 24, 0);
+
+    // A. 10 ms timer for 10 s through the dlsym address.
+    const ftick : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_tick");
+    const fout : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_out");
+    const mode : u64 = cbp_konst("kCFRunLoopDefaultMode");
+    say("dlsym finds cbp_tick and cbp_out", ftick != 0 and fout != 0);
+    // E. Duplex loop only: CBP_ONLY_E=1 skips A, B, C and D; the exit code is 0 only for a clean loop.
+    if (sys_getenv("CBP_ONLY_E") != 0) {
+        var efmt : [40]u8 = undefined;
+        cbp_pcm48k(efmt[0..40]);
+        if (direct and cbp_part_e(mode, efmt[0..40])) { say_line("abi-probe: E duplex loop clean\n"); sys_exit(0); }
+        say_line("abi-probe: FAILED\n");
+        sys_exit(1);
+    }
+    // F. Network loop only: CBP_ONLY_F=1; the exit code is 0 only for a clean run.
+    if (sys_getenv("CBP_ONLY_F") != 0) {
+        var ffmt : [40]u8 = undefined;
+        cbp_pcm48k(ffmt[0..40]);
+        if (direct and cbp_part_f(mode, ffmt[0..40])) { say_line("abi-probe: F network loop clean\n"); sys_exit(0); }
+        say_line("abi-probe: FAILED\n");
+        sys_exit(1);
+    }
+    var ctx : [40]u8 = undefined;
+    var k : usize = 0;
+    while (k < 40) { ctx[k] = 0; k = k + 1; }
+    put_u64(ctx[0..40], 8, ps);
+    var by_timer : bool = false;
+    if (!only_c and ftick != 0 and mode != 0) {
+        const t0 : u64 = cbp_us();
+        const t : u64 = cbp_timer_create(0, cbp_now() + 0.01, 0.01, 0, 0, ftick, ctx[0..40]);
+        if (t != 0) {
+            cbp_add_timer(cbp_rl_current(), t, mode);
+            const r : i32 = cbp_run(mode, 10.0, false);
+            say_num("run loop result: ", @as(i64, r));
+            cbp_timer_invalidate(t);
+            cbp_release(t);
+        }
+        const n : u64 = cbp_get(ps);
+        say_num("A ticks in 10 s: ", @as(i64, @intCast(n)));
+        say_num("A info sent (address of state): ", @as(i64, @intCast(ps)));
+        say_num("A info received:                ", @as(i64, @intCast(cbp_get(ps + 8))));
+        say_num("A magic in state block:         ", @as(i64, @intCast(cbp_get(ps + 16))));
+        say_num("A start us:       ", @as(i64, @intCast(t0)));
+        say_num("A first tick +us: ", @as(i64, @intCast(cbp_get(ps + 24) - t0)));
+        say_num("A last tick  +us: ", @as(i64, @intCast(cbp_get(ps + 32) - t0)));
+        by_timer = n >= 900 and n <= 1100 and cbp_get(ps + 8) == ps;
+    }
+    const a_ok : bool = say("A: about 1000 ticks, info matches", by_timer);
+
+    // B. 440 Hz tone, 4 buffers of 960 bytes, 60 s on this run loop.
+    var fmt : [40]u8 = undefined;
+    cbp_pcm48k(fmt[0..40]);
+    var aqb : [8]u8 = undefined;
+    put_u64(aqb[0..8], 0, 0);
+    cbp_put(ps, 0);
+    cbp_put(ps + 24, 0);
+    cbp_put(ps + 40, 0);
+    var s1 : i32 = -1;
+    if (!only_c and a_ok and fout != 0) { s1 = cbp_aq_new_output(fmt[0..40], fout, ps, cbp_rl_current(), mode, 0, aqb[0..8]); }
+    say_num("AudioQueueNewOutput status: ", @as(i64, s1));
+    const aq : u64 = get_u64(aqb[0..8], 0);
+    var queued : u32 = 0;
+    var s2 : i32 = -1;
+    var b_calls : u64 = 0;
+    var disposed : bool = false;
+    if (s1 == 0 and aq != 0) {
+        var n : u32 = 0;
+        while (n < 4) {
+            var bb : [8]u8 = undefined;
+            put_u64(bb[0..8], 0, 0);
+            if (cbp_aq_alloc(aq, 960, bb[0..8]) == 0) {
+                if (cbp_fill(ps, aq, get_u64(bb[0..8], 0)) == 0) { queued = queued + 1; }
+            }
+            n = n + 1;
+        }
+        say_num("buffers enqueued: ", @as(i64, @intCast(queued)));
+        s2 = cbp_aq_start(aq, 0);
+        say_num("AudioQueueStart status: ", @as(i64, s2));
+        if (s2 == 0) {
+            var sec : u32 = 0;
+            while (sec < 6) {
+                cbp_run(mode, 10.0, false);
+                say_num("B callbacks so far: ", @as(i64, @intCast(cbp_get(ps))));
+                sec = sec + 1;
+            }
+        }
+        b_calls = cbp_get(ps);
+        say_num("B callbacks in 60 s: ", @as(i64, @intCast(b_calls)));
+        say_num("B first +us (from queue start): ", @as(i64, @intCast(cbp_get(ps + 24))));
+        say_num("B last us - first us: ", @as(i64, @intCast(cbp_get(ps + 32) - cbp_get(ps + 24))));
+        disposed = cbp_aq_dispose(aq, true) == 0;
+    }
+    const b_ok : bool = say("B: Start=0, 4 buffers, callbacks >= 5900, disposed", s2 == 0 and queued == 4 and b_calls >= 5900 and disposed);
+
+    // C. Capture: input queue, 4 buffers of 960 bytes, 10 s on this run loop.
+    var cst : [96]u8 = undefined;
+    var q : usize = 0;
+    while (q < 96) { cst[q] = 0; q = q + 1; }
+    const pc : u64 = sys_addr(cst[0..96], cst[0..96], 0);
+    const fin : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_in");
+    say("dlsym finds cbp_in", fin != 0);
+    var aqi : [8]u8 = undefined;
+    put_u64(aqi[0..8], 0, 0);
+    var s3 : i32 = -1;
+    if (!only_d and fin != 0 and mode != 0) { s3 =cbp_aq_new_input(fmt[0..40], fin, pc, cbp_rl_current(), mode, 0, aqi[0..8]); }
+    say_num("AudioQueueNewInput status: ", @as(i64, s3));
+    const qi : u64 = get_u64(aqi[0..8], 0);
+    var c_queued : u32 = 0;
+    var s4 : i32 = -1;
+    var c_calls : u64 = 0;
+    var c_disposed : bool = false;
+    if (s3 == 0 and qi != 0) {
+        var m : u32 = 0;
+        while (m < 4) {
+            var cb : [8]u8 = undefined;
+            put_u64(cb[0..8], 0, 0);
+            if (cbp_aq_alloc(qi, 960, cb[0..8]) == 0) {
+                if (cbp_aq_enqueue(qi, get_u64(cb[0..8], 0), 0, 0) == 0) { c_queued = c_queued + 1; }
+            }
+            m = m + 1;
+        }
+        say_num("C buffers enqueued: ", @as(i64, @intCast(c_queued)));
+        const tc : u64 = cbp_us();
+        s4 = cbp_aq_start(qi, 0);
+        say_num("C AudioQueueStart status: ", @as(i64, s4));
+        if (s4 == 0) {
+            var sec : u32 = 0;
+            while (sec < 10) {
+                cbp_run(mode, 1.0, false);
+                say_num("C callbacks so far: ", @as(i64, @intCast(cbp_get(pc))));
+                sec = sec + 1;
+            }
+        }
+        c_disposed = cbp_aq_dispose(qi, true) == 0;
+        c_calls = cbp_get(pc);
+        say_num("C input callbacks in 10 s: ", @as(i64, @intCast(c_calls)));
+        if (c_calls > 0) {
+            say_num("C first callback +us (from start): ", @as(i64, @intCast(cbp_get(pc + 24) - tc)));
+            say_num("C last us - first us: ", @as(i64, @intCast(cbp_get(pc + 32) - cbp_get(pc + 24))));
+        }
+        say_num("C bytes captured: ", @as(i64, @intCast(cbp_get(pc + 64))));
+        say_num("C samples: ", @as(i64, @intCast(cbp_get(pc + 40))));
+        say_num("C nonzero samples: ", @as(i64, @intCast(cbp_get(pc + 48))));
+        var mean : u64 = 0;
+        if (cbp_get(pc + 40) > 0) { mean = cbp_get(pc + 56) / cbp_get(pc + 40); }
+        say_num("C mean |sample| (sum/samples): ", @as(i64, @intCast(mean)));
+        say_num("C max |sample|: ", @as(i64, @intCast(cbp_get(pc + 80))));
+        say_num("C failed re-enqueues: ", @as(i64, @intCast(cbp_get(pc + 72))));
+        if (cbp_get(pc + 16) == 1) {
+            const w : u64 = cbp_get(pc + 8);
+            say_num("C first buffer byte 0: ", @as(i64, @intCast(w & 255)));
+            say_num("C first buffer byte 1: ", @as(i64, @intCast((w >> 8) & 255)));
+            say_num("C first buffer byte 2: ", @as(i64, @intCast((w >> 16) & 255)));
+            say_num("C first buffer byte 3: ", @as(i64, @intCast((w >> 24) & 255)));
+        }
+        say("C disposed", c_disposed);
+    }
+    const c_ran : bool = s3 == 0 and s4 == 0 and c_queued == 4 and c_calls > 0 and c_disposed;
+    if (only_d) {
+        sys_write(1, "C skipped (CBP_ONLY_D)\n", 23);
+    } else if (s3 != 0 or s4 != 0) {
+        sys_write(1, "CAPTURE REFUSED: a status above is nonzero\n", 43);
+    } else if (c_calls == 0) {
+        sys_write(1, "CAPTURE UNVERIFIED: queue started, no input callback\n", 53);
+    } else if (cbp_get(pc + 48) == 0) {
+        sys_write(1, "CAPTURE SILENT: callbacks arrive, every sample is zero (TCC denial or muted input)\n", 83);
+    } else {
+        sys_write(1, "CAPTURE LIVE: callbacks arrive with nonzero samples\n", 52);
+    }
+
+    // D. Output queue with no run loop: the system calls cbp_outd on its own thread while main sleeps 10 s.
+    var dst : [96]u8 = undefined;
+    var dz : usize = 0;
+    while (dz < 96) { dst[dz] = 0; dz = dz + 1; }
+    const pd : u64 = sys_addr(dst[0..96], dst[0..96], 0);
+    cbp_put(pd + 8, pd);
+    cbp_put(pd + 16, CBP_D_MAGIC);
+    const main_th : u64 = cbp_thread();
+    cbp_put(pd + 56, main_th);
+    const fd : u64 = cbp_dlsym(CBP_RTLD_DEFAULT, "cbp_outd");
+    say("dlsym finds cbp_outd", fd != 0);
+    say("D main thread: pthread_main_np != 0", cbp_is_main() != 0);
+    var aqd : [8]u8 = undefined;
+    put_u64(aqd[0..8], 0, 0);
+    var s5 : i32 = -1;
+    if (fd != 0) { s5 = cbp_aq_new_output(fmt[0..40], fd, pd, 0, 0, 0, aqd[0..8]); }
+    say_num("D AudioQueueNewOutput status (run loop NULL): ", @as(i64, s5));
+    const qd : u64 = get_u64(aqd[0..8], 0);
+    var d_queued : u32 = 0;
+    var s6 : i32 = -1;
+    var d_calls : u64 = 0;
+    var d_disposed : bool = false;
+    var d_live_fail : u64 = 1;
+    if (s5 == 0 and qd != 0) {
+        var j : u32 = 0;
+        while (j < 4) {
+            var db : [8]u8 = undefined;
+            put_u64(db[0..8], 0, 0);
+            if (cbp_aq_alloc(qd, 960, db[0..8]) == 0) {
+                if (cbp_fill(pd, qd, get_u64(db[0..8], 0)) == 0) { d_queued = d_queued + 1; }
+            }
+            j = j + 1;
+        }
+        say_num("D buffers enqueued: ", @as(i64, @intCast(d_queued)));
+        const td : u64 = cbp_us();
+        s6 = cbp_aq_start(qd, 0);
+        say_num("D AudioQueueStart status: ", @as(i64, s6));
+        if (s6 == 0) {
+            var sec : u32 = 0;
+            while (sec < 10) {
+                cbp_usleep(1000000);
+                say_num("D callbacks so far: ", @as(i64, @intCast(cbp_get(pd))));
+                sec = sec + 1;
+            }
+        }
+        d_live_fail = cbp_get(pd + 88);
+        say_num("D failed enqueues before Dispose: ", @as(i64, @intCast(d_live_fail)));
+        d_disposed = cbp_aq_dispose(qd, true) == 0;
+        d_calls = cbp_get(pd);
+        say_num("D callbacks in 10 s: ", @as(i64, @intCast(d_calls)));
+        say_num("D integrity errors (magic or own address): ", @as(i64, @intCast(cbp_get(pd + 48))));
+        say("D magic and own address intact after run", cbp_get(pd + 16) == CBP_D_MAGIC and cbp_get(pd + 8) == pd);
+        say_num("D failed enqueues in total (buffers handed back by Dispose fail to re-enqueue): ",@as(i64, @intCast(cbp_get(pd + 88))));
+        say_num("D calls on the main pthread: ", @as(i64, @intCast(cbp_get(pd + 72))));
+        say_num("D calls with pthread_main_np != 0: ", @as(i64, @intCast(cbp_get(pd + 80))));
+        if (d_calls > 0) {
+            if (cbp_get(pd + 64) == main_th) {
+                sys_write(1, "D callback thread: SAME as main\n", 32);
+            } else {
+                sys_write(1, "D callback thread: OTHER than main\n", 35);
+            }
+            say_num("D first callback +us (from start): ", @as(i64, @intCast(cbp_get(pd + 24) - td)));
+            say_num("D last us - first us: ", @as(i64, @intCast(cbp_get(pd + 32) - cbp_get(pd + 24))));
+        }
+        say("D disposed", d_disposed);
+    }
+    const d_ok : bool = s5 == 0 and s6 == 0 and d_queued == 4 and d_calls >= 900 and d_disposed and cbp_get(pd + 48) == 0 and d_live_fail == 0 and cbp_get(pd + 72) == 0 and cbp_get(pd + 80) == 0;
+    say("D: foreign-thread callbacks >= 900, no integrity errors, never on main, disposed", d_ok);
+    if (only_d) {
+        if (direct and d_ok) {
+            sys_write(1, "abi-probe: D ran clean on a system thread\n", 42);
+            sys_exit(0);
+        }
+        sys_write(1, "abi-probe: FAILED\n", 18);
+        sys_exit(1);
+    }
+    if (only_c) {
+        if (direct and c_ran) {
+            sys_write(1, "abi-probe: C ran (see the CAPTURE line for the samples)\n", 56);
+            sys_exit(0);
+        }
+        sys_write(1, "abi-probe: FAILED\n", 18);
+        sys_exit(1);
+    }
+    if (a_ok and b_ok) {
+        sys_write(1, "abi-probe: A and B pass (audibility of the tone not checked)\n", 62);
+        sys_exit(0);
+    }
+    sys_write(1, "abi-probe: FAILED\n", 18);
+    sys_exit(1);
+}
+
+test the_pcm_format_is_48_khz_mono_16_bit {
+    var f : [40]u8 = undefined;
+    cbp_pcm48k(f[0..40]);
+    // 0x40E7700000000000: sign 0, exponent 0x40E (2^15), mantissa 0x77 << 44; 1.46484375 * 32768 = 48000.
+    assert get_u64(f[0..40], 0) == 4676829883349860352;
+    assert (get_u64(f[0..40], 0) >> 44) == 265847 and (get_u64(f[0..40], 0) & 17592186044415) == 0;
+    assert f[8] == 109 and f[9] == 99 and f[10] == 112 and f[11] == 108;
+    assert f[12] == 12 and f[16] == 2 and f[20] == 1 and f[24] == 2 and f[28] == 1 and f[32] == 16;
+}
+
+test the_duplex_ring_fits_its_block {
+    assert cbp_e_size() == 8152;
+    assert @as(u64, CBP_E_BYTES) == cbp_e_size();
+    // Header slots end at 59 * 8 = 472: tables 32..55, then warming, warm-up buffers, warm-up end.
+    assert 384 + CBP_E_SLOTS * 8 + 24 == CBP_E_HDR;
+    assert CBP_E_PRE >= 1 and CBP_E_PRE + @as(u64, CBP_E_OUTBUFS) < CBP_E_SLOTS;
+    assert CBP_VOL_LO < 1028443341 and 1028443341 < CBP_VOL_HI;
+}
+
+test the_network_block_and_packet_fit {
+    assert cbp_f_size() == 87680;
+    assert @as(u64, CBP_F_BYTES) == cbp_f_size();
+    assert CBP_F_EXT == CBP_F_LAST + 960;
+    assert CBP_F_TXD == 64 * 8 and CBP_F_RXS == CBP_F_TXD + CBP_F_TX * 960;
+    assert CBP_F_KIND == CBP_F_RXS + CBP_F_JB * 8 and CBP_F_CAPT == CBP_F_KIND + CBP_F_JB * 8;
+    assert CBP_F_RXD == CBP_F_CAPT + CBP_F_JB * 8 and CBP_F_LAST == CBP_F_RXD + CBP_F_JB * 960;
+    // Header 8 + frame 960 + redundant frame 960 fits one UDP datagram (net.inet.udp.maxdgram 9216).
+    assert 8 + 960 + 960 == 1928 and 1928 < 9216;
+    assert CBP_F_TARGET < CBP_F_MAX and CBP_F_MAX + CBP_F_TX < CBP_F_JB;
+    assert CBP_F_PRE >= 15 and CBP_F_PRE <= 20 and CBP_F_PRE < CBP_F_PREMAX and CBP_F_PREMAX + CBP_F_TX < CBP_F_JB;
+    assert CBP_F_PRE + CBP_F_SLACK == CBP_F_PREMAX and CBP_F_PRE + CBP_F_GROW <= CBP_F_CAP;
+    assert CBP_F_CAP + CBP_F_SLACK + CBP_F_TX < CBP_F_JB and CBP_F_CAP + CBP_F_SLACK <= 40;
+}
+
+test the_storm_drops_5_percent_and_swaps_1_in_100 {
+    var drop : u64 = 0;
+    var swap : u64 = 0;
+    var s : u64 = 0;
+    while (s < 2000) {
+        const w : u64 = cbp_storm(s);
+        if (w == 1) { drop = drop + 1; }
+        if (w == 2) { swap = swap + 1; assert cbp_storm(s + 1) == 0; }
+        // A dropped frame is never followed by another drop, so the next packet's redundant copy covers it.
+        if (w == 1) { assert cbp_storm(s + 1) != 1; }
+        s = s + 1;
+    }
+    assert drop == 100 and swap == 20;
+}
+
+test the_socket_address_is_127_0_0_1_port_47727 {
+    var a : [16]u8 = undefined;
+    cbp_inaddr(a[0..16], CBP_F_PORT);
+    assert a[0] == 16 and a[1] == 2 and a[2] == 186 and a[3] == 111;
+    assert a[4] == 127 and a[5] == 0 and a[6] == 0 and a[7] == 1 and a[15] == 0;
+}
+
+test the_peer_address_parses_and_lands_in_sockaddr {
+    assert cbp_parse_ip("192.168.1.10", 12) == 3232235786;
+    assert cbp_parse_ip("192.168.1.11", 12) == 3232235787;
+    assert cbp_parse_ip("0.0.0.0", 7) == 0;
+    assert cbp_parse_ip("127.0.0.1", 9) == CBP_LOOPBACK;
+    assert cbp_parse_ip("256.0.0.1", 9) == 4294967296;
+    assert cbp_parse_ip("1.2.3", 5) == 4294967296;
+    assert cbp_parse_ip("1.2.3.4.5", 9) == 4294967296;
+    assert cbp_parse_ip("1..3.4", 6) == 4294967296;
+    assert cbp_parse_ip("1.2.3.x", 7) == 4294967296;
+    var a : [16]u8 = undefined;
+    cbp_sockaddr(a[0..16], 3232235786, 47727);
+    assert a[0] == 16 and a[1] == 2 and a[2] == 186 and a[3] == 111;
+    assert a[4] == 192 and a[5] == 168 and a[6] == 1 and a[7] == 10 and a[8] == 0 and a[15] == 0;
+}
+
+test the_port_and_seconds_parse_as_decimal {
+    assert cbp_parse_u("47727", 5) == 47727;
+    assert cbp_parse_u("25", 2) == 25;
+    assert cbp_parse_u("1792680078", 10) == 1792680078;
+    assert cbp_parse_u("", 0) == 4294967296;
+    assert cbp_parse_u("4x", 2) == 4294967296;
+    assert cbp_parse_u("9999999999", 10) == 4294967296;
+}
