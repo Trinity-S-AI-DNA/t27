@@ -67,6 +67,7 @@ use t27os::keys::sec_key_safe;
 use t27os::keys_host::kc_get_n;
 use t27os::pty_proto::get_u64;
 use t27os::pty_logic::put_pollfd;
+use t27os::pty_logic::put_pollfd_events;
 use t27os::pty_logic::poll_revents;
 use t27os::pty_logic::tv_ms;
 use t27os::pty_client::SOCK_STREAM;
@@ -79,7 +80,6 @@ use t27os::pty_sys::sys_peek;
 use t27os::pty_sys::sys_socket;
 use t27os::pty_sys::sys_bind;
 use t27os::pty_sys::sys_listen;
-use t27os::pty_sys::sys_accept;
 use t27os::pty_sys::sys_poll;
 use t27os::pty_sys::sys_kill;
 use t27os::pty_sys::sys_waitpid;
@@ -110,8 +110,11 @@ pub const ROUTE_CHAT : u32 = 2;
 
 // ---- bytes -------------------------------------------------------------------------------------------------
 
+pub const LS_CR : u8 = 13;
+pub const LS_LF : u8 = 10;
+
 pub fn ls_ws(c: u8) -> bool {
-    return c == 32 or c == 9 or c == 10 or c == 13;
+    return c == 32 or c == 9 or c == LS_LF or c == LS_CR;
 }
 
 pub fn ls_lower(c: u8) -> u8 {
@@ -148,11 +151,26 @@ fn ls_match_ci(hay: []const u8, at: usize, lower_needle: []const u8) -> bool {
 // ---- the request -------------------------------------------------------------------------------------------
 
 /// Just past the blank line that ends the head; 0 while the head is not complete.
+/// The delimiter is compared as bytes: the native backend keeps an escaped CR as a backslash pair.
 pub fn ls_header_end(req: []const u8) -> usize {
-    const blank : []const u8 = "\r\n\r\n";
-    const i : usize = ls_find(req, blank, 0);
-    if (i >= req.len) { return 0; }
-    return i + blank.len;
+    var i : usize = 0;
+    while (i + 4 <= req.len) {
+        if (req[i] == LS_CR and req[i + 1] == LS_LF and req[i + 2] == LS_CR and req[i + 3] == LS_LF) {
+            return i + 4;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// The index of the first CRLF in b, or b.len when there is none.
+pub fn ls_find_crlf(b: []const u8) -> usize {
+    var i : usize = 0;
+    while (i + 2 <= b.len) {
+        if (b[i] == LS_CR and b[i + 1] == LS_LF) { return i; }
+        i = i + 1;
+    }
+    return b.len;
 }
 
 /// The Content-Length of a head (any case of the name); 0 when there is none.
@@ -176,7 +194,7 @@ pub fn ls_content_length(head: []const u8) -> usize {
 
 /// Which of the two routes the request line asks for; everything else is ROUTE_OTHER.
 pub fn ls_route(head: []const u8) -> u32 {
-    const le : usize = ls_find(head, "\r\n", 0);
+    const le : usize = ls_find_crlf(head);
     const line : []const u8 = head[0 .. le];
     var m : [12]u8 = undefined;
     var p : [64]u8 = undefined;
@@ -496,15 +514,29 @@ pub fn ls_reason(code: u32) -> []const u8 {
     return "Error";
 }
 
+/// Write one CRLF pair as bytes; the native backend keeps an escaped CR as a backslash pair.
+pub fn ls_put_crlf(out: []u8, at: usize) -> usize {
+    out[at] = LS_CR;
+    out[at + 1] = LS_LF;
+    return at + 2;
+}
+
 /// The head of an answer: the code, a JSON body of `body_len` bytes, the connection closed after it.
 pub fn ls_head(code: u32, body_len: usize, out: []u8) -> usize {
     var n : usize = put_bytes(out, 0, "HTTP/1.1 ");
     n = put_dec(out, n, @as(u64, code));
     n = put_bytes(out, n, " ");
     n = put_bytes(out, n, ls_reason(code));
-    n = put_bytes(out, n, "\r\nContent-Type: application/json\r\nContent-Length: ");
+    n = ls_put_crlf(out, n);
+    n = put_bytes(out, n, "Content-Type: application/json");
+    n = ls_put_crlf(out, n);
+    n = put_bytes(out, n, "Content-Length: ");
     n = put_dec(out, n, @as(u64, body_len));
-    return put_bytes(out, n, "\r\nConnection: close\r\n\r\n");
+    n = ls_put_crlf(out, n);
+    n = put_bytes(out, n, "Connection: close");
+    n = ls_put_crlf(out, n);
+    n = ls_put_crlf(out, n);
+    return n;
 }
 
 pub fn ls_probe_name(p: u32) -> []const u8 {
@@ -790,6 +822,10 @@ fn ld_attr_flags(attr: []u8, flags: i32) -> i32 { return @extern("posix_spawnatt
 fn ld_attr_destroy(attr: []u8) -> i32 { return @extern("posix_spawnattr_destroy"); }
 fn ld_setsockopt(fd: i32, level: i32, name: i32, val: []const u8, len: u32) -> i32 { return @extern("setsockopt"); }
 
+/// Darwin's accept entry under its unprefixed name collides with keysync::accept in the native link, so call the
+/// library's cancellation-safe alias. The returned descriptor is the accepted socket, never a decision value.
+fn ld_accept(fd: i32, addr: u64, len: u64) -> i32 { return @extern("__accept"); }
+
 fn ld_close(fd: u32) -> void {
     sys_close(@as(i32, @intCast(fd)));
 }
@@ -813,7 +849,7 @@ fn ld_write_all(fd: u32, data: []const u8, chunk: usize) -> bool {
     var spins : u32 = 0;
     while (live and off < data.len) {
         put_pollfd(pf[0..8], 0, fd);
-        pf[4] = LD_POLLOUT;
+        put_pollfd_events(pf[0..8], 0, @as(u16, @intCast(LD_POLLOUT)));
         const r : i32 = sys_poll(pf[0..8], 1, 5000);
         if (r == 0) {
             live = false;
@@ -1525,7 +1561,7 @@ pub fn main() -> void {
         put_pollfd(pf[0..8], 0, s[LS_LISTEN]);
         const r : i32 = sys_poll(pf[0..8], 1, 1000);
         if (r > 0 and poll_revents(pf[0..8], 0) != 0) {
-            const cfd : i32 = sys_accept(lfd, 0, 0);
+            const cfd : i32 = ld_accept(lfd, 0, 0);
             if (cfd >= 0) {
                 ld_serve(buf[0 .. LD_BUF], s[0 .. LS_SIZE], t[0 .. LT_SIZE], @as(u32, @intCast(cfd)));
                 sys_close(cfd);
@@ -1539,24 +1575,57 @@ pub fn main() -> void {
 // ---- tests of the pure half ----------------------------------------------------------------------------------
 
 test "a_request_line_routes_health_and_chat_only" {
-    assert ls_route("GET /health HTTP/1.1\r\nHost: x\r\n\r\n") == ROUTE_HEALTH;
-    assert ls_route("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n") == ROUTE_CHAT;
-    assert ls_route("GET /v1/chat/completions HTTP/1.1\r\n\r\n") == ROUTE_OTHER;
-    assert ls_route("POST /health HTTP/1.1\r\n\r\n") == ROUTE_OTHER;
-    assert ls_route("POST /v1/messages HTTP/1.1\r\n\r\n") == ROUTE_OTHER;
+    var req : [96]u8 = undefined;
+    var n : usize = put_bytes(req[0..96], 0, "GET /health HTTP/1.1");
+    n = ls_put_crlf(req[0..96], n);
+    n = put_bytes(req[0..96], n, "Host: x");
+    n = ls_put_crlf(req[0..96], n);
+    n = ls_put_crlf(req[0..96], n);
+    assert ls_route(req[0..n]) == ROUTE_HEALTH;
+    n = put_bytes(req[0..96], 0, "POST /v1/chat/completions HTTP/1.1");
+    n = ls_put_crlf(req[0..96], n);
+    n = put_bytes(req[0..96], n, "Host: x");
+    n = ls_put_crlf(req[0..96], n);
+    n = ls_put_crlf(req[0..96], n);
+    assert ls_route(req[0..n]) == ROUTE_CHAT;
+    assert ls_route("GET /v1/chat/completions HTTP/1.1") == ROUTE_OTHER;
+    assert ls_route("POST /health") == ROUTE_OTHER;
+    assert ls_route("POST /v1/messages") == ROUTE_OTHER;
     assert ls_route("garbage") == ROUTE_OTHER;
     assert ls_route("") == ROUTE_OTHER;
 }
 
 test "the_head_end_and_the_content_length_are_read_in_any_case" {
-    const req : []const u8 = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\ncontent-LENGTH:  17\r\n\r\n{\"model\":\"abc\"}";
-    const he : usize = ls_header_end(req);
+    var req : [160]u8 = undefined;
+    var n : usize = put_bytes(req[0..160], 0, "POST /v1/chat/completions HTTP/1.1");
+    n = ls_put_crlf(req[0..160], n);
+    n = put_bytes(req[0..160], n, "Host: x");
+    n = ls_put_crlf(req[0..160], n);
+    n = put_bytes(req[0..160], n, "content-LENGTH:  17");
+    n = ls_put_crlf(req[0..160], n);
+    n = ls_put_crlf(req[0..160], n);
+    n = put_bytes(req[0..160], n, "{\"model\":\"abc\"}");
+    const he : usize = ls_header_end(req[0..n]);
     assert he > 0;
-    assert he + 15 == req.len;
-    assert ls_content_length(req[0 .. he]) == 17;
-    assert ls_header_end("POST / HTTP/1.1\r\nHost: x\r\n") == 0;
-    assert ls_content_length("GET /health HTTP/1.1\r\nHost: x\r\n\r\n") == 0;
-    assert ls_content_length("POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\n") == 4;
+    assert he + 15 == n;
+    assert ls_content_length(req[0..he]) == 17;
+    n = put_bytes(req[0..160], 0, "POST / HTTP/1.1");
+    n = ls_put_crlf(req[0..160], n);
+    n = put_bytes(req[0..160], n, "Host: x");
+    n = ls_put_crlf(req[0..160], n);
+    assert ls_header_end(req[0..n]) == 0;
+    n = put_bytes(req[0..160], 0, "GET /health HTTP/1.1");
+    n = ls_put_crlf(req[0..160], n);
+    n = put_bytes(req[0..160], n, "Host: x");
+    n = ls_put_crlf(req[0..160], n);
+    n = ls_put_crlf(req[0..160], n);
+    assert ls_content_length(req[0..n]) == 0;
+    n = put_bytes(req[0..160], 0, "POST / HTTP/1.1");
+    n = ls_put_crlf(req[0..160], n);
+    n = put_bytes(req[0..160], n, "Content-Length: 4");
+    n = ls_put_crlf(req[0..160], n);
+    n = ls_put_crlf(req[0..160], n);
+    assert ls_content_length(req[0..n]) == 4;
 }
 
 test "the_port_parses_or_is_zero" {
@@ -1741,11 +1810,23 @@ test "quota_and_client_refusals_try_the_next_key_but_noise_and_silence_end_the_r
 
 test "the_heads_carry_the_code_the_length_and_close_the_connection" {
     var out : [256]u8 = undefined;
+    var want : [128]u8 = undefined;
     var n : usize = ls_head(200, 7, out[0..256]);
-    assert bytes_eq(out[0..n], "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\nConnection: close\r\n\r\n");
+    var wn : usize = put_bytes(want[0..128], 0, "HTTP/1.1 200 OK");
+    wn = ls_put_crlf(want[0..128], wn);
+    wn = put_bytes(want[0..128], wn, "Content-Type: application/json");
+    wn = ls_put_crlf(want[0..128], wn);
+    wn = put_bytes(want[0..128], wn, "Content-Length: 7");
+    wn = ls_put_crlf(want[0..128], wn);
+    wn = put_bytes(want[0..128], wn, "Connection: close");
+    wn = ls_put_crlf(want[0..128], wn);
+    wn = ls_put_crlf(want[0..128], wn);
+    assert bytes_eq(out[0..n], want[0..wn]);
+    assert out[15] == LS_CR;
+    assert out[16] == LS_LF;
     n = ls_head(503, 120, out[0..256]);
-    assert ls_find(out[0..n], "HTTP/1.1 503 Service Unavailable\r\n", 0) == 0;
-    assert ls_find(out[0..n], "Content-Length: 120\r\n", 0) < n;
+    assert ls_find(out[0..n], "HTTP/1.1 503 Service Unavailable", 0) == 0;
+    assert ls_find(out[0..n], "Content-Length: 120", 0) < n;
     n = ls_head(404, 0, out[0..256]);
     assert ls_find(out[0..n], "404 Not Found", 0) < n;
     n = ls_head(400, 0, out[0..256]);
