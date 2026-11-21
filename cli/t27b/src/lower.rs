@@ -4392,18 +4392,6 @@ impl<'a> Lower<'a> {
                         if !y.ty.is_int() {
                             return self.reject("ExprBinary(<< >>)", "bool shift amount".into());
                         }
-                        // Widen a constant left operand to u64 when the shift
-                        // amount is runtime (could exceed the left type's bit
-                        // width). t27c handles this by promoting the literal.
-                        let x = if let ExprKind::Const(v) = x.kind {
-                            Expr { ty: Ty::U64, kind: ExprKind::Const(v) }
-                        } else if x.ty.bits() < 64 {
-                            // Runtime left operand narrower than u64: widen to
-                            // u64 so any shift amount < 64 is safe.
-                            Expr { ty: Ty::U64, kind: ExprKind::Widen(Box::new(x)) }
-                        } else {
-                            x
-                        };
                         let ty = x.ty;
                         if ty.is_odd() && matches!(op, ArithOp::ShlW | ArithOp::ShrW) {
                             // Wrap mode masks the amount with `bits - 1`,
@@ -6759,8 +6747,7 @@ impl<'a> Lower<'a> {
                 let checked = Expr { ty: Ty::U64, kind: ExprKind::Bounds { idx: Box::new(e), len: Box::new(len), site } };
                 let ptr = Expr { ty: Ty::Ptr, kind: ExprKind::Load { addr: Box::new(hdr.clone()), off: 0 } };
                 let addr = Expr { ty: Ty::Ptr, kind: ExprKind::Offset { base: Box::new(ptr), idx: Box::new(checked), scale: esize } };
-                eprintln!("DEBUG index: returning place addr={:?}, elem={:?}, temp=Some(k)", addr, (*elem).clone());
-        return Ok(Ok(Place { addr, off: 0, ty: (*elem).clone(), mutable: true, temp: Some(k) }));
+                return Ok(Ok(Place { addr, off: 0, ty: (*elem).clone(), mutable: true, temp: None }));
             }
         }
         let base = match self.tuple_index(base, &idx)? {
