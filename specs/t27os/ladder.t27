@@ -22,10 +22,17 @@
 //   5. A rung's key never leaves the node; the ladder reads keys from the
 //      node's own store, clients authenticate to the ladder locally or not at
 //      all over loopback.
-//   6. THINKING OFF: the zai GLM head runs with thinking disabled unless the
-//      client asked for thinking by name (measured 2026-10-27: glm-5.3-flash
-//      answered in 11.7 s with real content thinking-off; thinking-on drained
-//      45 s into an empty answer).
+//   6. THE REQUEST SHAPE IS A PROPERTY OF THE MODEL (measured 2026-11-05,
+//      specs/t27os/lagger.t27 law 5): z.ai answers 400 with the provider code
+//      1210 ("this model always engages in thinking and cannot be disabled")
+//      when a request carries "thinking":{"type":"disabled"} for glm-5.3-flash
+//      -- in every form (disabled AND low) -- while the same request WITHOUT
+//      the member reaches the quota layer. So the member is OMITTED for
+//      glm-5.3-flash and KEPT (disabled) for the two heads that accept it:
+//      glm-4.7-flash answered 429/1305 (an overload, so the shape was
+//      accepted) and glm-4.5-flash answers 200 with it (2026-11-22). A client
+//      that sent a thinking member of its own keeps it: the ladder never adds
+//      a second one.
 //   7. SERVICE NOISE: a 1305/529 on glm-4.7-flash (owner finding 2026-10-25,
 //      re-measured 2026-10-27) is transient service noise -- it says nothing
 //      about the key or the model's presence on the plan. It rests the rung
@@ -34,9 +41,23 @@
 //   8. UNWIRED: a rung with no key, or with no probed 200 on a turn-sized
 //      request, is skipped with NO network call and recorded as unwired
 //      (STATUS_UNWIRED). The ladder never makes up an upstream status for it.
+//   9. THE PROBE WALKS THE MATRIX: a rung with several keys and several
+//      models is proven by the first (model, key) pair that answers a
+//      TURN-SIZED request with 200. The pairs are walked in ladder order --
+//      the models of the rung's table, each with every key the node holds --
+//      one attempt per pair, bounded by the pairs that exist (at most the
+//      models of the table times MAX_KEYS keys). A client refusal (4xx)
+//      advances to the next pair; a transient answer (5xx, 529, 1305) or
+//      silence ends that rung's probe without claiming anything about the
+//      pairs that were not tried. The pair that proved the rung is that
+//      rung's sticky start: the next serve begins with it, and the probe of
+//      another rung can never take it away.
 // ASCII only (L3). phi^2 + 1/phi^2 = 3 | TRINITY
 
 module T27OsLadder;
+
+use std::mem::bytes_eq;
+use t27os::keys::MAX_KEYS;
 
 // -- The rungs, in ladder order (index = attempt order) --
 // Remote rungs come first; the node-local ollama rung is always last.
@@ -95,22 +116,29 @@ pub fn refusal(status : u32) -> bool {
     return true;
 }
 
-// -- Law 6: thinking off on the zai GLM head (measured 2026-10-27) --
-// glm-5.3-flash thinking-on drained 45 s into an empty answer; thinking-off
-// answered the same turn in 11.7 s with real content. The node's ladder glue
-// already sends thinking disabled on every zai serve; this is that rule's law.
-pub const THINK_OFF_ANSWER_S : u32 = 12;
-pub const THINK_DRAIN_S : u32 = 45;
+// -- Law 6: the request shape is a property of the model (measured 2026-11-05) --
+// z.ai answers 400 with the provider code 1210 ("this model always engages in thinking and cannot be
+// disabled") when a request carries "thinking":{"type":"disabled"} for glm-5.3-flash, in every form
+// (disabled AND low); the same request WITHOUT the member reaches the quota layer. So the member is
+// OMITTED for that model and KEPT (disabled) for the two heads that accept it: glm-4.7-flash answered
+// 429/1305 (an overload, so the shape was accepted) and glm-4.5-flash answers 200 with it (2026-11-22).
+// The 2026-10-27 timing (thinking-off 11.7 s, thinking-on 45 s drain) was measured on the head the
+// provider now refuses: it is history, not a rule.
+pub const SHAPE_NONE : u32 = 0;
+pub const SHAPE_DISABLED : u32 = 1;
 
-fn has_glm_prefix(model : []const u8) -> bool {
-    if (model.len < 4) { return false; }
-    return model[0] == 103 and model[1] == 108 and model[2] == 109 and model[3] == 45;
+/// The shape of one zai model: SHAPE_NONE (no thinking member at all) or SHAPE_DISABLED.
+pub fn zai_model_shape(model : []const u8) -> u32 {
+    if (bytes_eq(model, "glm-4.7-flash")) { return SHAPE_DISABLED; }
+    if (bytes_eq(model, "glm-4.5-flash")) { return SHAPE_DISABLED; }
+    return SHAPE_NONE;
 }
 
-/// Thinking is off for a zai GLM model unless the client asked for it by name.
+/// True when the call carries "thinking":{"type":"disabled"}: the model accepts that shape and the
+/// client sent no thinking member of its own (a client's member is kept and never duplicated).
 pub fn zai_thinking_off(model : []const u8, client_asked : bool) -> bool {
     if (client_asked) { return false; }
-    return has_glm_prefix(model);
+    return zai_model_shape(model) == SHAPE_DISABLED;
 }
 
 // -- Law 7: service noise never demotes (owner finding 2026-10-25) --
@@ -152,6 +180,41 @@ pub fn rung_wired(has_key : bool, probe : u32) -> bool {
 pub fn recorded_status(wired : bool, upstream : u32) -> u32 {
     if (wired) { return upstream; }
     return STATUS_UNWIRED;
+}
+
+// -- Law 9: the probe walks the rung's (model, key) matrix --
+// The pairs of one rung are the models of its table, each with every key the node holds. The walk
+// visits them in ladder order, one attempt per pair, and the pair that proves the rung becomes that
+// rung's sticky start. The decision functions below are pure: the host half (ladder_serve.t27) only
+// moves bytes.
+
+/// What the probe does after one attempt: advance to the next pair, hold the winner, or end this
+/// rung's probe.
+pub const PROBE_STEP_NEXT : u32 = 0;
+pub const PROBE_STEP_HOLD : u32 = 1;
+pub const PROBE_STEP_STOP : u32 = 2;
+
+/// The next step of the probe after one attempt: a turn-sized 200 (law 2) HOLDS the pair -- the rung
+/// is proven and the pair becomes its sticky start; a client refusal (4xx) advances to the next pair;
+/// a transient answer (5xx, 529, 1305) or silence STOPS this rung's probe, so the pairs that were not
+/// tried are left unclaimed; a 200 below PROBE_TOKENS is not proof and advances like a refusal. The
+/// walk ends when the matrix is spent.
+pub fn probe_step(status : u32, tokens : u32, att : u32, cap : u32) -> u32 {
+    if (status == 200 and tokens >= PROBE_TOKENS) { return PROBE_STEP_HOLD; }
+    if (att + 1 >= cap) { return PROBE_STEP_STOP; }
+    if (status == 0) { return PROBE_STEP_STOP; }
+    if (status >= 500) { return PROBE_STEP_STOP; }
+    return PROBE_STEP_NEXT;
+}
+
+/// The probe state a rung ends in after the walk: PROBE_OK when a turn-sized 200 proved it,
+/// PROBE_REFUSED when the walk ended in a client refusal (the rung refused and the matrix is spent),
+/// PROBE_NONE when it ended in a transient answer or in silence (nothing is claimed about the rung
+/// or its keys -- law 7 says a transient answer never refuses a rung).
+pub fn probe_end(status : u32, tokens : u32) -> u32 {
+    if (status == 200) { return probe_after(status, tokens); }
+    if (status >= 400 and status < 500) { return PROBE_REFUSED; }
+    return PROBE_NONE;
 }
 
 // -- Law 3: the 503 names every rung that was tried, in ladder order --
@@ -217,11 +280,29 @@ pub fn rung_keyless(r : usize) -> bool {
     return r == RUNG_OLLAMA;
 }
 
+/// The largest model table of a rung (the zai rung): 3 models.
+pub const MAX_MODEL_COUNT : u32 = 3;
+
 /// How many models the rung tries, in order, before it counts as refused.
 pub fn rung_model_count(r : usize) -> usize {
-    if (r == RUNG_ZAI) { return 3; }
+    if (r == RUNG_ZAI) { return @as(usize, @intCast(MAX_MODEL_COUNT)); }
     if (r < RUNG_COUNT) { return 1; }
     return 0;
+}
+
+/// The maximum number of (model, key) attempts one rung's probe may make: the models of the rung's
+/// table times the keys the node holds, never more than MAX_KEYS (keys.t27) * MAX_MODEL_COUNT.
+pub const PROBE_CAP : u32 = MAX_KEYS * MAX_MODEL_COUNT;
+
+/// How many unique (model, key) pairs a rung can attempt: the models of its table times the keys the
+/// node holds (a keyless rung counts one), bounded by PROBE_CAP.
+pub fn rung_probe_cap(r : usize, key_count : u32) -> u32 {
+    const nm : usize = rung_model_count(r);
+    if (nm == 0 or key_count == 0) { return 0; }
+    const nk : u32 = if (rung_keyless(r)) { 1 } else { key_count };
+    const total : u32 = @as(u32, @intCast(nm)) * nk;
+    if (total > PROBE_CAP) { return PROBE_CAP; }
+    return total;
 }
 
 /// Model m of the rung (0-based, in try order); "" past the table.
@@ -277,11 +358,16 @@ test only_200_serves {
 
 test the_zai_head_runs_thinking_off_unless_the_client_asks {
     assert zai_thinking_off("glm-4.5-flash", false) == true;
-    assert zai_thinking_off("glm-5.3-flash", false) == true;
-    assert zai_thinking_off("gemma4:31b-cloud", false) == false;
+    assert zai_thinking_off("glm-4.7-flash", false) == true;
+    assert zai_thinking_off("glm-5.3-flash", false) == false;
     assert zai_thinking_off("glm-5.3-flash", true) == false;
     assert zai_thinking_off("", false) == false;
-    assert THINK_OFF_ANSWER_S < THINK_DRAIN_S;
+    // The shape is a property of the model (law 6), not a timer: 5.3 gets no
+    // thinking member at all, 4.7 and 4.5 get exactly one disabled member.
+    assert zai_model_shape("glm-5.3-flash") == SHAPE_NONE;
+    assert zai_model_shape("glm-4.7-flash") == SHAPE_DISABLED;
+    assert zai_model_shape("glm-4.5-flash") == SHAPE_DISABLED;
+    assert zai_model_shape("gemma4:31b-cloud") == SHAPE_NONE;
 }
 
 test service_noise_rests_and_never_demotes {
@@ -394,7 +480,10 @@ test the_rung_table_has_no_deepseek_and_no_empty_row {
     assert rung_name(RUNG_ZAI)[0] == 122;
     assert rung_model_count(RUNG_ZAI) == 3;
     assert rung_model(RUNG_ZAI, 0).len == 13;
-    assert zai_thinking_off(rung_model(RUNG_ZAI, 0), false) == true;
+    // Law 6: the shape is a property of the model. Model 0 of the zai table is glm-5.3-flash, which
+    // takes NO thinking member; model 2 is glm-4.5-flash, which takes one disabled member.
+    assert zai_thinking_off(rung_model(RUNG_ZAI, 0), false) == false;
+    assert zai_thinking_off(rung_model(RUNG_ZAI, 2), false) == true;
     assert rung_keyless(RUNG_OLLAMA) == true;
     assert rung_keyless(RUNG_ZAI) == false;
     assert CALL_TIMEOUT_MS == 90000;
@@ -416,3 +505,120 @@ invariant an_unwired_rung_never_shows_an_upstream_status
     assert recorded_status(false, 402) == STATUS_UNWIRED
     assert recorded_status(false, 429) == STATUS_UNWIRED
     assert rung_wired(false, PROBE_OK) == false
+
+test probe_step_steps_through_the_matrix_correctly {
+    // 200 with enough tokens holds the pair
+    assert probe_step(200, 100, 0, 15) == PROBE_STEP_HOLD;
+    assert probe_step(200, 240, 1, 15) == PROBE_STEP_HOLD;
+
+    // 200 with insufficient tokens advances (like a refusal)
+    assert probe_step(200, 99, 2, 15) == PROBE_STEP_NEXT;
+
+    // 4xx refusals advance to next pair
+    assert probe_step(429, 0, 3, 15) == PROBE_STEP_NEXT;
+    assert probe_step(402, 0, 4, 15) == PROBE_STEP_NEXT;
+    assert probe_step(400, 0, 5, 15) == PROBE_STEP_NEXT;
+
+    // 5xx and no answer stop the rung's probe
+    assert probe_step(500, 0, 6, 15) == PROBE_STEP_STOP;
+    assert probe_step(503, 0, 7, 15) == PROBE_STEP_STOP;
+    assert probe_step(0, 0, 8, 15) == PROBE_STEP_STOP;
+
+    // Exhaustion stops: the last pair of the matrix ends the walk
+    assert probe_step(429, 0, 13, 15) == PROBE_STEP_NEXT;
+    assert probe_step(429, 0, 14, 15) == PROBE_STEP_STOP;
+}
+
+test probe_cap_bounds_the_matrix_at_most_model_count_times_key_count {
+    // ZAI rung with the 5 observed keys: 3 models * 5 keys = 15 pairs
+    assert rung_probe_cap(RUNG_ZAI, 5) == 15;
+    assert rung_probe_cap(RUNG_ZAI, 8) == PROBE_CAP; // MAX_KEYS (8) * 3 models
+
+    // Other rungs: 1 model * the keys the node holds
+    assert rung_probe_cap(RUNG_NVIDIA, 5) == 5;
+    assert rung_probe_cap(RUNG_OPENROUTER, 5) == 5;
+    assert rung_probe_cap(RUNG_OLLAMA, 1) == 1; // keyless
+
+    // Never zero for a wired rung that holds keys, never above the cap
+    assert rung_probe_cap(RUNG_ZAI, 5) > 0;
+    assert rung_probe_cap(RUNG_NVIDIA, 5) > 0;
+    assert rung_probe_cap(RUNG_ZAI, 100) == PROBE_CAP;
+    assert rung_probe_cap(RUNG_ZAI, 0) == 0;
+}
+
+test glm_53_flash_never_gets_thinking_member_while_47_and_45_do {
+    // glm-5.3-flash never gets thinking member
+    assert zai_thinking_off("glm-5.3-flash", false) == false;
+    assert zai_thinking_off("glm-5.3-flash", true) == false;
+
+    // glm-4.7-flash and glm-4.5-flash get thinking:disabled when client didn't ask
+    assert zai_thinking_off("glm-4.7-flash", false) == true;
+    assert zai_thinking_off("glm-4.5-flash", false) == true;
+
+    // Client thinking member is preserved and never duplicated
+    assert zai_thinking_off("glm-4.7-flash", true) == false;
+    assert zai_thinking_off("glm-4.5-flash", true) == false;
+
+    // Non-zai models don't use thinking member
+    assert zai_thinking_off("gemma4:31b-cloud", false) == false;
+    assert zai_thinking_off("meta/llama-3.3-70b-instruct", false) == false;
+    assert zai_thinking_off("z-ai/glm-4.5-air:free", false) == false;
+}
+
+test probe_walk_covers_15_unique_pairs_for_zai {
+    const zai_cap : u32 = rung_probe_cap(RUNG_ZAI, 5);
+    assert zai_cap == 15; // 3 models * 5 observed keys
+
+    // Every (model, key) pair of the matrix is reachable and a turn-sized 200 holds it
+    var model_idx : u32 = 0;
+    while (model_idx < 3) {
+        var key_idx : u32 = 0;
+        while (key_idx < 5) {
+            const attempt : u32 = model_idx * 5 + key_idx;
+            const status : u32 = 200;
+            const tokens : u32 = 240;
+            const decision : u32 = probe_step(status, tokens, attempt, zai_cap);
+            assert decision == PROBE_STEP_HOLD; // 200 with enough tokens holds
+            key_idx = key_idx + 1;
+        }
+        model_idx = model_idx + 1;
+    }
+}
+
+test error_responses_are_handled_correctly {
+    // 400 continues to next pair
+    assert probe_step(400, 50, 0, 15) == PROBE_STEP_NEXT;
+
+    // 429 continues to next pair
+    assert probe_step(429, 0, 1, 15) == PROBE_STEP_NEXT;
+
+    // 402 continues to next pair
+    assert probe_step(402, 0, 2, 15) == PROBE_STEP_NEXT;
+
+    // 403 continues to next pair
+    assert probe_step(403, 0, 3, 15) == PROBE_STEP_NEXT;
+
+    // 500 stops the rung
+    assert probe_step(500, 0, 4, 15) == PROBE_STEP_STOP;
+
+    // 503 stops the rung
+    assert probe_step(503, 0, 5, 15) == PROBE_STEP_STOP;
+
+    // 1305 stops the rung
+    assert probe_step(1305, 0, 6, 15) == PROBE_STEP_STOP;
+
+    // No answer (0) stops the rung
+    assert probe_step(0, 0, 7, 15) == PROBE_STEP_STOP;
+}
+
+test probe_tokens_threshold_is_strictly_applied {
+    // Below threshold does not prove, even with 200
+    assert probe_step(200, 99, 0, 15) == PROBE_STEP_NEXT;
+    assert probe_step(200, 1, 1, 15) == PROBE_STEP_NEXT;
+    assert probe_step(200, 50, 2, 15) == PROBE_STEP_NEXT;
+
+    // At or above threshold proves
+    assert probe_step(200, 100, 3, 15) == PROBE_STEP_HOLD;
+    assert probe_step(200, 240, 4, 15) == PROBE_STEP_HOLD;
+    assert probe_step(200, 1000, 5, 15) == PROBE_STEP_HOLD;
+}
