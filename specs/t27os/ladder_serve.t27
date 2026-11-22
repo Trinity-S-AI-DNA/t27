@@ -100,7 +100,7 @@ use t27os::keys::sec_exit_code;
 // ---- limits ------------------------------------------------------------------------------------------------
 
 /// The largest request (head and body) the loop reads; a bigger one is answered 413.
-pub const REQ_CAP : usize = 28672;
+pub const REQ_CAP : usize = 524288;
 /// The largest upstream reply (body plus the status trailer) the loop keeps.
 pub const REPLY_CAP : usize = 24576;
 /// The most (model, key) attempts one rung gets before it counts as refused.
@@ -641,30 +641,34 @@ pub fn ls_refusal_body(tried: u32, unwired: u32, rs: []const u32, out: []u8) -> 
 }
 
 // ---- the arena, the state and the small decisions of the host half ----------------------------------------------
-// One stack arena holds every buffer of the loop (ld_*), two small arrays hold its state (LS_* in u32, LT_* in
+// One module-level array holds every buffer of the loop (ld_*), two small arrays hold its state (LS_* in u32, LT_* in
 // u64, the single provider lane at LS_L0 with LF_* fields). The regions and indices are tested for fit below;
-// nothing here moves a byte, the host fns after this block do. The whole arena is one array and must stay within 131072 bytes: the
-// Verilog width gate (tools/check_verilog_widths.py) refuses a lowered width of 2^20 bits or more, which caps a
-// request at 28 KiB and a kept reply at 24 KiB until the lowering or a heap allocation carries a bigger array.
+// nothing here moves a byte, the host fns after this block do. The arena is ONE module-level array LD_ARENA
+// (static storage, not the stack), because the Verilog width gate refuses a lowered local width of 2^20 bits or more
+// while module-level arrays pass it (frame_main.t27 FM_OUT is 921615 bytes). The request region is 512 KiB;
+// a kept reply stays 24 KiB.
 
 pub const LD_REQ : usize = 0;
-pub const LD_WB : usize = 28672;
-pub const LD_WB_CAP : usize = 32768;
-pub const LD_REP0 : usize = 61440;
-pub const LD_REP1 : usize = 86016;
-pub const LD_OUT : usize = 110592;
+pub const LD_WB : usize = 524288;
+pub const LD_WB_CAP : usize = 528384;
+pub const LD_REP0 : usize = 1052672;
+pub const LD_REP1 : usize = 1077248;
+pub const LD_OUT : usize = 1101824;
 pub const LD_OUT_CAP : usize = 8192;
-pub const LD_CFG : usize = 118784;
+pub const LD_CFG : usize = 1110016;
 pub const LD_CFG_CAP : usize = 4096;
-pub const LD_PB : usize = 122880;
+pub const LD_PB : usize = 1114112;
 pub const LD_PB_CAP : usize = 512;
-pub const LD_KEY : usize = 123392;
+pub const LD_KEY : usize = 1114624;
 pub const LD_KEY_CAP : usize = 256;
-pub const LD_TV : usize = 123648;
+pub const LD_TV : usize = 1114880;
 pub const LD_TV_CAP : usize = 64;
-pub const LD_LOG : usize = 123712;
+pub const LD_LOG : usize = 1114944;
 pub const LD_LOG_CAP : usize = 256;
-pub const LD_BUF : usize = 123968;
+pub const LD_BUF : usize = 1115200;
+
+/// The arena itself, static storage so a 1 MiB buffer never sits on the stack of main.
+pub var LD_ARENA : [LD_BUF]u8 = undefined;
 
 pub const LS_LISTEN : usize = 0;
 pub const LS_LAST : usize = 1;
@@ -1430,6 +1434,18 @@ fn ld_walk(b: []u8, s: []u32, t: []u64, src: usize, src_len: usize, sp_at: usize
 
 // ---- the connection: read a request, answer it ---------------------------------------------------------------------
 
+/// The read verdict for `got` bytes read, head length `he` (0 = not complete yet) and
+/// Content-Length `cl`: 413 = head + body cannot fit REQ_CAP, 1 = complete, 0 = read more.
+pub fn ls_read_verdict(got: usize, he: usize, cl: usize) -> u32 {
+    if (he == 0) {
+        if (got >= REQ_CAP) { return 413; }
+        return 0;
+    }
+    if (he + cl > REQ_CAP) { return 413; }
+    if (got >= he + cl) { return 1; }
+    return 0;
+}
+
 /// Read one request into the request region: poll 5000 ms per wait, read until the head is complete and
 /// head + Content-Length bytes are in. 1 = complete (s[LS_HEAD] = head length, s[LS_BLEN] = body length),
 /// 413 = it does not fit REQ_CAP, 0 = nothing usable (silent, closed or stalled).
@@ -1457,10 +1473,11 @@ fn ld_read_request(b: []u8, s: []u32, cfd: u32) -> u32 {
                 const he : usize = ls_header_end(b[LD_REQ .. LD_REQ + got]);
                 if (he > 0) {
                     const cl : usize = ls_content_length(b[LD_REQ .. LD_REQ + he]);
-                    if (he + cl > REQ_CAP) {
+                    const v : u32 = ls_read_verdict(got, he, cl);
+                    if (v == 413) {
                         result = 413;
                         live = false;
-                    } else if (got >= he + cl) {
+                    } else if (v == 1) {
                         s[LS_HEAD] = @as(u32, @intCast(he));
                         s[LS_BLEN] = @as(u32, @intCast(cl));
                         result = 1;
@@ -1549,10 +1566,9 @@ fn ld_idle(b: []u8, s: []u32, t: []u64) -> void {
 /// The T27 Ladder: bind 127.0.0.1 on LADDER_PORT (the constant, or the environment value when it is a port),
 /// scan the keys, then serve one client at a time forever.
 pub fn main() -> void {
-    var buf : [LD_BUF]u8 = undefined;
     var s : [LS_SIZE]u32 = undefined;
     var t : [LT_SIZE]u64 = undefined;
-    kd_view_clear(buf[0 .. LD_BUF]);
+    kd_view_clear(LD_ARENA[0 .. LD_BUF]);
     var z : usize = 0;
     while (z < LS_SIZE) {
         s[z] = 0;
@@ -1571,14 +1587,14 @@ pub fn main() -> void {
     if (ep != 0) {
         var en : u64 = sys_strlen(ep);
         if (en > 16) { en = 16; }
-        sys_peek(buf[LD_PB .. LD_PB + 16], ep, en);
-        const pv : u32 = ls_parse_port(buf[LD_PB .. LD_PB + @as(usize, @intCast(en))]);
+        sys_peek(LD_ARENA[LD_PB .. LD_PB + 16], ep, en);
+        const pv : u32 = ls_parse_port(LD_ARENA[LD_PB .. LD_PB + @as(usize, @intCast(en))]);
         if (pv > 0) { port = pv; }
-        kd_view_clear(buf[LD_PB .. LD_PB + 16]);
+        kd_view_clear(LD_ARENA[LD_PB .. LD_PB + 16]);
     }
     s[LS_PORT] = port;
-    const pbn : usize = ls_probe_base(buf[LD_PB .. LD_PB + LD_PB_CAP]);
-    if (ls_scan_top(buf[LD_PB .. LD_PB + pbn], t[LT_PSP .. LT_PSP + 6]) == false) {
+    const pbn : usize = ls_probe_base(LD_ARENA[LD_PB .. LD_PB + LD_PB_CAP]);
+    if (ls_scan_top(LD_ARENA[LD_PB .. LD_PB + pbn], t[LT_PSP .. LT_PSP + 6]) == false) {
         ld_say("[ladder] cannot read its own probe body\n");
         sys_exit(1);
         return;
@@ -1613,12 +1629,12 @@ pub fn main() -> void {
         return;
     }
     s[LS_LISTEN] = @as(u32, @intCast(lfd));
-    ld_scan_keys(buf[0 .. LD_BUF], s[0 .. LS_SIZE]);
-    t[LT_SCAN] = ld_now(buf[0 .. LD_BUF]) + KEY_RESCAN_MS;
-    var ln : usize = put_bytes(buf[LD_LOG .. LD_LOG + LD_LOG_CAP], 0, "[ladder] listening on 127.0.0.1:");
-    ln = put_dec(buf[LD_LOG .. LD_LOG + LD_LOG_CAP], ln, @as(u64, port));
-    ln = put_bytes(buf[LD_LOG .. LD_LOG + LD_LOG_CAP], ln, "\n");
-    sys_write(2, buf[LD_LOG .. LD_LOG + ln], @as(u64, ln));
+    ld_scan_keys(LD_ARENA[0 .. LD_BUF], s[0 .. LS_SIZE]);
+    t[LT_SCAN] = ld_now(LD_ARENA[0 .. LD_BUF]) + KEY_RESCAN_MS;
+    var ln : usize = put_bytes(LD_ARENA[LD_LOG .. LD_LOG + LD_LOG_CAP], 0, "[ladder] listening on 127.0.0.1:");
+    ln = put_dec(LD_ARENA[LD_LOG .. LD_LOG + LD_LOG_CAP], ln, @as(u64, port));
+    ln = put_bytes(LD_ARENA[LD_LOG .. LD_LOG + LD_LOG_CAP], ln, "\n");
+    sys_write(2, LD_ARENA[LD_LOG .. LD_LOG + ln], @as(u64, ln));
     var pf : [8]u8 = undefined;
     while (true) {
         put_pollfd(pf[0..8], 0, s[LS_LISTEN]);
@@ -1626,11 +1642,11 @@ pub fn main() -> void {
         if (r > 0 and poll_revents(pf[0..8], 0) != 0) {
             const cfd : i32 = ld_accept(lfd, 0, 0);
             if (cfd >= 0) {
-                ld_serve(buf[0 .. LD_BUF], s[0 .. LS_SIZE], t[0 .. LT_SIZE], @as(u32, @intCast(cfd)));
+                ld_serve(LD_ARENA[0 .. LD_BUF], s[0 .. LS_SIZE], t[0 .. LT_SIZE], @as(u32, @intCast(cfd)));
                 sys_close(cfd);
             }
         } else {
-            ld_idle(buf[0 .. LD_BUF], s[0 .. LS_SIZE], t[0 .. LT_SIZE]);
+            ld_idle(LD_ARENA[0 .. LD_BUF], s[0 .. LS_SIZE], t[0 .. LT_SIZE]);
         }
     }
 }
@@ -1990,15 +2006,31 @@ test "the_arena_regions_do_not_overlap" {
     assert LD_TV + LD_TV_CAP <= LD_LOG;
     assert LD_LOG + LD_LOG_CAP <= LD_BUF;
     assert LD_REP1 - LD_REP0 == REPLY_CAP;
-    assert LD_BUF == 123968;
-    // the Verilog lowering carries a width of at most 2^20 bits: one array of 131072 bytes is its ceiling
-    assert LD_BUF <= 131072;
+    assert LD_BUF == 1115200;
+    // the request region holds at least 512 KiB
+    assert REQ_CAP >= 524288;
     // a rewritten body is at most the request plus the model and the thinking member
     assert REQ_CAP + 256 <= LD_WB_CAP;
     // the config needs the url, the key and 256 bytes of fixed text
     assert 256 + LD_KEY_CAP + 256 <= LD_CFG_CAP;
     // a probe base fits its region with room for the model
     assert LD_PB_CAP >= 300;
+}
+
+test "a_200_kib_body_is_read_and_a_body_over_the_cap_answers_413" {
+    // a 200 KiB body behind a 512-byte head is complete once all of it is in
+    assert ls_read_verdict(512 + 204800, 512, 204800) == 1;
+    assert ls_read_verdict(512 + 100000, 512, 204800) == 0;
+    // the largest body that fits, and one byte more
+    assert ls_read_verdict(REQ_CAP, 512, REQ_CAP - 512) == 1;
+    assert ls_read_verdict(512, 512, REQ_CAP - 511) == 413;
+    // a 600 KiB body is refused before it is read
+    assert ls_read_verdict(1024, 512, 614400) == 413;
+    // a head that never ends is refused at the cap, a short one waits
+    assert ls_read_verdict(REQ_CAP, 0, 0) == 413;
+    assert ls_read_verdict(4096, 0, 0) == 0;
+    // the rewrite region holds a 200 KiB body plus the model and thinking members
+    assert 204800 + 256 <= LD_WB_CAP;
 }
 
 test "the_state_indices_fit_and_do_not_overlap" {
