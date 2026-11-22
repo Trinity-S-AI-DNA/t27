@@ -101,8 +101,13 @@ use t27os::keys::sec_exit_code;
 
 /// The largest request (head and body) the loop reads; a bigger one is answered 413.
 pub const REQ_CAP : usize = 524288;
-/// The largest upstream reply (body plus the status trailer) the loop keeps.
-pub const REPLY_CAP : usize = 24576;
+/// The largest upstream reply (body plus the status trailer) the loop keeps. #14216: 24 KiB cut every
+/// streamed answer of a few hundred lines (an SSE reply repeats the envelope per token) and turned it into
+/// a generic 503; the reply region now matches the 512 KiB request region of #14212. A reply that still
+/// fills it is answered 502 "reply too large" (ST_TOO_LARGE), never sent truncated.
+pub const REPLY_CAP : usize = 524288;
+/// The lane status of a reply that filled its region: not an HTTP status, not a refusal, not silence.
+pub const ST_TOO_LARGE : u32 = 1;
 /// The most (model, key) attempts one rung gets before it counts as refused.
 pub const ATTEMPT_CAP : u32 = 6;
 /// A refused or unprobed rung is probed again after this long.
@@ -523,6 +528,7 @@ pub fn ls_reason(code: u32) -> []const u8 {
     if (code == 400) { return "Bad Request"; }
     if (code == 404) { return "Not Found"; }
     if (code == 413) { return "Payload Too Large"; }
+    if (code == 502) { return "Bad Gateway"; }
     if (code == 503) { return "Service Unavailable"; }
     return "Error";
 }
@@ -604,6 +610,16 @@ pub fn ls_health(keys: []const u32, probe: []const u32, last_good: u32, out: []u
 /// The 503 body (law 3): every rung that was called and refused, in ladder order, with the status it
 /// recorded and its class; then the rungs that made no call. `tried` and `unwired` are rung bit masks,
 /// `rs` the recorded status per rung.
+/// The 502 body when rung `r` answered more than the reply region holds (#14216): the rung and the cap, so
+/// the client sees why, and nothing of the cut reply.
+pub fn ls_too_large_body(r: usize, out: []u8) -> usize {
+    var n : usize = put_bytes(out, 0, "{\"error\":\"reply too large\",\"rung\":");
+    n = ls_put_name(out, n, r);
+    n = put_bytes(out, n, ",\"cap\":");
+    n = put_dec(out, n, @as(u64, REPLY_CAP));
+    return put_bytes(out, n, "}");
+}
+
 pub fn ls_refusal_body(tried: u32, unwired: u32, rs: []const u32, out: []u8) -> usize {
     var n : usize = put_bytes(out, 0, "{\"error\":\"all rungs refused\",\"tried\":[");
     var from : u32 = 0;
@@ -643,28 +659,28 @@ pub fn ls_refusal_body(tried: u32, unwired: u32, rs: []const u32, out: []u8) -> 
 // ---- the arena, the state and the small decisions of the host half ----------------------------------------------
 // One stack array in main holds every buffer of the loop (ld_*), two small arrays hold its state (LS_* in u32, LT_* in
 // u64, the single provider lane at LS_L0 with LF_* fields). The regions and indices are tested for fit below;
-// nothing here moves a byte, the host fns after this block do. The arena (about 1.1 MiB) stays on the stack of main,
+// nothing here moves a byte, the host fns after this block do. The arena (about 2.1 MiB) stays on the stack of main,
 // well inside the 8 MiB main-thread stack, because a t27b Mach-O object has no writable data section and refuses a
-// module-level var. The request region is 512 KiB; a kept reply stays 24 KiB.
+// module-level var. The request region is 512 KiB and each kept reply 512 KiB (about 2.1 MiB in all).
 
 pub const LD_REQ : usize = 0;
 pub const LD_WB : usize = 524288;
 pub const LD_WB_CAP : usize = 528384;
 pub const LD_REP0 : usize = 1052672;
-pub const LD_REP1 : usize = 1077248;
-pub const LD_OUT : usize = 1101824;
+pub const LD_REP1 : usize = 1576960;
+pub const LD_OUT : usize = 2101248;
 pub const LD_OUT_CAP : usize = 8192;
-pub const LD_CFG : usize = 1110016;
+pub const LD_CFG : usize = 2109440;
 pub const LD_CFG_CAP : usize = 4096;
-pub const LD_PB : usize = 1114112;
+pub const LD_PB : usize = 2113536;
 pub const LD_PB_CAP : usize = 512;
-pub const LD_KEY : usize = 1114624;
+pub const LD_KEY : usize = 2114048;
 pub const LD_KEY_CAP : usize = 256;
-pub const LD_TV : usize = 1114880;
+pub const LD_TV : usize = 2114304;
 pub const LD_TV_CAP : usize = 64;
-pub const LD_LOG : usize = 1114944;
+pub const LD_LOG : usize = 2114368;
 pub const LD_LOG_CAP : usize = 256;
-pub const LD_BUF : usize = 1115200;
+pub const LD_BUF : usize = 2114624;
 
 
 pub const LS_LISTEN : usize = 0;
@@ -686,6 +702,8 @@ pub const LS_HEAD : usize = 26;
 pub const LS_BLEN : usize = 27;
 pub const LS_PBLEN : usize = 28;
 pub const LS_WIN : usize = 29;
+/// The rung whose reply filled its region in this walk, plus 1 (0 = none); it ends the walk with a 502.
+pub const LS_BIG : usize = 60;
 pub const LS_L0 : usize = 30;
 pub const LS_LSTEP : usize = 12;
 pub const LS_SIZE : usize = 64;
@@ -736,10 +754,11 @@ pub fn ls_wait_ms(now: u64, deadline: u64) -> i32 {
     return @as(i32, @intCast(left));
 }
 
-/// The status a finished lane is given: 0 when it was cut, curl exited with an error, the reply holds no
-/// trailer or filled the whole region; the trailer's HTTP status otherwise.
+/// The status a finished lane is given: ST_TOO_LARGE when the reply filled the whole region; 0 when it was
+/// cut, curl exited with an error or the reply holds no trailer; the trailer's HTTP status otherwise.
 pub fn ls_lane_status(cut: bool, code: u32, got: usize, reply: []const u8) -> u32 {
-    if (cut or code != 0 or got < 4 or got >= REPLY_CAP) { return 0; }
+    if (got >= REPLY_CAP) { return ST_TOO_LARGE; }
+    if (cut or code != 0 or got < 4) { return 0; }
     return ls_reply_status(reply[0 .. got]);
 }
 
@@ -1216,6 +1235,16 @@ pub fn ls_find_win(s: []const u32) -> usize {
     return LANES;
 }
 
+/// The first finished lane whose reply filled its region, or LANES when there is none.
+pub fn ls_find_big(s: []const u32) -> usize {
+    var lane : usize = 0;
+    while (lane < LANES) {
+        if (s[ls_lane_at(lane, LF_ACT)] == LANE_DONE and s[ls_lane_at(lane, LF_STATUS)] == ST_TOO_LARGE) { return lane; }
+        lane = lane + 1;
+    }
+    return LANES;
+}
+
 /// Law 8 on the state: the rung holds a key (or needs none) AND its probe proved it.
 pub fn ls_wired(s: []const u32, r: usize) -> bool {
     return rung_wired(rung_keyless(r) or s[LS_KM + r] > 0, s[LS_PR + r]);
@@ -1385,6 +1414,7 @@ fn ld_walk(b: []u8, s: []u32, t: []u64, src: usize, src_len: usize, sp_at: usize
     s[LS_TRIED] = 0;
     s[LS_UNW] = 0;
     s[LS_WIN] = @as(u32, @intCast(LANES));
+    s[LS_BIG] = 0;
     var r : usize = 0;
     while (r < RUNG_COUNT) {
         s[LS_RS + r] = 0;
@@ -1415,6 +1445,10 @@ fn ld_walk(b: []u8, s: []u32, t: []u64, src: usize, src_len: usize, sp_at: usize
                 s[LS_STK + wr] = s[wa + LF_SLOT];
                 s[LS_WIN] = @as(u32, @intCast(w));
                 won = true;
+                live = false;
+            } else if (ls_find_big(s) < LANES) {
+                // the rung answered, only more than the region holds: no demotion, no next rung (#14216)
+                s[LS_BIG] = s[ls_lane_at(ls_find_big(s), LF_RUNG)] + 1;
                 live = false;
             } else {
                 lane = 0;
@@ -1517,6 +1551,11 @@ fn ld_chat(b: []u8, s: []u32, t: []u64, cfd: u32) -> void {
         const got : usize = @as(usize, s[ls_lane_at(wl, LF_GOT)]);
         const bl : usize = ls_reply_body_len(b[ra .. ra + got]);
         ld_send(b, cfd, 200, ra, bl);
+        return;
+    }
+    if (s[LS_BIG] > 0) {
+        const nb : usize = ls_too_large_body(@as(usize, s[LS_BIG] - 1), b[LD_OUT + 512 .. LD_OUT + LD_OUT_CAP]);
+        ld_send(b, cfd, 502, LD_OUT + 512, nb);
         return;
     }
     const n : usize = ls_refusal_body(s[LS_TRIED], s[LS_UNW], s[LS_RS .. LS_RS + RUNG_COUNT], b[LD_OUT + 512 .. LD_OUT + LD_OUT_CAP]);
@@ -2004,7 +2043,7 @@ test "the_arena_regions_do_not_overlap" {
     assert LD_TV + LD_TV_CAP <= LD_LOG;
     assert LD_LOG + LD_LOG_CAP <= LD_BUF;
     assert LD_REP1 - LD_REP0 == REPLY_CAP;
-    assert LD_BUF == 1115200;
+    assert LD_BUF == 2114624;
     // the request region holds at least 512 KiB
     assert REQ_CAP >= 524288;
     // a rewritten body is at most the request plus the model and the thinking member
@@ -2081,11 +2120,69 @@ test "a_lane_status_is_the_trailer_unless_it_was_cut_or_failed" {
     assert ls_lane_status(false, 256, reply.len, reply) == 0;
     assert ls_lane_status(false, 0, 3, reply) == 0;
     assert ls_lane_status(false, 0, 0, reply) == 0;
-    assert ls_lane_status(false, 0, REPLY_CAP, reply) == 0;
+    assert ls_lane_status(false, 0, REPLY_CAP, reply) == ST_TOO_LARGE;
     const refused : []const u8 = "{}\n429";
     assert ls_lane_status(false, 0, refused.len, refused) == 429;
     const nothing : []const u8 = "\n000";
     assert ls_lane_status(false, 0, nothing.len, nothing) == 0;
+}
+
+test "a_long_reply_is_kept_and_an_oversized_one_is_too_large_not_unreachable" {
+    // #14216: the reply region matches the 512 KiB request region; the request cap is unchanged
+    assert REPLY_CAP == 524288;
+    assert REQ_CAP == 524288;
+    assert LD_REP0 + REPLY_CAP <= LD_REP1 and LD_REP1 + REPLY_CAP <= LD_OUT;
+    // a short reply, a reply over the old 24 KiB cap, a reply one byte under the cap: the trailer's status
+    // only the 4-byte status trailer is read, so the body bytes stay as they are
+    var big : [524288]u8 = undefined;
+    big[0] = 123;
+    var e : usize = 16;
+    big[e - 5] = 125;
+    big[e - 4] = 10;
+    big[e - 3] = 50;
+    big[e - 2] = 48;
+    big[e - 1] = 48;
+    assert ls_lane_status(false, 0, e, big[0 .. e]) == 200;
+    e = 24576 + 4096;
+    big[e - 5] = 125;
+    big[e - 4] = 10;
+    big[e - 3] = 50;
+    big[e - 2] = 48;
+    big[e - 1] = 48;
+    assert ls_lane_status(false, 0, e, big[0 .. e]) == 200;
+    assert ls_reply_body_len(big[0 .. e]) == e - 4;
+    e = REPLY_CAP - 1;
+    big[e - 5] = 125;
+    big[e - 4] = 10;
+    big[e - 3] = 50;
+    big[e - 2] = 48;
+    big[e - 1] = 48;
+    assert ls_lane_status(false, 0, e, big[0 .. e]) == 200;
+    // a reply that fills the region is too large, even when the lane was cut for it, and is no refusal
+    assert ls_lane_status(false, 0, REPLY_CAP, big[0 .. REPLY_CAP]) == ST_TOO_LARGE;
+    assert ls_lane_status(true, 0, REPLY_CAP, big[0 .. REPLY_CAP]) == ST_TOO_LARGE;
+    assert ST_TOO_LARGE != 0 and ST_TOO_LARGE != 200;
+    assert demotes_rung(ST_TOO_LARGE) == false;
+    assert ls_attempt_goes_on(ST_TOO_LARGE) == false;
+    // the 502 body names the rung and the cap
+    var out : [128]u8 = undefined;
+    const n : usize = ls_too_large_body(RUNG_NVIDIA, out[0..128]);
+    assert bytes_eq(out[0..n], "{\"error\":\"reply too large\",\"rung\":\"nvidia\",\"cap\":524288}");
+    assert bytes_eq(ls_reason(502), "Bad Gateway");
+    // the walk finds the too-large lane and not a winner
+    var s : [64]u32 = undefined;
+    var z : usize = 0;
+    while (z < 64) {
+        s[z] = 0;
+        z = z + 1;
+    }
+    s[ls_lane_at(0, LF_ACT)] = LANE_DONE;
+    s[ls_lane_at(0, LF_STATUS)] = ST_TOO_LARGE;
+    assert ls_find_big(s[0..64]) == 0;
+    assert ls_find_win(s[0..64]) == LANES;
+    s[ls_lane_at(0, LF_STATUS)] = 200;
+    assert ls_find_big(s[0..64]) == LANES;
+    assert LS_L0 + LANES * LS_LSTEP <= LS_BIG and LS_BIG < LS_SIZE;
 }
 
 test "a_retry_needs_a_client_refusal_and_an_attempt_left" {
