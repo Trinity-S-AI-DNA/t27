@@ -36,6 +36,13 @@ use t27os::ladder::RUNG_OPENROUTER;
 use t27os::ladder::PROBE_NONE;
 use t27os::ladder::PROBE_OK;
 use t27os::ladder::PROBE_REFUSED;
+use t27os::ladder::PROBE_STEP_NEXT;
+use t27os::ladder::PROBE_STEP_HOLD;
+use t27os::ladder::PROBE_STEP_STOP;
+use t27os::ladder::PROBE_CAP;
+use t27os::ladder::probe_step;
+use t27os::ladder::probe_end;
+use t27os::ladder::rung_probe_cap;
 use t27os::ladder::LADDER_PORT;
 use t27os::ladder::CALL_TIMEOUT_MS;
 use t27os::ladder::zai_thinking_off;
@@ -491,6 +498,8 @@ pub fn ls_attempt_cap(nm: usize, nk: u32) -> u32 {
     return total;
 }
 
+/// The bound of the probe matrix (model_count * key_count) lives in ladder.t27 as PROBE_CAP.
+
 /// The model of attempt `att`: the sticky model, moving to the next one after every key has been tried.
 pub fn ls_plan_model(stm: usize, att: u32, nk: u32, nm: usize) -> usize {
     if (nk == 0 or nm == 0) { return 0; }
@@ -502,6 +511,10 @@ pub fn ls_plan_model(stm: usize, att: u32, nk: u32, nm: usize) -> usize {
 pub fn ls_attempt_goes_on(status: u32) -> bool {
     return status >= 400 and status < 500;
 }
+
+/// Probe decision after one (model, key) attempt, the end state of a rung's probe and the bound of the
+/// matrix all live in ladder.t27 (law 9): probe_step, probe_end and rung_probe_cap. The runtime only
+/// moves bytes; the decision has one home.
 
 // ---- the answers -------------------------------------------------------------------------------------------
 
@@ -655,20 +668,24 @@ pub const LD_BUF : usize = 123968;
 
 pub const LS_LISTEN : usize = 0;
 pub const LS_LAST : usize = 1;
+/// The sticky model index of each rung (4 entries). Per rung, because a rung's model index means
+/// nothing in another rung's table: a one-model rung's probe must not erase the model a three-model
+/// rung proved (law 9).
 pub const LS_STM : usize = 2;
-pub const LS_STK : usize = 3;
-pub const LS_KM : usize = 4;
-pub const LS_PR : usize = 8;
-pub const LS_PORT : usize = 12;
-pub const LS_VIS : usize = 13;
-pub const LS_TRIED : usize = 14;
-pub const LS_UNW : usize = 15;
-pub const LS_RS : usize = 16;
-pub const LS_HEAD : usize = 20;
-pub const LS_BLEN : usize = 21;
-pub const LS_PBLEN : usize = 22;
-pub const LS_WIN : usize = 23;
-pub const LS_L0 : usize = 24;
+/// The sticky key slot of each rung (4 entries), per rung for the same reason.
+pub const LS_STK : usize = 6;
+pub const LS_KM : usize = 10;
+pub const LS_PR : usize = 14;
+pub const LS_PORT : usize = 18;
+pub const LS_VIS : usize = 19;
+pub const LS_TRIED : usize = 20;
+pub const LS_UNW : usize = 21;
+pub const LS_RS : usize = 22;
+pub const LS_HEAD : usize = 26;
+pub const LS_BLEN : usize = 27;
+pub const LS_PBLEN : usize = 28;
+pub const LS_WIN : usize = 29;
+pub const LS_L0 : usize = 30;
 pub const LS_LSTEP : usize = 12;
 pub const LS_SIZE : usize = 64;
 pub const LF_ACT : usize = 0;
@@ -925,8 +942,8 @@ fn ld_start(b: []u8, s: []u32, t: []u64, lane: usize, rung: usize, att: u32, src
     const nm : usize = rung_model_count(rung);
     s[la + LF_NK] = nk;
     if (nk == 0 or nm == 0) { return false; }
-    const mi : usize = ls_plan_model(@as(usize, s[LS_STM]), att, nk, nm);
-    const slot : u32 = ls_key_slot(km, s[LS_STK], att % nk);
+    const mi : usize = ls_plan_model(@as(usize, s[LS_STM + rung]), att, nk, nm);
+    const slot : u32 = ls_key_slot(km, s[LS_STK + rung], att % nk);
     if (slot >= MAX_KEYS) { return false; }
     s[la + LF_MODEL] = @as(u32, @intCast(mi));
     s[la + LF_SLOT] = slot;
@@ -1226,31 +1243,76 @@ fn ld_kill_running(b: []u8, s: []u32, t: []u64) -> void {
     }
 }
 
-/// Probe one rung on lane 0: one chat call that needs at least PROBE_TOKENS of answer; probe_after turns the
-/// status and the token count into the rung's state. A rung that is not proven waits REPROBE_MS for the next try.
+/// Probe one rung sequentially through its (model, key) matrix, one attempt per pair.
+/// Updates that rung's sticky start (LS_STM, LS_STK) on success, or probes next rung if none works.
 fn ld_probe(b: []u8, s: []u32, t: []u64, rung: usize) -> void {
     const la : usize = ls_lane_at(0, 0);
     s[la + LF_ACT] = LANE_IDLE;
-    if (ld_start(b, s, t, 0, rung, 0, LD_PB, @as(usize, s[LS_PBLEN]), LT_PSP) == false) {
-        t[LT_PA + rung] = ld_now(b) + REPROBE_MS;
-        return;
-    }
-    ld_wait_any(b, s, t);
-    if (s[la + LF_ACT] == LANE_RUNNING) {
-        s[la + LF_CUT] = 1;
-        ld_end(b, s, t, 0);
-    }
-    const st : u32 = s[la + LF_STATUS];
+
+    const nm : usize = rung_model_count(rung);
+    const km : u32 = s[LS_KM + rung];
+    const nk : u32 = ls_popcount(km);
+    const cap : u32 = rung_probe_cap(rung, nk);
+
+    var att : u32 = 0;
+    var won : bool = false;
+    var st : u32 = 0;
     var tokens : u32 = 0;
-    if (st == 200) {
-        const got : usize = @as(usize, s[la + LF_GOT]);
-        const bl : usize = ls_reply_body_len(b[LD_REP0 .. LD_REP0 + got]);
-        tokens = ls_completion_tokens(b[LD_REP0 .. LD_REP0 + bl]);
+
+    // Walk the matrix: models × keys, one attempt per pair
+    while (att < cap and won == false) {
+        const mi : usize = ls_plan_model(@as(usize, s[LS_STM + rung]), att, nk, nm);
+        const slot : u32 = ls_key_slot(km, s[LS_STK + rung], att % nk);
+
+        if (slot >= MAX_KEYS) {
+            // No key available for this slot
+            st = 0;
+            tokens = 0;
+        } else if (ld_start(b, s, t, 0, rung, att, LD_PB, @as(usize, s[LS_PBLEN]), LT_PSP)) {
+            // Attempt this (model, key) pair
+            ld_wait_any(b, s, t);
+
+            if (s[la + LF_ACT] == LANE_RUNNING) {
+                s[la + LF_CUT] = 1;
+                ld_end(b, s, t, 0);
+            }
+
+            st = s[la + LF_STATUS];
+            if (st == 200) {
+                const got : usize = @as(usize, s[la + LF_GOT]);
+                const bl : usize = ls_reply_body_len(b[LD_REP0 .. LD_REP0 + got]);
+                tokens = ls_completion_tokens(b[LD_REP0 .. LD_REP0 + bl]);
+            }
+        } else {
+            // Could not start the attempt (no key, network error, etc.)
+            st = 0;
+            tokens = 0;
+        }
+
+        // Pure decision: what happens after this attempt?
+        const step : u32 = probe_step(st, tokens, att, cap);
+
+        if (step == PROBE_STEP_HOLD) {
+            // Success! Update this rung's sticky start and mark the rung as proven
+            won = true;
+            s[LS_STM + rung] = @as(u32, @intCast(mi));
+            s[LS_STK + rung] = slot;
+            s[LS_PR + rung] = PROBE_OK;
+        } else if (step == PROBE_STEP_STOP) {
+            // Stop this rung's probe (5xx, timeout, or exhaustion)
+            break;
+        }
+        // PROBE_STEP_NEXT: continue to next attempt
+        att = att + 1;
     }
-    const ps : u32 = probe_after(st, tokens);
-    s[LS_PR + rung] = ps;
-    if (ps != PROBE_OK) { t[LT_PA + rung] = ld_now(b) + REPROBE_MS; }
-    s[la + LF_ACT] = LANE_IDLE;
+
+    if (won == false) {
+        // Probe ended without success
+        s[LS_PR + rung] = probe_end(st, tokens);
+        if (s[LS_PR + rung] != PROBE_OK) {
+            t[LT_PA + rung] = ld_now(b) + REPROBE_MS;
+        }
+    }
 }
 
 /// Probe the rungs that are due, at most `limit` of them.
@@ -1346,9 +1408,10 @@ fn ld_walk(b: []u8, s: []u32, t: []u64, src: usize, src_len: usize, sp_at: usize
             const w : usize = ls_find_win(s);
             if (w < LANES) {
                 const wa : usize = ls_lane_at(w, 0);
+                const wr : usize = @as(usize, s[wa + LF_RUNG]);
                 s[LS_LAST] = s[wa + LF_RUNG];
-                s[LS_STM] = s[wa + LF_MODEL];
-                s[LS_STK] = s[wa + LF_SLOT];
+                s[LS_STM + wr] = s[wa + LF_MODEL];
+                s[LS_STK + wr] = s[wa + LF_SLOT];
                 s[LS_WIN] = @as(u32, @intCast(w));
                 won = true;
                 live = false;
@@ -1695,19 +1758,33 @@ test "a_body_that_is_not_one_object_is_refused" {
     assert ls_scan_top("{\"a\":1}  \n", sp[0..6]);
 }
 
-test "thinking_goes_off_on_the_zai_head_unless_the_client_asked" {
+test "the_thinking_member_follows_the_model_not_a_blanket_rule" {
     var sp : [6]u64 = undefined;
     var out : [512]u8 = undefined;
     const plain : []const u8 = "{\"model\":\"x\",\"a\":1}";
+
+    // glm-5.3-flash takes NO thinking member (z.ai answers 400 with 1210 when it carries one)
     assert ls_scan_top(plain, sp[0..6]);
     assert sp[3] == 0;
     var n : usize = ls_rewrite(plain, sp[0..6], "glm-5.3-flash", zai_thinking_off("glm-5.3-flash", sp[3] == 1), out[0..512]);
-    assert bytes_eq(out[0..n], "{\"model\":\"glm-5.3-flash\",\"thinking\":{\"type\":\"disabled\"},\"a\":1}");
+    assert bytes_eq(out[0..n], "{\"model\":\"glm-5.3-flash\",\"a\":1}");
+
+    // glm-4.7-flash and glm-4.5-flash take exactly one disabled member
+    n = ls_rewrite(plain, sp[0..6], "glm-4.7-flash", zai_thinking_off("glm-4.7-flash", sp[3] == 1), out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"glm-4.7-flash\",\"thinking\":{\"type\":\"disabled\"},\"a\":1}");
+    n = ls_rewrite(plain, sp[0..6], "glm-4.5-flash", zai_thinking_off("glm-4.5-flash", sp[3] == 1), out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"glm-4.5-flash\",\"thinking\":{\"type\":\"disabled\"},\"a\":1}");
+
+    // A client's own thinking member is preserved, never duplicated
     const asked : []const u8 = "{\"model\":\"x\",\"thinking\":{\"type\":\"enabled\"}}";
     assert ls_scan_top(asked, sp[0..6]);
     assert sp[3] == 1;
     n = ls_rewrite(asked, sp[0..6], "glm-5.3-flash", zai_thinking_off("glm-5.3-flash", sp[3] == 1), out[0..512]);
     assert bytes_eq(out[0..n], "{\"model\":\"glm-5.3-flash\",\"thinking\":{\"type\":\"enabled\"}}");
+    n = ls_rewrite(asked, sp[0..6], "glm-4.7-flash", zai_thinking_off("glm-4.7-flash", sp[3] == 1), out[0..512]);
+    assert bytes_eq(out[0..n], "{\"model\":\"glm-4.7-flash\",\"thinking\":{\"type\":\"enabled\"}}");
+
+    // A model that is not a zai head takes no thinking member
     assert ls_scan_top(plain, sp[0..6]);
     n = ls_rewrite(plain, sp[0..6], "gemma4:31b-cloud", zai_thinking_off("gemma4:31b-cloud", false), out[0..512]);
     assert bytes_eq(out[0..n], "{\"model\":\"gemma4:31b-cloud\",\"a\":1}");
@@ -1925,6 +2002,8 @@ test "the_arena_regions_do_not_overlap" {
 }
 
 test "the_state_indices_fit_and_do_not_overlap" {
+    assert LS_STM + 4 <= LS_STK;
+    assert LS_STK + 4 <= LS_KM;
     assert LS_KM + 4 <= LS_PR;
     assert LS_PR + 4 <= LS_PORT;
     assert LS_RS + 4 <= LS_HEAD;
@@ -1939,8 +2018,8 @@ test "the_state_indices_fit_and_do_not_overlap" {
     assert LT_SP + 6 <= LT_PSP;
     assert LT_PSP + 6 <= LT_ST;
     assert LT_ST + LANES <= LT_SIZE;
-    assert ls_lane_at(0, LF_ACT) == 24;
-    assert ls_lane_at(1, LF_CUT) == 24 + 12 + 10;
+    assert ls_lane_at(0, LF_ACT) == 30;
+    assert ls_lane_at(1, LF_CUT) == 30 + 12 + 10;
     assert ls_reply_at(0) == LD_REP0 and ls_reply_at(1) == LD_REP1;
     assert RUNG_COUNT == 4;
 }
@@ -2125,4 +2204,144 @@ test "the_503_names_the_tried_rungs_with_their_honest_status_and_the_unwired_one
     // the unwired rungs are not among the tried ones
     assert ls_find(out[0..n], "\"rung\":\"nvidia\"", 0) >= n;
     assert ls_find(out[0..n], "\"rung\":\"ollama\"", 0) >= n;
+}
+
+test "probe_step_decides_next_action_for_each_matrix_pair" {
+    // Success holds
+    assert probe_step(200, 100, 0, 15) == PROBE_STEP_HOLD;
+    assert probe_step(200, 240, 5, 15) == PROBE_STEP_HOLD;
+
+    // Insufficient tokens advance
+    assert probe_step(200, 99, 1, 15) == PROBE_STEP_NEXT;
+
+    // 4xx refusals advance
+    assert probe_step(429, 0, 2, 15) == PROBE_STEP_NEXT;
+    assert probe_step(402, 0, 3, 15) == PROBE_STEP_NEXT;
+    assert probe_step(400, 0, 4, 15) == PROBE_STEP_NEXT;
+
+    // 5xx and no answer stop
+    assert probe_step(500, 0, 5, 15) == PROBE_STEP_STOP;
+    assert probe_step(503, 0, 6, 15) == PROBE_STEP_STOP;
+    assert probe_step(0, 0, 7, 15) == PROBE_STEP_STOP;
+
+    // Exhaustion stops: the last pair of the matrix ends the walk
+    assert probe_step(429, 0, 13, 15) == PROBE_STEP_NEXT;
+    assert probe_step(429, 0, 14, 15) == PROBE_STEP_STOP;
+}
+
+test "probe_classifies_end_state_correctly" {
+    // 200 with sufficient tokens = PROBE_OK
+    assert probe_end(200, 100) == PROBE_OK;
+    assert probe_end(200, 240) == PROBE_OK;
+
+    // 200 with insufficient tokens = PROBE_NONE (not proof)
+    assert probe_end(200, 99) == PROBE_NONE;
+
+    // 4xx = PROBE_REFUSED
+    assert probe_end(429, 0) == PROBE_REFUSED;
+    assert probe_end(402, 0) == PROBE_REFUSED;
+    assert probe_end(400, 0) == PROBE_REFUSED;
+
+    // 5xx, no answer = PROBE_NONE (transient, not refused)
+    assert probe_end(500, 0) == PROBE_NONE;
+    assert probe_end(503, 0) == PROBE_NONE;
+    assert probe_end(0, 0) == PROBE_NONE;
+}
+
+test "probe_attempt_cap_bounds_matrix_properly" {
+    // ZAI with 5 keys: 3*5 = 15 pairs
+    assert rung_probe_cap(RUNG_ZAI, 5) == 15;
+    assert rung_probe_cap(RUNG_ZAI, 8) == PROBE_CAP; // MAX_KEYS (8) * 3 models
+
+    // Single model rungs
+    assert rung_probe_cap(RUNG_NVIDIA, 5) == 5;
+    assert rung_probe_cap(RUNG_OPENROUTER, 5) == 5;
+
+    // Keyless rung
+    assert rung_probe_cap(RUNG_OLLAMA, 1) == 1;
+
+    // Never exceeds PROBE_CAP
+    assert rung_probe_cap(RUNG_ZAI, 100) == PROBE_CAP;
+    assert rung_probe_cap(RUNG_ZAI, 0) == 0;
+}
+
+test "the_sticky_start_is_per_rung_so_one_rung_cannot_erase_another" {
+    var s : [64]u32 = undefined;
+    var z : usize = 0;
+    while (z < 64) { s[z] = 0; z = z + 1; }
+
+    // The zai rung proves model 1 on key slot 4
+    s[LS_STM + RUNG_ZAI] = 1;
+    s[LS_STK + RUNG_ZAI] = 4;
+
+    // A one-model rung proves its own model 0 on key slot 1
+    s[LS_STM + RUNG_NVIDIA] = 0;
+    s[LS_STK + RUNG_NVIDIA] = 1;
+
+    // The zai rung keeps its proven model and key: the other rung did not erase them
+    assert ls_plan_model(@as(usize, s[LS_STM + RUNG_ZAI]), 0, 3, 3) == 1;
+    assert ls_plan_model(@as(usize, s[LS_STM + RUNG_ZAI]), 1, 3, 3) == 1;
+    assert ls_plan_model(@as(usize, s[LS_STM + RUNG_ZAI]), 2, 3, 3) == 1;
+    assert ls_key_slot(0xFF, s[LS_STK + RUNG_ZAI], 0) == 4; // From sticky slot 4
+    assert ls_key_slot(0xFF, s[LS_STK + RUNG_ZAI], 1) == 5; // Next key
+
+    // The one-model rung has its own sticky
+    assert ls_plan_model(@as(usize, s[LS_STM + RUNG_NVIDIA]), 0, 3, 1) == 0;
+    assert ls_key_slot(0xFF, s[LS_STK + RUNG_NVIDIA], 0) == 1;
+}
+
+test "probe_matrix_walks_in_ladder_order" {
+    // Test the planned model sequence for ZAI rung
+    assert ls_plan_model(0, 0, 5, 3) == 0; // First key of model 0
+    assert ls_plan_model(0, 1, 5, 3) == 0; // Second key of model 0
+    assert ls_plan_model(0, 2, 5, 3) == 0; // Third key of model 0
+    assert ls_plan_model(0, 3, 5, 3) == 0; // Fourth key of model 0
+    assert ls_plan_model(0, 4, 5, 3) == 0; // Fifth key of model 0
+    assert ls_plan_model(0, 5, 5, 3) == 1; // First key of model 1
+    assert ls_plan_model(0, 6, 5, 3) == 1; // Second key of model 1
+    assert ls_plan_model(0, 7, 5, 3) == 1; // Third key of model 1
+    assert ls_plan_model(0, 8, 5, 3) == 1; // Fourth key of model 1
+    assert ls_plan_model(0, 9, 5, 3) == 1; // Fifth key of model 1
+    assert ls_plan_model(0, 10, 5, 3) == 2; // First key of model 2
+    assert ls_plan_model(0, 11, 5, 3) == 2; // Second key of model 2
+    assert ls_plan_model(0, 12, 5, 3) == 2; // Third key of model 2
+    assert ls_plan_model(0, 13, 5, 3) == 2; // Fourth key of model 2
+    assert ls_plan_model(0, 14, 5, 3) == 2; // Fifth key of model 2
+
+    // Verify boundary conditions: a model owns nk attempts, so attempt nk is the next model
+    assert ls_plan_model(1, 0, 5, 3) == 1; // Sticky start at model 1
+    assert ls_plan_model(1, 4, 5, 3) == 1; // Still model 1 (its last key)
+    assert ls_plan_model(1, 5, 5, 3) == 2; // Move to next model
+}
+
+test "the_sticky_model_two_yields_45_then_53_then_47" {
+    // The zai table is 0 = glm-5.3-flash, 1 = glm-4.7-flash, 2 = glm-4.5-flash. A sticky start of
+    // model 2 walks 4.5 first, then 5.3, then 4.7, each for its own keys.
+    assert ls_plan_model(2, 0, 5, 3) == 2;
+    assert ls_plan_model(2, 4, 5, 3) == 2;
+    assert ls_plan_model(2, 5, 5, 3) == 0;
+    assert ls_plan_model(2, 9, 5, 3) == 0;
+    assert ls_plan_model(2, 10, 5, 3) == 1;
+    assert ls_plan_model(2, 14, 5, 3) == 1;
+
+    // The names behind those indexes are the measured heads
+    assert bytes_eq(rung_model(RUNG_ZAI, 2), "glm-4.5-flash");
+    assert bytes_eq(rung_model(RUNG_ZAI, 0), "glm-5.3-flash");
+    assert bytes_eq(rung_model(RUNG_ZAI, 1), "glm-4.7-flash");
+}
+
+test "error_scenarios_handled_correctly" {
+    // No key available for slot
+    assert ls_key_slot(0, 0, 0) == MAX_KEYS; // No keys in mask
+
+    // Invalid key index
+    assert ls_key_slot(0xFF, 0, 100) == MAX_KEYS; // nth too large
+
+    // Empty model list
+    assert ls_plan_model(0, 0, 0, 3) == 0; // No keys to cycle
+    assert ls_plan_model(0, 0, 3, 0) == 0; // No models
+
+    // Zero attempts cap
+    assert rung_probe_cap(RUNG_ZAI, 0) == 0;
+    assert rung_probe_cap(RUNG_NVIDIA, 0) == 0;
 }
