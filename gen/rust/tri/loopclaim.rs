@@ -28,7 +28,7 @@ pub fn test_tag_prefix_ends_with_slash() {
 
 #[test]
 pub fn test_claim_msg_prefix_starts_with_loop() {
-    assert!((&CLAIM_MSG_PREFIX.as_bytes()[(0) as usize..(4) as usize] == "loop"));
+    assert!((&CLAIM_MSG_PREFIX.as_bytes()[(0) as usize..(4) as usize] == b"loop"));
 }
 
 #[test]

@@ -5,37 +5,37 @@ pub const KIND: &'static str = "tool";
 
 pub const FAMILY: &'static str = "tri-cli";
 
-pub const ID: &'static str = "tri/scratch";
+pub const ID: &'static str = "tri/mods";
 
 pub const REPO: &'static str = "gHashTag/t27";
 
-pub const QUALIFIED_ID: &'static str = "gHashTag/t27:tri/scratch";
+pub const QUALIFIED_ID: &'static str = "gHashTag/t27:tri/mods";
 
 pub const SCHEMA: u32 = 2;
 
-pub const COMMAND: &'static str = "tri scratch";
+pub const COMMAND: &'static str = "tri mods";
 
-pub const VARIANT: &'static str = "Commands::Harness";
+pub const VARIANT: &'static str = "Commands::Mods";
 
-pub const SOURCE: &'static str = "cli/tri/src/scratch.rs";
+pub const SOURCE: &'static str = "cli/tri/src/modreach.rs";
 
 pub const ENTRY: &'static str = "cli/tri/src/main.rs";
 
-pub const ABOUT: &'static str = "Test binaries whose tests share one scratch directory.";
+pub const ABOUT: &'static str = "Source files no crate root reaches, and so nothing compiles. Test-harness hygiene.";
 
-pub const ABOUT_SOURCE: &'static str = "clap /// doc on HarnessCmd::Scratch (cli/tri/src/main.rs; module cli/tri/src/scratch.rs)";
+pub const ABOUT_SOURCE: &'static str = "module doc, cli/tri/src/modreach.rs:1 (Commands::Mods dispatches to modreach, cli/tri/src/main.rs:1380)";
 
-pub const ACTIONS: [&'static str; 1] = ["scratch"];
+pub const ACTIONS: [&'static str; 1] = ["orphan"];
 
-pub const ACTIONS_ABOUT: [&'static str; 1] = ["Test binaries whose tests share one scratch directory."];
+pub const ACTIONS_ABOUT: [&'static str; 1] = ["List them."];
 
-pub const ARGS: [&'static str; 2] = ["--gate: Exit non-zero when any binary shares a scratch directory.", "--self-check: Negative control: prove this gate can see a planted collision."];
+pub const ARGS: [&'static str; 2] = ["gate: Compare against docs/reports/orphan_modules.json...", "self_check: Negative control: prove this gate can see a planted orphan."];
 
 pub const AGENTS: [&'static str; 2] = ["T", "C"];
 
-pub const AGENTS_NOTE: &'static str = "docs/agents/AGENTS_ALPHABET.md \"Who holds a tool, and who holds a skill\" binds every tool to the Queen (T). Domain lead C: the gate's decision table over scratch-directory key shapes is a compiler-domain rule (phi accumulator growth, Z[phi] exactness), so C holds it beside T.";
+pub const AGENTS_NOTE: &'static str = "docs/agents/AGENTS_ALPHABET.md \"Who holds a tool, and who holds a skill\" binds every tool to the Queen (T). Domain lead C: modreach.rs is the Rust crate-graph reachability walk behind `tri mods orphan`; ABOUT \"Source files no crate root reaches, and so nothing compiles. Test-harness hygiene.\" -- `cargo build` cannot error on a file it does not compile, so the `--self_check` negative control (plant an orphan, prove the gate sees it) is what makes the gate real.";
 
-pub const WHEN_TO_USE: &'static str = "Test binaries whose tests share one scratch directory.";
+pub const WHEN_TO_USE: &'static str = "Source files no crate root reaches, and so nothing compiles. Test-harness hygiene.";
 
 pub const WITNESS: &'static str = "source-parse";
 
@@ -83,7 +83,7 @@ pub fn test_id_command_and_variant_name_one_subcommand() {
         if (ID.as_bytes()[(n) as usize] == b'-') {
             word_start = true;
         } else {
-            if (word_start) != 0 {
+            if word_start {
                 assert!((VARIANT.as_bytes()[(v) as usize] == (ID.as_bytes()[(n) as usize] - 32)));
             } else {
                 assert!((VARIANT.as_bytes()[(v) as usize] == ID.as_bytes()[(n) as usize]));
@@ -118,7 +118,16 @@ pub fn test_clap_names_are_kebab_case() {
     }
     let mut g: usize = 0;
     while (g < ARGS.len()) {
-        assert!(((ARGS[(g) as usize].as_bytes()[0] == b'<') || ((ARGS[(g) as usize].as_bytes()[0] == b'-') && (ARGS[(g) as usize].as_bytes()[1] == b'-'))));
+        assert!(((ARGS[(g) as usize].as_bytes()[0] >= b'a') && (ARGS[(g) as usize].as_bytes()[0] <= b'z')));
+        let mut c: usize = 0;
+        let mut doc: bool = false;
+        while (c < (ARGS[(g) as usize].len() - 1)) {
+            if ((ARGS[(g) as usize].as_bytes()[(c) as usize] == b':') && (ARGS[(g) as usize].as_bytes()[((c + 1)) as usize] == b' ')) {
+                doc = true;
+            }
+            c = (c + 1);
+        }
+        assert!(doc);
         g = (g + 1);
     }
 }

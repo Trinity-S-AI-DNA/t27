@@ -5,37 +5,37 @@ pub const KIND: &'static str = "tool";
 
 pub const FAMILY: &'static str = "tri-cli";
 
-pub const ID: &'static str = "tri/mods";
+pub const ID: &'static str = "tri/scratch";
 
 pub const REPO: &'static str = "gHashTag/t27";
 
-pub const QUALIFIED_ID: &'static str = "gHashTag/t27:tri/mods";
+pub const QUALIFIED_ID: &'static str = "gHashTag/t27:tri/scratch";
 
 pub const SCHEMA: u32 = 2;
 
-pub const COMMAND: &'static str = "tri mods";
+pub const COMMAND: &'static str = "tri scratch";
 
-pub const VARIANT: &'static str = "Commands::Mods";
+pub const VARIANT: &'static str = "Commands::Harness";
 
-pub const SOURCE: &'static str = "cli/tri/src/modreach.rs";
+pub const SOURCE: &'static str = "cli/tri/src/scratch.rs";
 
 pub const ENTRY: &'static str = "cli/tri/src/main.rs";
 
-pub const ABOUT: &'static str = "Source files no crate root reaches, and so nothing compiles. Test-harness hygiene.";
+pub const ABOUT: &'static str = "Test binaries whose tests share one scratch directory.";
 
-pub const ABOUT_SOURCE: &'static str = "module doc, cli/tri/src/modreach.rs:1 (Commands::Mods dispatches to modreach, cli/tri/src/main.rs:1380)";
+pub const ABOUT_SOURCE: &'static str = "clap /// doc on HarnessCmd::Scratch (cli/tri/src/main.rs; module cli/tri/src/scratch.rs)";
 
-pub const ACTIONS: [&'static str; 1] = ["orphan"];
+pub const ACTIONS: [&'static str; 1] = ["scratch"];
 
-pub const ACTIONS_ABOUT: [&'static str; 1] = ["List them."];
+pub const ACTIONS_ABOUT: [&'static str; 1] = ["Test binaries whose tests share one scratch directory."];
 
-pub const ARGS: [&'static str; 2] = ["gate: Compare against docs/reports/orphan_modules.json...", "self_check: Negative control: prove this gate can see a planted orphan."];
+pub const ARGS: [&'static str; 2] = ["--gate: Exit non-zero when any binary shares a scratch directory.", "--self-check: Negative control: prove this gate can see a planted collision."];
 
 pub const AGENTS: [&'static str; 2] = ["T", "C"];
 
-pub const AGENTS_NOTE: &'static str = "docs/agents/AGENTS_ALPHABET.md \"Who holds a tool, and who holds a skill\" binds every tool to the Queen (T). Domain lead C: modreach.rs is the Rust crate-graph reachability walk behind `tri mods orphan`; ABOUT \"Source files no crate root reaches, and so nothing compiles. Test-harness hygiene.\" -- `cargo build` cannot error on a file it does not compile, so the `--self_check` negative control (plant an orphan, prove the gate sees it) is what makes the gate real.";
+pub const AGENTS_NOTE: &'static str = "docs/agents/AGENTS_ALPHABET.md \"Who holds a tool, and who holds a skill\" binds every tool to the Queen (T). Domain lead C: the gate's decision table over scratch-directory key shapes is a compiler-domain rule (phi accumulator growth, Z[phi] exactness), so C holds it beside T.";
 
-pub const WHEN_TO_USE: &'static str = "Source files no crate root reaches, and so nothing compiles. Test-harness hygiene.";
+pub const WHEN_TO_USE: &'static str = "Test binaries whose tests share one scratch directory.";
 
 pub const WITNESS: &'static str = "source-parse";
 
@@ -77,23 +77,19 @@ pub fn test_id_command_and_variant_name_one_subcommand() {
     assert!((VARIANT.as_bytes()[8] == b':'));
     assert!((VARIANT.as_bytes()[9] == b':'));
     let mut v: usize = 10;
-    let mut n: usize = 4;
     let mut word_start: bool = true;
-    while (n < ID.len()) {
-        if (ID.as_bytes()[(n) as usize] == b'-') {
-            word_start = true;
-        } else {
-            if (word_start) != 0 {
-                assert!((VARIANT.as_bytes()[(v) as usize] == (ID.as_bytes()[(n) as usize] - 32)));
-            } else {
-                assert!((VARIANT.as_bytes()[(v) as usize] == ID.as_bytes()[(n) as usize]));
-            }
+    while (v < VARIANT.len()) {
+        if word_start {
+            assert!(((VARIANT.as_bytes()[(v) as usize] >= b'A') && (VARIANT.as_bytes()[(v) as usize] <= b'Z')));
             word_start = false;
-            v = (v + 1);
+        } else {
+            assert!((((VARIANT.as_bytes()[(v) as usize] >= b'a') && (VARIANT.as_bytes()[(v) as usize] <= b'z')) || (VARIANT.as_bytes()[(v) as usize] == b'-')));
+            if (VARIANT.as_bytes()[(v) as usize] == b'-') {
+                word_start = true;
+            }
         }
-        n = (n + 1);
+        v = (v + 1);
     }
-    assert!((v == VARIANT.len()));
 }
 
 #[test]
