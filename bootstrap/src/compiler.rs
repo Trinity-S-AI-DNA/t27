@@ -27415,6 +27415,17 @@ impl RustCodegen {
         self.write_line("#[test]");
         self.write_line(&format!("pub fn {}() {{", fn_name));
         self.indent += 1;
+        // A test body is a function body to the emitter's bookkeeping. The
+        // statement loop asks `bool_vars` when lowering an `if`, and with the
+        // set left empty here every `var ok : bool = ...` local came out as a
+        // numeric `(ok) != 0` condition -- E0308 in the generated Rust tests
+        // (#14105). Populate the set exactly the way the `pub fn` path does;
+        // tests have no parameters, so only locals and module vars apply.
+        self.bool_vars.clear();
+        collect_bool_locals(&node.children, &mut self.bool_vars);
+        for name in &self.bool_module_vars {
+            self.bool_vars.insert(name.clone());
+        }
         for stmt in &node.children {
             self.gen_rust_stmt(stmt);
         }
@@ -29071,8 +29082,19 @@ impl RustCodegen {
     fn coerce_binary_operands(&self, node: &Node, left: &mut String, right: &mut String) {
         let text = |n: &Node, s: &mut String| if n.kind == NodeKind::ExprLiteral && n.extra_kind == "string" { s.insert(0, 'b') }
             else if self.rust_type_of(n).as_deref() == Some("&'static str") { s.push_str(".as_bytes()") }; // #8971: bytes meet text
-        if self.rust_type_of(&node.children[0]).as_deref() == Some("&[u8]") { text(&node.children[1], right) }
-        if self.rust_type_of(&node.children[1]).as_deref() == Some("&[u8]") { text(&node.children[0], left) }
+        // `rust_type_of` answers None for a ranged slice (`x[a..b]`): which
+        // element type a range holds is the emitter's call. Over a str base
+        // the ExprIndex arm emits `&base.as_bytes()[a..b]`, a `&[u8]`, so a
+        // str literal beside it must join the bytes or the comparison is
+        // E0277 (`&[u8] == &str`, #14105). Recognise that shape here.
+        let bytes = |n: &Node| {
+            self.rust_type_of(n).as_deref() == Some("&[u8]")
+                || (n.kind == NodeKind::ExprIndex
+                    && n.children.first().is_some_and(|b| self.rust_type_of(b).as_deref() == Some("&'static str"))
+                    && n.children.get(1).is_some_and(|i| i.extra_op == ".."))
+        };
+        if bytes(&node.children[0]) { text(&node.children[1], right) }
+        if bytes(&node.children[1]) { text(&node.children[0], left) }
         if matches!(node.extra_op.as_str(), "<<" | ">>") {
             return;
         }
