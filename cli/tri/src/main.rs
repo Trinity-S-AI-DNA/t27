@@ -18,6 +18,7 @@ mod fleet;
 mod fmtmine;
 mod fpga;
 mod gates;
+#[path = "../../../gen/rust/tri/gendet_rules.rs"] pub mod gendet_rules; // t27c gen-rust of specs/tri/gendet.t27
 mod gendet;
 mod hooks;
 mod inflight;
