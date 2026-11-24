@@ -2,8 +2,6 @@ use anyhow::{bail, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
-#[allow(dead_code, unused_parens)]
-pub use crate::fmtmine_rules::*;
 
 // Logic migrated to specs/tri/fmtmine.t27
 // Thin glue remains for CLI wiring

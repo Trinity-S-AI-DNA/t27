@@ -89,23 +89,17 @@ Provides comprehensive command-line interface with proper argument parsing and o
 
 #### Supported Commands:
 
+The verbs this manifest designed -- worktree create / enter / status / list /
+verify / checkpoint / handoff / cleanup, issue claim / progress / complete, and
+pr prepare / guard / merge -- are **not shipped**. The surfaces that resolve
+today:
+
 ```bash
-tri worktree create --issue 123
-tri worktree enter --issue 123
-tri worktree status --issue 123
-tri worktree list
-tri worktree verify --issue 123
-tri worktree checkpoint --issue 123
-tri worktree handoff --issue 123 --agent repair
-tri worktree cleanup --issue 123 --approve
-
-tri issue claim --issue 123
-tri issue progress --issue 123 --message "..."
-tri issue complete --issue 123 --evidence ...
-
-tri pr prepare --issue 123
-tri pr guard --pr 456
-tri pr merge --pr 456 --when-green
+tri worktrees                  # what the checkouts hold; deletes nothing
+tri trigit claim <issue> <sha> # claim an issue at a head (swarm lanes)
+tri issue create               # open a GitHub issue
+tri pr ready                   # classify failing checks; is the PR safe to merge
+tri land --issue 123           # merge master, gates, push, PR, auto-merge
 ```
 
 #### Performance Benchmarks:

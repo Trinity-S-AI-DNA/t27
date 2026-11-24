@@ -18,6 +18,7 @@ mod fleet;
 mod fmtmine;
 mod fpga;
 mod gates;
+#[path = "../../../gen/rust/tri/gendet.rs"] pub mod gendet_rules; // t27c gen-rust of specs/tri/gendet.t27
 mod gendet;
 mod hooks;
 mod inflight;
@@ -33,7 +34,8 @@ mod night;
 mod oneaway;
 mod payout;
 mod window;
-#[path = "../../../gen/rust/tri/modreach/modreach.rs"] #[allow(dead_code, unused_parens)] mod modreach_rules; mod modreach; // t27c gen-rust of specs/tools/tri/modreach.t27
+#[path = "../../../gen/rust/tools/tri/modreach.rs"] #[allow(dead_code, unused_parens)] mod modreach_rules; // t27c gen-rust of specs/tools/tri/modreach.t27
+mod modreach;
 mod mutate;
 mod nownote;
 mod orphaned;
@@ -80,7 +82,8 @@ mod pf; // t27c gen-rust of specs/tri/preflight/preflight.t27: the push prefligh
 mod renum;
 mod reseal;
 mod rtl;
-#[path = "../../../gen/rust/tri/scratch/scratch.rs"] #[allow(dead_code, unused_parens)] mod scratch_rules; mod scratch; // t27c gen-rust of specs/tools/tri/scratch.t27
+#[path = "../../../gen/rust/tools/tri/scratch.rs"] #[allow(dead_code, unused_parens)] mod scratch_rules; // t27c gen-rust of specs/tools/tri/scratch.t27
+mod scratch;
 mod seals;
 mod skillnum;
 mod sweep;
