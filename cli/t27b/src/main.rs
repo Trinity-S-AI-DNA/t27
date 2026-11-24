@@ -73,6 +73,8 @@ struct Opts {
     reference: Option<String>,
     reference_cache: Option<String>,
     reference_timeout_ms: u64,
+    /// `--fixture NAME=path` (#8603): file bytes injected as `FIXTURE_<NAME>` / `FIXTURE_<NAME>_LEN`.
+    fixtures: Vec<(String, String)>,
 }
 
 fn usage(msg: &str) -> ExitCode {
@@ -106,6 +108,7 @@ fn parse_args() -> Result<Opts, String> {
         reference: None,
         reference_cache: None,
         reference_timeout_ms: 300_000,
+        fixtures: Vec::new(),
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -130,6 +133,14 @@ fn parse_args() -> Result<Opts, String> {
             "--reference" => o.reference = Some(args.next().ok_or("--reference needs the t27c binary")?),
             "--reference-cache" => o.reference_cache = Some(args.next().ok_or("--reference-cache needs a path")?),
             "--reference-timeout-ms" => o.reference_timeout_ms = args.next().and_then(|s| s.parse().ok()).ok_or("--reference-timeout-ms takes a number")?,
+            "--fixture" => {
+                let kv = args.next().ok_or("--fixture needs NAME=path")?;
+                let (name, path) = kv.split_once('=').ok_or("--fixture takes NAME=path")?;
+                if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.is_empty() {
+                    return Err("--fixture NAME must be ASCII letters, digits, underscore".into());
+                }
+                o.fixtures.push((name.to_string(), path.to_string()));
+            }
             "--json" => o.json = Some(args.next().ok_or("--json needs a path")?),
             "--runner" => {
                 o.runner = args
@@ -205,6 +216,30 @@ fn compile_front(input: &str, o: &Opts) -> Result<(Program, Phases), u8> {
             return Err(EXIT_IO);
         }
     };
+    // --fixture NAME=path (#8603): inject `FIXTURE_<NAME>` bytes as consts so a spec can
+    // hash an external document at test time. A `[N]u8` array plus an explicit `..._LEN`
+    // keeps an empty file representable (LEN 0, placeholder byte); oversize is refused.
+    let mut src = src;
+    if !o.fixtures.is_empty() {
+        let mut inject = String::new();
+        for (name, fpath) in &o.fixtures {
+            const FIXTURE_MAX: u64 = 1 << 20; // a fixture is an input, not a corpus
+            let bytes = std::fs::read(fpath).map_err(|e| {
+                errln!("t27b: fixture {} ({}): {}", name, fpath, e);
+                EXIT_IO
+            })?;
+            if bytes.len() as u64 > FIXTURE_MAX {
+                errln!("t27b: fixture {} is {} bytes, over the {} cap", name, bytes.len(), FIXTURE_MAX);
+                return Err(EXIT_IO);
+            }
+            let items: Vec<String> = if bytes.is_empty() { vec!["0".into()] } else { bytes.iter().map(|b| b.to_string()).collect() };
+            inject.push_str(&format!("pub const FIXTURE_{}_LEN : usize = {};\npub const FIXTURE_{} : [{}]u8 = [{}];\n", name, bytes.len(), name, bytes.len().max(1), items.join(",")));
+        }
+        match src.find("\nmodule ") {
+            Some(at) => { let after = src[at..].find(';').map(|s| at + s + 1).unwrap_or(at); src.insert_str(after, &format!("\n{}", inject)); }
+            None => src.insert_str(0, &format!("{}\n", inject)),
+        }
+    }
     let parsed = ph.time("parse", || front::parse(&path, &src));
     let parsed = match parsed {
         Ok(p) => { p.notes.iter().for_each(|n| errln!("t27b: note: {}", n)); p }
