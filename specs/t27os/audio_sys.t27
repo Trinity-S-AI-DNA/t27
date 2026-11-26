@@ -1,0 +1,158 @@
+module T27osAudioSys;
+
+// The host calls the audio capture actor makes, one home for them, so
+// audio_capture.t27 and the binary that runs it share a declaration instead of
+// each keeping a copy. Nothing here decides anything; every decision (consent,
+// device, hysteresis) is a fn in audio_capture.t27, tested there.
+// The pattern and the calling rules are pty_sys.t27 (gHashTag/t27#8946, #10902):
+//   a slice argument is the address of its bytes, with the length riding along
+//   as one extra C argument (safe only as the last argument);
+//   a fixed-size array argument is its own address in an @extern call, but a
+//   t27 fn that takes an array gets a copy, so a caller builds the array it
+//   passes (the order is pinned by a test below, not by a helper fn);
+//   a scalar goes by value; an int result reads as i32, an ssize_t as i64.
+// Under `t27b test` an @extern call traps ("import run outside an object"),
+// exactly as in pty_sys.t27: the tests here pin the declarations, the
+// constants and the pure fail-closed helpers; the IO-shaped audio_query runs
+// only in the executable stand, where real host behaviour and the owner's
+// one-time TCC microphone click are proven (issue #14252, the pty_sys
+// filecmp stand pattern, Refs #13055). The render callback and the sample
+// plumbing are the next slice; nothing here moves audio data.
+// Every CoreAudio and AudioUnit value below was read from the macOS SDK
+// headers on this machine (Xcode MacOSX.sdk, arm64) and cites its header
+// line; none is from memory. Four-char codes pack big-endian into the u32.
+
+// ---- CoreAudio object ids and property selectors ----
+// CoreAudio.framework/Headers/AudioHardware.h:110, AudioHardwareBase.h:177.
+pub const CA_SYSTEM_OBJECT : u32 = 1;   // kAudioObjectSystemObject
+pub const CA_UNKNOWN_OBJECT : u32 = 0;  // kAudioObjectUnknown
+// AudioHardwareBase.h:203 and :207.
+pub const CA_SCOPE_GLOBAL : u32 = 1735159650;  // 'glob' kAudioObjectPropertyScopeGlobal
+pub const CA_ELEMENT_MAIN : u32 = 0;           // kAudioObjectPropertyElementMain
+// AudioHardware.h:609, AudioHardwareBase.h:739, AudioHardware.h:1000.
+pub const CA_PROP_DEFAULT_INPUT : u32 = 1682533920;  // 'dIn ' kAudioHardwarePropertyDefaultInputDevice
+pub const CA_PROP_DEVICE_ALIVE : u32 = 1818850926;   // 'livn' kAudioDevicePropertyDeviceIsAlive
+pub const CA_PROP_IS_RUNNING : u32 = 1735356005;     // 'gone' kAudioDevicePropertyDeviceIsRunningSomewhere
+
+// ---- AUHAL: the component the input tap is found through ----
+// AudioToolbox.framework/Headers/AUComponent.h:193, :297, :254.
+pub const AU_TYPE_OUTPUT : u32 = 1635086197;  // 'auou' kAudioUnitType_Output
+pub const AU_SUBTYPE_HAL : u32 = 1634230636;  // 'ahal' kAudioUnitSubType_HALOutput
+pub const AU_MAKER_APPLE : u32 = 1634758764;  // 'appl' kAudioUnitManufacturer_Apple
+// AudioToolbox.framework/Headers/AudioUnitProperties.h:2527.
+pub const AU_PROP_SET_INPUT_CALLBACK : u32 = 2005;
+
+// ---- imports: CoreAudio property reads and the AUHAL lifecycle ----
+pub fn sys_addr(dst : []u8, src : []const u8, n : u64) -> u64 { return @extern("memmove"); }
+pub fn sys_audio_get_prop(dev : u32, addr : [3]u32, qsz : u64, qdat : u64, dsz : u64, data : []u8) -> i32 { return @extern("AudioObjectGetPropertyData"); }
+pub fn sys_au_find_next(comp : u64, desc : [5]u32) -> u64 { return @extern("AudioComponentFindNext"); }
+pub fn sys_au_new(comp : u64, unit_p : u64) -> i32 { return @extern("AudioComponentInstanceNew"); }
+pub fn sys_au_set_prop(unit : u64, pid : u32, scope : u32, elem : u32, params : u64, size : u32) -> i32 { return @extern("AudioUnitSetProperty"); }
+pub fn sys_au_init(unit : u64) -> i32 { return @extern("AudioUnitInitialize"); }
+pub fn sys_au_start(unit : u64) -> i32 { return @extern("AudioOutputUnitStart"); }
+pub fn sys_au_stop(unit : u64) -> i32 { return @extern("AudioOutputUnitStop"); }
+pub fn sys_au_uninit(unit : u64) -> i32 { return @extern("AudioUnitUninitialize"); }
+pub fn sys_au_dispose(unit : u64) -> i32 { return @extern("AudioComponentInstanceDispose"); }
+
+// The AudioComponentDescription for the AUHAL input tap is built by the caller
+// as `[AU_TYPE_OUTPUT, AU_SUBTYPE_HAL, AU_MAKER_APPLE, 0, 0]` (type, subtype,
+// manufacturer, flags, mask; the flags stay zero). A helper fn cannot fill a
+// caller's array: t27 hands a fn a copy, and this spec's first run proved it.
+
+// The pure fail-closed helpers; the tests run these, the externs stay stubbed.
+
+// Zero the caller's buffer. audio_query does this BEFORE the read, so a
+// stubbed or failed read comes back as bytes 0 = kAudioObjectUnknown, which
+// audio_capture.t27 names AC_DEV_NONE: a query never invents a device.
+pub fn buf_zero(dst : []u8, n : usize) -> void {
+    var i : usize = 0;
+    while (i < n) {
+        dst[i] = 0;
+        i += 1;
+    }
+}
+
+// An object id the SDK names unknown names no device: 0 is the fail-closed id.
+pub fn audio_obj_is_known(dev : u32) -> bool {
+    return dev != CA_UNKNOWN_OBJECT;
+}
+
+// One CoreAudio property read (stand-only: it calls sys_addr, whose import
+// traps under `t27b test`): zero the caller's buffer first, build the
+// AudioObjectPropertyAddress (selector, scope, element, in that order), hand
+// the ioDataSize cell over by address (memmove with n = 0 returns dst's
+// address, pty_sys.t27), and return the raw OSStatus. The size cell holds the
+// UInt32 4 as little-endian bytes, the arm64 ABI layout. out is the result
+// buffer and n its length (counted, pty_sys.t27).
+pub fn audio_query(dev : u32, sel : u32, out : []u8, n : usize) -> i32 {
+    buf_zero(out, n);
+    var a : [3]u32 = [sel, CA_SCOPE_GLOBAL, CA_ELEMENT_MAIN];
+    var szb : [8]u8 = [4, 0, 0, 0, 0, 0, 0, 0];
+    const sz_p : u64 = sys_addr(szb[0..8], "", 0);
+    return sys_audio_get_prop(dev, a, 0, 0, sz_p, out);
+}
+
+invariant every_constant_is_its_sdk_value
+assert CA_SYSTEM_OBJECT == 1 and CA_UNKNOWN_OBJECT == 0
+assert CA_SCOPE_GLOBAL == 1735159650 and CA_ELEMENT_MAIN == 0
+assert CA_PROP_DEFAULT_INPUT == 1682533920 and CA_PROP_DEVICE_ALIVE == 1818850926
+assert CA_PROP_IS_RUNNING == 1735356005 and AU_TYPE_OUTPUT == 1635086197
+assert AU_SUBTYPE_HAL == 1634230636 and AU_MAKER_APPLE == 1634758764
+
+invariant a_failed_or_stubbed_read_lands_on_the_unknown_id
+assert CA_UNKNOWN_OBJECT == 0 and CA_ELEMENT_MAIN == 0
+assert AU_PROP_SET_INPUT_CALLBACK == 2005
+
+test the_imports_are_declared {
+    var b : [4]u8 = undefined;
+    b[0] = 1;
+    assert(b[0] == 1);
+}
+
+test the_constants_carry_their_sdk_values {
+    assert(CA_SYSTEM_OBJECT == 1);
+    assert(CA_UNKNOWN_OBJECT == 0);
+    assert(CA_SCOPE_GLOBAL == 1735159650);
+    assert(CA_ELEMENT_MAIN == 0);
+    assert(CA_PROP_DEFAULT_INPUT == 1682533920);
+    assert(CA_PROP_DEVICE_ALIVE == 1818850926);
+    assert(CA_PROP_IS_RUNNING == 1735356005);
+    assert(AU_TYPE_OUTPUT == 1635086197);
+    assert(AU_SUBTYPE_HAL == 1634230636);
+    assert(AU_MAKER_APPLE == 1634758764);
+    assert(AU_PROP_SET_INPUT_CALLBACK == 2005);
+}
+
+test the_auhal_description_order_is_pinned {
+    var d : [5]u32 = [AU_TYPE_OUTPUT, AU_SUBTYPE_HAL, AU_MAKER_APPLE, 0, 0];
+    assert(d[0] == 1635086197);
+    assert(d[1] == 1634230636);
+    assert(d[2] == 1634758764);
+    assert(d[3] == 0);
+    assert(d[4] == 0);
+}
+
+test an_unknown_object_id_is_not_a_device {
+    assert(audio_obj_is_known(0) == false);
+    assert(audio_obj_is_known(1) == true);
+    assert(audio_obj_is_known(43) == true);
+}
+
+test a_zeroed_buffer_reads_as_no_device {
+    var out : [4]u8 = [255, 255, 255, 255];
+    buf_zero(out[0..4], 4);
+    assert(out[0] == 0);
+    assert(out[1] == 0);
+    assert(out[2] == 0);
+    assert(out[3] == 0);
+    assert(audio_obj_is_known((out[0] as u32)) == false);
+}
+
+test negative_control_the_glue_never_invents_a_device {
+    var out : [4]u8 = [255, 255, 255, 255];
+    buf_zero(out[0..4], 4);
+    assert(out[0] == 0);
+    assert((out[0] as u32) == CA_UNKNOWN_OBJECT);
+    assert(audio_obj_is_known(CA_UNKNOWN_OBJECT) == false);
+    assert(audio_obj_is_known(CA_SYSTEM_OBJECT) == true);
+}
