@@ -1,0 +1,349 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/audio_capture.t27 -- the microphone capture decisions of the Live Translator
+; (issue #14252, epic #14250). Decisions only: consent, device, start/stop, the level
+; cadence and the peak/mean-square window. The @extern host glue and the plist key are the
+; recorded next step (T2b); nothing here touches transport, UI or a provider.
+; --
+; THE LAW. Capture runs only when consent is GRANTED and the device is PRESENT, and both
+; gates are checked in that order: the human gate precedes the hardware gate. Fails closed,
+; three ways. An unreadable device state means NO_MIC, never a guess (the devices.t27 "-"
+; convention: an unreadable number is not a fake 0). Consent not explicitly GRANTED --
+; unknown or DENIED -- means NO_CONSENT, and capture never starts. And a refused decision
+; changes nothing: every refusal returns its named code and leaves the machine as it was.
+; The world can take either gate away at any moment: losing the device or having consent
+; revoked while running stops the capture and frees the device, fail closed, and says which
+; gate fell (the return code names it).
+; --
+; THE LEVELS. Levels arrive on a named cadence, AC_LEVEL_EVERY_TICKS, and are computed over
+; a window of at most AC_WIN_MAX samples, each at most AC_MAX_SAMPLE: a longer window, an
+; empty window or an out-of-range sample is refused (ok=false), not truncated, so the sum of
+; squares cannot overflow and no dishonest number is produced. The window reports the peak
+; sample and the integer mean square (sum of squares divided by count; the remainder is
+; dropped, so the estimate is honest and slightly low). The speech gate carries hysteresis:
+; it turns on at AC_ON_MS2, off at AC_OFF_MS2, holds between the two thresholds, and a
+; refused window never flips it -- no fake level ever starts a segment (the gate feeds the
+; T1 segment lifecycle, specs/t27os/translator_model.t27).
+; --
+; Purity: every function here is a pure function of its arguments. No @extern, no transport,
+; no UI, no provider calls. The owner's one-time TCC click is the only runtime gate, and it
+; is physical, not a code gate (issue #14252). ASCII only (L3).
+; phi^2 + 1/phi^2 = 3 | TRINITY
+
+module T27osAudioCapture;
+
+/// Capture states: idle, running, stopped (a stopped capture frees the device).
+pub const AC_IDLE : u8 = 0;
+pub const AC_RUNNING : u8 = 1;
+pub const AC_STOPPED : u8 = 2;
+
+/// Consent, as the TCC world reports it: only an explicit grant opens the human gate.
+pub const AC_CONSENT_UNKNOWN : u8 = 0;
+pub const AC_CONSENT_GRANTED : u8 = 1;
+pub const AC_CONSENT_DENIED : u8 = 2;
+
+/// Device presence: none, present, or present-but-unreadable (which is no mic, not a guess).
+pub const AC_DEV_NONE : u8 = 0;
+pub const AC_DEV_PRESENT : u8 = 1;
+pub const AC_DEV_UNREADABLE : u8 = 2;
+
+/// Accept, or refuse with the reason named. Refused means changed nothing.
+pub const AC_OK : u8 = 0;
+pub const AC_NO_CONSENT : u8 = 1;
+pub const AC_NO_MIC : u8 = 2;
+pub const AC_WRONG_STATE : u8 = 3;
+pub const AC_BAD_ARG : u8 = 4;
+
+/// The level cadence and the window shape: named constants, tested, never magic numbers.
+pub const AC_LEVEL_EVERY_TICKS : u32 = 3;
+pub const AC_WIN_MAX : usize = 64;
+pub const AC_MAX_SAMPLE : u16 = 4095;
+
+/// Speech-gate hysteresis thresholds in mean-square units: on above AC_ON_MS2, off at or
+/// below AC_OFF_MS2, hold in between.
+pub const AC_ON_MS2 : u32 = 1000000;
+pub const AC_OFF_MS2 : u32 = 250000;
+
+/// One capture decision machine: state, consent, device. No clock, no buffers, no host.
+pub struct CaptureState {
+    state : u8,
+    consent : u8,
+    device : u8,
+}
+
+/// One level window: honest or refused (ok=false means no level, never a fake one).
+pub struct ACWin {
+    ok : bool,
+    peak : u16,
+    mean_square : u32,
+}
+
+/// A fresh machine sits idle with no consent known and no device.
+pub fn new_capture() -> CaptureState {
+    return CaptureState { state: AC_IDLE, consent: AC_CONSENT_UNKNOWN, device: AC_DEV_NONE };
+}
+
+/// Records the consent state. An invalid value is refused; revoking while running stops the
+/// capture and frees the device, and the return code names the gate that fell.
+pub fn ac_set_consent(s : *CaptureState, c : u8) -> u8 {
+    if (c > AC_CONSENT_DENIED) { return AC_BAD_ARG; }
+    s.consent = c;
+    if (c != AC_CONSENT_GRANTED and s.state == AC_RUNNING) {
+        s.state = AC_STOPPED;
+        s.device = AC_DEV_NONE;
+        return AC_NO_CONSENT;
+    }
+    return AC_OK;
+}
+
+/// Records the device state. An invalid value is refused; losing the device while running
+/// stops the capture and frees it, and the return code names the gate that fell.
+pub fn ac_set_device(s : *CaptureState, d : u8) -> u8 {
+    if (d > AC_DEV_UNREADABLE) { return AC_BAD_ARG; }
+    s.device = d;
+    if (d != AC_DEV_PRESENT and s.state == AC_RUNNING) {
+        s.state = AC_STOPPED;
+        return AC_NO_MIC;
+    }
+    return AC_OK;
+}
+
+/// Starts capture: consent first, then device, then state. Every gate refused is named and
+/// changes nothing.
+pub fn ac_start(s : *CaptureState) -> u8 {
+    if (s.consent != AC_CONSENT_GRANTED) { return AC_NO_CONSENT; }
+    if (s.device != AC_DEV_PRESENT) { return AC_NO_MIC; }
+    if (s.state == AC_RUNNING) { return AC_WRONG_STATE; }
+    s.state = AC_RUNNING;
+    return AC_OK;
+}
+
+/// Stops a running capture and frees the device: the next start needs consent, device and a
+/// fresh enumeration. Stopping anything but a running capture is refused.
+pub fn ac_stop(s : *CaptureState) -> u8 {
+    if (s.state != AC_RUNNING) { return AC_WRONG_STATE; }
+    s.state = AC_STOPPED;
+    s.device = AC_DEV_NONE;
+    return AC_OK;
+}
+
+/// Whether this tick is a level tick: levels arrive only on the stated cadence.
+pub fn ac_due(tick : u32) -> bool {
+    return tick % AC_LEVEL_EVERY_TICKS == 0;
+}
+
+/// Computes one honest window or refuses it: empty, too long or out-of-range means ok=false
+/// and no numbers, never a fake level.
+pub fn ac_window(samples : []const u16) -> ACWin {
+    if (samples.len == 0) { return ACWin { ok: false, peak: 0, mean_square: 0 }; }
+    if (samples.len > AC_WIN_MAX) { return ACWin { ok: false, peak: 0, mean_square: 0 }; }
+    var sum : u32 = 0;
+    var peak : u16 = 0;
+    var i : usize = 0;
+    while (i < samples.len) {
+        const v : u16 = samples[i];
+        if (v > AC_MAX_SAMPLE) { return ACWin { ok: false, peak: 0, mean_square: 0 }; }
+        const sq : u32 = (v as u32) * (v as u32);
+        sum = sum + sq;
+        if (v > peak) { peak = v; }
+        i = i + 1;
+    }
+    return ACWin { ok: true, peak: peak, mean_square: sum / (samples.len as u32) };
+}
+
+/// The speech gate with hysteresis: on at AC_ON_MS2, off at or below AC_OFF_MS2, hold in
+/// between, and a refused window holds -- no fake level ever flips the gate.
+pub fn ac_gate(active : bool, w : ACWin) -> bool {
+    if (w.ok == false) { return active; }
+    if (active == false and w.mean_square >= AC_ON_MS2) { return true; }
+    if (active == true and w.mean_square <= AC_OFF_MS2) { return false; }
+    return active;
+}
+
+invariant the_hysteresis_band_is_real
+    assert AC_OFF_MS2 < AC_ON_MS2 and AC_LEVEL_EVERY_TICKS > 0 and AC_WIN_MAX >= 1
+
+invariant every_refusal_is_named_and_nonzero
+    assert AC_OK == 0 and AC_NO_CONSENT > 0 and AC_NO_MIC > 0 and AC_WRONG_STATE > 0 and AC_BAD_ARG > 0
+
+// ---- tests ----
+
+test the_states_codes_and_thresholds_hold {
+    assert_eq(AC_IDLE, 0);
+    assert_eq(AC_RUNNING, 1);
+    assert_eq(AC_STOPPED, 2);
+    assert_eq(AC_OK, 0);
+    assert_eq(AC_NO_CONSENT, 1);
+    assert_eq(AC_NO_MIC, 2);
+    assert_eq(AC_WRONG_STATE, 3);
+    assert_eq(AC_BAD_ARG, 4);
+    assert_eq(AC_LEVEL_EVERY_TICKS, 3);
+    assert_eq(AC_WIN_MAX, 64);
+    assert_eq(AC_MAX_SAMPLE, 4095);
+    assert_eq(AC_OFF_MS2 < AC_ON_MS2, true);
+}
+
+test a_fresh_capture_is_idle_without_consent_or_device {
+    var s : CaptureState = new_capture();
+    assert_eq(s.state, AC_IDLE);
+    assert_eq(s.consent, AC_CONSENT_UNKNOWN);
+    assert_eq(s.device, AC_DEV_NONE);
+}
+
+test start_never_runs_without_explicit_consent {
+    var s : CaptureState = new_capture();
+    // consent unknown: not granted is refused, the human gate is never guessed open
+    assert_eq(ac_start(&s), AC_NO_CONSENT);
+    assert_eq(s.state, AC_IDLE);
+    // consent denied: refused the same way, still nothing running
+    assert_eq(ac_set_consent(&s, AC_CONSENT_DENIED), AC_OK);
+    assert_eq(ac_start(&s), AC_NO_CONSENT);
+    assert_eq(s.state, AC_IDLE);
+    // and an invalid consent value is refused as an argument, machine untouched
+    assert_eq(ac_set_consent(&s, 9), AC_BAD_ARG);
+    assert_eq(s.consent, AC_CONSENT_DENIED);
+}
+
+test an_unreadable_device_is_no_mic_and_a_missing_device_is_no_mic {
+    var s : CaptureState = new_capture();
+    assert_eq(ac_set_consent(&s, AC_CONSENT_GRANTED), AC_OK);
+    // no device: refused, fail closed
+    assert_eq(ac_start(&s), AC_NO_MIC);
+    assert_eq(s.state, AC_IDLE);
+    // present-but-unreadable: the same refusal, never a guess
+    assert_eq(ac_set_device(&s, AC_DEV_UNREADABLE), AC_OK);
+    assert_eq(ac_start(&s), AC_NO_MIC);
+    assert_eq(s.state, AC_IDLE);
+    // an invalid device value is refused as an argument
+    assert_eq(ac_set_device(&s, 7), AC_BAD_ARG);
+    assert_eq(s.device, AC_DEV_UNREADABLE);
+}
+
+test the_happy_path_runs_and_double_start_is_refused {
+    var s : CaptureState = new_capture();
+    assert_eq(ac_set_consent(&s, AC_CONSENT_GRANTED), AC_OK);
+    assert_eq(ac_set_device(&s, AC_DEV_PRESENT), AC_OK);
+    assert_eq(ac_start(&s), AC_OK);
+    assert_eq(s.state, AC_RUNNING);
+    // a second start is a state error, and the machine keeps running
+    assert_eq(ac_start(&s), AC_WRONG_STATE);
+    assert_eq(s.state, AC_RUNNING);
+}
+
+test losing_a_gate_while_running_fails_closed_and_frees_the_device {
+    // device lost while running: stopped, and the code names the gate that fell
+    var s : CaptureState = new_capture();
+    assert_eq(ac_set_consent(&s, AC_CONSENT_GRANTED), AC_OK);
+    assert_eq(ac_set_device(&s, AC_DEV_PRESENT), AC_OK);
+    assert_eq(ac_start(&s), AC_OK);
+    assert_eq(ac_set_device(&s, AC_DEV_UNREADABLE), AC_NO_MIC);
+    assert_eq(s.state, AC_STOPPED);
+    // consent revoked while running: the same fail-closed stop, the other gate named
+    var t : CaptureState = new_capture();
+    assert_eq(ac_set_consent(&t, AC_CONSENT_GRANTED), AC_OK);
+    assert_eq(ac_set_device(&t, AC_DEV_PRESENT), AC_OK);
+    assert_eq(ac_start(&t), AC_OK);
+    assert_eq(ac_set_consent(&t, AC_CONSENT_DENIED), AC_NO_CONSENT);
+    assert_eq(t.state, AC_STOPPED);
+    // and after either stop, nothing starts until every gate is earned again
+    assert_eq(ac_start(&t), AC_NO_CONSENT);
+}
+
+test stop_runs_only_while_running_and_frees_the_device {
+    var s : CaptureState = new_capture();
+    // stopping an idle machine is a state error, nothing changed
+    assert_eq(ac_stop(&s), AC_WRONG_STATE);
+    assert_eq(s.state, AC_IDLE);
+    // stop while running: freed, so the next start needs a fresh device enumeration
+    assert_eq(ac_set_consent(&s, AC_CONSENT_GRANTED), AC_OK);
+    assert_eq(ac_set_device(&s, AC_DEV_PRESENT), AC_OK);
+    assert_eq(ac_start(&s), AC_OK);
+    assert_eq(ac_stop(&s), AC_OK);
+    assert_eq(s.state, AC_STOPPED);
+    assert_eq(s.device, AC_DEV_NONE);
+    assert_eq(ac_start(&s), AC_NO_MIC);
+    // stopping a stopped machine is a state error
+    assert_eq(ac_stop(&s), AC_WRONG_STATE);
+}
+
+test levels_arrive_only_on_the_stated_cadence {
+    assert_eq(ac_due(0), true);
+    assert_eq(ac_due(1), false);
+    assert_eq(ac_due(2), false);
+    assert_eq(ac_due(3), true);
+    assert_eq(ac_due(5), false);
+    assert_eq(ac_due(6), true);
+}
+
+test a_window_reports_peak_and_mean_square_or_refuses {
+    var none : [0]u16 = [];
+    var w0 : ACWin = ac_window(none[0..0]);
+    assert_eq(w0.ok, false);
+    var two : [2]u16 = [100, 200];
+    var w1 : ACWin = ac_window(two[0..2]);
+    assert_eq(w1.ok, true);
+    assert_eq(w1.peak, 200);
+    assert_eq(w1.mean_square, 25000);
+    // an out-of-range sample refuses the whole window, no truncation, no fake level
+    var bad : [1]u16 = [4096];
+    var w2 : ACWin = ac_window(bad[0..1]);
+    assert_eq(w2.ok, false);
+    // the full-scale window is honest arithmetic: 4095^2 = 16769025
+    var full : [2]u16 = [4095, 4095];
+    var w3 : ACWin = ac_window(full[0..2]);
+    assert_eq(w3.ok, true);
+    assert_eq(w3.peak, 4095);
+    assert_eq(w3.mean_square, 16769025);
+    // a window longer than AC_WIN_MAX is refused, so the sum of squares cannot overflow
+    var big : [65]u16 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var w4 : ACWin = ac_window(big[0..65]);
+    assert_eq(w4.ok, false);
+}
+
+test the_speech_gate_only_flips_at_its_thresholds {
+    var loud : ACWin = ACWin { ok: true, peak: 2000, mean_square: 4000000 };
+    var mid : ACWin = ACWin { ok: true, peak: 700, mean_square: 490000 };
+    var quiet : ACWin = ACWin { ok: true, peak: 100, mean_square: 10000 };
+    var refused : ACWin = ACWin { ok: false, peak: 0, mean_square: 0 };
+    // exactly at the on threshold: activates; exactly at the off threshold: deactivates
+    var at_on : ACWin = ACWin { ok: true, peak: 1000, mean_square: 1000000 };
+    var at_off : ACWin = ACWin { ok: true, peak: 500, mean_square: 250000 };
+    assert_eq(ac_gate(false, at_on), true);
+    assert_eq(ac_gate(true, at_off), false);
+    // inside the band the gate holds, whichever side it is on
+    assert_eq(ac_gate(false, mid), false);
+    assert_eq(ac_gate(true, mid), true);
+    // loud opens, quiet closes
+    assert_eq(ac_gate(false, loud), true);
+    assert_eq(ac_gate(true, quiet), false);
+    // a refused window never flips the gate: no fake level starts or stops a segment
+    assert_eq(ac_gate(false, refused), false);
+    assert_eq(ac_gate(true, refused), true);
+}
+
+test negative_control_no_refusal_ever_fakes_a_state {
+    // control 1: consent denied, mic present -- start is still refused, nothing runs
+    var a : CaptureState = new_capture();
+    assert_eq(ac_set_consent(&a, AC_CONSENT_DENIED), AC_OK);
+    assert_eq(ac_set_device(&a, AC_DEV_PRESENT), AC_OK);
+    assert_eq(ac_start(&a), AC_NO_CONSENT);
+    assert_eq(a.state, AC_IDLE);
+    // control 2: consent granted, device unreadable -- refused the other way, still idle
+    var b : CaptureState = new_capture();
+    assert_eq(ac_set_consent(&b, AC_CONSENT_GRANTED), AC_OK);
+    assert_eq(ac_set_device(&b, AC_DEV_UNREADABLE), AC_OK);
+    assert_eq(ac_start(&b), AC_NO_MIC);
+    assert_eq(b.state, AC_IDLE);
+    // control 3: a refused window never flips the gate, either direction
+    var refused : ACWin = ACWin { ok: false, peak: 0, mean_square: 0 };
+    assert_eq(ac_gate(false, refused), false);
+    assert_eq(ac_gate(true, refused), true);
+    // contrast: the very same machine starts once every gate is earned honestly
+    assert_eq(ac_set_consent(&b, AC_CONSENT_GRANTED), AC_OK);
+    assert_eq(ac_set_device(&b, AC_DEV_PRESENT), AC_OK);
+    assert_eq(ac_start(&b), AC_OK);
+    assert_eq(b.state, AC_RUNNING);
+    // and the two refusals meant different gates: consent fell for a, device fell for b
+    assert_eq(a.consent, AC_CONSENT_DENIED);
+    assert_eq(b.consent, AC_CONSENT_GRANTED);
+    assert_eq(b.device, AC_DEV_PRESENT);
+}
