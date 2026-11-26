@@ -1,0 +1,406 @@
+use t27os::keysync_host::ks_sha256;
+use t27os::keysync_host::ks_verify;
+use t27os::directory_wire::dw_init;
+use t27os::directory_wire::dw_payload;
+use t27os::directory_wire::dw_sign;
+use t27os::directory_wire::dw_verify;
+use t27os::directory_wire::dw_canonical;
+use t27os::directory_wire::dw_reply;
+use t27os::directory_wire::dw_u32;
+use t27os::directory_wire::DW_HEADER;
+use t27os::directory_wire::DW_MAX;
+use t27os::directory_wire::DW_PUBLIC;
+use t27os::directory_wire::DW_TARGET;
+use t27os::directory_wire::DW_HASH;
+use t27os::directory_wire::DW_SIGLEN;
+use t27os::directory_wire::DW_LENGTH;
+use t27os::directory_wire::DW_SIGNATURE;
+use t27os::keysync_host::ks_gen_pair;
+use t27os::keysync_host::ks_sign;
+use t27os::call_crypto_probe::ckh_rand;
+use t27os::call_core::ck_wipe;
+use t27os::call_core::ck_same;
+use t27os::call_core::get_u64;
+use t27os::call_core::put_u64;
+fn qp_socket(a:i32,b:i32,c:i32)->i32 {
+    return @extern("socket");
+}
+fn qp_connect(fd:i32,sa:[]const u8,n:u32)->i32 {
+    return @extern("connect");
+}
+fn qp_read(fd:i32,b:[]u8,n:u64)->i64 {
+    return @extern("read");
+}
+fn qp_write(fd:i32,b:[]const u8,n:u64)->i64 {
+    return @extern("write");
+}
+fn qp_close(fd:i32)->i32 {
+    return @extern("close");
+}
+fn qp_alarm(n:u32)->u32 {
+    return @extern("alarm");
+}
+fn qp_note(s:[]const u8)->void {
+    qp_write(1,s,@as(u64,s.len));
+    qp_write(1,"\n",1);
+}
+fn qp_line(b:[]u8,at:usize,s:[]const u8)->usize {
+    var i:usize=0;
+    while(i<s.len) {
+        b[at+i]=s[i];
+        i=i+1;
+    }
+    b[at+s.len]=13;
+    b[at+s.len+1]=10;
+    return at+s.len+2;
+}
+fn qp_all(fd:i32,b:[]const u8)->bool {
+    var at:usize=0;
+    while(at<b.len) {
+        const n:i64=qp_write(fd,b[at..b.len],@as(u64,b.len-at));
+        if(n<=0) {
+            return false;
+        }
+        at=at+@as(usize,@intCast(n));
+    }
+    return true;
+}
+fn qp_http(packet:[]const u8,response:[]u8)->usize {
+    const fd:i32=qp_socket(2,1,0);
+    if(fd<0) {
+        return 0;
+    }
+    var sa:[16]u8=undefined;
+    ck_wipe(sa[0..16]);
+    sa[0]=16;
+    sa[1]=2;
+    sa[2]=192;
+    sa[3]=148;
+    sa[4]=127;
+    sa[7]=1;
+    if(qp_connect(fd,sa[0..16],16)!=0) {
+        qp_close(fd);
+        return 0;
+    }
+    var head:[512]u8=undefined;
+    var at:usize=qp_line(head[0..512],0,"POST /t27 HTTP/1.1");
+    at=qp_line(head[0..512],at,"Host: 127.0.0.1");
+    const prefix:[]const u8="Content-Length: ";
+    var i:usize=0;
+    while(i<prefix.len) {
+        head[at+i]=prefix[i];
+        i=i+1;
+    }
+    at=at+prefix.len;
+    var digits:[12]u8=undefined;
+    var count:usize=0;
+    var value:usize=packet.len;
+    while(true) {
+        digits[count]=@as(u8,@intCast(value%10))+48;
+        count=count+1;
+        value=value/10;
+        if(value==0) {
+            break;
+        }
+    }
+    while(count>0) {
+        count=count-1;
+        head[at]=digits[count];
+        at=at+1;
+    }
+    head[at]=13;
+    head[at+1]=10;
+    at=at+2;
+    at=qp_line(head[0..512],at,"Connection: close");
+    head[at]=13;
+    head[at+1]=10;
+    at=at+2;
+    if(!qp_all(fd,head[0..at]) or !qp_all(fd,packet)) {
+        qp_close(fd);
+        return 0;
+    }
+    var raw:[65536]u8=undefined;
+    var used:usize=0;
+    while(used<65536) {
+        const n:i64=qp_read(fd,raw[used..65536],@as(u64,65536-used));
+        if(n<0) {
+            qp_close(fd);
+            return 0;
+        }
+        if(n==0) {
+            break;
+        }
+        used=used+@as(usize,@intCast(n));
+    }
+    qp_close(fd);
+    if(used<16 or raw[9]!=50 or raw[10]!=48 or raw[11]!=48) {
+        return 0;
+    }
+    i=0;
+    while(i+3<used) {
+        if(raw[i]==13 and raw[i+1]==10 and raw[i+2]==13 and raw[i+3]==10) {
+            const start:usize=i+4;
+            const length:usize=used-start;
+            if(length>response.len) {
+                return 0;
+            }
+            i=0;
+            while(i<length) {
+                response[i]=raw[start+i];
+                i=i+1;
+            }
+            return length;
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn qp_user(user:[]u8)->bool {
+    ck_wipe(user);
+    return ks_gen_pair(user[0..97],user[97..162]) and ckh_rand(user[176..192]);
+}
+fn qp_request(user:[]u8,peer:[]const u8,op:u8,flags:u8,nonce:[]const u8,body:[]const u8,out:[]u8)->usize {
+    var packet:[32768]u8=undefined;
+    if(!dw_init(packet[0..32768],op,flags,user[176..192],user[97..162],peer)) {
+        return 0;
+    }
+    const seq:u64=get_u64(user,192)+1;
+    put_u64(user,192,seq);
+    const n:usize=dw_payload(packet[0..32768],seq,get_u64(user,200),nonce,body);
+    if(n==0) {
+        return 0;
+    }
+    if(op!=1 and !dw_sign(packet[0..n],user[0..97])) {
+        return 0;
+    }
+    const got:usize=qp_http(packet[0..n],out);
+    if(!dw_reply(out[0..got],user[176..192],seq) or out[6]!=op) {
+        return 0;
+    }
+    if(get_u64(out,32)>0) {
+        put_u64(user,200,get_u64(out,32));
+    }
+    return got;
+}
+fn qp_register(user:[]u8,out:[]u8)->bool {
+    if(qp_request(user,user[0..0],1,0,user[0..0],user[0..0],out)!=64 or out[5]!=1) {
+        return false;
+    }
+    var nonce:[16]u8=undefined;
+    var i:usize=0;
+    while(i<16) {
+        nonce[i]=out[40+i];
+        i=i+1;
+    }
+    i=0;
+    while(i<16) {
+        user[224+i]=nonce[i];
+        i=i+1;
+    }
+    put_u64(user,240,get_u64(out,32));
+    return qp_request(user,user[0..0],2,0,nonce[0..16],user[0..0],out)==64 and out[5]==2;
+}
+fn qp_poll(user:[]u8,out:[]u8,ack:bool)->usize {
+    var body:[8]u8=undefined;
+    put_u64(body[0..8],0,get_u64(user,208));
+    const n:usize=qp_request(user,user[0..0],3,0,user[0..0],body[0..8],out);
+    if(n>=64 and out[5]==3 and ack and get_u64(out,40)>0) {
+        put_u64(user,208,get_u64(out,40));
+    }
+    return n;
+}
+fn qp_consumed_nonce(user:[]u8,out:[]u8)->bool {
+    var packet:[32768]u8=undefined;
+    if(!dw_init(packet[0..32768],2,0,user[176..192],user[97..162],user[0..0])) {
+        return false;
+    }
+    const seq:u64=get_u64(user,192)+1;
+    put_u64(user,192,seq);
+    const n:usize=dw_payload(packet[0..32768],seq,get_u64(user,240),user[224..240],user[0..0]);
+    if(n!=304 or !dw_sign(packet[0..n],user[0..97])) {
+        return false;
+    }
+    const got:usize=qp_http(packet[0..n],out);
+    return got==64 and dw_reply(out[0..got],user[176..192],seq) and out[5]==22;
+}
+fn qp_bad_registration(a:[]u8,b:[]u8,out:[]u8)->bool {
+    if(qp_request(a,a[0..0],1,0,a[0..0],a[0..0],out)!=64 or out[5]!=1) {
+        return false;
+    }
+    var nonce:[16]u8=undefined;
+    var i:usize=0;
+    while(i<16) {
+        nonce[i]=out[40+i];
+        i=i+1;
+    }
+    var packet:[32768]u8=undefined;
+    if(!dw_init(packet[0..32768],2,0,a[176..192],a[97..162],a[0..0])) {
+        return false;
+    }
+    const seq:u64=get_u64(a,192)+1;
+    put_u64(a,192,seq);
+    const n:usize=dw_payload(packet[0..32768],seq,get_u64(a,200),nonce[0..16],a[0..0]);
+    if(n!=304 or dw_sign(packet[0..n],b[0..97])) {
+        return false;
+    }
+    // Deliberate owned negative: a valid B signature claiming public A must fail on Linux.
+    var canonical:[222]u8=undefined;
+    var signature:[128]u8=undefined;
+    if(!dw_canonical(packet[0..n],canonical[0..222])) {
+        return false;
+    }
+    const count:usize=ks_sign(b[0..97],canonical[0..222],signature[0..128]);
+    if(count<8 or count>80) {
+        return false;
+    }
+    packet[218]=@as(u8,@intCast(count));
+    packet[219]=0;
+    i=0;
+    while(i<count) {
+        packet[224+i]=signature[i];
+        i=i+1;
+    }
+    const got:usize=qp_http(packet[0..n],out);
+    return got==64 and dw_reply(out[0..got],a[176..192],seq) and out[5]==23;
+}
+fn qp_replayed_sequence(user:[]u8,peer:[]const u8,out:[]u8)->bool {
+    var packet:[32768]u8=undefined;
+    if(!dw_init(packet[0..32768],4,0,user[176..192],user[97..162],peer)) {
+        return false;
+    }
+    const seq:u64=get_u64(user,192);
+    const n:usize=dw_payload(packet[0..32768],seq,get_u64(user,200),user[0..0],user[0..0]);
+    if(n!=304 or !dw_sign(packet[0..n],user[0..97])) {
+        return false;
+    }
+    const got:usize=qp_http(packet[0..n],out);
+    return got==64 and dw_reply(out[0..got],user[176..192],seq) and out[5]==25;
+}
+pub fn main()->i32 {
+    qp_alarm(40);
+    var users:[768]u8=undefined;
+    var out:[65536]u8=undefined;
+    if(!qp_user(users[0..256]) or !qp_user(users[256..512]) or !qp_user(users[512..768])) {
+        return 1;
+    }
+    if(ck_same(users[97..162],users[353..418])) {
+        return 2;
+    }
+    if(!qp_bad_registration(users[0..256],users[256..512],out[0..65536])) {
+        return 20;
+    }
+    qp_note("PASS valid signature under wrong real P256 principal refused");
+    if(!qp_register(users[0..256],out[0..65536]) or !qp_register(users[256..512],out[0..65536]) or !qp_register(users[512..768],out[0..65536])) {
+        return 3;
+    }
+    qp_note("PASS three real ephemeral principals registered by P256 nonce possession proof");
+    if(qp_request(users[0..256],users[353..418],4,0,users[0..0],users[0..0],out[0..65536])!=64 or out[5]!=4) {
+        return 4;
+    }
+    if(!qp_replayed_sequence(users[0..256],users[353..418],out[0..65536])) {
+        return 21;
+    }
+    if(!qp_consumed_nonce(users[0..256],out[0..65536])) {
+        return 5;
+    }
+    qp_note("PASS exact-key lookup and consumed/unknown registration nonce rejection");
+    const prior_expiry:u64=get_u64(users[0..256],200);
+    put_u64(users[0..256],200,1);
+    if(qp_request(users[0..256],users[0..0],3,0,users[0..0],users[0..0],out[0..65536])!=64 or out[5]!=24) {
+        return 22;
+    }
+    put_u64(users[0..256],200,prior_expiry);
+    qp_note("PASS replayed request sequence and expired lease refused");
+    var advertisement:[19]u8=undefined;ck_wipe(advertisement[0..19]);
+    advertisement[0]=1;advertisement[11]=255;advertisement[12]=255;
+    advertisement[13]=192;advertisement[14]=168;advertisement[15]=1;advertisement[16]=3;
+    advertisement[17]=194;advertisement[18]=237;
+    if(qp_request(users[256..512],users[353..418],9,0,users[0..0],advertisement[0..19],out[0..65536])!=64 or out[5]!=11){return 30;}
+    if(qp_request(users[0..256],users[353..418],4,0,users[0..0],users[0..0],out[0..65536])!=387 or out[5]!=4){return 31;}
+    if(!dw_verify(out[64..387],users[353..418],users[353..418])){return 32;}
+    out[64+304+16]=4;
+    if(dw_verify(out[64..387],users[353..418],users[353..418])){return 33;}
+    advertisement[13]=169;advertisement[14]=254;
+    if(qp_request(users[256..512],users[353..418],9,0,users[0..0],advertisement[0..19],out[0..65536])!=64 or out[5]!=20){return 34;}
+    qp_note("PASS full-key signed leased candidate lookup, altered proof and metadata endpoint refused");
+
+    if(qp_request(users[0..256],users[353..418],5,0,users[0..0],users[0..0],out[0..65536])!=64 or out[5]!=5) {
+        return 6;
+    }
+    var room:[16]u8=undefined;
+    var i:usize=0;
+    while(i<16) {
+        room[i]=out[40+i];
+        i=i+1;
+    }
+    if(qp_request(users[0..256],users[353..418],6,0,room[0..16],users[0..0],out[0..65536])!=64 or out[5]!=6) {
+        return 7;
+    }
+    const invitation:usize=qp_poll(users[256..512],out[0..65536],true);
+    if(invitation!=453 or out[64]!=1 or !dw_verify(out[149..453],users[97..162],users[353..418])) {
+        return 8;
+    }
+    if(qp_request(users[512..768],users[97..162],6,0,room[0..16],users[0..0],out[0..65536])!=64 or out[5]!=26) {
+        return 9;
+    }
+    if(qp_request(users[256..512],users[97..162],6,0,room[0..16],users[0..0],out[0..65536])!=64 or out[5]!=7) {
+        return 10;
+    }
+    const ready:usize=qp_poll(users[0..256],out[0..65536],true);
+    if(ready!=453 or out[64]!=2 or !dw_verify(out[149..453],users[353..418],users[97..162])) {
+        return 11;
+    }
+    qp_note("PASS mutual signed room consent, exact friend proof, wrong participant refused");
+    var payload:[54]u8=undefined;
+    payload[0]=52;
+    payload[1]=0;
+    i=2;
+    while(i<54) {
+        payload[i]=90;
+        i=i+1;
+    }
+    if(qp_request(users[0..256],users[353..418],7,1,room[0..16],payload[0..54],out[0..65536])!=64 or out[5]!=10) {
+        return 12;
+    }
+    const received:usize=qp_poll(users[256..512],out[0..65536],false);
+    if(received!=201 or out[64]!=3 or out[65]!=1) {
+        return 13;
+    }
+    i=149;
+    while(i<201) {
+        if(out[i]!=90) {
+            return 14;
+        }
+        i=i+1;
+    }
+    const batch:u64=get_u64(out[0..received],40);
+    const repeated:usize=qp_poll(users[256..512],out[0..65536],false);
+    if(repeated!=received or get_u64(out[0..repeated],40)!=batch) {
+        return 15;
+    }
+    put_u64(users[256..512],208,batch);
+    if(qp_poll(users[256..512],out[0..65536],true)!=64) {
+        return 16;
+    }
+    qp_note("PASS bounded opaque relay and lost-response batch retransmit until signed recipient ACK");
+    if(qp_request(users[0..256],users[353..418],8,0,room[0..16],users[0..0],out[0..65536])!=64 or out[5]!=9) {
+        return 17;
+    }
+    if(qp_request(users[0..256],users[353..418],7,1,room[0..16],payload[0..54],out[0..65536])!=64 or out[5]!=26) {
+        return 18;
+    }
+    qp_note("PASS closed room cannot forward; no private key or raw card logged");
+    if(qp_request(users[512..768],users[0..0],8,0,users[0..0],users[0..0],out[0..65536])!=64 or out[5]!=9) {
+        return 23;
+    }
+    if(qp_request(users[0..256],users[609..674],4,0,users[0..0],users[0..0],out[0..65536])!=64 or out[5]!=8) {
+        return 24;
+    }
+    qp_note("PASS authenticated logout becomes offline without false delivery");
+    ck_wipe(users[0..768]);
+    return 0;
+}
+test qa_transport_and_record_bounds {
+    assert DW_HEADER==304 and DW_MAX==32768;
+    assert DW_PUBLIC+65==DW_TARGET and DW_SIGNATURE+80==DW_HEADER;
+}

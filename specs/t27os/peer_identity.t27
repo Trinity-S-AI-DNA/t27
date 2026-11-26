@@ -1,0 +1,1873 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/peer_identity.t27 -- who a person on this network IS, for the in-OS call (Refs gHashTag/t27#11560).
+// Pure decisions, no @extern, no crypto: the host (peer_identity_host.t27) makes the keys, hashes, reads and writes the
+// files and talks to mDNS; every rule it follows is a tested fn here. (specs/t27os/identity.t27 is the agent identity
+// card of the window and is not touched.) ASCII only (L3), English only (LANG-EN).
+//
+// FINGERPRINT  the first 10 bytes of SHA-256( "t27os-call-id-v1" 0x00 || P-256 public key, 65 bytes uncompressed ).
+//   SHA-256 because the OS already ships it (CC_SHA256, the same primitive keysync.t27 and call_core.t27 use for their
+//   fingerprints), so no new primitive and no new code to trust; the domain prefix stops a digest made for another
+//   purpose from being replayed as an identity. 10 bytes = 80 bits: finding a second key with the same fingerprint
+//   costs about 2^80 hashes; the call still ends in the 6-digit code both people compare (call_core), so the invite
+//   string is a locator and a pin, not the only defence. This spec takes the digest as an input (it cannot hash).
+// INVITE STRING  "T27-" + 4 groups of 4 base32 symbols + "-" + 1 check symbol, 25 characters, e.g.
+//   T27-ABCD-EFGH-JKMN-PQRS-T. The 16 symbols are the 80 bits of the fingerprint (5 bits each, most significant bit
+//   first); the alphabet is 0-9 A-Z without I, L, O, U (no symbol looks like another or spells a rude word). The
+//   check symbol is sum((2*j+1) * value_j) mod 32 over the 16 symbols (j from 0): every single wrong symbol changes
+//   it (the weights are odd, so invertible mod 32); an adjacent swap is caught unless the two symbols differ by
+//   exactly 16. The parser is case-insensitive for letters and refuses everything else: a short string, a long one,
+//   a wrong prefix, a dash in the wrong place, a character outside the alphabet, a wrong check symbol.
+//   NOTE: the shape T27-XXXX-XXXX-XXXX (12 symbols = 60 bits) cannot carry 10 bytes; this format keeps all 80 bits.
+// IDENTITY FILE  ~/.t27os/identity, 207 bytes: magic "T27OSID\n" (8) | version u32 LE (4) | suite u32 LE (4, 1 = P-256)
+//   | public key (65) | private key X9.63 (97) | nick length (1) | nick (24, zero padded) | CRC-32 of all before (4).
+//   No file -> make a new identity. A file that does not check -> NEVER overwrite it, return the error (it may be the
+//   only copy of a key). The private half is the OS's X9.63 export; the file is mode 0600 and written atomically.
+// FRIENDS FILE  ~/.t27os/friends, 1108 bytes: magic "T27OSFR\n" (8) | version u32 LE (4) | count u32 LE (4) | 32 rows
+//   of fingerprint (10) + nick (24, zero padded) | CRC-32 of all before (4). This is version 1; the table in memory
+//   keeps this shape (version 1, FT_LEN) for every caller.
+// FRIENDS FILE v2  3508 bytes: the v1 bytes up to the rows (version u32 = 2) | 32 key slots of fingerprint (10) + P-256
+//   public key (65, uncompressed, first byte 0x04), an all-zero slot is empty | CRC-32 of all before (4). A key is kept
+//   only for a friend in the rows, only one key per friend, and only after the host checked that the key hashes to
+//   that fingerprint (the fingerprint stays derived from the key). The keys live in memory as their own FK_LEN buffer;
+//   ft2_split reads a v1 or v2 file into the table and the keys (a v1 file: no keys, every friend "unverified"),
+//   ft2_join writes v2 and drops the key of a friend who is no longer in the rows. The first save writes v2.
+// IDENTITY IN A SESSION  after the keys of a call or a message session exist, each side sends its identity key and an
+//   ECDSA P-256 signature over the session's transcript (call_core ck_ident_input: the session id, the transcript hash
+//   that holds both ephemeral keys and nonces, the signer's own ephemeral key and both fingerprints). The host checks
+//   that the key hashes to the fingerprint the frames name and that the signature verifies; pid_verdict says what
+//   follows: TRUSTED (a stored key, the same key, a proof that checks: no code needed), CODE (the people compare the
+//   6 digits: a stranger, a friend with no stored key, no proof yet), REFUSE (a stored key and another key or a proof
+//   that does not check: the session ends). A message session has no person to compare the code, so only TRUSTED
+//   opens it. After the people said "match" in a call, a proven key of a friend is stored (pid_pinnable).
+// mDNS  service type _t27call._udp, TXT strings "fp=<invite>", "port=<udp port>", "nick=<nick>" (length-prefixed).
+
+module T27osPeerIdentity;
+
+use t27os::editors::same_bytes;
+
+// ---------------------------------------------------------------- bytes helpers
+
+pub const FP_BYTES : usize = 10;
+pub const PUB_BYTES : usize = 65;
+pub const PRIV_BYTES : usize = 97;
+pub const NICK_MAX : usize = 24;
+
+fn zero_fill(b: []u8) -> void {
+    var i : usize = 0;
+    while (i < b.len) {
+        b[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn put_u32le(b: []u8, at: usize, v: u32) -> void {
+    b[at] = @as(u8, @intCast(v & 255));
+    b[at + 1] = @as(u8, @intCast((v >> 8) & 255));
+    b[at + 2] = @as(u8, @intCast((v >> 16) & 255));
+    b[at + 3] = @as(u8, @intCast((v >> 24) & 255));
+}
+
+fn get_u32le(b: []const u8, at: usize) -> u32 {
+    return @as(u32, b[at]) | (@as(u32, b[at + 1]) << 8) | (@as(u32, b[at + 2]) << 16) | (@as(u32, b[at + 3]) << 24);
+}
+
+/// CRC-32 (IEEE, reflected 0xEDB88320) of the first n bytes. Corruption detection, not security.
+pub fn crc32(b: []const u8, n: usize) -> u32 {
+    var c : u32 = 4294967295;
+    var i : usize = 0;
+    while (i < n) {
+        c = c ^ @as(u32, b[i]);
+        var k : u32 = 0;
+        while (k < 8) {
+            if ((c & 1) == 1) { c = (c >> 1) ^ 3988292384; } else { c = c >> 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return c ^ 4294967295;
+}
+
+fn same_range(a: []const u8, ao: usize, b: []const u8, bo: usize, n: usize) -> bool {
+    var d : u32 = 0;
+    var i : usize = 0;
+    while (i < n) {
+        d = d | @as(u32, a[ao + i] ^ b[bo + i]);
+        i = i + 1;
+    }
+    return d == 0;
+}
+
+/// A nick is 0..24 printable ASCII bytes (0x20..0x7E): it travels in a TXT string and on the screen.
+pub fn nick_ok(nick: []const u8, n: usize) -> bool {
+    if (n > NICK_MAX or n > nick.len) { return false; }
+    var i : usize = 0;
+    while (i < n) {
+        if (nick[i] < 32 or nick[i] > 126) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- fingerprint
+
+pub const FP_PREFIX_LEN : usize = 17;
+pub const FP_INPUT_LEN : usize = 82;
+
+/// What the host hashes: "t27os-call-id-v1" 0x00 then the 65-byte public key. 82 bytes into out; 0 on a bad size.
+pub fn pi_fp_input(pubk: []const u8, out: []u8) -> usize {
+    if (pubk.len != PUB_BYTES or out.len < FP_INPUT_LEN) { return 0; }
+    const p : [16]u8 = [116, 50, 55, 111, 115, 45, 99, 97, 108, 108, 45, 105, 100, 45, 118, 49];
+    var i : usize = 0;
+    while (i < 16) {
+        out[i] = p[i];
+        i = i + 1;
+    }
+    out[16] = 0;
+    i = 0;
+    while (i < PUB_BYTES) {
+        out[17 + i] = pubk[i];
+        i = i + 1;
+    }
+    return FP_INPUT_LEN;
+}
+
+/// The fingerprint is the first 10 bytes of the 32-byte SHA-256 digest.
+pub fn pi_fp_from_digest(digest: []const u8, out: []u8) -> bool {
+    if (digest.len != 32 or out.len < FP_BYTES) { return false; }
+    var i : usize = 0;
+    while (i < FP_BYTES) {
+        out[i] = digest[i];
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- invite string
+
+pub const INVITE_LEN : usize = 25;
+pub const INV_OK : u32 = 0;
+pub const INV_LEN : u32 = 1;
+pub const INV_PREFIX : u32 = 2;
+pub const INV_DASH : u32 = 3;
+pub const INV_CHAR : u32 = 4;
+pub const INV_CHECK : u32 = 5;
+pub const INV_ARG : u32 = 6;
+
+/// Symbol value 0..31 -> ASCII of the alphabet 0-9 A-Z without I L O U.
+pub fn sym_char(v: u32) -> u8 {
+    if (v < 10) { return @as(u8, @intCast(48 + v)); }
+    var c : u32 = 65 + (v - 10);
+    if (v >= 18) { c = c + 1; }
+    if (v >= 20) { c = c + 1; }
+    if (v >= 22) { c = c + 1; }
+    if (v >= 27) { c = c + 1; }
+    return @as(u8, @intCast(c));
+}
+
+/// ASCII -> symbol value, letters case-insensitive; 32 when the character is not in the alphabet.
+pub fn sym_value(ch: u8) -> u32 {
+    var c : u32 = @as(u32, ch);
+    if (c >= 97 and c <= 122) { c = c - 32; }
+    if (c >= 48 and c <= 57) { return c - 48; }
+    if (c < 65 or c > 90) { return 32; }
+    if (c == 73 or c == 76 or c == 79 or c == 85) { return 32; }
+    var v : u32 = c - 65 + 10;
+    if (c > 73) { v = v - 1; }
+    if (c > 76) { v = v - 1; }
+    if (c > 79) { v = v - 1; }
+    if (c > 85) { v = v - 1; }
+    return v;
+}
+
+fn fp_symbol(fp: []const u8, j: usize) -> u32 {
+    const b : usize = 5 * j;
+    const i : usize = b / 8;
+    const o : u32 = @as(u32, @intCast(b % 8));
+    var lo : u32 = 0;
+    if (i + 1 < FP_BYTES) { lo = @as(u32, fp[i + 1]); }
+    const w : u32 = (@as(u32, fp[i]) << 8) | lo;
+    return (w >> (11 - o)) & 31;
+}
+
+fn check_of(vals: []const u32) -> u32 {
+    var s : u32 = 0;
+    var j : u32 = 0;
+    while (j < 16) {
+        s = s + (2 * j + 1) * vals[@as(usize, @intCast(j))];
+        j = j + 1;
+    }
+    return s & 31;
+}
+
+/// "T27-XXXX-XXXX-XXXX-XXXX-C" from the 10-byte fingerprint, 25 bytes into out; 0 on a bad size.
+pub fn invite_make(fp: []const u8, out: []u8) -> usize {
+    if (fp.len != FP_BYTES or out.len < INVITE_LEN) { return 0; }
+    out[0] = 84;
+    out[1] = 50;
+    out[2] = 55;
+    out[3] = 45;
+    var vals : [16]u32 = undefined;
+    var j : usize = 0;
+    while (j < 16) {
+        vals[j] = fp_symbol(fp, j);
+        j = j + 1;
+    }
+    j = 0;
+    while (j < 16) {
+        const g : usize = j / 4;
+        const k : usize = j % 4;
+        out[4 + 5 * g + k] = sym_char(vals[j]);
+        j = j + 1;
+    }
+    out[8] = 45;
+    out[13] = 45;
+    out[18] = 45;
+    out[23] = 45;
+    out[24] = sym_char(check_of(vals[0..16]));
+    return INVITE_LEN;
+}
+
+/// Parse an invite string into its 10-byte fingerprint. Returns INV_OK or the first reason it was refused.
+pub fn invite_parse(s: []const u8, fp: []u8) -> u32 {
+    if (fp.len < FP_BYTES) { return INV_ARG; }
+    if (s.len != INVITE_LEN) { return INV_LEN; }
+    if (s[0] != 84 and s[0] != 116) { return INV_PREFIX; }
+    if (s[1] != 50 or s[2] != 55 or s[3] != 45) { return INV_PREFIX; }
+    if (s[8] != 45 or s[13] != 45 or s[18] != 45 or s[23] != 45) { return INV_DASH; }
+    var vals : [16]u32 = undefined;
+    var j : usize = 0;
+    while (j < 16) {
+        const g : usize = j / 4;
+        const k : usize = j % 4;
+        const v : u32 = sym_value(s[4 + 5 * g + k]);
+        if (v > 31) { return INV_CHAR; }
+        vals[j] = v;
+        j = j + 1;
+    }
+    const cv : u32 = sym_value(s[24]);
+    if (cv > 31) { return INV_CHAR; }
+    if (cv != check_of(vals[0..16])) { return INV_CHECK; }
+    zero_fill(fp[0..FP_BYTES]);
+    j = 0;
+    while (j < 16) {
+        var k : usize = 0;
+        while (k < 5) {
+            const bit : u32 = (vals[j] >> @as(u32, @intCast(4 - k))) & 1;
+            const pos : usize = 5 * j + k;
+            fp[pos / 8] = fp[pos / 8] | @as(u8, @intCast(bit << @as(u32, @intCast(7 - pos % 8))));
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    return INV_OK;
+}
+
+// ---------------------------------------------------------------- identity file
+
+pub const ID_LEN : usize = 207;
+pub const ID_OFF_VERSION : usize = 8;
+pub const ID_OFF_SUITE : usize = 12;
+pub const ID_OFF_PUB : usize = 16;
+pub const ID_OFF_PRIV : usize = 81;
+pub const ID_OFF_NICK_LEN : usize = 178;
+pub const ID_OFF_NICK : usize = 179;
+pub const ID_OFF_CRC : usize = 203;
+pub const ID_VERSION : u32 = 1;
+pub const ID_SUITE_P256 : u32 = 1;
+
+pub const ID_OK : u32 = 0;
+pub const ID_SHORT : u32 = 1;
+pub const ID_LONG : u32 = 2;
+pub const ID_MAGIC : u32 = 3;
+pub const ID_VERSION_BAD : u32 = 4;
+pub const ID_SUITE_BAD : u32 = 5;
+pub const ID_CRC : u32 = 6;
+pub const ID_NICK_BAD : u32 = 7;
+pub const ID_KEY_BAD : u32 = 8;
+pub const ID_ARG : u32 = 9;
+
+pub const ACT_CREATE : u32 = 1;
+pub const ACT_USE : u32 = 2;
+pub const ACT_REFUSE : u32 = 3;
+
+fn put_magic(b: []u8, kind: u32) -> void {
+    b[0] = 84;
+    b[1] = 50;
+    b[2] = 55;
+    b[3] = 79;
+    b[4] = 83;
+    if (kind == 0) { b[5] = 73; b[6] = 68; } else { b[5] = 70; b[6] = 82; }
+    b[7] = 10;
+}
+
+fn magic_ok(b: []const u8, kind: u32) -> bool {
+    var m : [8]u8 = undefined;
+    put_magic(m[0..8], kind);
+    return same_range(b, 0, m[0..8], 0, 8);
+}
+
+/// Lay out an identity file: the public key, the private key (X9.63, which starts with the public key), the nick.
+/// ID_LEN on success; 0 on a wrong size or a bad nick.
+pub fn id_build(pubk: []const u8, priv: []const u8, nick: []const u8, n: usize, out: []u8) -> usize {
+    if (pubk.len != PUB_BYTES or priv.len != PRIV_BYTES or out.len < ID_LEN) { return 0; }
+    if (nick_ok(nick, n) == false) { return 0; }
+    zero_fill(out[0..ID_LEN]);
+    put_magic(out, 0);
+    put_u32le(out, ID_OFF_VERSION, ID_VERSION);
+    put_u32le(out, ID_OFF_SUITE, ID_SUITE_P256);
+    var i : usize = 0;
+    while (i < PUB_BYTES) {
+        out[ID_OFF_PUB + i] = pubk[i];
+        i = i + 1;
+    }
+    i = 0;
+    while (i < PRIV_BYTES) {
+        out[ID_OFF_PRIV + i] = priv[i];
+        i = i + 1;
+    }
+    out[ID_OFF_NICK_LEN] = @as(u8, @intCast(n));
+    i = 0;
+    while (i < n) {
+        out[ID_OFF_NICK + i] = nick[i];
+        i = i + 1;
+    }
+    put_u32le(out, ID_OFF_CRC, crc32(out, ID_OFF_CRC));
+    return ID_LEN;
+}
+
+/// Does the buffer hold a whole, sane identity file? The first thing wrong is the answer.
+pub fn id_check(b: []const u8) -> u32 {
+    if (b.len < ID_LEN) { return ID_SHORT; }
+    if (b.len > ID_LEN) { return ID_LONG; }
+    if (magic_ok(b, 0) == false) { return ID_MAGIC; }
+    if (get_u32le(b, ID_OFF_VERSION) != ID_VERSION) { return ID_VERSION_BAD; }
+    if (get_u32le(b, ID_OFF_SUITE) != ID_SUITE_P256) { return ID_SUITE_BAD; }
+    if (get_u32le(b, ID_OFF_CRC) != crc32(b, ID_OFF_CRC)) { return ID_CRC; }
+    const n : usize = @as(usize, b[ID_OFF_NICK_LEN]);
+    if (n > NICK_MAX) { return ID_NICK_BAD; }
+    var i : usize = 0;
+    while (i < NICK_MAX) {
+        const c : u8 = b[ID_OFF_NICK + i];
+        if (i < n and (c < 32 or c > 126)) { return ID_NICK_BAD; }
+        if (i >= n and c != 0) { return ID_NICK_BAD; }
+        i = i + 1;
+    }
+    if (b[ID_OFF_PUB] != 4) { return ID_KEY_BAD; }
+    if (same_range(b, ID_OFF_PUB, b, ID_OFF_PRIV, PUB_BYTES) == false) { return ID_KEY_BAD; }
+    return ID_OK;
+}
+
+/// What to do at start: no file -> make one; a good file -> use it; a file that is there but wrong (or could not be
+/// read) -> refuse and leave it alone.
+pub fn id_action(exists: bool, status: u32) -> u32 {
+    if (exists == false) { return ACT_CREATE; }
+    if (status == ID_OK) { return ACT_USE; }
+    return ACT_REFUSE;
+}
+
+// ---------------------------------------------------------------- friends table
+
+pub const FT_MAX : usize = 32;
+pub const FT_ROW : usize = 34;
+pub const FT_HDR : usize = 16;
+pub const FT_LEN : usize = 1108;
+pub const FT_OFF_CRC : usize = 1104;
+
+pub const FT_OK : u32 = 0;
+pub const FT_SHORT : u32 = 1;
+pub const FT_LONG : u32 = 2;
+pub const FT_MAGIC : u32 = 3;
+pub const FT_VERSION_BAD : u32 = 4;
+pub const FT_COUNT : u32 = 5;
+pub const FT_CRC : u32 = 6;
+pub const FT_DUP : u32 = 7;
+
+pub const FA_OK : u32 = 0;
+pub const FA_BAD_INVITE : u32 = 1;
+pub const FA_DUPLICATE : u32 = 2;
+pub const FA_FULL : u32 = 3;
+pub const FA_SELF : u32 = 4;
+pub const FA_DAMAGED : u32 = 5;
+
+fn ft_row_at(i: usize) -> usize { return FT_HDR + i * FT_ROW; }
+
+pub fn ft_count(t: []const u8) -> u32 { return get_u32le(t, 8 + 4); }
+
+/// Recompute the trailing CRC-32 after any change.
+pub fn ft_seal(t: []u8) -> void {
+    put_u32le(t, FT_OFF_CRC, crc32(t, FT_OFF_CRC));
+}
+
+/// An empty table (count 0), sealed.
+pub fn ft_init(t: []u8) -> bool {
+    if (t.len < FT_LEN) { return false; }
+    zero_fill(t[0..FT_LEN]);
+    put_magic(t, 1);
+    put_u32le(t, 8, 1);
+    ft_seal(t);
+    return true;
+}
+
+/// The index of the friend with this fingerprint, FT_MAX when there is none.
+pub fn ft_find(t: []const u8, fp: []const u8) -> usize {
+    if (t.len < FT_LEN or fp.len < FP_BYTES) { return FT_MAX; }
+    const n : usize = @as(usize, ft_count(t));
+    var i : usize = 0;
+    while (i < n and i < FT_MAX) {
+        if (same_range(t, ft_row_at(i), fp, 0, FP_BYTES)) { return i; }
+        i = i + 1;
+    }
+    return FT_MAX;
+}
+
+/// Does the buffer hold a whole, sane table (right size, magic, version, count, CRC, no fingerprint twice)?
+pub fn ft_check(t: []const u8) -> u32 {
+    if (t.len < FT_LEN) { return FT_SHORT; }
+    if (t.len > FT_LEN) { return FT_LONG; }
+    if (magic_ok(t, 1) == false) { return FT_MAGIC; }
+    if (get_u32le(t, 8) != 1) { return FT_VERSION_BAD; }
+    if (get_u32le(t, 12) > 32) { return FT_COUNT; }
+    if (get_u32le(t, FT_OFF_CRC) != crc32(t, FT_OFF_CRC)) { return FT_CRC; }
+    const n : usize = @as(usize, ft_count(t));
+    var i : usize = 0;
+    while (i < n) {
+        var k : usize = i + 1;
+        while (k < n) {
+            if (same_range(t, ft_row_at(i), t, ft_row_at(k), FP_BYTES)) { return FT_DUP; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return FT_OK;
+}
+
+/// Add a friend by invite string. Own fingerprint is refused (you do not call yourself), so is a second copy.
+/// The nick starts empty; ft_set_nick names the row. The table is sealed again on success.
+pub fn ft_add(t: []u8, invite: []const u8, own_fp: []const u8) -> u32 {
+    if (ft_check(t) != FT_OK) { return FA_DAMAGED; }
+    var fp : [10]u8 = undefined;
+    if (invite_parse(invite, fp[0..10]) != INV_OK) { return FA_BAD_INVITE; }
+    if (own_fp.len == FP_BYTES and same_range(fp[0..10], 0, own_fp, 0, FP_BYTES)) { return FA_SELF; }
+    if (ft_find(t, fp[0..10]) != FT_MAX) { return FA_DUPLICATE; }
+    const n : usize = @as(usize, ft_count(t));
+    if (n >= FT_MAX) { return FA_FULL; }
+    var i : usize = 0;
+    while (i < FP_BYTES) {
+        t[ft_row_at(n) + i] = fp[i];
+        i = i + 1;
+    }
+    put_u32le(t, 12, @as(u32, @intCast(n + 1)));
+    ft_seal(t);
+    return FA_OK;
+}
+
+/// Name a friend (printable ASCII, up to 24). False when the friend is not in the table or the nick is bad.
+pub fn ft_set_nick(t: []u8, fp: []const u8, nick: []const u8, n: usize) -> bool {
+    if (nick_ok(nick, n) == false) { return false; }
+    const idx : usize = ft_find(t, fp);
+    if (idx == FT_MAX) { return false; }
+    var i : usize = 0;
+    while (i < NICK_MAX) {
+        if (i < n) { t[ft_row_at(idx) + FP_BYTES + i] = nick[i]; } else { t[ft_row_at(idx) + FP_BYTES + i] = 0; }
+        i = i + 1;
+    }
+    ft_seal(t);
+    return true;
+}
+
+/// Remove a friend; the rows after it move up, the freed last row is zeroed. False when there is no such friend.
+pub fn ft_remove(t: []u8, fp: []const u8) -> bool {
+    const idx : usize = ft_find(t, fp);
+    if (idx == FT_MAX) { return false; }
+    const n : usize = @as(usize, ft_count(t));
+    var i : usize = idx;
+    while (i + 1 < n) {
+        var k : usize = 0;
+        while (k < FT_ROW) {
+            t[ft_row_at(i) + k] = t[ft_row_at(i + 1) + k];
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    var k : usize = 0;
+    while (k < FT_ROW) {
+        t[ft_row_at(n - 1) + k] = 0;
+        k = k + 1;
+    }
+    put_u32le(t, 12, @as(u32, @intCast(n - 1)));
+    ft_seal(t);
+    return true;
+}
+
+/// Copy the fingerprint of row i (0-based) into out. False when i is not a row.
+pub fn ft_fp_at(t: []const u8, i: usize, out: []u8) -> bool {
+    if (i >= @as(usize, ft_count(t)) or out.len < FP_BYTES) { return false; }
+    var k : usize = 0;
+    while (k < FP_BYTES) {
+        out[k] = t[ft_row_at(i) + k];
+        k = k + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- friends file v2: the friends' public keys
+
+pub const FT2_VERSION : u32 = 2;
+pub const FK_SLOT : usize = 75;
+pub const FK_LEN : usize = 2400;
+pub const FT2_OFF_KEYS : usize = 1104;
+pub const FT2_OFF_CRC : usize = 3504;
+pub const FT2_LEN : usize = 3508;
+/// A v2 key slot that is malformed, names someone who is not a friend, or names a friend twice.
+pub const FT_KEY_BAD : u32 = 8;
+
+pub const PIN_NEW : u32 = 0;
+pub const PIN_SAME : u32 = 1;
+/// Another key is already stored for this friend: it is never replaced (remove and add the friend again).
+pub const PIN_CONFLICT : u32 = 2;
+pub const PIN_NOT_FRIEND : u32 = 3;
+pub const PIN_BAD : u32 = 4;
+pub const PIN_FULL : u32 = 5;
+
+fn fk_used(keys: []const u8, i: usize) -> bool {
+    var d : u32 = 0;
+    var k : usize = 0;
+    while (k < FK_SLOT) {
+        d = d | @as(u32, keys[i * FK_SLOT + k]);
+        k = k + 1;
+    }
+    return d != 0;
+}
+
+/// The slot holding the key of this fingerprint, FT_MAX when there is none.
+pub fn fk_find(keys: []const u8, fp: []const u8) -> usize {
+    if (keys.len < FK_LEN or fp.len < FP_BYTES) { return FT_MAX; }
+    var i : usize = 0;
+    while (i < FT_MAX) {
+        if (fk_used(keys, i) and same_range(keys, i * FK_SLOT, fp, 0, FP_BYTES)) { return i; }
+        i = i + 1;
+    }
+    return FT_MAX;
+}
+
+/// The stored key of this friend into out (65 bytes). False when none is stored.
+pub fn fk_get(keys: []const u8, fp: []const u8, out: []u8) -> bool {
+    const i : usize = fk_find(keys, fp);
+    if (i == FT_MAX or out.len < PUB_BYTES) { return false; }
+    var k : usize = 0;
+    while (k < PUB_BYTES) {
+        out[k] = keys[i * FK_SLOT + FP_BYTES + k];
+        k = k + 1;
+    }
+    return true;
+}
+
+/// How many keys are stored.
+pub fn fk_count(keys: []const u8) -> u32 {
+    if (keys.len < FK_LEN) { return 0; }
+    var n : u32 = 0;
+    var i : usize = 0;
+    while (i < FT_MAX) {
+        if (fk_used(keys, i)) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Store the key of a friend. The caller (the host) has checked that the key hashes to fp. A friend keeps the first
+/// key stored for it: another key is PIN_CONFLICT and changes nothing.
+pub fn fk_pin(t: []const u8, keys: []u8, fp: []const u8, pubk: []const u8) -> u32 {
+    if (keys.len < FK_LEN or fp.len < FP_BYTES or pubk.len != PUB_BYTES or pubk[0] != 4) { return PIN_BAD; }
+    if (ft_find(t, fp) == FT_MAX) { return PIN_NOT_FRIEND; }
+    const at : usize = fk_find(keys, fp);
+    if (at != FT_MAX) {
+        if (same_range(keys, at * FK_SLOT + FP_BYTES, pubk, 0, PUB_BYTES)) { return PIN_SAME; }
+        return PIN_CONFLICT;
+    }
+    var i : usize = 0;
+    while (i < FT_MAX and fk_used(keys, i)) { i = i + 1; }
+    if (i == FT_MAX) { return PIN_FULL; }
+    var k : usize = 0;
+    while (k < FP_BYTES) {
+        keys[i * FK_SLOT + k] = fp[k];
+        k = k + 1;
+    }
+    k = 0;
+    while (k < PUB_BYTES) {
+        keys[i * FK_SLOT + FP_BYTES + k] = pubk[k];
+        k = k + 1;
+    }
+    return PIN_NEW;
+}
+
+/// Read a friends file of n bytes (v1 or v2) into the table t (v1 shape, sealed) and the keys. FT_OK or the first
+/// thing wrong; a v1 file gives empty keys.
+pub fn ft2_split(f: []const u8, n: usize, t: []u8, keys: []u8) -> u32 {
+    if (n > f.len or t.len < FT_LEN or keys.len < FK_LEN) { return FT_SHORT; }
+    zero_fill(keys[0..FK_LEN]);
+    if (n == FT_LEN) {
+        const r : u32 = ft_check(f[0..FT_LEN]);
+        if (r != FT_OK) { return r; }
+        var i : usize = 0;
+        while (i < FT_LEN) {
+            t[i] = f[i];
+            i = i + 1;
+        }
+        return FT_OK;
+    }
+    if (n < FT2_LEN) { return FT_SHORT; }
+    if (n > FT2_LEN) { return FT_LONG; }
+    if (magic_ok(f, 1) == false) { return FT_MAGIC; }
+    if (get_u32le(f, 8) != FT2_VERSION) { return FT_VERSION_BAD; }
+    if (get_u32le(f, 12) > 32) { return FT_COUNT; }
+    if (get_u32le(f, FT2_OFF_CRC) != crc32(f, FT2_OFF_CRC)) { return FT_CRC; }
+    zero_fill(t[0..FT_LEN]);
+    var i : usize = 0;
+    while (i < FT_OFF_CRC) {
+        t[i] = f[i];
+        i = i + 1;
+    }
+    put_u32le(t, 8, 1);
+    ft_seal(t);
+    const r : u32 = ft_check(t[0..FT_LEN]);
+    if (r != FT_OK) { return r; }
+    i = 0;
+    while (i < FT_MAX) {
+        const at : usize = FT2_OFF_KEYS + i * FK_SLOT;
+        if (fk_used(f[FT2_OFF_KEYS..FT2_OFF_CRC], i)) {
+            if (f[at + FP_BYTES] != 4) { return FT_KEY_BAD; }
+            if (ft_find(t, f[at..at + FP_BYTES]) == FT_MAX) { return FT_KEY_BAD; }
+            if (fk_find(keys, f[at..at + FP_BYTES]) != FT_MAX) { return FT_KEY_BAD; }
+            var k : usize = 0;
+            while (k < FK_SLOT) {
+                keys[i * FK_SLOT + k] = f[at + k];
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return FT_OK;
+}
+
+/// Drop every stored key that does not hash to the fingerprint it is stored under: calc holds, slot by slot (FP_BYTES
+/// each, FT_MAX slots), the fingerprint the host computed from that slot's key (zeros when it could not). A key read
+/// from a file that was changed by hand must not make its friend "verified"; the friend reads not verified (no key)
+/// until a matched code stores the right one. How many were dropped (0 when calc is short: nothing is trusted then
+/// either, every key goes).
+pub fn fk_drop_unhashed(keys: []u8, calc: []const u8) -> u32 {
+    if (keys.len < FK_LEN) { return 0; }
+    var n : u32 = 0;
+    var i : usize = 0;
+    while (i < FT_MAX) {
+        if (fk_used(keys, i)) {
+            if (calc.len < FT_MAX * FP_BYTES or !same_range(keys, i * FK_SLOT, calc, i * FP_BYTES, FP_BYTES)) {
+                zero_fill(keys[i * FK_SLOT .. (i + 1) * FK_SLOT]);
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Lay out the v2 file from a table that checks and the keys: the key of a fingerprint that is not in the rows is
+/// left out, so is a second key for the same friend. FT2_LEN, or 0 on a bad table or size.
+pub fn ft2_join(t: []const u8, keys: []const u8, out: []u8) -> usize {
+    if (t.len < FT_LEN or keys.len < FK_LEN or out.len < FT2_LEN) { return 0; }
+    if (ft_check(t[0..FT_LEN]) != FT_OK) { return 0; }
+    zero_fill(out[0..FT2_LEN]);
+    var i : usize = 0;
+    while (i < FT_OFF_CRC) {
+        out[i] = t[i];
+        i = i + 1;
+    }
+    put_u32le(out, 8, FT2_VERSION);
+    var j : usize = 0;
+    i = 0;
+    while (i < FT_MAX) {
+        const a : usize = i * FK_SLOT;
+        if (fk_used(keys, i) and keys[a + FP_BYTES] == 4 and ft_find(t, keys[a..a + FP_BYTES]) != FT_MAX) {
+            if (fk_find(out[FT2_OFF_KEYS..FT2_OFF_CRC], keys[a..a + FP_BYTES]) == FT_MAX) {
+                var k : usize = 0;
+                while (k < FK_SLOT) {
+                    out[FT2_OFF_KEYS + j * FK_SLOT + k] = keys[a + k];
+                    k = k + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    put_u32le(out, FT2_OFF_CRC, crc32(out, FT2_OFF_CRC));
+    return FT2_LEN;
+}
+
+// ---------------------------------------------------------------- identity in a session: who may skip the code
+
+pub const PID_CODE : u32 = 0;
+pub const PID_TRUSTED : u32 = 1;
+pub const PID_REFUSE : u32 = 2;
+
+/// pinned: a key is stored for this peer. got: the peer's identity proof arrived. proof_ok: its key hashes to the
+/// fingerprint the frames name and its signature over this session's transcript verifies. same_key: that key is the
+/// stored one.
+pub fn pid_verdict(pinned: bool, got: bool, proof_ok: bool, same_key: bool) -> u32 {
+    if (got == false) { return PID_CODE; }
+    if (pinned) {
+        if (proof_ok and same_key) { return PID_TRUSTED; }
+        return PID_REFUSE;
+    }
+    return PID_CODE;
+}
+
+/// After the people compared the code and said "match": store the proven key of a peer that had none.
+pub fn pid_pinnable(pinned: bool, got: bool, proof_ok: bool) -> bool {
+    return pinned == false and got and proof_ok;
+}
+
+/// The session says "match" by itself only for a peer it already trusts.
+pub fn pid_auto_match(verdict: u32) -> bool { return verdict == PID_TRUSTED; }
+
+/// May a person's "match" count? Not after a refusal, and never in a message session (no person compares a code
+/// there: only TRUSTED opens it).
+pub fn pid_person_may_match(verdict: u32, message_session: bool) -> bool {
+    return verdict != PID_REFUSE and message_session == false;
+}
+
+/// A message session ends at once when the peer's proof arrived and does not make it TRUSTED, or when this device
+/// has no identity to prove itself with.
+pub fn pid_message_refused(have_own: bool, got: bool, verdict: u32) -> bool {
+    if (have_own == false) { return true; }
+    return got and verdict != PID_TRUSTED;
+}
+
+/// How long a session waits for the proof of a peer whose key is stored before it shows the code after all.
+pub const PID_WAIT_MS : u64 = 1500;
+
+/// Show the 6 digits now? Never for a refused peer. A trusted peer needs no code; it is shown only when the call is
+/// still not open after 2 * PID_WAIT_MS (the other side does not know this key yet and its person compares). A peer
+/// with a stored key whose proof has not come gets PID_WAIT_MS before the code is shown. Anyone else at once.
+pub fn pid_show_code(pinned: bool, got: bool, verdict: u32, waited_ms: u64) -> bool {
+    if (verdict == PID_REFUSE) { return false; }
+    if (got and verdict == PID_TRUSTED) { return waited_ms >= 2 * PID_WAIT_MS; }
+    if (pinned and got == false) { return waited_ms >= PID_WAIT_MS; }
+    return true;
+}
+
+// ---------------------------------------------------------------- invitations (owner, 2026-10-22)
+// A person adds a friend by pasting the friend's key string: the fingerprint in it is the person's own input. In a
+// message session (no person compares a code there) the first proof of such a friend whose key is not stored yet is
+// stored as the friend's key (the host checks it hashes to that fingerprint, ih_pin_put); the verdict that follows is
+// pid_verdict's own TRUSTED. A session from someone who is not a friend at all is an invitation: it never opens, the
+// proven key is kept for the person to ACCEPT or DECLINE (invites.t27).
+
+/// Store the proof of a friend whose key is not stored, before the verdict: only in a message session, only for a proof
+/// that checks.
+pub fn pid_store_first(pinned: bool, got: bool, proof_ok: bool, message_session: bool) -> bool {
+    return message_session and pinned == false and got and proof_ok;
+}
+
+/// A message session from a peer who is not a friend, whose proof checks, is an invitation to keep (and to close).
+pub fn pid_is_invitation(friend: bool, got: bool, proof_ok: bool, message_session: bool) -> bool {
+    return message_session and friend == false and got and proof_ok;
+}
+
+// ---------------------------------------------------------------- mDNS TXT record
+
+pub const TXT_MAX : usize = 96;
+
+fn put_str(out: []u8, at: usize, key: []const u8, val: []const u8, vn: usize) -> usize {
+    // one length-prefixed string "key=value"
+    const total : usize = key.len + 1 + vn;
+    out[at] = @as(u8, @intCast(total));
+    var p : usize = at + 1;
+    var i : usize = 0;
+    while (i < key.len) {
+        out[p] = key[i];
+        p = p + 1;
+        i = i + 1;
+    }
+    out[p] = 61;
+    p = p + 1;
+    i = 0;
+    while (i < vn) {
+        out[p] = val[i];
+        p = p + 1;
+        i = i + 1;
+    }
+    return p;
+}
+
+/// TXT bytes for the announcement: fp=<invite>, port=<1..65535>, nick=<nick>. Length, or 0 on a bad input.
+pub fn txt_build(invite: []const u8, port: u32, nick: []const u8, n: usize, out: []u8) -> usize {
+    if (out.len < TXT_MAX or invite.len != INVITE_LEN or port == 0 or port > 65535) { return 0; }
+    var fp : [10]u8 = undefined;
+    if (invite_parse(invite, fp[0..10]) != INV_OK) { return 0; }
+    if (nick_ok(nick, n) == false) { return 0; }
+    var digits : [5]u8 = undefined;
+    var dn : usize = 0;
+    var tmp : [5]u8 = undefined;
+    var x : u32 = port;
+    var tn : usize = 0;
+    while (x > 0) {
+        tmp[tn] = @as(u8, @intCast(48 + x % 10));
+        x = x / 10;
+        tn = tn + 1;
+    }
+    while (tn > 0) {
+        tn = tn - 1;
+        digits[dn] = tmp[tn];
+        dn = dn + 1;
+    }
+    const kfp : [2]u8 = [102, 112];
+    const kport : [4]u8 = [112, 111, 114, 116];
+    const knick : [4]u8 = [110, 105, 99, 107];
+    var p : usize = 0;
+    p = put_str(out, p, kfp[0..2], invite, INVITE_LEN);
+    p = put_str(out, p, kport[0..4], digits[0..5], dn);
+    p = put_str(out, p, knick[0..4], nick, n);
+    return p;
+}
+
+/// The value of "key=" in a TXT record, copied into out; its length, or 0 when the key is absent, the record is
+/// cut short (a length byte that runs past the end) or out is too small. Empty values read as 0 as well.
+pub fn txt_get(txt: []const u8, n: usize, key: []const u8, out: []u8) -> usize {
+    if (n > txt.len) { return 0; }
+    var p : usize = 0;
+    while (p < n) {
+        const l : usize = @as(usize, txt[p]);
+        if (p + 1 + l > n) { return 0; }
+        if (l > key.len and txt[p + 1 + key.len] == 61) {
+            var same : bool = true;
+            var i : usize = 0;
+            while (i < key.len) {
+                if (txt[p + 1 + i] != key[i]) { same = false; }
+                i = i + 1;
+            }
+            if (same) {
+                const vn : usize = l - key.len - 1;
+                if (vn > out.len) { return 0; }
+                i = 0;
+                while (i < vn) {
+                    out[i] = txt[p + 2 + key.len + i];
+                    i = i + 1;
+                }
+                return vn;
+            }
+        }
+        p = p + 1 + l;
+    }
+    return 0;
+}
+
+/// The announced UDP port as a number; 0 for a missing, non-numeric, zero or too large value.
+pub fn txt_port(txt: []const u8, n: usize) -> u32 {
+    var v : [8]u8 = undefined;
+    const key : [4]u8 = [112, 111, 114, 116];
+    const vn : usize = txt_get(txt, n, key[0..4], v[0..8]);
+    if (vn == 0 or vn > 5) { return 0; }
+    var x : u32 = 0;
+    var i : usize = 0;
+    while (i < vn) {
+        if (v[i] < 48 or v[i] > 57) { return 0; }
+        x = x * 10 + @as(u32, v[i]) - 48;
+        i = i + 1;
+    }
+    if (x > 65535) { return 0; }
+    return x;
+}
+
+/// The announced fingerprint, parsed and checked. INV_OK or the reason; a missing "fp" is INV_LEN.
+pub fn txt_fp(txt: []const u8, n: usize, fp: []u8) -> u32 {
+    var v : [32]u8 = undefined;
+    const key : [2]u8 = [102, 112];
+    const vn : usize = txt_get(txt, n, key[0..2], v[0..32]);
+    return invite_parse(v[0..vn], fp);
+}
+
+// ---------------------------------------------------------------- tests
+
+const T_FP : [10]u8 = [1, 35, 69, 103, 137, 171, 205, 239, 254, 220];
+
+fn t_invite(out: []u8) -> void {
+    invite_make(T_FP[0..10], out);
+}
+
+test crc32_matches_the_published_check_value {
+    // CRC-32/IEEE of "123456789" is 0xCBF43926
+    const s : [9]u8 = [49, 50, 51, 52, 53, 54, 55, 56, 57];
+    assert crc32(s[0..9], 9) == 3421780262;
+}
+
+test every_symbol_value_round_trips_through_the_alphabet {
+    var v : u32 = 0;
+    while (v < 32) {
+        assert sym_value(sym_char(v)) == v;
+        v = v + 1;
+    }
+    // the four dropped letters and punctuation are not symbols
+    assert sym_value(73) == 32;
+    assert sym_value(76) == 32;
+    assert sym_value(79) == 32;
+    assert sym_value(85) == 32;
+    assert sym_value(45) == 32;
+    assert sym_value(32) == 32;
+    // lowercase is the same symbol
+    assert sym_value(97) == sym_value(65);
+    assert sym_char(0) == 48;
+    assert sym_char(31) == 90;
+}
+
+test the_fingerprint_input_is_a_domain_prefix_then_the_key {
+    var k : [65]u8 = undefined;
+    var i : usize = 0;
+    while (i < 65) {
+        k[i] = @as(u8, @intCast(i + 4));
+        i = i + 1;
+    }
+    var o : [82]u8 = undefined;
+    assert pi_fp_input(k[0..65], o[0..82]) == 82;
+    assert o[0] == 116;
+    assert o[15] == 49;
+    assert o[16] == 0;
+    assert o[17] == 4;
+    assert o[81] == 68;
+    assert pi_fp_input(k[0..64], o[0..82]) == 0;
+    var d : [32]u8 = undefined;
+    i = 0;
+    while (i < 32) {
+        d[i] = @as(u8, @intCast(i));
+        i = i + 1;
+    }
+    var fp : [10]u8 = undefined;
+    assert pi_fp_from_digest(d[0..32], fp[0..10]);
+    assert fp[9] == 9;
+    assert pi_fp_from_digest(d[0..31], fp[0..10]) == false;
+}
+
+test an_invite_has_the_fixed_shape {
+    var s : [25]u8 = undefined;
+    assert invite_make(T_FP[0..10], s[0..25]) == 25;
+    assert s[0] == 84 and s[1] == 50 and s[2] == 55 and s[3] == 45;
+    assert s[8] == 45 and s[13] == 45 and s[18] == 45 and s[23] == 45;
+    // 0x01 0x23 = 00000 00100 10001 1... -> symbols 0, 4, 17: "04H"
+    assert s[4] == 48;
+    assert s[5] == 52;
+    assert s[6] == 72;
+}
+
+test an_invite_parses_back_to_the_same_fingerprint {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    var fp : [10]u8 = undefined;
+    assert invite_parse(s[0..25], fp[0..10]) == INV_OK;
+    assert same_bytes(fp[0..10], T_FP[0..10]);
+    // lowercase is accepted and means the same
+    var lo : [25]u8 = undefined;
+    var i : usize = 0;
+    while (i < 25) {
+        lo[i] = s[i];
+        if (s[i] >= 65 and s[i] <= 90) { lo[i] = s[i] + 32; }
+        i = i + 1;
+    }
+    var fp2 : [10]u8 = undefined;
+    assert invite_parse(lo[0..25], fp2[0..10]) == INV_OK;
+    assert same_bytes(fp2[0..10], T_FP[0..10]);
+}
+
+test every_fingerprint_bit_pattern_survives_make_and_parse {
+    var n : u32 = 0;
+    while (n < 64) {
+        var fp : [10]u8 = undefined;
+        var i : usize = 0;
+        while (i < 10) {
+            fp[i] = @as(u8, @intCast((n * 37 + @as(u32, @intCast(i)) * 101 + 7) & 255));
+            i = i + 1;
+        }
+        var s : [25]u8 = undefined;
+        assert invite_make(fp[0..10], s[0..25]) == 25;
+        var back : [10]u8 = undefined;
+        assert invite_parse(s[0..25], back[0..10]) == INV_OK;
+        assert same_bytes(back[0..10], fp[0..10]);
+        n = n + 1;
+    }
+}
+
+test a_truncated_or_padded_invite_is_refused {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    var fp : [10]u8 = undefined;
+    assert invite_parse(s[0..24], fp[0..10]) == INV_LEN;
+    assert invite_parse(s[0..0], fp[0..10]) == INV_LEN;
+    assert invite_parse(s[0..13], fp[0..10]) == INV_LEN;
+    var big : [26]u8 = undefined;
+    var i : usize = 0;
+    while (i < 25) {
+        big[i] = s[i];
+        i = i + 1;
+    }
+    big[25] = 32;
+    assert invite_parse(big[0..26], fp[0..10]) == INV_LEN;
+}
+
+test a_wrong_prefix_or_dash_is_refused {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    var fp : [10]u8 = undefined;
+    var a : [25]u8 = s;
+    a[0] = 88;
+    assert invite_parse(a[0..25], fp[0..10]) == INV_PREFIX;
+    var b : [25]u8 = s;
+    b[3] = 95;
+    assert invite_parse(b[0..25], fp[0..10]) == INV_PREFIX;
+    var c : [25]u8 = s;
+    c[13] = 32;
+    assert invite_parse(c[0..25], fp[0..10]) == INV_DASH;
+    var d : [25]u8 = s;
+    d[23] = 48;
+    assert invite_parse(d[0..25], fp[0..10]) == INV_DASH;
+}
+
+test a_character_outside_the_alphabet_is_refused {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    var fp : [10]u8 = undefined;
+    var a : [25]u8 = s;
+    a[5] = 79;
+    assert invite_parse(a[0..25], fp[0..10]) == INV_CHAR;
+    var b : [25]u8 = s;
+    b[10] = 33;
+    assert invite_parse(b[0..25], fp[0..10]) == INV_CHAR;
+    var c : [25]u8 = s;
+    c[24] = 85;
+    assert invite_parse(c[0..25], fp[0..10]) == INV_CHAR;
+}
+
+test every_single_wrong_symbol_is_caught_by_the_check {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    var pos : usize = 0;
+    var caught : u32 = 0;
+    var tried : u32 = 0;
+    while (pos < 25) {
+        if (pos >= 4 and pos != 8 and pos != 13 and pos != 18 and pos != 23) {
+            var v : u32 = 0;
+            while (v < 32) {
+                var a : [25]u8 = s;
+                const ch : u8 = sym_char(v);
+                if (ch != s[pos]) {
+                    a[pos] = ch;
+                    var fp : [10]u8 = undefined;
+                    tried = tried + 1;
+                    if (invite_parse(a[0..25], fp[0..10]) == INV_CHECK) { caught = caught + 1; }
+                }
+                v = v + 1;
+            }
+        }
+        pos = pos + 1;
+    }
+    // 17 symbol positions x 31 other symbols
+    assert tried == 527;
+    assert caught == 527;
+}
+
+test an_adjacent_swap_is_caught_unless_the_symbols_differ_by_16 {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    var a : [25]u8 = s;
+    a[4] = s[5];
+    a[5] = s[4];
+    var fp : [10]u8 = undefined;
+    // symbols 0 and 4 (values differ by 4): the check sees the swap
+    assert invite_parse(a[0..25], fp[0..10]) == INV_CHECK;
+}
+
+test the_identity_file_round_trips_and_checks {
+    var pubk : [65]u8 = undefined;
+    var priv : [97]u8 = undefined;
+    var i : usize = 0;
+    while (i < 65) {
+        pubk[i] = @as(u8, @intCast(i + 1));
+        i = i + 1;
+    }
+    pubk[0] = 4;
+    i = 0;
+    while (i < 97) {
+        if (i < 65) { priv[i] = pubk[i]; } else { priv[i] = @as(u8, @intCast((i * 3) & 255)); }
+        i = i + 1;
+    }
+    const nick : [3]u8 = [75, 111, 116];
+    var f : [207]u8 = undefined;
+    assert id_build(pubk[0..65], priv[0..97], nick[0..3], 3, f[0..207]) == 207;
+    assert id_check(f[0..207]) == ID_OK;
+    assert f[0] == 84 and f[7] == 10;
+    assert f[16] == 4;
+    assert f[178] == 3;
+    assert f[179] == 75;
+    assert id_check(f[0..206]) == ID_SHORT;
+    assert id_check(f[0..100]) == ID_SHORT;
+    assert id_check(f[0..0]) == ID_SHORT;
+    var big : [208]u8 = undefined;
+    i = 0;
+    while (i < 207) {
+        big[i] = f[i];
+        i = i + 1;
+    }
+    big[207] = 0;
+    assert id_check(big[0..208]) == ID_LONG;
+    // a bad nick or a bad key size builds nothing
+    const bad : [2]u8 = [7, 8];
+    assert id_build(pubk[0..65], priv[0..97], bad[0..2], 2, f[0..207]) == 0;
+    assert id_build(pubk[0..64], priv[0..97], nick[0..3], 3, f[0..207]) == 0;
+}
+
+test every_flipped_byte_of_an_identity_file_is_refused {
+    var pubk : [65]u8 = undefined;
+    var priv : [97]u8 = undefined;
+    var i : usize = 0;
+    while (i < 65) {
+        pubk[i] = @as(u8, @intCast(i + 1));
+        i = i + 1;
+    }
+    pubk[0] = 4;
+    i = 0;
+    while (i < 97) {
+        if (i < 65) { priv[i] = pubk[i]; } else { priv[i] = @as(u8, @intCast((i * 3) & 255)); }
+        i = i + 1;
+    }
+    const nick : [3]u8 = [75, 111, 116];
+    var f : [207]u8 = undefined;
+    id_build(pubk[0..65], priv[0..97], nick[0..3], 3, f[0..207]);
+    var pos : usize = 0;
+    var refused : u32 = 0;
+    while (pos < 207) {
+        var g : [207]u8 = f;
+        g[pos] = g[pos] ^ 1;
+        if (id_check(g[0..207]) != ID_OK) { refused = refused + 1; }
+        pos = pos + 1;
+    }
+    assert refused == 207;
+}
+
+test a_missing_file_is_made_and_a_damaged_one_is_never_overwritten {
+    assert id_action(false, ID_SHORT) == ACT_CREATE;
+    assert id_action(false, ID_OK) == ACT_CREATE;
+    assert id_action(true, ID_OK) == ACT_USE;
+    assert id_action(true, ID_CRC) == ACT_REFUSE;
+    assert id_action(true, ID_SHORT) == ACT_REFUSE;
+    assert id_action(true, ID_MAGIC) == ACT_REFUSE;
+    assert id_action(true, ID_KEY_BAD) == ACT_REFUSE;
+}
+
+test the_friends_table_adds_by_invite_and_refuses_the_rest {
+    var t : [1108]u8 = undefined;
+    assert ft_init(t[0..1108]);
+    assert ft_check(t[0..1108]) == FT_OK;
+    assert ft_count(t[0..1108]) == 0;
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    var own : [10]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    assert ft_add(t[0..1108], s[0..25], own[0..10]) == FA_OK;
+    assert ft_count(t[0..1108]) == 1;
+    assert ft_check(t[0..1108]) == FT_OK;
+    assert ft_find(t[0..1108], T_FP[0..10]) == 0;
+    // the same friend twice
+    assert ft_add(t[0..1108], s[0..25], own[0..10]) == FA_DUPLICATE;
+    assert ft_count(t[0..1108]) == 1;
+    // a typo
+    var typo : [25]u8 = s;
+    typo[6] = sym_char((sym_value(s[6]) + 1) & 31);
+    assert ft_add(t[0..1108], typo[0..25], own[0..10]) == FA_BAD_INVITE;
+    // myself
+    assert ft_add(t[0..1108], s[0..25], T_FP[0..10]) == FA_SELF;
+    assert ft_count(t[0..1108]) == 1;
+}
+
+test the_friends_table_removes_keeps_order_and_names_rows {
+    var t : [1108]u8 = undefined;
+    ft_init(t[0..1108]);
+    var own : [10]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    var n : u32 = 0;
+    while (n < 3) {
+        var fp : [10]u8 = undefined;
+        var i : usize = 0;
+        while (i < 10) {
+            fp[i] = @as(u8, @intCast(n * 50 + @as(u32, @intCast(i))));
+            i = i + 1;
+        }
+        var s : [25]u8 = undefined;
+        invite_make(fp[0..10], s[0..25]);
+        assert ft_add(t[0..1108], s[0..25], own[0..10]) == FA_OK;
+        n = n + 1;
+    }
+    assert ft_count(t[0..1108]) == 3;
+    var mid : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    const nick : [3]u8 = [66, 111, 98];
+    assert ft_set_nick(t[0..1108], mid[0..10], nick[0..3], 3);
+    assert t[16 + 34 + 10] == 66;
+    assert ft_remove(t[0..1108], mid[0..10]);
+    assert ft_count(t[0..1108]) == 2;
+    assert ft_find(t[0..1108], mid[0..10]) == FT_MAX;
+    var last : [10]u8 = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109];
+    assert ft_find(t[0..1108], last[0..10]) == 1;
+    assert ft_check(t[0..1108]) == FT_OK;
+    // removing again or an unknown friend does nothing
+    assert ft_remove(t[0..1108], mid[0..10]) == false;
+    assert ft_set_nick(t[0..1108], mid[0..10], nick[0..3], 3) == false;
+    // the freed row is zero
+    var z : u32 = 0;
+    var i : usize = 0;
+    while (i < 34) {
+        z = z + @as(u32, t[16 + 2 * 34 + i]);
+        i = i + 1;
+    }
+    assert z == 0;
+}
+
+test the_friends_table_holds_32_and_then_says_full {
+    var t : [1108]u8 = undefined;
+    ft_init(t[0..1108]);
+    var own : [10]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    var n : u32 = 0;
+    while (n < 32) {
+        var fp : [10]u8 = undefined;
+        var i : usize = 0;
+        while (i < 10) {
+            fp[i] = @as(u8, @intCast((n * 7 + 1 + @as(u32, @intCast(i)) * 11) & 255));
+            i = i + 1;
+        }
+        var s : [25]u8 = undefined;
+        invite_make(fp[0..10], s[0..25]);
+        assert ft_add(t[0..1108], s[0..25], own[0..10]) == FA_OK;
+        n = n + 1;
+    }
+    assert ft_count(t[0..1108]) == 32;
+    assert ft_check(t[0..1108]) == FT_OK;
+    var s2 : [25]u8 = undefined;
+    t_invite(s2[0..25]);
+    assert ft_add(t[0..1108], s2[0..25], own[0..10]) == FA_FULL;
+    assert ft_count(t[0..1108]) == 32;
+}
+
+test a_damaged_friends_table_is_refused_and_never_changed {
+    var t : [1108]u8 = undefined;
+    ft_init(t[0..1108]);
+    var own : [10]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    ft_add(t[0..1108], s[0..25], own[0..10]);
+    assert ft_check(t[0..1000]) == FT_SHORT;
+    var pos : usize = 0;
+    var refused : u32 = 0;
+    while (pos < 1108) {
+        var g : [1108]u8 = t;
+        g[pos] = g[pos] ^ 1;
+        if (ft_check(g[0..1108]) != FT_OK) { refused = refused + 1; }
+        pos = pos + 1;
+    }
+    assert refused == 1108;
+    var bad : [1108]u8 = t;
+    bad[300] = bad[300] ^ 255;
+    assert ft_add(bad[0..1108], s[0..25], own[0..10]) == FA_DAMAGED;
+    assert bad[300] == t[300] ^ 255;
+    // the same table saved and read back is the same bytes
+    var again : [1108]u8 = t;
+    assert same_bytes(again[0..1108], t[0..1108]);
+    assert ft_check(again[0..1108]) == FT_OK;
+    assert id_action(true, ft_check(bad[0..1108])) == ACT_REFUSE;
+    assert id_action(false, FT_SHORT) == ACT_CREATE;
+}
+
+test the_txt_record_carries_fp_port_and_nick {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    const nick : [4]u8 = [78, 111, 100, 101];
+    var txt : [96]u8 = undefined;
+    const n : usize = txt_build(s[0..25], 47741, nick[0..4], 4, txt[0..96]);
+    // (1+3+25) + (1+5+5) + (1+5+4)
+    assert n == 50;
+    assert txt[0] == 28;
+    assert txt_port(txt[0..96], n) == 47741;
+    var fp : [10]u8 = undefined;
+    assert txt_fp(txt[0..96], n, fp[0..10]) == INV_OK;
+    assert same_bytes(fp[0..10], T_FP[0..10]);
+    var v : [32]u8 = undefined;
+    const knick : [4]u8 = [110, 105, 99, 107];
+    assert txt_get(txt[0..96], n, knick[0..4], v[0..32]) == 4;
+    assert v[0] == 78 and v[3] == 101;
+}
+
+test a_bad_or_cut_txt_record_yields_nothing {
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    const nick : [4]u8 = [78, 111, 100, 101];
+    var txt : [96]u8 = undefined;
+    const n : usize = txt_build(s[0..25], 47741, nick[0..4], 4, txt[0..96]);
+    var fp : [10]u8 = undefined;
+    // cut anywhere inside the first string: no fp
+    assert txt_fp(txt[0..96], 20, fp[0..10]) != INV_OK;
+    assert txt_port(txt[0..96], 5) == 0;
+    // port 0, port 65536 and a non-numeric port are refused
+    assert txt_build(s[0..25], 0, nick[0..4], 4, txt[0..96]) == 0;
+    assert txt_build(s[0..25], 65536, nick[0..4], 4, txt[0..96]) == 0;
+    // a corrupted fp in the record is refused by the check symbol
+    var bad : [96]u8 = undefined;
+    const m : usize = txt_build(s[0..25], 47741, nick[0..4], 4, bad[0..96]);
+    bad[8] = sym_char((sym_value(bad[8]) + 1) & 31);
+    assert txt_fp(bad[0..96], m, fp[0..10]) == INV_CHECK;
+    // a bad invite or a bad nick builds nothing
+    var typo : [25]u8 = s;
+    typo[24] = sym_char((sym_value(s[24]) + 1) & 31);
+    assert txt_build(typo[0..25], 47741, nick[0..4], 4, txt[0..96]) == 0;
+    const ctl : [1]u8 = [10];
+    assert txt_build(s[0..25], 47741, ctl[0..1], 1, txt[0..96]) == 0;
+    // an empty record
+    assert txt_port(txt[0..0], 0) == 0;
+    assert n == 50;
+}
+
+test the_nick_is_printable_ascii_up_to_24 {
+    const ok : [3]u8 = [32, 65, 126];
+    assert nick_ok(ok[0..3], 3);
+    assert nick_ok(ok[0..3], 0);
+    const bad : [2]u8 = [65, 127];
+    assert nick_ok(bad[0..2], 2) == false;
+    assert nick_ok(ok[0..3], 4) == false;
+    var long : [25]u8 = undefined;
+    var i : usize = 0;
+    while (i < 25) {
+        long[i] = 97;
+        i = i + 1;
+    }
+    assert nick_ok(long[0..25], 24);
+    assert nick_ok(long[0..25], 25) == false;
+}
+
+// ---------------------------------------------------------------- tests: friends file v2 and identity in a session
+
+/// A fake public key: 0x04 then bytes from a seed (the pure spec cannot make or hash keys; the host does).
+fn t_key(seed: u8, out: []u8) -> void {
+    out[0] = 4;
+    var i : usize = 1;
+    while (i < 65) {
+        out[i] = @as(u8, @intCast((@as(u32, seed) * 31 + @as(u32, @intCast(i)) * 7) & 255));
+        i = i + 1;
+    }
+}
+
+/// A table with two friends: T_FP and [50..59].
+fn t_two(t: []u8) -> void {
+    ft_init(t);
+    var own : [10]u8 = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    var s : [25]u8 = undefined;
+    t_invite(s[0..25]);
+    ft_add(t, s[0..25], own[0..10]);
+    var fp : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    invite_make(fp[0..10], s[0..25]);
+    ft_add(t, s[0..25], own[0..10]);
+}
+
+test a_friend_keeps_the_first_key_stored_for_it {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    var ka : [65]u8 = undefined;
+    var kb : [65]u8 = undefined;
+    t_key(1, ka[0..65]);
+    t_key(2, kb[0..65]);
+    assert fk_count(keys[0..2400]) == 0;
+    assert fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]) == PIN_NEW;
+    assert fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]) == PIN_SAME;
+    // someone else's key for the same friend is never stored over the first one
+    assert fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], kb[0..65]) == PIN_CONFLICT;
+    var got : [65]u8 = undefined;
+    assert fk_get(keys[0..2400], T_FP[0..10], got[0..65]);
+    assert same_bytes(got[0..65], ka[0..65]);
+    assert fk_count(keys[0..2400]) == 1;
+    // a stranger gets no key; a key that is not an uncompressed point or not 65 bytes is refused
+    var stranger : [10]u8 = [7, 7, 7, 7, 7, 7, 7, 7, 7, 7];
+    assert fk_pin(t[0..1108], keys[0..2400], stranger[0..10], kb[0..65]) == PIN_NOT_FRIEND;
+    var bad : [65]u8 = kb;
+    bad[0] = 2;
+    var mid : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    assert fk_pin(t[0..1108], keys[0..2400], mid[0..10], bad[0..65]) == PIN_BAD;
+    assert fk_pin(t[0..1108], keys[0..2400], mid[0..10], kb[0..64]) == PIN_BAD;
+    assert fk_get(keys[0..2400], mid[0..10], got[0..65]) == false;
+    assert fk_get(keys[0..2400], stranger[0..10], got[0..65]) == false;
+}
+
+test the_v2_file_round_trips_the_rows_and_the_keys {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    const nick : [3]u8 = [66, 111, 98];
+    ft_set_nick(t[0..1108], T_FP[0..10], nick[0..3], 3);
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    var ka : [65]u8 = undefined;
+    t_key(1, ka[0..65]);
+    assert fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]) == PIN_NEW;
+    var f : [3508]u8 = undefined;
+    assert ft2_join(t[0..1108], keys[0..2400], f[0..3508]) == FT2_LEN;
+    assert get_u32le(f[0..3508], 8) == 2;
+    var t2 : [1108]u8 = undefined;
+    var k2 : [2400]u8 = undefined;
+    assert ft2_split(f[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_OK;
+    // the table in memory is the v1 shape, byte for byte the one saved
+    assert same_bytes(t2[0..1108], t[0..1108]);
+    assert ft_check(t2[0..1108]) == FT_OK;
+    var got : [65]u8 = undefined;
+    assert fk_get(k2[0..2400], T_FP[0..10], got[0..65]);
+    assert same_bytes(got[0..65], ka[0..65]);
+    var mid : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    assert fk_get(k2[0..2400], mid[0..10], got[0..65]) == false;
+}
+
+test an_old_v1_file_reads_with_every_friend_unverified {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    // a v1 file on disk is the table itself
+    var t2 : [1108]u8 = undefined;
+    var k2 : [2400]u8 = undefined;
+    var i : usize = 0;
+    while (i < 2400) {
+        k2[i] = 255;
+        i = i + 1;
+    }
+    assert ft2_split(t[0..1108], 1108, t2[0..1108], k2[0..2400]) == FT_OK;
+    assert same_bytes(t2[0..1108], t[0..1108]);
+    assert ft_count(t2[0..1108]) == 2;
+    assert fk_count(k2[0..2400]) == 0;
+    var got : [65]u8 = undefined;
+    assert fk_get(k2[0..2400], T_FP[0..10], got[0..65]) == false;
+    // no stored key: even a proof that checks asks for the code
+    assert pid_verdict(false, true, true, false) == PID_CODE;
+    // a damaged v1 file is still refused, and a v1 file with version 2 written in it is not a v2 file
+    var bad : [1108]u8 = t;
+    bad[40] = bad[40] ^ 1;
+    assert ft2_split(bad[0..1108], 1108, t2[0..1108], k2[0..2400]) == FT_CRC;
+    // the next save is v2 and still has no keys
+    var f : [3508]u8 = undefined;
+    assert ft2_join(t[0..1108], k2[0..2400], f[0..3508]) == FT2_LEN;
+    assert ft2_split(f[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_OK;
+    assert fk_count(k2[0..2400]) == 0;
+}
+
+test every_flipped_byte_of_a_v2_file_is_refused_and_wrong_sizes_too {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    var ka : [65]u8 = undefined;
+    t_key(3, ka[0..65]);
+    fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]);
+    var f : [3508]u8 = undefined;
+    ft2_join(t[0..1108], keys[0..2400], f[0..3508]);
+    var t2 : [1108]u8 = undefined;
+    var k2 : [2400]u8 = undefined;
+    var pos : usize = 0;
+    var refused : u32 = 0;
+    while (pos < 3508) {
+        var g : [3508]u8 = f;
+        g[pos] = g[pos] ^ 1;
+        if (ft2_split(g[0..3508], 3508, t2[0..1108], k2[0..2400]) != FT_OK) { refused = refused + 1; }
+        pos = pos + 1;
+    }
+    assert refused == 3508;
+    assert ft2_split(f[0..3508], 3507, t2[0..1108], k2[0..2400]) == FT_SHORT;
+    assert ft2_split(f[0..3508], 2000, t2[0..1108], k2[0..2400]) == FT_SHORT;
+    assert ft2_split(f[0..3508], 100, t2[0..1108], k2[0..2400]) == FT_SHORT;
+}
+
+test a_v2_key_slot_for_a_stranger_or_twice_for_a_friend_is_refused {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    var ka : [65]u8 = undefined;
+    t_key(4, ka[0..65]);
+    fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]);
+    var f : [3508]u8 = undefined;
+    ft2_join(t[0..1108], keys[0..2400], f[0..3508]);
+    var t2 : [1108]u8 = undefined;
+    var k2 : [2400]u8 = undefined;
+    // slot 1 names a stranger (sealed again, so only the key rule can refuse it)
+    var a : [3508]u8 = f;
+    var i : usize = 0;
+    while (i < 75) {
+        a[FT2_OFF_KEYS + 75 + i] = f[FT2_OFF_KEYS + i];
+        i = i + 1;
+    }
+    a[FT2_OFF_KEYS + 75] = 7;
+    put_u32le(a[0..3508], FT2_OFF_CRC, crc32(a[0..3508], FT2_OFF_CRC));
+    assert ft2_split(a[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_KEY_BAD;
+    // slot 1 repeats the friend of slot 0
+    var b : [3508]u8 = a;
+    b[FT2_OFF_KEYS + 75] = f[FT2_OFF_KEYS];
+    put_u32le(b[0..3508], FT2_OFF_CRC, crc32(b[0..3508], FT2_OFF_CRC));
+    assert ft2_split(b[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_KEY_BAD;
+    // a key that is not an uncompressed point
+    var c : [3508]u8 = f;
+    c[FT2_OFF_KEYS + 10] = 3;
+    put_u32le(c[0..3508], FT2_OFF_CRC, crc32(c[0..3508], FT2_OFF_CRC));
+    assert ft2_split(c[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_KEY_BAD;
+}
+
+test removing_a_friend_drops_its_key_at_the_next_save {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    var ka : [65]u8 = undefined;
+    var kb : [65]u8 = undefined;
+    t_key(5, ka[0..65]);
+    t_key(6, kb[0..65]);
+    var mid : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]);
+    fk_pin(t[0..1108], keys[0..2400], mid[0..10], kb[0..65]);
+    assert ft_remove(t[0..1108], T_FP[0..10]);
+    var f : [3508]u8 = undefined;
+    assert ft2_join(t[0..1108], keys[0..2400], f[0..3508]) == FT2_LEN;
+    var t2 : [1108]u8 = undefined;
+    var k2 : [2400]u8 = undefined;
+    assert ft2_split(f[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_OK;
+    assert fk_count(k2[0..2400]) == 1;
+    var got : [65]u8 = undefined;
+    assert fk_get(k2[0..2400], T_FP[0..10], got[0..65]) == false;
+    assert fk_get(k2[0..2400], mid[0..10], got[0..65]);
+    assert same_bytes(got[0..65], kb[0..65]);
+}
+
+test the_identity_verdict_for_every_proof {
+    // no stored key: the code, whatever the proof says
+    assert pid_verdict(false, false, false, false) == PID_CODE;
+    assert pid_verdict(false, true, true, false) == PID_CODE;
+    assert pid_verdict(false, true, false, false) == PID_CODE;
+    // a stored key and the same key with a signature that verifies: no code
+    assert pid_verdict(true, true, true, true) == PID_TRUSTED;
+    // a stored key and no proof (yet, or an old build): the code
+    assert pid_verdict(true, false, false, false) == PID_CODE;
+    // a stored key and a signature that does not verify: refused
+    assert pid_verdict(true, true, false, true) == PID_REFUSE;
+    // a stored key and another key, even one with a good signature of its own: refused
+    assert pid_verdict(true, true, true, false) == PID_REFUSE;
+    assert pid_verdict(true, true, false, false) == PID_REFUSE;
+}
+
+test a_stranger_needs_the_code_and_a_message_session_needs_trust {
+    const v : u32 = pid_verdict(false, true, true, false);
+    assert pid_auto_match(v) == false;
+    assert pid_person_may_match(v, false);
+    assert pid_person_may_match(v, true) == false;
+    assert pid_message_refused(true, true, v);
+    // no proof yet in a message session: wait (the session times out if none comes)
+    assert pid_message_refused(true, false, PID_CODE) == false;
+    // no own identity: nothing to prove, the message session ends
+    assert pid_message_refused(false, false, PID_CODE);
+    // trusted: the message session opens by itself
+    assert pid_message_refused(true, true, PID_TRUSTED) == false;
+    assert pid_auto_match(PID_TRUSTED);
+    // refused: nobody's "match" counts
+    assert pid_person_may_match(PID_REFUSE, false) == false;
+    assert pid_auto_match(PID_REFUSE) == false;
+}
+
+test after_a_matched_code_the_key_is_stored_and_the_next_session_skips_the_code {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    var ka : [65]u8 = undefined;
+    t_key(8, ka[0..65]);
+    // session 1: a friend from a v1 file, its proof checks; the people compare the code and say match
+    var stored : [65]u8 = undefined;
+    var pinned : bool = fk_get(keys[0..2400], T_FP[0..10], stored[0..65]);
+    var v : u32 = pid_verdict(pinned, true, true, false);
+    assert v == PID_CODE;
+    assert pid_person_may_match(v, false);
+    assert pid_pinnable(pinned, true, true);
+    assert fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]) == PIN_NEW;
+    var f : [3508]u8 = undefined;
+    ft2_join(t[0..1108], keys[0..2400], f[0..3508]);
+    // the app starts again: the file is read back
+    var t2 : [1108]u8 = undefined;
+    var k2 : [2400]u8 = undefined;
+    assert ft2_split(f[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_OK;
+    // session 2: the same key with a good signature -> no code, the session says match by itself
+    pinned = fk_get(k2[0..2400], T_FP[0..10], stored[0..65]);
+    assert pinned;
+    v = pid_verdict(pinned, true, true, same_bytes(stored[0..65], ka[0..65]));
+    assert v == PID_TRUSTED;
+    assert pid_auto_match(v);
+    assert pid_pinnable(pinned, true, true) == false;
+    assert pid_message_refused(true, true, v) == false;
+    // session 3: someone in the middle shows its own key with its own good signature -> refused, nothing stored
+    var km : [65]u8 = undefined;
+    t_key(9, km[0..65]);
+    v = pid_verdict(pinned, true, true, same_bytes(stored[0..65], km[0..65]));
+    assert v == PID_REFUSE;
+    assert fk_pin(t2[0..1108], k2[0..2400], T_FP[0..10], km[0..65]) == PIN_CONFLICT;
+    // a proof that does not verify stores nothing
+    assert pid_pinnable(false, true, false) == false;
+    assert pid_pinnable(false, false, false) == false;
+}
+
+test the_code_is_shown_to_strangers_at_once_and_to_a_trusted_friend_only_if_the_other_side_still_waits {
+    // a stranger or a friend with no stored key: at once
+    assert pid_show_code(false, false, PID_CODE, 0);
+    assert pid_show_code(false, true, PID_CODE, 0);
+    // a stored key: wait for its proof first
+    assert pid_show_code(true, false, PID_CODE, 0) == false;
+    assert pid_show_code(true, false, PID_CODE, PID_WAIT_MS - 1) == false;
+    assert pid_show_code(true, false, PID_CODE, PID_WAIT_MS);
+    // trusted: no code, unless the other side is still comparing much later
+    assert pid_show_code(true, true, PID_TRUSTED, PID_WAIT_MS) == false;
+    assert pid_show_code(true, true, PID_TRUSTED, 2 * PID_WAIT_MS);
+    // refused: never
+    assert pid_show_code(true, true, PID_REFUSE, 100000) == false;
+}
+
+test an_invitation_never_opens_and_only_a_friend_s_first_proof_is_stored_in_a_message_session {
+    // a stranger's message session with a good proof: an invitation, never trusted, refused (pid_verdict says CODE)
+    assert pid_is_invitation(false, true, true, true);
+    assert pid_verdict(false, true, true, false) == PID_CODE;
+    assert pid_message_refused(true, true, PID_CODE);
+    // not an invitation: a friend, no proof yet, a proof that does not check, a call (the code is compared there)
+    assert pid_is_invitation(true, true, true, true) == false;
+    assert pid_is_invitation(false, false, false, true) == false;
+    assert pid_is_invitation(false, true, false, true) == false;
+    assert pid_is_invitation(false, true, true, false) == false;
+    // a friend added by key whose key is not stored: the first good proof in a message session is stored, and with it
+    // stored the same proof is pid_verdict's TRUSTED (the session opens)
+    assert pid_store_first(false, true, true, true);
+    var t : [1108]u8 = undefined;
+    var k : [2400]u8 = undefined;
+    t_two(t[0..1108]);
+    var i : usize = 0;
+    while (i < 2400) {
+        k[i] = 0;
+        i = i + 1;
+    }
+    var ka : [65]u8 = undefined;
+    t_key(5, ka[0..65]);
+    assert fk_pin(t[0..1108], k[0..2400], T_FP[0..10], ka[0..65]) == PIN_NEW;
+    assert pid_verdict(true, true, true, true) == PID_TRUSTED and pid_message_refused(true, true, PID_TRUSTED) == false;
+    // never in a call, never twice (a stored key decides: another key is REFUSE), never for a proof that fails
+    assert pid_store_first(false, true, true, false) == false;
+    assert pid_store_first(true, true, true, true) == false;
+    assert pid_store_first(false, true, false, true) == false;
+    assert pid_store_first(false, false, false, true) == false;
+    assert pid_verdict(true, true, true, false) == PID_REFUSE;
+}
+
+test same_range_compares_only_the_asked_window_in_constant_shape {
+    const a : [6]u8 = [1, 2, 3, 4, 5, 6];
+    const b : [6]u8 = [0, 0, 3, 4, 5, 9];
+    assert same_range(a[0..6], 2, b[0..6], 2, 3);
+    assert same_range(a[0..6], 2, b[0..6], 2, 4) == false;
+    assert same_range(a[0..6], 0, b[0..6], 0, 1) == false;
+    assert same_range(a[0..6], 5, b[0..6], 5, 1) == false;
+    assert same_range(a[0..6], 1, b[0..6], 3, 0);
+    // a difference in the high bit of the last byte is seen
+    const c : [3]u8 = [7, 7, 7];
+    const d : [3]u8 = [7, 7, 135];
+    assert same_range(c[0..3], 0, d[0..3], 0, 3) == false;
+}
+
+test fp_symbol_reads_five_bits_at_a_time_and_pads_the_last_with_zero {
+    assert fp_symbol(T_FP[0..10], 0) == 0;
+    assert fp_symbol(T_FP[0..10], 1) == 4;
+    assert fp_symbol(T_FP[0..10], 2) == 17;
+    assert fp_symbol(T_FP[0..10], 15) == 28;
+    var z : [10]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var f : [10]u8 = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255];
+    var j : usize = 0;
+    while (j < 16) {
+        assert fp_symbol(z[0..10], j) == 0;
+        assert fp_symbol(f[0..10], j) == 31;
+        j = j + 1;
+    }
+    // only the first five bits set: symbol 0 is 31 and symbol 1 is 0
+    z[0] = 248;
+    assert fp_symbol(z[0..10], 0) == 31 and fp_symbol(z[0..10], 1) == 0;
+    // the last symbol is the low five bits of the last byte
+    z[0] = 0;
+    z[9] = 31;
+    assert fp_symbol(z[0..10], 15) == 31 and fp_symbol(z[0..10], 14) == 0;
+    z[9] = 224;
+    assert fp_symbol(z[0..10], 15) == 0;
+}
+
+test check_of_weights_symbol_j_by_2j_plus_1_modulo_32 {
+    var v : [16]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert check_of(v[0..16]) == 0;
+    v[0] = 1;
+    assert check_of(v[0..16]) == 1;
+    v[0] = 0;
+    v[1] = 1;
+    assert check_of(v[0..16]) == 3;
+    v[1] = 0;
+    v[15] = 1;
+    assert check_of(v[0..16]) == 31;
+    v[15] = 2;
+    assert check_of(v[0..16]) == 30;
+    // all ones: 1 + 3 + ... + 31 = 256, which is 0 modulo 32
+    var j : usize = 0;
+    while (j < 16) {
+        v[j] = 1;
+        j = j + 1;
+    }
+    assert check_of(v[0..16]) == 0;
+}
+
+test put_magic_and_magic_ok_tell_the_identity_and_friends_files_apart {
+    var m : [8]u8 = undefined;
+    put_magic(m[0..8], 0);
+    assert m[0] == 84 and m[4] == 83 and m[5] == 73 and m[6] == 68 and m[7] == 10;
+    assert magic_ok(m[0..8], 0) and magic_ok(m[0..8], 1) == false;
+    put_magic(m[0..8], 1);
+    assert m[5] == 70 and m[6] == 82 and m[7] == 10;
+    assert magic_ok(m[0..8], 1) and magic_ok(m[0..8], 0) == false;
+    // any single changed byte is refused, the first and the last included
+    m[0] = 85;
+    assert magic_ok(m[0..8], 1) == false;
+    m[0] = 84;
+    m[7] = 13;
+    assert magic_ok(m[0..8], 1) == false;
+    m[7] = 10;
+    assert magic_ok(m[0..8], 1);
+}
+
+test ft_row_at_puts_row_i_after_the_header_in_34_byte_steps {
+    assert ft_row_at(0) == FT_HDR and ft_row_at(0) == 16;
+    assert ft_row_at(1) == 50;
+    assert ft_row_at(FT_MAX - 1) == FT_HDR + 31 * FT_ROW;
+    assert ft_row_at(FT_MAX) == FT_OFF_CRC;
+}
+
+test ft_seal_makes_a_changed_table_check_again {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    assert ft_check(t[0..1108]) == FT_OK;
+    t[ft_row_at(0) + FP_BYTES] = 65;
+    assert ft_check(t[0..1108]) == FT_CRC;
+    ft_seal(t[0..1108]);
+    assert ft_check(t[0..1108]) == FT_OK;
+    assert get_u32le(t[0..1108], FT_OFF_CRC) == crc32(t[0..1108], FT_OFF_CRC);
+    // only the four CRC bytes move
+    const before : u8 = t[FT_OFF_CRC - 1];
+    ft_seal(t[0..1108]);
+    assert t[FT_OFF_CRC - 1] == before and ft_check(t[0..1108]) == FT_OK;
+}
+
+test ft_fp_at_gives_the_fingerprint_of_a_row_and_refuses_what_is_not_one {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    var out : [10]u8 = undefined;
+    assert ft_fp_at(t[0..1108], 0, out[0..10]) and same_bytes(out[0..10], T_FP[0..10]);
+    assert ft_fp_at(t[0..1108], 1, out[0..10]) and out[0] == 50 and out[9] == 59;
+    // row 2 is past the count (2), a short output is refused, and out is left alone
+    out[0] = 77;
+    assert ft_fp_at(t[0..1108], 2, out[0..10]) == false and out[0] == 77;
+    assert ft_fp_at(t[0..1108], 0, out[0..9]) == false;
+    assert ft_fp_at(t[0..1108], 31, out[0..10]) == false;
+}
+
+test fk_used_and_fk_find_see_a_slot_by_any_nonzero_byte {
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    assert fk_used(keys[0..2400], 0) == false and fk_used(keys[0..2400], 31) == false;
+    // the last byte of the last slot alone makes it used; the slot before stays free
+    keys[31 * FK_SLOT + FK_SLOT - 1] = 1;
+    assert fk_used(keys[0..2400], 31) and fk_used(keys[0..2400], 30) == false;
+    keys[31 * FK_SLOT + FK_SLOT - 1] = 0;
+    keys[FK_SLOT] = 9;
+    assert fk_used(keys[0..2400], 1) and fk_used(keys[0..2400], 0) == false;
+    keys[FK_SLOT] = 0;
+    // a stored fingerprint is found at its slot, the last slot included
+    var fp : [10]u8 = [3, 3, 3, 3, 3, 3, 3, 3, 3, 4];
+    var i : usize = 0;
+    while (i < FP_BYTES) {
+        keys[31 * FK_SLOT + i] = fp[i];
+        keys[31 * FK_SLOT + FP_BYTES + 1] = 4;
+        i = i + 1;
+    }
+    assert fk_find(keys[0..2400], fp[0..10]) == 31;
+    fp[9] = 5;
+    assert fk_find(keys[0..2400], fp[0..10]) == FT_MAX;
+    // a short key buffer or a short fingerprint finds nothing
+    fp[9] = 4;
+    assert fk_find(keys[0..2399], fp[0..10]) == FT_MAX;
+    assert fk_find(keys[0..2400], fp[0..9]) == FT_MAX;
+    // a free slot never matches, even for an all-zero fingerprint
+    var zf : [10]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert fk_find(keys[0..2400], zf[0..10]) == FT_MAX;
+}
+
+test put_str_writes_one_length_prefixed_key_equals_value_and_returns_the_end {
+    var out : [16]u8 = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255];
+    const val : [4]u8 = [97, 98, 99, 100];
+    const end : usize = put_str(out[0..16], 2, "fp", val[0..4], 2);
+    assert end == 8;
+    assert out[2] == 5 and out[3] == 102 and out[4] == 112 and out[5] == 61 and out[6] == 97 and out[7] == 98;
+    assert out[1] == 255 and out[8] == 255;
+    // an empty value is "key=" with length 3
+    const e2 : usize = put_str(out[0..16], 8, "ab", val[0..4], 0);
+    assert e2 == 12 and out[8] == 3 and out[9] == 97 and out[10] == 98 and out[11] == 61 and out[12] == 255;
+}
+
+test same_range_uses_each_side_s_own_offset {
+    const a : [6]u8 = [1, 2, 3, 4, 5, 6];
+    const b : [6]u8 = [9, 9, 3, 4, 5, 9];
+    assert same_range(a[0..6], 2, b[0..6], 2, 3);
+    const c : [4]u8 = [3, 4, 5, 0];
+    assert same_range(a[0..6], 2, c[0..4], 0, 3);
+    assert same_range(a[0..6], 2, c[0..4], 1, 3) == false;
+    assert same_range(c[0..4], 0, a[0..6], 2, 3);
+    assert same_range(c[0..4], 0, a[0..6], 3, 3) == false;
+}
+
+test a_stored_key_that_does_not_hash_to_its_fingerprint_is_dropped_and_its_friend_is_not_verified {
+    var t : [1108]u8 = undefined;
+    t_two(t[0..1108]);
+    var keys : [2400]u8 = undefined;
+    zero_fill(keys[0..2400]);
+    var ka : [65]u8 = undefined;
+    var kb : [65]u8 = undefined;
+    t_key(5, ka[0..65]);
+    t_key(6, kb[0..65]);
+    var mid : [10]u8 = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59];
+    assert fk_pin(t[0..1108], keys[0..2400], T_FP[0..10], ka[0..65]) == PIN_NEW;
+    assert fk_pin(t[0..1108], keys[0..2400], mid[0..10], kb[0..65]) == PIN_NEW;
+    // the file goes through ft2_join / ft2_split unchanged in format (v2)
+    var f : [3508]u8 = undefined;
+    assert ft2_join(t[0..1108], keys[0..2400], f[0..3508]) == FT2_LEN;
+    var t2 : [1108]u8 = undefined;
+    var k2 : [2400]u8 = undefined;
+    assert ft2_split(f[0..3508], 3508, t2[0..1108], k2[0..2400]) == FT_OK;
+    // the host's hashes: slot 0 hashes to its fingerprint, slot 1 (a key put in by hand) to another one
+    var calc : [320]u8 = undefined;
+    zero_fill(calc[0..320]);
+    var k : usize = 0;
+    while (k < 10) {
+        calc[k] = k2[k];
+        calc[10 + k] = k2[FK_SLOT + k] ^ 1;
+        k = k + 1;
+    }
+    var got : [65]u8 = undefined;
+    const keep0 : bool = fk_get(k2[0..2400], k2[0..10], got[0..65]);
+    assert keep0;
+    var fp1 : [10]u8 = undefined;
+    k = 0;
+    while (k < 10) {
+        fp1[k] = k2[FK_SLOT + k];
+        k = k + 1;
+    }
+    assert fk_drop_unhashed(k2[0..2400], calc[0..320]) == 1;
+    assert fk_count(k2[0..2400]) == 1;
+    assert fk_get(k2[0..2400], fp1[0..10], got[0..65]) == false;
+    assert fk_get(k2[0..2400], calc[0..10], got[0..65]);
+    // the keys that hash are left alone; a short calc trusts none
+    assert fk_drop_unhashed(k2[0..2400], calc[0..320]) == 0;
+    assert fk_drop_unhashed(k2[0..2400], calc[0..10]) == 1 and fk_count(k2[0..2400]) == 0;
+}

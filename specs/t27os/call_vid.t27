@@ -1,0 +1,601 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/call_vid.t27 -- the video of a T27 OS call: a test source and the picture decoder (owner, 2026-10-22).
+// The camera is not allowed yet (the system has not been asked), so the source of a call's video is a generator, as
+// TONE is for sound: a 320x240 picture made pixel by pixel in .t27 -- a gradient that slides with the frame number, a
+// bright bar that sweeps across, and the frame number itself in large digits -- encoded to JPEG by ImageIO
+// (quality 0.5, 3-6 KB). When the camera is allowed, call_session takes its JPEG instead (vc_source in call_core:
+// the camera while its frame is fresh, the generator otherwise); nothing here changes.
+// vid_make(frame, out) -> n          the JPEG of frame `frame` into out (n bytes, 0 on failure).
+// vid_make_of(frame, out, small)     the same; small = a group call's 160x120 at quality 0.3 (owner, 2026-10-23).
+// vid_decode(jpeg) -> CGImage        the picture of a JPEG (ImageIO), 0 when it does not decode; release it with
+//                                     vid_release. The window draws it in the CALL panel.
+// vid_size(img) -> w << 16 | h       the size of a decoded picture.
+// vgq_new / vgq_plan_of / vgq_kick / vgq_take   vid_make on its own serial queue, off the polling thread (below).
+// Host code (@extern): test with t27b, not t27c. Refs gHashTag/t27#11560.
+module T27osCallVid;
+
+use t27os::pty_sys::sys_peek;
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+
+const VID_W : u64 = 320;
+const VID_H : u64 = 240;
+/// kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little (BGRA in memory).
+const VID_BITMAP_INFO : u32 = 8194;
+const VID_RTLD_DEFAULT : u64 = 18446744073709551614;
+/// Digits: 5x7 cells of 8x8 pixels, up to 5 digits.
+const VID_CELL : u64 = 8;
+const VID_DIGITS : u64 = 5;
+
+fn vid_dlsym(h: u64, name: []const u8) -> u64 { return @extern("dlsym"); }
+fn vid_poke(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+fn vid_calloc(n: u64, size: u64) -> u64 { return @extern("calloc"); }
+fn vid_free(p: u64) -> void { @extern("free"); }
+fn vid_release(x: u64) -> void { @extern("CFRelease"); }
+fn vid_cf_str(alloc: u64, bytes: []const u8, n: usize, enc: u32, ext: bool) -> u64 { return @extern("CFStringCreateWithBytes"); }
+fn vid_cf_num(alloc: u64, kind: u64, p: []const u8) -> u64 { return @extern("CFNumberCreate"); }
+fn vid_cf_dict(alloc: u64, keys: []const u8, vals: []const u8, n: u64, kcb: u64, vcb: u64) -> u64 { return @extern("CFDictionaryCreate"); }
+fn vid_cf_data(alloc: u64, bytes: []const u8, n: u64) -> u64 { return @extern("CFDataCreate"); }
+fn vid_cf_mdata(alloc: u64, cap: u64) -> u64 { return @extern("CFDataCreateMutable"); }
+fn vid_cf_len(d: u64) -> i64 { return @extern("CFDataGetLength"); }
+fn vid_cf_ptr(d: u64) -> u64 { return @extern("CFDataGetBytePtr"); }
+fn vid_cg_rgb() -> u64 { return @extern("CGColorSpaceCreateDeviceRGB"); }
+fn vid_cg_bitmap(data: u64, w: usize, h: usize, bits: usize, row: usize, space: u64, info: u32) -> u64 { return @extern("CGBitmapContextCreate"); }
+fn vid_cg_image(c: u64) -> u64 { return @extern("CGBitmapContextCreateImage"); }
+fn vid_cg_ctx_release(c: u64) -> void { @extern("CGContextRelease"); }
+fn vid_cg_image_release(i: u64) -> void { @extern("CGImageRelease"); }
+fn vid_cg_space_release(s: u64) -> void { @extern("CGColorSpaceRelease"); }
+fn vid_cg_w(i: u64) -> u64 { return @extern("CGImageGetWidth"); }
+fn vid_cg_h(i: u64) -> u64 { return @extern("CGImageGetHeight"); }
+fn vid_dest_data(d: u64, kind: u64, count: u64, opts: u64) -> u64 { return @extern("CGImageDestinationCreateWithData"); }
+fn vid_dest_add(d: u64, img: u64, props: u64) -> void { @extern("CGImageDestinationAddImage"); }
+fn vid_dest_end(d: u64) -> bool { return @extern("CGImageDestinationFinalize"); }
+fn vid_src_data(d: u64, opts: u64) -> u64 { return @extern("CGImageSourceCreateWithData"); }
+fn vid_src_image(s: u64, idx: u64, opts: u64) -> u64 { return @extern("CGImageSourceCreateImageAtIndex"); }
+
+fn vid_cf(s: []const u8) -> u64 { return vid_cf_str(0, s, s.len, 134217984, false); }
+
+fn vid_konst(name: []const u8) -> u64 {
+    const a : u64 = vid_dlsym(VID_RTLD_DEFAULT, name);
+    if (a == 0) { return 0; }
+    var b : [8]u8 = undefined;
+    sys_peek(b[0..8], a, 8);
+    return @as(u64, b[0]) | (@as(u64, b[1]) << 8) | (@as(u64, b[2]) << 16) | (@as(u64, b[3]) << 24) | (@as(u64, b[4]) << 32) | (@as(u64, b[5]) << 40) | (@as(u64, b[6]) << 48) | (@as(u64, b[7]) << 56);
+}
+
+/// A 5x7 digit as 7 rows of 5 bits, packed row 0 first in the top bits (35 bits).
+pub fn vid_glyph(d: u32) -> u64 {
+    if (d == 0) { return 15623448110; }
+    if (d == 1) { return 4701950094; }
+    if (d == 2) { return 15603929375; }
+    if (d == 3) { return 33357366830; }
+    if (d == 4) { return 2359917634; }
+    if (d == 5) { return 33854359086; }
+    if (d == 6) { return 6728664622; }
+    if (d == 7) { return 33321787656; }
+    if (d == 8) { return 15621113390; }
+    if (d == 9) { return 15621129292; }
+    return 0;
+}
+
+/// Is the pixel (cx, cy) of a digit's cell grid lit: row 0..6, column 0..4.
+pub fn vid_lit(d: u32, row: u64, col: u64) -> bool {
+    if (row > 6 or col > 4) { return false; }
+    const g : u64 = vid_glyph(d);
+    return ((g >> (5 * (6 - row))) >> (4 - col) & 1) == 1;
+}
+
+/// How many decimal digits the frame number shows (1 .. VID_DIGITS; larger numbers show their last digits).
+pub fn vid_ndigits(frame: u64) -> u64 {
+    var n : u64 = 1;
+    var v : u64 = frame / 10;
+    while (v > 0 and n < VID_DIGITS) {
+        n = n + 1;
+        v = v / 10;
+    }
+    return n;
+}
+
+/// The digit that stands at slot `slot` (0 = leftmost) of the frame number shown with `nd` digits.
+pub fn vid_digit_at(frame: u64, nd: u64, slot: u64) -> u32 {
+    var v : u64 = frame;
+    var k : u64 = nd - 1 - slot;
+    while (k > 0) {
+        v = v / 10;
+        k = k - 1;
+    }
+    return @as(u32, @intCast(v % 10));
+}
+
+/// One pixel of frame `frame` at (x, y) as B, G, R (alpha is always 255): a gradient that slides with the frame, a
+/// white sweep bar, and the number in white on a dark plate in the middle.
+pub fn vid_px(x: u64, y: u64, frame: u64) -> u32 {
+    const nd : u64 = vid_ndigits(frame);
+    const pw : u64 = nd * 6 * VID_CELL + VID_CELL;
+    const ph : u64 = 9 * VID_CELL;
+    const px0 : u64 = (VID_W - pw) / 2;
+    const py0 : u64 = (VID_H - ph) / 2;
+    if (x >= px0 and x < px0 + pw and y >= py0 and y < py0 + ph) {
+        const cx : u64 = x - px0;
+        const cy : u64 = y - py0;
+        if (cx >= VID_CELL and cy >= VID_CELL and cy < 8 * VID_CELL) {
+            const gx : u64 = cx / VID_CELL - 1;
+            const gy : u64 = cy / VID_CELL - 1;
+            const slot : u64 = gx / 6;
+            const col : u64 = gx % 6;
+            if (slot < nd and col < 5 and gy < 7 and vid_lit(vid_digit_at(frame, nd, slot), gy, col)) { return 16777215; }
+        }
+        return 1315860;
+    }
+    const bar : u64 = (frame * 8) % VID_W;
+    var dx : u64 = 0;
+    if (x >= bar) { dx = x - bar; } else { dx = bar - x; }
+    if (dx < 4) { return 16777215; }
+    // blue grows with the column shifted by the frame, green with the row, red with the diagonal
+    const b : u64 = ((x + frame * 3) * 255 / VID_W) % 256;
+    const g : u64 = y * 255 / VID_H;
+    const r : u64 = ((x + y + frame * 5) / 2) % 256;
+    return @as(u32, @intCast((r << 16) | (g << 8) | b));
+}
+
+/// Row y of frame `frame` as BGRA (1280 bytes) into row: the same pixels as vid_px, with the work that does not depend
+/// on the pixel (the plate's place, the blue ramp) done once per row, not once per pixel. The main loop that polls the
+/// call's audio calls this 240 times per frame, so it has to be cheap.
+pub fn vid_row(row: []u8, y: u64, frame: u64) -> void {
+    const nd : u64 = vid_ndigits(frame);
+    const pw : u64 = nd * 6 * VID_CELL + VID_CELL;
+    const ph : u64 = 9 * VID_CELL;
+    const px0 : u64 = (VID_W - pw) / 2;
+    const py0 : u64 = (VID_H - ph) / 2;
+    const in_rows : bool = y >= py0 and y < py0 + ph;
+    const bar : u64 = (frame * 8) % VID_W;
+    const g : u64 = y * 255 / VID_H;
+    const shift : u64 = frame * 3;
+    var x : u64 = 0;
+    while (x < VID_W) {
+        var v : u32 = 0;
+        if (in_rows and x >= px0 and x < px0 + pw) {
+            v = vid_px(x, y, frame);
+        } else {
+            var dx : u64 = 0;
+            if (x >= bar) { dx = x - bar; } else { dx = bar - x; }
+            if (dx < 4) {
+                v = 16777215;
+            } else {
+                const b : u64 = ((x + shift) * 255 / VID_W) % 256;
+                const r : u64 = ((x + y + frame * 5) / 2) % 256;
+                v = @as(u32, @intCast((r << 16) | (g << 8) | b));
+            }
+        }
+        const o : usize = @as(usize, @intCast(x * 4));
+        row[o] = @as(u8, @intCast(v & 255));
+        row[o + 1] = @as(u8, @intCast((v >> 8) & 255));
+        row[o + 2] = @as(u8, @intCast((v >> 16) & 255));
+        row[o + 3] = 255;
+        x = x + 1;
+    }
+}
+
+/// The size of the picture: 320x240 for a one to one call, 160x120 for a group call (small), as w << 16 | h.
+pub fn vid_dims(small: bool) -> u64 {
+    if (small) { return (VID_W / 2) << 16 | (VID_H / 2); }
+    return VID_W << 16 | VID_H;
+}
+
+/// The JPEG quality as IEEE-754 binary64: 0.5 for a one to one call, 0.3 for a group call (owner, 2026-10-23).
+pub fn vid_quality(small: bool) -> u64 {
+    if (small) { return 4599075939470750515; }
+    return 4602678819172646912;
+}
+
+/// Row y of the small picture (160 px, BGRA) into half: every other pixel of row 2y of the large one.
+pub fn vid_half_row(half: []u8, row: []u8, y: u64, frame: u64) -> void {
+    vid_row(row, 2 * y, frame);
+    var x : usize = 0;
+    while (x < 160) {
+        half[4 * x] = row[8 * x];
+        half[4 * x + 1] = row[8 * x + 1];
+        half[4 * x + 2] = row[8 * x + 2];
+        half[4 * x + 3] = row[8 * x + 3];
+        x = x + 1;
+    }
+}
+
+/// The JPEG of frame `frame` into out. Its length, 0 when ImageIO fails or out is too small.
+pub fn vid_make(frame: u64, out: []u8) -> usize { return vid_make_of(frame, out, false); }
+
+/// The same, small: the group call's 160x120 at quality 0.3.
+pub fn vid_make_of(frame: u64, out: []u8, small: bool) -> usize {
+    const d : u64 = vid_dims(small);
+    const w : u64 = d >> 16;
+    const h : u64 = d & 65535;
+    const mem : u64 = vid_calloc(w * h, 4);
+    if (mem == 0) { return 0; }
+    var row : [1280]u8 = undefined;
+    var half : [640]u8 = undefined;
+    var y : u64 = 0;
+    while (y < h) {
+        if (small) {
+            vid_half_row(half[0..640], row[0..1280], y, frame);
+            vid_poke(mem + y * w * 4, half[0..640], 640);
+        } else {
+            vid_row(row[0..1280], y, frame);
+            vid_poke(mem + y * w * 4, row[0..1280], 1280);
+        }
+        y = y + 1;
+    }
+    var n : usize = 0;
+    const space : u64 = vid_cg_rgb();
+    const ctx : u64 = vid_cg_bitmap(mem, @as(usize, @intCast(w)), @as(usize, @intCast(h)), 8, @as(usize, @intCast(w * 4)), space, VID_BITMAP_INFO);
+    if (ctx != 0) {
+        const img : u64 = vid_cg_image(ctx);
+        if (img != 0) {
+            const data : u64 = vid_cf_mdata(0, 0);
+            const kind : u64 = vid_cf("public.jpeg");
+            const dest : u64 = vid_dest_data(data, kind, 1, 0);
+            if (dest != 0) {
+                var kb : [8]u8 = undefined;
+                var vb : [8]u8 = undefined;
+                var qb : [8]u8 = undefined;
+                put_u64(kb[0..8], 0, vid_konst("kCGImageDestinationLossyCompressionQuality"));
+                put_u64(qb[0..8], 0, vid_quality(small));
+                const qn : u64 = vid_cf_num(0, 6, qb[0..8]);
+                put_u64(vb[0..8], 0, qn);
+                const props : u64 = vid_cf_dict(0, kb[0..8], vb[0..8], 1, vid_dlsym(VID_RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks"), vid_dlsym(VID_RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks"));
+                vid_dest_add(dest, img, props);
+                if (vid_dest_end(dest)) {
+                    const len : i64 = vid_cf_len(data);
+                    if (len > 0 and @as(usize, @intCast(len)) <= out.len) {
+                        sys_peek(out[0..@as(usize, @intCast(len))], vid_cf_ptr(data), @as(u64, @intCast(len)));
+                        n = @as(usize, @intCast(len));
+                    }
+                }
+                if (props != 0) { vid_release(props); }
+                if (qn != 0) { vid_release(qn); }
+                vid_release(dest);
+            }
+            vid_release(kind);
+            vid_release(data);
+            vid_cg_image_release(img);
+        }
+        vid_cg_ctx_release(ctx);
+    }
+    vid_cg_space_release(space);
+    vid_free(mem);
+    return n;
+}
+
+/// The picture of a JPEG as a CGImage (the caller releases it with vid_release_image); 0 when it does not decode.
+pub fn vid_decode(jpeg: []const u8) -> u64 {
+    if (jpeg.len < 4) { return 0; }
+    const data : u64 = vid_cf_data(0, jpeg, @as(u64, jpeg.len));
+    if (data == 0) { return 0; }
+    const src : u64 = vid_src_data(data, 0);
+    var img : u64 = 0;
+    if (src != 0) {
+        img = vid_src_image(src, 0, 0);
+        vid_release(src);
+    }
+    vid_release(data);
+    return img;
+}
+
+pub fn vid_release_image(img: u64) -> void {
+    if (img != 0) { vid_cg_image_release(img); }
+}
+
+/// width << 16 | height of a decoded picture.
+pub fn vid_size(img: u64) -> u64 {
+    if (img == 0) { return 0; }
+    return (vid_cg_w(img) << 16) | vid_cg_h(img);
+}
+
+// ---------------------------------------------------------------- the encoder off the polling thread (owner, 2026-10-22)
+
+// A live call measured the sender's frame at 5-10 ms inside cs_poll, against an audio budget of 10 ms a pass, and all
+// of it was vid_make (240 rows of pixels and the ImageIO JPEG). So the test picture is made on the block's own serial
+// queue: a due tick of the poll asks for a frame (vgq_kick: a few stores and dispatch_async_f), the job makes it and
+// publishes it under a sequence number (odd = being written), and a later tick copies the finished JPEG (vgq_take) and
+// only cuts it into parts. At most one job is in flight: while one runs no new one is queued and the tick counts a frame
+// skipped by the encoder. The polling thread is the only one that queues; the job is the only one that publishes.
+// Slots of the block (u64 at st + 8 k); the JPEG stands at st + VGQ_BUF.
+const VGQ_MAGIC : u64 = 6074266361726096167;
+const VGQ_REQ : u64 = 1;
+const VGQ_DONE : u64 = 2;
+const VGQ_SEQ : u64 = 3;
+const VGQ_LEN : u64 = 4;
+const VGQ_FRAME : u64 = 5;
+const VGQ_FED : u64 = 6;
+const VGQ_Q : u64 = 7;
+const VGQ_FN : u64 = 8;
+const VGQ_ENC : u64 = 9;
+const VGQ_FAIL : u64 = 10;
+const VGQ_MAX_US : u64 = 11;
+const VGQ_REFUSED : u64 = 12;
+/// 1 = the job makes the group call's small picture (vgq_kick_of), written with the frame number before the job is queued.
+const VGQ_SMALL : u64 = 13;
+const VGQ_BUF : u64 = 128;
+const VGQ_BUF_MAX : u64 = 24000;
+
+/// What a due tick does with the encoder (bits): take the JPEG the job published and the tick has not taken (seq even,
+/// non-zero, not the one taken last), queue the next frame when no job is in flight (req == done), or, with a job still
+/// running and nothing new to take, skip this frame (counted).
+pub const VGQ_TAKE : u32 = 1;
+pub const VGQ_KICK : u32 = 2;
+pub const VGQ_BUSY : u32 = 4;
+
+pub fn vgq_plan(req: u64, done: u64, seq: u64, fed: u64) -> u32 {
+    var a : u32 = 0;
+    if (seq != 0 and seq % 2 == 0 and seq != fed) { a = a | VGQ_TAKE; }
+    if (req == done) {
+        a = a | VGQ_KICK;
+    } else if ((a & VGQ_TAKE) == 0) {
+        a = a | VGQ_BUSY;
+    }
+    return a;
+}
+
+fn vgq_put(at: u64, v: u64) -> void {
+    var c : [8]u8 = undefined;
+    put_u64(c[0..8], 0, v);
+    vid_poke(at, c[0..8], 8);
+}
+
+fn vgq_get(at: u64) -> u64 {
+    var c : [8]u8 = undefined;
+    sys_peek(c[0..8], at, 8);
+    return get_u64(c[0..8], 0);
+}
+
+fn vgq_ok(st: u64) -> bool { return st != 0 and vgq_get(st) == VGQ_MAGIC; }
+
+fn vgq_queue(label: []const u8, attr: u64) -> u64 { return @extern("dispatch_queue_create"); }
+fn vgq_async(q: u64, ctx: u64, f: u64) -> void { @extern("dispatch_async_f"); }
+fn vgq_fence() -> void { @extern("OSMemoryBarrier"); }
+fn vgq_now() -> f64 { return @extern("CFAbsoluteTimeGetCurrent"); }
+fn vgq_copy(dst: u64, src: []const u8, n: u64) -> u64 { return @extern("memmove"); }
+
+/// A new encoder block with its serial queue; 0 when memory or the queue is missing (the caller then makes frames in
+/// its own pass, as before).
+pub fn vgq_new() -> u64 {
+    const st : u64 = vid_calloc(1, VGQ_BUF + VGQ_BUF_MAX + 64);
+    if (st == 0) { return 0; }
+    // Never true: makes sure vgq_job is emitted and exported for dlsym.
+    if (vgq_get(st + VGQ_BUF) == 99) { vgq_job(0); }
+    const q : u64 = vgq_queue("t27.callvid.encode", 0);
+    const f : u64 = vid_dlsym(VID_RTLD_DEFAULT, "vgq_job");
+    if (q == 0 or f == 0) {
+        vid_free(st);
+        return 0;
+    }
+    vgq_put(st + VGQ_Q * 8, q);
+    vgq_put(st + VGQ_FN * 8, f);
+    vgq_put(st, VGQ_MAGIC);
+    return st;
+}
+
+/// The plan of this tick for the block (polling thread, a few reads); 0 for no block.
+pub fn vgq_plan_of(st: u64) -> u32 {
+    if (!vgq_ok(st)) { return 0; }
+    const done : u64 = vgq_get(st + VGQ_DONE * 8);
+    vgq_fence();
+    return vgq_plan(vgq_get(st + VGQ_REQ * 8), done, vgq_get(st + VGQ_SEQ * 8), vgq_get(st + VGQ_FED * 8));
+}
+
+/// Queue the making of frame `frame` (polling thread, returns at once). False, and counted, while a job is in flight.
+pub fn vgq_kick(st: u64, frame: u64) -> bool { return vgq_kick_of(st, frame, false); }
+
+/// The same for the small picture of a group call (small = true).
+pub fn vgq_kick_of(st: u64, frame: u64, small: bool) -> bool {
+    if (!vgq_ok(st)) { return false; }
+    const req : u64 = vgq_get(st + VGQ_REQ * 8);
+    if (req != vgq_get(st + VGQ_DONE * 8)) {
+        vgq_put(st + VGQ_REFUSED * 8, vgq_get(st + VGQ_REFUSED * 8) + 1);
+        return false;
+    }
+    var sm : u64 = 0;
+    if (small) { sm = 1; }
+    vgq_put(st + VGQ_SMALL * 8, sm);
+    vgq_put(st + VGQ_FRAME * 8, frame);
+    vgq_put(st + VGQ_REQ * 8, req + 1);
+    vgq_fence();
+    vgq_async(vgq_get(st + VGQ_Q * 8), st, vgq_get(st + VGQ_FN * 8));
+    return true;
+}
+
+/// The job, on the block's serial queue (never the polling thread): make the frame, publish it, count it done.
+pub fn vgq_job(st: u64) -> u64 {
+    if (!vgq_ok(st)) { return 0; }
+    const t0 : f64 = vgq_now();
+    var jpeg : [24000]u8 = undefined;
+    const n : usize = vid_make_of(vgq_get(st + VGQ_FRAME * 8), jpeg[0..24000], vgq_get(st + VGQ_SMALL * 8) != 0);
+    if (n >= 4 and @as(u64, n) <= VGQ_BUF_MAX) {
+        // odd sequence = being written; the reader refuses an odd or a changed one
+        vgq_put(st + VGQ_SEQ * 8, vgq_get(st + VGQ_SEQ * 8) + 1);
+        vgq_fence();
+        vgq_copy(st + VGQ_BUF, jpeg[0..n], @as(u64, n));
+        vgq_put(st + VGQ_LEN * 8, @as(u64, n));
+        vgq_fence();
+        vgq_put(st + VGQ_SEQ * 8, vgq_get(st + VGQ_SEQ * 8) + 1);
+        vgq_put(st + VGQ_ENC * 8, vgq_get(st + VGQ_ENC * 8) + 1);
+    } else {
+        vgq_put(st + VGQ_FAIL * 8, vgq_get(st + VGQ_FAIL * 8) + 1);
+    }
+    const us : u64 = @as(u64, @intFromFloat((vgq_now() - t0) * 1000000.0));
+    if (us > vgq_get(st + VGQ_MAX_US * 8)) { vgq_put(st + VGQ_MAX_US * 8, us); }
+    vgq_fence();
+    vgq_put(st + VGQ_DONE * 8, vgq_get(st + VGQ_DONE * 8) + 1);
+    return 0;
+}
+
+/// Copy the finished JPEG not yet taken into out; its length, 0 when there is none (or the job was writing it).
+pub fn vgq_take(st: u64, out: []u8) -> usize {
+    if (!vgq_ok(st)) { return 0; }
+    const seq : u64 = vgq_get(st + VGQ_SEQ * 8);
+    if (seq == 0 or seq % 2 == 1 or seq == vgq_get(st + VGQ_FED * 8)) { return 0; }
+    vgq_fence();
+    const n : u64 = vgq_get(st + VGQ_LEN * 8);
+    if (n < 4 or n > VGQ_BUF_MAX or n > @as(u64, out.len)) { return 0; }
+    sys_peek(out[0..@as(usize, @intCast(n))], st + VGQ_BUF, n);
+    vgq_fence();
+    if (vgq_get(st + VGQ_SEQ * 8) != seq) { return 0; }
+    vgq_put(st + VGQ_FED * 8, seq);
+    return @as(usize, @intCast(n));
+}
+
+/// Counters of the block: 0 jobs queued, 1 jobs done, 2 JPEG made, 3 failures, 4 longest job in microseconds,
+/// 5 kicks refused while a job was in flight.
+pub fn vgq_stat(st: u64, k: u32) -> u64 {
+    if (!vgq_ok(st)) { return 0; }
+    if (k == 0) { return vgq_get(st + VGQ_REQ * 8); }
+    if (k == 1) { return vgq_get(st + VGQ_DONE * 8); }
+    if (k == 2) { return vgq_get(st + VGQ_ENC * 8); }
+    if (k == 3) { return vgq_get(st + VGQ_FAIL * 8); }
+    if (k == 4) { return vgq_get(st + VGQ_MAX_US * 8); }
+    if (k == 5) { return vgq_get(st + VGQ_REFUSED * 8); }
+    return 0;
+}
+
+test the_digits_are_5_by_7_and_the_number_reads_back_from_its_slots {
+    assert vid_lit(8, 0, 1) and vid_lit(8, 0, 0) == false;
+    assert vid_lit(1, 6, 1) and vid_lit(1, 6, 3) and vid_lit(1, 6, 0) == false and vid_lit(1, 0, 0) == false;
+    assert vid_lit(0, 3, 0) and vid_lit(0, 3, 2) and vid_lit(0, 3, 1) == false;
+    assert vid_lit(7, 0, 4) and vid_lit(7, 7, 0) == false;
+    assert vid_ndigits(0) == 1 and vid_ndigits(9) == 1 and vid_ndigits(10) == 2 and vid_ndigits(200) == 3;
+    assert vid_ndigits(123456789) == 5;
+    assert vid_digit_at(205, 3, 0) == 2 and vid_digit_at(205, 3, 1) == 0 and vid_digit_at(205, 3, 2) == 5;
+    assert vid_digit_at(7, 1, 0) == 7;
+}
+
+test two_frames_differ_and_a_frame_repeats {
+    var a : u64 = 0;
+    var b : u64 = 0;
+    var c : u64 = 0;
+    var x : u64 = 0;
+    while (x < 320) {
+        a = a + @as(u64, vid_px(x, 20, 1)) * (x + 1);
+        b = b + @as(u64, vid_px(x, 20, 2)) * (x + 1);
+        c = c + @as(u64, vid_px(x, 20, 1)) * (x + 1);
+        x = x + 1;
+    }
+    assert a != b;
+    assert a == c;
+    // the middle plate is dark where no digit is lit and white where one is
+    assert vid_px(160, 120, 1) == 16777215 or vid_px(160, 120, 1) == 1315860;
+}
+
+test the_fast_row_gives_the_same_pixels_as_the_pixel_function {
+    var row : [1280]u8 = undefined;
+    var f : u64 = 1;
+    var bad : u64 = 0;
+    while (f < 3000) {
+        var y : u64 = 0;
+        while (y < 240) {
+            vid_row(row[0..1280], y, f);
+            var x : u64 = 0;
+            while (x < 320) {
+                const v : u32 = vid_px(x, y, f);
+                const o : usize = @as(usize, @intCast(x * 4));
+                if (row[o] != @as(u8, @intCast(v & 255)) or row[o + 1] != @as(u8, @intCast((v >> 8) & 255)) or row[o + 2] != @as(u8, @intCast((v >> 16) & 255)) or row[o + 3] != 255) { bad = bad + 1; }
+                x = x + 1;
+            }
+            y = y + 97;
+        }
+        f = f + 211;
+    }
+    assert bad == 0;
+}
+
+test the_encoder_plan_takes_a_new_frame_kicks_when_idle_and_skips_when_busy {
+    // nothing queued yet: kick, nothing to take, no skip
+    assert vgq_plan(0, 0, 0, 0) == VGQ_KICK;
+    // a job in flight, nothing published: the frame is skipped by the encoder, no second job
+    assert vgq_plan(1, 0, 0, 0) == VGQ_BUSY;
+    // the job is done and published (seq 2): take it and queue the next
+    assert vgq_plan(1, 1, 2, 0) == VGQ_TAKE | VGQ_KICK;
+    // taken already, the next job in flight: skip, never kick
+    assert vgq_plan(2, 1, 2, 2) == VGQ_BUSY;
+    // being written (odd seq) is never taken
+    assert vgq_plan(2, 1, 3, 2) == VGQ_BUSY;
+    // a job that failed (done, nothing new): kick again, nothing to take, not a skip
+    assert vgq_plan(2, 2, 2, 2) == VGQ_KICK;
+    // no plan ever kicks while a job is in flight
+    var r : u64 = 0;
+    while (r < 6) {
+        var d : u64 = 0;
+        while (d < 6) {
+            if (r != d) { assert (vgq_plan(r, d, 2 * d, 0) & VGQ_KICK) == 0; }
+            d = d + 1;
+        }
+        r = r + 1;
+    }
+}
+
+test a_simulated_call_keeps_at_most_one_frame_in_flight_and_counts_sent_and_skipped {
+    // each due tick follows vgq_plan; a job finishes `cost` ticks after it was queued (cost 1 = before the next tick)
+    var cost : u64 = 1;
+    while (cost <= 3) {
+        var req : u64 = 0;
+        var done : u64 = 0;
+        var seq : u64 = 0;
+        var fed : u64 = 0;
+        var due_at : u64 = 0;
+        var sent : u64 = 0;
+        var skipped : u64 = 0;
+        var maxfly : u64 = 0;
+        var t : u64 = 0;
+        while (t < 60) {
+            // the job finishes and publishes
+            if (req > done and t >= due_at) {
+                seq = seq + 2;
+                done = done + 1;
+            }
+            const a : u32 = vgq_plan(req, done, seq, fed);
+            if ((a & VGQ_TAKE) != 0) { fed = seq; sent = sent + 1; }
+            if ((a & VGQ_BUSY) != 0) { skipped = skipped + 1; }
+            if ((a & VGQ_KICK) != 0) { req = req + 1; due_at = t + cost; }
+            if (req - done > maxfly) { maxfly = req - done; }
+            t = t + 1;
+        }
+        assert maxfly == 1;
+        // every tick either sent a frame, skipped one, or was the first (nothing made yet)
+        assert sent + skipped + 1 == 60;
+        // a job that takes cost ticks leaves cost - 1 skips per frame sent
+        assert skipped == (cost - 1) * (sent + 1) or skipped == (cost - 1) * sent;
+        if (cost == 1) { assert sent == 59 and skipped == 0; }
+        cost = cost + 1;
+    }
+}
+
+test the_encoder_block_refuses_no_block {
+    var b : [64]u8 = undefined;
+    assert vgq_plan_of(0) == 0 and vgq_kick(0, 1) == false and vgq_take(0, b[0..64]) == 0 and vgq_stat(0, 0) == 0;
+    assert VGQ_BUF >= 8 * (VGQ_SMALL + 1) and VGQ_BUF_MAX == 24000;
+    assert vgq_kick_of(0, 1, true) == false;
+}
+
+test the_group_picture_is_160_by_120_at_a_lower_quality_and_is_every_other_pixel {
+    assert vid_dims(false) == (320 << 16 | 240) and vid_dims(true) == (160 << 16 | 120);
+    // binary64 of 0.3 and 0.5: same sign and exponent order, so the smaller bits are the lower quality
+    assert vid_quality(true) < vid_quality(false) and vid_quality(false) == 4602678819172646912;
+    var row : [1280]u8 = undefined;
+    var half : [640]u8 = undefined;
+    var big : [1280]u8 = undefined;
+    var bad : u64 = 0;
+    var f : u64 = 1;
+    while (f < 400) {
+        var y : u64 = 0;
+        while (y < 120) {
+            vid_half_row(half[0..640], row[0..1280], y, f);
+            vid_row(big[0..1280], 2 * y, f);
+            var x : usize = 0;
+            while (x < 160) {
+                if (half[4 * x] != big[8 * x] or half[4 * x + 1] != big[8 * x + 1] or half[4 * x + 2] != big[8 * x + 2] or half[4 * x + 3] != 255) { bad = bad + 1; }
+                x = x + 1;
+            }
+            y = y + 37;
+        }
+        f = f + 97;
+    }
+    assert bad == 0;
+}

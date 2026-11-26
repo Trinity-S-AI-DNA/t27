@@ -1,0 +1,536 @@
+// SPDX-License-Identifier: Apache-2.0
+// specs/t27os/trust.t27 -- the key mismatch warning that outlives the app (owner, 2026-10-23; Refs gHashTag/t27#11560).
+// Pure decisions only: no @extern, no socket, no clock, no hash (the host, peer_identity_host.t27, reads and writes the
+// file; glass_window.t27 hands in each session's verdict and draws what this file says). ASCII only (L3), English only
+// (LANG-EN). Flat namespace (the window build splices imported modules): every name here starts with tru_ / TRU_.
+//
+// WHY  a call or a message session from a friend whose key is stored, that offers another key or a signature that does
+//   not verify, is refused (call_session CS_R_IDENTITY) and the friend's card says "! key mismatch". That mark lived in
+//   the window's memory only: after a restart the card read "verified" again and the attempt to pass as the friend was
+//   forgotten. This file keeps it.
+// MARK  set by every refused session (one row per fingerprint: the count goes up, the time is the latest refusal).
+//   Cleared only by a session in which the person's own check succeeded with that friend: the stored key came again
+//   with a signature that verifies (call_session CS_ID_VERIFIED), or, in a call, the person compared the 6-digit code
+//   and said match (CS_ID_STORED of a call). A message session that stores a first key (pid_store_first) proves
+//   nothing to the person and clears nothing. The friends file (v2) is not touched.
+// WHAT THE PERSON SEES  while a row exists for a friend with a stored key, the friend reads friends_view FV_T_MISMATCH
+//   ("! key mismatch" on the card, " key mismatch!" in the row), and the card adds tru_line_put:
+//   "refused 3 times, last 2 h ago".
+//
+// TRUST FILE  ~/.t27os/trust.t27, TRU_LEN = 1556 bytes, written whole and atomically (mode 0600, directory 0700):
+//   magic "T27OSTR\n" (8) | version u32 LE (4, = 1) | count u32 LE (4, 0..64) | 64 rows of TRU_ROW = 24 bytes |
+//   CRC-32 (IEEE, peer_identity crc32) of all bytes before it (4).
+//   ROW  fingerprint (10) | reason (1: TRU_R_CALL a call was refused, TRU_R_MESSAGE a message session was) | 1 zero
+//   byte | refusals (u32 LE, >= 1) | last refusal, ms of the wall clock (u64 LE).
+//   Rows 0..count-1 are used, latest refusal first; the rows after them are zero. A fingerprint is in at most one row.
+//   No key is written: a row names who was impersonated, not the key that was offered.
+//   A file that does not check is moved aside by the host (trust.t27.bad, kept) and the table starts empty.
+// LIMIT  64 rows (the friends table holds 32). A new fingerprint on a full table pushes out the oldest row.
+module T27osTrust;
+
+use t27os::pty_proto::put_u64;
+use t27os::pty_proto::get_u64;
+use t27os::peer_identity::crc32;
+use t27os::peer_identity::FP_BYTES;
+use t27os::editors::same_bytes;
+use t27os::friends_view::fv_put32;
+use t27os::friends_view::fv_get32;
+use t27os::friends_view::fv_eq;
+use t27os::friends_view::fv_trust_of;
+use t27os::friends_view::fv_trust_word_put;
+use t27os::friends_view::fv_trust_tag_put;
+use t27os::friends_view::FV_TB_PIN;
+use t27os::friends_view::FV_TB_BAD;
+use t27os::friends_view::FV_T_VERIFIED;
+use t27os::friends_view::FV_T_MISMATCH;
+use t27os::friends_view::FV_T_UNVERIFIED;
+use t27os::session_store::put_dec;
+use t27os::session_store::put_bytes;
+
+pub const TRU_MAX : usize = 64;
+pub const TRU_ROW : usize = 24;
+pub const TRU_HDR : usize = 16;
+pub const TRU_OFF_CRC : usize = 1552;
+pub const TRU_LEN : usize = 1556;
+pub const TRU_VERSION : u32 = 1;
+
+pub const TRR_FP : usize = 0;
+pub const TRR_REASON : usize = 10;
+pub const TRR_ZERO : usize = 11;
+pub const TRR_COUNT : usize = 12;
+pub const TRR_LAST : usize = 16;
+
+/// Why the last session was refused: a call, or the message session.
+pub const TRU_R_CALL : u8 = 1;
+pub const TRU_R_MESSAGE : u8 = 2;
+
+/// tru_check.
+pub const TRU_OK : u32 = 0;
+pub const TRU_SHORT : u32 = 1;
+pub const TRU_LONG : u32 = 2;
+pub const TRU_MAGIC : u32 = 3;
+pub const TRU_VERSION_BAD : u32 = 4;
+pub const TRU_COUNT : u32 = 5;
+pub const TRU_CRC : u32 = 6;
+pub const TRU_DUP : u32 = 7;
+pub const TRU_ROW_BAD : u32 = 8;
+
+/// tru_step: nothing changed, or the table changed and is to be written.
+pub const TRU_S_NONE : u32 = 0;
+pub const TRU_S_MARKED : u32 = 1;
+pub const TRU_S_CLEARED : u32 = 2;
+
+fn tru_put32(b: []u8, at: usize, v: u32) -> void { fv_put32(b, at, @as(u64, v)); }
+
+fn tru_get32(b: []const u8, at: usize) -> u32 { return @as(u32, @intCast(fv_get32(b, at))); }
+
+/// Where row i starts.
+pub fn tru_at(i: usize) -> usize { return TRU_HDR + i * TRU_ROW; }
+
+pub fn tru_count(t: []const u8) -> usize {
+    if (t.len < TRU_LEN) { return 0; }
+    const n : u32 = tru_get32(t, 12);
+    if (n > 64) { return 0; }
+    return @as(usize, n);
+}
+
+/// Recompute the trailing CRC-32 after any change.
+pub fn tru_seal(t: []u8) -> void { tru_put32(t, TRU_OFF_CRC, crc32(t, TRU_OFF_CRC)); }
+
+/// The CRC the table carries (the window folds it into its frame key: any change redraws).
+pub fn tru_crc(t: []const u8) -> u32 { return tru_get32(t, TRU_OFF_CRC); }
+
+fn tru_magic_ok(t: []const u8) -> bool {
+    const mg : [8]u8 = [84, 50, 55, 79, 83, 84, 82, 10];
+    return same_bytes(t[0..8], mg[0..8]);
+}
+
+/// An empty table (count 0), sealed.
+pub fn tru_init(t: []u8) -> bool {
+    if (t.len < TRU_LEN) { return false; }
+    var i : usize = 0;
+    while (i < TRU_LEN) {
+        t[i] = 0;
+        i = i + 1;
+    }
+    const mg : [8]u8 = [84, 50, 55, 79, 83, 84, 82, 10];
+    i = 0;
+    while (i < 8) {
+        t[i] = mg[i];
+        i = i + 1;
+    }
+    tru_put32(t, 8, TRU_VERSION);
+    tru_seal(t);
+    return true;
+}
+
+fn tru_row_ok(t: []const u8, i: usize) -> bool {
+    const a : usize = tru_at(i);
+    if (t[a + TRR_REASON] != TRU_R_CALL and t[a + TRR_REASON] != TRU_R_MESSAGE) { return false; }
+    if (t[a + TRR_ZERO] != 0) { return false; }
+    return tru_get32(t, a + TRR_COUNT) >= 1;
+}
+
+/// Does the buffer hold a whole, sane table: size, magic, version, count, CRC, every used row well formed, no
+/// fingerprint twice?
+pub fn tru_check(t: []const u8) -> u32 {
+    if (t.len < TRU_LEN) { return TRU_SHORT; }
+    if (t.len > TRU_LEN) { return TRU_LONG; }
+    if (tru_magic_ok(t) == false) { return TRU_MAGIC; }
+    if (tru_get32(t, 8) != TRU_VERSION) { return TRU_VERSION_BAD; }
+    if (tru_get32(t, 12) > 64) { return TRU_COUNT; }
+    if (tru_get32(t, TRU_OFF_CRC) != crc32(t, TRU_OFF_CRC)) { return TRU_CRC; }
+    const n : usize = tru_count(t);
+    var i : usize = 0;
+    while (i < n) {
+        if (tru_row_ok(t, i) == false) { return TRU_ROW_BAD; }
+        var k : usize = i + 1;
+        while (k < n) {
+            if (same_bytes(t[tru_at(i) .. tru_at(i) + FP_BYTES], t[tru_at(k) .. tru_at(k) + FP_BYTES])) { return TRU_DUP; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return TRU_OK;
+}
+
+/// Read a file of n bytes into t: TRU_OK and the table, or what is wrong (t is then an empty table).
+pub fn tru_load(f: []const u8, n: usize, t: []u8) -> u32 {
+    if (t.len < TRU_LEN) { return TRU_SHORT; }
+    var r : u32 = TRU_SHORT;
+    if (n <= f.len) { r = tru_check(f[0..n]); }
+    if (r != TRU_OK) {
+        tru_init(t);
+        return r;
+    }
+    var i : usize = 0;
+    while (i < TRU_LEN) {
+        t[i] = f[i];
+        i = i + 1;
+    }
+    return TRU_OK;
+}
+
+/// The row of this fingerprint, TRU_MAX when there is none.
+pub fn tru_find(t: []const u8, fp: []const u8) -> usize {
+    if (t.len < TRU_LEN or fp.len < FP_BYTES) { return TRU_MAX; }
+    const n : usize = tru_count(t);
+    var i : usize = 0;
+    while (i < n) {
+        if (same_bytes(t[tru_at(i) .. tru_at(i) + FP_BYTES], fp[0..FP_BYTES])) { return i; }
+        i = i + 1;
+    }
+    return TRU_MAX;
+}
+
+fn tru_copy_row(t: []u8, to: usize, from: usize) -> void {
+    var b : usize = 0;
+    while (b < TRU_ROW) {
+        t[tru_at(to) + b] = t[tru_at(from) + b];
+        b = b + 1;
+    }
+}
+
+/// Row i goes; the rows after it move up, the freed last row is zeroed.
+fn tru_drop(t: []u8, i: usize) -> void {
+    const n : usize = tru_count(t);
+    var j : usize = i;
+    while (j + 1 < n) {
+        tru_copy_row(t, j, j + 1);
+        j = j + 1;
+    }
+    var b : usize = 0;
+    while (b < TRU_ROW) {
+        t[tru_at(n - 1) + b] = 0;
+        b = b + 1;
+    }
+    tru_put32(t, 12, @as(u32, @intCast(n - 1)));
+}
+
+/// Row i goes to the top (index 0); the rows above it move down by one.
+fn tru_to_top(t: []u8, i: usize) -> void {
+    if (i == 0) { return; }
+    var keep : [24]u8 = undefined;
+    var b : usize = 0;
+    while (b < TRU_ROW) {
+        keep[b] = t[tru_at(i) + b];
+        b = b + 1;
+    }
+    var j : usize = i;
+    while (j > 0) {
+        tru_copy_row(t, j, j - 1);
+        j = j - 1;
+    }
+    b = 0;
+    while (b < TRU_ROW) {
+        t[tru_at(0) + b] = keep[b];
+        b = b + 1;
+    }
+}
+
+/// A session of friend fp was refused for its key at now (ms of the wall clock): the row is made or its count goes up,
+/// its time and reason become this refusal's, and it moves to the top. False when the table does not check or fp is
+/// short (nothing changes).
+pub fn tru_refuse(t: []u8, fp: []const u8, reason: u8, now: u64) -> bool {
+    if (t.len < TRU_LEN or tru_check(t[0..TRU_LEN]) != TRU_OK) { return false; }
+    if (fp.len < FP_BYTES or (reason != TRU_R_CALL and reason != TRU_R_MESSAGE)) { return false; }
+    var i : usize = tru_find(t, fp);
+    if (i == TRU_MAX) {
+        var n : usize = tru_count(t);
+        if (n >= TRU_MAX) {
+            tru_drop(t, n - 1);
+            n = n - 1;
+        }
+        var b : usize = 0;
+        while (b < TRU_ROW) {
+            t[tru_at(n) + b] = 0;
+            b = b + 1;
+        }
+        b = 0;
+        while (b < FP_BYTES) {
+            t[tru_at(n) + TRR_FP + b] = fp[b];
+            b = b + 1;
+        }
+        tru_put32(t, 12, @as(u32, @intCast(n + 1)));
+        i = n;
+    }
+    const a : usize = tru_at(i);
+    const c : u32 = tru_get32(t, a + TRR_COUNT);
+    if (c < 4294967295) { tru_put32(t, a + TRR_COUNT, c + 1); }
+    t[a + TRR_REASON] = reason;
+    put_u64(t, a + TRR_LAST, now);
+    tru_to_top(t, i);
+    tru_seal(t);
+    return true;
+}
+
+/// The person's own check with friend fp succeeded: its row goes (the count is gone with it). False when there was none.
+pub fn tru_clear(t: []u8, fp: []const u8) -> bool {
+    const i : usize = tru_find(t, fp);
+    if (i == TRU_MAX) { return false; }
+    tru_drop(t, i);
+    tru_seal(t);
+    return true;
+}
+
+/// How many sessions of fp were refused since the last good check (0: none on file).
+pub fn tru_refused(t: []const u8, fp: []const u8) -> u32 {
+    const i : usize = tru_find(t, fp);
+    if (i == TRU_MAX) { return 0; }
+    return tru_get32(t, tru_at(i) + TRR_COUNT);
+}
+
+/// When the latest refusal of fp was (ms of the wall clock), 0 when none is on file.
+pub fn tru_last(t: []const u8, fp: []const u8) -> u64 {
+    const i : usize = tru_find(t, fp);
+    if (i == TRU_MAX) { return 0; }
+    return get_u64(t, tru_at(i) + TRR_LAST);
+}
+
+/// The reason byte of fp's row, 0 when none.
+pub fn tru_reason(t: []const u8, fp: []const u8) -> u8 {
+    const i : usize = tru_find(t, fp);
+    if (i == TRU_MAX) { return 0; }
+    return t[tru_at(i) + TRR_REASON];
+}
+
+/// The window's trust bits of fp (friends_view FV_TB_*) with the file folded in: a stored key with a refusal on file
+/// is a mismatch whatever this run has seen; with no key stored nothing is refused (pid_verdict refuses nobody else).
+pub fn tru_bits(t: []const u8, fp: []const u8, bits: u32) -> u32 {
+    if ((bits & FV_TB_PIN) == 0) { return bits; }
+    if (tru_find(t, fp) != TRU_MAX) { return bits | FV_TB_BAD; }
+    return bits;
+}
+
+/// One session's verdict on its peer fp, once per session (fresh: this session's refusal is not on file yet):
+///   refused and fresh        -> the refusal is counted (TRU_S_MARKED);
+///   checked (key and proof good, or a matched code in a call) and a row exists -> the row goes (TRU_S_CLEARED);
+///   anything else            -> TRU_S_NONE.
+pub fn tru_step(t: []u8, fp: []const u8, refused: bool, fresh: bool, checked: bool, reason: u8, now: u64) -> u32 {
+    if (refused) {
+        if (fresh and tru_refuse(t, fp, reason, now)) { return TRU_S_MARKED; }
+        return TRU_S_NONE;
+    }
+    if (checked and tru_clear(t, fp)) { return TRU_S_CLEARED; }
+    return TRU_S_NONE;
+}
+
+/// "just now", "5 min ago", "2 h ago", "1 day ago", "3 days ago".
+pub fn tru_ago_put(out: []u8, at: usize, secs: u64) -> usize {
+    if (secs < 60) { return put_bytes(out, at, "just now"); }
+    if (secs < 3600) { return put_bytes(out, put_dec(out, at, secs / 60), " min ago"); }
+    if (secs < 86400) { return put_bytes(out, put_dec(out, at, secs / 3600), " h ago"); }
+    const d : u64 = secs / 86400;
+    if (d == 1) { return put_bytes(out, at, "1 day ago"); }
+    return put_bytes(out, put_dec(out, at, d), " days ago");
+}
+
+/// The card's line under the key: "refused 1 time, last just now", "refused 3 times, last 2 h ago". A clock that went
+/// back reads "just now". 0 when there is nothing on file.
+pub fn tru_line_put(out: []u8, count: u32, last_ms: u64, now_ms: u64) -> usize {
+    if (count == 0 or out.len < 48) { return 0; }
+    var n : usize = put_dec(out, put_bytes(out, 0, "refused "), @as(u64, count));
+    if (count == 1) { n = put_bytes(out, n, " time, last "); } else { n = put_bytes(out, n, " times, last "); }
+    var secs : u64 = 0;
+    if (now_ms > last_ms) { secs = (now_ms - last_ms) / 1000; }
+    return tru_ago_put(out, n, secs);
+}
+
+/// tru_line_put for friend fp from the table.
+pub fn tru_line_for(t: []const u8, fp: []const u8, now_ms: u64, out: []u8) -> usize {
+    return tru_line_put(out, tru_refused(t, fp), tru_last(t, fp), now_ms);
+}
+
+// ---------------------------------------------------------------- tests
+
+fn t_fp(seed: u8, out: []u8) -> void {
+    var i : usize = 0;
+    while (i < 10) {
+        out[i] = seed + @as(u8, @intCast(i)) * 3;
+        i = i + 1;
+    }
+}
+
+fn t_copy(f: []u8, t: []const u8) -> void {
+    var i : usize = 0;
+    while (i < TRU_LEN) {
+        f[i] = t[i];
+        i = i + 1;
+    }
+}
+
+test tru_an_empty_table_checks_and_has_the_published_layout {
+    var t : [1556]u8 = undefined;
+    assert tru_init(t[0..TRU_LEN]);
+    assert tru_check(t[0..TRU_LEN]) == TRU_OK and tru_count(t[0..TRU_LEN]) == 0;
+    // "T27OSTR\n", version 1
+    assert t[0] == 84 and t[5] == 84 and t[6] == 82 and t[7] == 10 and t[8] == 1 and t[12] == 0;
+    assert TRU_OFF_CRC == TRU_HDR + TRU_MAX * TRU_ROW and TRU_LEN == TRU_OFF_CRC + 4;
+    assert TRR_FP + FP_BYTES == TRR_REASON and TRR_COUNT + 4 == TRR_LAST and TRR_LAST + 8 == TRU_ROW;
+    assert tru_init(t[0..100]) == false and tru_count(t[0..100]) == 0;
+}
+
+test tru_the_file_round_trips_and_every_damage_is_refused {
+    var t : [1556]u8 = undefined;
+    var u : [1556]u8 = undefined;
+    var f : [1557]u8 = undefined;
+    var a : [10]u8 = undefined;
+    tru_init(t[0..TRU_LEN]);
+    t_fp(1, a[0..10]);
+    assert tru_refuse(t[0..TRU_LEN], a[0..10], TRU_R_CALL, 1000);
+    t_copy(f[0..1557], t[0..TRU_LEN]);
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_OK and tru_find(u[0..TRU_LEN], a[0..10]) == 0;
+    assert tru_crc(u[0..TRU_LEN]) == tru_crc(t[0..TRU_LEN]) and tru_refused(u[0..TRU_LEN], a[0..10]) == 1;
+    assert tru_last(u[0..TRU_LEN], a[0..10]) == 1000 and tru_reason(u[0..TRU_LEN], a[0..10]) == TRU_R_CALL;
+    // cut, long, a flipped byte, wrong magic, wrong version: refused, the table starts empty
+    assert tru_load(f[0..1557], TRU_LEN - 1, u[0..TRU_LEN]) == TRU_SHORT and tru_count(u[0..TRU_LEN]) == 0;
+    assert tru_load(f[0..1557], TRU_LEN + 1, u[0..TRU_LEN]) == TRU_LONG;
+    assert tru_load(f[0..1557], TRU_LEN + 5, u[0..TRU_LEN]) == TRU_SHORT;
+    f[TRU_HDR + 3] = f[TRU_HDR + 3] ^ 1;
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_CRC and tru_count(u[0..TRU_LEN]) == 0;
+    f[TRU_HDR + 3] = f[TRU_HDR + 3] ^ 1;
+    f[0] = 88;
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_MAGIC;
+    f[0] = 84;
+    f[8] = 2;
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_VERSION_BAD;
+    f[8] = 1;
+    // a row with no reason, a non-zero pad byte, a zero count: refused even with a good CRC
+    f[TRU_HDR + TRR_REASON] = 0;
+    tru_seal(f[0..TRU_LEN]);
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_ROW_BAD;
+    f[TRU_HDR + TRR_REASON] = TRU_R_MESSAGE;
+    f[TRU_HDR + TRR_ZERO] = 1;
+    tru_seal(f[0..TRU_LEN]);
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_ROW_BAD;
+    f[TRU_HDR + TRR_ZERO] = 0;
+    tru_put32(f[0..TRU_LEN], TRU_HDR + TRR_COUNT, 0);
+    tru_seal(f[0..TRU_LEN]);
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_ROW_BAD;
+    tru_put32(f[0..TRU_LEN], TRU_HDR + TRR_COUNT, 1);
+    // a count over 64
+    f[12] = 65;
+    tru_seal(f[0..TRU_LEN]);
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_COUNT;
+    // the same fingerprint twice
+    f[12] = 2;
+    var b : usize = 0;
+    while (b < TRU_ROW) {
+        f[tru_at(1) + b] = f[tru_at(0) + b];
+        b = b + 1;
+    }
+    tru_seal(f[0..TRU_LEN]);
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_DUP;
+    // a damaged table takes no refusal (nothing to write over a file that does not check)
+    assert tru_refuse(f[0..TRU_LEN], a[0..10], TRU_R_CALL, 5) == false;
+}
+
+test tru_refusals_add_up_and_only_a_good_check_clears_them {
+    var t : [1556]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    tru_init(t[0..TRU_LEN]);
+    t_fp(1, a[0..10]);
+    t_fp(100, b[0..10]);
+    // a refused call is marked; the same session seen again (not fresh) is not counted twice
+    assert tru_step(t[0..TRU_LEN], a[0..10], true, true, false, TRU_R_CALL, 1000) == TRU_S_MARKED;
+    assert tru_step(t[0..TRU_LEN], a[0..10], true, false, false, TRU_R_CALL, 1500) == TRU_S_NONE;
+    assert tru_refused(t[0..TRU_LEN], a[0..10]) == 1 and tru_last(t[0..TRU_LEN], a[0..10]) == 1000;
+    // a second refused session (the message session) adds up, its time and reason become the row's
+    assert tru_step(t[0..TRU_LEN], a[0..10], true, true, false, TRU_R_MESSAGE, 9000) == TRU_S_MARKED;
+    assert tru_refused(t[0..TRU_LEN], a[0..10]) == 2 and tru_last(t[0..TRU_LEN], a[0..10]) == 9000;
+    assert tru_reason(t[0..TRU_LEN], a[0..10]) == TRU_R_MESSAGE and tru_check(t[0..TRU_LEN]) == TRU_OK;
+    // another friend: its own row, at the top (latest first); a's row is untouched
+    assert tru_refuse(t[0..TRU_LEN], b[0..10], TRU_R_CALL, 9500);
+    assert tru_find(t[0..TRU_LEN], b[0..10]) == 0 and tru_find(t[0..TRU_LEN], a[0..10]) == 1 and tru_refused(t[0..TRU_LEN], a[0..10]) == 2;
+    // a session that was neither refused nor checked changes nothing; a check of b clears b only
+    assert tru_step(t[0..TRU_LEN], a[0..10], false, true, false, TRU_R_CALL, 9900) == TRU_S_NONE;
+    assert tru_refused(t[0..TRU_LEN], a[0..10]) == 2;
+    assert tru_step(t[0..TRU_LEN], b[0..10], false, true, true, TRU_R_CALL, 9900) == TRU_S_CLEARED;
+    assert tru_refused(t[0..TRU_LEN], b[0..10]) == 0 and tru_find(t[0..TRU_LEN], a[0..10]) == 0 and tru_count(t[0..TRU_LEN]) == 1;
+    // the good check of a: the count is back to 0 and the row is gone; a second check has nothing to clear
+    assert tru_step(t[0..TRU_LEN], a[0..10], false, true, true, TRU_R_CALL, 10000) == TRU_S_CLEARED;
+    assert tru_refused(t[0..TRU_LEN], a[0..10]) == 0 and tru_last(t[0..TRU_LEN], a[0..10]) == 0 and tru_count(t[0..TRU_LEN]) == 0;
+    assert tru_step(t[0..TRU_LEN], a[0..10], false, true, true, TRU_R_CALL, 10000) == TRU_S_NONE;
+    assert tru_check(t[0..TRU_LEN]) == TRU_OK;
+    // a short fingerprint or an unknown reason is no refusal
+    assert tru_refuse(t[0..TRU_LEN], a[0..5], TRU_R_CALL, 1) == false and tru_refuse(t[0..TRU_LEN], a[0..10], 7, 1) == false;
+}
+
+test tru_a_full_table_keeps_the_latest_64_refusals {
+    var t : [1556]u8 = undefined;
+    var f : [10]u8 = undefined;
+    tru_init(t[0..TRU_LEN]);
+    var k : usize = 0;
+    while (k < 64) {
+        t_fp(@as(u8, @intCast(k)), f[0..10]);
+        f[9] = 250;
+        assert tru_refuse(t[0..TRU_LEN], f[0..10], TRU_R_CALL, @as(u64, k) * 10 + 1);
+        k = k + 1;
+    }
+    assert tru_count(t[0..TRU_LEN]) == 64 and tru_check(t[0..TRU_LEN]) == TRU_OK;
+    // a 65th fingerprint pushes out the oldest (k = 0); the newest is at the top
+    t_fp(200, f[0..10]);
+    assert tru_refuse(t[0..TRU_LEN], f[0..10], TRU_R_CALL, 5000);
+    assert tru_count(t[0..TRU_LEN]) == 64 and tru_find(t[0..TRU_LEN], f[0..10]) == 0 and tru_check(t[0..TRU_LEN]) == TRU_OK;
+    t_fp(0, f[0..10]);
+    f[9] = 250;
+    assert tru_find(t[0..TRU_LEN], f[0..10]) == TRU_MAX;
+    t_fp(1, f[0..10]);
+    f[9] = 250;
+    assert tru_find(t[0..TRU_LEN], f[0..10]) == 63;
+    // a refusal of a fingerprint already on a full table pushes nothing out
+    assert tru_refuse(t[0..TRU_LEN], f[0..10], TRU_R_MESSAGE, 6000) and tru_count(t[0..TRU_LEN]) == 64 and tru_find(t[0..TRU_LEN], f[0..10]) == 0;
+}
+
+test tru_the_card_line_says_how_often_and_how_long_ago {
+    var o : [64]u8 = undefined;
+    assert fv_eq(o[0..64], tru_ago_put(o[0..64], 0, 0), "just now");
+    assert fv_eq(o[0..64], tru_ago_put(o[0..64], 0, 59), "just now");
+    assert fv_eq(o[0..64], tru_ago_put(o[0..64], 0, 300), "5 min ago");
+    assert fv_eq(o[0..64], tru_ago_put(o[0..64], 0, 7200), "2 h ago");
+    assert fv_eq(o[0..64], tru_ago_put(o[0..64], 0, 86400), "1 day ago");
+    assert fv_eq(o[0..64], tru_ago_put(o[0..64], 0, 3 * 86400 + 5), "3 days ago");
+    const now : u64 = 1800000000000;
+    assert fv_eq(o[0..64], tru_line_put(o[0..64], 3, now - 7200000, now), "refused 3 times, last 2 h ago");
+    assert fv_eq(o[0..64], tru_line_put(o[0..64], 1, now - 3 * 86400000, now), "refused 1 time, last 3 days ago");
+    // a clock that went back, and nothing on file
+    assert fv_eq(o[0..64], tru_line_put(o[0..64], 2, now + 5000, now), "refused 2 times, last just now");
+    assert tru_line_put(o[0..64], 0, now, now) == 0 and tru_line_put(o[0..10], 3, now, now) == 0;
+    var t : [1556]u8 = undefined;
+    var a : [10]u8 = undefined;
+    tru_init(t[0..TRU_LEN]);
+    t_fp(1, a[0..10]);
+    assert tru_line_for(t[0..TRU_LEN], a[0..10], now, o[0..64]) == 0;
+    tru_refuse(t[0..TRU_LEN], a[0..10], TRU_R_CALL, now - 7300000);
+    tru_refuse(t[0..TRU_LEN], a[0..10], TRU_R_CALL, now - 7200000);
+    assert fv_eq(o[0..64], tru_line_for(t[0..TRU_LEN], a[0..10], now, o[0..64]), "refused 2 times, last 2 h ago");
+}
+
+test tru_a_refusal_on_file_reads_key_mismatch_after_a_restart_never_verified {
+    var t : [1556]u8 = undefined;
+    var f : [1557]u8 = undefined;
+    var u : [1556]u8 = undefined;
+    var a : [10]u8 = undefined;
+    var b : [10]u8 = undefined;
+    tru_init(t[0..TRU_LEN]);
+    t_fp(1, a[0..10]);
+    t_fp(100, b[0..10]);
+    assert tru_refuse(t[0..TRU_LEN], a[0..10], TRU_R_CALL, 1000);
+    // a restart: the window's own bits are only "a key is stored"; the file read back makes it a mismatch
+    t_copy(f[0..1557], t[0..TRU_LEN]);
+    assert tru_load(f[0..1557], TRU_LEN, u[0..TRU_LEN]) == TRU_OK;
+    assert fv_trust_of(tru_bits(u[0..TRU_LEN], a[0..10], FV_TB_PIN)) == FV_T_MISMATCH;
+    assert fv_trust_of(tru_bits(u[0..TRU_LEN], b[0..10], FV_TB_PIN)) == FV_T_VERIFIED;
+    // no key stored: nothing could have been refused, the friend reads not verified
+    assert fv_trust_of(tru_bits(u[0..TRU_LEN], a[0..10], 0)) == FV_T_UNVERIFIED;
+    // the card and the row say it, not the check mark of verified
+    var o : [64]u8 = undefined;
+    const tw : u32 = fv_trust_of(tru_bits(u[0..TRU_LEN], a[0..10], FV_TB_PIN));
+    assert fv_eq(o[0..64], fv_trust_word_put(o[0..64], tw), "! key mismatch");
+    assert fv_eq(o[0..64], fv_trust_tag_put(o[0..64], 0, tw), " key mismatch!");
+    assert fv_eq(o[0..64], tru_line_for(u[0..TRU_LEN], a[0..10], 1000 + 7200000, o[0..64]), "refused 1 time, last 2 h ago");
+    // after the good check the row is gone and the same restart reads verified
+    assert tru_clear(u[0..TRU_LEN], a[0..10]);
+    assert fv_trust_of(tru_bits(u[0..TRU_LEN], a[0..10], FV_TB_PIN)) == FV_T_VERIFIED;
+}
