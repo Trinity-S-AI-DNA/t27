@@ -1,116 +1,193 @@
 module T27osTranslate;
 
-/// Streaming machine-translation merge of one segment (RU to EN and EN to RU),
-/// provider status codes with fallback through specs/t27os/provider_router.t27,
-/// and a tiny glossary. No STT, no TTS, no UI. REPLACE-merge semantics mirror
-/// the cumulative REPLACE rules of specs/t27os/router_stream.t27.
+; The live translation state for one segment: it accepts a translated body only
+; for a SEALED segment at a fresh sequence, carries the seg id and sequence so
+; the petal can trace every shown character, and hands everything that already
+; has a home to that home -- stream accounting to specs/t27os/router_stream.t27,
+; provider selection to specs/t27os/provider_router.t27, byte comparison to
+; specs/t27os/editors.t27. Nothing here re-implements another spec's logic.
+; Closes #14255.
 
-/// Provider status codes (mirror provider_router.t27)
-pub const ST_PAYMENT : u32 = 402;
-pub const ST_RATE     : u32 = 429;
-pub const ST_OVERLOADED : u32 = 529;
+use t27os::editors::same_bytes;
+use t27os::router_stream::rs_begin;
+use t27os::router_stream::rs_anthropic;
+use t27os::router_stream::rs_openai;
+use t27os::router_stream::rs_close;
+use t27os::router_stream::RS_FIELDS;
+use t27os::router_stream::RS_INCOMPLETE;
+use t27os::provider_router::pr_should_next;
+use t27os::provider_router::pr_after;
+use t27os::translator_model::SEG_FINAL;
+use t27os::translator_model::SEG_TRANSLATED;
 
-/// Glossary entries (ASCII in the spec, law L3; RU bytes arrive as runtime data)
-pub const GL_Hello   : []const u8 = "Hello";
-pub const GL_World   : []const u8 = "World";
-pub const GL_Day     : []const u8 = "day";
-pub const GL_Sun     : []const u8 = "sun";
+pub const TR_OK : u8 = 0;
+pub const TR_NOT_SEALED : u8 = 1;
+pub const TR_STALE : u8 = 2;
+pub const TR_EMPTY : u8 = 3;
 
-/// Accumulator struct (6 u32 slots) -- passed by *pointer* so merge mutates it
-pub struct Acc {
-    f0 : u32,
-    f1 : u32,
-    f2 : u32,
-    f3 : u32,
-    f4 : u32,
-    f5 : u32,
+; Glossary entries (ASCII in the spec, law L3; RU bytes arrive as runtime data)
+pub const GL_Day : []const u8 = "day";
+pub const GL_Sun : []const u8 = "sun";
+
+/// One segment waiting for its translated body. The stage starts at SEG_FINAL
+/// (the source side is sealed in by tr_seal) and moves to SEG_TRANSLATED only
+/// when tr_done installs a body.
+pub struct Translation {
+    seg_id : u64,
+    seq : u32,
+    stage : u8,
+    sealed : bool,
+    src : []const u8,
+    dst : []const u8,
+    dst_lang : []const u8,
 }
 
-/// New zeroed accumulator
-pub fn acc_new() -> Acc {
-    var a : Acc = Acc { f0 : 0, f1 : 0, f2 : 0, f3 : 0, f4 : 0, f5 : 0 };
-    return a;
+pub fn tr_new(seg_id : u64, seq : u32, src : []const u8, dst_lang : []const u8) -> Translation {
+    var t : Translation = Translation { seg_id: seg_id, seq: seq, stage: SEG_FINAL, sealed: false, src: src, dst: "", dst_lang: dst_lang };
+    return t;
 }
 
-/// Begin an attempt: wipe all fields (pin left at length 0)
-pub fn acc_begin(st : *Acc) -> void {
-    st.f0 = 0;
-    st.f1 = 0;
-    st.f2 = 0;
-    st.f3 = 0;
-    st.f4 = 0;
-    st.f5 = 0;
+/// Seal the source side: only after this may a translated body be installed.
+pub fn tr_seal(t : *Translation) -> void {
+    t.sealed = true;
 }
 
-/// Replace: a nonzero field in the fragment REPLACES the state; a zero leaves it
-pub fn acc_merge(st : *Acc, u : Acc) -> void {
-    if (u.f0 != 0) { st.f0 = u.f0; }
-    if (u.f1 != 0) { st.f1 = u.f1; }
-    if (u.f2 != 0) { st.f2 = u.f2; }
-    if (u.f3 != 0) { st.f3 = u.f3; }
-    if (u.f4 != 0) { st.f4 = u.f4; }
-    if (u.f5 != 0) { st.f5 = u.f5; }
+/// Install the translated body. An unsealed segment, a stale sequence or an
+/// empty body is refused with a named code and the state stands untouched.
+pub fn tr_done(t : *Translation, seq : u32, dst : []const u8) -> u8 {
+    if (!t.sealed) { return TR_NOT_SEALED; }
+    if (seq < t.seq) { return TR_STALE; }
+    if (dst.len == 0) { return TR_EMPTY; }
+    t.dst = dst;
+    t.seq = seq;
+    t.stage = SEG_TRANSLATED;
+    return TR_OK;
 }
 
-/// Anthropic usage-chunk handling (glue; host supplies the fragment)
-pub fn acc_anthropic(st : *Acc, frag : []const u8) -> void {
+; Feed one provider fragment into the attempt accumulator: Anthropic shape or
+; OpenRouter shape, as the host glue reports. Both parsers live in router_stream;
+; this only names the call site.
+pub fn tr_feed(acc : []u64, frag : []const u8, anthropic_shape : bool) -> void {
+    if (anthropic_shape) { rs_anthropic(acc, frag); } else { rs_openai(acc, frag); }
 }
 
-/// OpenAI usage-chunk handling (glue; host supplies the fragment)
-pub fn acc_openai(st : *Acc, frag : []const u8) -> void {
+; One translation attempt against the chain head: begin a fresh stream
+; accumulator (a fallback must never inherit the failed attempt's usage),
+; close the attempt, and return the chain after the reply -- the head is
+; demoted exactly when the reply says next. The chain and the accumulator are
+; the caller's; the decisions live in provider_router and router_stream.
+pub fn tr_attempt(out : []u8, chain : []const u8, acc : []u64, status : u32, body : []const u8, clean : bool) -> usize {
+    rs_begin(acc);
+    rs_close(acc, clean);
+    return pr_after(out, chain, status, body);
 }
 
-invariant statuses_are_the_three_retry_reasons
-    assert ST_PAYMENT == 402 and ST_RATE == 429 and ST_OVERLOADED == 529
+invariant refusals_are_named_and_nonzero
+    assert TR_OK == 0 and TR_NOT_SEALED > 0 and TR_STALE > 0 and TR_EMPTY > 0 and TR_NOT_SEALED != TR_STALE and TR_STALE != TR_EMPTY and TR_NOT_SEALED != TR_EMPTY
 
-invariant glossary_entries_are_nonempty
-    assert GL_Hello[0] == 72 and GL_World[0] == 87 and GL_Day[0] != 0 and GL_Sun[0] != 0
+invariant the_stage_moves_forward_only
+    assert SEG_FINAL < SEG_TRANSLATED
 
-/// Begin wipes everything
-test acc_begin_wipes_everything {
-    var a : Acc = acc_new();
-    a.f0 = 7;
-    a.f3 = 9;
-    acc_begin(&a);
-    assert a.f0 == 0 and a.f3 == 0;
+test "an_unsealed_segment_is_never_translated" {
+    var t : Translation = tr_new(7, 3, GL_Day, "ru");
+    const r : u8 = tr_done(&t, 3, "den");
+    assert r == TR_NOT_SEALED;
+    assert t.stage == SEG_FINAL;
+    assert t.dst.len == 0;
 }
 
-/// Idempotent merge: merging the same delta twice leaves the state unchanged
-test merge_is_replace_not_append {
-    var a : Acc = acc_new();
-    var u : Acc = Acc { f0 : 10, f1 : 20, f2 : 30, f3 : 0, f4 : 0, f5 : 0 };
-    acc_merge(&a, u);
-    acc_merge(&a, u);
-    assert a.f0 == 10 and a.f1 == 20 and a.f2 == 30;
-    assert a.f3 == 0 and a.f4 == 0 and a.f5 == 0;
+test "a_sealed_segment_takes_its_translation_and_carries_the_trace" {
+    var t : Translation = tr_new(7, 3, GL_Day, "ru");
+    tr_seal(&t);
+    const r : u8 = tr_done(&t, 4, "den");
+    assert r == TR_OK;
+    assert t.stage == SEG_TRANSLATED;
+    assert t.seg_id == 7;
+    assert t.seq == 4;
+    assert same_bytes(t.dst, "den");
+    assert same_bytes(t.dst_lang, "ru");
 }
 
-/// A zero field in the fragment leaves the state field untouched
-test zero_fragment_field_leaves_state {
-    var a : Acc = acc_new();
-    a.f1 = 55;
-    var u : Acc = acc_new();
-    acc_merge(&a, u);
-    assert a.f1 == 55;
+test "a_stale_sequence_is_refused_and_the_state_stands" {
+    var t : Translation = tr_new(7, 5, GL_Day, "ru");
+    tr_seal(&t);
+    const r : u8 = tr_done(&t, 4, "den");
+    assert r == TR_STALE;
+    assert t.stage == SEG_FINAL;
+    assert t.seq == 5;
+    assert t.dst.len == 0;
 }
 
-/// Negative control: append instead of replace must fail
-test negative_control_appends_instead_of_replaces {
-    var a : Acc = acc_new();
-    var u : Acc = Acc { f0 : 10, f1 : 0, f2 : 0, f3 : 0, f4 : 0, f5 : 0 };
-    acc_merge(&a, u);
-    acc_merge(&a, u);
-    assert a.f0 == 10;
-    assert a.f0 != 20;
+test "an_empty_translation_is_refused_even_when_sealed" {
+    var t : Translation = tr_new(7, 3, GL_Day, "ru");
+    tr_seal(&t);
+    const r : u8 = tr_done(&t, 3, "");
+    assert r == TR_EMPTY;
+    assert t.stage == SEG_FINAL;
+    assert t.dst.len == 0;
 }
 
-/// Provider status codes are distinct
-test provider_statuses_distinct {
-    assert ST_PAYMENT != ST_RATE and ST_RATE != ST_OVERLOADED and ST_PAYMENT != ST_OVERLOADED;
+test "the_retry_statuses_and_the_subscription_mark_move_on" {
+    assert pr_should_next(ST_PAYMENT, "");
+    assert pr_should_next(ST_RATE, "");
+    assert pr_should_next(ST_OVERLOADED, "");
+    assert pr_should_next(200, "organization has disabled Claude subscription access for this key");
+    assert pr_should_next(200, "ok") == false;
+    assert pr_should_next(400, "ok") == false;
 }
 
-/// Glossary entries carry their first bytes
-test glossary_entries_readable {
-    assert GL_Hello[0] == 72 and GL_World[0] == 87;
-    assert GL_Day[0] != 0 and GL_Sun[0] != 0;
+test "provider_fragments_replace_and_never_double_count" {
+    var acc : [RS_FIELDS]u64 = undefined;
+    rs_begin(acc[0..]);
+    tr_feed(acc[0..], "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":80}}}", true);
+    tr_feed(acc[0..], "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}", true);
+    tr_feed(acc[0..], "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}", true);
+    // message_start sets total = input + cache_read = 180 and read = 80; replaying the
+    // same delta twice (output_tokens is not one of the three counters) must not move them.
+    assert acc[0] == 180;
+    assert acc[1] == 80;
+    assert acc[2] == 0;
+}
+
+test "a_retry_demotes_the_chain_head_and_a_standing_reply_does_not" {
+    var out : [96]u8 = undefined;
+    var acc : [RS_FIELDS]u64 = undefined;
+    const n : usize = tr_attempt(out[0..], "anthropic,openai", acc[0..], ST_RATE, "", true);
+    assert same_bytes(out[0..n], "openai,anthropic");
+    assert (acc[5] & RS_INCOMPLETE) == 0;
+    var keep : [96]u8 = undefined;
+    var acc2 : [RS_FIELDS]u64 = undefined;
+    const m : usize = tr_attempt(keep[0..], "anthropic,openai", acc2[0..], 200, "ok", true);
+    assert same_bytes(keep[0..m], "anthropic,openai");
+}
+
+test "an_aborted_attempt_is_incomplete_and_a_new_attempt_starts_from_zero" {
+    var out : [96]u8 = undefined;
+    var acc : [RS_FIELDS]u64 = undefined;
+    tr_attempt(out[0..], "zai,kie", acc[0..], 200, "", false);
+    assert (acc[5] & RS_INCOMPLETE) != 0;
+    rs_begin(acc[0..]);
+    assert (acc[5] & RS_INCOMPLETE) == 0;
+    assert (acc[5] & RS_CLOSED) == 0;
+}
+
+test "a_replay_of_the_same_call_folds_to_the_same_state" {
+    var a : Translation = tr_new(9, 2, GL_Sun, "ru");
+    tr_seal(&a);
+    const r1 : u8 = tr_done(&a, 2, "solntse");
+    var b : Translation = tr_new(9, 2, GL_Sun, "ru");
+    tr_seal(&b);
+    const r2 : u8 = tr_done(&b, 2, "solntse");
+    assert r1 == r2;
+    assert a.stage == b.stage;
+    assert a.seq == b.seq;
+    assert same_bytes(a.dst, b.dst);
+}
+
+test "negative_control_a_machine_that_translates_without_a_seal_leaves_a_trace" {
+    var t : Translation = tr_new(7, 3, GL_Day, "ru");
+    const r : u8 = tr_done(&t, 9, "den");
+    assert r != TR_OK;
+    assert t.stage != SEG_TRANSLATED;
+    assert t.seg_id == 7;
 }
