@@ -1,86 +1,83 @@
 // SPDX-License-Identifier: Apache-2.0
-// T27 Providers SSOT
-// Purpose: the single registry of provider routes, their funding state and
-//          their quarantine state. One provider fact, one owner.
+// T27 System Route Registry SSOT
+// Purpose: the registry the SYSTEM layer uses to route a request: which route
+//          class exists, whether it is local or remote, which credential
+//          REFERENCE it uses, when a route may enter the table, when it
+//          leaves, and what the caller is told when it fails.
 //
-// Owner: T27_ORDER_RESTORE_01 (issue #12897), 2026-10-30.
+// Owner: T27_ORDER_RESTORE_01 (issue #14282), 2026-10-30.
 //
 // OWNS:
-//   - provider identity and route scope (local / remote)
-//   - the credential REFERENCE name bound to a provider (never the value)
-//   - funding state per provider and per credential
-//   - quarantine state, and the only event that clears it
-//   - the upstream-status to client-status transparency rule
+//   - the route classes of the system layer and their scope (local / remote)
+//   - the rule that a local route is loopback only
+//   - the admission rule: a route enters the table only when it is funded
+//     AND probed
+//   - the leave rules: an unfunded route leaves, an invalid credential leaves
+//     the pool but not the route
+//   - quarantine stickiness: only an explicit re-verification clears it
+//   - the status transparency rule: the caller sees the real cause
 //
 // DOES NOT OWN (never restate these facts here):
-//   - request-time preflight verdicts and the failure-class taxonomy:
-//       specs/system/llm_request_provider_gate.t27
-//   - response-side circuit breaker, retry budget, cooldown:
-//       specs/system/model_routing_circuit_breaker.t27
-//   - rung order, per-rung model, request adaptation:
-//       specs/system/model-ladder.t27
-//   - key values, rotation, masking, dead-key quarantine:
+//   - the dated route matrix (which route answered when, at which price):
+//       specs/queen/api_fleet.t27
+//   - the scan state vocabulary and the ranking:
+//       specs/t27os/access_scan.t27
+//   - per-credential refusal kinds, cooldowns, bitmasks, attempt bound:
+//       specs/queen/key_failover.t27
+//   - the node rung table, the serve laws (thinking off, fail-closed 503 that
+//     names every rung), the probe size: specs/t27os/ladder.t27,
+//       specs/t27os/ladder_speed.t27, specs/t27os/ladder_serve.t27
+//   - the routing policy above a table (admission of a rung, the switch
+//     rules, the walk budget): specs/system/model-ladder.t27
+//   - credential custody, rotation by age, leases and audit:
+//       specs/vault/policy.t27, specs/vault/custodian.t27,
+//       specs/vault/audit.t27
+//   - the credential reference registry and the pool reload contract:
 //       specs/system/credentials.t27
-//   - the fact-ownership map of the system layer:
+//   - the scan rules that find a secret in a diff:
+//       specs/policy/secret_gate.t27
+//   - the recovery ladder levels and the Doctor states:
+//       specs/system/session-recovery-ladder.t27,
+//       specs/system/session-doctor.t27
+//   - the fact-ownership index of the system layer:
 //       specs/system/language-boundary.t27
 //
 // Live evidence (2026-10-30, local route 127.0.0.1:3131):
-//   - ladder up, 5 z.ai keys loaded at start, 4 healthy, 1 quota-exhausted
-//     until 2026-11-01, 1 rejected with 401
-//   - upstream 429 and 401 were observed directly; they must stay visible
-//     to the caller instead of being flattened into a generic 503
+//   - the running ladder answered 200 while one pool credential was refused
+//     with 401 and another was out of quota until 2026-11-01; the caller saw
+//     a generic 503 instead of the real cause
+//   - the loaded pool held 5 credentials while the store held 6
+//
+// L3 NO_SILENT_FALLBACK and L4 UNFUNDED_MEANS_STOP, as route state.
 
 module providers;
 
-// ─── Provider identity ─────────────────────────────────────────────────────
+// ─── Route classes of the system layer ─────────────────────────────────────
 //
-// Identity only. The base URL, the endpoint and the key live in the host
-// configuration and in the secret store; this registry names them.
+// Identity of a ROUTE, not of a provider card. The provider cards live under
+// specs/providers/ (the catalog contract, specs/providers/catalog.t27) and the
+// dated funding matrix lives in specs/queen/api_fleet.t27.
 
-pub const PROVIDER_T27_LADDER : u8 = 0;  // local loopback route
-pub const PROVIDER_ZAI : u8 = 1;         // remote, glm models
-pub const PROVIDER_OLLAMA : u8 = 2;      // local loopback route
-pub const PROVIDER_DEEPSEEK : u8 = 3;    // remote, blocked until funded
-pub const PROVIDER_NVIDIA_NIM : u8 = 4;  // remote, funded models
-pub const PROVIDER_UNKNOWN : u8 = 5;
+pub const ROUTE_LOCAL_LADDER : u8 = 0;   // the local model ladder, loopback
+pub const ROUTE_LOCAL_OLLAMA : u8 = 1;   // the local model host, loopback
+pub const ROUTE_REMOTE_ZAI : u8 = 2;     // remote, glm models
+pub const ROUTE_REMOTE_NIM : u8 = 3;     // remote, funded models
+pub const ROUTE_REMOTE_DEEPSEEK : u8 = 4; // remote, blocked until funded
+pub const ROUTE_COUNT : u32 = 5;
 
-pub const PROVIDER_COUNT : u32 = 5;
-
-// ─── Route scope ───────────────────────────────────────────────────────────
+// ─── Scope ─────────────────────────────────────────────────────────────────
 
 pub const SCOPE_NONE : u8 = 0;
-pub const SCOPE_LOCAL : u8 = 1;   // loopback only
+pub const SCOPE_LOCAL : u8 = 1;
 pub const SCOPE_REMOTE : u8 = 2;
 
-// ─── Funding state ─────────────────────────────────────────────────────────
-
-pub const FUNDING_UNKNOWN : u8 = 0;      // never verified
-pub const FUNDING_FUNDED : u8 = 1;       // verified usable
-pub const FUNDING_EXHAUSTED : u8 = 2;    // quota/balance consumed
-pub const FUNDING_INVALID : u8 = 3;      // credential rejected
-pub const FUNDING_UNVERIFIED : u8 = 4;   // present but not proven
-
-// ─── Route signal ──────────────────────────────────────────────────────────
-//
-// A signal is an already-observed route event. It is NOT a re-classification
-// of a response body: the failure taxonomy is owned by
-// specs/system/llm_request_provider_gate.t27.
-
-pub const SIGNAL_NONE : u8 = 0;
-pub const SIGNAL_TRANSIENT : u8 = 1;
-pub const SIGNAL_UNFUNDED : u8 = 2;
-pub const SIGNAL_INVALID_KEY : u8 = 3;
-pub const SIGNAL_TERMINAL : u8 = 4;
-pub const SIGNAL_NEEDS_CAUSE : u8 = 5;   // status alone is not decisive
-
-// ─── Quarantine state ──────────────────────────────────────────────────────
+// ─── Quarantine ────────────────────────────────────────────────────────────
 
 pub const QUARANTINE_NONE : u8 = 0;
 pub const QUARANTINE_UNFUNDED : u8 = 1;
-pub const QUARANTINE_INVALID_KEY : u8 = 2;
-pub const QUARANTINE_REVIEW : u8 = 3;
+pub const QUARANTINE_INVALID_CREDENTIAL : u8 = 2;
 
-// ─── Client status codes used by the transparency rule ─────────────────────
+// ─── HTTP statuses the caller must see as themselves ───────────────────────
 
 pub const HTTP_OK : u16 = 200;
 pub const HTTP_UNAUTHORIZED : u16 = 401;
@@ -91,137 +88,127 @@ pub const HTTP_SERVICE_UNAVAILABLE : u16 = 503;
 
 // ─── Functions ─────────────────────────────────────────────────────────────
 
-// provider_is_known(p) - identity check against the registry.
-pub fn provider_is_known(p: u8) -> bool {
-    if (p < PROVIDER_COUNT) {
+// registry_entry_count() - how many route classes the system layer routes to.
+pub fn registry_entry_count() -> u32 {
+    return ROUTE_COUNT;
+}
+
+// route_class_is_known(route_class) -> bool
+pub fn route_class_is_known(route_class: u8) -> bool {
+    if (route_class < ROUTE_COUNT) {
         return true;
     }
     return false;
 }
 
-// route_scope(p) - local routes are loopback only; a remote provider is
-// never treated as local, and an unknown provider has no scope at all.
-pub fn route_scope(p: u8) -> u8 {
-    if (p == PROVIDER_T27_LADDER) {
+// route_scope(route_class) -> u8
+pub fn route_scope(route_class: u8) -> u8 {
+    if (route_class == ROUTE_LOCAL_LADDER) {
         return SCOPE_LOCAL;
     }
-    if (p == PROVIDER_OLLAMA) {
+    if (route_class == ROUTE_LOCAL_OLLAMA) {
         return SCOPE_LOCAL;
     }
-    if (p == PROVIDER_ZAI or p == PROVIDER_DEEPSEEK or p == PROVIDER_NVIDIA_NIM) {
+    if (route_class == ROUTE_REMOTE_ZAI) {
+        return SCOPE_REMOTE;
+    }
+    if (route_class == ROUTE_REMOTE_NIM) {
+        return SCOPE_REMOTE;
+    }
+    if (route_class == ROUTE_REMOTE_DEEPSEEK) {
         return SCOPE_REMOTE;
     }
     return SCOPE_NONE;
 }
 
-// local_route_is_loopback_only(p) - a local provider must never be reachable
-// from off-host. This is the route form of the loopback law.
-pub fn local_route_is_loopback_only(p: u8) -> bool {
-    if (route_scope(p) != SCOPE_LOCAL) {
+// local_route_is_loopback_only(route_class) -> bool - a local route is node
+// plumbing; it is never a network service.
+pub fn local_route_is_loopback_only(route_class: u8) -> bool {
+    if (route_scope(route_class) != SCOPE_LOCAL) {
         return false;
     }
     return true;
 }
 
-// signal_from_upstream_status(status) - maps an upstream HTTP status to a
-// route signal. 429 is deliberately NOT decided here: the same status means
-// "rate limit" on one key and "weekly/monthly limit exhausted" on another,
-// so the cause must be read before the route state changes.
-pub fn signal_from_upstream_status(status: u16) -> u8 {
-    if (status == HTTP_UNAUTHORIZED) {
-        return SIGNAL_INVALID_KEY;
+// route_admitted(funded, probed) -> bool - a route enters the table only when
+// it is funded AND probed. An unprobed route is not a route yet.
+pub fn route_admitted(funded: bool, probed: bool) -> bool {
+    if (funded == false) {
+        return false;
     }
-    if (status == HTTP_PAYMENT_REQUIRED) {
-        return SIGNAL_UNFUNDED;
+    if (probed == false) {
+        return false;
     }
-    if (status == HTTP_FORBIDDEN) {
-        return SIGNAL_INVALID_KEY;
-    }
-    if (status == HTTP_TOO_MANY_REQUESTS) {
-        return SIGNAL_NEEDS_CAUSE;
-    }
-    if (status >= 500) {
-        return SIGNAL_TRANSIENT;
-    }
-    return SIGNAL_TERMINAL;
+    return true;
 }
 
-// funding_state_from_signal(signal) - the funding fact of a route.
-pub fn funding_state_from_signal(signal: u8) -> u8 {
-    if (signal == SIGNAL_UNFUNDED) {
-        return FUNDING_EXHAUSTED;
+// route_leaves_on_unfunded(funded) -> bool - an exhausted route leaves the
+// table until it is funded and probed again.
+pub fn route_leaves_on_unfunded(funded: bool) -> bool {
+    if (funded) {
+        return false;
     }
-    if (signal == SIGNAL_INVALID_KEY) {
-        return FUNDING_INVALID;
-    }
-    if (signal == SIGNAL_TRANSIENT or signal == SIGNAL_TERMINAL) {
-        return FUNDING_UNKNOWN;
-    }
-    if (signal == SIGNAL_NEEDS_CAUSE) {
-        return FUNDING_UNVERIFIED;
-    }
-    return FUNDING_UNKNOWN;
+    return true;
 }
 
-// quarantine_for_signal(signal) - what the registry does with a route after
-// an observed signal.
-pub fn quarantine_for_signal(signal: u8) -> u8 {
-    if (signal == SIGNAL_UNFUNDED) {
+// route_leaves_on_invalid_credential(invalid_credential) -> bool - one
+// rejected credential leaves the POOL, not the route: other credentials of
+// the same route may still answer.
+pub fn route_leaves_on_invalid_credential(invalid_credential: bool) -> bool {
+    return invalid_credential;
+}
+
+// quarantine_state_for(funded, invalid_credential) -> u8
+pub fn quarantine_state_for(funded: bool, invalid_credential: bool) -> u8 {
+    if (funded == false) {
         return QUARANTINE_UNFUNDED;
     }
-    if (signal == SIGNAL_INVALID_KEY) {
-        return QUARANTINE_INVALID_KEY;
-    }
-    if (signal == SIGNAL_TERMINAL) {
-        return QUARANTINE_REVIEW;
+    if (invalid_credential) {
+        return QUARANTINE_INVALID_CREDENTIAL;
     }
     return QUARANTINE_NONE;
 }
 
-// provider_selectable(p, funding, quarantine) - a quarantined or exhausted
-// provider is never selected again on the same evidence.
-pub fn provider_selectable(p: u8, funding: u8, quarantine: u8) -> bool {
-    if (provider_is_known(p) == false) {
+// quarantine_is_sticky(quarantined, explicit_reverify) -> bool - quarantine is
+// cleared only by an explicit re-verification, never by a retry and never by
+// the passage of time.
+pub fn quarantine_is_sticky(quarantined: bool, explicit_reverify: bool) -> bool {
+    if (quarantined == false) {
         return false;
     }
-    if (quarantine != QUARANTINE_NONE) {
-        return false;
-    }
-    if (funding == FUNDING_EXHAUSTED) {
-        return false;
-    }
-    if (funding == FUNDING_INVALID) {
+    if (explicit_reverify) {
         return false;
     }
     return true;
 }
 
-// provider_verified_funded(p, funding) - only a verified provider may be
-// reported as funded. Unknown and unverified are never "funded".
-pub fn provider_verified_funded(p: u8, funding: u8) -> bool {
-    if (provider_is_known(p) == false) {
+// route_is_selectable(route_class, funded, probed, quarantined) -> bool
+pub fn route_is_selectable(route_class: u8, funded: bool, probed: bool, quarantined: bool) -> bool {
+    if (route_class_is_known(route_class) == false) {
         return false;
     }
-    return funding == FUNDING_FUNDED;
-}
-
-// quarantine_cleared(signal, explicit_reverify) - quarantine is sticky. It is
-// cleared only by an explicit re-verification that succeeded, never by the
-// passage of time and never by a retry.
-pub fn quarantine_cleared(signal: u8, explicit_reverify: bool) -> bool {
-    if (explicit_reverify == false) {
+    if (quarantined) {
         return false;
     }
-    if (signal == SIGNAL_UNFUNDED or signal == SIGNAL_INVALID_KEY) {
-        return true;
-    }
-    return false;
+    return route_admitted(funded, probed);
 }
 
-// client_status_for(upstream_status, signal) - status transparency. The
-// caller must see the real reason: 401, 402, 403 and 429 are preserved, and
-// 503 is reserved for a genuinely exhausted ladder.
-pub fn client_status_for(upstream_status: u16, signal: u8) -> u16 {
+// remote_route_needs_matrix_entry(is_remote, matrix_has_entry) -> bool - a
+// remote route must appear in the dated matrix (specs/queen/api_fleet.t27),
+// otherwise the system layer routes to something nobody measured.
+pub fn remote_route_needs_matrix_entry(is_remote: bool, matrix_has_entry: bool) -> bool {
+    if (is_remote == false) {
+        return false;
+    }
+    if (matrix_has_entry) {
+        return false;
+    }
+    return true;
+}
+
+// client_status_for(upstream_status) -> u16 - the caller sees the real cause.
+// A generic 503 is reserved for a ladder that really was exhausted.
+pub fn client_status_for(upstream_status: u16) -> u16 {
     if (upstream_status == HTTP_UNAUTHORIZED) {
         return HTTP_UNAUTHORIZED;
     }
@@ -234,150 +221,135 @@ pub fn client_status_for(upstream_status: u16, signal: u8) -> u16 {
     if (upstream_status == HTTP_TOO_MANY_REQUESTS) {
         return HTTP_TOO_MANY_REQUESTS;
     }
-    if (signal == SIGNAL_UNFUNDED) {
-        return HTTP_PAYMENT_REQUIRED;
-    }
-    if (signal == SIGNAL_INVALID_KEY) {
-        return HTTP_UNAUTHORIZED;
-    }
     return upstream_status;
 }
 
-// ladder_exhausted_status(last_signal) - 503 is used for exactly one case:
-// every rung refused and nothing else is left.
-pub fn ladder_exhausted_status(last_signal: u8) -> u16 {
-    if (last_signal == SIGNAL_NONE) {
-        return HTTP_SERVICE_UNAVAILABLE;
+// status_is_masked(upstream_status, client_status) -> bool - a refusal that
+// arrives as a generic 503 is a masked cause.
+pub fn status_is_masked(upstream_status: u16, client_status: u16) -> bool {
+    if (client_status != HTTP_SERVICE_UNAVAILABLE) {
+        return false;
     }
-    return client_status_for(HTTP_SERVICE_UNAVAILABLE, last_signal);
+    if (upstream_status == HTTP_SERVICE_UNAVAILABLE) {
+        return false;
+    }
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-test "known_providers_have_exactly_one_scope" {
-    assert(provider_is_known(PROVIDER_T27_LADDER) == true);
-    assert(provider_is_known(PROVIDER_ZAI) == true);
-    assert(provider_is_known(PROVIDER_OLLAMA) == true);
-    assert(provider_is_known(PROVIDER_DEEPSEEK) == true);
-    assert(provider_is_known(PROVIDER_NVIDIA_NIM) == true);
-    assert(provider_is_known(PROVIDER_UNKNOWN) == false);
-    assert(route_scope(PROVIDER_T27_LADDER) == SCOPE_LOCAL);
-    assert(route_scope(PROVIDER_OLLAMA) == SCOPE_LOCAL);
-    assert(route_scope(PROVIDER_ZAI) == SCOPE_REMOTE);
-    assert(route_scope(PROVIDER_DEEPSEEK) == SCOPE_REMOTE);
-    assert(route_scope(PROVIDER_NVIDIA_NIM) == SCOPE_REMOTE);
-    assert(route_scope(PROVIDER_UNKNOWN) == SCOPE_NONE);
+test "the_registry_has_five_route_classes" {
+    assert(registry_entry_count() == 5);
+    assert(route_class_is_known(ROUTE_LOCAL_LADDER) == true);
+    assert(route_class_is_known(ROUTE_REMOTE_DEEPSEEK) == true);
+    assert(route_class_is_known(200) == false);
 }
 
-test "local_routes_are_loopback_only" {
-    assert(local_route_is_loopback_only(PROVIDER_T27_LADDER) == true);
-    assert(local_route_is_loopback_only(PROVIDER_OLLAMA) == true);
-    assert(local_route_is_loopback_only(PROVIDER_ZAI) == false);
-    assert(local_route_is_loopback_only(PROVIDER_UNKNOWN) == false);
+test "local_routes_are_loopback_only_and_remote_routes_are_not" {
+    assert(route_scope(ROUTE_LOCAL_LADDER) == SCOPE_LOCAL);
+    assert(route_scope(ROUTE_LOCAL_OLLAMA) == SCOPE_LOCAL);
+    assert(route_scope(ROUTE_REMOTE_ZAI) == SCOPE_REMOTE);
+    assert(local_route_is_loopback_only(ROUTE_LOCAL_LADDER) == true);
+    assert(local_route_is_loopback_only(ROUTE_LOCAL_OLLAMA) == true);
+    assert(local_route_is_loopback_only(ROUTE_REMOTE_ZAI) == false);
+    assert(local_route_is_loopback_only(200) == false);
 }
 
-test "unfunded_signal_exhausts_funding_and_quarantines_route" {
-    var signal = signal_from_upstream_status(HTTP_PAYMENT_REQUIRED);
-    assert(signal == SIGNAL_UNFUNDED);
-    assert(funding_state_from_signal(signal) == FUNDING_EXHAUSTED);
-    assert(quarantine_for_signal(signal) == QUARANTINE_UNFUNDED);
-    assert(provider_selectable(PROVIDER_ZAI, FUNDING_EXHAUSTED, QUARANTINE_UNFUNDED) == false);
+test "a_route_enters_the_table_only_when_it_is_funded_and_probed" {
+    assert(route_admitted(true, true) == true);
+    assert(route_admitted(false, true) == false);
+    assert(route_admitted(true, false) == false);
+    assert(route_admitted(false, false) == false);
 }
 
-test "invalid_key_signal_quarantines_the_credential_not_the_balance" {
-    var signal = signal_from_upstream_status(HTTP_UNAUTHORIZED);
-    assert(signal == SIGNAL_INVALID_KEY);
-    assert(funding_state_from_signal(signal) == FUNDING_INVALID);
-    assert(quarantine_for_signal(signal) == QUARANTINE_INVALID_KEY);
-    assert(provider_selectable(PROVIDER_ZAI, FUNDING_INVALID, QUARANTINE_INVALID_KEY) == false);
+test "an_unfunded_route_leaves_the_table" {
+    assert(route_leaves_on_unfunded(false) == true);
+    assert(route_leaves_on_unfunded(true) == false);
+    assert(quarantine_state_for(false, false) == QUARANTINE_UNFUNDED);
 }
 
-test "rate_limit_status_is_not_decided_without_its_cause" {
-    var signal = signal_from_upstream_status(HTTP_TOO_MANY_REQUESTS);
-    assert(signal == SIGNAL_NEEDS_CAUSE);
-    assert(funding_state_from_signal(signal) == FUNDING_UNVERIFIED);
-    assert(quarantine_for_signal(signal) == QUARANTINE_NONE);
+test "an_invalid_credential_leaves_the_pool_but_not_the_route" {
+    assert(route_leaves_on_invalid_credential(true) == true);
+    assert(route_leaves_on_invalid_credential(false) == false);
+    assert(quarantine_state_for(true, true) == QUARANTINE_INVALID_CREDENTIAL);
 }
 
-test "transient_signal_never_quarantines_and_never_claims_funded" {
-    var signal = signal_from_upstream_status(HTTP_SERVICE_UNAVAILABLE);
-    assert(signal == SIGNAL_TRANSIENT);
-    assert(funding_state_from_signal(signal) == FUNDING_UNKNOWN);
-    assert(quarantine_for_signal(signal) == QUARANTINE_NONE);
-    assert(provider_verified_funded(PROVIDER_ZAI, FUNDING_UNKNOWN) == false);
-    assert(provider_verified_funded(PROVIDER_ZAI, FUNDING_FUNDED) == true);
+test "quarantine_is_cleared_only_by_an_explicit_reverification" {
+    assert(quarantine_is_sticky(true, false) == true);
+    assert(quarantine_is_sticky(true, true) == false);
+    assert(quarantine_is_sticky(false, false) == false);
 }
 
-test "unknown_funding_is_never_reported_as_funded" {
-    assert(provider_verified_funded(PROVIDER_ZAI, FUNDING_UNKNOWN) == false);
-    assert(provider_verified_funded(PROVIDER_ZAI, FUNDING_UNVERIFIED) == false);
-    assert(provider_verified_funded(PROVIDER_UNKNOWN, FUNDING_FUNDED) == false);
+test "a_quarantined_or_unmeasured_route_is_never_selectable" {
+    assert(route_is_selectable(ROUTE_REMOTE_ZAI, true, true, false) == true);
+    assert(route_is_selectable(ROUTE_REMOTE_ZAI, false, true, false) == false);
+    assert(route_is_selectable(ROUTE_REMOTE_ZAI, true, false, false) == false);
+    assert(route_is_selectable(ROUTE_REMOTE_ZAI, true, true, true) == false);
+    assert(route_is_selectable(200, true, true, false) == false);
 }
 
-test "quarantine_is_sticky_until_explicit_reverification" {
-    assert(quarantine_cleared(SIGNAL_UNFUNDED, false) == false);
-    assert(quarantine_cleared(SIGNAL_INVALID_KEY, false) == false);
-    assert(quarantine_cleared(SIGNAL_UNFUNDED, true) == true);
-    assert(quarantine_cleared(SIGNAL_INVALID_KEY, true) == true);
-    assert(quarantine_cleared(SIGNAL_TRANSIENT, true) == false);
+test "a_remote_route_without_a_matrix_entry_is_a_gap" {
+    assert(remote_route_needs_matrix_entry(true, false) == true);
+    assert(remote_route_needs_matrix_entry(true, true) == false);
+    assert(remote_route_needs_matrix_entry(false, false) == false);
 }
 
-test "client_status_preserves_the_real_cause" {
-    assert(client_status_for(HTTP_UNAUTHORIZED, SIGNAL_INVALID_KEY) == HTTP_UNAUTHORIZED);
-    assert(client_status_for(HTTP_PAYMENT_REQUIRED, SIGNAL_UNFUNDED) == HTTP_PAYMENT_REQUIRED);
-    assert(client_status_for(HTTP_FORBIDDEN, SIGNAL_INVALID_KEY) == HTTP_FORBIDDEN);
-    assert(client_status_for(HTTP_TOO_MANY_REQUESTS, SIGNAL_NEEDS_CAUSE) == HTTP_TOO_MANY_REQUESTS);
+test "the_caller_sees_the_real_cause" {
+    assert(client_status_for(HTTP_UNAUTHORIZED) == HTTP_UNAUTHORIZED);
+    assert(client_status_for(HTTP_PAYMENT_REQUIRED) == HTTP_PAYMENT_REQUIRED);
+    assert(client_status_for(HTTP_FORBIDDEN) == HTTP_FORBIDDEN);
+    assert(client_status_for(HTTP_TOO_MANY_REQUESTS) == HTTP_TOO_MANY_REQUESTS);
+    assert(client_status_for(HTTP_OK) == HTTP_OK);
 }
 
-test "generic_503_is_not_used_to_hide_an_unfunded_or_invalid_key" {
-    assert(client_status_for(HTTP_SERVICE_UNAVAILABLE, SIGNAL_UNFUNDED) == HTTP_PAYMENT_REQUIRED);
-    assert(client_status_for(HTTP_SERVICE_UNAVAILABLE, SIGNAL_INVALID_KEY) == HTTP_UNAUTHORIZED);
-    assert(ladder_exhausted_status(SIGNAL_NONE) == HTTP_SERVICE_UNAVAILABLE);
-    assert(ladder_exhausted_status(SIGNAL_UNFUNDED) == HTTP_PAYMENT_REQUIRED);
-}
-
-test "unknown_provider_is_never_selectable" {
-    assert(provider_selectable(PROVIDER_UNKNOWN, FUNDING_FUNDED, QUARANTINE_NONE) == false);
+test "a_refusal_that_arrives_as_a_generic_503_is_masked" {
+    assert(status_is_masked(HTTP_UNAUTHORIZED, HTTP_SERVICE_UNAVAILABLE) == true);
+    assert(status_is_masked(HTTP_PAYMENT_REQUIRED, HTTP_SERVICE_UNAVAILABLE) == true);
+    assert(status_is_masked(HTTP_TOO_MANY_REQUESTS, HTTP_SERVICE_UNAVAILABLE) == true);
+    assert(status_is_masked(HTTP_SERVICE_UNAVAILABLE, HTTP_SERVICE_UNAVAILABLE) == false);
+    assert(status_is_masked(HTTP_UNAUTHORIZED, HTTP_UNAUTHORIZED) == false);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Invariants
 // ═══════════════════════════════════════════════════════════════════════════
 
-invariant only_known_providers_are_selectable {
-    provider_selectable(PROVIDER_UNKNOWN, FUNDING_FUNDED, QUARANTINE_NONE) == false;
-    provider_selectable(PROVIDER_T27_LADDER, FUNDING_FUNDED, QUARANTINE_NONE) == true;
+invariant every_route_class_has_exactly_one_scope {
+    route_scope(ROUTE_LOCAL_LADDER) == SCOPE_LOCAL;
+    route_scope(ROUTE_LOCAL_OLLAMA) == SCOPE_LOCAL;
+    route_scope(ROUTE_REMOTE_ZAI) == SCOPE_REMOTE;
+    route_scope(ROUTE_REMOTE_NIM) == SCOPE_REMOTE;
+    route_scope(ROUTE_REMOTE_DEEPSEEK) == SCOPE_REMOTE;
+    route_scope(200) == SCOPE_NONE;
 }
 
-invariant quarantine_never_selects {
-    provider_selectable(PROVIDER_ZAI, FUNDING_FUNDED, QUARANTINE_UNFUNDED) == false;
-    provider_selectable(PROVIDER_ZAI, FUNDING_FUNDED, QUARANTINE_INVALID_KEY) == false;
-    provider_selectable(PROVIDER_ZAI, FUNDING_FUNDED, QUARANTINE_REVIEW) == false;
+invariant a_local_route_is_never_exposed_off_host {
+    local_route_is_loopback_only(ROUTE_LOCAL_LADDER) == true;
+    local_route_is_loopback_only(ROUTE_LOCAL_OLLAMA) == true;
+    local_route_is_loopback_only(ROUTE_REMOTE_NIM) == false;
 }
 
-invariant no_remote_provider_is_local {
-    local_route_is_loopback_only(PROVIDER_ZAI) == false;
-    local_route_is_loopback_only(PROVIDER_DEEPSEEK) == false;
-    local_route_is_loopback_only(PROVIDER_NVIDIA_NIM) == false;
-    route_scope(PROVIDER_UNKNOWN) == SCOPE_NONE;
+invariant an_unfunded_or_unprobed_route_is_never_selectable {
+    route_is_selectable(ROUTE_REMOTE_ZAI, false, true, false) == false;
+    route_is_selectable(ROUTE_REMOTE_ZAI, true, false, false) == false;
 }
 
-invariant funded_is_never_claimed_for_exhausted_or_invalid {
-    provider_verified_funded(PROVIDER_ZAI, FUNDING_EXHAUSTED) == false;
-    provider_verified_funded(PROVIDER_ZAI, FUNDING_INVALID) == false;
-    provider_verified_funded(PROVIDER_ZAI, FUNDING_FUNDED) == true;
+invariant a_quarantined_route_is_never_selectable {
+    route_is_selectable(ROUTE_REMOTE_ZAI, true, true, true) == false;
+    quarantine_is_sticky(true, false) == true;
 }
 
-invariant quarantine_clears_only_by_explicit_reverify {
-    quarantine_cleared(SIGNAL_UNFUNDED, false) == false;
-    quarantine_cleared(SIGNAL_INVALID_KEY, false) == false;
+invariant a_real_cause_is_never_flattened_to_503 {
+    client_status_for(HTTP_UNAUTHORIZED) != HTTP_SERVICE_UNAVAILABLE;
+    client_status_for(HTTP_PAYMENT_REQUIRED) != HTTP_SERVICE_UNAVAILABLE;
+    client_status_for(HTTP_FORBIDDEN) != HTTP_SERVICE_UNAVAILABLE;
+    client_status_for(HTTP_TOO_MANY_REQUESTS) != HTTP_SERVICE_UNAVAILABLE;
+    status_is_masked(HTTP_UNAUTHORIZED, HTTP_SERVICE_UNAVAILABLE) == true;
 }
 
-invariant real_causes_are_never_flattened_to_503 {
-    client_status_for(HTTP_UNAUTHORIZED, SIGNAL_INVALID_KEY) != HTTP_SERVICE_UNAVAILABLE;
-    client_status_for(HTTP_PAYMENT_REQUIRED, SIGNAL_UNFUNDED) != HTTP_SERVICE_UNAVAILABLE;
-    client_status_for(HTTP_FORBIDDEN, SIGNAL_INVALID_KEY) != HTTP_SERVICE_UNAVAILABLE;
-    client_status_for(HTTP_TOO_MANY_REQUESTS, SIGNAL_NEEDS_CAUSE) != HTTP_SERVICE_UNAVAILABLE;
+invariant the_registry_is_a_closed_set {
+    registry_entry_count() == 5;
+    route_class_is_known(200) == false;
 }

@@ -129,6 +129,112 @@ The first spec on these pins is `specs/fpga/eth_beacon.t27`, with the wrapper
 
 ---
 
+## 2026-11-26 -- the AX7203 UART speaks **115200 8N1**, one record per second (measured)
+
+Measured on this bench Mac on 2026-11-26 with
+`bench007_probe_ax7203.bit` (hash not recorded) loaded into **SRAM only**, flash
+untouched. Cable Digilent FT232H serial `210512180081` at `--busdev-num 1:3`,
+`idcode 0x3636093` (xilinx, family artix a7 200t, model xc7a200, irlength 6).
+UART bridge CP2102N serial `f29b9f74a016f01192063aadb887153e` on
+`/dev/cu.usbserial-1130`.
+
+The reader opens the port with `IOSSIOSPEED`
+(`fcntl.ioctl(fd, 0x80045402, struct.pack("I", baud))`), which is how an arbitrary
+rate such as 160000 is set on macOS; a plain `termios.B115200` set is equivalent for
+the standard rate.
+
+| baud | outcome |
+|---|---|
+| **115200** | clean records, 30/30 and 60/60 across two captures |
+| 160000 | 289 B/8 s, structured but not a frame |
+| 57600, 19200, 38400, 230400, 460800, 921600, 500000, 1000000 | no frame |
+
+One record is 32 ASCII characters plus CRLF, and exactly one arrives per second:
+
+```
+B7,0000031C,04034C4B,000100D3,CD\r\n
+```
+
+- field 1 `B7` -- a tag, present on all 90 records measured;
+- field 2 -- a 32-bit counter, 8 hex digits, `0x455 -> 0x490` over 60 records, step 1
+  with no gap;
+- field 5 -- **XOR of the 12 bytes of the three preceding hex fields**, verified 90/90.
+
+### The field names, from `bench_meter.v` (not a guess)
+
+The loaded design is `bench007_probe_ax7203`, and its source is the local clone
+`trinity-fpga/bench/bench007/` (`rtl/bench_meter.v`,
+`rtl/bench007_probe_ax7203.v`, `host/b7_{format,capture,analyze}.py`, `sim/`).
+The sha256 of the bitstream that is on the die,
+`9a4e5c2bccbeca3c4ba448a7b7ffebba93cc3add14b60311b5d0e9c982c368b3`, is byte-identical
+to the `bench007_probe_ax7203.bit` in that directory, so the captured frames come from
+exactly those sources. Its line is `B7,SSSSSSSS,CCCCCCCC,PPPPPPPP,KK`:
+
+| field | RTL name | meaning |
+|---|---|---|
+| `S` | `seq_l` | window sequence number, 32-bit hex. Window 0 is partial by design and dropped |
+| field 3 | `cyc_l` | **DUT clock (CFGMCLK) cycles in the window**, 32-bit hex |
+| field 4 | `stp_l` | **`dut_step` pulses in the window**. `div == 10'h3FF` on the DUT clock, so a step is one per 1024 DUT cycles |
+| field 5 | `chk` | `x4(seq_l) ^ x4(cyc_l) ^ x4(stp_l)` over the 12 bytes |
+
+So field 3 is a **frequency** and field 4 a **step rate**, both counted against a window
+closed by 100,000,000 ref cycles, where `ref_clk` is the 200 MHz crystal on R4/T4
+divided by two. `dut_clk` is CFGMCLK from `STARTUPE2` through a `BUFG`. The field 3
+shape I recorded above was `0403xxxx`, i.e. about 67.3 MHz, and the field 4 shape
+`000100yy`, i.e. about 65.7 kHz.
+
+### Measured on this die (2026-11-26), cross-validated
+
+Two independent parsings of the stream agree, and the design's own self-check passes on
+every window.
+
+| quantity | value |
+|---|---|
+| windows | 60 by `b7_analyze.py`, and 90 across an earlier pair of captures; 0 checksum rejects, 0 sequence gaps |
+| instrument self-check `P in {floor(C/1024), ceil(C/1024)}` | **60/60 PASS**, and 90/90 earlier |
+| `C/P` ratio | 1023.99 to 1024.01, i.e. the divider is 1024 |
+| CFGMCLK mean | **67.282464 MHz**, window sd 14375.3 Hz, min 67.251328, max 67.305366 |
+| steps per second | 65,705.5 |
+| capture | `b7_capture.py --port /dev/cu.usbserial-1130`, sealed; log sha256 `d432e09c62dce549d587f46c33b56e0954633723a73baa55334a29d741447668` |
+
+**This die reads BELOW the range the RTL header records** (68.8-70.77 MHz across three
+dice, T495), by about 1.5 MHz. Two readings, neither yet settled:
+
+* CFGMCLK on this die is genuinely 67.28 MHz. CFGMCLK is an *internal* configuration
+  oscillator, not the crystal, so a per-die difference is expected; the 214 ppm
+  window-to-window spread (sd 14375 Hz) is far wider than the +-50 ppm crystal and is
+  that internal oscillator's own wander.
+* the "one second" reference is off. Field 3 is a frequency only if `ref_clk` is exactly
+  100 MHz. This file's 2026-10-10 entry independently measured the "200 MHz oscillator
+  domain" at **205.89 MHz against 200** on this same bench; at that ratio the true
+  CFGMCLK would be about 69.3 MHz, inside the recorded range.
+
+What settles it: count the crystal against a reference that is not the crystal. Until
+then the number to quote is 67.282464 MHz *as measured against the crystal-derived
+window*, never as the die's oscillator frequency.
+
+Evidence under `build/fpga/ax7203/` (gitignored): `uart_115200.log`,
+`uart_115200_60s.log`, `RECEIPT_2026-11-26.md`.
+
+Two corrections to what stood in this file:
+
+1. Above, at line 96, **160000 baud** is stated for `gf8_clean_ax7203.bit`. On this
+   bench on 2026-11-26 that bitstream (sha256 verified as
+   `47d8a076e5195205f44c0967c0d924562d8adfe7a70ac0d5d95dc33ea310e369`, matching the
+   prefix this file prints) loaded cleanly into SRAM (`isc_done 1 isc_ena 0 init 1
+   done 1`) and emitted **0 bytes in 120 s** at 160000, and 0 bytes at 115200, 9600,
+   19200, 38400, 57600, 230400, 460800 and 921600. The figure is not contradicted:
+   that design apparently does not print. `bench007_probe_ax7203.bit` does, at
+   **115200**, which is what
+   `docs/analog/board-psp103-inv-2026-10-20.md` already says -- that document stands.
+2. The chipdb path on line 113 -- `build/fpga/openxc7/xc7a200tfbg484-2.bin` -- does
+   not exist; `build/fpga/openxc7/` is empty on this host. The file is
+   **`fpga/chipdb/xc7a200tfbg484-2.bin`**. `nextpnr-openxc7`, `nextpnr-xilinx`,
+   `fasm2frames`, `prjxray-db/artix7` and `venv` are all absent here; only `yosys`
+   and `xc7frames2bit` are installed (`nextpnr-himbaechel` is present, untested).
+
+---
+
 ## W796-W799 — five specifications answered from silicon
 
 `t27c silicon` carries a `.t27` spec through Verilog, yosys, nextpnr on

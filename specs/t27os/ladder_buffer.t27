@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: Apache-2.0
+; specs/t27os/ladder_buffer.t27 -- the contract of the T27 Ladder buffer, the
+; loopback proxy in front of the t27-native ladder of ladder_serve.t27.
+; WHY IT EXISTS. ladder_serve.t27 states its own limit: one client connection
+; is served at a time, and while its single worker walks the rung table it does
+; not call accept. Measured on 2026-11-26 with 20 concurrent clients
+; (build/fpga/ax7203/b7host/loadtest_3131.py):
+;   `nc -z -G 5 127.0.0.1 3131` against :3131 -> 1 of 10 accept probes
+;     succeeded, then every connect timed out; /health timed out after 22 s;
+;     `curl -s -m 25 .../v1/chat/completions` answered 0 of 20 requests.
+;   the same probes against :3133 -> 178 of 178 accepted, max 5.9 ms, 0 refused,
+;     and /health answered 200 in 0.00 s.
+; The buffer does not repair the ladder. It keeps the limit of the ladder from
+; taking the whole service down. It is plumbing, so this spec states only what
+; the plumbing owes the client, never which rung to call or when to refuse a
+; model; those stay in ladder.t27 and ladder_speed.t27.
+; Law of this spec: accept is never blocked by work; the queue is BOUNDED, so an
+; overload answers the client at once instead of moving the failure from the
+; kernel queue into the heap; liveness never depends on a model call or on how
+; deep the queue is; one retry only for a connection-level upstream failure,
+; never for an answer the ladder itself produced.
+
+module T27osLadderBuffer;
+
+/// How much work may sit between the client and the one upstream slot. The slot
+; in flight counts as one. Measured high water on 2026-11-26 was 22 of 26
+; queued under a 20-client burst, so 64 leaves headroom and rejects nothing at
+; that load. This is the default of the deployed host file and its QUEUE_CAP.
+pub const LB_QUEUE_CAP : usize = 64;
+
+/// The status a full queue answers. 429, not 503: the client is limited by its
+; own queue position and the ladder is still alive.
+pub const LB_QUEUE_OVERFLOW_STATUS : u32 = 429;
+
+/// Seconds the overflow answer asks the client to wait, in retry-after.
+pub const LB_RETRY_AFTER_S : u32 = 1;
+
+/// How long the buffer waits for the ladder before answering 504. It must
+; exceed the deadlines of the ladder so a slow rung stays a slow answer and a
+; hung rung becomes a clean 504; see the invariant at the end.
+pub const LB_UPSTREAM_TIMEOUT_MS : u64 = 300000;
+
+/// Retries granted to one request. One: a ladder restart is the only case
+; where the same body is worth sending twice.
+pub const LB_RETRY_ATTEMPTS : u32 = 1;
+
+/// Connection-level failure codes. A model refusal (429, 402, 5xx) is not in
+; this set: the ladder already answered.
+pub const LB_ERR_NONE : u32 = 0;
+pub const LB_ERR_CONNREFUSED : u32 = 1;
+pub const LB_ERR_CONNRESET : u32 = 2;
+pub const LB_ERR_EPIPE : u32 = 3;
+pub const LB_ERR_ETIMEDOUT : u32 = 4;
+
+/// Room for one more waiting request. The in-flight request takes a slot, so a
+; client never queues behind a request that is already being served.
+pub fn lb_has_room(in_flight: bool, depth: usize, cap: usize) -> bool {
+    const used : usize = if (in_flight) { 1 } else { 0 };
+    return used + depth < cap;
+}
+
+/// The number reported as queueDepth: what the client sees, including the job
+; the worker is on.
+pub fn lb_depth(in_flight: bool, depth: usize) -> usize {
+    return if (in_flight) { depth + 1 } else { depth };
+}
+
+/// True only for a connection-level failure, the one case worth a retry.
+pub fn lb_conn_refusal(code: u32) -> bool {
+    return code == LB_ERR_CONNREFUSED or code == LB_ERR_CONNRESET
+        or code == LB_ERR_EPIPE or code == LB_ERR_ETIMEDOUT;
+}
+
+/// A retry is granted only on a connection-level failure, and only once.
+pub fn lb_retry_allowed(attempts: u32, code: u32) -> bool {
+    if (attempts >= LB_RETRY_ATTEMPTS) { return false; }
+    return lb_conn_refusal(code);
+}
+
+/// The depth an overflow answer reports, so a client can back off instead of
+; retrying blind.
+pub fn lb_overflow_depth(in_flight: bool, depth: usize) -> usize {
+    return lb_depth(in_flight, depth);
+}
+
+/// Liveness never depends on a model call or on the queue: full, empty or a
+; hung upstream, the status is the same. The health endpoint reports the queue
+; and the upstream state in its body, separately and non-blocking.
+pub fn lb_health_status(depth: usize) -> u32 {
+    return 200;
+}
+
+test the_cap_counts_the_slot_in_flight {
+    assert lb_has_room(false, 0, 1);
+    assert lb_has_room(true, 0, 1) == false;
+    assert lb_has_room(false, 63, 64);
+    assert lb_has_room(true, 63, 64) == false;
+    assert lb_depth(true, 3) == 4;
+    assert lb_depth(false, 3) == 3;
+}
+
+test a_full_queue_is_an_overflow_not_a_hang {
+    assert lb_has_room(true, 63, 64) == false;
+    assert lb_overflow_depth(true, 63) == 64;
+    assert LB_QUEUE_OVERFLOW_STATUS == 429;
+    assert LB_RETRY_AFTER_S == 1;
+}
+
+test only_a_connection_failure_may_be_retried_once {
+    assert lb_conn_refusal(LB_ERR_CONNREFUSED);
+    assert lb_conn_refusal(LB_ERR_CONNRESET);
+    assert lb_conn_refusal(LB_ERR_EPIPE);
+    assert lb_conn_refusal(LB_ERR_ETIMEDOUT);
+    assert lb_retry_allowed(0, LB_ERR_CONNREFUSED);
+    assert lb_retry_allowed(1, LB_ERR_CONNREFUSED) == false;
+}
+
+test a_model_refusal_is_never_retried {
+    assert lb_conn_refusal(LB_ERR_NONE) == false;
+    assert lb_retry_allowed(0, LB_ERR_NONE) == false;
+}
+
+test liveness_does_not_depend_on_the_queue {
+    assert lb_health_status(0) == 200;
+    assert lb_health_status(1) == 200;
+    assert lb_health_status(63) == 200;
+    assert lb_health_status(6399) == 200;
+}
+
+; The deadline of the buffer must outlast the deadlines of the ladder it fronts:
+; ladder.t27 CALL_TIMEOUT_MS is 90000 and ladder_doctor.t27 LD_WALK_CEILING_MS
+; is 120000. It answers 504 of its own rather than cutting a legitimate slow
+; answer of the ladder.
+invariant the_deadline_covers_the_ladders_own_deadlines {
+    assert LB_UPSTREAM_TIMEOUT_MS > 90000 + 120000;
+}
+
+phi^2 + 1/phi^2 = 3 | TRINITY
