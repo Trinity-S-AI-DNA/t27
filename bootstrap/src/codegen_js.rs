@@ -248,8 +248,14 @@ impl Bound {
 /// A built-in type name, so the refusal can say `a type is not a value` instead
 /// of the vaguer `not declared here`. Widths are not enumerated: `u3` and `i27`
 /// are ordinary in a ternary spec, so the shape is matched rather than a list.
+///
+/// `string` is accepted beside `str` because the language spells the type both
+/// ways -- array declarations already take either (`[string;11]` lowers), and a
+/// backend that refuses a `string`-spelled fn parameter while emitting the same
+/// spelling inside an array literal is refusing its own language, not a
+/// boundary (measured 2026-11-25, gateway_ui spec).
 fn is_primitive_type(name: &str) -> bool {
-    if matches!(name, "bool" | "void" | "type" | "str" | "char" | "trit" | "tryte") {
+    if matches!(name, "bool" | "void" | "type" | "str" | "string" | "char" | "trit" | "tryte") {
         return true;
     }
     let Some(width) = name
@@ -1547,6 +1553,16 @@ mod tests {
         // The defect this backend was written beside: every other emitter
         // printed `habr_search` where `"habr_search"` belonged.
         assert_eq!(expr(&JS, &lit("habr_search", "string"), &scope(&[])).unwrap(), "\"habr_search\"");
+    }
+
+    #[test]
+    fn the_string_type_alias_lowers_in_fn_signatures() {
+        // The language spells the text type both ways; array declarations take
+        // either, so a fn signature taking `string` must lower like `str` --
+        // refusing one spelling while emitting the other refused the language,
+        // not a boundary (measured 2026-11-25, gateway_ui spec).
+        assert!(is_primitive_type("string"));
+        assert!(is_primitive_type("str"));
     }
 
     #[test]
