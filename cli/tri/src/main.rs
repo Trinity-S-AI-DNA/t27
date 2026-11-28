@@ -43,6 +43,7 @@ mod piddir;
 mod prcheck;
 mod prose;
 mod quant;
+#[path = "../../../gen/rust/t27os/promotion_manifest.rs"] mod promotion_manifest_rules; // t27c gen-rust of specs/t27os/promotion_manifest.t27 (#14220)
 mod git;
 mod red;
 #[path = "../../../gen/rust/tri/test/report.rs"] #[allow(dead_code, unused_parens)]
@@ -272,6 +273,11 @@ enum Commands {
     Mods {
         #[command(subcommand)]
         action: ModsCmd,
+    },
+    /// The promotion manifest beside SHA256SUMS (#14220).
+    Promo {
+        #[command(subcommand)]
+        action: PromoCmd,
     },
     /// Classify a compiler's error output before quoting a number from it.
     Elab {
@@ -777,11 +783,39 @@ fn append_akashic(root: &Path, evt: &AkashicEvent) -> Result<()> {
 
 use std::io::Write;
 
-fn file_sha256(path: &Path) -> Result<String> {
+pub(crate) fn file_sha256(path: &Path) -> Result<String> {
     let data = fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+// tri promo manifest (#14220): the schema (keys, order, caps names) is specs/t27os/promotion_manifest.t27 via its generated module; this wiring adds no key and renames none.
+fn promo_json_esc(s: &str) -> String { s.replace('\\', "\\\\").replace('"', "\\\"") }
+fn promo_json_members(pairs: &[String]) -> String {
+    pairs.iter().map(|p| { let (k, v) = p.split_once('=').unwrap_or((p.as_str(), "")); format!("\"{}\":\"{}\"", promo_json_esc(k), promo_json_esc(v)) }).collect::<Vec<_>>().join(",")
+}
+fn promo_json_render(c: &str, a: &str, d: &str, caps: &[String], envs: &[String], t: &str, b: &str) -> String {
+    let k = &promotion_manifest_rules::KEYS; format!("{{\"{}\":\"{}\",\"{}\":\"{}\",\"{}\":\"{}\",\"{}\":\"{}\",\"{}\":{{{}}},\"{}\":{{{}}},\"{}\":\"{}\",\"{}\":\"{}\"}}", k[0], promotion_manifest_rules::SCHEMA_VERSION, k[1], promo_json_esc(c), k[2], promo_json_esc(a), k[3], d, k[4], promo_json_members(caps), k[5], promo_json_members(envs), k[6], promo_json_esc(t), k[7], promo_json_esc(b))
+}
+#[derive(Subcommand)]
+enum PromoCmd {
+    /// Print promotion-manifest.json from measured inputs (#14220).
+    Manifest {
+        #[arg(long)] commit: String,
+        #[arg(long)] binary: std::path::PathBuf,
+        #[arg(long)] asset: String,
+        #[arg(long = "cap")] caps: Vec<String>,
+        #[arg(long = "env")] envs: Vec<String>,
+        #[arg(long)] toolchain: String,
+        #[arg(long = "build-command")] build_command: String,
+    },
+}
+fn promo_run(a: &PromoCmd) -> Result<()> {
+    let PromoCmd::Manifest { commit, binary, asset, caps, envs, toolchain, build_command } = a;
+    let digest = file_sha256(binary).context("promo: cannot hash the binary")?;
+    println!("{}", promo_json_render(commit, asset, &digest, caps, envs, toolchain, build_command));
+    Ok(())
 }
 
 fn git_short_hash() -> String {
@@ -1419,6 +1453,7 @@ fn main() -> Result<()> {
         Commands::Harness { action } => match action {
             HarnessCmd::Scratch { gate, self_check } => scratch::run(*gate, *self_check)?,
         },
+        Commands::Promo { action } => promo_run(&action)?,
         Commands::Mods { action } => match action {
             ModsCmd::Orphan { gate, self_check } => {
                 if *self_check {
