@@ -178,7 +178,7 @@ pub const EMPTY_TREE: &'static str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub const ALIVE_PREF: &'static str = "refs/swarm/alive/";
 
-pub fn beat_msg(out: &mut [u8], cap: usize, host: &[u8], build: u32, ver: &[u8], tc: &[u8]) -> usize {
+pub fn beat_msg(out: &mut [u8], cap: usize, host: &[u8], build: u32, ver: &[u8], tc: &[u8], caps: &[u8]) -> usize {
     let mut w: usize = 0;
     w = put_s(out, w, cap, b"hb1 host=");
     w = put_s(out, w, cap, host);
@@ -188,7 +188,13 @@ pub fn beat_msg(out: &mut [u8], cap: usize, host: &[u8], build: u32, ver: &[u8],
     w = put_s(out, w, cap, ver);
     w = put_s(out, w, cap, b" tc=");
     w = put_s(out, w, cap, tc);
-    w = put_s(out, w, cap, b" cpu=- ram=- disk=- lanes=-");
+    if (caps.len() == 0) {
+        w = put_s(out, w, cap, b" cpu=- ram_gb=- disk_free_gb=- gpu_count=0");
+    } else {
+        w = put_s(out, w, cap, b" ");
+        w = put_s(out, w, cap, caps);
+    }
+    w = put_s(out, w, cap, b" lanes=-");
     return w;
 }
 
